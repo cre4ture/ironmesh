@@ -1,0 +1,23 @@
+name: System Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  system-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run system tests
+        run: cargo test -p system-tests
