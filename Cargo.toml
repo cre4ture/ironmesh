@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/common",
+    "crates/client-sdk",
+    "apps/server-node",
+    "apps/cli-client",
+    "apps/web-ui",
+    "apps/android-app",
+    "apps/ios-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["ironmesh contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }

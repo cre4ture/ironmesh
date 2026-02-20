@@ -1,0 +1,15 @@
+[package]
+name = "server-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+common = { path = "../../crates/common" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

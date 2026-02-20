@@ -1,0 +1,16 @@
+[package]
+name = "cli-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+client-sdk = { path = "../../crates/client-sdk" }
+serde_json.workspace = true
+tokio.workspace = true
+web-ui = { path = "../web-ui" }
