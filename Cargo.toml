@@ -6,7 +6,7 @@ members = [
     "apps/cli-client",
     "apps/web-ui",
     "apps/android-app",
-    "apps/ios-app",
+    "apps/ios-app", "tests/system-tests",
 ]
 resolver = "2"
 

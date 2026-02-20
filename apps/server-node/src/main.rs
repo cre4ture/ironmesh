@@ -37,7 +37,9 @@ async fn main() -> Result<()> {
         .route("/store/{key}", put(put_object).get(get_object))
         .with_state(state);
 
-    let bind_addr: SocketAddr = "127.0.0.1:8080".parse()?;
+    let bind_addr = std::env::var("IRONMESH_SERVER_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        .parse::<SocketAddr>()?;
     info!(%bind_addr, "server node listening");
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
