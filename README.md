@@ -28,3 +28,7 @@ cargo run -p cli-client -- --help
 - iOS: C-ABI/Swift bridge (or UniFFI).
 
 Those bridges can be added incrementally without changing the workspace topology.
+
+## Storage design
+
+- Persistent storage strategy and requirements are documented in [docs/persistent-storage-strategy.md](docs/persistent-storage-strategy.md).
