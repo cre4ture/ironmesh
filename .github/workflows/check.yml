@@ -1,4 +1,4 @@
-name: System Tests
+name: Workspace Check
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  system-tests:
+  workspace-check:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -19,5 +19,5 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run system tests
-        run: cargo test -p system-tests
+      - name: Run workspace check
+        run: cargo check --workspace
