@@ -1,8 +1,12 @@
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::ffi::OsString;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::process::Stdio;
+    use std::sync::OnceLock;
+    use std::time::SystemTime;
     use std::time::Duration;
 
     use anyhow::{Context, Result, bail};
@@ -74,11 +78,110 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn snapshot_time_travel_read_via_http() -> Result<()> {
+        let bind = "127.0.0.1:19083";
+        let data_dir = fresh_data_dir("snapshot-time-travel");
+        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let base_url = format!("http://{bind}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            client
+                .put(format!("{base_url}/store/history-key"))
+                .body("v1")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let first_snapshot_id = latest_snapshot_id(&client, &base_url).await?;
+
+            client
+                .put(format!("{base_url}/store/history-key"))
+                .body("v2")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let latest = client
+                .get(format!("{base_url}/store/history-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert_eq!(latest, "v2");
+
+            let historical = client
+                .get(format!(
+                    "{base_url}/store/history-key?snapshot={first_snapshot_id}"
+                ))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert_eq!(historical, "v1");
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
+    async fn corrupted_chunk_returns_conflict() -> Result<()> {
+        let bind = "127.0.0.1:19084";
+        let data_dir = fresh_data_dir("corrupt-detection");
+        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let base_url = format!("http://{bind}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            client
+                .put(format!("{base_url}/store/corrupt-me"))
+                .body("payload-for-corruption-check")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let chunk_file = first_chunk_file(data_dir.join("chunks"))?;
+            let mut bytes = fs::read(&chunk_file)?;
+            if bytes.is_empty() {
+                bail!("chunk file unexpectedly empty: {}", chunk_file.display());
+            }
+            bytes[0] ^= 0xFF;
+            fs::write(&chunk_file, bytes)?;
+
+            let response = client
+                .get(format!("{base_url}/store/corrupt-me"))
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
     async fn start_server(bind: &str) -> Result<Child> {
+        let data_dir = fresh_data_dir("default-server");
+        start_server_with_data_dir(bind, &data_dir).await
+    }
+
+    async fn start_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<Child> {
         let server_bin = binary_path("server-node")?;
 
         let child = Command::new(server_bin)
             .env("IRONMESH_SERVER_BIND", bind)
+            .env("IRONMESH_DATA_DIR", data_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -86,6 +189,28 @@ mod tests {
 
         wait_for_server(bind, 40).await?;
         Ok(child)
+    }
+
+    async fn latest_snapshot_id(http: &reqwest::Client, base_url: &str) -> Result<String> {
+        let payload = http
+            .get(format!("{base_url}/snapshots"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+
+        let parsed: serde_json::Value = serde_json::from_str(&payload)?;
+        let first = parsed
+            .as_array()
+            .and_then(|arr| arr.first())
+            .context("snapshots endpoint returned empty list")?;
+
+        first
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .context("snapshot id missing in response")
     }
 
     async fn run_cli(args: &[&str]) -> Result<String> {
@@ -149,6 +274,7 @@ mod tests {
 
     fn binary_path(name: &str) -> Result<PathBuf> {
         let workspace_root = workspace_root()?;
+        ensure_binaries_built(&workspace_root)?;
         let mut path = workspace_root.join("target").join("debug").join(name);
 
         if let Some(suffix) = std::env::consts::EXE_SUFFIX.strip_prefix('.') {
@@ -156,10 +282,6 @@ mod tests {
             filename.push(".");
             filename.push(suffix);
             path = workspace_root.join("target").join("debug").join(filename);
-        }
-
-        if !path.exists() {
-            build_required_binaries(&workspace_root)?;
         }
 
         if !path.exists() {
@@ -194,5 +316,51 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    fn ensure_binaries_built(workspace_root: &PathBuf) -> Result<()> {
+        static BUILD_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+
+        let result = BUILD_RESULT.get_or_init(|| {
+            build_required_binaries(workspace_root).map_err(|err| err.to_string())
+        });
+
+        if let Err(message) = result {
+            bail!("failed to build required binaries: {message}");
+        }
+
+        Ok(())
+    }
+
+    fn fresh_data_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("ironmesh-{name}-{unique}"));
+        let _ = fs::remove_dir_all(&path);
+        let _ = fs::create_dir_all(&path);
+        path
+    }
+
+    fn first_chunk_file(root: PathBuf) -> Result<PathBuf> {
+        let mut dirs = vec![root];
+
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir)
+                .with_context(|| format!("failed to read dir {}", dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    return Ok(path);
+                }
+            }
+        }
+
+        bail!("no chunk files found")
     }
 }
