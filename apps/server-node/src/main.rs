@@ -50,6 +50,8 @@ struct RepairConfig {
     batch_size: usize,
     max_retries: u32,
     backoff_secs: u64,
+    startup_repair_enabled: bool,
+    startup_repair_delay_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,11 +83,23 @@ impl RepairConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
 
+        let startup_repair_enabled = std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+
+        let startup_repair_delay_secs = std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5);
+
         Self {
             enabled,
             batch_size,
             max_retries,
             backoff_secs,
+            startup_repair_enabled,
+            startup_repair_delay_secs,
         }
     }
 }
@@ -298,6 +312,9 @@ async fn main() -> Result<()> {
     }
 
     spawn_replication_auditor(state.clone(), audit_interval_secs);
+    if state.repair_config.startup_repair_enabled {
+        spawn_startup_replication_repair(state.clone(), state.repair_config.startup_repair_delay_secs);
+    }
     if peer_heartbeat_config.enabled {
         spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
     }
@@ -413,6 +430,51 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
                 );
             }
         }
+    });
+}
+
+fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
+    tokio::spawn(async move {
+        if delay_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+
+        let keys = {
+            let store = state.store.lock().await;
+            store
+                .list_replication_subjects()
+                .await
+                .unwrap_or_else(|_| store.current_keys())
+        };
+
+        let plan = {
+            let mut cluster = state.cluster.lock().await;
+            cluster.update_health_and_detect_offline_transition();
+            cluster.replication_plan(&keys)
+        };
+
+        if plan.items.is_empty() {
+            info!(
+                delay_secs,
+                "startup replication repair skipped: no replication gaps detected"
+            );
+            return;
+        }
+
+        let report = execute_replication_repair_inner(&state, None).await;
+        info!(
+            delay_secs,
+            under_replicated = plan.under_replicated,
+            over_replicated = plan.over_replicated,
+            items = plan.items.len(),
+            attempted = report.attempted_transfers,
+            success = report.successful_transfers,
+            failed = report.failed_transfers,
+            skipped = report.skipped_items,
+            skipped_backoff = report.skipped_backoff,
+            skipped_max_retries = report.skipped_max_retries,
+            "startup replication repair run"
+        );
     });
 }
 

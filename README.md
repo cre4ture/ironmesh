@@ -208,6 +208,13 @@ Those bridges can be added incrementally without changing the workspace topology
 - Configuration:
 	- `IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED` (default: `true`)
 
+### Startup replication repair
+
+- On startup, the server can run a one-shot replication repair pass after a short delay to heal inconsistent states.
+- Configuration:
+	- `IRONMESH_STARTUP_REPAIR_ENABLED` (default: `true`)
+	- `IRONMESH_STARTUP_REPAIR_DELAY_SECS` (default: `5`)
+
 - Rejoin reconciliation endpoints:
 	- `GET /cluster/reconcile/export/provisional`
 	- `POST /cluster/reconcile/{node_id}`

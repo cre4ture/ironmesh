@@ -65,6 +65,18 @@ Validation added:
 - Unit test `replication_plan_handles_divergent_versions_for_same_key`
 - Unit test `list_replication_subjects_includes_all_heads_for_divergent_versions`
 
+### 5) Startup one-shot repair
+
+Implemented:
+
+- Server can run a one-shot replication repair pass shortly after startup.
+- Intended to heal inconsistent states after nodes reconnect (useful for tests and local cluster bring-up).
+
+Configuration:
+
+- `IRONMESH_STARTUP_REPAIR_ENABLED` (default: `true`)
+- `IRONMESH_STARTUP_REPAIR_DELAY_SECS` (default: `5`)
+
 ## Key Files Touched Recently
 
 - `apps/server-node/src/main.rs`
