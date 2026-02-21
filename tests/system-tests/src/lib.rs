@@ -297,24 +297,145 @@ mod tests {
         result
     }
 
+    #[tokio::test]
+    async fn multi_node_replication_plan_detects_missing_replicas() -> Result<()> {
+        let bind_a = "127.0.0.1:19090";
+        let bind_b = "127.0.0.1:19091";
+        let bind_c = "127.0.0.1:19092";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000000a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000000b2";
+        let node_id_c = "00000000-0000-0000-0000-0000000000c3";
+
+        let data_a = fresh_data_dir("multi-node-a");
+        let data_b = fresh_data_dir("multi-node-b");
+        let data_c = fresh_data_dir("multi-node-c");
+
+        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let base_c = format!("http://{bind_c}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+            register_node(&http, &base_a, node_id_c, &base_c, "dc-c", "rack-3").await?;
+
+            http.put(format!("{base_a}/store/multi-key"))
+                .body("multi-node-payload")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let plan_body = http
+                .get(format!("{base_a}/cluster/replication/plan"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+
+            let plan: serde_json::Value = serde_json::from_str(&plan_body)?;
+            let items = plan
+                .get("items")
+                .and_then(|v| v.as_array())
+                .context("missing replication plan items")?;
+
+            let item = items
+                .iter()
+                .find(|entry| {
+                    entry
+                        .get("key")
+                        .and_then(|v| v.as_str())
+                        .map(|k| k == "multi-key")
+                        .unwrap_or(false)
+                })
+                .context("replication plan did not include multi-key")?;
+
+            let missing = item
+                .get("missing_nodes")
+                .and_then(|v| v.as_array())
+                .context("missing_nodes absent in plan item")?;
+            assert!(!missing.is_empty(), "expected missing replicas in multi-node plan");
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        stop_server(&mut node_c).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&data_c);
+
+        result
+    }
+
     async fn start_server(bind: &str) -> Result<Child> {
         let data_dir = fresh_data_dir("default-server");
         start_server_with_data_dir(bind, &data_dir).await
     }
 
     async fn start_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<Child> {
+        start_server_with_config(bind, data_dir, "", 3).await
+    }
+
+    async fn start_server_with_config(
+        bind: &str,
+        data_dir: &Path,
+        node_id: &str,
+        replication_factor: usize,
+    ) -> Result<Child> {
         let server_bin = binary_path("server-node")?;
 
-        let child = Command::new(server_bin)
+        let mut command = Command::new(server_bin);
+        command
             .env("IRONMESH_SERVER_BIND", bind)
             .env("IRONMESH_DATA_DIR", data_dir)
+            .env("IRONMESH_REPLICATION_FACTOR", replication_factor.to_string())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn server-node")?;
+            .stderr(Stdio::null());
+
+        if !node_id.is_empty() {
+            command.env("IRONMESH_NODE_ID", node_id);
+        }
+
+        let child = command.spawn().context("failed to spawn server-node")?;
 
         wait_for_server(bind, 40).await?;
         Ok(child)
+    }
+
+    async fn register_node(
+        http: &reqwest::Client,
+        controller_base: &str,
+        node_id: &str,
+        public_url: &str,
+        dc: &str,
+        rack: &str,
+    ) -> Result<()> {
+        let body = serde_json::json!({
+            "public_url": public_url,
+            "labels": {
+                "region": "local",
+                "dc": dc,
+                "rack": rack
+            },
+            "capacity_bytes": 1_000_000,
+            "free_bytes": 800_000
+        });
+
+        http.put(format!("{controller_base}/cluster/nodes/{node_id}"))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
     }
 
     async fn latest_snapshot_id(http: &reqwest::Client, base_url: &str) -> Result<String> {
