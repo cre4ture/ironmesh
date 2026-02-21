@@ -28,3 +28,25 @@ ci-stable:
     cargo +stable check --workspace
     cargo +stable clippy --workspace --all-targets -- -D warnings
     cargo +stable test --workspace
+
+context-refresh:
+    @test -f docs/agent-context.md
+    @echo "==> Context refresh helper"
+    @changed="$$(git diff --name-only -- README.md docs apps/server-node tests/system-tests .cargo rust-toolchain.toml Cargo.toml justfile)"; \
+    if [ -n "$$changed" ]; then \
+        echo "Potentially context-impacting changes:"; \
+        echo "$$changed"; \
+    else \
+        echo "No staged/unstaged context-impacting changes detected in tracked areas."; \
+    fi
+    @echo ""
+    @echo "Update docs/agent-context.md with:" \
+         "(1) what changed" \
+         "(2) why" \
+         "(3) quick validation command" \
+         "(4) source-of-truth files"
+
+context-check:
+    @test -f docs/agent-context.md
+    @grep -q "## Update Protocol" docs/agent-context.md
+    @echo "docs/agent-context.md exists and contains update protocol."
