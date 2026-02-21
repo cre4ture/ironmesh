@@ -187,6 +187,11 @@ impl ClusterService {
         let mut changed_to_offline = false;
 
         for node in self.nodes.values_mut() {
+            if node.node_id == self.local_node {
+                node.status = NodeStatus::Online;
+                continue;
+            }
+
             let stale = now.saturating_sub(node.last_heartbeat_unix) > self.heartbeat_timeout_secs;
             if stale && node.status != NodeStatus::Offline {
                 node.status = NodeStatus::Offline;
@@ -543,6 +548,53 @@ mod tests {
         let nodes = exported.get("subject-a").unwrap();
         assert!(nodes.contains(&node_a));
         assert!(nodes.contains(&node_b));
+    }
+
+    #[test]
+    fn update_health_keeps_local_node_online() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 0);
+        svc.register_node(mk_node(local, "dc-a", "rack-1", 900));
+
+        let transitioned = svc.update_health_and_detect_offline_transition();
+        assert!(!transitioned);
+
+        let local_node = svc
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == local)
+            .expect("local node should exist");
+        assert_eq!(local_node.status, NodeStatus::Online);
+    }
+
+    #[test]
+    fn replication_plan_never_has_empty_desired_nodes_for_local_subject() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 3,
+                ..ReplicationPolicy::default()
+            },
+            0,
+        );
+
+        let remote_a = NodeId::new_v4();
+        let remote_b = NodeId::new_v4();
+        svc.register_node(mk_node(local, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(remote_a, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(remote_b, "dc-c", "rack-3", 700));
+        svc.note_replica("hello", local);
+
+        svc.update_health_and_detect_offline_transition();
+        let plan = svc.replication_plan(&["hello".to_string()]);
+
+        if let Some(item) = plan.items.iter().find(|item| item.key == "hello") {
+            assert!(
+                !item.desired_nodes.is_empty(),
+                "desired nodes must include at least the local online node"
+            );
+        }
     }
 
     #[test]
