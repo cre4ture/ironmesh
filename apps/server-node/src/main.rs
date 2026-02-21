@@ -792,7 +792,7 @@ async fn drop_replication_subject(
     headers: HeaderMap,
     Query(query): Query<ReplicationDropQuery>,
 ) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers) {
+    if !is_internal_request_authorized(&state, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -969,6 +969,7 @@ async fn execute_replication_cleanup(
 
             if let Some(token) = state.internal_api_token.as_deref() {
                 request = request.header("x-ironmesh-internal-token", token);
+                request = request.header("x-ironmesh-node-id", state.node_id.to_string());
             }
 
             let response = request.send().await;
@@ -1042,7 +1043,7 @@ async fn push_replication_chunk(
     Path(hash): Path<String>,
     payload: Bytes,
 ) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers) {
+    if !is_internal_request_authorized(&state, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1062,7 +1063,7 @@ async fn push_replication_manifest(
     Query(query): Query<ReplicationManifestPushQuery>,
     payload: Bytes,
 ) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers) {
+    if !is_internal_request_authorized(&state, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1223,6 +1224,7 @@ async fn execute_replication_repair_inner(
                 &bundle,
                 &state.store,
                 state.internal_api_token.as_deref(),
+                state.node_id,
             )
             .await;
 
@@ -1297,6 +1299,7 @@ async fn replicate_bundle_to_target(
     bundle: &ReplicationExportBundle,
     store: &Arc<Mutex<PersistentStore>>,
     internal_api_token: Option<&str>,
+    source_node_id: NodeId,
 ) -> Result<String> {
     let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
 
@@ -1337,6 +1340,7 @@ async fn replicate_bundle_to_target(
 
     if let Some(token) = internal_api_token {
         request = request.header("x-ironmesh-internal-token", token);
+        request = request.header("x-ironmesh-node-id", source_node_id.to_string());
     }
 
     let response = request.send().await?.error_for_status()?;
@@ -1391,13 +1395,41 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
     base_backoff_secs.saturating_add(jitter)
 }
 
-fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap) -> bool {
+async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap) -> bool {
     let configured = state.internal_api_token.as_deref();
     let provided = headers
         .get("x-ironmesh-internal-token")
         .and_then(|value| value.to_str().ok());
 
-    internal_token_matches(configured, provided)
+    if !internal_token_matches(configured, provided) {
+        return false;
+    }
+
+    if configured.is_none() {
+        return true;
+    }
+
+    let node_id_header = headers
+        .get("x-ironmesh-node-id")
+        .and_then(|value| value.to_str().ok());
+
+    if !internal_node_header_valid(configured, node_id_header) {
+        return false;
+    }
+
+    let Some(node_id_header) = node_id_header else {
+        return false;
+    };
+
+    let Ok(caller_node_id) = node_id_header.parse::<NodeId>() else {
+        return false;
+    };
+
+    let cluster = state.cluster.lock().await;
+    cluster
+        .list_nodes()
+        .iter()
+        .any(|node| node.node_id == caller_node_id)
 }
 
 fn internal_token_matches(configured: Option<&str>, provided: Option<&str>) -> bool {
@@ -1405,6 +1437,16 @@ fn internal_token_matches(configured: Option<&str>, provided: Option<&str>) -> b
         None => true,
         Some(expected) => provided.map(|token| token == expected).unwrap_or(false),
     }
+}
+
+fn internal_node_header_valid(configured: Option<&str>, provided: Option<&str>) -> bool {
+    if configured.is_none() {
+        return true;
+    }
+
+    provided
+        .and_then(|value| value.parse::<NodeId>().ok())
+        .is_some()
 }
 
 fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> {
@@ -1424,7 +1466,7 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 
 #[cfg(test)]
 mod tests {
-    use super::{internal_token_matches, jittered_backoff_secs};
+    use super::{internal_node_header_valid, internal_token_matches, jittered_backoff_secs};
 
     #[test]
     fn jittered_backoff_is_deterministic_for_same_inputs() {
@@ -1451,6 +1493,20 @@ mod tests {
         assert!(!internal_token_matches(Some("secret"), None));
         assert!(!internal_token_matches(Some("secret"), Some("wrong")));
         assert!(internal_token_matches(Some("secret"), Some("secret")));
+    }
+
+    #[test]
+    fn internal_node_header_rules_match_token_mode() {
+        assert!(internal_node_header_valid(None, None));
+        assert!(!internal_node_header_valid(Some("secret"), None));
+        assert!(!internal_node_header_valid(
+            Some("secret"),
+            Some("not-a-uuid")
+        ));
+        assert!(internal_node_header_valid(
+            Some("secret"),
+            Some("00000000-0000-0000-0000-000000000001")
+        ));
     }
 }
 
