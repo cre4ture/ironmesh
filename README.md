@@ -144,6 +144,10 @@ Those bridges can be added incrementally without changing the workspace topology
 
 - Multi-node requirements, replication strategy, and rollout plan are documented in [docs/multi-node-strategy.md](docs/multi-node-strategy.md).
 
+## CI operations
+
+- CI branch-protection alignment and nightly-lane triage steps are documented in [docs/ci-runbook.md](docs/ci-runbook.md).
+
 ## API semantics (current)
 
 ### Versioning and commit
