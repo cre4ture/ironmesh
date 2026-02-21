@@ -438,47 +438,60 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
 fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
     tokio::spawn(async move {
-        if delay_secs > 0 {
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        match run_startup_replication_repair_once(&state, delay_secs).await {
+            Some((plan, report)) => {
+                info!(
+                    delay_secs,
+                    under_replicated = plan.under_replicated,
+                    over_replicated = plan.over_replicated,
+                    items = plan.items.len(),
+                    attempted = report.attempted_transfers,
+                    success = report.successful_transfers,
+                    failed = report.failed_transfers,
+                    skipped = report.skipped_items,
+                    skipped_backoff = report.skipped_backoff,
+                    skipped_max_retries = report.skipped_max_retries,
+                    "startup replication repair run"
+                );
+            }
+            None => {
+                info!(
+                    delay_secs,
+                    "startup replication repair skipped: no replication gaps detected"
+                );
+            }
         }
-
-        let keys = {
-            let store = state.store.lock().await;
-            store
-                .list_replication_subjects()
-                .await
-                .unwrap_or_else(|_| store.current_keys())
-        };
-
-        let plan = {
-            let mut cluster = state.cluster.lock().await;
-            cluster.update_health_and_detect_offline_transition();
-            cluster.replication_plan(&keys)
-        };
-
-        if plan.items.is_empty() {
-            info!(
-                delay_secs,
-                "startup replication repair skipped: no replication gaps detected"
-            );
-            return;
-        }
-
-        let report = execute_replication_repair_inner(&state, None).await;
-        info!(
-            delay_secs,
-            under_replicated = plan.under_replicated,
-            over_replicated = plan.over_replicated,
-            items = plan.items.len(),
-            attempted = report.attempted_transfers,
-            success = report.successful_transfers,
-            failed = report.failed_transfers,
-            skipped = report.skipped_items,
-            skipped_backoff = report.skipped_backoff,
-            skipped_max_retries = report.skipped_max_retries,
-            "startup replication repair run"
-        );
     });
+}
+
+async fn run_startup_replication_repair_once(
+    state: &ServerState,
+    delay_secs: u64,
+) -> Option<(ReplicationPlan, ReplicationRepairReport)> {
+    if delay_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+    }
+
+    let keys = {
+        let store = state.store.lock().await;
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+    };
+
+    let plan = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        cluster.replication_plan(&keys)
+    };
+
+    if plan.items.is_empty() {
+        return None;
+    }
+
+    let report = execute_replication_repair_inner(state, None).await;
+    Some((plan, report))
 }
 
 fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
@@ -2077,11 +2090,18 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_store_index_entries, constant_time_eq, expected_internal_token_for_node,
+        build_store_index_entries, cluster, constant_time_eq, expected_internal_token_for_node,
         internal_node_header_valid, internal_token_matches, jittered_backoff_secs,
-        parse_internal_node_tokens,
+        parse_internal_node_tokens, run_startup_replication_repair_once, MetadataCommitMode,
+        RepairConfig, RepairExecutorState, ServerState,
     };
     use common::NodeId;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Mutex;
+
+    use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
     use std::collections::HashMap;
 
     #[test]
@@ -2188,6 +2208,132 @@ mod tests {
         key_paths.sort();
 
         assert_eq!(key_paths, vec!["images/cat.png", "images/dogs/beagle.png"]);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_noop_when_plan_is_empty() {
+        let state = build_test_state(1, false).await;
+
+        let result = run_startup_replication_repair_once(&state, 0).await;
+        assert!(result.is_none());
+
+        cleanup_test_state(&state).await;
+    }
+
+    #[tokio::test]
+    async fn startup_repair_runs_when_gaps_exist() {
+        let state = build_test_state(2, true).await;
+
+        let result = run_startup_replication_repair_once(&state, 0).await;
+        assert!(result.is_some());
+
+        let (plan, report) = result.unwrap();
+        assert!(!plan.items.is_empty());
+        assert!(
+            report.attempted_transfers > 0,
+            "startup repair should attempt transfers when replication gaps exist"
+        );
+
+        cleanup_test_state(&state).await;
+    }
+
+    async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerState {
+        let root = fresh_test_dir("startup-repair-main");
+        let local_node_id = NodeId::new_v4();
+
+        let store = Arc::new(Mutex::new(PersistentStore::init(root.clone()).await.unwrap()));
+
+        let mut service = cluster::ClusterService::new(
+            local_node_id,
+            cluster::ReplicationPolicy {
+                replication_factor,
+                ..cluster::ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        service.register_node(cluster::NodeDescriptor {
+            node_id: local_node_id,
+            public_url: "http://127.0.0.1:39080".to_string(),
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 900_000,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        });
+
+        if replication_factor > 1 {
+            service.register_node(cluster::NodeDescriptor {
+                node_id: NodeId::new_v4(),
+                public_url: "http://127.0.0.1:9".to_string(),
+                labels: HashMap::new(),
+                capacity_bytes: 1_000_000,
+                free_bytes: 800_000,
+                last_heartbeat_unix: 0,
+                status: cluster::NodeStatus::Online,
+            });
+        }
+
+        let state = ServerState {
+            node_id: local_node_id,
+            store: store.clone(),
+            cluster: Arc::new(Mutex::new(service)),
+            metadata_commit_mode: MetadataCommitMode::Local,
+            internal_node_tokens: Arc::new(Mutex::new(HashMap::new())),
+            autonomous_replication_on_put_enabled: false,
+            repair_config: RepairConfig {
+                enabled: true,
+                batch_size: 32,
+                max_retries: 3,
+                backoff_secs: 0,
+                startup_repair_enabled: true,
+                startup_repair_delay_secs: 0,
+            },
+            repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        };
+
+        if seed_gap {
+            let put = {
+                let mut locked = store.lock().await;
+                locked
+                    .put_object_versioned(
+                        "startup-gap-key",
+                        bytes::Bytes::from_static(b"payload"),
+                        PutOptions {
+                            parent_version_ids: Vec::new(),
+                            state: VersionConsistencyState::Confirmed,
+                            inherit_preferred_parent: true,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            };
+
+            let mut cluster = state.cluster.lock().await;
+            cluster.note_replica("startup-gap-key", local_node_id);
+            cluster.note_replica(format!("startup-gap-key@{}", put.version_id), local_node_id);
+        }
+
+        state
+    }
+
+    async fn cleanup_test_state(state: &ServerState) {
+        let root = {
+            let store = state.store.lock().await;
+            store.root_dir().to_path_buf()
+        };
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    fn fresh_test_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("ironmesh-{name}-{unique}"));
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::create_dir_all(&path);
+        path
     }
 }
 

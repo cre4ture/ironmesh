@@ -77,6 +77,11 @@ Configuration:
 - `IRONMESH_STARTUP_REPAIR_ENABLED` (default: `true`)
 - `IRONMESH_STARTUP_REPAIR_DELAY_SECS` (default: `5`)
 
+Validation added:
+
+- Unit test `startup_repair_noop_when_plan_is_empty`
+- Unit test `startup_repair_runs_when_gaps_exist`
+
 ## Key Files Touched Recently
 
 - `apps/server-node/src/main.rs`
