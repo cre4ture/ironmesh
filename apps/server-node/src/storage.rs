@@ -646,3 +646,59 @@ async fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_record(
+        version_id: &str,
+        state: VersionConsistencyState,
+        created_at_unix: u64,
+    ) -> FileVersionRecord {
+        FileVersionRecord {
+            version_id: version_id.to_string(),
+            key: "k".to_string(),
+            manifest_hash: format!("m-{version_id}"),
+            parent_version_ids: Vec::new(),
+            state,
+            created_at_unix,
+        }
+    }
+
+    #[test]
+    fn preferred_head_prioritizes_confirmed_over_newer_provisional() {
+        let mut index = empty_version_index("k");
+        index
+            .versions
+            .insert("v-old-confirmed".to_string(), mk_record("v-old-confirmed", VersionConsistencyState::Confirmed, 10));
+        index
+            .versions
+            .insert("v-new-provisional".to_string(), mk_record("v-new-provisional", VersionConsistencyState::Provisional, 100));
+        index.head_version_ids = vec!["v-old-confirmed".to_string(), "v-new-provisional".to_string()];
+
+        let preferred = choose_preferred_head(&index);
+        assert_eq!(preferred.as_deref(), Some("v-old-confirmed"));
+    }
+
+    #[test]
+    fn preferred_head_uses_latest_when_same_state() {
+        let mut index = empty_version_index("k");
+        index
+            .versions
+            .insert("v1".to_string(), mk_record("v1", VersionConsistencyState::Confirmed, 11));
+        index
+            .versions
+            .insert("v2".to_string(), mk_record("v2", VersionConsistencyState::Confirmed, 22));
+        index.head_version_ids = vec!["v1".to_string(), "v2".to_string()];
+
+        let preferred = choose_preferred_head(&index);
+        assert_eq!(preferred.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn preferred_head_none_for_empty_heads() {
+        let index = empty_version_index("k");
+        assert!(choose_preferred_head(&index).is_none());
+    }
+}

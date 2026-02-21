@@ -315,3 +315,80 @@ fn unix_ts() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_node(id: NodeId, dc: &str, rack: &str, free_bytes: u64) -> NodeDescriptor {
+        let mut labels = HashMap::new();
+        labels.insert("dc".to_string(), dc.to_string());
+        labels.insert("rack".to_string(), rack.to_string());
+
+        NodeDescriptor {
+            node_id: id,
+            public_url: format!("http://{id}"),
+            labels,
+            capacity_bytes: 1_000,
+            free_bytes,
+            last_heartbeat_unix: unix_ts(),
+            status: NodeStatus::Online,
+        }
+    }
+
+    #[test]
+    fn placement_is_deterministic_for_same_key_and_topology() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-a", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-b", "rack-7", 700));
+
+        let p1 = svc.placement_for_key("alpha");
+        let p2 = svc.placement_for_key("alpha");
+        assert_eq!(p1.selected_nodes, p2.selected_nodes);
+    }
+
+    #[test]
+    fn replication_plan_detects_missing_and_extra() {
+        let local = NodeId::new_v4();
+        let mut policy = ReplicationPolicy::default();
+        policy.replication_factor = 2;
+
+        let mut svc = ClusterService::new(local, policy, 60);
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 100));
+
+        svc.note_replica("k", node_a);
+        svc.note_replica("k", node_c);
+
+        let placement = svc.placement_for_key("k");
+        let expected_count = placement
+            .selected_nodes
+            .iter()
+            .filter(|node_id| [node_a, node_c].contains(node_id))
+            .count();
+
+        let plan = svc.replication_plan(&["k".to_string()]);
+
+        if expected_count == placement.selected_nodes.len() && expected_count == 2 {
+            assert!(plan.items.is_empty());
+        } else {
+            assert_eq!(plan.items.len(), 1);
+            let item = &plan.items[0];
+            assert!(item.missing_nodes.len() <= 2);
+            assert!(item.extra_nodes.len() <= 2);
+            assert!(plan.under_replicated + plan.over_replicated >= 1);
+        }
+    }
+}
