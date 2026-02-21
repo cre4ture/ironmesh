@@ -1079,6 +1079,10 @@ async fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn test_store_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ironmesh-{name}-{}", unix_ts_nanos()))
+    }
+
     fn mk_record(
         version_id: &str,
         state: VersionConsistencyState,
@@ -1275,5 +1279,186 @@ mod tests {
 
         let selected = manifest_hash_for_read_mode(&index, ObjectReadMode::ProvisionalAllowed);
         assert_eq!(selected.as_deref(), Some("m-v-provisional"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_marker_roundtrip_is_detected() {
+        let root = test_store_dir("reconcile-marker");
+        let store = PersistentStore::init(root.clone()).await.unwrap();
+
+        assert!(
+            !store
+                .has_reconcile_marker("node-a", "key-a", "source-v1")
+                .await
+                .unwrap()
+        );
+
+        store
+            .mark_reconciled("node-a", "key-a", "source-v1", Some("local-v1"))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .has_reconcile_marker("node-a", "key-a", "source-v1")
+                .await
+                .unwrap()
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn list_provisional_versions_filters_and_sorts_by_key_then_time() {
+        let root = test_store_dir("provisional-list");
+        let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+        store
+            .put_object_versioned(
+                "z-key",
+                Bytes::from_static(b"confirmed"),
+                PutOptions {
+                    state: VersionConsistencyState::Confirmed,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .put_object_versioned(
+                "b-key",
+                Bytes::from_static(b"prov-b"),
+                PutOptions {
+                    state: VersionConsistencyState::Provisional,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .put_object_versioned(
+                "a-key",
+                Bytes::from_static(b"prov-a"),
+                PutOptions {
+                    state: VersionConsistencyState::Provisional,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let provisional = store.list_provisional_versions().await.unwrap();
+        assert_eq!(provisional.len(), 2);
+        assert_eq!(provisional[0].key, "a-key");
+        assert_eq!(provisional[1].key, "b-key");
+        assert!(
+            provisional
+                .iter()
+                .all(|entry| entry.state == VersionConsistencyState::Provisional)
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_unreferenced_dry_run_reports_without_deleting() {
+        let root = test_store_dir("cleanup-dry-run");
+        let store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let orphan_chunk_payload = b"orphan-chunk";
+        let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
+        let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash);
+        fs::create_dir_all(orphan_chunk_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&orphan_chunk_path, orphan_chunk_payload)
+            .await
+            .unwrap();
+
+        let orphan_manifest = ObjectManifest {
+            key: "orphan-key".to_string(),
+            total_size_bytes: orphan_chunk_payload.len(),
+            created_at_unix: 0,
+            chunks: vec![ChunkRef {
+                hash: orphan_chunk_hash.clone(),
+                size_bytes: orphan_chunk_payload.len(),
+            }],
+        };
+        let orphan_manifest_bytes = serde_json::to_vec_pretty(&orphan_manifest).unwrap();
+        let orphan_manifest_hash = hash_hex(&orphan_manifest_bytes);
+        let orphan_manifest_path = store
+            .manifests_dir
+            .join(format!("{orphan_manifest_hash}.json"));
+        fs::write(&orphan_manifest_path, orphan_manifest_bytes)
+            .await
+            .unwrap();
+
+        let report = store.cleanup_unreferenced(0, true).await.unwrap();
+        assert_eq!(report.deleted_manifests, 0);
+        assert_eq!(report.deleted_chunks, 0);
+        assert!(report.protected_manifests == 0);
+        assert!(fs::try_exists(&orphan_manifest_path).await.unwrap());
+        assert!(fs::try_exists(&orphan_chunk_path).await.unwrap());
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk() {
+        let root = test_store_dir("cleanup-delete");
+        let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+        store
+            .put_object_versioned(
+                "live",
+                Bytes::from_static(b"live-data"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let orphan_chunk_payload = b"orphan-chunk-delete";
+        let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
+        let orphan_chunk_path = chunk_path_for_hash(&store.chunks_dir, &orphan_chunk_hash);
+        fs::create_dir_all(orphan_chunk_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&orphan_chunk_path, orphan_chunk_payload)
+            .await
+            .unwrap();
+
+        let orphan_manifest = ObjectManifest {
+            key: "orphan-key-delete".to_string(),
+            total_size_bytes: orphan_chunk_payload.len(),
+            created_at_unix: 0,
+            chunks: vec![ChunkRef {
+                hash: orphan_chunk_hash.clone(),
+                size_bytes: orphan_chunk_payload.len(),
+            }],
+        };
+        let orphan_manifest_bytes = serde_json::to_vec_pretty(&orphan_manifest).unwrap();
+        let orphan_manifest_hash = hash_hex(&orphan_manifest_bytes);
+        let orphan_manifest_path = store
+            .manifests_dir
+            .join(format!("{orphan_manifest_hash}.json"));
+        fs::write(&orphan_manifest_path, orphan_manifest_bytes)
+            .await
+            .unwrap();
+
+        let report = store.cleanup_unreferenced(0, false).await.unwrap();
+        assert!(report.deleted_manifests >= 1);
+        assert!(report.deleted_chunks >= 1);
+        assert!(!fs::try_exists(&orphan_manifest_path).await.unwrap());
+        assert!(!fs::try_exists(&orphan_chunk_path).await.unwrap());
+
+        let live = store
+            .get_object("live", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap();
+        assert_eq!(live.as_ref(), b"live-data");
+
+        let _ = fs::remove_dir_all(root).await;
     }
 }
