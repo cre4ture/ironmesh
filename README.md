@@ -42,6 +42,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 This prevents pushes that would fail the CI rustfmt check.
 
+## Coverage gate
+
+CI enforces a minimum line coverage floor using `cargo-llvm-cov`:
+
+```bash
+cargo llvm-cov --workspace --all-features --summary-only \
+	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/server-node/src/main.rs|crates/common/src/lib.rs' \
+	--fail-under-lines 33
+```
+
+Notes:
+
+- The excluded files are shell/bootstrap entrypoints and wrapper crates that currently have no direct tests.
+- The threshold is intentionally conservative for now and can be raised as targeted tests are added.
+
 ## Notes for mobile integration
 
 `android-app` and `ios-app` are Rust-first shells designed to expose the storage SDK and web GUI string payload to native layers. Typical production integration uses:
