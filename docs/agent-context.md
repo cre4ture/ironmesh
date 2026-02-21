@@ -48,6 +48,21 @@ Validation added:
 
 - System test `autonomous_replication_after_put_populates_peer_without_manual_repair`
 
+### 4) Low-churn replication planning
+
+Problem:
+
+- Strict desired-vs-current set diff could suggest 3 transfers after a write on non-desired node (RF=3 with 4 nodes), producing temporary overreplication.
+
+Implemented:
+
+- Planner now preserves current replicas while under target and only backfills enough nodes to reach target count.
+- Extra replicas are only flagged when current replica count is above target count.
+
+Validation added:
+
+- Unit test `replication_plan_limits_backfill_when_current_replica_not_in_desired_set`
+
 ## Key Files Touched Recently
 
 - `apps/server-node/src/main.rs`

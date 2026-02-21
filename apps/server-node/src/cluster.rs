@@ -251,21 +251,33 @@ impl ClusterService {
         for key in keys {
             let desired_nodes = select_nodes_by_rendezvous(key, &self.nodes, &self.policy);
             let desired_set: HashSet<_> = desired_nodes.iter().copied().collect();
+            let target_replica_count = desired_nodes.len();
 
             let current_set = self.replicas_by_key.get(key).cloned().unwrap_or_default();
             let mut current_nodes: Vec<_> = current_set.iter().copied().collect();
             current_nodes.sort();
 
-            let mut missing_nodes: Vec<_> = desired_set.difference(&current_set).copied().collect();
-            missing_nodes.sort();
+            let needed_replicas = target_replica_count.saturating_sub(current_set.len());
+            let missing_nodes: Vec<_> = desired_nodes
+                .iter()
+                .copied()
+                .filter(|node_id| !current_set.contains(node_id))
+                .take(needed_replicas)
+                .collect();
 
-            let mut extra_nodes: Vec<_> = current_set.difference(&desired_set).copied().collect();
-            extra_nodes.sort_by_key(|node_id| {
-                self.nodes
-                    .get(node_id)
-                    .map(|node| node.free_bytes)
-                    .unwrap_or(0)
-            });
+            let extra_nodes = if current_set.len() > target_replica_count {
+                let mut extra_nodes: Vec<_> =
+                    current_set.difference(&desired_set).copied().collect();
+                extra_nodes.sort_by_key(|node_id| {
+                    self.nodes
+                        .get(node_id)
+                        .map(|node| node.free_bytes)
+                        .unwrap_or(0)
+                });
+                extra_nodes
+            } else {
+                Vec::new()
+            };
 
             if !missing_nodes.is_empty() || !extra_nodes.is_empty() {
                 items.push(ReplicationPlanItem {
@@ -595,6 +607,53 @@ mod tests {
                 "desired nodes must include at least the local online node"
             );
         }
+    }
+
+    #[test]
+    fn replication_plan_limits_backfill_when_current_replica_not_in_desired_set() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 3,
+                ..ReplicationPolicy::default()
+            },
+            0,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+        let node_d = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+        svc.register_node(mk_node(node_d, "dc-d", "rack-4", 600));
+
+        let mut selected_key = None;
+        for idx in 0..10_000 {
+            let candidate = format!("hello@ver-{idx}");
+            let placement = svc.placement_for_key(&candidate);
+            if placement.selected_nodes.len() == 3 && !placement.selected_nodes.contains(&node_a) {
+                selected_key = Some(candidate);
+                break;
+            }
+        }
+
+        let key = selected_key.expect("failed to find key where desired set excludes node_a");
+        svc.note_replica(&key, node_a);
+
+        let plan = svc.replication_plan(std::slice::from_ref(&key));
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.key == key)
+            .expect("expected replication plan item for key");
+
+        assert_eq!(item.current_nodes, vec![node_a]);
+        assert_eq!(item.missing_nodes.len(), 2);
+        assert!(item.extra_nodes.is_empty());
     }
 
     #[test]
