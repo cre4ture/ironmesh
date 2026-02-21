@@ -14,10 +14,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Run system tests
-        run: cargo test -p system-tests
+        run: cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml

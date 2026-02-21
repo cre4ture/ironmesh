@@ -6,9 +6,10 @@ members = [
     "apps/cli-client",
     "apps/web-ui",
     "apps/android-app",
-    "apps/ios-app", "tests/system-tests",
+    "apps/ios-app",
 ]
 resolver = "2"
+exclude = ["tests/system-tests"]
 
 [workspace.package]
 version = "0.1.0"

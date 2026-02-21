@@ -1,17 +1,17 @@
 [package]
 name = "system-tests"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["ironmesh contributors"]
 
 [dependencies]
-anyhow.workspace = true
-bytes.workspace = true
+anyhow = "1"
+bytes = "1"
 client-sdk = { path = "../../crates/client-sdk" }
-reqwest.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 server_node = { path = "../../apps/server-node", package = "server-node", artifact = "bin" }
