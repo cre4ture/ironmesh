@@ -96,8 +96,19 @@ Client node pool should:
 
 - Actual inter-node replication transfer execution.
 - Persistent replica index across restarts.
-- Cleanup execution logic and scheduler.
+- Cleanup scheduling/automation policy tuning.
 - Client-side multi-node adaptive routing implementation.
+
+## Current implementation status (phased)
+
+- **Phase A:** Completed — version DAG metadata primitives (`provisional`/`confirmed`, parent links, version listing).
+- **Phase B:** Completed — metadata commit endpoint and quorum-gated commit mode.
+- **Phase C:** Completed — provisional rejoin reconciliation with branch-preserving import.
+- **Phase D:** Completed — deterministic preferred-head reads and explicit read modes.
+- **Phase E.1:** Completed — replication auditing now includes version-head subjects (`key@version`).
+- **Phase E.2:** Completed — retention-safe orphan cleanup endpoint with reachability guardrails.
+- **Phase E.3:** Completed — reconciliation idempotency via persisted replay markers.
+- **Next:** Phase E.4 documentation/UI stabilization and then executor-side replication transfer.
 
 ## Decision log
 
@@ -235,9 +246,10 @@ Options:
 Recommended default:
 
 - Support explicit read mode:
-	- `confirmed` (stable/default for sync clients)
-	- `latest_visible` (may include provisional)
-	- `version_id` (exact historical read)
+	- `preferred` (deterministic preferred head; default)
+	- `confirmed_only` (latest confirmed head only)
+	- `provisional_allowed` (latest head, including provisional)
+- Keep exact historical reads via `version=<version_id>` query selector.
 
 ### Decision 8: Membership authority
 

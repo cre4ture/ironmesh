@@ -58,3 +58,37 @@ Those bridges can be added incrementally without changing the workspace topology
 ## Multi-node strategy
 
 - Multi-node requirements, replication strategy, and rollout plan are documented in [docs/multi-node-strategy.md](docs/multi-node-strategy.md).
+
+## API semantics (current)
+
+### Versioning and commit
+
+- Writes support `confirmed` and `provisional` version states via `PUT /store/{key}?state=...`.
+- Version metadata is available via `GET /versions/{key}`.
+- Version commit endpoints:
+	- `POST /versions/{key}/commit/{version_id}`
+	- `POST /versions/{key}/confirm/{version_id}` (compatibility alias)
+- Metadata commit mode is configurable with `IRONMESH_METADATA_COMMIT_MODE`:
+	- `local` (default): commit allowed locally.
+	- `quorum`: commit requires cluster majority online.
+
+### Read modes
+
+- `GET /store/{key}` defaults to `read_mode=preferred`.
+- Explicit read modes:
+	- `read_mode=preferred` — deterministic preferred branch head.
+	- `read_mode=confirmed_only` — latest **confirmed head** only.
+	- `read_mode=provisional_allowed` — latest head regardless of state.
+- Additional selectors:
+	- `version=<version_id>` for exact historical reads.
+	- `snapshot=<snapshot_id>` for snapshot time-travel reads.
+
+### Reconciliation and maintenance
+
+- Rejoin reconciliation endpoints:
+	- `GET /cluster/reconcile/export/provisional`
+	- `POST /cluster/reconcile/{node_id}`
+- Reconciliation is idempotent: repeated imports from the same source key/version are skipped via persisted replay markers.
+- Maintenance cleanup endpoint:
+	- `POST /maintenance/cleanup?retention_secs=<n>&dry_run=true|false`
+	- Cleanup only removes unreferenced manifests/chunks after retention checks.
