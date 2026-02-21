@@ -1897,10 +1897,12 @@ async fn replicate_bundle_to_target(
     Ok(report.version_id)
 }
 
-fn build_internal_replication_put_url(target_base_url: &str, key: &str, state_query: &str) -> String {
-    format!(
-        "{target_base_url}/store/{key}?state={state_query}&internal_replication=true"
-    )
+fn build_internal_replication_put_url(
+    target_base_url: &str,
+    key: &str,
+    state_query: &str,
+) -> String {
+    format!("{target_base_url}/store/{key}?state={state_query}&internal_replication=true")
 }
 
 async fn persist_repair_state(state: &ServerState) -> Result<()> {
@@ -2111,8 +2113,8 @@ mod tests {
         MetadataCommitMode, RepairConfig, RepairExecutorState, ServerState,
         build_internal_replication_put_url, build_store_index_entries, cluster, constant_time_eq,
         expected_internal_token_for_node, internal_node_header_valid, internal_token_matches,
-        jittered_backoff_secs, parse_internal_node_tokens,
-        run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
+        jittered_backoff_secs, parse_internal_node_tokens, run_startup_replication_repair_once,
+        should_trigger_autonomous_post_write_replication,
     };
     use common::NodeId;
     use std::path::PathBuf;
@@ -2231,14 +2233,21 @@ mod tests {
 
     #[test]
     fn autonomous_post_write_replication_trigger_guard_blocks_internal_writes() {
-        assert!(should_trigger_autonomous_post_write_replication(true, false));
-        assert!(!should_trigger_autonomous_post_write_replication(true, true));
-        assert!(!should_trigger_autonomous_post_write_replication(false, false));
+        assert!(should_trigger_autonomous_post_write_replication(
+            true, false
+        ));
+        assert!(!should_trigger_autonomous_post_write_replication(
+            true, true
+        ));
+        assert!(!should_trigger_autonomous_post_write_replication(
+            false, false
+        ));
     }
 
     #[test]
     fn internal_replication_put_url_sets_internal_flag() {
-        let url = build_internal_replication_put_url("http://127.0.0.1:18080", "hello", "confirmed");
+        let url =
+            build_internal_replication_put_url("http://127.0.0.1:18080", "hello", "confirmed");
         assert!(url.contains("/store/hello?"));
         assert!(url.contains("state=confirmed"));
         assert!(url.contains("internal_replication=true"));
