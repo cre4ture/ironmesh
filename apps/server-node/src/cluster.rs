@@ -99,6 +99,19 @@ impl ClusterService {
         self.nodes.insert(descriptor.node_id, descriptor);
     }
 
+    pub fn remove_node(&mut self, node_id: NodeId) -> bool {
+        if self.nodes.remove(&node_id).is_none() {
+            return false;
+        }
+
+        self.replicas_by_key.retain(|_, replicas| {
+            replicas.remove(&node_id);
+            !replicas.is_empty()
+        });
+
+        true
+    }
+
     pub fn touch_heartbeat(
         &mut self,
         node_id: NodeId,
@@ -530,5 +543,33 @@ mod tests {
         let nodes = exported.get("subject-a").unwrap();
         assert!(nodes.contains(&node_a));
         assert!(nodes.contains(&node_b));
+    }
+
+    #[test]
+    fn remove_node_cleans_membership_and_replica_references() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+
+        svc.note_replica("subject-a", node_a);
+        svc.note_replica("subject-a", node_b);
+        svc.note_replica("subject-b", node_a);
+
+        assert!(svc.remove_node(node_a));
+        assert!(!svc.nodes.contains_key(&node_a));
+
+        let exported = svc.export_replicas_by_key();
+        assert_eq!(exported.get("subject-a").map(Vec::len), Some(1));
+        assert_eq!(exported.get("subject-b"), None);
+        assert!(
+            exported
+                .get("subject-a")
+                .map(|nodes| nodes.contains(&node_b))
+                .unwrap_or(false)
+        );
     }
 }

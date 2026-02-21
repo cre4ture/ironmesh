@@ -277,7 +277,10 @@ async fn main() -> Result<()> {
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
-        .route("/cluster/nodes/{node_id}", put(register_node))
+        .route(
+            "/cluster/nodes/{node_id}",
+            put(register_node).delete(remove_node),
+        )
         .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route(
@@ -450,6 +453,7 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
       <li><code>GET /cluster/status</code> — cluster summary</li>
       <li><code>GET /cluster/nodes</code> — known node list</li>
       <li><code>PUT /cluster/nodes/{{node_id}}</code> — register/update node metadata</li>
+    <li><code>DELETE /cluster/nodes/{{node_id}}</code> — remove node from cluster membership</li>
       <li><code>POST /cluster/nodes/{{node_id}}/heartbeat</code> — refresh node liveness</li>
       <li><code>GET /cluster/placement/{{key}}</code> — deterministic placement decision</li>
       <li><code>GET /cluster/replication/plan</code> — current replication gaps/overages</li>
@@ -723,6 +727,54 @@ async fn register_node(
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     });
+
+    StatusCode::NO_CONTENT
+}
+
+async fn remove_node(
+    State(state): State<ServerState>,
+    Path(node_id): Path<String>,
+) -> impl IntoResponse {
+    let node_id = match node_id.parse::<NodeId>() {
+        Ok(id) => id,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+
+    if node_id == state.node_id {
+        return StatusCode::CONFLICT;
+    }
+
+    let removed = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.remove_node(node_id)
+    };
+
+    if !removed {
+        return StatusCode::NOT_FOUND;
+    }
+
+    {
+        let mut tokens = state.internal_node_tokens.lock().await;
+        tokens.remove(&node_id);
+    }
+
+    if let Err(err) = persist_cluster_replicas_state(&state).await {
+        warn!(
+            error = %err,
+            node_id = %node_id,
+            "failed to persist cluster replicas after node removal"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    if let Err(err) = persist_internal_node_tokens_state(&state).await {
+        warn!(
+            error = %err,
+            node_id = %node_id,
+            "failed to persist internal tokens after node removal"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
 
     StatusCode::NO_CONTENT
 }

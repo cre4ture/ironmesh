@@ -650,6 +650,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_node_decommission_removes_member_and_validates_errors() -> Result<()> {
+        let bind = "127.0.0.1:19093";
+        let local_node_id = "00000000-0000-0000-0000-0000000000d1";
+        let remove_node_id = "00000000-0000-0000-0000-0000000000e2";
+
+        let data_dir = fresh_data_dir("node-decommission");
+        let mut server = start_server_with_config(bind, &data_dir, local_node_id, 2).await?;
+
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(
+                &http,
+                &base_url,
+                remove_node_id,
+                "http://127.0.0.1:29093",
+                "dc-x",
+                "rack-x",
+            )
+            .await?;
+
+            let before_nodes: serde_json::Value = http
+                .get(format!("{base_url}/cluster/nodes"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let before_len = before_nodes
+                .as_array()
+                .map(Vec::len)
+                .context("cluster nodes response is not an array")?;
+            assert!(before_len >= 2);
+
+            let remove_response = http
+                .delete(format!("{base_url}/cluster/nodes/{remove_node_id}"))
+                .send()
+                .await?;
+            assert_eq!(remove_response.status(), StatusCode::NO_CONTENT);
+
+            let after_nodes: serde_json::Value = http
+                .get(format!("{base_url}/cluster/nodes"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let after_array = after_nodes
+                .as_array()
+                .context("cluster nodes response is not an array")?;
+            assert_eq!(after_array.len() + 1, before_len);
+
+            let removed_absent = after_array.iter().all(|entry| {
+                entry
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .map(|id| id != remove_node_id)
+                    .unwrap_or(true)
+            });
+            assert!(removed_absent, "decommissioned node should be absent");
+
+            let not_found = http
+                .delete(format!("{base_url}/cluster/nodes/{remove_node_id}"))
+                .send()
+                .await?;
+            assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+
+            let local_conflict = http
+                .delete(format!("{base_url}/cluster/nodes/{local_node_id}"))
+                .send()
+                .await?;
+            assert_eq!(local_conflict.status(), StatusCode::CONFLICT);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
     async fn manual_replication_repair_reduces_missing_plan_items() -> Result<()> {
         let bind_a = "127.0.0.1:19105";
         let bind_b = "127.0.0.1:19106";

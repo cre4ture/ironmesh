@@ -100,6 +100,11 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Reconciliation and maintenance
 
+- Cluster node membership endpoints:
+	- `GET /cluster/nodes`
+	- `PUT /cluster/nodes/{node_id}`
+	- `DELETE /cluster/nodes/{node_id}` (rejects local node id)
+
 - Rejoin reconciliation endpoints:
 	- `GET /cluster/reconcile/export/provisional`
 	- `POST /cluster/reconcile/{node_id}`
