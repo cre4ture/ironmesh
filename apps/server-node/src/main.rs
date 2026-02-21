@@ -198,12 +198,11 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
 
     let repair_config = RepairConfig::from_env();
-    let autonomous_replication_on_put_enabled = std::env::var(
-        "IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED",
-    )
-    .ok()
-    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-    .unwrap_or(true);
+    let autonomous_replication_on_put_enabled =
+        std::env::var("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
     let peer_heartbeat_config = PeerHeartbeatConfig::from_env();
 
     let policy = ReplicationPolicy {
