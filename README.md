@@ -20,6 +20,22 @@ cargo run -p server-node
 cargo run -p cli-client -- --help
 ```
 
+## Local git hooks (recommended)
+
+Enable repository-managed hooks once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The `pre-push` hook runs:
+
+```bash
+cargo fmt --all -- --check
+```
+
+This prevents pushes that would fail the CI rustfmt check.
+
 ## Notes for mobile integration
 
 `android-app` and `ios-app` are Rust-first shells designed to expose the storage SDK and web GUI string payload to native layers. Typical production integration uses:
