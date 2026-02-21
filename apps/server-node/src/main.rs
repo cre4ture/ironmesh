@@ -347,6 +347,11 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(3600);
 
+    let replica_view_sync_interval_secs = std::env::var("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5);
+
     let replication_factor = std::env::var("IRONMESH_REPLICATION_FACTOR")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -475,6 +480,7 @@ async fn main() -> Result<()> {
     }
 
     spawn_replication_auditor(state.clone(), audit_interval_secs);
+    spawn_replica_view_synchronizer(state.clone(), replica_view_sync_interval_secs);
     if state.repair_config.startup_repair_enabled {
         spawn_startup_replication_repair(
             state.clone(),
@@ -519,6 +525,10 @@ async fn main() -> Result<()> {
             delete(revoke_internal_node_token),
         )
         .route("/cluster/replication/plan", get(replication_plan))
+        .route(
+            "/cluster/replication/subjects/local",
+            get(local_replication_subjects),
+        )
         .route(
             "/cluster/replication/audit",
             post(trigger_replication_audit),
@@ -598,6 +608,106 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
                     skipped_backoff = report.skipped_backoff,
                     skipped_max_retries = report.skipped_max_retries,
                     "replication repair executor run"
+                );
+            }
+        }
+    });
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalReplicationSubjectsResponse {
+    node_id: NodeId,
+    subject_count: usize,
+    generated_at_unix: u64,
+    subjects: Vec<String>,
+}
+
+fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+
+        loop {
+            ticker.tick().await;
+
+            let local_subjects = {
+                let store = state.store.lock().await;
+                store
+                    .list_replication_subjects()
+                    .await
+                    .unwrap_or_else(|_| store.current_keys())
+            };
+
+            let mut changed = {
+                let mut cluster = state.cluster.lock().await;
+                cluster.replace_node_replica_view(state.node_id, &local_subjects)
+            };
+
+            let peers = {
+                let mut cluster = state.cluster.lock().await;
+                cluster.update_health_and_detect_offline_transition();
+                cluster
+                    .list_nodes()
+                    .into_iter()
+                    .filter(|node| {
+                        node.node_id != state.node_id && node.status == cluster::NodeStatus::Online
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let internal_token = internal_outbound_token(&state).await;
+
+            for peer in peers {
+                let base = peer.public_url.trim_end_matches('/');
+                let url = format!("{base}/cluster/replication/subjects/local");
+
+                let mut request = http.get(url);
+                if let Some(token) = &internal_token {
+                    request = request.header("x-ironmesh-internal-token", token);
+                    request = request.header("x-ironmesh-node-id", state.node_id.to_string());
+                }
+
+                match request.send().await {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<LocalReplicationSubjectsResponse>().await {
+                            Ok(payload) => {
+                                let mut cluster = state.cluster.lock().await;
+                                if cluster
+                                    .replace_node_replica_view(payload.node_id, &payload.subjects)
+                                {
+                                    changed = true;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(
+                                    node_id = %peer.node_id,
+                                    error = %err,
+                                    "failed decoding replica subject sync payload"
+                                );
+                            }
+                        }
+                    }
+                    Ok(response) => {
+                        tracing::debug!(
+                            node_id = %peer.node_id,
+                            status = %response.status(),
+                            "replica subject sync request rejected"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            node_id = %peer.node_id,
+                            error = %err,
+                            "failed replica subject sync request"
+                        );
+                    }
+                }
+            }
+
+            if changed && let Err(err) = persist_cluster_replicas_state(&state).await {
+                warn!(
+                    error = %err,
+                    "failed persisting cluster replicas after replica subject sync"
                 );
             }
         }
@@ -1410,6 +1520,34 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
     );
 
     Json(plan)
+}
+
+async fn local_replication_subjects(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !is_internal_request_authorized(&state, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let subjects = {
+        let store = state.store.lock().await;
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+    };
+
+    (
+        StatusCode::OK,
+        Json(LocalReplicationSubjectsResponse {
+            node_id: state.node_id,
+            subject_count: subjects.len(),
+            generated_at_unix: unix_ts(),
+            subjects,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]

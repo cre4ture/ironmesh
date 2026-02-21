@@ -209,6 +209,43 @@ impl ClusterService {
             .insert(node_id);
     }
 
+    pub fn replace_node_replica_view(&mut self, node_id: NodeId, subjects: &[String]) -> bool {
+        let desired_subjects: HashSet<String> = subjects.iter().cloned().collect();
+        let current_subjects: HashSet<String> = self
+            .replicas_by_key
+            .iter()
+            .filter(|(_, replicas)| replicas.contains(&node_id))
+            .map(|(subject, _)| subject.clone())
+            .collect();
+
+        if current_subjects == desired_subjects {
+            return false;
+        }
+
+        let mut changed = false;
+
+        for replicas in self.replicas_by_key.values_mut() {
+            if replicas.remove(&node_id) {
+                changed = true;
+            }
+        }
+        self.replicas_by_key
+            .retain(|_, replicas| !replicas.is_empty());
+
+        for subject in desired_subjects {
+            if self
+                .replicas_by_key
+                .entry(subject)
+                .or_default()
+                .insert(node_id)
+            {
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
     pub fn import_replicas_by_key(&mut self, replicas: HashMap<String, Vec<NodeId>>) {
         self.replicas_by_key = replicas
             .into_iter()
@@ -627,6 +664,45 @@ mod tests {
         let nodes = exported.get("subject-a").unwrap();
         assert!(nodes.contains(&node_a));
         assert!(nodes.contains(&node_b));
+    }
+
+    #[test]
+    fn replace_node_replica_view_replaces_previous_membership() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+
+        svc.note_replica("subject-a", node_a);
+        svc.note_replica("subject-b", node_a);
+        svc.note_replica("subject-b", node_b);
+
+        let changed = svc.replace_node_replica_view(node_a, &["subject-c".to_string()]);
+        assert!(changed);
+
+        let exported = svc.export_replicas_by_key();
+        assert_eq!(exported.get("subject-a"), None);
+        assert_eq!(
+            exported.get("subject-b").map(Vec::as_slice),
+            Some(&[node_b][..])
+        );
+        assert_eq!(
+            exported.get("subject-c").map(Vec::as_slice),
+            Some(&[node_a][..])
+        );
+    }
+
+    #[test]
+    fn replace_node_replica_view_noop_when_identical() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        svc.note_replica("subject-a", node_a);
+
+        let changed = svc.replace_node_replica_view(node_a, &["subject-a".to_string()]);
+        assert!(!changed);
     }
 
     #[test]
