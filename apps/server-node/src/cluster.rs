@@ -683,4 +683,64 @@ mod tests {
                 .unwrap_or(false)
         );
     }
+
+    #[test]
+    fn replication_plan_handles_divergent_versions_for_same_key() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 3,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+
+        svc.note_replica("hello", node_a);
+        svc.note_replica("hello@ver-a", node_a);
+        svc.note_replica("hello@ver-b", node_b);
+
+        let keys = vec![
+            "hello".to_string(),
+            "hello@ver-a".to_string(),
+            "hello@ver-b".to_string(),
+        ];
+
+        let plan = svc.replication_plan(&keys);
+
+        assert!(
+            !plan.items.is_empty(),
+            "replication plan should remain visible for divergent version subjects"
+        );
+        assert!(
+            plan.under_replicated >= 1,
+            "divergent version subjects should still be considered for missing replicas"
+        );
+
+        let version_items = plan
+            .items
+            .iter()
+            .filter(|item| item.key.starts_with("hello@"))
+            .collect::<Vec<_>>();
+        assert!(
+            !version_items.is_empty(),
+            "expected replication items for per-version subjects"
+        );
+
+        for item in version_items {
+            assert!(
+                !item.missing_nodes.is_empty(),
+                "version subject {} should have missing nodes when only one current holder exists",
+                item.key
+            );
+        }
+    }
 }

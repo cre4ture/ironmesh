@@ -1891,6 +1891,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_replication_subjects_includes_all_heads_for_divergent_versions() {
+        let root = test_store_dir("replication-subjects-divergent-heads");
+        let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let first = store
+            .put_object_versioned(
+                "hello",
+                Bytes::from_static(b"payload-a"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let second = store
+            .put_object_versioned(
+                "hello",
+                Bytes::from_static(b"payload-b"),
+                PutOptions {
+                    parent_version_ids: Vec::new(),
+                    state: VersionConsistencyState::Provisional,
+                    inherit_preferred_parent: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(first.version_id, second.version_id);
+
+        let versions = store.list_versions("hello").await.unwrap().unwrap();
+        assert!(
+            versions.head_version_ids.contains(&first.version_id),
+            "first write should remain a head when second write is parentless"
+        );
+        assert!(
+            versions.head_version_ids.contains(&second.version_id),
+            "second write should be a concurrent head"
+        );
+
+        let subjects = store.list_replication_subjects().await.unwrap();
+
+        assert!(subjects.contains(&"hello".to_string()));
+        assert!(subjects.contains(&format!("hello@{}", first.version_id)));
+        assert!(subjects.contains(&format!("hello@{}", second.version_id)));
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn load_cluster_replicas_returns_empty_when_file_missing() {
         let root = test_store_dir("cluster-replicas-empty");
         let store = PersistentStore::init(root.clone()).await.unwrap();

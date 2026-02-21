@@ -62,6 +62,8 @@ Implemented:
 Validation added:
 
 - Unit test `replication_plan_limits_backfill_when_current_replica_not_in_desired_set`
+- Unit test `replication_plan_handles_divergent_versions_for_same_key`
+- Unit test `list_replication_subjects_includes_all_heads_for_divergent_versions`
 
 ## Key Files Touched Recently
 
