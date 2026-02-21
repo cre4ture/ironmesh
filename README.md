@@ -20,6 +20,27 @@ cargo run -p server-node
 cargo run -p cli-client -- --help
 ```
 
+## Local 4-node cluster (manual testing)
+
+Use the helper script to start/stop a 4-node cluster on one machine with isolated data dirs:
+
+```bash
+scripts/local-cluster.sh start
+scripts/local-cluster.sh status
+scripts/local-cluster.sh stop
+```
+
+Defaults:
+
+- Base port: `18080` (nodes on `18080..18083`)
+- Data + logs + pid files: `data/local-cluster/`
+
+Optional overrides:
+
+- `IRONMESH_LOCAL_CLUSTER_BASE_PORT`
+- `IRONMESH_LOCAL_CLUSTER_DIR`
+- `IRONMESH_SERVER_BIN`
+
 ## Local git hooks (recommended)
 
 Enable repository-managed hooks once per clone:
