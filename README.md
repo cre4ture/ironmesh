@@ -34,6 +34,12 @@ The `pre-push` hook runs:
 cargo fmt --all -- --check
 ```
 
+The `pre-commit` hook runs:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
 This prevents pushes that would fail the CI rustfmt check.
 
 ## Notes for mobile integration
