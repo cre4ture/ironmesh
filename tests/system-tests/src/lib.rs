@@ -765,6 +765,107 @@ mod tests {
         result
     }
 
+    #[tokio::test]
+    async fn maintenance_cleanup_removes_orphans_and_keeps_live_data() -> Result<()> {
+        let bind = "127.0.0.1:19102";
+        let data_dir = fresh_data_dir("maintenance-cleanup");
+        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let base_url = format!("http://{bind}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            client
+                .put(format!("{base_url}/store/live-key"))
+                .body("live-payload")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let orphan_chunk_bytes = b"orphan-chunk-payload";
+            let orphan_chunk_hash =
+                "aa11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff".to_string();
+            let orphan_chunk_dir = data_dir.join("chunks").join(&orphan_chunk_hash[0..2]);
+            fs::create_dir_all(&orphan_chunk_dir)?;
+            fs::write(
+                orphan_chunk_dir.join(&orphan_chunk_hash),
+                orphan_chunk_bytes,
+            )?;
+
+            let orphan_manifest = serde_json::json!({
+                "key": "orphan-key",
+                "total_size_bytes": orphan_chunk_bytes.len(),
+                "created_at_unix": 0,
+                "chunks": [
+                    {
+                        "hash": orphan_chunk_hash,
+                        "size_bytes": orphan_chunk_bytes.len()
+                    }
+                ]
+            });
+
+            let orphan_manifest_bytes = serde_json::to_vec_pretty(&orphan_manifest)?;
+            let orphan_manifest_hash =
+                "bb11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff".to_string();
+            fs::write(
+                data_dir
+                    .join("manifests")
+                    .join(format!("{orphan_manifest_hash}.json")),
+                orphan_manifest_bytes,
+            )?;
+
+            let cleanup_response = client
+                .post(format!(
+                    "{base_url}/maintenance/cleanup?retention_secs=0&dry_run=false"
+                ))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let cleanup_report: serde_json::Value = cleanup_response.json().await?;
+            assert!(
+                cleanup_report
+                    .get("deleted_manifests")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    >= 1,
+                "expected at least one orphan manifest to be deleted"
+            );
+            assert!(
+                cleanup_report
+                    .get("deleted_chunks")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    >= 1,
+                "expected at least one orphan chunk to be deleted"
+            );
+
+            let live_payload = client
+                .get(format!("{base_url}/store/live-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert_eq!(live_payload, "live-payload");
+
+            let orphan_manifest_still_exists = data_dir
+                .join("manifests")
+                .join(format!("{orphan_manifest_hash}.json"))
+                .exists();
+            assert!(
+                !orphan_manifest_still_exists,
+                "orphan manifest should be removed"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
     async fn start_server(bind: &str) -> Result<Child> {
         let data_dir = fresh_data_dir("default-server");
         start_server_with_data_dir(bind, &data_dir).await

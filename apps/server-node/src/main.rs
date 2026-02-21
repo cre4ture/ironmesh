@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
             get(export_provisional_versions),
         )
         .route("/cluster/reconcile/{node_id}", post(reconcile_from_node))
+        .route("/maintenance/cleanup", post(run_cleanup))
         .with_state(state);
 
     info!(%bind_addr, %node_id, "server node listening");
@@ -282,6 +283,7 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
       <li><code>POST /cluster/replication/audit</code> — manual audit trigger</li>
         <li><code>GET /cluster/reconcile/export/provisional</code> — export local provisional metadata for rejoin sync</li>
         <li><code>POST /cluster/reconcile/{{node_id}}</code> — import provisional commits from a peer node</li>
+            <li><code>POST /maintenance/cleanup?retention_secs=&lt;n&gt;&amp;dry_run=true|false</code> — retention-safe orphan cleanup for manifests/chunks</li>
     </ul>
   </main>
 </body>
@@ -486,6 +488,12 @@ struct NodeHeartbeatRequest {
     labels: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CleanupQuery {
+    retention_secs: Option<u64>,
+    dry_run: Option<bool>,
+}
+
 async fn cluster_status(State(state): State<ServerState>) -> Json<cluster::ClusterSummary> {
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
@@ -589,6 +597,23 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
     );
 
     Json(plan)
+}
+
+async fn run_cleanup(
+    State(state): State<ServerState>,
+    Query(query): Query<CleanupQuery>,
+) -> impl IntoResponse {
+    let retention_secs = query.retention_secs.unwrap_or(60 * 60 * 24);
+    let dry_run = query.dry_run.unwrap_or(true);
+
+    let store = state.store.lock().await;
+    match store.cleanup_unreferenced(retention_secs, dry_run).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "maintenance cleanup failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

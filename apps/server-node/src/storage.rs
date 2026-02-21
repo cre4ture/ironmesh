@@ -100,6 +100,18 @@ pub struct SnapshotInfo {
     pub object_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupReport {
+    pub retention_secs: u64,
+    pub dry_run: bool,
+    pub protected_manifests: usize,
+    pub protected_chunks: usize,
+    pub skipped_recent_manifests: usize,
+    pub skipped_recent_chunks: usize,
+    pub deleted_manifests: usize,
+    pub deleted_chunks: usize,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -590,6 +602,97 @@ impl PersistentStore {
         Ok(snapshots)
     }
 
+    pub async fn cleanup_unreferenced(
+        &self,
+        retention_secs: u64,
+        dry_run: bool,
+    ) -> Result<CleanupReport> {
+        let now = unix_ts();
+        let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
+        let all_manifests = self.load_all_manifests().await?;
+
+        let mut retained_manifests = referenced_manifests.clone();
+        let mut skipped_recent_manifests = 0usize;
+        let mut deleted_manifests = 0usize;
+
+        for (manifest_hash, manifest) in &all_manifests {
+            if referenced_manifests.contains(manifest_hash) {
+                continue;
+            }
+
+            let age_secs = now.saturating_sub(manifest.created_at_unix);
+            if age_secs < retention_secs {
+                retained_manifests.insert(manifest_hash.clone());
+                skipped_recent_manifests += 1;
+                continue;
+            }
+
+            if dry_run {
+                continue;
+            }
+
+            let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+            if fs::try_exists(&manifest_path).await? {
+                fs::remove_file(&manifest_path).await?;
+                deleted_manifests += 1;
+            }
+        }
+
+        let mut protected_chunks = HashSet::<String>::new();
+        for manifest_hash in &retained_manifests {
+            if let Some(manifest) = all_manifests.get(manifest_hash) {
+                for chunk in &manifest.chunks {
+                    protected_chunks.insert(chunk.hash.clone());
+                }
+            }
+        }
+
+        let mut skipped_recent_chunks = 0usize;
+        let mut deleted_chunks = 0usize;
+
+        let chunk_files = self.collect_chunk_file_paths().await?;
+        for chunk_path in chunk_files {
+            let chunk_hash = match chunk_path.file_name().and_then(|n| n.to_str()) {
+                Some(hash) => hash.to_string(),
+                None => continue,
+            };
+
+            if protected_chunks.contains(&chunk_hash) {
+                continue;
+            }
+
+            let metadata = fs::metadata(&chunk_path).await?;
+            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+            let age_secs = modified
+                .duration_since(UNIX_EPOCH)
+                .map(|d| now.saturating_sub(d.as_secs()))
+                .unwrap_or(0);
+
+            if age_secs < retention_secs {
+                skipped_recent_chunks += 1;
+                continue;
+            }
+
+            if dry_run {
+                continue;
+            }
+
+            fs::remove_file(&chunk_path).await?;
+            deleted_chunks += 1;
+        }
+
+        Ok(CleanupReport {
+            retention_secs,
+            dry_run,
+            protected_manifests: referenced_manifests.len(),
+            protected_chunks: protected_chunks.len(),
+            skipped_recent_manifests,
+            skipped_recent_chunks,
+            deleted_manifests,
+            deleted_chunks,
+        })
+    }
+
     async fn load_version_index(&self, key: &str) -> Result<Option<FileVersionIndex>> {
         let path = self.version_index_path(key);
 
@@ -673,6 +776,95 @@ impl PersistentStore {
             .with_context(|| format!("invalid snapshot manifest {}", path.display()))?;
 
         Ok(Some(snapshot))
+    }
+
+    async fn collect_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
+        let mut referenced = HashSet::<String>::new();
+
+        for manifest_hash in self.current_state.objects.values() {
+            referenced.insert(manifest_hash.clone());
+        }
+
+        let mut snapshot_entries = fs::read_dir(&self.snapshots_dir).await?;
+        while let Some(entry) = snapshot_entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = fs::read(&path).await?;
+            let snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                .with_context(|| format!("invalid snapshot manifest {}", path.display()))?;
+
+            for manifest_hash in snapshot.objects.values() {
+                referenced.insert(manifest_hash.clone());
+            }
+        }
+
+        let mut version_entries = fs::read_dir(&self.versions_dir).await?;
+        while let Some(entry) = version_entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = fs::read(&path).await?;
+            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
+                .with_context(|| format!("invalid version index {}", path.display()))?;
+
+            for version in index.versions.values() {
+                referenced.insert(version.manifest_hash.clone());
+            }
+        }
+
+        Ok(referenced)
+    }
+
+    async fn load_all_manifests(&self) -> Result<HashMap<String, ObjectManifest>> {
+        let mut manifests = HashMap::<String, ObjectManifest>::new();
+        let mut entries = fs::read_dir(&self.manifests_dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+
+            let payload = fs::read(&path).await?;
+            let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+                .with_context(|| format!("invalid manifest {}", path.display()))?;
+            manifests.insert(file_stem.to_string(), manifest);
+        }
+
+        Ok(manifests)
+    }
+
+    async fn collect_chunk_file_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut files = Vec::<PathBuf>::new();
+        let mut dirs = vec![self.chunks_dir.clone()];
+
+        while let Some(dir) = dirs.pop() {
+            let mut entries = match fs::read_dir(&dir).await {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let ftype = entry.file_type().await?;
+                if ftype.is_dir() {
+                    dirs.push(path);
+                } else if ftype.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+
+        Ok(files)
     }
 
     fn version_index_path(&self, key: &str) -> PathBuf {
