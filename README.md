@@ -20,6 +20,23 @@ cargo run -p server-node
 cargo run -p cli-client -- --help
 ```
 
+## Justfile commands
+
+Common workflows are available via `just`:
+
+```bash
+just check-stable
+just clippy-stable
+just test-stable
+just test-system-nightly
+```
+
+Single system-test targeting:
+
+```bash
+just test-system-nightly-one tests::autonomous_peer_heartbeat_recovers_after_peer_restart
+```
+
 ## System-tests toolchain policy (nightly)
 
 `tests/system-tests` uses Cargo binary artifact dependencies to consume `server-node` and `cli-client` binaries directly during test runs.
