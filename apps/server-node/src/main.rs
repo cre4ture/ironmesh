@@ -12,10 +12,10 @@ use anyhow::{Context, Result};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use common::{HealthStatus, NodeId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -27,12 +27,14 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 mod cluster;
+mod replication;
 mod storage;
+mod ui;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
     ObjectReadMode, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    ReplicationExportBundle, SnapshotInfo, StoreReadError, VersionConsistencyState,
+    StoreReadError, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -484,8 +486,8 @@ async fn main() -> Result<()> {
     }
 
     let app = Router::new()
-        .route("/", get(index))
-        .route("/logs", get(list_logs))
+        .route("/", get(ui::index))
+        .route("/logs", get(ui::list_logs))
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
@@ -523,7 +525,7 @@ async fn main() -> Result<()> {
         )
         .route(
             "/cluster/replication/repair",
-            post(execute_replication_repair),
+            post(replication::execute_replication_repair),
         )
         .route(
             "/cluster/replication/cleanup",
@@ -587,7 +589,7 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
             }
 
             if state.repair_config.enabled && !plan.items.is_empty() {
-                let report = execute_replication_repair_inner(&state, None).await;
+                let report = replication::execute_replication_repair_inner(&state, None).await;
                 info!(
                     attempted = report.attempted_transfers,
                     success = report.successful_transfers,
@@ -674,7 +676,7 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
 async fn run_startup_replication_repair_once(
     state: &ServerState,
     delay_secs: u64,
-) -> Option<(ReplicationPlan, ReplicationRepairReport)> {
+) -> Option<(ReplicationPlan, replication::ReplicationRepairReport)> {
     if delay_secs > 0 {
         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
     }
@@ -697,7 +699,7 @@ async fn run_startup_replication_repair_once(
         return None;
     }
 
-    let report = execute_replication_repair_inner(state, None).await;
+    let report = replication::execute_replication_repair_inner(state, None).await;
     Some((plan, report))
 }
 
@@ -768,214 +770,6 @@ async fn health(State(state): State<ServerState>) -> Json<HealthStatus> {
         role: "server-node".to_string(),
         online: true,
     })
-}
-
-async fn index(State(state): State<ServerState>) -> Html<String> {
-    let (storage_dir, object_count, snapshots) = {
-        let store = state.store.lock().await;
-        let snapshots = store
-            .list_snapshots()
-            .await
-            .unwrap_or_else(|_| Vec::<SnapshotInfo>::new());
-        (
-            store.root_dir().display().to_string(),
-            store.object_count(),
-            snapshots,
-        )
-    };
-
-    let (cluster_total, cluster_online, replication_factor) = {
-        let cluster = state.cluster.lock().await;
-        let summary = cluster.summary();
-        (
-            summary.total_nodes,
-            summary.online_nodes,
-            summary.policy.replication_factor,
-        )
-    };
-
-    let (replication_plan_items, under_replicated, over_replicated) = {
-        let keys = {
-            let store = state.store.lock().await;
-            store
-                .list_replication_subjects()
-                .await
-                .unwrap_or_else(|_| store.current_keys())
-        };
-
-        let mut cluster = state.cluster.lock().await;
-        cluster.update_health_and_detect_offline_transition();
-        let plan = cluster.replication_plan(&keys);
-        (
-            plan.items.len(),
-            plan.under_replicated,
-            plan.over_replicated,
-        )
-    };
-
-    let startup_repair_status = {
-        let status = state.startup_repair_status.lock().await;
-        startup_repair_status_label(*status)
-    };
-
-    let current_inflight_requests = state.inflight_requests.load(Ordering::Relaxed);
-    let repair_busy_throttle_status = if state.repair_config.busy_throttle_enabled {
-        format!(
-            "enabled (threshold={}, wait={}ms)",
-            state.repair_config.busy_inflight_threshold.max(1),
-            state.repair_config.busy_wait_millis.max(10)
-        )
-    } else {
-        "disabled".to_string()
-    };
-
-    let peer_heartbeat_status = if state.peer_heartbeat_config.enabled {
-        format!(
-            "enabled (every {}s)",
-            state.peer_heartbeat_config.interval_secs.max(1)
-        )
-    } else {
-        "disabled".to_string()
-    };
-
-    let latest_snapshot = snapshots
-        .first()
-        .map(|s| s.id.clone())
-        .unwrap_or_else(|| "none".to_string());
-
-    let body = format!(
-        "<!doctype html>
-<html lang=\"en\">
-<head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>ironmesh Server Node</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; margin: 2rem; }}
-    main {{ max-width: 860px; margin: 0 auto; }}
-    code {{ background: #f4f4f4; padding: 0.2rem 0.4rem; border-radius: 0.2rem; }}
-    ul {{ line-height: 1.6; }}
-        #server-logs {{ background: #f4f4f4; padding: 0.75rem; border-radius: 0.2rem; min-height: 12rem; max-height: 24rem; overflow: auto; white-space: pre-wrap; }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>ironmesh Server Node</h1>
-    <p>Node ID: <code>{}</code></p>
-    <p>Stored objects (latest state): <code>{}</code></p>
-    <p>Latest snapshot ID: <code>{}</code></p>
-    <p>Data directory: <code>{}</code></p>
-    <p>Cluster nodes online/total: <code>{}/{}</code></p>
-    <p>Replication factor target: <code>{}</code></p>
-        <h2>Background work</h2>
-        <ul>
-            <li><strong>Autonomous post-write replication</strong>: <code>{}</code></li>
-            <li><strong>Periodic replication audit</strong>: <code>enabled (every {}s)</code></li>
-            <li><strong>Autonomous peer heartbeat emitter</strong>: <code>{}</code></li>
-            <li><strong>Startup one-shot repair</strong>: <code>{}</code> (delay: <code>{}s</code>)</li>
-            <li><strong>Repair busy-throttle</strong>: <code>{}</code>; in-flight requests now=<code>{}</code></li>
-            <li><strong>Current replication backlog</strong>: plan items=<code>{}</code>, under-replicated=<code>{}</code>, over-replicated=<code>{}</code></li>
-        </ul>
-        <h2>Server logs</h2>
-        <p>Recent in-memory log lines from this node.</p>
-        <pre id=\"server-logs\">loading…</pre>
-    <h2>Available routes</h2>
-    <ul>
-      <li><code>GET /</code> — info page</li>
-            <li><code>GET /logs?limit=&lt;n&gt;</code> — latest server log lines</li>
-      <li><code>GET /health</code> — node health JSON</li>
-      <li><code>GET /snapshots</code> — snapshot metadata</li>
-      <li><code>PUT /store/{{key}}</code> — store object bytes</li>
-      <li><code>GET /store/{{key}}</code> — fetch object bytes from latest state</li>
-      <li><code>GET /store/{{key}}?snapshot=&lt;id&gt;</code> — fetch object from snapshot state</li>
-    <li><code>GET /store/{{key}}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
-    <li><code>GET /store/{{key}}?read_mode=preferred|confirmed_only|provisional_allowed</code> — read latest via explicit consistency mode</li>
-    <li><code>GET /versions/{{key}}</code> — list version DAG metadata</li>
-    <li><code>POST /versions/{{key}}/commit/{{version_id}}</code> — commit version (quorum policy aware)</li>
-    <li><code>POST /versions/{{key}}/confirm/{{version_id}}</code> — compatibility alias for commit endpoint</li>
-      <li><code>GET /cluster/status</code> — cluster summary</li>
-      <li><code>GET /cluster/nodes</code> — known node list</li>
-      <li><code>PUT /cluster/nodes/{{node_id}}</code> — register/update node metadata</li>
-    <li><code>DELETE /cluster/nodes/{{node_id}}</code> — remove node from cluster membership</li>
-      <li><code>POST /cluster/nodes/{{node_id}}/heartbeat</code> — refresh node liveness</li>
-      <li><code>GET /cluster/placement/{{key}}</code> — deterministic placement decision</li>
-      <li><code>GET /cluster/replication/plan</code> — current replication gaps/overages</li>
-      <li><code>POST /cluster/replication/audit</code> — manual audit trigger</li>
-    <li><code>POST /cluster/replication/repair</code> — execute one-pass replica repair for missing placements</li>
-        <li><code>GET /cluster/reconcile/export/provisional</code> — export local provisional metadata for rejoin sync</li>
-        <li><code>POST /cluster/reconcile/{{node_id}}</code> — import provisional commits from a peer node</li>
-            <li><code>POST /maintenance/cleanup?retention_secs=&lt;n&gt;&amp;dry_run=true|false</code> — retention-safe orphan cleanup for manifests/chunks</li>
-    </ul>
-  </main>
-    <script>
-        async function refreshServerLogs() {{
-            try {{
-                const response = await fetch('/logs?limit=200', {{ cache: 'no-store' }});
-                if (!response.ok) {{
-                    throw new Error('HTTP ' + response.status);
-                }}
-
-                const payload = await response.json();
-                const logs = Array.isArray(payload.entries) ? payload.entries : [];
-                document.getElementById('server-logs').textContent = logs.join('\\n') || 'no logs yet';
-            }} catch (error) {{
-                document.getElementById('server-logs').textContent = 'failed to load logs: ' + error;
-            }}
-        }}
-
-        refreshServerLogs();
-        setInterval(refreshServerLogs, 2000);
-    </script>
-</body>
-</html>\n",
-        state.node_id,
-        object_count,
-        latest_snapshot,
-        storage_dir,
-        cluster_online,
-        cluster_total,
-        replication_factor,
-        if state.autonomous_replication_on_put_enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        state.replication_audit_interval_secs.max(5),
-        peer_heartbeat_status,
-        startup_repair_status,
-        state.repair_config.startup_repair_delay_secs,
-        repair_busy_throttle_status,
-        current_inflight_requests,
-        replication_plan_items,
-        under_replicated,
-        over_replicated,
-    );
-
-    Html(body)
-}
-
-#[derive(Debug, Deserialize)]
-struct LogsQuery {
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct LogsResponse {
-    entries: Vec<String>,
-}
-
-async fn list_logs(
-    State(state): State<ServerState>,
-    Query(query): Query<LogsQuery>,
-) -> impl IntoResponse {
-    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
-    (
-        StatusCode::OK,
-        Json(LogsResponse {
-            entries: state.log_buffer.recent(limit),
-        }),
-    )
-        .into_response()
 }
 
 async fn list_snapshots(State(state): State<ServerState>) -> impl IntoResponse {
@@ -1079,7 +873,9 @@ async fn put_object(
             ) {
                 let state_for_repair = state.clone();
                 tokio::spawn(async move {
-                    let report = execute_replication_repair_inner(&state_for_repair, None).await;
+                    let report =
+                        replication::execute_replication_repair_inner(&state_for_repair, None)
+                            .await;
                     if report.attempted_transfers > 0 || report.failed_transfers > 0 {
                         info!(
                             attempted = report.attempted_transfers,
@@ -1610,22 +1406,6 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
     Json(plan)
 }
 
-#[derive(Debug, Serialize)]
-struct ReplicationRepairReport {
-    attempted_transfers: usize,
-    successful_transfers: usize,
-    failed_transfers: usize,
-    skipped_items: usize,
-    skipped_backoff: usize,
-    skipped_max_retries: usize,
-    last_error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReplicationRepairQuery {
-    batch_size: Option<usize>,
-}
-
 #[derive(Debug, Deserialize)]
 struct ReplicationCleanupQuery {
     dry_run: Option<bool>,
@@ -1983,254 +1763,6 @@ async fn push_replication_manifest(
     }
 }
 
-async fn execute_replication_repair(
-    State(state): State<ServerState>,
-    Query(query): Query<ReplicationRepairQuery>,
-) -> impl IntoResponse {
-    let batch_override = query.batch_size.filter(|v| *v > 0);
-    let report = execute_replication_repair_inner(&state, batch_override).await;
-
-    (StatusCode::OK, Json(report))
-}
-
-async fn execute_replication_repair_inner(
-    state: &ServerState,
-    batch_size_override: Option<usize>,
-) -> ReplicationRepairReport {
-    let keys = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
-
-    let (plan, nodes) = {
-        let mut cluster = state.cluster.lock().await;
-        cluster.update_health_and_detect_offline_transition();
-        (cluster.replication_plan(&keys), cluster.list_nodes())
-    };
-
-    let node_by_id: HashMap<NodeId, NodeDescriptor> =
-        nodes.into_iter().map(|node| (node.node_id, node)).collect();
-
-    let mut attempted_transfers = 0usize;
-    let mut successful_transfers = 0usize;
-    let mut failed_transfers = 0usize;
-    let mut skipped_items = 0usize;
-    let mut skipped_backoff = 0usize;
-    let mut skipped_max_retries = 0usize;
-    let mut last_error = None;
-    let mut replicas_state_dirty = false;
-    let mut repair_state_dirty = false;
-
-    let max_attempts = state.repair_config.max_retries;
-    let backoff_secs = state.repair_config.backoff_secs;
-    let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
-    let now = unix_ts();
-
-    let http = reqwest::Client::new();
-
-    for item in plan.items {
-        if attempted_transfers >= max_transfers {
-            break;
-        }
-
-        let Some((key, version_id)) = parse_replication_subject(&item.key) else {
-            skipped_items += 1;
-            continue;
-        };
-
-        let bundle = {
-            let store = state.store.lock().await;
-
-            match store
-                .export_replication_bundle(&key, version_id.as_deref(), ObjectReadMode::Preferred)
-                .await
-            {
-                Ok(Some(bundle)) => bundle,
-                _ => {
-                    skipped_items += 1;
-                    continue;
-                }
-            }
-        };
-
-        for target in item.missing_nodes {
-            if attempted_transfers >= max_transfers {
-                break;
-            }
-
-            let Some(node) = node_by_id.get(&target) else {
-                failed_transfers += 1;
-                continue;
-            };
-
-            if target == state.node_id {
-                continue;
-            }
-
-            let transfer_key = format!("{}|{}", item.key, target);
-
-            {
-                let repair_state = state.repair_state.lock().await;
-                if let Some(previous) = repair_state.attempts.get(&transfer_key) {
-                    if previous.attempts > max_attempts {
-                        skipped_max_retries += 1;
-                        continue;
-                    }
-
-                    let elapsed = now.saturating_sub(previous.last_failure_unix);
-                    let required_backoff =
-                        jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
-                    if elapsed < required_backoff {
-                        skipped_backoff += 1;
-                        continue;
-                    }
-                }
-            }
-
-            await_repair_busy_threshold(state).await;
-
-            attempted_transfers += 1;
-            let transfer_result = replicate_bundle_to_target(
-                &http,
-                &node.public_url,
-                &bundle,
-                &state.store,
-                internal_outbound_token(state).await,
-                state.node_id,
-            )
-            .await;
-
-            match transfer_result {
-                Ok(remote_version_id) => {
-                    successful_transfers += 1;
-
-                    let mut cluster = state.cluster.lock().await;
-                    cluster.note_replica(&item.key, target);
-                    if let Some(version_id) = &bundle.version_id {
-                        cluster.note_replica(format!("{key}@{version_id}"), target);
-                    } else {
-                        cluster.note_replica(&key, target);
-                    }
-                    cluster.note_replica(format!("{key}@{remote_version_id}"), target);
-                    drop(cluster);
-                    replicas_state_dirty = true;
-
-                    let mut repair_state = state.repair_state.lock().await;
-                    repair_state.attempts.remove(&transfer_key);
-                    drop(repair_state);
-                    repair_state_dirty = true;
-                }
-                Err(err) => {
-                    failed_transfers += 1;
-                    last_error = Some(err.to_string());
-
-                    let mut repair_state = state.repair_state.lock().await;
-                    let entry =
-                        repair_state
-                            .attempts
-                            .entry(transfer_key)
-                            .or_insert(RepairAttemptEntry {
-                                attempts: 0,
-                                last_failure_unix: now,
-                            });
-                    entry.attempts = entry.attempts.saturating_add(1);
-                    entry.last_failure_unix = now;
-                    drop(repair_state);
-                    repair_state_dirty = true;
-                }
-            }
-        }
-    }
-
-    if replicas_state_dirty && let Err(err) = persist_cluster_replicas_state(state).await {
-        warn!(
-            error = %err,
-            "failed to persist cluster replicas after repair run"
-        );
-    }
-
-    if repair_state_dirty && let Err(err) = persist_repair_state(state).await {
-        warn!(error = %err, "failed persisting repair attempts after repair run");
-    }
-
-    ReplicationRepairReport {
-        attempted_transfers,
-        successful_transfers,
-        failed_transfers,
-        skipped_items,
-        skipped_backoff,
-        skipped_max_retries,
-        last_error,
-    }
-}
-
-async fn replicate_bundle_to_target(
-    http: &reqwest::Client,
-    target_base_url: &str,
-    bundle: &ReplicationExportBundle,
-    store: &Arc<Mutex<PersistentStore>>,
-    internal_token: Option<String>,
-    source_node_id: NodeId,
-) -> Result<String> {
-    let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
-
-    for chunk in &bundle.manifest.chunks {
-        let payload = {
-            let guard = store.lock().await;
-            guard
-                .read_chunk_payload(&chunk.hash)
-                .await?
-                .with_context(|| format!("missing local chunk {}", chunk.hash))?
-        };
-
-        assembled.extend_from_slice(&payload);
-    }
-
-    let state_query = match bundle.state {
-        VersionConsistencyState::Confirmed => "confirmed",
-        VersionConsistencyState::Provisional => "provisional",
-    };
-
-    let put_url = build_internal_replication_put_url(target_base_url, &bundle.key, state_query);
-    http.put(put_url)
-        .body(assembled.freeze())
-        .send()
-        .await?
-        .error_for_status()?;
-
-    let manifest_url = format!("{target_base_url}/cluster/replication/push/manifest");
-    let mut request = http
-        .post(manifest_url)
-        .query(&ReplicationManifestPushQuery {
-            key: bundle.key.clone(),
-            version_id: bundle.version_id.clone(),
-            state: bundle.state.clone(),
-            manifest_hash: bundle.manifest_hash.clone(),
-        })
-        .body(bundle.manifest_bytes.clone());
-
-    if let Some(token) = internal_token {
-        request = request.header("x-ironmesh-internal-token", token);
-        request = request.header("x-ironmesh-node-id", source_node_id.to_string());
-    }
-
-    let response = request.send().await?.error_for_status()?;
-
-    let report = response.json::<ReplicationManifestPushReport>().await?;
-    Ok(report.version_id)
-}
-
-fn build_internal_replication_put_url(
-    target_base_url: &str,
-    key: &str,
-    state_query: &str,
-) -> String {
-    format!("{target_base_url}/store/{key}?state={state_query}&internal_replication=true")
-}
-
 async fn persist_repair_state(state: &ServerState) -> Result<()> {
     let attempts = {
         let repair_state = state.repair_state.lock().await;
@@ -2434,331 +1966,8 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState, ServerState,
-        StartupRepairStatus, await_repair_busy_threshold, build_internal_replication_put_url,
-        build_store_index_entries, cluster, constant_time_eq, expected_internal_token_for_node,
-        internal_node_header_valid, internal_token_matches, jittered_backoff_secs,
-        parse_internal_node_tokens, run_startup_replication_repair_once,
-        should_trigger_autonomous_post_write_replication,
-    };
-    use common::NodeId;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::Mutex;
-
-    use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
-    use std::collections::HashMap;
-    use tokio::time::{Duration, Instant};
-
-    #[test]
-    fn jittered_backoff_is_deterministic_for_same_inputs() {
-        let first = jittered_backoff_secs(30, "key@ver|node", 2);
-        let second = jittered_backoff_secs(30, "key@ver|node", 2);
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn jittered_backoff_stays_within_expected_range() {
-        let value = jittered_backoff_secs(40, "another-key|node", 3);
-        assert!(value >= 40);
-        assert!(value <= 60);
-    }
-
-    #[test]
-    fn constant_time_eq_compares_equal_and_non_equal_values() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(!constant_time_eq(b"secret", b"Secret"));
-        assert!(!constant_time_eq(b"secret", b"secret-long"));
-    }
-
-    #[test]
-    fn internal_token_auth_requires_exact_match_when_configured() {
-        assert!(!internal_token_matches("secret", None));
-        assert!(!internal_token_matches("secret", Some("wrong")));
-        assert!(internal_token_matches("secret", Some("secret")));
-    }
-
-    #[test]
-    fn internal_node_header_rules_match_token_mode() {
-        assert!(!internal_node_header_valid(None));
-        assert!(!internal_node_header_valid(Some("not-a-uuid")));
-        assert!(internal_node_header_valid(Some(
-            "00000000-0000-0000-0000-000000000001"
-        )));
-    }
-
-    #[test]
-    fn parse_internal_node_tokens_parses_multiple_entries() {
-        let parsed = parse_internal_node_tokens(
-            "00000000-0000-0000-0000-000000000001=tok-a,00000000-0000-0000-0000-000000000002=tok-b",
-        )
-        .unwrap();
-
-        assert_eq!(parsed.len(), 2);
-    }
-
-    #[test]
-    fn parse_internal_node_tokens_rejects_duplicate_node_ids() {
-        let duplicate =
-            "00000000-0000-0000-0000-000000000001=tok-a,00000000-0000-0000-0000-000000000001=tok-b";
-        assert!(parse_internal_node_tokens(duplicate).is_err());
-    }
-
-    #[test]
-    fn expected_internal_token_returns_none_when_node_missing() {
-        let node_tokens = HashMap::new();
-        let expected = expected_internal_token_for_node(&node_tokens, NodeId::new_v4());
-        assert_eq!(expected, None);
-    }
-
-    #[test]
-    fn expected_internal_token_returns_node_token() {
-        let node = NodeId::new_v4();
-        let mut node_tokens = HashMap::new();
-        node_tokens.insert(node, "node-token".to_string());
-
-        let expected = expected_internal_token_for_node(&node_tokens, node);
-        assert_eq!(expected, Some("node-token"));
-    }
-
-    #[test]
-    fn store_index_depth_groups_prefixes() {
-        let keys = vec![
-            "docs/guide/intro.md".to_string(),
-            "docs/guide/setup.md".to_string(),
-            "docs/api/v1.json".to_string(),
-        ];
-
-        let entries = build_store_index_entries(&keys, "docs", 1);
-        let paths = entries
-            .into_iter()
-            .map(|entry| entry.path)
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec!["docs/api/", "docs/guide/"]);
-    }
-
-    #[test]
-    fn store_index_prefix_returns_matching_keys() {
-        let keys = vec![
-            "images/cat.png".to_string(),
-            "images/dogs/beagle.png".to_string(),
-            "docs/readme.md".to_string(),
-        ];
-
-        let entries = build_store_index_entries(&keys, "images", 2);
-        let mut key_paths = entries
-            .into_iter()
-            .filter(|entry| entry.entry_type == "key")
-            .map(|entry| entry.path)
-            .collect::<Vec<_>>();
-        key_paths.sort();
-
-        assert_eq!(key_paths, vec!["images/cat.png", "images/dogs/beagle.png"]);
-    }
-
-    #[test]
-    fn autonomous_post_write_replication_trigger_guard_blocks_internal_writes() {
-        assert!(should_trigger_autonomous_post_write_replication(
-            true, false
-        ));
-        assert!(!should_trigger_autonomous_post_write_replication(
-            true, true
-        ));
-        assert!(!should_trigger_autonomous_post_write_replication(
-            false, false
-        ));
-    }
-
-    #[test]
-    fn internal_replication_put_url_sets_internal_flag() {
-        let url =
-            build_internal_replication_put_url("http://127.0.0.1:18080", "hello", "confirmed");
-        assert!(url.contains("/store/hello?"));
-        assert!(url.contains("state=confirmed"));
-        assert!(url.contains("internal_replication=true"));
-    }
-
-    #[tokio::test]
-    async fn repair_busy_threshold_returns_immediately_when_disabled() {
-        let mut state = build_test_state(1, false).await;
-        state.repair_config.busy_throttle_enabled = false;
-        state
-            .inflight_requests
-            .store(1_000, std::sync::atomic::Ordering::Relaxed);
-        let start = Instant::now();
-
-        await_repair_busy_threshold(&state).await;
-
-        assert!(start.elapsed() < Duration::from_millis(10));
-        cleanup_test_state(&state).await;
-    }
-
-    #[tokio::test]
-    async fn repair_busy_threshold_waits_until_load_drops() {
-        let mut state = build_test_state(1, false).await;
-        state.repair_config.busy_throttle_enabled = true;
-        state.repair_config.busy_inflight_threshold = 1;
-        state.repair_config.busy_wait_millis = 5;
-        state
-            .inflight_requests
-            .store(5, std::sync::atomic::Ordering::Relaxed);
-
-        let inflight_requests_for_release = Arc::clone(&state.inflight_requests);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            inflight_requests_for_release.store(0, std::sync::atomic::Ordering::Relaxed);
-        });
-
-        let start = Instant::now();
-        await_repair_busy_threshold(&state).await;
-
-        assert!(start.elapsed() >= Duration::from_millis(15));
-        cleanup_test_state(&state).await;
-    }
-
-    #[tokio::test]
-    async fn startup_repair_noop_when_plan_is_empty() {
-        let state = build_test_state(1, false).await;
-
-        let result = run_startup_replication_repair_once(&state, 0).await;
-        assert!(result.is_none());
-
-        cleanup_test_state(&state).await;
-    }
-
-    #[tokio::test]
-    async fn startup_repair_runs_when_gaps_exist() {
-        let state = build_test_state(2, true).await;
-
-        let result = run_startup_replication_repair_once(&state, 0).await;
-        assert!(result.is_some());
-
-        let (plan, report) = result.unwrap();
-        assert!(!plan.items.is_empty());
-        assert!(
-            report.attempted_transfers > 0,
-            "startup repair should attempt transfers when replication gaps exist"
-        );
-
-        cleanup_test_state(&state).await;
-    }
-
-    async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerState {
-        let root = fresh_test_dir("startup-repair-main");
-        let local_node_id = NodeId::new_v4();
-
-        let store = Arc::new(Mutex::new(
-            PersistentStore::init(root.clone()).await.unwrap(),
-        ));
-
-        let mut service = cluster::ClusterService::new(
-            local_node_id,
-            cluster::ReplicationPolicy {
-                replication_factor,
-                ..cluster::ReplicationPolicy::default()
-            },
-            60,
-        );
-
-        service.register_node(cluster::NodeDescriptor {
-            node_id: local_node_id,
-            public_url: "http://127.0.0.1:39080".to_string(),
-            labels: HashMap::new(),
-            capacity_bytes: 1_000_000,
-            free_bytes: 900_000,
-            last_heartbeat_unix: 0,
-            status: cluster::NodeStatus::Online,
-        });
-
-        if replication_factor > 1 {
-            service.register_node(cluster::NodeDescriptor {
-                node_id: NodeId::new_v4(),
-                public_url: "http://127.0.0.1:9".to_string(),
-                labels: HashMap::new(),
-                capacity_bytes: 1_000_000,
-                free_bytes: 800_000,
-                last_heartbeat_unix: 0,
-                status: cluster::NodeStatus::Online,
-            });
-        }
-
-        let state = ServerState {
-            node_id: local_node_id,
-            store: store.clone(),
-            cluster: Arc::new(Mutex::new(service)),
-            metadata_commit_mode: MetadataCommitMode::Local,
-            internal_node_tokens: Arc::new(Mutex::new(HashMap::new())),
-            autonomous_replication_on_put_enabled: false,
-            inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            replication_audit_interval_secs: 3600,
-            peer_heartbeat_config: PeerHeartbeatConfig {
-                enabled: false,
-                interval_secs: 15,
-            },
-            repair_config: RepairConfig {
-                enabled: true,
-                batch_size: 32,
-                max_retries: 3,
-                backoff_secs: 0,
-                startup_repair_enabled: true,
-                startup_repair_delay_secs: 0,
-                busy_throttle_enabled: false,
-                busy_inflight_threshold: 1,
-                busy_wait_millis: 100,
-            },
-            log_buffer: Arc::new(super::LogBuffer::new(64)),
-            startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
-            repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
-        };
-
-        if seed_gap {
-            let put = {
-                let mut locked = store.lock().await;
-                locked
-                    .put_object_versioned(
-                        "startup-gap-key",
-                        bytes::Bytes::from_static(b"payload"),
-                        PutOptions {
-                            parent_version_ids: Vec::new(),
-                            state: VersionConsistencyState::Confirmed,
-                            inherit_preferred_parent: true,
-                            create_snapshot: true,
-                        },
-                    )
-                    .await
-                    .unwrap()
-            };
-
-            let mut cluster = state.cluster.lock().await;
-            cluster.note_replica("startup-gap-key", local_node_id);
-            cluster.note_replica(format!("startup-gap-key@{}", put.version_id), local_node_id);
-        }
-
-        state
-    }
-
-    async fn cleanup_test_state(state: &ServerState) {
-        let root = {
-            let store = state.store.lock().await;
-            store.root_dir().to_path_buf()
-        };
-        let _ = tokio::fs::remove_dir_all(root).await;
-    }
-
-    fn fresh_test_dir(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("ironmesh-{name}-{unique}"));
-        let _ = std::fs::remove_dir_all(&path);
-        let _ = std::fs::create_dir_all(&path);
-        path
-    }
-}
+#[path = "main_tests.rs"]
+mod tests;
 
 fn unix_ts() -> u64 {
     SystemTime::now()
