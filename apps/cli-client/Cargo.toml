@@ -15,4 +15,3 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-web-ui = { path = "../web-ui" }

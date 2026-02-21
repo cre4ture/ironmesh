@@ -133,6 +133,7 @@ Those bridges can be added incrementally without changing the workspace topology
 - `ironmesh nodes`
 - `ironmesh replication-plan`
 - `ironmesh serve-web` provides an interactive web UI for upload/download, key browsing, health checks, and replication-plan inspection.
+	- `serve-web` serves static files directly from `apps/web-ui/static/`.
 
 ### Reconciliation and maintenance
 

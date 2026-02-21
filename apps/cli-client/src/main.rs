@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -17,6 +18,7 @@ struct WebState {
     server_url: String,
     http: Client,
     client: ClientNode,
+    static_dir: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -107,14 +109,18 @@ async fn main() -> Result<()> {
         }
         Commands::ServeWeb { bind } => {
             let bind_addr: SocketAddr = bind.parse()?;
+            let static_dir =
+                PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../web-ui/static"));
             let state = WebState {
                 server_url: cli.server_url.clone(),
                 http,
                 client,
+                static_dir,
             };
 
             let app = Router::new()
-                .route("/", get(|| async { Html(web_ui::app_html()) }))
+                .route("/", get(web_static_index))
+                .route("/{*path}", get(web_static_file))
                 .route("/api/health", get(web_health))
                 .route("/api/cluster/status", get(web_cluster_status))
                 .route("/api/cluster/nodes", get(web_cluster_nodes))
@@ -186,6 +192,55 @@ async fn fetch_server_json(
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
+}
+
+fn content_type_for(path: &str) -> &'static str {
+    if path.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if path.ends_with(".js") {
+        "application/javascript; charset=utf-8"
+    } else if path.ends_with(".json") {
+        "application/json; charset=utf-8"
+    } else {
+        "text/html; charset=utf-8"
+    }
+}
+
+async fn web_static_index(State(state): State<WebState>) -> Response {
+    let path = state.static_dir.join("index.html");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", "text/html; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read {}: {err}", path.display()),
+        ),
+    }
+}
+
+async fn web_static_file(State(state): State<WebState>, Path(path): Path<String>) -> Response {
+    if path.starts_with("api/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if path.is_empty() {
+        return web_static_index(State(state)).await;
+    }
+
+    let requested = state.static_dir.join(&path);
+    match tokio::fs::read(&requested).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", content_type_for(&path))],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn web_health(State(state): State<WebState>) -> impl IntoResponse {
