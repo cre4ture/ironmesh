@@ -32,3 +32,7 @@ Those bridges can be added incrementally without changing the workspace topology
 ## Storage design
 
 - Persistent storage strategy and requirements are documented in [docs/persistent-storage-strategy.md](docs/persistent-storage-strategy.md).
+
+## Multi-node strategy
+
+- Multi-node requirements, replication strategy, and rollout plan are documented in [docs/multi-node-strategy.md](docs/multi-node-strategy.md).
