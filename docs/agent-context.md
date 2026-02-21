@@ -107,6 +107,20 @@ Implemented on `GET /` page:
 - Startup one-shot repair status (`scheduled`/`running`/`completed`/`no gaps`/`disabled`).
 - Current replication backlog summary (plan items, under-replicated, over-replicated).
 
+### 8) Adaptive repair busy-throttling
+
+Implemented:
+
+- Server tracks live in-flight request count via middleware.
+- Replication repair transfer attempts can wait until node load drops below a configured in-flight threshold.
+- UI background-work section now shows busy-throttle configuration and current in-flight count.
+
+Configuration:
+
+- `IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED` (default: `false`)
+- `IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
+- `IRONMESH_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)
+
 ## Key Files Touched Recently
 
 - `apps/server-node/src/main.rs`

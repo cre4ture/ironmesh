@@ -3,12 +3,14 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::{Bytes, BytesMut};
@@ -34,6 +36,7 @@ struct ServerState {
     metadata_commit_mode: MetadataCommitMode,
     internal_node_tokens: Arc<Mutex<HashMap<NodeId, String>>>,
     autonomous_replication_on_put_enabled: bool,
+    inflight_requests: Arc<AtomicUsize>,
     replication_audit_interval_secs: u64,
     peer_heartbeat_config: PeerHeartbeatConfig,
     repair_config: RepairConfig,
@@ -53,6 +56,9 @@ struct RepairConfig {
     batch_size: usize,
     max_retries: u32,
     backoff_secs: u64,
+    busy_throttle_enabled: bool,
+    busy_inflight_threshold: usize,
+    busy_wait_millis: u64,
     startup_repair_enabled: bool,
     startup_repair_delay_secs: u64,
 }
@@ -105,6 +111,21 @@ impl RepairConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
 
+        let busy_throttle_enabled = std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+
+        let busy_inflight_threshold = std::env::var("IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
+
+        let busy_wait_millis = std::env::var("IRONMESH_REPAIR_BUSY_WAIT_MILLIS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200);
+
         let startup_repair_enabled = std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
@@ -120,6 +141,9 @@ impl RepairConfig {
             batch_size,
             max_retries,
             backoff_secs,
+            busy_throttle_enabled,
+            busy_inflight_threshold,
+            busy_wait_millis,
             startup_repair_enabled,
             startup_repair_delay_secs,
         }
@@ -300,6 +324,7 @@ async fn main() -> Result<()> {
         metadata_commit_mode,
         internal_node_tokens: Arc::new(Mutex::new(internal_node_tokens)),
         autonomous_replication_on_put_enabled,
+        inflight_requests: Arc::new(AtomicUsize::new(0)),
         replication_audit_interval_secs: audit_interval_secs,
         peer_heartbeat_config,
         repair_config,
@@ -412,7 +437,11 @@ async fn main() -> Result<()> {
         )
         .route("/cluster/reconcile/{node_id}", post(reconcile_from_node))
         .route("/maintenance/cleanup", post(run_cleanup))
-        .with_state(state);
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_inflight_requests,
+        ));
 
     info!(%bind_addr, %node_id, "server node listening");
 
@@ -464,6 +493,34 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
             }
         }
     });
+}
+
+async fn track_inflight_requests(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    state.inflight_requests.fetch_add(1, Ordering::Relaxed);
+    let response = next.run(request).await;
+    state.inflight_requests.fetch_sub(1, Ordering::Relaxed);
+    response
+}
+
+async fn await_repair_busy_threshold(state: &ServerState) {
+    if !state.repair_config.busy_throttle_enabled {
+        return;
+    }
+
+    let threshold = state.repair_config.busy_inflight_threshold.max(1);
+    let wait_duration = Duration::from_millis(state.repair_config.busy_wait_millis.max(10));
+
+    loop {
+        let inflight = state.inflight_requests.load(Ordering::Relaxed);
+        if inflight <= threshold {
+            break;
+        }
+        tokio::time::sleep(wait_duration).await;
+    }
 }
 
 fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
@@ -654,6 +711,17 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
         startup_repair_status_label(*status)
     };
 
+    let current_inflight_requests = state.inflight_requests.load(Ordering::Relaxed);
+    let repair_busy_throttle_status = if state.repair_config.busy_throttle_enabled {
+        format!(
+            "enabled (threshold={}, wait={}ms)",
+            state.repair_config.busy_inflight_threshold.max(1),
+            state.repair_config.busy_wait_millis.max(10)
+        )
+    } else {
+        "disabled".to_string()
+    };
+
     let peer_heartbeat_status = if state.peer_heartbeat_config.enabled {
         format!(
             "enabled (every {}s)",
@@ -697,6 +765,7 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
             <li><strong>Periodic replication audit</strong>: <code>enabled (every {}s)</code></li>
             <li><strong>Autonomous peer heartbeat emitter</strong>: <code>{}</code></li>
             <li><strong>Startup one-shot repair</strong>: <code>{}</code> (delay: <code>{}s</code>)</li>
+            <li><strong>Repair busy-throttle</strong>: <code>{}</code>; in-flight requests now=<code>{}</code></li>
             <li><strong>Current replication backlog</strong>: plan items=<code>{}</code>, under-replicated=<code>{}</code>, over-replicated=<code>{}</code></li>
         </ul>
     <h2>Available routes</h2>
@@ -744,6 +813,8 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
         peer_heartbeat_status,
         startup_repair_status,
         state.repair_config.startup_repair_delay_secs,
+        repair_busy_throttle_status,
+        current_inflight_requests,
         replication_plan_items,
         under_replicated,
         over_replicated,
@@ -1861,6 +1932,8 @@ async fn execute_replication_repair_inner(
                 }
             }
 
+            await_repair_busy_threshold(state).await;
+
             attempted_transfers += 1;
             let transfer_result = replicate_bundle_to_target(
                 &http,
@@ -2207,10 +2280,11 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 mod tests {
     use super::{
         MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState, ServerState,
-        StartupRepairStatus, build_internal_replication_put_url, build_store_index_entries,
-        cluster, constant_time_eq, expected_internal_token_for_node, internal_node_header_valid,
-        internal_token_matches, jittered_backoff_secs, parse_internal_node_tokens,
-        run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
+        StartupRepairStatus, await_repair_busy_threshold, build_internal_replication_put_url,
+        build_store_index_entries, cluster, constant_time_eq, expected_internal_token_for_node,
+        internal_node_header_valid, internal_token_matches, jittered_backoff_secs,
+        parse_internal_node_tokens, run_startup_replication_repair_once,
+        should_trigger_autonomous_post_write_replication,
     };
     use common::NodeId;
     use std::path::PathBuf;
@@ -2220,6 +2294,7 @@ mod tests {
 
     use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
     use std::collections::HashMap;
+    use tokio::time::{Duration, Instant};
 
     #[test]
     fn jittered_backoff_is_deterministic_for_same_inputs() {
@@ -2350,6 +2425,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repair_busy_threshold_returns_immediately_when_disabled() {
+        let mut state = build_test_state(1, false).await;
+        state.repair_config.busy_throttle_enabled = false;
+        state
+            .inflight_requests
+            .store(1_000, std::sync::atomic::Ordering::Relaxed);
+        let start = Instant::now();
+
+        await_repair_busy_threshold(&state).await;
+
+        assert!(start.elapsed() < Duration::from_millis(10));
+        cleanup_test_state(&state).await;
+    }
+
+    #[tokio::test]
+    async fn repair_busy_threshold_waits_until_load_drops() {
+        let mut state = build_test_state(1, false).await;
+        state.repair_config.busy_throttle_enabled = true;
+        state.repair_config.busy_inflight_threshold = 1;
+        state.repair_config.busy_wait_millis = 5;
+        state
+            .inflight_requests
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+
+        let inflight_requests_for_release = Arc::clone(&state.inflight_requests);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            inflight_requests_for_release.store(0, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let start = Instant::now();
+        await_repair_busy_threshold(&state).await;
+
+        assert!(start.elapsed() >= Duration::from_millis(15));
+        cleanup_test_state(&state).await;
+    }
+
+    #[tokio::test]
     async fn startup_repair_noop_when_plan_is_empty() {
         let state = build_test_state(1, false).await;
 
@@ -2422,6 +2535,7 @@ mod tests {
             metadata_commit_mode: MetadataCommitMode::Local,
             internal_node_tokens: Arc::new(Mutex::new(HashMap::new())),
             autonomous_replication_on_put_enabled: false,
+            inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replication_audit_interval_secs: 3600,
             peer_heartbeat_config: PeerHeartbeatConfig {
                 enabled: false,
@@ -2434,6 +2548,9 @@ mod tests {
                 backoff_secs: 0,
                 startup_repair_enabled: true,
                 startup_repair_delay_secs: 0,
+                busy_throttle_enabled: false,
+                busy_inflight_threshold: 1,
+                busy_wait_millis: 100,
             },
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),

@@ -214,6 +214,11 @@ Those bridges can be added incrementally without changing the workspace topology
 - Configuration:
 	- `IRONMESH_STARTUP_REPAIR_ENABLED` (default: `true`)
 	- `IRONMESH_STARTUP_REPAIR_DELAY_SECS` (default: `5`)
+	- `IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED` (default: `false`)
+	- `IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
+	- `IRONMESH_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)
+
+- When busy-throttle is enabled, each repair transfer waits while current in-flight request count is above the configured threshold.
 
 - Rejoin reconciliation endpoints:
 	- `GET /cluster/reconcile/export/provisional`
