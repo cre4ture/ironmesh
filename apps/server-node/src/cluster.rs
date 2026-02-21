@@ -743,4 +743,70 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn replication_plan_same_key_multi_writer_keeps_visibility_without_forced_eviction() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 3,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+        let node_d = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+        svc.register_node(mk_node(node_d, "dc-d", "rack-4", 600));
+
+        svc.note_replica("hello", node_a);
+        svc.note_replica("hello", node_b);
+        svc.note_replica("hello@ver-a", node_a);
+        svc.note_replica("hello@ver-b", node_b);
+
+        let keys = vec![
+            "hello".to_string(),
+            "hello@ver-a".to_string(),
+            "hello@ver-b".to_string(),
+        ];
+        let plan = svc.replication_plan(&keys);
+
+        let hello_item = plan
+            .items
+            .iter()
+            .find(|item| item.key == "hello")
+            .expect("expected base key replication item to remain visible");
+
+        assert_eq!(hello_item.current_nodes.len(), 2);
+        assert_eq!(hello_item.missing_nodes.len(), 1);
+        assert!(
+            hello_item.extra_nodes.is_empty(),
+            "base key should not force-evict writer nodes while still under target"
+        );
+
+        let version_a = plan
+            .items
+            .iter()
+            .find(|item| item.key == "hello@ver-a")
+            .expect("expected version-a replication item");
+        assert_eq!(version_a.current_nodes, vec![node_a]);
+        assert_eq!(version_a.missing_nodes.len(), 2);
+        assert!(version_a.extra_nodes.is_empty());
+
+        let version_b = plan
+            .items
+            .iter()
+            .find(|item| item.key == "hello@ver-b")
+            .expect("expected version-b replication item");
+        assert_eq!(version_b.current_nodes, vec![node_b]);
+        assert_eq!(version_b.missing_nodes.len(), 2);
+        assert!(version_b.extra_nodes.is_empty());
+    }
 }
