@@ -32,6 +32,7 @@ struct ServerState {
     cluster: Arc<Mutex<ClusterService>>,
     metadata_commit_mode: MetadataCommitMode,
     internal_api_token: Option<String>,
+    internal_node_tokens: HashMap<NodeId, String>,
     repair_config: RepairConfig,
     repair_state: Arc<Mutex<RepairExecutorState>>,
 }
@@ -166,6 +167,11 @@ async fn main() -> Result<()> {
     let internal_api_token = std::env::var("IRONMESH_INTERNAL_API_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let internal_node_tokens = std::env::var("IRONMESH_INTERNAL_NODE_TOKENS")
+        .ok()
+        .map(|raw| parse_internal_node_tokens(raw.as_str()))
+        .transpose()?
+        .unwrap_or_default();
 
     let repair_config = RepairConfig::from_env();
 
@@ -204,6 +210,7 @@ async fn main() -> Result<()> {
         cluster: Arc::new(Mutex::new(cluster)),
         metadata_commit_mode,
         internal_api_token,
+        internal_node_tokens,
         repair_config,
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
     };
@@ -967,7 +974,7 @@ async fn execute_replication_cleanup(
                     version_id: Some(candidate.version_id.clone()),
                 });
 
-            if let Some(token) = state.internal_api_token.as_deref() {
+            if let Some(token) = internal_outbound_token(&state) {
                 request = request.header("x-ironmesh-internal-token", token);
                 request = request.header("x-ironmesh-node-id", state.node_id.to_string());
             }
@@ -1223,7 +1230,7 @@ async fn execute_replication_repair_inner(
                 &node.public_url,
                 &bundle,
                 &state.store,
-                state.internal_api_token.as_deref(),
+                internal_outbound_token(state),
                 state.node_id,
             )
             .await;
@@ -1298,7 +1305,7 @@ async fn replicate_bundle_to_target(
     target_base_url: &str,
     bundle: &ReplicationExportBundle,
     store: &Arc<Mutex<PersistentStore>>,
-    internal_api_token: Option<&str>,
+    internal_api_token: Option<String>,
     source_node_id: NodeId,
 ) -> Result<String> {
     let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
@@ -1396,24 +1403,19 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
 }
 
 async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap) -> bool {
-    let configured = state.internal_api_token.as_deref();
-    let provided = headers
-        .get("x-ironmesh-internal-token")
-        .and_then(|value| value.to_str().ok());
-
-    if !internal_token_matches(configured, provided) {
-        return false;
-    }
-
-    if configured.is_none() {
+    if state.internal_api_token.is_none() && state.internal_node_tokens.is_empty() {
         return true;
     }
+
+    let provided_token = headers
+        .get("x-ironmesh-internal-token")
+        .and_then(|value| value.to_str().ok());
 
     let node_id_header = headers
         .get("x-ironmesh-node-id")
         .and_then(|value| value.to_str().ok());
 
-    if !internal_node_header_valid(configured, node_id_header) {
+    if !internal_node_header_valid(true, node_id_header) {
         return false;
     }
 
@@ -1426,10 +1428,75 @@ async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap
     };
 
     let cluster = state.cluster.lock().await;
-    cluster
+    let caller_is_registered = cluster
         .list_nodes()
         .iter()
-        .any(|node| node.node_id == caller_node_id)
+        .any(|node| node.node_id == caller_node_id);
+    drop(cluster);
+
+    if !caller_is_registered {
+        return false;
+    }
+
+    let expected = expected_internal_token_for_node(
+        state.internal_api_token.as_deref(),
+        &state.internal_node_tokens,
+        caller_node_id,
+    );
+
+    internal_token_matches(expected, provided_token)
+}
+
+fn internal_outbound_token(state: &ServerState) -> Option<String> {
+    expected_internal_token_for_node(
+        state.internal_api_token.as_deref(),
+        &state.internal_node_tokens,
+        state.node_id,
+    )
+    .map(ToString::to_string)
+}
+
+fn expected_internal_token_for_node<'a>(
+    global_token: Option<&'a str>,
+    node_tokens: &'a HashMap<NodeId, String>,
+    node_id: NodeId,
+) -> Option<&'a str> {
+    node_tokens
+        .get(&node_id)
+        .map(|value| value.as_str())
+        .or(global_token)
+}
+
+fn parse_internal_node_tokens(raw: &str) -> Result<HashMap<NodeId, String>> {
+    let mut parsed = HashMap::new();
+
+    for pair in raw.split(',') {
+        let entry = pair.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let Some((node_id_raw, token_raw)) = entry.split_once('=') else {
+            return Err(anyhow::anyhow!(
+                "invalid IRONMESH_INTERNAL_NODE_TOKENS entry '{entry}', expected '<node_id>=<token>'"
+            ));
+        };
+
+        let node_id = node_id_raw.trim().parse::<NodeId>().with_context(|| {
+            format!("invalid node id in IRONMESH_INTERNAL_NODE_TOKENS: {node_id_raw}")
+        })?;
+        let token = token_raw.trim();
+
+        if token.is_empty() {
+            return Err(anyhow::anyhow!(
+                "empty token for node {node_id} in IRONMESH_INTERNAL_NODE_TOKENS"
+            ));
+        }
+
+        parsed.insert(node_id, token.to_string());
+    }
+
+    Ok(parsed)
 }
 
 fn internal_token_matches(configured: Option<&str>, provided: Option<&str>) -> bool {
@@ -1439,8 +1506,8 @@ fn internal_token_matches(configured: Option<&str>, provided: Option<&str>) -> b
     }
 }
 
-fn internal_node_header_valid(configured: Option<&str>, provided: Option<&str>) -> bool {
-    if configured.is_none() {
+fn internal_node_header_valid(auth_enabled: bool, provided: Option<&str>) -> bool {
+    if !auth_enabled {
         return true;
     }
 
@@ -1466,7 +1533,12 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 
 #[cfg(test)]
 mod tests {
-    use super::{internal_node_header_valid, internal_token_matches, jittered_backoff_secs};
+    use super::{
+        expected_internal_token_for_node, internal_node_header_valid, internal_token_matches,
+        jittered_backoff_secs, parse_internal_node_tokens,
+    };
+    use common::NodeId;
+    use std::collections::HashMap;
 
     #[test]
     fn jittered_backoff_is_deterministic_for_same_inputs() {
@@ -1497,16 +1569,33 @@ mod tests {
 
     #[test]
     fn internal_node_header_rules_match_token_mode() {
-        assert!(internal_node_header_valid(None, None));
-        assert!(!internal_node_header_valid(Some("secret"), None));
-        assert!(!internal_node_header_valid(
-            Some("secret"),
-            Some("not-a-uuid")
-        ));
+        assert!(internal_node_header_valid(false, None));
+        assert!(!internal_node_header_valid(true, None));
+        assert!(!internal_node_header_valid(true, Some("not-a-uuid")));
         assert!(internal_node_header_valid(
-            Some("secret"),
+            true,
             Some("00000000-0000-0000-0000-000000000001")
         ));
+    }
+
+    #[test]
+    fn parse_internal_node_tokens_parses_multiple_entries() {
+        let parsed = parse_internal_node_tokens(
+            "00000000-0000-0000-0000-000000000001=tok-a,00000000-0000-0000-0000-000000000002=tok-b",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn expected_internal_token_prefers_node_specific_over_global() {
+        let node = NodeId::new_v4();
+        let mut node_tokens = HashMap::new();
+        node_tokens.insert(node, "node-token".to_string());
+
+        let expected = expected_internal_token_for_node(Some("global-token"), &node_tokens, node);
+        assert_eq!(expected, Some("node-token"));
     }
 }
 

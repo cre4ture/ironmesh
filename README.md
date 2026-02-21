@@ -110,10 +110,13 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Internal replication security
 
-- Internal replication mutation endpoints can be restricted with `IRONMESH_INTERNAL_API_TOKEN`.
-- When configured, requests to these endpoints must include headers:
+- Internal replication mutation endpoints can be restricted with either:
+	- `IRONMESH_INTERNAL_API_TOKEN` (shared fallback token), and/or
+	- `IRONMESH_INTERNAL_NODE_TOKENS` (per-node token map: `<node_uuid>=<token>,<node_uuid>=<token>,...`).
+- When auth is configured, requests to these endpoints must include headers:
 	- `x-ironmesh-internal-token: <token>`
 	- `x-ironmesh-node-id: <uuid>` (must be a registered cluster node)
+- Token resolution order is node-specific first, then shared fallback token.
 
 - Protected endpoints:
 	- `POST /cluster/replication/push/chunk/{hash}`
