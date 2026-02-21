@@ -357,8 +357,10 @@ mod tests {
     #[test]
     fn replication_plan_detects_missing_and_extra() {
         let local = NodeId::new_v4();
-        let mut policy = ReplicationPolicy::default();
-        policy.replication_factor = 2;
+        let policy = ReplicationPolicy {
+            replication_factor: 2,
+            ..ReplicationPolicy::default()
+        };
 
         let mut svc = ClusterService::new(local, policy, 60);
         let node_a = NodeId::new_v4();

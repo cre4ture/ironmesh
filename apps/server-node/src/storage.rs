@@ -506,12 +506,7 @@ impl PersistentStore {
             .versions
             .get(preferred_head)
             .map(|record| record.manifest_hash.clone())
-            .with_context(|| {
-                format!(
-                    "preferred head {} missing in index for key={key}",
-                    preferred_head
-                )
-            })?;
+            .with_context(|| format!("preferred head {preferred_head} missing in index for key={key}"))?;
 
         self.current_state.objects.insert(key.to_string(), manifest_hash);
         Ok(())

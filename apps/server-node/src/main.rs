@@ -80,8 +80,10 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(3);
 
-    let mut policy = ReplicationPolicy::default();
-    policy.replication_factor = replication_factor;
+    let policy = ReplicationPolicy {
+        replication_factor,
+        ..ReplicationPolicy::default()
+    };
 
     let mut cluster = ClusterService::new(node_id, policy, heartbeat_timeout_secs);
     cluster.register_node(NodeDescriptor {
