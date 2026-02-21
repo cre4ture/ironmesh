@@ -612,6 +612,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn autonomous_peer_heartbeat_keeps_peers_online() -> Result<()> {
+        let bind_a = "127.0.0.1:19123";
+        let bind_b = "127.0.0.1:19124";
+        let node_id_a = "00000000-0000-0000-0000-0000000007c1";
+        let node_id_b = "00000000-0000-0000-0000-0000000007d2";
+
+        let data_a = fresh_data_dir("autonomous-heartbeat-a");
+        let data_b = fresh_data_dir("autonomous-heartbeat-b");
+
+        let heartbeat_env = [
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+        ];
+
+        let mut node_a = start_server_with_env_options(
+            bind_a,
+            &data_a,
+            node_id_a,
+            2,
+            None,
+            Some(2),
+            &heartbeat_env,
+        )
+        .await?;
+
+        let mut node_b = start_server_with_env_options(
+            bind_b,
+            &data_b,
+            node_id_b,
+            2,
+            None,
+            Some(2),
+            &heartbeat_env,
+        )
+        .await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            register_node(&client, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&client, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+
+            sleep(Duration::from_secs(5)).await;
+
+            let status_a: serde_json::Value = client
+                .get(format!("{base_a}/cluster/status"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let status_b: serde_json::Value = client
+                .get(format!("{base_b}/cluster/status"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let online_a = status_a
+                .get("online_nodes")
+                .and_then(|v| v.as_u64())
+                .context("missing online_nodes for node A")?;
+            let online_b = status_b
+                .get("online_nodes")
+                .and_then(|v| v.as_u64())
+                .context("missing online_nodes for node B")?;
+
+            assert_eq!(online_a, 2, "expected both nodes online on node A view");
+            assert_eq!(online_b, 2, "expected both nodes online on node B view");
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
     async fn multi_node_replication_plan_detects_missing_replicas() -> Result<()> {
         let bind_a = "127.0.0.1:19090";
         let bind_b = "127.0.0.1:19091";
