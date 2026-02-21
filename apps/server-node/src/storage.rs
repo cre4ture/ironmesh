@@ -182,6 +182,12 @@ pub struct ReplicationExportBundle {
     pub manifest: ReplicationManifestPayload,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairAttemptRecord {
+    pub attempts: u32,
+    pub last_failure_unix: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PutResult {
     pub snapshot_id: String,
@@ -199,6 +205,7 @@ pub struct PersistentStore {
     versions_dir: PathBuf,
     reconcile_markers_dir: PathBuf,
     current_state_path: PathBuf,
+    repair_attempts_path: PathBuf,
     current_state: CurrentState,
 }
 
@@ -221,6 +228,7 @@ impl PersistentStore {
         let reconcile_markers_dir = root_dir.join("reconcile_markers");
         let state_dir = root_dir.join("state");
         let current_state_path = state_dir.join("current.json");
+        let repair_attempts_path = state_dir.join("repair_attempts.json");
 
         fs::create_dir_all(&chunks_dir).await?;
         fs::create_dir_all(&manifests_dir).await?;
@@ -246,8 +254,34 @@ impl PersistentStore {
             versions_dir,
             reconcile_markers_dir,
             current_state_path,
+            repair_attempts_path,
             current_state,
         })
+    }
+
+    pub async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
+        if !fs::try_exists(&self.repair_attempts_path).await? {
+            return Ok(HashMap::new());
+        }
+
+        let payload = fs::read(&self.repair_attempts_path).await?;
+        let attempts = serde_json::from_slice::<HashMap<String, RepairAttemptRecord>>(&payload)
+            .with_context(|| {
+                format!(
+                    "invalid repair attempts state: {}",
+                    self.repair_attempts_path.display()
+                )
+            })?;
+
+        Ok(attempts)
+    }
+
+    pub async fn persist_repair_attempts(
+        &self,
+        attempts: &HashMap<String, RepairAttemptRecord>,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(attempts)?;
+        write_atomic(&self.repair_attempts_path, &payload).await
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -1688,6 +1722,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(live.as_ref(), b"live-data");
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn load_repair_attempts_returns_empty_when_file_missing() {
+        let root = test_store_dir("repair-attempts-empty");
+        let store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let attempts = store.load_repair_attempts().await.unwrap();
+        assert!(attempts.is_empty());
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn persist_and_load_repair_attempts_roundtrip() {
+        let root = test_store_dir("repair-attempts-roundtrip");
+        let store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let mut attempts = HashMap::new();
+        attempts.insert(
+            "subject@version|node".to_string(),
+            RepairAttemptRecord {
+                attempts: 2,
+                last_failure_unix: 123,
+            },
+        );
+
+        store.persist_repair_attempts(&attempts).await.unwrap();
+        let loaded = store.load_repair_attempts().await.unwrap();
+
+        let entry = loaded.get("subject@version|node").unwrap();
+        assert_eq!(entry.attempts, 2);
+        assert_eq!(entry.last_failure_unix, 123);
 
         let _ = fs::remove_dir_all(root).await;
     }

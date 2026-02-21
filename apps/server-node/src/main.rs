@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,15 +14,15 @@ use bytes::{Bytes, BytesMut};
 use common::{HealthStatus, NodeId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 mod cluster;
 mod storage;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
-    ObjectReadMode, PersistentStore, PutOptions, ReconcileVersionEntry, ReplicationExportBundle,
-    SnapshotInfo, StoreReadError, VersionConsistencyState,
+    ObjectReadMode, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
+    ReplicationExportBundle, SnapshotInfo, StoreReadError, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -187,6 +188,33 @@ async fn main() -> Result<()> {
         repair_config,
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
     };
+
+    let persisted_attempts = {
+        let store = state.store.lock().await;
+        match store.load_repair_attempts().await {
+            Ok(attempts) => attempts,
+            Err(err) => {
+                warn!(error = %err, "failed to load repair attempts state; starting empty");
+                HashMap::new()
+            }
+        }
+    };
+
+    {
+        let mut repair_state = state.repair_state.lock().await;
+        repair_state.attempts = persisted_attempts
+            .into_iter()
+            .map(|(key, record)| {
+                (
+                    key,
+                    RepairAttemptEntry {
+                        attempts: record.attempts,
+                        last_failure_unix: record.last_failure_unix,
+                    },
+                )
+            })
+            .collect();
+    }
 
     spawn_replication_auditor(state.clone(), audit_interval_secs);
 
@@ -869,7 +897,9 @@ async fn execute_replication_repair_inner(
                     }
 
                     let elapsed = now.saturating_sub(previous.last_failure_unix);
-                    if elapsed < backoff_secs {
+                    let required_backoff =
+                        jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
+                    if elapsed < required_backoff {
                         skipped_backoff += 1;
                         continue;
                     }
@@ -895,6 +925,11 @@ async fn execute_replication_repair_inner(
 
                     let mut repair_state = state.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
+                    drop(repair_state);
+
+                    if let Err(err) = persist_repair_state(state).await {
+                        warn!(error = %err, "failed persisting repair attempts after success");
+                    }
                 }
                 Err(err) => {
                     failed_transfers += 1;
@@ -911,6 +946,11 @@ async fn execute_replication_repair_inner(
                             });
                     entry.attempts = entry.attempts.saturating_add(1);
                     entry.last_failure_unix = now;
+                    drop(repair_state);
+
+                    if let Err(err) = persist_repair_state(state).await {
+                        warn!(error = %err, "failed persisting repair attempts after failure");
+                    }
                 }
             }
         }
@@ -977,6 +1017,42 @@ async fn replicate_bundle_to_target(
     Ok(report.version_id)
 }
 
+async fn persist_repair_state(state: &ServerState) -> Result<()> {
+    let attempts = {
+        let repair_state = state.repair_state.lock().await;
+        repair_state
+            .attempts
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    RepairAttemptRecord {
+                        attempts: entry.attempts,
+                        last_failure_unix: entry.last_failure_unix,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    };
+
+    let store = state.store.lock().await;
+    store.persist_repair_attempts(&attempts).await
+}
+
+fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u32) -> u64 {
+    if base_backoff_secs == 0 {
+        return 0;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    transfer_key.hash(&mut hasher);
+    attempts.hash(&mut hasher);
+    let jitter_max = (base_backoff_secs / 2).max(1);
+    let jitter = hasher.finish() % (jitter_max + 1);
+
+    base_backoff_secs.saturating_add(jitter)
+}
+
 fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> {
     if subject.is_empty() {
         return None;
@@ -990,6 +1066,25 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
     }
 
     Some((subject.to_string(), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jittered_backoff_secs;
+
+    #[test]
+    fn jittered_backoff_is_deterministic_for_same_inputs() {
+        let first = jittered_backoff_secs(30, "key@ver|node", 2);
+        let second = jittered_backoff_secs(30, "key@ver|node", 2);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_expected_range() {
+        let value = jittered_backoff_secs(40, "another-key|node", 3);
+        assert!(value >= 40);
+        assert!(value <= 60);
+    }
 }
 
 fn unix_ts() -> u64 {
