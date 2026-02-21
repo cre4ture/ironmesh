@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
+use common::NodeId;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -206,6 +207,7 @@ pub struct PersistentStore {
     reconcile_markers_dir: PathBuf,
     current_state_path: PathBuf,
     repair_attempts_path: PathBuf,
+    cluster_replicas_path: PathBuf,
     current_state: CurrentState,
 }
 
@@ -229,6 +231,7 @@ impl PersistentStore {
         let state_dir = root_dir.join("state");
         let current_state_path = state_dir.join("current.json");
         let repair_attempts_path = state_dir.join("repair_attempts.json");
+        let cluster_replicas_path = state_dir.join("cluster_replicas.json");
 
         fs::create_dir_all(&chunks_dir).await?;
         fs::create_dir_all(&manifests_dir).await?;
@@ -255,6 +258,7 @@ impl PersistentStore {
             reconcile_markers_dir,
             current_state_path,
             repair_attempts_path,
+            cluster_replicas_path,
             current_state,
         })
     }
@@ -282,6 +286,31 @@ impl PersistentStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(attempts)?;
         write_atomic(&self.repair_attempts_path, &payload).await
+    }
+
+    pub async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
+        if !fs::try_exists(&self.cluster_replicas_path).await? {
+            return Ok(HashMap::new());
+        }
+
+        let payload = fs::read(&self.cluster_replicas_path).await?;
+        let replicas = serde_json::from_slice::<HashMap<String, Vec<NodeId>>>(&payload)
+            .with_context(|| {
+                format!(
+                    "invalid cluster replicas state: {}",
+                    self.cluster_replicas_path.display()
+                )
+            })?;
+
+        Ok(replicas)
+    }
+
+    pub async fn persist_cluster_replicas(
+        &self,
+        replicas: &HashMap<String, Vec<NodeId>>,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(replicas)?;
+        write_atomic(&self.cluster_replicas_path, &payload).await
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -1829,6 +1858,36 @@ mod tests {
                 .iter()
                 .all(|entry| entry.version_id != put.version_id)
         );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn load_cluster_replicas_returns_empty_when_file_missing() {
+        let root = test_store_dir("cluster-replicas-empty");
+        let store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let replicas = store.load_cluster_replicas().await.unwrap();
+        assert!(replicas.is_empty());
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn persist_and_load_cluster_replicas_roundtrip() {
+        let root = test_store_dir("cluster-replicas-roundtrip");
+        let store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let mut replicas: HashMap<String, Vec<NodeId>> = HashMap::new();
+        replicas.insert(
+            "subject-a".to_string(),
+            vec![NodeId::new_v4(), NodeId::new_v4()],
+        );
+
+        store.persist_cluster_replicas(&replicas).await.unwrap();
+        let loaded = store.load_cluster_replicas().await.unwrap();
+
+        assert_eq!(loaded.get("subject-a").map(Vec::len), Some(2));
 
         let _ = fs::remove_dir_all(root).await;
     }

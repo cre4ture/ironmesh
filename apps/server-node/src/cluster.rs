@@ -191,6 +191,24 @@ impl ClusterService {
             .insert(node_id);
     }
 
+    pub fn import_replicas_by_key(&mut self, replicas: HashMap<String, Vec<NodeId>>) {
+        self.replicas_by_key = replicas
+            .into_iter()
+            .map(|(key, nodes)| (key, nodes.into_iter().collect::<HashSet<_>>()))
+            .collect();
+    }
+
+    pub fn export_replicas_by_key(&self) -> HashMap<String, Vec<NodeId>> {
+        self.replicas_by_key
+            .iter()
+            .map(|(key, nodes)| {
+                let mut ordered: Vec<NodeId> = nodes.iter().copied().collect();
+                ordered.sort();
+                (key.clone(), ordered)
+            })
+            .collect()
+    }
+
     pub fn remove_replica(&mut self, key: &str, node_id: NodeId) {
         if let Some(nodes) = self.replicas_by_key.get_mut(key) {
             nodes.remove(&node_id);
@@ -492,5 +510,25 @@ mod tests {
 
         let after = svc.replication_plan(&["subject-a".to_string()]);
         assert!(after.items.is_empty());
+    }
+
+    #[test]
+    fn import_export_replicas_roundtrip() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+
+        let mut replicas = HashMap::new();
+        replicas.insert("subject-a".to_string(), vec![node_b, node_a]);
+
+        svc.import_replicas_by_key(replicas);
+        let exported = svc.export_replicas_by_key();
+
+        assert_eq!(exported.get("subject-a").map(Vec::len), Some(2));
+        let nodes = exported.get("subject-a").unwrap();
+        assert!(nodes.contains(&node_a));
+        assert!(nodes.contains(&node_b));
     }
 }

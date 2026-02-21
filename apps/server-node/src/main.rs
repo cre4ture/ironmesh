@@ -180,9 +180,22 @@ async fn main() -> Result<()> {
         status: cluster::NodeStatus::Online,
     });
 
+    let store = Arc::new(Mutex::new(PersistentStore::init(data_dir).await?));
+    let persisted_cluster_replicas = {
+        let store_guard = store.lock().await;
+        match store_guard.load_cluster_replicas().await {
+            Ok(replicas) => replicas,
+            Err(err) => {
+                warn!(error = %err, "failed to load cluster replica state; starting empty");
+                HashMap::new()
+            }
+        }
+    };
+    cluster.import_replicas_by_key(persisted_cluster_replicas);
+
     let state = ServerState {
         node_id,
-        store: Arc::new(Mutex::new(PersistentStore::init(data_dir).await?)),
+        store,
         cluster: Arc::new(Mutex::new(cluster)),
         metadata_commit_mode,
         repair_config,
@@ -475,6 +488,11 @@ async fn put_object(
                 format!("{}@{}", key, outcome.version_id.as_str()),
                 state.node_id,
             );
+            drop(cluster);
+
+            if let Err(err) = persist_cluster_replicas_state(&state).await {
+                warn!(error = %err, "failed to persist cluster replicas after put");
+            }
 
             info!(
                 key = %key,
@@ -792,6 +810,11 @@ async fn drop_replication_subject(
         if let Some(version_id) = &query.version_id {
             cluster.remove_replica(&format!("{}@{}", query.key, version_id), state.node_id);
         }
+        drop(cluster);
+
+        if let Err(err) = persist_cluster_replicas_state(&state).await {
+            warn!(error = %err, "failed to persist cluster replicas after drop");
+        }
     }
 
     (StatusCode::OK, Json(ReplicationDropReport { dropped })).into_response()
@@ -946,6 +969,14 @@ async fn execute_replication_cleanup(
                         &format!("{}@{}", candidate.key, candidate.version_id),
                         candidate.node_id,
                     );
+                    drop(cluster);
+
+                    if let Err(err) = persist_cluster_replicas_state(&state).await {
+                        warn!(
+                            error = %err,
+                            "failed to persist cluster replicas after cleanup deletion"
+                        );
+                    }
                 }
                 _ => {
                     failed_deletions += 1;
@@ -1028,6 +1059,14 @@ async fn push_replication_manifest(
             let mut cluster = state.cluster.lock().await;
             cluster.note_replica(&query.key, state.node_id);
             cluster.note_replica(format!("{}@{}", query.key, version_id), state.node_id);
+            drop(cluster);
+
+            if let Err(err) = persist_cluster_replicas_state(&state).await {
+                warn!(
+                    error = %err,
+                    "failed to persist cluster replicas after manifest import"
+                );
+            }
 
             (
                 StatusCode::OK,
@@ -1168,6 +1207,14 @@ async fn execute_replication_repair_inner(
                         cluster.note_replica(&key, target);
                     }
                     cluster.note_replica(format!("{key}@{remote_version_id}"), target);
+                    drop(cluster);
+
+                    if let Err(err) = persist_cluster_replicas_state(state).await {
+                        warn!(
+                            error = %err,
+                            "failed to persist cluster replicas after repair success"
+                        );
+                    }
 
                     let mut repair_state = state.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
@@ -1283,6 +1330,16 @@ async fn persist_repair_state(state: &ServerState) -> Result<()> {
 
     let store = state.store.lock().await;
     store.persist_repair_attempts(&attempts).await
+}
+
+async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
+    let replicas = {
+        let cluster = state.cluster.lock().await;
+        cluster.export_replicas_by_key()
+    };
+
+    let store = state.store.lock().await;
+    store.persist_cluster_replicas(&replicas).await
 }
 
 fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u32) -> u64 {
@@ -1604,6 +1661,14 @@ async fn reconcile_from_node(
                     format!("{}@{}", entry.key, outcome.version_id.as_str()),
                     state.node_id,
                 );
+                drop(cluster);
+
+                if let Err(err) = persist_cluster_replicas_state(&state).await {
+                    warn!(
+                        error = %err,
+                        "failed to persist cluster replicas after reconciliation import"
+                    );
+                }
             }
             Err(err) => {
                 tracing::error!(
