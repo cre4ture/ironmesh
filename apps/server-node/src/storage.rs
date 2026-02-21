@@ -85,17 +85,12 @@ pub enum PreferredHeadReason {
     DeterministicTiebreakVersionId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ObjectReadMode {
+    #[default]
     Preferred,
     ConfirmedOnly,
     ProvisionalAllowed,
-}
-
-impl Default for ObjectReadMode {
-    fn default() -> Self {
-        Self::Preferred
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
