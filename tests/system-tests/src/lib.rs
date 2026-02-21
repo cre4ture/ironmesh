@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::ffi::OsString;
+    use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::sync::OnceLock;
-    use std::time::SystemTime;
     use std::time::Duration;
+    use std::time::SystemTime;
 
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
@@ -194,8 +194,7 @@ mod tests {
                 .error_for_status()?
                 .text()
                 .await?;
-            let first_versions: serde_json::Value =
-                serde_json::from_str(&first_versions_payload)?;
+            let first_versions: serde_json::Value = serde_json::from_str(&first_versions_payload)?;
 
             let first_version_id = first_versions
                 .get("versions")
@@ -359,7 +358,10 @@ mod tests {
                 .get("missing_nodes")
                 .and_then(|v| v.as_array())
                 .context("missing_nodes absent in plan item")?;
-            assert!(!missing.is_empty(), "expected missing replicas in multi-node plan");
+            assert!(
+                !missing.is_empty(),
+                "expected missing replicas in multi-node plan"
+            );
 
             Ok::<(), anyhow::Error>(())
         }
@@ -396,7 +398,10 @@ mod tests {
         command
             .env("IRONMESH_SERVER_BIND", bind)
             .env("IRONMESH_DATA_DIR", data_dir)
-            .env("IRONMESH_REPLICATION_FACTOR", replication_factor.to_string())
+            .env(
+                "IRONMESH_REPLICATION_FACTOR",
+                replication_factor.to_string(),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
@@ -568,9 +573,8 @@ mod tests {
     fn ensure_binaries_built(workspace_root: &PathBuf) -> Result<()> {
         static BUILD_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
-        let result = BUILD_RESULT.get_or_init(|| {
-            build_required_binaries(workspace_root).map_err(|err| err.to_string())
-        });
+        let result = BUILD_RESULT
+            .get_or_init(|| build_required_binaries(workspace_root).map_err(|err| err.to_string()));
 
         if let Err(message) = result {
             bail!("failed to build required binaries: {message}");

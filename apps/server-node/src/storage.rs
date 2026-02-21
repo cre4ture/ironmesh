@@ -154,8 +154,9 @@ impl PersistentStore {
 
         let current_state = if fs::try_exists(&current_state_path).await? {
             let payload = fs::read(&current_state_path).await?;
-            serde_json::from_slice::<CurrentState>(&payload)
-                .with_context(|| format!("invalid current state: {}", current_state_path.display()))?
+            serde_json::from_slice::<CurrentState>(&payload).with_context(|| {
+                format!("invalid current state: {}", current_state_path.display())
+            })?
         } else {
             CurrentState::default()
         };
@@ -506,9 +507,13 @@ impl PersistentStore {
             .versions
             .get(preferred_head)
             .map(|record| record.manifest_hash.clone())
-            .with_context(|| format!("preferred head {preferred_head} missing in index for key={key}"))?;
+            .with_context(|| {
+                format!("preferred head {preferred_head} missing in index for key={key}")
+            })?;
 
-        self.current_state.objects.insert(key.to_string(), manifest_hash);
+        self.current_state
+            .objects
+            .insert(key.to_string(), manifest_hash);
         Ok(())
     }
 
@@ -664,13 +669,22 @@ mod tests {
     #[test]
     fn preferred_head_prioritizes_confirmed_over_newer_provisional() {
         let mut index = empty_version_index("k");
-        index
-            .versions
-            .insert("v-old-confirmed".to_string(), mk_record("v-old-confirmed", VersionConsistencyState::Confirmed, 10));
-        index
-            .versions
-            .insert("v-new-provisional".to_string(), mk_record("v-new-provisional", VersionConsistencyState::Provisional, 100));
-        index.head_version_ids = vec!["v-old-confirmed".to_string(), "v-new-provisional".to_string()];
+        index.versions.insert(
+            "v-old-confirmed".to_string(),
+            mk_record("v-old-confirmed", VersionConsistencyState::Confirmed, 10),
+        );
+        index.versions.insert(
+            "v-new-provisional".to_string(),
+            mk_record(
+                "v-new-provisional",
+                VersionConsistencyState::Provisional,
+                100,
+            ),
+        );
+        index.head_version_ids = vec![
+            "v-old-confirmed".to_string(),
+            "v-new-provisional".to_string(),
+        ];
 
         let preferred = choose_preferred_head(&index);
         assert_eq!(preferred.as_deref(), Some("v-old-confirmed"));
@@ -679,12 +693,14 @@ mod tests {
     #[test]
     fn preferred_head_uses_latest_when_same_state() {
         let mut index = empty_version_index("k");
-        index
-            .versions
-            .insert("v1".to_string(), mk_record("v1", VersionConsistencyState::Confirmed, 11));
-        index
-            .versions
-            .insert("v2".to_string(), mk_record("v2", VersionConsistencyState::Confirmed, 22));
+        index.versions.insert(
+            "v1".to_string(),
+            mk_record("v1", VersionConsistencyState::Confirmed, 11),
+        );
+        index.versions.insert(
+            "v2".to_string(),
+            mk_record("v2", VersionConsistencyState::Confirmed, 22),
+        );
         index.head_version_ids = vec!["v1".to_string(), "v2".to_string()];
 
         let preferred = choose_preferred_head(&index);

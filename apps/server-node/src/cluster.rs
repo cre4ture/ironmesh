@@ -192,7 +192,12 @@ impl ClusterService {
             missing_nodes.sort();
 
             let mut extra_nodes: Vec<_> = current_set.difference(&desired_set).copied().collect();
-            extra_nodes.sort_by_key(|node_id| self.nodes.get(node_id).map(|node| node.free_bytes).unwrap_or(0));
+            extra_nodes.sort_by_key(|node_id| {
+                self.nodes
+                    .get(node_id)
+                    .map(|node| node.free_bytes)
+                    .unwrap_or(0)
+            });
 
             if !missing_nodes.is_empty() || !extra_nodes.is_empty() {
                 items.push(ReplicationPlanItem {
@@ -252,22 +257,29 @@ fn select_nodes_by_rendezvous(
             None => continue,
         };
 
-        let helps_constraint = policy.min_distinct_labels.iter().any(|(label_key, min_needed)| {
-            let current_count = seen_label_values
-                .get(label_key)
-                .map(HashSet::len)
-                .unwrap_or(0);
+        let helps_constraint = policy
+            .min_distinct_labels
+            .iter()
+            .any(|(label_key, min_needed)| {
+                let current_count = seen_label_values
+                    .get(label_key)
+                    .map(HashSet::len)
+                    .unwrap_or(0);
 
-            if current_count >= *min_needed {
-                return false;
-            }
+                if current_count >= *min_needed {
+                    return false;
+                }
 
-            let value = node.labels.get(label_key).cloned().unwrap_or_else(|| "_unknown".to_string());
-            !seen_label_values
-                .get(label_key)
-                .map(|values| values.contains(&value))
-                .unwrap_or(false)
-        });
+                let value = node
+                    .labels
+                    .get(label_key)
+                    .cloned()
+                    .unwrap_or_else(|| "_unknown".to_string());
+                !seen_label_values
+                    .get(label_key)
+                    .map(|values| values.contains(&value))
+                    .unwrap_or(false)
+            });
 
         if helps_constraint || selected.len() < policy.min_distinct_labels.len() {
             selected.push(*node_id);

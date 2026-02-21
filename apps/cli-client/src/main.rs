@@ -20,8 +20,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Put { key: String, value: String },
-    Get { key: String },
+    Put {
+        key: String,
+        value: String,
+    },
+    Get {
+        key: String,
+    },
     CacheList,
     ServeWeb {
         #[arg(long, default_value = "127.0.0.1:8081")]

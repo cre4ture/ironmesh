@@ -1,5 +1,5 @@
 pub fn app_html() -> String {
-        r#"<!doctype html>
+    r#"<!doctype html>
 <html lang=\"en\">
 <head>
     <meta charset=\"utf-8\" />

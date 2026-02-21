@@ -19,9 +19,7 @@ mod cluster;
 mod storage;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
-use storage::{
-    PersistentStore, PutOptions, SnapshotInfo, StoreReadError, VersionConsistencyState,
-};
+use storage::{PersistentStore, PutOptions, SnapshotInfo, StoreReadError, VersionConsistencyState};
 
 #[derive(Clone)]
 struct ServerState {
@@ -43,7 +41,8 @@ async fn main() -> Result<()> {
         .and_then(|value| value.parse::<NodeId>().ok())
         .unwrap_or_else(NodeId::new_v4);
 
-    let data_dir = std::env::var("IRONMESH_DATA_DIR").unwrap_or_else(|_| "./data/server-node".to_string());
+    let data_dir =
+        std::env::var("IRONMESH_DATA_DIR").unwrap_or_else(|_| "./data/server-node".to_string());
     let bind_addr: SocketAddr = std::env::var("IRONMESH_SERVER_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
         .parse()
@@ -63,7 +62,8 @@ async fn main() -> Result<()> {
         std::env::var("IRONMESH_RACK").unwrap_or_else(|_| "local-rack".to_string()),
     );
 
-    let public_url = std::env::var("IRONMESH_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind_addr}"));
+    let public_url =
+        std::env::var("IRONMESH_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind_addr}"));
 
     let heartbeat_timeout_secs = std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
         .ok()
@@ -120,7 +120,10 @@ async fn main() -> Result<()> {
         .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route("/cluster/replication/plan", get(replication_plan))
-        .route("/cluster/replication/audit", post(trigger_replication_audit))
+        .route(
+            "/cluster/replication/audit",
+            post(trigger_replication_audit),
+        )
         .with_state(state);
 
     info!(%bind_addr, %node_id, "server node listening");
@@ -348,7 +351,10 @@ async fn get_object(
     }
 }
 
-async fn list_versions(State(state): State<ServerState>, Path(key): Path<String>) -> impl IntoResponse {
+async fn list_versions(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
     let store = state.store.lock().await;
     match store.list_versions(&key).await {
         Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
