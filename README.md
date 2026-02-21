@@ -20,6 +20,33 @@ cargo run -p server-node
 cargo run -p cli-client -- --help
 ```
 
+## System-tests toolchain policy (nightly)
+
+`tests/system-tests` uses Cargo binary artifact dependencies to consume `server-node` and `cli-client` binaries directly during test runs.
+
+Why this was chosen:
+
+- Avoids nested `cargo build` calls from inside tests.
+- Prevents duplicate compilation phases during one test invocation.
+- Reduces side effects and timing noise that made integration tests flaky.
+- Makes binary provisioning explicit in Cargo dependency resolution.
+
+Current setup:
+
+- Workspace is pinned to nightly via `rust-toolchain.toml`.
+- `bindeps` is enabled in `.cargo/config.toml`.
+
+If you must run with stable for local work, use explicit binaries instead of artifact deps:
+
+```bash
+cargo build -p server-node -p cli-client
+IRONMESH_SERVER_BIN=target/debug/server-node \
+IRONMESH_CLI_BIN=target/debug/cli-client \
+cargo +stable test -p system-tests
+```
+
+Note: CI/push hooks may enforce stricter checks across the workspace. If local commits are needed while unrelated lint debt exists in untouched crates, use local-only commits and avoid pushing until lint debt is resolved.
+
 ## Local 4-node cluster (manual testing)
 
 Use the helper script to start/stop a 4-node cluster on one machine with isolated data dirs:
