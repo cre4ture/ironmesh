@@ -34,7 +34,10 @@ struct ServerState {
     metadata_commit_mode: MetadataCommitMode,
     internal_node_tokens: Arc<Mutex<HashMap<NodeId, String>>>,
     autonomous_replication_on_put_enabled: bool,
+    replication_audit_interval_secs: u64,
+    peer_heartbeat_config: PeerHeartbeatConfig,
     repair_config: RepairConfig,
+    startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
 }
 
@@ -58,6 +61,25 @@ struct RepairConfig {
 struct PeerHeartbeatConfig {
     enabled: bool,
     interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StartupRepairStatus {
+    Disabled,
+    Scheduled,
+    Running,
+    SkippedNoGaps,
+    Completed,
+}
+
+fn startup_repair_status_label(status: StartupRepairStatus) -> &'static str {
+    match status {
+        StartupRepairStatus::Disabled => "disabled",
+        StartupRepairStatus::Scheduled => "scheduled",
+        StartupRepairStatus::Running => "running",
+        StartupRepairStatus::SkippedNoGaps => "completed (no gaps)",
+        StartupRepairStatus::Completed => "completed",
+    }
 }
 
 impl RepairConfig {
@@ -218,6 +240,11 @@ async fn main() -> Result<()> {
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
             .unwrap_or(true);
     let peer_heartbeat_config = PeerHeartbeatConfig::from_env();
+    let startup_repair_status = if repair_config.startup_repair_enabled {
+        StartupRepairStatus::Scheduled
+    } else {
+        StartupRepairStatus::Disabled
+    };
 
     let policy = ReplicationPolicy {
         replication_factor,
@@ -273,7 +300,10 @@ async fn main() -> Result<()> {
         metadata_commit_mode,
         internal_node_tokens: Arc::new(Mutex::new(internal_node_tokens)),
         autonomous_replication_on_put_enabled,
+        replication_audit_interval_secs: audit_interval_secs,
+        peer_heartbeat_config,
         repair_config,
+        startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
     };
 
@@ -438,8 +468,17 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
 fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
     tokio::spawn(async move {
+        {
+            let mut status = state.startup_repair_status.lock().await;
+            *status = StartupRepairStatus::Running;
+        }
+
         match run_startup_replication_repair_once(&state, delay_secs).await {
             Some((plan, report)) => {
+                {
+                    let mut status = state.startup_repair_status.lock().await;
+                    *status = StartupRepairStatus::Completed;
+                }
                 info!(
                     delay_secs,
                     under_replicated = plan.under_replicated,
@@ -455,6 +494,10 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
                 );
             }
             None => {
+                {
+                    let mut status = state.startup_repair_status.lock().await;
+                    *status = StartupRepairStatus::SkippedNoGaps;
+                }
                 info!(
                     delay_secs,
                     "startup replication repair skipped: no replication gaps detected"
@@ -587,6 +630,35 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
         )
     };
 
+    let (replication_plan_items, under_replicated, over_replicated) = {
+        let keys = {
+            let store = state.store.lock().await;
+            store
+                .list_replication_subjects()
+                .await
+                .unwrap_or_else(|_| store.current_keys())
+        };
+
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        let plan = cluster.replication_plan(&keys);
+        (plan.items.len(), plan.under_replicated, plan.over_replicated)
+    };
+
+    let startup_repair_status = {
+        let status = state.startup_repair_status.lock().await;
+        startup_repair_status_label(*status)
+    };
+
+    let peer_heartbeat_status = if state.peer_heartbeat_config.enabled {
+        format!(
+            "enabled (every {}s)",
+            state.peer_heartbeat_config.interval_secs.max(1)
+        )
+    } else {
+        "disabled".to_string()
+    };
+
     let latest_snapshot = snapshots
         .first()
         .map(|s| s.id.clone())
@@ -615,6 +687,14 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
     <p>Data directory: <code>{}</code></p>
     <p>Cluster nodes online/total: <code>{}/{}</code></p>
     <p>Replication factor target: <code>{}</code></p>
+        <h2>Background work</h2>
+        <ul>
+            <li><strong>Autonomous post-write replication</strong>: <code>{}</code></li>
+            <li><strong>Periodic replication audit</strong>: <code>enabled (every {}s)</code></li>
+            <li><strong>Autonomous peer heartbeat emitter</strong>: <code>{}</code></li>
+            <li><strong>Startup one-shot repair</strong>: <code>{}</code> (delay: <code>{}s</code>)</li>
+            <li><strong>Current replication backlog</strong>: plan items=<code>{}</code>, under-replicated=<code>{}</code>, over-replicated=<code>{}</code></li>
+        </ul>
     <h2>Available routes</h2>
     <ul>
       <li><code>GET /</code> — info page</li>
@@ -651,6 +731,18 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
         cluster_online,
         cluster_total,
         replication_factor,
+        if state.autonomous_replication_on_put_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        state.replication_audit_interval_secs.max(5),
+        peer_heartbeat_status,
+        startup_repair_status,
+        state.repair_config.startup_repair_delay_secs,
+        replication_plan_items,
+        under_replicated,
+        over_replicated,
     );
 
     Html(body)
@@ -2110,7 +2202,8 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 #[cfg(test)]
 mod tests {
     use super::{
-        MetadataCommitMode, RepairConfig, RepairExecutorState, ServerState,
+        MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState, ServerState,
+        StartupRepairStatus,
         build_internal_replication_put_url, build_store_index_entries, cluster, constant_time_eq,
         expected_internal_token_for_node, internal_node_header_valid, internal_token_matches,
         jittered_backoff_secs, parse_internal_node_tokens, run_startup_replication_repair_once,
@@ -2326,6 +2419,11 @@ mod tests {
             metadata_commit_mode: MetadataCommitMode::Local,
             internal_node_tokens: Arc::new(Mutex::new(HashMap::new())),
             autonomous_replication_on_put_enabled: false,
+            replication_audit_interval_secs: 3600,
+            peer_heartbeat_config: PeerHeartbeatConfig {
+                enabled: false,
+                interval_secs: 15,
+            },
             repair_config: RepairConfig {
                 enabled: true,
                 batch_size: 32,
@@ -2334,6 +2432,7 @@ mod tests {
                 startup_repair_enabled: true,
                 startup_repair_delay_secs: 0,
             },
+            startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         };
 

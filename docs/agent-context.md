@@ -99,6 +99,14 @@ Validation added:
 - Unit test `autonomous_post_write_replication_trigger_guard_blocks_internal_writes`
 - Unit test `internal_replication_put_url_sets_internal_flag`
 
+### 7) Node web UI background-work overview
+
+Implemented on `GET /` page:
+
+- Active background workers (autonomous post-write replication, periodic audit, peer heartbeat).
+- Startup one-shot repair status (`scheduled`/`running`/`completed`/`no gaps`/`disabled`).
+- Current replication backlog summary (plan items, under-replicated, over-replicated).
+
 ## Key Files Touched Recently
 
 - `apps/server-node/src/main.rs`
