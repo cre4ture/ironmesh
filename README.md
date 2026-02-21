@@ -49,7 +49,7 @@ CI enforces a minimum line coverage floor using `cargo-llvm-cov`:
 ```bash
 cargo llvm-cov --workspace --all-features --summary-only \
 	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/server-node/src/main.rs|crates/common/src/lib.rs' \
-	--fail-under-lines 33
+	--fail-under-lines 70
 ```
 
 Notes:
