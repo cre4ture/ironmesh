@@ -112,6 +112,8 @@ Those bridges can be added incrementally without changing the workspace topology
 
 - Internal replication mutation endpoints can be restricted with:
 	- `IRONMESH_INTERNAL_NODE_TOKENS` (per-node token map: `<node_uuid>=<token>,<node_uuid>=<token>,...`).
+- When configured, the local server node id must have a token entry in `IRONMESH_INTERNAL_NODE_TOKENS`.
+- Duplicate node ids in `IRONMESH_INTERNAL_NODE_TOKENS` are rejected at startup.
 - When auth is configured, requests to these endpoints must include headers:
 	- `x-ironmesh-internal-token: <token>`
 	- `x-ironmesh-node-id: <uuid>` (must be a registered cluster node)

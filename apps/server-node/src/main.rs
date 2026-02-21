@@ -169,6 +169,12 @@ async fn main() -> Result<()> {
         .transpose()?
         .unwrap_or_default();
 
+    if !internal_node_tokens.is_empty() && !internal_node_tokens.contains_key(&node_id) {
+        return Err(anyhow::anyhow!(
+            "IRONMESH_INTERNAL_NODE_TOKENS is configured but has no token for local node {node_id}"
+        ));
+    }
+
     let repair_config = RepairConfig::from_env();
 
     let policy = ReplicationPolicy {
@@ -1410,7 +1416,7 @@ async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap
         .get("x-ironmesh-node-id")
         .and_then(|value| value.to_str().ok());
 
-    if !internal_node_header_valid(true, node_id_header) {
+    if !internal_node_header_valid(node_id_header) {
         return false;
     }
 
@@ -1439,7 +1445,7 @@ async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap
         return false;
     };
 
-    internal_token_matches(Some(expected), provided_token)
+    internal_token_matches(expected, provided_token)
 }
 
 fn internal_outbound_token(state: &ServerState) -> Option<String> {
@@ -1480,27 +1486,39 @@ fn parse_internal_node_tokens(raw: &str) -> Result<HashMap<NodeId, String>> {
             ));
         }
 
-        parsed.insert(node_id, token.to_string());
+        if parsed.insert(node_id, token.to_string()).is_some() {
+            return Err(anyhow::anyhow!(
+                "duplicate node id {node_id} in IRONMESH_INTERNAL_NODE_TOKENS"
+            ));
+        }
     }
 
     Ok(parsed)
 }
 
-fn internal_token_matches(configured: Option<&str>, provided: Option<&str>) -> bool {
-    match configured {
-        None => true,
-        Some(expected) => provided.map(|token| token == expected).unwrap_or(false),
-    }
+fn internal_token_matches(expected: &str, provided: Option<&str>) -> bool {
+    provided
+        .map(|token| constant_time_eq(expected.as_bytes(), token.as_bytes()))
+        .unwrap_or(false)
 }
 
-fn internal_node_header_valid(auth_enabled: bool, provided: Option<&str>) -> bool {
-    if !auth_enabled {
-        return true;
-    }
-
+fn internal_node_header_valid(provided: Option<&str>) -> bool {
     provided
         .and_then(|value| value.parse::<NodeId>().ok())
         .is_some()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+
+    for index in 0..max_len {
+        let left_byte = *left.get(index).unwrap_or(&0);
+        let right_byte = *right.get(index).unwrap_or(&0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+
+    diff == 0
 }
 
 fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> {
@@ -1521,8 +1539,8 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 #[cfg(test)]
 mod tests {
     use super::{
-        expected_internal_token_for_node, internal_node_header_valid, internal_token_matches,
-        jittered_backoff_secs, parse_internal_node_tokens,
+        constant_time_eq, expected_internal_token_for_node, internal_node_header_valid,
+        internal_token_matches, jittered_backoff_secs, parse_internal_node_tokens,
     };
     use common::NodeId;
     use std::collections::HashMap;
@@ -1542,27 +1560,26 @@ mod tests {
     }
 
     #[test]
-    fn internal_token_auth_without_expected_token_does_not_enforce_match() {
-        assert!(internal_token_matches(None, None));
-        assert!(internal_token_matches(None, Some("anything")));
+    fn constant_time_eq_compares_equal_and_non_equal_values() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"Secret"));
+        assert!(!constant_time_eq(b"secret", b"secret-long"));
     }
 
     #[test]
     fn internal_token_auth_requires_exact_match_when_configured() {
-        assert!(!internal_token_matches(Some("secret"), None));
-        assert!(!internal_token_matches(Some("secret"), Some("wrong")));
-        assert!(internal_token_matches(Some("secret"), Some("secret")));
+        assert!(!internal_token_matches("secret", None));
+        assert!(!internal_token_matches("secret", Some("wrong")));
+        assert!(internal_token_matches("secret", Some("secret")));
     }
 
     #[test]
     fn internal_node_header_rules_match_token_mode() {
-        assert!(internal_node_header_valid(false, None));
-        assert!(!internal_node_header_valid(true, None));
-        assert!(!internal_node_header_valid(true, Some("not-a-uuid")));
-        assert!(internal_node_header_valid(
-            true,
-            Some("00000000-0000-0000-0000-000000000001")
-        ));
+        assert!(!internal_node_header_valid(None));
+        assert!(!internal_node_header_valid(Some("not-a-uuid")));
+        assert!(internal_node_header_valid(Some(
+            "00000000-0000-0000-0000-000000000001"
+        )));
     }
 
     #[test]
@@ -1573,6 +1590,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn parse_internal_node_tokens_rejects_duplicate_node_ids() {
+        let duplicate =
+            "00000000-0000-0000-0000-000000000001=tok-a,00000000-0000-0000-0000-000000000001=tok-b";
+        assert!(parse_internal_node_tokens(duplicate).is_err());
     }
 
     #[test]

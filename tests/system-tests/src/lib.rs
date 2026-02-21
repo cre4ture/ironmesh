@@ -1191,6 +1191,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_replication_drop_rejects_malformed_node_id_header() -> Result<()> {
+        let bind = "127.0.0.1:19119";
+        let node_id = "00000000-0000-0000-0000-0000000006da";
+        let data_dir = fresh_data_dir("internal-auth-malformed-node-id");
+        let node_tokens = format!("{node_id}=secret-5");
+
+        let mut server = start_server_with_env(
+            bind,
+            &data_dir,
+            node_id,
+            1,
+            &[("IRONMESH_INTERNAL_NODE_TOKENS", node_tokens.as_str())],
+        )
+        .await?;
+
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            let response = http
+                .post(format!("{base_url}/cluster/replication/drop"))
+                .query(&[("key", "missing-key")])
+                .header("x-ironmesh-node-id", "not-a-uuid")
+                .header("x-ironmesh-internal-token", "secret-5")
+                .send()
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
+    async fn internal_replication_drop_rejects_registered_node_without_token_mapping() -> Result<()>
+    {
+        let bind = "127.0.0.1:19120";
+        let controller_node_id = "00000000-0000-0000-0000-0000000006eb";
+        let caller_node_id = "00000000-0000-0000-0000-0000000006fc";
+        let data_dir = fresh_data_dir("internal-auth-registered-no-token");
+        let node_tokens = format!("{controller_node_id}=secret-controller");
+
+        let mut server = start_server_with_env(
+            bind,
+            &data_dir,
+            controller_node_id,
+            1,
+            &[("IRONMESH_INTERNAL_NODE_TOKENS", node_tokens.as_str())],
+        )
+        .await?;
+
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(
+                &http,
+                &base_url,
+                caller_node_id,
+                "http://127.0.0.1:29997",
+                "dc-caller",
+                "rack-caller",
+            )
+            .await?;
+
+            let response = http
+                .post(format!("{base_url}/cluster/replication/drop"))
+                .query(&[("key", "missing-key")])
+                .header("x-ironmesh-node-id", caller_node_id)
+                .header("x-ironmesh-internal-token", "secret-controller")
+                .send()
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
     async fn rejoin_reconciliation_preserves_provisional_branches() -> Result<()> {
         let bind_a = "127.0.0.1:19100";
         let bind_b = "127.0.0.1:19101";
