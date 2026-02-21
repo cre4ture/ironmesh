@@ -94,6 +94,11 @@ Fix:
 - Internal transfer writes now set `internal_replication=1` query flag.
 - `put_object` skips autonomous post-write repair trigger when `internal_replication` is set.
 
+Validation added:
+
+- Unit test `autonomous_post_write_replication_trigger_guard_blocks_internal_writes`
+- Unit test `internal_replication_put_url_sets_internal_flag`
+
 ## Key Files Touched Recently
 
 - `apps/server-node/src/main.rs`

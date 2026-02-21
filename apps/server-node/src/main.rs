@@ -703,6 +703,13 @@ struct PutObjectQuery {
     internal_replication: bool,
 }
 
+fn should_trigger_autonomous_post_write_replication(
+    autonomous_replication_on_put_enabled: bool,
+    internal_replication: bool,
+) -> bool {
+    autonomous_replication_on_put_enabled && !internal_replication
+}
+
 async fn put_object(
     State(state): State<ServerState>,
     Path(key): Path<String>,
@@ -743,7 +750,10 @@ async fn put_object(
                 warn!(error = %err, "failed to persist cluster replicas after put");
             }
 
-            if state.autonomous_replication_on_put_enabled && !query.internal_replication {
+            if should_trigger_autonomous_post_write_replication(
+                state.autonomous_replication_on_put_enabled,
+                query.internal_replication,
+            ) {
                 let state_for_repair = state.clone();
                 tokio::spawn(async move {
                     let report = execute_replication_repair_inner(&state_for_repair, None).await;
@@ -1858,10 +1868,7 @@ async fn replicate_bundle_to_target(
         VersionConsistencyState::Provisional => "provisional",
     };
 
-    let put_url = format!(
-        "{target_base_url}/store/{}?state={state_query}&internal_replication=1",
-        bundle.key
-    );
+    let put_url = build_internal_replication_put_url(target_base_url, &bundle.key, state_query);
     http.put(put_url)
         .body(assembled.freeze())
         .send()
@@ -1888,6 +1895,12 @@ async fn replicate_bundle_to_target(
 
     let report = response.json::<ReplicationManifestPushReport>().await?;
     Ok(report.version_id)
+}
+
+fn build_internal_replication_put_url(target_base_url: &str, key: &str, state_query: &str) -> String {
+    format!(
+        "{target_base_url}/store/{key}?state={state_query}&internal_replication=true"
+    )
 }
 
 async fn persist_repair_state(state: &ServerState) -> Result<()> {
@@ -2096,9 +2109,10 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 mod tests {
     use super::{
         MetadataCommitMode, RepairConfig, RepairExecutorState, ServerState,
-        build_store_index_entries, cluster, constant_time_eq, expected_internal_token_for_node,
-        internal_node_header_valid, internal_token_matches, jittered_backoff_secs,
-        parse_internal_node_tokens, run_startup_replication_repair_once,
+        build_internal_replication_put_url, build_store_index_entries, cluster, constant_time_eq,
+        expected_internal_token_for_node, internal_node_header_valid, internal_token_matches,
+        jittered_backoff_secs, parse_internal_node_tokens,
+        run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
     };
     use common::NodeId;
     use std::path::PathBuf;
@@ -2213,6 +2227,21 @@ mod tests {
         key_paths.sort();
 
         assert_eq!(key_paths, vec!["images/cat.png", "images/dogs/beagle.png"]);
+    }
+
+    #[test]
+    fn autonomous_post_write_replication_trigger_guard_blocks_internal_writes() {
+        assert!(should_trigger_autonomous_post_write_replication(true, false));
+        assert!(!should_trigger_autonomous_post_write_replication(true, true));
+        assert!(!should_trigger_autonomous_post_write_replication(false, false));
+    }
+
+    #[test]
+    fn internal_replication_put_url_sets_internal_flag() {
+        let url = build_internal_replication_put_url("http://127.0.0.1:18080", "hello", "confirmed");
+        assert!(url.contains("/store/hello?"));
+        assert!(url.contains("state=confirmed"));
+        assert!(url.contains("internal_replication=true"));
     }
 
     #[tokio::test]
