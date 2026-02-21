@@ -12,3 +12,7 @@ client-sdk = { path = "../../crates/client-sdk" }
 reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+server_node = { path = "../../apps/server-node", package = "server-node", artifact = "bin" }
+cli_client = { path = "../../apps/cli-client", package = "cli-client", artifact = "bin" }

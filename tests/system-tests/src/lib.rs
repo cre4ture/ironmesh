@@ -1,12 +1,10 @@
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
     use std::process::Stdio;
-    use std::sync::OnceLock;
     use std::time::Duration;
     use std::time::SystemTime;
 
@@ -2138,19 +2136,42 @@ mod tests {
     }
 
     fn binary_path(name: &str) -> Result<PathBuf> {
-        let workspace_root = workspace_root()?;
-        ensure_binaries_built(&workspace_root)?;
-        let mut path = workspace_root.join("target").join("debug").join(name);
+        let override_key = match name {
+            "server-node" => "IRONMESH_SERVER_BIN",
+            "cli-client" => "IRONMESH_CLI_BIN",
+            _ => "",
+        };
 
-        if let Some(suffix) = std::env::consts::EXE_SUFFIX.strip_prefix('.') {
-            let mut filename = OsString::from(name);
-            filename.push(".");
-            filename.push(suffix);
-            path = workspace_root.join("target").join("debug").join(filename);
+        if !override_key.is_empty()
+            && let Ok(override_path) = std::env::var(override_key)
+        {
+            let path = PathBuf::from(override_path);
+            if path.exists() {
+                return Ok(path);
+            }
+            bail!("{override_key} points to missing binary: {}", path.display());
         }
 
+        let artifact_path = match name {
+            "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_server-node"),
+            "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_cli-client"),
+            _ => None,
+        };
+
+        if let Some(path) = artifact_path {
+            return Ok(PathBuf::from(path));
+        }
+
+        let workspace_root = workspace_root()?;
+        let path = workspace_root.join("target").join("debug").join(name);
+
         if !path.exists() {
-            bail!("expected binary does not exist: {}", path.display());
+            bail!(
+                "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{} overrides)",
+                path.display(),
+                "IRONMESH_SERVER_BIN",
+                "IRONMESH_CLI_BIN"
+            );
         }
 
         Ok(path)
@@ -2163,37 +2184,6 @@ mod tests {
             .and_then(|p| p.parent())
             .map(PathBuf::from)
             .context("failed to resolve workspace root")
-    }
-
-    fn build_required_binaries(workspace_root: &PathBuf) -> Result<()> {
-        let status = std::process::Command::new("cargo")
-            .arg("build")
-            .arg("-p")
-            .arg("server-node")
-            .arg("-p")
-            .arg("cli-client")
-            .current_dir(workspace_root)
-            .status()
-            .context("failed to run cargo build for system test binaries")?;
-
-        if !status.success() {
-            bail!("cargo build for system test binaries failed");
-        }
-
-        Ok(())
-    }
-
-    fn ensure_binaries_built(workspace_root: &PathBuf) -> Result<()> {
-        static BUILD_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-
-        let result = BUILD_RESULT
-            .get_or_init(|| build_required_binaries(workspace_root).map_err(|err| err.to_string()));
-
-        if let Err(message) = result {
-            bail!("failed to build required binaries: {message}");
-        }
-
-        Ok(())
     }
 
     fn fresh_data_dir(name: &str) -> PathBuf {
