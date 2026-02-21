@@ -210,31 +210,59 @@ async fn replicate_bundle_to_target(
     internal_token: Option<String>,
     source_node_id: NodeId,
 ) -> Result<String> {
-    let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
+    if bundle.version_id.is_some() {
+        for chunk in &bundle.manifest.chunks {
+            let payload = {
+                let guard = store.lock().await;
+                guard
+                    .read_chunk_payload(&chunk.hash)
+                    .await?
+                    .with_context(|| format!("missing local chunk {}", chunk.hash))?
+            };
 
-    for chunk in &bundle.manifest.chunks {
-        let payload = {
-            let guard = store.lock().await;
-            guard
-                .read_chunk_payload(&chunk.hash)
-                .await?
-                .with_context(|| format!("missing local chunk {}", chunk.hash))?
+            let chunk_url = format!(
+                "{target_base_url}/cluster/replication/push/chunk/{}",
+                chunk.hash
+            );
+            let mut request = http.post(chunk_url).body(payload);
+            if let Some(token) = &internal_token {
+                request = request.header("x-ironmesh-internal-token", token);
+                request = request.header("x-ironmesh-node-id", source_node_id.to_string());
+            }
+            request.send().await?.error_for_status()?;
+        }
+    } else {
+        let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
+
+        for chunk in &bundle.manifest.chunks {
+            let payload = {
+                let guard = store.lock().await;
+                guard
+                    .read_chunk_payload(&chunk.hash)
+                    .await?
+                    .with_context(|| format!("missing local chunk {}", chunk.hash))?
+            };
+
+            assembled.extend_from_slice(&payload);
+        }
+
+        let state_query = match bundle.state {
+            VersionConsistencyState::Confirmed => "confirmed",
+            VersionConsistencyState::Provisional => "provisional",
         };
 
-        assembled.extend_from_slice(&payload);
+        let put_url = build_internal_replication_put_url(
+            target_base_url,
+            &bundle.key,
+            state_query,
+            bundle.version_id.as_deref(),
+        );
+        http.put(put_url)
+            .body(assembled.freeze())
+            .send()
+            .await?
+            .error_for_status()?;
     }
-
-    let state_query = match bundle.state {
-        VersionConsistencyState::Confirmed => "confirmed",
-        VersionConsistencyState::Provisional => "provisional",
-    };
-
-    let put_url = build_internal_replication_put_url(target_base_url, &bundle.key, state_query);
-    http.put(put_url)
-        .body(assembled.freeze())
-        .send()
-        .await?
-        .error_for_status()?;
 
     let manifest_url = format!("{target_base_url}/cluster/replication/push/manifest");
     let mut request = http
@@ -262,6 +290,14 @@ pub(crate) fn build_internal_replication_put_url(
     target_base_url: &str,
     key: &str,
     state_query: &str,
+    version_id: Option<&str>,
 ) -> String {
-    format!("{target_base_url}/store/{key}?state={state_query}&internal_replication=true")
+    match version_id {
+        Some(version_id) => format!(
+            "{target_base_url}/store/{key}?state={state_query}&version_id={version_id}&internal_replication=true"
+        ),
+        None => {
+            format!("{target_base_url}/store/{key}?state={state_query}&internal_replication=true")
+        }
+    }
 }

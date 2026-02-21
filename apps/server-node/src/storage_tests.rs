@@ -472,6 +472,7 @@ async fn list_replication_subjects_includes_all_heads_for_divergent_versions() {
                 state: VersionConsistencyState::Provisional,
                 inherit_preferred_parent: false,
                 create_snapshot: true,
+                explicit_version_id: None,
             },
         )
         .await
@@ -505,6 +506,51 @@ async fn load_cluster_replicas_returns_empty_when_file_missing() {
 
     let replicas = store.load_cluster_replicas().await.unwrap();
     assert!(replicas.is_empty());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn explicit_version_id_is_idempotent_for_matching_manifest() {
+    let root = test_store_dir("explicit-version-id-idempotent");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    let first = store
+        .put_object_versioned(
+            "hello",
+            Bytes::from_static(b"payload-a"),
+            PutOptions {
+                parent_version_ids: Vec::new(),
+                state: VersionConsistencyState::Confirmed,
+                inherit_preferred_parent: false,
+                create_snapshot: false,
+                explicit_version_id: Some("ver-fixed-1".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = store
+        .put_object_versioned(
+            "hello",
+            Bytes::from_static(b"payload-a"),
+            PutOptions {
+                parent_version_ids: Vec::new(),
+                state: VersionConsistencyState::Confirmed,
+                inherit_preferred_parent: false,
+                create_snapshot: false,
+                explicit_version_id: Some("ver-fixed-1".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.version_id, "ver-fixed-1");
+    assert_eq!(second.version_id, "ver-fixed-1");
+
+    let versions = store.list_versions("hello").await.unwrap().unwrap();
+    assert_eq!(versions.versions.len(), 1);
+    assert_eq!(versions.versions[0].version_id, "ver-fixed-1");
 
     let _ = fs::remove_dir_all(root).await;
 }

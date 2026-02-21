@@ -237,7 +237,8 @@ impl ClusterService {
     }
 
     pub fn placement_for_key(&self, key: &str) -> PlacementDecision {
-        let selected_nodes = select_nodes_by_rendezvous(key, &self.nodes, &self.policy);
+        let placement_key = replication_placement_key(key);
+        let selected_nodes = select_nodes_by_rendezvous(placement_key, &self.nodes, &self.policy);
         PlacementDecision {
             key: key.to_string(),
             selected_nodes,
@@ -249,7 +250,9 @@ impl ClusterService {
         let mut items = Vec::new();
 
         for key in keys {
-            let desired_nodes = select_nodes_by_rendezvous(key, &self.nodes, &self.policy);
+            let placement_key = replication_placement_key(key);
+            let desired_nodes =
+                select_nodes_by_rendezvous(placement_key, &self.nodes, &self.policy);
             let desired_set: HashSet<_> = desired_nodes.iter().copied().collect();
             let target_replica_count = desired_nodes.len();
 
@@ -391,6 +394,10 @@ fn select_nodes_by_rendezvous(
     selected
 }
 
+fn replication_placement_key(key: &str) -> &str {
+    key.split_once("@ver-").map(|(base, _)| base).unwrap_or(key)
+}
+
 fn rendezvous_score(key: &str, node_id: NodeId) -> u64 {
     let seed = format!("{key}:{node_id}");
     let hash = blake3::hash(seed.as_bytes());
@@ -444,6 +451,66 @@ mod tests {
         let p1 = svc.placement_for_key("alpha");
         let p2 = svc.placement_for_key("alpha");
         assert_eq!(p1.selected_nodes, p2.selected_nodes);
+    }
+
+    #[test]
+    fn placement_for_version_subject_uses_base_key() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+        let node_d = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-a", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-b", "rack-7", 700));
+        svc.register_node(mk_node(node_d, "dc-c", "rack-3", 600));
+
+        let base = svc.placement_for_key("manual-check-12");
+        let version = svc.placement_for_key("manual-check-12@ver-1234");
+
+        assert_eq!(base.selected_nodes, version.selected_nodes);
+    }
+
+    #[test]
+    fn replication_plan_aligns_base_and_version_desired_nodes() {
+        let local = NodeId::new_v4();
+        let policy = ReplicationPolicy {
+            replication_factor: 3,
+            ..ReplicationPolicy::default()
+        };
+
+        let mut svc = ClusterService::new(local, policy, 60);
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+        let node_d = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+        svc.register_node(mk_node(node_d, "dc-d", "rack-4", 600));
+
+        let keys = vec![
+            "manual-check-12".to_string(),
+            "manual-check-12@ver-1234".to_string(),
+        ];
+        let plan = svc.replication_plan(&keys);
+
+        let base_item = plan
+            .items
+            .iter()
+            .find(|item| item.key == "manual-check-12")
+            .expect("base key item missing");
+        let version_item = plan
+            .items
+            .iter()
+            .find(|item| item.key == "manual-check-12@ver-1234")
+            .expect("version key item missing");
+
+        assert_eq!(base_item.desired_nodes, version_item.desired_nodes);
     }
 
     #[test]

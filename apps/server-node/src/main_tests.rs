@@ -137,9 +137,15 @@ fn autonomous_post_write_replication_trigger_guard_blocks_internal_writes() {
 
 #[test]
 fn internal_replication_put_url_sets_internal_flag() {
-    let url = build_internal_replication_put_url("http://127.0.0.1:18080", "hello", "confirmed");
+    let url = build_internal_replication_put_url(
+        "http://127.0.0.1:18080",
+        "hello",
+        "confirmed",
+        Some("ver-123"),
+    );
     assert!(url.contains("/store/hello?"));
     assert!(url.contains("state=confirmed"));
+    assert!(url.contains("version_id=ver-123"));
     assert!(url.contains("internal_replication=true"));
 }
 
@@ -288,6 +294,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
                         state: VersionConsistencyState::Confirmed,
                         inherit_preferred_parent: true,
                         create_snapshot: true,
+                        explicit_version_id: None,
                     },
                 )
                 .await

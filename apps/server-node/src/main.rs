@@ -815,6 +815,7 @@ struct PutObjectQuery {
     state: Option<String>,
     #[serde(default)]
     parent: Vec<String>,
+    version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
 }
@@ -832,6 +833,10 @@ async fn put_object(
     Query(query): Query<PutObjectQuery>,
     payload: Bytes,
 ) -> impl IntoResponse {
+    if query.version_id.is_some() && !query.internal_replication {
+        return StatusCode::BAD_REQUEST;
+    }
+
     let version_state = match query.state.as_deref() {
         None | Some("confirmed") => VersionConsistencyState::Confirmed,
         Some("provisional") => VersionConsistencyState::Provisional,
@@ -848,6 +853,7 @@ async fn put_object(
                 state: version_state,
                 inherit_preferred_parent: true,
                 create_snapshot: !query.internal_replication,
+                explicit_version_id: query.version_id,
             },
         )
         .await
@@ -2202,6 +2208,7 @@ async fn reconcile_from_node(
                         state: VersionConsistencyState::Provisional,
                         inherit_preferred_parent: false,
                         create_snapshot: true,
+                        explicit_version_id: Some(entry.version_id.clone()),
                     },
                 )
                 .await

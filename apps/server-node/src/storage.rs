@@ -138,6 +138,7 @@ pub struct PutOptions {
     pub state: VersionConsistencyState,
     pub inherit_preferred_parent: bool,
     pub create_snapshot: bool,
+    pub explicit_version_id: Option<String>,
 }
 
 impl Default for PutOptions {
@@ -147,6 +148,7 @@ impl Default for PutOptions {
             state: VersionConsistencyState::Confirmed,
             inherit_preferred_parent: true,
             create_snapshot: true,
+            explicit_version_id: None,
         }
     }
 }
@@ -449,7 +451,36 @@ impl PersistentStore {
             }
         }
 
-        let version_id = format!("ver-{}-{}", unix_ts_nanos(), &manifest_hash[..12]);
+        let version_id = options
+            .explicit_version_id
+            .clone()
+            .unwrap_or_else(|| format!("ver-{}-{}", unix_ts_nanos(), &manifest_hash[..12]));
+
+        if let Some(existing) = index.versions.get(&version_id) {
+            if existing.manifest_hash != manifest_hash {
+                bail!(
+                    "version id collision for key={key} version_id={version_id}: different manifest"
+                );
+            }
+
+            self.sync_current_state_for_key_from_index(key, &index)?;
+            self.persist_current_state().await?;
+
+            let snapshot_id = if options.create_snapshot {
+                self.create_snapshot().await?
+            } else {
+                format!("snap-skipped-{version_id}")
+            };
+
+            return Ok(PutResult {
+                snapshot_id,
+                version_id,
+                state: existing.state.clone(),
+                new_chunks,
+                dedup_reused_chunks,
+            });
+        }
+
         let record = FileVersionRecord {
             version_id: version_id.clone(),
             key: key.to_string(),
