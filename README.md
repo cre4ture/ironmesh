@@ -107,3 +107,11 @@ Those bridges can be added incrementally without changing the workspace topology
 - Maintenance cleanup endpoint:
 	- `POST /maintenance/cleanup?retention_secs=<n>&dry_run=true|false`
 	- Cleanup only removes unreferenced manifests/chunks after retention checks.
+
+### Internal replication security
+
+- Internal replication mutation endpoints can be restricted with `IRONMESH_INTERNAL_API_TOKEN`.
+- When configured, requests to these endpoints must include header `x-ironmesh-internal-token: <token>`:
+	- `POST /cluster/replication/push/chunk/{hash}`
+	- `POST /cluster/replication/push/manifest`
+	- `POST /cluster/replication/drop`

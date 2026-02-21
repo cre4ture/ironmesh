@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -31,6 +31,7 @@ struct ServerState {
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     metadata_commit_mode: MetadataCommitMode,
+    internal_api_token: Option<String>,
     repair_config: RepairConfig,
     repair_state: Arc<Mutex<RepairExecutorState>>,
 }
@@ -162,6 +163,10 @@ async fn main() -> Result<()> {
             .as_str(),
     )?;
 
+    let internal_api_token = std::env::var("IRONMESH_INTERNAL_API_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
     let repair_config = RepairConfig::from_env();
 
     let policy = ReplicationPolicy {
@@ -198,6 +203,7 @@ async fn main() -> Result<()> {
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         metadata_commit_mode,
+        internal_api_token,
         repair_config,
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
     };
@@ -783,8 +789,13 @@ struct ReplicationCleanupReport {
 
 async fn drop_replication_subject(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<ReplicationDropQuery>,
 ) -> impl IntoResponse {
+    if !is_internal_request_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let dropped = {
         let mut store = state.store.lock().await;
         match store
@@ -946,7 +957,7 @@ async fn execute_replication_cleanup(
         for candidate in selected {
             attempted_deletions += 1;
 
-            let response = http
+            let mut request = http
                 .post(format!(
                     "{}/cluster/replication/drop",
                     candidate.node_public_url
@@ -954,9 +965,13 @@ async fn execute_replication_cleanup(
                 .query(&ReplicationDropQuery {
                     key: candidate.key.clone(),
                     version_id: Some(candidate.version_id.clone()),
-                })
-                .send()
-                .await;
+                });
+
+            if let Some(token) = state.internal_api_token.as_deref() {
+                request = request.header("x-ironmesh-internal-token", token);
+            }
+
+            let response = request.send().await;
 
             match response {
                 Ok(resp) if resp.status().is_success() => {
@@ -1023,9 +1038,14 @@ struct ReplicationManifestPushReport {
 
 async fn push_replication_chunk(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(hash): Path<String>,
     payload: Bytes,
 ) -> impl IntoResponse {
+    if !is_internal_request_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let store = state.store.lock().await;
     match store.ingest_chunk(&hash, &payload).await {
         Ok(stored) => (StatusCode::OK, Json(ReplicationChunkPushReport { stored })).into_response(),
@@ -1038,9 +1058,14 @@ async fn push_replication_chunk(
 
 async fn push_replication_manifest(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<ReplicationManifestPushQuery>,
     payload: Bytes,
 ) -> impl IntoResponse {
+    if !is_internal_request_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let import_result = {
         let mut store = state.store.lock().await;
         store
@@ -1192,8 +1217,14 @@ async fn execute_replication_repair_inner(
             }
 
             attempted_transfers += 1;
-            let transfer_result =
-                replicate_bundle_to_target(&http, &node.public_url, &bundle, &state.store).await;
+            let transfer_result = replicate_bundle_to_target(
+                &http,
+                &node.public_url,
+                &bundle,
+                &state.store,
+                state.internal_api_token.as_deref(),
+            )
+            .await;
 
             match transfer_result {
                 Ok(remote_version_id) => {
@@ -1265,6 +1296,7 @@ async fn replicate_bundle_to_target(
     target_base_url: &str,
     bundle: &ReplicationExportBundle,
     store: &Arc<Mutex<PersistentStore>>,
+    internal_api_token: Option<&str>,
 ) -> Result<String> {
     let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
 
@@ -1293,7 +1325,7 @@ async fn replicate_bundle_to_target(
         .error_for_status()?;
 
     let manifest_url = format!("{target_base_url}/cluster/replication/push/manifest");
-    let response = http
+    let mut request = http
         .post(manifest_url)
         .query(&ReplicationManifestPushQuery {
             key: bundle.key.clone(),
@@ -1301,10 +1333,13 @@ async fn replicate_bundle_to_target(
             state: bundle.state.clone(),
             manifest_hash: bundle.manifest_hash.clone(),
         })
-        .body(bundle.manifest_bytes.clone())
-        .send()
-        .await?
-        .error_for_status()?;
+        .body(bundle.manifest_bytes.clone());
+
+    if let Some(token) = internal_api_token {
+        request = request.header("x-ironmesh-internal-token", token);
+    }
+
+    let response = request.send().await?.error_for_status()?;
 
     let report = response.json::<ReplicationManifestPushReport>().await?;
     Ok(report.version_id)
@@ -1356,6 +1391,22 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
     base_backoff_secs.saturating_add(jitter)
 }
 
+fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap) -> bool {
+    let configured = state.internal_api_token.as_deref();
+    let provided = headers
+        .get("x-ironmesh-internal-token")
+        .and_then(|value| value.to_str().ok());
+
+    internal_token_matches(configured, provided)
+}
+
+fn internal_token_matches(configured: Option<&str>, provided: Option<&str>) -> bool {
+    match configured {
+        None => true,
+        Some(expected) => provided.map(|token| token == expected).unwrap_or(false),
+    }
+}
+
 fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> {
     if subject.is_empty() {
         return None;
@@ -1373,7 +1424,7 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 
 #[cfg(test)]
 mod tests {
-    use super::jittered_backoff_secs;
+    use super::{internal_token_matches, jittered_backoff_secs};
 
     #[test]
     fn jittered_backoff_is_deterministic_for_same_inputs() {
@@ -1387,6 +1438,19 @@ mod tests {
         let value = jittered_backoff_secs(40, "another-key|node", 3);
         assert!(value >= 40);
         assert!(value <= 60);
+    }
+
+    #[test]
+    fn internal_token_auth_allows_when_unconfigured() {
+        assert!(internal_token_matches(None, None));
+        assert!(internal_token_matches(None, Some("anything")));
+    }
+
+    #[test]
+    fn internal_token_auth_requires_exact_match_when_configured() {
+        assert!(!internal_token_matches(Some("secret"), None));
+        assert!(!internal_token_matches(Some("secret"), Some("wrong")));
+        assert!(internal_token_matches(Some("secret"), Some("secret")));
     }
 }
 
