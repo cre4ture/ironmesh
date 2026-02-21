@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use common::{HealthStatus, NodeId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -20,8 +20,8 @@ mod storage;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
-    ObjectReadMode, PersistentStore, PutOptions, ReconcileVersionEntry, SnapshotInfo,
-    StoreReadError, VersionConsistencyState,
+    ObjectReadMode, PersistentStore, PutOptions, ReconcileVersionEntry, ReplicationExportBundle,
+    SnapshotInfo, StoreReadError, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -214,6 +214,14 @@ async fn main() -> Result<()> {
         .route(
             "/cluster/replication/repair",
             post(execute_replication_repair),
+        )
+        .route(
+            "/cluster/replication/push/chunk/{hash}",
+            post(push_replication_chunk),
+        )
+        .route(
+            "/cluster/replication/push/manifest",
+            post(push_replication_manifest),
         )
         .route(
             "/cluster/reconcile/export/provisional",
@@ -682,11 +690,87 @@ struct ReplicationRepairReport {
     skipped_items: usize,
     skipped_backoff: usize,
     skipped_max_retries: usize,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReplicationRepairQuery {
     batch_size: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReplicationManifestPushQuery {
+    key: String,
+    version_id: Option<String>,
+    state: VersionConsistencyState,
+    manifest_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationChunkPushReport {
+    stored: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReplicationManifestPushReport {
+    version_id: String,
+}
+
+async fn push_replication_chunk(
+    State(state): State<ServerState>,
+    Path(hash): Path<String>,
+    payload: Bytes,
+) -> impl IntoResponse {
+    let store = state.store.lock().await;
+    match store.ingest_chunk(&hash, &payload).await {
+        Ok(stored) => (StatusCode::OK, Json(ReplicationChunkPushReport { stored })).into_response(),
+        Err(err) => {
+            tracing::warn!(hash = %hash, error = %err, "failed to ingest replication chunk");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+async fn push_replication_manifest(
+    State(state): State<ServerState>,
+    Query(query): Query<ReplicationManifestPushQuery>,
+    payload: Bytes,
+) -> impl IntoResponse {
+    let import_result = {
+        let mut store = state.store.lock().await;
+        store
+            .import_replica_manifest(
+                &query.key,
+                query.version_id.as_deref(),
+                query.state,
+                &query.manifest_hash,
+                &payload,
+            )
+            .await
+    };
+
+    match import_result {
+        Ok(version_id) => {
+            let mut cluster = state.cluster.lock().await;
+            cluster.note_replica(&query.key, state.node_id);
+            cluster.note_replica(format!("{}@{}", query.key, version_id), state.node_id);
+
+            (
+                StatusCode::OK,
+                Json(ReplicationManifestPushReport { version_id }),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::warn!(
+                key = %query.key,
+                version_id = ?query.version_id,
+                error = %err,
+                "failed to import replication manifest"
+            );
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
 }
 
 async fn execute_replication_repair(
@@ -726,6 +810,7 @@ async fn execute_replication_repair_inner(
     let mut skipped_items = 0usize;
     let mut skipped_backoff = 0usize;
     let mut skipped_max_retries = 0usize;
+    let mut last_error = None;
 
     let max_attempts = state.repair_config.max_retries;
     let backoff_secs = state.repair_config.backoff_secs;
@@ -744,35 +829,19 @@ async fn execute_replication_repair_inner(
             continue;
         };
 
-        let (payload, version_state) = {
+        let bundle = {
             let store = state.store.lock().await;
 
-            let payload = match store
-                .get_object(&key, None, version_id.as_deref(), ObjectReadMode::Preferred)
+            match store
+                .export_replication_bundle(&key, version_id.as_deref(), ObjectReadMode::Preferred)
                 .await
             {
-                Ok(bytes) => bytes,
-                Err(_) => {
+                Ok(Some(bundle)) => bundle,
+                _ => {
                     skipped_items += 1;
                     continue;
                 }
-            };
-
-            let version_state = if let Some(version_id) = &version_id {
-                match store.list_versions(&key).await {
-                    Ok(Some(summary)) => summary
-                        .versions
-                        .iter()
-                        .find(|entry| &entry.version_id == version_id)
-                        .map(|entry| entry.state.clone())
-                        .unwrap_or(VersionConsistencyState::Confirmed),
-                    _ => VersionConsistencyState::Confirmed,
-                }
-            } else {
-                VersionConsistencyState::Confirmed
-            };
-
-            (payload, version_state)
+            }
         };
 
         for target in item.missing_nodes {
@@ -794,7 +863,7 @@ async fn execute_replication_repair_inner(
             {
                 let repair_state = state.repair_state.lock().await;
                 if let Some(previous) = repair_state.attempts.get(&transfer_key) {
-                    if previous.attempts >= max_attempts {
+                    if previous.attempts > max_attempts {
                         skipped_max_retries += 1;
                         continue;
                     }
@@ -808,29 +877,28 @@ async fn execute_replication_repair_inner(
             }
 
             attempted_transfers += 1;
-            let state_query = match version_state {
-                VersionConsistencyState::Confirmed => "confirmed",
-                VersionConsistencyState::Provisional => "provisional",
-            };
+            let transfer_result =
+                replicate_bundle_to_target(&http, &node.public_url, &bundle, &state.store).await;
 
-            let url = format!("{}/store/{}?state={}", node.public_url, key, state_query);
-            match http.put(url).body(payload.clone()).send().await {
-                Ok(response) if response.status().is_success() => {
+            match transfer_result {
+                Ok(remote_version_id) => {
                     successful_transfers += 1;
 
                     let mut cluster = state.cluster.lock().await;
                     cluster.note_replica(&item.key, target);
-                    if let Some(version_id) = &version_id {
+                    if let Some(version_id) = &bundle.version_id {
                         cluster.note_replica(format!("{key}@{version_id}"), target);
                     } else {
                         cluster.note_replica(&key, target);
                     }
+                    cluster.note_replica(format!("{key}@{remote_version_id}"), target);
 
                     let mut repair_state = state.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
                 }
-                _ => {
+                Err(err) => {
                     failed_transfers += 1;
+                    last_error = Some(err.to_string());
 
                     let mut repair_state = state.repair_state.lock().await;
                     let entry =
@@ -855,7 +923,58 @@ async fn execute_replication_repair_inner(
         skipped_items,
         skipped_backoff,
         skipped_max_retries,
+        last_error,
     }
+}
+
+async fn replicate_bundle_to_target(
+    http: &reqwest::Client,
+    target_base_url: &str,
+    bundle: &ReplicationExportBundle,
+    store: &Arc<Mutex<PersistentStore>>,
+) -> Result<String> {
+    let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
+
+    for chunk in &bundle.manifest.chunks {
+        let payload = {
+            let guard = store.lock().await;
+            guard
+                .read_chunk_payload(&chunk.hash)
+                .await?
+                .with_context(|| format!("missing local chunk {}", chunk.hash))?
+        };
+
+        assembled.extend_from_slice(&payload);
+    }
+
+    let state_query = match bundle.state {
+        VersionConsistencyState::Confirmed => "confirmed",
+        VersionConsistencyState::Provisional => "provisional",
+    };
+
+    let put_url = format!("{target_base_url}/store/{}?state={state_query}", bundle.key);
+    http.put(put_url)
+        .body(assembled.freeze())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let manifest_url = format!("{target_base_url}/cluster/replication/push/manifest");
+    let response = http
+        .post(manifest_url)
+        .query(&ReplicationManifestPushQuery {
+            key: bundle.key.clone(),
+            version_id: bundle.version_id.clone(),
+            state: bundle.state.clone(),
+            manifest_hash: bundle.manifest_hash.clone(),
+        })
+        .body(bundle.manifest_bytes.clone())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let report = response.json::<ReplicationManifestPushReport>().await?;
+    Ok(report.version_id)
 }
 
 fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> {

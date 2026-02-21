@@ -707,7 +707,10 @@ mod tests {
                 .get("successful_transfers")
                 .and_then(|v| v.as_u64())
                 .context("missing successful_transfers")?;
-            assert!(successful >= 1, "expected at least one successful transfer");
+            assert!(
+                successful >= 1,
+                "expected at least one successful transfer, report={repair_report:?}"
+            );
 
             let after_plan: serde_json::Value = http
                 .get(format!("{base_a}/cluster/replication/plan"))
@@ -816,6 +819,103 @@ mod tests {
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn manual_replication_repair_preserves_version_id_on_target() -> Result<()> {
+        let bind_a = "127.0.0.1:19111";
+        let bind_b = "127.0.0.1:19112";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000005a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000005b2";
+
+        let data_a = fresh_data_dir("repair-version-a");
+        let data_b = fresh_data_dir("repair-version-b");
+
+        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+
+            http.put(format!("{base_a}/store/repair-version-key"))
+                .body("repair-version-payload")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let versions_a: serde_json::Value = http
+                .get(format!("{base_a}/versions/repair-version-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let source_version_id = versions_a
+                .get("preferred_head_version_id")
+                .and_then(|v| v.as_str())
+                .context("missing preferred_head_version_id on source")?
+                .to_string();
+
+            let repair_report: serde_json::Value = http
+                .post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let successful = repair_report
+                .get("successful_transfers")
+                .and_then(|v| v.as_u64())
+                .context("missing successful_transfers")?;
+            assert!(
+                successful >= 1,
+                "expected at least one successful transfer, report={repair_report:?}"
+            );
+
+            let versions_b: serde_json::Value = http
+                .get(format!("{base_b}/versions/repair-version-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let contains_source_version = versions_b
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .map(|entries| {
+                    entries.iter().any(|entry| {
+                        entry
+                            .get("version_id")
+                            .and_then(|v| v.as_str())
+                            .map(|id| id == source_version_id)
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+
+            assert!(
+                contains_source_version,
+                "expected target node to contain replicated source version id"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
 
         result
     }

@@ -158,6 +158,30 @@ pub struct ReconcileVersionEntry {
     pub created_at_unix: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationChunkInfo {
+    pub hash: String,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationManifestPayload {
+    pub key: String,
+    pub total_size_bytes: usize,
+    pub created_at_unix: u64,
+    pub chunks: Vec<ReplicationChunkInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationExportBundle {
+    pub key: String,
+    pub version_id: Option<String>,
+    pub state: VersionConsistencyState,
+    pub manifest_hash: String,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest: ReplicationManifestPayload,
+}
+
 #[derive(Debug, Clone)]
 pub struct PutResult {
     pub snapshot_id: String,
@@ -436,6 +460,207 @@ impl PersistentStore {
             .versions
             .values()
             .any(|record| record.manifest_hash == manifest_hash))
+    }
+
+    pub async fn export_replication_bundle(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+        read_mode: ObjectReadMode,
+    ) -> Result<Option<ReplicationExportBundle>> {
+        let (selected_version_id, state, manifest_hash) = if let Some(version_id) = version_id {
+            let Some(index) = self.load_version_index(key).await? else {
+                return Ok(None);
+            };
+
+            let Some(record) = index.versions.get(version_id) else {
+                return Ok(None);
+            };
+
+            (
+                Some(record.version_id.clone()),
+                record.state.clone(),
+                record.manifest_hash.clone(),
+            )
+        } else {
+            match self.load_version_index(key).await? {
+                Some(index) => {
+                    let Some(record) = version_record_for_read_mode(&index, read_mode) else {
+                        return Ok(None);
+                    };
+
+                    (
+                        Some(record.version_id.clone()),
+                        record.state.clone(),
+                        record.manifest_hash.clone(),
+                    )
+                }
+                None => {
+                    let Some(manifest_hash) = self.current_state.objects.get(key).cloned() else {
+                        return Ok(None);
+                    };
+                    (None, VersionConsistencyState::Confirmed, manifest_hash)
+                }
+            }
+        };
+
+        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let manifest_bytes = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&manifest_bytes)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+
+        if manifest.key != key {
+            bail!(
+                "manifest key mismatch for replication export: expected={key} actual={}",
+                manifest.key
+            );
+        }
+
+        Ok(Some(ReplicationExportBundle {
+            key: key.to_string(),
+            version_id: selected_version_id,
+            state,
+            manifest_hash,
+            manifest_bytes,
+            manifest: ReplicationManifestPayload {
+                key: manifest.key,
+                total_size_bytes: manifest.total_size_bytes,
+                created_at_unix: manifest.created_at_unix,
+                chunks: manifest
+                    .chunks
+                    .into_iter()
+                    .map(|chunk| ReplicationChunkInfo {
+                        hash: chunk.hash,
+                        size_bytes: chunk.size_bytes,
+                    })
+                    .collect(),
+            },
+        }))
+    }
+
+    pub async fn read_chunk_payload(&self, hash: &str) -> Result<Option<Bytes>> {
+        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash);
+        if !fs::try_exists(&chunk_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&chunk_path).await?;
+        Ok(Some(Bytes::from(payload)))
+    }
+
+    pub async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
+        let actual_hash = hash_hex(payload);
+        if actual_hash != hash {
+            bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
+        }
+
+        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash);
+        if fs::try_exists(&chunk_path).await? {
+            return Ok(false);
+        }
+
+        if let Some(parent) = chunk_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        write_atomic(&chunk_path, payload).await?;
+        Ok(true)
+    }
+
+    pub async fn import_replica_manifest(
+        &mut self,
+        key: &str,
+        version_id: Option<&str>,
+        state: VersionConsistencyState,
+        manifest_hash: &str,
+        manifest_payload: &[u8],
+    ) -> Result<String> {
+        let computed_manifest_hash = hash_hex(manifest_payload);
+        if computed_manifest_hash != manifest_hash {
+            bail!(
+                "manifest hash mismatch: expected={manifest_hash} actual={computed_manifest_hash}"
+            );
+        }
+
+        let manifest = serde_json::from_slice::<ObjectManifest>(manifest_payload)
+            .context("invalid replication manifest payload")?;
+
+        if manifest.key != key {
+            bail!(
+                "replication manifest key mismatch: expected={key} actual={}",
+                manifest.key
+            );
+        }
+
+        for chunk in &manifest.chunks {
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            if !fs::try_exists(&chunk_path).await? {
+                bail!("manifest references missing chunk hash={}", chunk.hash);
+            }
+
+            let metadata = fs::metadata(&chunk_path).await?;
+            if metadata.len() != chunk.size_bytes as u64 {
+                bail!(
+                    "manifest chunk size mismatch hash={} expected={} actual={}",
+                    chunk.hash,
+                    chunk.size_bytes,
+                    metadata.len()
+                );
+            }
+        }
+
+        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        if !fs::try_exists(&manifest_path).await? {
+            write_atomic(&manifest_path, manifest_payload).await?;
+        }
+
+        let mut index = self
+            .load_version_index(key)
+            .await?
+            .unwrap_or_else(|| empty_version_index(key));
+
+        let resolved_version_id = version_id
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("rep-{}-{}", unix_ts_nanos(), &manifest_hash[..12]));
+
+        if let Some(existing) = index.versions.get(&resolved_version_id) {
+            if existing.manifest_hash != manifest_hash {
+                bail!(
+                    "version id collision for key={key} version_id={resolved_version_id}: different manifest"
+                );
+            }
+
+            return Ok(resolved_version_id);
+        }
+
+        let record = FileVersionRecord {
+            version_id: resolved_version_id.clone(),
+            key: key.to_string(),
+            manifest_hash: manifest_hash.to_string(),
+            parent_version_ids: Vec::new(),
+            state,
+            created_at_unix: unix_ts(),
+        };
+
+        index.versions.insert(resolved_version_id.clone(), record);
+
+        let mut heads: HashSet<String> = index.head_version_ids.into_iter().collect();
+        heads.insert(resolved_version_id.clone());
+
+        index.head_version_ids = heads.into_iter().collect();
+        index.head_version_ids.sort();
+        index.preferred_head_version_id = choose_preferred_head(&index);
+
+        self.persist_version_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)?;
+        self.persist_current_state().await?;
+        self.create_snapshot().await?;
+
+        Ok(resolved_version_id)
     }
 
     pub async fn has_reconcile_marker(
@@ -982,6 +1207,13 @@ fn manifest_hash_for_read_mode(
     index: &FileVersionIndex,
     read_mode: ObjectReadMode,
 ) -> Option<String> {
+    version_record_for_read_mode(index, read_mode).map(|record| record.manifest_hash.clone())
+}
+
+fn version_record_for_read_mode(
+    index: &FileVersionIndex,
+    read_mode: ObjectReadMode,
+) -> Option<&FileVersionRecord> {
     let mut heads: Vec<&FileVersionRecord> = index
         .head_version_ids
         .iter()
@@ -992,7 +1224,7 @@ fn manifest_hash_for_read_mode(
         return None;
     }
 
-    let selected = match read_mode {
+    match read_mode {
         ObjectReadMode::Preferred => {
             let preferred = choose_preferred_head(index)?;
             index.versions.get(&preferred)
@@ -1017,9 +1249,7 @@ fn manifest_hash_for_read_mode(
 
             heads.first().copied()
         }
-    };
-
-    selected.map(|record| record.manifest_hash.clone())
+    }
 }
 
 fn rank_state(state: &VersionConsistencyState) -> u8 {
