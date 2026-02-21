@@ -208,6 +208,7 @@ pub struct PersistentStore {
     current_state_path: PathBuf,
     repair_attempts_path: PathBuf,
     cluster_replicas_path: PathBuf,
+    internal_node_tokens_path: PathBuf,
     current_state: CurrentState,
 }
 
@@ -232,6 +233,7 @@ impl PersistentStore {
         let current_state_path = state_dir.join("current.json");
         let repair_attempts_path = state_dir.join("repair_attempts.json");
         let cluster_replicas_path = state_dir.join("cluster_replicas.json");
+        let internal_node_tokens_path = state_dir.join("internal_node_tokens.json");
 
         fs::create_dir_all(&chunks_dir).await?;
         fs::create_dir_all(&manifests_dir).await?;
@@ -259,6 +261,7 @@ impl PersistentStore {
             current_state_path,
             repair_attempts_path,
             cluster_replicas_path,
+            internal_node_tokens_path,
             current_state,
         })
     }
@@ -311,6 +314,31 @@ impl PersistentStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(replicas)?;
         write_atomic(&self.cluster_replicas_path, &payload).await
+    }
+
+    pub async fn load_internal_node_tokens(&self) -> Result<HashMap<NodeId, String>> {
+        if !fs::try_exists(&self.internal_node_tokens_path).await? {
+            return Ok(HashMap::new());
+        }
+
+        let payload = fs::read(&self.internal_node_tokens_path).await?;
+        let tokens =
+            serde_json::from_slice::<HashMap<NodeId, String>>(&payload).with_context(|| {
+                format!(
+                    "invalid internal node tokens state: {}",
+                    self.internal_node_tokens_path.display()
+                )
+            })?;
+
+        Ok(tokens)
+    }
+
+    pub async fn persist_internal_node_tokens(
+        &self,
+        tokens: &HashMap<NodeId, String>,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(tokens)?;
+        write_atomic(&self.internal_node_tokens_path, &payload).await
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -1888,6 +1916,34 @@ mod tests {
         let loaded = store.load_cluster_replicas().await.unwrap();
 
         assert_eq!(loaded.get("subject-a").map(Vec::len), Some(2));
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn load_internal_node_tokens_returns_empty_when_file_missing() {
+        let root = test_store_dir("internal-node-tokens-empty");
+        let store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let tokens = store.load_internal_node_tokens().await.unwrap();
+        assert!(tokens.is_empty());
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn persist_and_load_internal_node_tokens_roundtrip() {
+        let root = test_store_dir("internal-node-tokens-roundtrip");
+        let store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let mut tokens = HashMap::new();
+        let node_id = NodeId::new_v4();
+        tokens.insert(node_id, "token-1".to_string());
+
+        store.persist_internal_node_tokens(&tokens).await.unwrap();
+        let loaded = store.load_internal_node_tokens().await.unwrap();
+
+        assert_eq!(loaded.get(&node_id).map(String::as_str), Some("token-1"));
 
         let _ = fs::remove_dir_all(root).await;
     }

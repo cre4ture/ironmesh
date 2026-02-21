@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::{Bytes, BytesMut};
 use common::{HealthStatus, NodeId};
@@ -31,7 +31,7 @@ struct ServerState {
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     metadata_commit_mode: MetadataCommitMode,
-    internal_node_tokens: HashMap<NodeId, String>,
+    internal_node_tokens: Arc<Mutex<HashMap<NodeId, String>>>,
     repair_config: RepairConfig,
     repair_state: Arc<Mutex<RepairExecutorState>>,
 }
@@ -163,17 +163,11 @@ async fn main() -> Result<()> {
             .as_str(),
     )?;
 
-    let internal_node_tokens = std::env::var("IRONMESH_INTERNAL_NODE_TOKENS")
+    let env_node_tokens = std::env::var("IRONMESH_INTERNAL_NODE_TOKENS")
         .ok()
         .map(|raw| parse_internal_node_tokens(raw.as_str()))
         .transpose()?
         .unwrap_or_default();
-
-    if !internal_node_tokens.is_empty() && !internal_node_tokens.contains_key(&node_id) {
-        return Err(anyhow::anyhow!(
-            "IRONMESH_INTERNAL_NODE_TOKENS is configured but has no token for local node {node_id}"
-        ));
-    }
 
     let repair_config = RepairConfig::from_env();
 
@@ -194,6 +188,24 @@ async fn main() -> Result<()> {
     });
 
     let store = Arc::new(Mutex::new(PersistentStore::init(data_dir).await?));
+    let persisted_internal_node_tokens = {
+        let store_guard = store.lock().await;
+        store_guard
+            .load_internal_node_tokens()
+            .await
+            .context("failed to load internal node token state")?
+    };
+    let internal_node_tokens = if persisted_internal_node_tokens.is_empty() {
+        env_node_tokens
+    } else {
+        persisted_internal_node_tokens
+    };
+
+    if !internal_node_tokens.is_empty() && !internal_node_tokens.contains_key(&node_id) {
+        return Err(anyhow::anyhow!(
+            "internal node tokens are configured but have no token for local node {node_id}"
+        ));
+    }
     let persisted_cluster_replicas = {
         let store_guard = store.lock().await;
         match store_guard.load_cluster_replicas().await {
@@ -211,10 +223,17 @@ async fn main() -> Result<()> {
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         metadata_commit_mode,
-        internal_node_tokens,
+        internal_node_tokens: Arc::new(Mutex::new(internal_node_tokens)),
         repair_config,
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
     };
+
+    if let Err(err) = persist_internal_node_tokens_state(&state).await {
+        warn!(
+            error = %err,
+            "failed to persist internal node tokens during startup"
+        );
+    }
 
     let persisted_attempts = {
         let store = state.store.lock().await;
@@ -261,6 +280,18 @@ async fn main() -> Result<()> {
         .route("/cluster/nodes/{node_id}", put(register_node))
         .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route("/cluster/placement/{key}", get(placement_for_key))
+        .route(
+            "/cluster/internal-auth/tokens",
+            get(list_internal_node_tokens),
+        )
+        .route(
+            "/cluster/internal-auth/tokens/rotate",
+            post(rotate_internal_node_token),
+        )
+        .route(
+            "/cluster/internal-auth/tokens/{node_id}",
+            delete(revoke_internal_node_token),
+        )
         .route("/cluster/replication/plan", get(replication_plan))
         .route(
             "/cluster/replication/audit",
@@ -642,6 +673,24 @@ struct CleanupQuery {
     dry_run: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct InternalNodeTokenRotateRequest {
+    node_id: NodeId,
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalNodeTokenListResponse {
+    count: usize,
+    node_ids: Vec<NodeId>,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalNodeTokenMutationResponse {
+    node_id: NodeId,
+    changed: bool,
+}
+
 async fn cluster_status(State(state): State<ServerState>) -> Json<cluster::ClusterSummary> {
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
@@ -708,6 +757,125 @@ async fn placement_for_key(
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
     Json(cluster.placement_for_key(&key))
+}
+
+async fn list_internal_node_tokens(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !is_internal_request_authorized(&state, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut node_ids = {
+        let tokens = state.internal_node_tokens.lock().await;
+        tokens.keys().cloned().collect::<Vec<_>>()
+    };
+    node_ids.sort_by_key(|node_id| node_id.to_string());
+
+    (
+        StatusCode::OK,
+        Json(InternalNodeTokenListResponse {
+            count: node_ids.len(),
+            node_ids,
+        }),
+    )
+        .into_response()
+}
+
+async fn rotate_internal_node_token(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<InternalNodeTokenRotateRequest>,
+) -> impl IntoResponse {
+    if !is_internal_request_authorized(&state, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let token = request.token.trim();
+    if token.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let previous = {
+        let mut tokens = state.internal_node_tokens.lock().await;
+        tokens.insert(request.node_id, token.to_string())
+    };
+
+    if let Err(err) = persist_internal_node_tokens_state(&state).await {
+        warn!(
+            error = %err,
+            node_id = %request.node_id,
+            "failed to persist internal token rotation"
+        );
+
+        let mut tokens = state.internal_node_tokens.lock().await;
+        if let Some(previous) = previous {
+            tokens.insert(request.node_id, previous);
+        } else {
+            tokens.remove(&request.node_id);
+        }
+
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(InternalNodeTokenMutationResponse {
+            node_id: request.node_id,
+            changed: true,
+        }),
+    )
+        .into_response()
+}
+
+async fn revoke_internal_node_token(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+) -> impl IntoResponse {
+    if !is_internal_request_authorized(&state, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let node_id = match node_id.parse::<NodeId>() {
+        Ok(node_id) => node_id,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    if node_id == state.node_id {
+        return StatusCode::CONFLICT.into_response();
+    }
+
+    let removed = {
+        let mut tokens = state.internal_node_tokens.lock().await;
+        tokens.remove(&node_id)
+    };
+
+    let Some(removed) = removed else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if let Err(err) = persist_internal_node_tokens_state(&state).await {
+        warn!(
+            error = %err,
+            node_id = %node_id,
+            "failed to persist internal token revocation"
+        );
+
+        let mut tokens = state.internal_node_tokens.lock().await;
+        tokens.insert(node_id, removed);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(InternalNodeTokenMutationResponse {
+            node_id,
+            changed: true,
+        }),
+    )
+        .into_response()
 }
 
 async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationPlan> {
@@ -975,7 +1143,7 @@ async fn execute_replication_cleanup(
                     version_id: Some(candidate.version_id.clone()),
                 });
 
-            if let Some(token) = internal_outbound_token(&state) {
+            if let Some(token) = internal_outbound_token(&state).await {
                 request = request.header("x-ironmesh-internal-token", token);
                 request = request.header("x-ironmesh-node-id", state.node_id.to_string());
             }
@@ -1231,7 +1399,7 @@ async fn execute_replication_repair_inner(
                 &node.public_url,
                 &bundle,
                 &state.store,
-                internal_outbound_token(state),
+                internal_outbound_token(state).await,
                 state.node_id,
             )
             .await;
@@ -1389,6 +1557,16 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
     store.persist_cluster_replicas(&replicas).await
 }
 
+async fn persist_internal_node_tokens_state(state: &ServerState) -> Result<()> {
+    let tokens = {
+        let tokens = state.internal_node_tokens.lock().await;
+        tokens.clone()
+    };
+
+    let store = state.store.lock().await;
+    store.persist_internal_node_tokens(&tokens).await
+}
+
 fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u32) -> u64 {
     if base_backoff_secs == 0 {
         return 0;
@@ -1404,7 +1582,22 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
 }
 
 async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap) -> bool {
-    if state.internal_node_tokens.is_empty() {
+    let (auth_enabled, expected_for_caller) = {
+        let tokens = state.internal_node_tokens.lock().await;
+        let auth_enabled = !tokens.is_empty();
+
+        let node_id_header = headers
+            .get("x-ironmesh-node-id")
+            .and_then(|value| value.to_str().ok());
+        let caller_node_id = node_id_header.and_then(|value| value.parse::<NodeId>().ok());
+        let expected_for_caller = caller_node_id.and_then(|node_id| {
+            expected_internal_token_for_node(&tokens, node_id).map(str::to_string)
+        });
+
+        (auth_enabled, expected_for_caller)
+    };
+
+    if !auth_enabled {
         return true;
     }
 
@@ -1439,18 +1632,16 @@ async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap
         return false;
     }
 
-    let Some(expected) =
-        expected_internal_token_for_node(&state.internal_node_tokens, caller_node_id)
-    else {
+    let Some(expected) = expected_for_caller else {
         return false;
     };
 
-    internal_token_matches(expected, provided_token)
+    internal_token_matches(expected.as_str(), provided_token)
 }
 
-fn internal_outbound_token(state: &ServerState) -> Option<String> {
-    expected_internal_token_for_node(&state.internal_node_tokens, state.node_id)
-        .map(ToString::to_string)
+async fn internal_outbound_token(state: &ServerState) -> Option<String> {
+    let tokens = state.internal_node_tokens.lock().await;
+    expected_internal_token_for_node(&tokens, state.node_id).map(ToString::to_string)
 }
 
 fn expected_internal_token_for_node(

@@ -118,6 +118,12 @@ Those bridges can be added incrementally without changing the workspace topology
 	- `x-ironmesh-internal-token: <token>`
 	- `x-ironmesh-node-id: <uuid>` (must be a registered cluster node)
 - The token must match the caller node id entry in `IRONMESH_INTERNAL_NODE_TOKENS`.
+- Token updates are persisted in node state and take effect without restart.
+
+- Token lifecycle endpoints:
+	- `GET /cluster/internal-auth/tokens` — list configured node ids
+	- `POST /cluster/internal-auth/tokens/rotate` — set/replace token for a node (`{"node_id":"<uuid>","token":"..."}`)
+	- `DELETE /cluster/internal-auth/tokens/{node_id}` — revoke token for a node (local node token revocation is rejected)
 
 - Protected endpoints:
 	- `POST /cluster/replication/push/chunk/{hash}`

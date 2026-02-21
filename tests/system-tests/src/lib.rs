@@ -1279,6 +1279,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_node_token_rotation_and_revocation_apply_without_restart() -> Result<()> {
+        let bind = "127.0.0.1:19121";
+        let controller_node_id = "00000000-0000-0000-0000-0000000007a1";
+        let caller_node_id = "00000000-0000-0000-0000-0000000007b2";
+        let data_dir = fresh_data_dir("internal-auth-rotate-revoke");
+        let node_tokens =
+            format!("{controller_node_id}=controller-token,{caller_node_id}=old-token");
+
+        let mut server = start_server_with_env(
+            bind,
+            &data_dir,
+            controller_node_id,
+            1,
+            &[("IRONMESH_INTERNAL_NODE_TOKENS", node_tokens.as_str())],
+        )
+        .await?;
+
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(
+                &http,
+                &base_url,
+                caller_node_id,
+                "http://127.0.0.1:29996",
+                "dc-caller",
+                "rack-caller",
+            )
+            .await?;
+
+            let initial_drop = http
+                .post(format!("{base_url}/cluster/replication/drop"))
+                .query(&[("key", "missing-key")])
+                .header("x-ironmesh-node-id", caller_node_id)
+                .header("x-ironmesh-internal-token", "old-token")
+                .send()
+                .await?;
+            assert_eq!(initial_drop.status(), StatusCode::OK);
+
+            let rotate = http
+                .post(format!("{base_url}/cluster/internal-auth/tokens/rotate"))
+                .header("x-ironmesh-node-id", controller_node_id)
+                .header("x-ironmesh-internal-token", "controller-token")
+                .json(&serde_json::json!({
+                    "node_id": caller_node_id,
+                    "token": "new-token"
+                }))
+                .send()
+                .await?;
+            assert_eq!(rotate.status(), StatusCode::OK);
+
+            let old_token_after_rotate = http
+                .post(format!("{base_url}/cluster/replication/drop"))
+                .query(&[("key", "missing-key")])
+                .header("x-ironmesh-node-id", caller_node_id)
+                .header("x-ironmesh-internal-token", "old-token")
+                .send()
+                .await?;
+            assert_eq!(old_token_after_rotate.status(), StatusCode::UNAUTHORIZED);
+
+            let new_token_after_rotate = http
+                .post(format!("{base_url}/cluster/replication/drop"))
+                .query(&[("key", "missing-key")])
+                .header("x-ironmesh-node-id", caller_node_id)
+                .header("x-ironmesh-internal-token", "new-token")
+                .send()
+                .await?;
+            assert_eq!(new_token_after_rotate.status(), StatusCode::OK);
+
+            let revoke = http
+                .delete(format!(
+                    "{base_url}/cluster/internal-auth/tokens/{caller_node_id}"
+                ))
+                .header("x-ironmesh-node-id", controller_node_id)
+                .header("x-ironmesh-internal-token", "controller-token")
+                .send()
+                .await?;
+            assert_eq!(revoke.status(), StatusCode::OK);
+
+            let after_revoke = http
+                .post(format!("{base_url}/cluster/replication/drop"))
+                .query(&[("key", "missing-key")])
+                .header("x-ironmesh-node-id", caller_node_id)
+                .header("x-ironmesh-internal-token", "new-token")
+                .send()
+                .await?;
+            assert_eq!(after_revoke.status(), StatusCode::UNAUTHORIZED);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
     async fn rejoin_reconciliation_preserves_provisional_branches() -> Result<()> {
         let bind_a = "127.0.0.1:19100";
         let bind_b = "127.0.0.1:19101";
