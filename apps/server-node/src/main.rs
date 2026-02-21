@@ -114,7 +114,7 @@ impl RepairConfig {
         let busy_throttle_enabled = std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         let busy_inflight_threshold = std::env::var("IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD")
             .ok()
@@ -124,7 +124,7 @@ impl RepairConfig {
         let busy_wait_millis = std::env::var("IRONMESH_REPAIR_BUSY_WAIT_MILLIS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(200);
+            .unwrap_or(100);
 
         let startup_repair_enabled = std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
             .ok()
