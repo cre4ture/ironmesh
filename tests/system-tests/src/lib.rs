@@ -623,6 +623,18 @@ mod tests {
                 "expected missing replicas in multi-node plan"
             );
 
+            let has_version_subject = items.iter().any(|entry| {
+                entry
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .map(|k| k.starts_with("multi-key@"))
+                    .unwrap_or(false)
+            });
+            assert!(
+                has_version_subject,
+                "expected branch-aware replication subject key (multi-key@<version>)"
+            );
+
             Ok::<(), anyhow::Error>(())
         }
         .await;

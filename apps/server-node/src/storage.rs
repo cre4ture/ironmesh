@@ -213,6 +213,30 @@ impl PersistentStore {
         self.current_state.objects.keys().cloned().collect()
     }
 
+    pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
+        let mut subjects: HashSet<String> = self.current_state.objects.keys().cloned().collect();
+
+        let mut entries = fs::read_dir(&self.versions_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = fs::read(&path).await?;
+            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
+                .with_context(|| format!("invalid version index {}", path.display()))?;
+
+            for head_version_id in &index.head_version_ids {
+                subjects.insert(format!("{}@{}", index.key, head_version_id));
+            }
+        }
+
+        let mut output: Vec<String> = subjects.into_iter().collect();
+        output.sort();
+        Ok(output)
+    }
+
     pub async fn put_object_versioned(
         &mut self,
         key: &str,

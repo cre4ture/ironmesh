@@ -178,7 +178,10 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
             let keys = {
                 let store = state.store.lock().await;
-                store.current_keys()
+                store
+                    .list_replication_subjects()
+                    .await
+                    .unwrap_or_else(|_| store.current_keys())
             };
 
             let mut cluster = state.cluster.lock().await;
@@ -350,6 +353,10 @@ async fn put_object(
 
             let mut cluster = state.cluster.lock().await;
             cluster.note_replica(&key, state.node_id);
+            cluster.note_replica(
+                format!("{}@{}", key, outcome.version_id.as_str()),
+                state.node_id,
+            );
 
             info!(
                 key = %key,
@@ -550,7 +557,10 @@ async fn placement_for_key(
 async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationPlan> {
     let keys = {
         let store = state.store.lock().await;
-        store.current_keys()
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
     };
 
     let mut cluster = state.cluster.lock().await;
@@ -561,7 +571,10 @@ async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationP
 async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<ReplicationPlan> {
     let keys = {
         let store = state.store.lock().await;
-        store.current_keys()
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
     };
 
     let mut cluster = state.cluster.lock().await;
@@ -747,10 +760,14 @@ async fn reconcile_from_node(
         };
 
         match put_result {
-            Ok(_) => {
+            Ok(outcome) => {
                 imported += 1;
                 let mut cluster = state.cluster.lock().await;
                 cluster.note_replica(&entry.key, state.node_id);
+                cluster.note_replica(
+                    format!("{}@{}", entry.key, outcome.version_id.as_str()),
+                    state.node_id,
+                );
             }
             Err(err) => {
                 tracing::error!(
