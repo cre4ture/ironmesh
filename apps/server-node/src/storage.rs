@@ -697,6 +697,34 @@ impl PersistentStore {
         Ok(resolved_version_id)
     }
 
+    pub async fn drop_replica_subject(
+        &mut self,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<bool> {
+        let Some(version_id) = version_id else {
+            return Ok(false);
+        };
+
+        let Some(mut index) = self.load_version_index(key).await? else {
+            return Ok(false);
+        };
+
+        if index.versions.remove(version_id).is_none() {
+            return Ok(false);
+        }
+
+        index.head_version_ids = recompute_head_version_ids(&index);
+        index.preferred_head_version_id = choose_preferred_head(&index);
+
+        self.persist_version_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)?;
+        self.persist_current_state().await?;
+        self.create_snapshot().await?;
+
+        Ok(true)
+    }
+
     pub async fn has_reconcile_marker(
         &self,
         source_node_id: &str,
@@ -1193,6 +1221,19 @@ fn empty_version_index(key: &str) -> FileVersionIndex {
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
     }
+}
+
+fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {
+    let mut all_ids: HashSet<String> = index.versions.keys().cloned().collect();
+    for record in index.versions.values() {
+        for parent in &record.parent_version_ids {
+            all_ids.remove(parent);
+        }
+    }
+
+    let mut heads: Vec<String> = all_ids.into_iter().collect();
+    heads.sort();
+    heads
 }
 
 fn choose_preferred_head(index: &FileVersionIndex) -> Option<String> {
@@ -1757,6 +1798,37 @@ mod tests {
         let entry = loaded.get("subject@version|node").unwrap();
         assert_eq!(entry.attempts, 2);
         assert_eq!(entry.last_failure_unix, 123);
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn drop_replica_subject_removes_version() {
+        let root = test_store_dir("drop-replica-subject");
+        let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+        let put = store
+            .put_object_versioned(
+                "drop-key",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let dropped = store
+            .drop_replica_subject("drop-key", Some(&put.version_id))
+            .await
+            .unwrap();
+        assert!(dropped);
+
+        let versions = store.list_versions("drop-key").await.unwrap().unwrap();
+        assert!(
+            versions
+                .versions
+                .iter()
+                .all(|entry| entry.version_id != put.version_id)
+        );
 
         let _ = fs::remove_dir_all(root).await;
     }

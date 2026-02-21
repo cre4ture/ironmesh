@@ -244,6 +244,10 @@ async fn main() -> Result<()> {
             post(execute_replication_repair),
         )
         .route(
+            "/cluster/replication/cleanup",
+            post(execute_replication_cleanup),
+        )
+        .route(
             "/cluster/replication/push/chunk/{hash}",
             post(push_replication_chunk),
         )
@@ -251,6 +255,7 @@ async fn main() -> Result<()> {
             "/cluster/replication/push/manifest",
             post(push_replication_manifest),
         )
+        .route("/cluster/replication/drop", post(drop_replication_subject))
         .route(
             "/cluster/reconcile/export/provisional",
             get(export_provisional_versions),
@@ -724,6 +729,247 @@ struct ReplicationRepairReport {
 #[derive(Debug, Deserialize)]
 struct ReplicationRepairQuery {
     batch_size: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplicationCleanupQuery {
+    dry_run: Option<bool>,
+    max_deletions: Option<usize>,
+    retained_overhead_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReplicationDropQuery {
+    key: String,
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationDropReport {
+    dropped: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationCleanupReport {
+    dry_run: bool,
+    planned_candidates: usize,
+    considered_candidates: usize,
+    target_reclaimed_bytes: u64,
+    estimated_overhead_bytes: u64,
+    reclaimed_bytes: u64,
+    attempted_deletions: usize,
+    successful_deletions: usize,
+    failed_deletions: usize,
+    skipped_items: usize,
+}
+
+async fn drop_replication_subject(
+    State(state): State<ServerState>,
+    Query(query): Query<ReplicationDropQuery>,
+) -> impl IntoResponse {
+    let dropped = {
+        let mut store = state.store.lock().await;
+        match store
+            .drop_replica_subject(&query.key, query.version_id.as_deref())
+            .await
+        {
+            Ok(dropped) => dropped,
+            Err(err) => {
+                tracing::warn!(
+                    key = %query.key,
+                    version_id = ?query.version_id,
+                    error = %err,
+                    "failed dropping replication subject"
+                );
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+    };
+
+    if dropped {
+        let mut cluster = state.cluster.lock().await;
+        cluster.remove_replica(&query.key, state.node_id);
+        if let Some(version_id) = &query.version_id {
+            cluster.remove_replica(&format!("{}@{}", query.key, version_id), state.node_id);
+        }
+    }
+
+    (StatusCode::OK, Json(ReplicationDropReport { dropped })).into_response()
+}
+
+#[derive(Debug, Clone)]
+struct CleanupCandidate {
+    subject: String,
+    key: String,
+    version_id: String,
+    node_id: NodeId,
+    node_public_url: String,
+    size_bytes: u64,
+    node_free_bytes: u64,
+}
+
+async fn execute_replication_cleanup(
+    State(state): State<ServerState>,
+    Query(query): Query<ReplicationCleanupQuery>,
+) -> impl IntoResponse {
+    let dry_run = query.dry_run.unwrap_or(true);
+    let max_deletions = query.max_deletions.unwrap_or(64).max(1);
+    let retained_overhead_bytes = query.retained_overhead_bytes.unwrap_or(0);
+
+    let keys = {
+        let store = state.store.lock().await;
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+    };
+
+    let (plan, nodes) = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        (cluster.replication_plan(&keys), cluster.list_nodes())
+    };
+
+    let node_by_id: HashMap<NodeId, NodeDescriptor> =
+        nodes.into_iter().map(|node| (node.node_id, node)).collect();
+
+    let mut candidates = Vec::<CleanupCandidate>::new();
+    let mut skipped_items = 0usize;
+
+    for item in plan
+        .items
+        .iter()
+        .filter(|item| !item.extra_nodes.is_empty())
+    {
+        let Some((key, version_id)) = parse_replication_subject(&item.key) else {
+            skipped_items += 1;
+            continue;
+        };
+
+        let Some(version_id) = version_id else {
+            skipped_items += 1;
+            continue;
+        };
+
+        let bundle = {
+            let store = state.store.lock().await;
+            match store
+                .export_replication_bundle(&key, Some(&version_id), ObjectReadMode::Preferred)
+                .await
+            {
+                Ok(Some(bundle)) => bundle,
+                _ => {
+                    skipped_items += 1;
+                    continue;
+                }
+            }
+        };
+
+        let size_bytes = bundle.manifest.total_size_bytes as u64;
+
+        for extra_node in &item.extra_nodes {
+            let Some(node) = node_by_id.get(extra_node) else {
+                skipped_items += 1;
+                continue;
+            };
+
+            candidates.push(CleanupCandidate {
+                subject: item.key.clone(),
+                key: key.clone(),
+                version_id: version_id.clone(),
+                node_id: *extra_node,
+                node_public_url: node.public_url.clone(),
+                size_bytes,
+                node_free_bytes: node.free_bytes,
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        a.node_free_bytes
+            .cmp(&b.node_free_bytes)
+            .then_with(|| b.size_bytes.cmp(&a.size_bytes))
+    });
+
+    let estimated_overhead_bytes = candidates.iter().fold(0u64, |acc, candidate| {
+        acc.saturating_add(candidate.size_bytes)
+    });
+    let target_reclaimed_bytes = estimated_overhead_bytes.saturating_sub(retained_overhead_bytes);
+
+    let mut selected = Vec::<CleanupCandidate>::new();
+    let mut selected_bytes = 0u64;
+    for candidate in candidates {
+        if selected.len() >= max_deletions {
+            break;
+        }
+        if selected_bytes >= target_reclaimed_bytes {
+            break;
+        }
+        selected_bytes = selected_bytes.saturating_add(candidate.size_bytes);
+        selected.push(candidate);
+    }
+
+    let mut attempted_deletions = 0usize;
+    let mut successful_deletions = 0usize;
+    let mut failed_deletions = 0usize;
+    let mut reclaimed_bytes = 0u64;
+
+    if dry_run {
+        attempted_deletions = selected.len();
+        successful_deletions = selected.len();
+        reclaimed_bytes = selected_bytes;
+    } else {
+        let http = reqwest::Client::new();
+        for candidate in selected {
+            attempted_deletions += 1;
+
+            let response = http
+                .post(format!(
+                    "{}/cluster/replication/drop",
+                    candidate.node_public_url
+                ))
+                .query(&ReplicationDropQuery {
+                    key: candidate.key.clone(),
+                    version_id: Some(candidate.version_id.clone()),
+                })
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    successful_deletions += 1;
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(candidate.size_bytes);
+
+                    let mut cluster = state.cluster.lock().await;
+                    cluster.remove_replica(&candidate.subject, candidate.node_id);
+                    cluster.remove_replica(
+                        &format!("{}@{}", candidate.key, candidate.version_id),
+                        candidate.node_id,
+                    );
+                }
+                _ => {
+                    failed_deletions += 1;
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(ReplicationCleanupReport {
+            dry_run,
+            planned_candidates: plan.over_replicated,
+            considered_candidates: attempted_deletions,
+            target_reclaimed_bytes,
+            estimated_overhead_bytes,
+            reclaimed_bytes,
+            attempted_deletions,
+            successful_deletions,
+            failed_deletions,
+            skipped_items,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize, Serialize)]

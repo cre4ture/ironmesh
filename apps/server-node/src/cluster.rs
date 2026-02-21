@@ -191,6 +191,15 @@ impl ClusterService {
             .insert(node_id);
     }
 
+    pub fn remove_replica(&mut self, key: &str, node_id: NodeId) {
+        if let Some(nodes) = self.replicas_by_key.get_mut(key) {
+            nodes.remove(&node_id);
+            if nodes.is_empty() {
+                self.replicas_by_key.remove(key);
+            }
+        }
+    }
+
     pub fn placement_for_key(&self, key: &str) -> PlacementDecision {
         let selected_nodes = select_nodes_by_rendezvous(key, &self.nodes, &self.policy);
         PlacementDecision {
@@ -466,5 +475,22 @@ mod tests {
 
         assert_eq!(svc.metadata_commit_quorum_size(), 1);
         assert!(svc.has_metadata_commit_quorum());
+    }
+
+    #[test]
+    fn remove_replica_clears_subject_membership() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        svc.note_replica("subject-a", node_a);
+
+        let before = svc.replication_plan(&["subject-a".to_string()]);
+        assert_eq!(before.items.len(), 1);
+
+        svc.remove_replica("subject-a", node_a);
+
+        let after = svc.replication_plan(&["subject-a".to_string()]);
+        assert!(after.items.is_empty());
     }
 }
