@@ -173,8 +173,18 @@ pub struct PersistentStore {
     manifests_dir: PathBuf,
     snapshots_dir: PathBuf,
     versions_dir: PathBuf,
+    reconcile_markers_dir: PathBuf,
     current_state_path: PathBuf,
     current_state: CurrentState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReconcileMarker {
+    source_node_id: String,
+    key: String,
+    source_version_id: String,
+    local_version_id: Option<String>,
+    imported_at_unix: u64,
 }
 
 impl PersistentStore {
@@ -184,6 +194,7 @@ impl PersistentStore {
         let manifests_dir = root_dir.join("manifests");
         let snapshots_dir = root_dir.join("snapshots");
         let versions_dir = root_dir.join("versions");
+        let reconcile_markers_dir = root_dir.join("reconcile_markers");
         let state_dir = root_dir.join("state");
         let current_state_path = state_dir.join("current.json");
 
@@ -191,6 +202,7 @@ impl PersistentStore {
         fs::create_dir_all(&manifests_dir).await?;
         fs::create_dir_all(&snapshots_dir).await?;
         fs::create_dir_all(&versions_dir).await?;
+        fs::create_dir_all(&reconcile_markers_dir).await?;
         fs::create_dir_all(&state_dir).await?;
 
         let current_state = if fs::try_exists(&current_state_path).await? {
@@ -208,6 +220,7 @@ impl PersistentStore {
             manifests_dir,
             snapshots_dir,
             versions_dir,
+            reconcile_markers_dir,
             current_state_path,
             current_state,
         })
@@ -423,6 +436,36 @@ impl PersistentStore {
             .versions
             .values()
             .any(|record| record.manifest_hash == manifest_hash))
+    }
+
+    pub async fn has_reconcile_marker(
+        &self,
+        source_node_id: &str,
+        key: &str,
+        source_version_id: &str,
+    ) -> Result<bool> {
+        let path = self.reconcile_marker_path(source_node_id, key, source_version_id);
+        fs::try_exists(path).await.map_err(Into::into)
+    }
+
+    pub async fn mark_reconciled(
+        &self,
+        source_node_id: &str,
+        key: &str,
+        source_version_id: &str,
+        local_version_id: Option<&str>,
+    ) -> Result<()> {
+        let marker = ReconcileMarker {
+            source_node_id: source_node_id.to_string(),
+            key: key.to_string(),
+            source_version_id: source_version_id.to_string(),
+            local_version_id: local_version_id.map(ToString::to_string),
+            imported_at_unix: unix_ts(),
+        };
+
+        let path = self.reconcile_marker_path(source_node_id, key, source_version_id);
+        let payload = serde_json::to_vec_pretty(&marker)?;
+        write_atomic(&path, &payload).await
     }
 
     pub async fn list_provisional_versions(&self) -> Result<Vec<ReconcileVersionEntry>> {
@@ -870,6 +913,17 @@ impl PersistentStore {
     fn version_index_path(&self, key: &str) -> PathBuf {
         let key_hash = hash_hex(key.as_bytes());
         self.versions_dir.join(format!("{key_hash}.json"))
+    }
+
+    fn reconcile_marker_path(
+        &self,
+        source_node_id: &str,
+        key: &str,
+        source_version_id: &str,
+    ) -> PathBuf {
+        let seed = format!("{source_node_id}:{key}:{source_version_id}");
+        let marker_id = hash_hex(seed.as_bytes());
+        self.reconcile_markers_dir.join(format!("{marker_id}.json"))
     }
 }
 

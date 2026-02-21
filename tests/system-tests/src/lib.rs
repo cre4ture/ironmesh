@@ -766,6 +766,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_replay_is_idempotent() -> Result<()> {
+        let bind_a = "127.0.0.1:19103";
+        let bind_b = "127.0.0.1:19104";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000002a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000002b2";
+
+        let data_a = fresh_data_dir("reconcile-idempotent-a");
+        let data_b = fresh_data_dir("reconcile-idempotent-b");
+
+        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            http.put(format!("{base_b}/store/replay-key?state=provisional"))
+                .body("remote-branch")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+
+            let first_report: serde_json::Value = http
+                .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let first_imported = first_report
+                .get("imported")
+                .and_then(|v| v.as_u64())
+                .context("missing first imported count")?;
+            assert!(first_imported >= 1, "expected first reconcile to import");
+
+            let versions_after_first: serde_json::Value = http
+                .get(format!("{base_a}/versions/replay-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let count_after_first = versions_after_first
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len())
+                .context("missing versions after first reconcile")?;
+
+            let second_report: serde_json::Value = http
+                .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let second_imported = second_report
+                .get("imported")
+                .and_then(|v| v.as_u64())
+                .context("missing second imported count")?;
+            let second_skipped_replayed = second_report
+                .get("skipped_replayed")
+                .and_then(|v| v.as_u64())
+                .context("missing second skipped_replayed count")?;
+
+            assert_eq!(second_imported, 0);
+            assert!(
+                second_skipped_replayed >= 1,
+                "expected replay skips on second reconcile"
+            );
+
+            let versions_after_second: serde_json::Value = http
+                .get(format!("{base_a}/versions/replay-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let count_after_second = versions_after_second
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len())
+                .context("missing versions after second reconcile")?;
+
+            assert_eq!(count_after_first, count_after_second);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
     async fn maintenance_cleanup_removes_orphans_and_keeps_live_data() -> Result<()> {
         let bind = "127.0.0.1:19102";
         let data_dir = fresh_data_dir("maintenance-cleanup");

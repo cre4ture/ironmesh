@@ -621,6 +621,7 @@ struct ReconcileReport {
     source_node_id: NodeId,
     imported: usize,
     skipped_existing: usize,
+    skipped_replayed: usize,
     failed: usize,
 }
 
@@ -696,9 +697,37 @@ async fn reconcile_from_node(
 
     let mut imported = 0usize;
     let mut skipped_existing = 0usize;
+    let mut skipped_replayed = 0usize;
     let mut failed = 0usize;
+    let source_node_id_string = source_node_id.to_string();
 
     for entry in remote_entries {
+        let replayed = {
+            let store = state.store.lock().await;
+            match store
+                .has_reconcile_marker(&source_node_id_string, &entry.key, &entry.version_id)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!(
+                        source_node_id = %source_node_id,
+                        key = %entry.key,
+                        version_id = %entry.version_id,
+                        error = %err,
+                        "failed checking reconciliation replay marker"
+                    );
+                    failed += 1;
+                    continue;
+                }
+            }
+        };
+
+        if replayed {
+            skipped_replayed += 1;
+            continue;
+        }
+
         let already_present = {
             let store = state.store.lock().await;
             match store
@@ -721,6 +750,22 @@ async fn reconcile_from_node(
 
         if already_present {
             skipped_existing += 1;
+            let mark_result = {
+                let store = state.store.lock().await;
+                store
+                    .mark_reconciled(&source_node_id_string, &entry.key, &entry.version_id, None)
+                    .await
+            };
+
+            if let Err(err) = mark_result {
+                tracing::error!(
+                    source_node_id = %source_node_id,
+                    key = %entry.key,
+                    version_id = %entry.version_id,
+                    error = %err,
+                    "failed writing reconciliation marker for existing manifest"
+                );
+            }
             continue;
         }
 
@@ -787,6 +832,31 @@ async fn reconcile_from_node(
         match put_result {
             Ok(outcome) => {
                 imported += 1;
+
+                let mark_result = {
+                    let store = state.store.lock().await;
+                    store
+                        .mark_reconciled(
+                            &source_node_id_string,
+                            &entry.key,
+                            &entry.version_id,
+                            Some(outcome.version_id.as_str()),
+                        )
+                        .await
+                };
+
+                if let Err(err) = mark_result {
+                    tracing::error!(
+                        source_node_id = %source_node_id,
+                        key = %entry.key,
+                        version_id = %entry.version_id,
+                        error = %err,
+                        "failed writing reconciliation marker"
+                    );
+                    failed += 1;
+                    continue;
+                }
+
                 let mut cluster = state.cluster.lock().await;
                 cluster.note_replica(&entry.key, state.node_id);
                 cluster.note_replica(
@@ -813,6 +883,7 @@ async fn reconcile_from_node(
             source_node_id,
             imported,
             skipped_existing,
+            skipped_replayed,
             failed,
         }),
     )
