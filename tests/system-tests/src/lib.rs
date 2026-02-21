@@ -134,6 +134,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_index_lists_keys_by_prefix_and_depth() -> Result<()> {
+        let bind = "127.0.0.1:19122";
+        let data_dir = fresh_data_dir("store-index");
+        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let base_url = format!("http://{bind}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            for (key, payload) in [
+                ("docs/guide/intro.md", "intro"),
+                ("docs/guide/setup.md", "setup"),
+                ("docs/api/v1.json", "api"),
+            ] {
+                let encoded = key.replace('/', "%2F");
+                client
+                    .put(format!("{base_url}/store/{encoded}"))
+                    .body(payload)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            let index: serde_json::Value = client
+                .get(format!("{base_url}/store/index?prefix=docs&depth=1"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let paths = index
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.get("path").and_then(|v| v.as_str()))
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .context("missing entries in store index response")?;
+
+            assert!(paths.contains(&"docs/api/".to_string()));
+            assert!(paths.contains(&"docs/guide/".to_string()));
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
     async fn corrupted_chunk_returns_conflict() -> Result<()> {
         let bind = "127.0.0.1:19084";
         let data_dir = fresh_data_dir("corrupt-detection");

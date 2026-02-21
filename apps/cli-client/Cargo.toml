@@ -11,6 +11,8 @@ axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
+reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 web-ui = { path = "../web-ui" }

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
@@ -268,6 +269,7 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
+        .route("/store/index", get(list_store_index))
         .route("/store/{key}", put(put_object).get(get_object))
         .route("/versions/{key}", get(list_versions))
         .route(
@@ -497,6 +499,26 @@ struct ObjectGetQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct StoreIndexQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreIndexEntry {
+    path: String,
+    entry_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreIndexResponse {
+    prefix: String,
+    depth: usize,
+    entry_count: usize,
+    entries: Vec<StoreIndexEntry>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PutObjectQuery {
     state: Option<String>,
     #[serde(default)]
@@ -559,6 +581,91 @@ async fn put_object(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+async fn list_store_index(
+    State(state): State<ServerState>,
+    Query(query): Query<StoreIndexQuery>,
+) -> impl IntoResponse {
+    let prefix = query.prefix.unwrap_or_default();
+    let depth = query.depth.unwrap_or(1).max(1);
+
+    let keys = {
+        let store = state.store.lock().await;
+        store.current_keys()
+    };
+
+    let entries = build_store_index_entries(&keys, &prefix, depth);
+
+    (
+        StatusCode::OK,
+        Json(StoreIndexResponse {
+            prefix,
+            depth,
+            entry_count: entries.len(),
+            entries,
+        }),
+    )
+        .into_response()
+}
+
+fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
+    let normalized_prefix = prefix.trim_end_matches('/');
+    let mut file_entries = BTreeSet::new();
+    let mut prefix_entries = BTreeSet::new();
+
+    for key in keys {
+        if !normalized_prefix.is_empty() && !key.starts_with(normalized_prefix) {
+            continue;
+        }
+
+        let mut remainder = if normalized_prefix.is_empty() {
+            key.as_str()
+        } else {
+            match key.strip_prefix(normalized_prefix) {
+                Some(value) => value,
+                None => continue,
+            }
+        };
+
+        if remainder.starts_with('/') {
+            remainder = remainder.trim_start_matches('/');
+        }
+
+        let segments: Vec<&str> = remainder
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+
+        if segments.is_empty() || segments.len() <= depth {
+            file_entries.insert(key.clone());
+            continue;
+        }
+
+        let partial = segments[..depth].join("/");
+        let combined = if normalized_prefix.is_empty() {
+            partial
+        } else {
+            format!("{normalized_prefix}/{partial}")
+        };
+        prefix_entries.insert(format!("{}/", combined.trim_end_matches('/')));
+    }
+
+    let mut entries = Vec::with_capacity(file_entries.len() + prefix_entries.len());
+    for path in prefix_entries {
+        entries.push(StoreIndexEntry {
+            path,
+            entry_type: "prefix".to_string(),
+        });
+    }
+    for path in file_entries {
+        entries.push(StoreIndexEntry {
+            path,
+            entry_type: "key".to_string(),
+        });
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries
 }
 
 async fn get_object(
@@ -1782,8 +1889,9 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 #[cfg(test)]
 mod tests {
     use super::{
-        constant_time_eq, expected_internal_token_for_node, internal_node_header_valid,
-        internal_token_matches, jittered_backoff_secs, parse_internal_node_tokens,
+        build_store_index_entries, constant_time_eq, expected_internal_token_for_node,
+        internal_node_header_valid, internal_token_matches, jittered_backoff_secs,
+        parse_internal_node_tokens,
     };
     use common::NodeId;
     use std::collections::HashMap;
@@ -1857,6 +1965,41 @@ mod tests {
 
         let expected = expected_internal_token_for_node(&node_tokens, node);
         assert_eq!(expected, Some("node-token"));
+    }
+
+    #[test]
+    fn store_index_depth_groups_prefixes() {
+        let keys = vec![
+            "docs/guide/intro.md".to_string(),
+            "docs/guide/setup.md".to_string(),
+            "docs/api/v1.json".to_string(),
+        ];
+
+        let entries = build_store_index_entries(&keys, "docs", 1);
+        let paths = entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["docs/api/", "docs/guide/"]);
+    }
+
+    #[test]
+    fn store_index_prefix_returns_matching_keys() {
+        let keys = vec![
+            "images/cat.png".to_string(),
+            "images/dogs/beagle.png".to_string(),
+            "docs/readme.md".to_string(),
+        ];
+
+        let entries = build_store_index_entries(&keys, "images", 2);
+        let mut key_paths = entries
+            .into_iter()
+            .filter(|entry| entry.entry_type == "key")
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        key_paths.sort();
+
+        assert_eq!(key_paths, vec!["images/cat.png", "images/dogs/beagle.png"]);
     }
 }
 

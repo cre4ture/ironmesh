@@ -98,6 +98,21 @@ Those bridges can be added incrementally without changing the workspace topology
 	- `version=<version_id>` for exact historical reads.
 	- `snapshot=<snapshot_id>` for snapshot time-travel reads.
 
+### Object index and browsing
+
+- `GET /store/index?prefix=<prefix>&depth=<n>` lists object keys as a virtual directory tree.
+- Keys are treated as slash-delimited paths for browsing convenience.
+- `depth` controls how many path segments are grouped under `prefix`.
+
+### CLI status and browsing commands
+
+- `ironmesh list --prefix <prefix> --depth <n>`
+- `ironmesh health`
+- `ironmesh cluster-status`
+- `ironmesh nodes`
+- `ironmesh replication-plan`
+- `ironmesh serve-web` provides an interactive web UI for upload/download, key browsing, health checks, and replication-plan inspection.
+
 ### Reconciliation and maintenance
 
 - Cluster node membership endpoints:
