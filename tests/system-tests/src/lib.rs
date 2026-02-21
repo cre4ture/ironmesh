@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
@@ -503,6 +504,122 @@ mod tests {
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn rejoin_reconciliation_preserves_provisional_branches() -> Result<()> {
+        let bind_a = "127.0.0.1:19100";
+        let bind_b = "127.0.0.1:19101";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000001a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000001b2";
+
+        let data_a = fresh_data_dir("rejoin-a");
+        let data_b = fresh_data_dir("rejoin-b");
+
+        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            http.put(format!("{base_a}/store/rejoin-key"))
+                .body("a-confirmed")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            http.put(format!("{base_a}/store/rejoin-key?state=provisional"))
+                .body("a-branch")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            http.put(format!("{base_b}/store/rejoin-key?state=provisional"))
+                .body("b-branch")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+
+            let reconcile = http
+                .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
+                .send()
+                .await?
+                .error_for_status()?;
+            let reconcile_body: serde_json::Value = reconcile.json().await?;
+            let imported = reconcile_body
+                .get("imported")
+                .and_then(|v| v.as_u64())
+                .context("missing imported count")?;
+            assert!(
+                imported >= 1,
+                "expected at least one imported provisional commit"
+            );
+
+            let versions_payload = http
+                .get(format!("{base_a}/versions/rejoin-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+
+            let versions: serde_json::Value = serde_json::from_str(&versions_payload)?;
+            let entries = versions
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .context("missing versions array")?;
+
+            let provisional_count = entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .map(|state| state == "provisional")
+                        .unwrap_or(false)
+                })
+                .count();
+            assert!(
+                provisional_count >= 2,
+                "expected at least two provisional branches after reconciliation"
+            );
+
+            let mut payloads = HashSet::new();
+            for entry in entries {
+                let version_id = entry
+                    .get("version_id")
+                    .and_then(|v| v.as_str())
+                    .context("missing version_id")?;
+
+                let payload = http
+                    .get(format!("{base_a}/store/rejoin-key?version={version_id}"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .text()
+                    .await?;
+                payloads.insert(payload);
+            }
+
+            assert!(payloads.contains("a-confirmed"));
+            assert!(payloads.contains("a-branch"));
+            assert!(payloads.contains("b-branch"));
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
 
         result
     }

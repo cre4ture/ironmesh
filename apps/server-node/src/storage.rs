@@ -106,6 +106,7 @@ impl std::error::Error for StoreReadError {}
 pub struct PutOptions {
     pub parent_version_ids: Vec<String>,
     pub state: VersionConsistencyState,
+    pub inherit_preferred_parent: bool,
 }
 
 impl Default for PutOptions {
@@ -113,8 +114,19 @@ impl Default for PutOptions {
         Self {
             parent_version_ids: Vec::new(),
             state: VersionConsistencyState::Confirmed,
+            inherit_preferred_parent: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileVersionEntry {
+    pub key: String,
+    pub version_id: String,
+    pub manifest_hash: String,
+    pub parent_version_ids: Vec<String>,
+    pub state: VersionConsistencyState,
+    pub created_at_unix: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -235,11 +247,15 @@ impl PersistentStore {
             .unwrap_or_else(|| empty_version_index(key));
 
         let parent_version_ids = if options.parent_version_ids.is_empty() {
-            index
-                .preferred_head_version_id
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
+            if options.inherit_preferred_parent {
+                index
+                    .preferred_head_version_id
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
         } else {
             options.parent_version_ids.clone()
         };
@@ -340,6 +356,57 @@ impl PersistentStore {
             head_version_ids: index.head_version_ids,
             versions,
         }))
+    }
+
+    pub async fn has_manifest_for_key(&self, key: &str, manifest_hash: &str) -> Result<bool> {
+        let Some(index) = self.load_version_index(key).await? else {
+            return Ok(false);
+        };
+
+        Ok(index
+            .versions
+            .values()
+            .any(|record| record.manifest_hash == manifest_hash))
+    }
+
+    pub async fn list_provisional_versions(&self) -> Result<Vec<ReconcileVersionEntry>> {
+        let mut entries = fs::read_dir(&self.versions_dir).await?;
+        let mut output = Vec::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = fs::read(&path).await?;
+            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
+                .with_context(|| format!("invalid version index {}", path.display()))?;
+
+            for record in index.versions.values() {
+                if record.state != VersionConsistencyState::Provisional {
+                    continue;
+                }
+
+                output.push(ReconcileVersionEntry {
+                    key: record.key.clone(),
+                    version_id: record.version_id.clone(),
+                    manifest_hash: record.manifest_hash.clone(),
+                    parent_version_ids: record.parent_version_ids.clone(),
+                    state: record.state.clone(),
+                    created_at_unix: record.created_at_unix,
+                });
+            }
+        }
+
+        output.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| a.created_at_unix.cmp(&b.created_at_unix))
+                .then_with(|| a.version_id.cmp(&b.version_id))
+        });
+
+        Ok(output)
     }
 
     pub async fn get_object(

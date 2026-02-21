@@ -11,7 +11,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use common::{HealthStatus, NodeId};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -19,7 +19,10 @@ mod cluster;
 mod storage;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
-use storage::{PersistentStore, PutOptions, SnapshotInfo, StoreReadError, VersionConsistencyState};
+use storage::{
+    PersistentStore, PutOptions, ReconcileVersionEntry, SnapshotInfo, StoreReadError,
+    VersionConsistencyState,
+};
 
 #[derive(Clone)]
 struct ServerState {
@@ -151,6 +154,11 @@ async fn main() -> Result<()> {
             "/cluster/replication/audit",
             post(trigger_replication_audit),
         )
+        .route(
+            "/cluster/reconcile/export/provisional",
+            get(export_provisional_versions),
+        )
+        .route("/cluster/reconcile/{node_id}", post(reconcile_from_node))
         .with_state(state);
 
     info!(%bind_addr, %node_id, "server node listening");
@@ -268,6 +276,8 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
       <li><code>GET /cluster/placement/{{key}}</code> — deterministic placement decision</li>
       <li><code>GET /cluster/replication/plan</code> — current replication gaps/overages</li>
       <li><code>POST /cluster/replication/audit</code> — manual audit trigger</li>
+            <li><code>GET /cluster/reconcile/export/provisional</code> — export local provisional metadata for rejoin sync</li>
+            <li><code>POST /cluster/reconcile/{{node_id}}</code> — import provisional commits from a peer node</li>
     </ul>
   </main>
 </body>
@@ -328,6 +338,7 @@ async fn put_object(
             PutOptions {
                 parent_version_ids: query.parent,
                 state: version_state,
+                inherit_preferred_parent: true,
             },
         )
         .await
@@ -551,4 +562,203 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
     );
 
     Json(plan)
+}
+
+#[derive(Debug, Serialize)]
+struct ReconcileReport {
+    source_node_id: NodeId,
+    imported: usize,
+    skipped_existing: usize,
+    failed: usize,
+}
+
+async fn export_provisional_versions(State(state): State<ServerState>) -> impl IntoResponse {
+    let store = state.store.lock().await;
+    match store.list_provisional_versions().await {
+        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to export provisional versions");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn reconcile_from_node(
+    State(state): State<ServerState>,
+    Path(node_id): Path<String>,
+) -> impl IntoResponse {
+    let source_node_id = match node_id.parse::<NodeId>() {
+        Ok(id) => id,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let remote_url = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+
+        let Some(node) = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|entry| entry.node_id == source_node_id)
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+
+        node.public_url
+    };
+
+    let http = reqwest::Client::new();
+
+    let export_url = format!("{remote_url}/cluster/reconcile/export/provisional");
+    let remote_entries: Vec<ReconcileVersionEntry> = match http.get(export_url).send().await {
+        Ok(response) => match response.error_for_status() {
+            Ok(ok_response) => match ok_response.json::<Vec<ReconcileVersionEntry>>().await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    tracing::error!(
+                        source_node_id = %source_node_id,
+                        error = %err,
+                        "failed to parse reconciliation export payload"
+                    );
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
+            },
+            Err(err) => {
+                tracing::error!(
+                    source_node_id = %source_node_id,
+                    error = %err,
+                    "reconciliation export endpoint returned error"
+                );
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+        },
+        Err(err) => {
+            tracing::error!(
+                source_node_id = %source_node_id,
+                error = %err,
+                "failed to call reconciliation export endpoint"
+            );
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    let mut imported = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut failed = 0usize;
+
+    for entry in remote_entries {
+        let already_present = {
+            let store = state.store.lock().await;
+            match store
+                .has_manifest_for_key(&entry.key, &entry.manifest_hash)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!(
+                        source_node_id = %source_node_id,
+                        key = %entry.key,
+                        error = %err,
+                        "failed checking local manifest during reconciliation"
+                    );
+                    failed += 1;
+                    continue;
+                }
+            }
+        };
+
+        if already_present {
+            skipped_existing += 1;
+            continue;
+        }
+
+        let object_url = format!(
+            "{remote_url}/store/{}?version={}",
+            entry.key, entry.version_id
+        );
+        let payload = match http.get(object_url).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(ok_response) => match ok_response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        tracing::error!(
+                            source_node_id = %source_node_id,
+                            key = %entry.key,
+                            version_id = %entry.version_id,
+                            error = %err,
+                            "failed to read reconciliation object payload"
+                        );
+                        failed += 1;
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    tracing::error!(
+                        source_node_id = %source_node_id,
+                        key = %entry.key,
+                        version_id = %entry.version_id,
+                        error = %err,
+                        "reconciliation object fetch returned error"
+                    );
+                    failed += 1;
+                    continue;
+                }
+            },
+            Err(err) => {
+                tracing::error!(
+                    source_node_id = %source_node_id,
+                    key = %entry.key,
+                    version_id = %entry.version_id,
+                    error = %err,
+                    "failed to call reconciliation object fetch"
+                );
+                failed += 1;
+                continue;
+            }
+        };
+
+        let put_result = {
+            let mut store = state.store.lock().await;
+            store
+                .put_object_versioned(
+                    &entry.key,
+                    payload,
+                    PutOptions {
+                        parent_version_ids: Vec::new(),
+                        state: VersionConsistencyState::Provisional,
+                        inherit_preferred_parent: false,
+                    },
+                )
+                .await
+        };
+
+        match put_result {
+            Ok(_) => {
+                imported += 1;
+                let mut cluster = state.cluster.lock().await;
+                cluster.note_replica(&entry.key, state.node_id);
+            }
+            Err(err) => {
+                tracing::error!(
+                    source_node_id = %source_node_id,
+                    key = %entry.key,
+                    version_id = %entry.version_id,
+                    error = %err,
+                    "failed importing provisional version during reconciliation"
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(ReconcileReport {
+            source_node_id,
+            imported,
+            skipped_existing,
+            failed,
+        }),
+    )
+        .into_response()
 }
