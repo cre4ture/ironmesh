@@ -310,7 +310,7 @@ fn select_nodes_by_rendezvous(
         })
         .collect();
 
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     let mut selected = Vec::<NodeId>::new();
     let mut seen_label_values: HashMap<String, HashSet<String>> = HashMap::new();

@@ -985,7 +985,7 @@ impl PersistentStore {
             });
         }
 
-        snapshots.sort_by(|a, b| b.created_at_unix.cmp(&a.created_at_unix));
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.created_at_unix));
         Ok(snapshots)
     }
 
