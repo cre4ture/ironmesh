@@ -171,6 +171,132 @@ mod tests {
         result
     }
 
+    #[tokio::test]
+    async fn version_graph_and_confirm_flow() -> Result<()> {
+        let bind = "127.0.0.1:19085";
+        let data_dir = fresh_data_dir("version-graph");
+        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let base_url = format!("http://{bind}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            client
+                .put(format!("{base_url}/store/versioned-key"))
+                .body("v1")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let first_versions_payload = client
+                .get(format!("{base_url}/versions/versioned-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            let first_versions: serde_json::Value =
+                serde_json::from_str(&first_versions_payload)?;
+
+            let first_version_id = first_versions
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|entry| entry.get("version_id"))
+                .and_then(|v| v.as_str())
+                .context("missing first version id")?
+                .to_string();
+
+            client
+                .put(format!("{base_url}/store/versioned-key?state=provisional"))
+                .body("v2")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let second_versions_payload = client
+                .get(format!("{base_url}/versions/versioned-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            let second_versions: serde_json::Value =
+                serde_json::from_str(&second_versions_payload)?;
+
+            let provisional_entry = second_versions
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter().find(|entry| {
+                        entry
+                            .get("state")
+                            .and_then(|s| s.as_str())
+                            .map(|state| state == "provisional")
+                            .unwrap_or(false)
+                    })
+                })
+                .context("missing provisional version entry")?;
+
+            let provisional_version_id = provisional_entry
+                .get("version_id")
+                .and_then(|v| v.as_str())
+                .context("missing provisional version id")?
+                .to_string();
+
+            let v1_payload = client
+                .get(format!(
+                    "{base_url}/store/versioned-key?version={first_version_id}"
+                ))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert_eq!(v1_payload, "v1");
+
+            let confirm_response = client
+                .post(format!(
+                    "{base_url}/versions/versioned-key/confirm/{provisional_version_id}"
+                ))
+                .send()
+                .await?;
+            assert_eq!(confirm_response.status(), StatusCode::NO_CONTENT);
+
+            let third_versions_payload = client
+                .get(format!("{base_url}/versions/versioned-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            let third_versions: serde_json::Value = serde_json::from_str(&third_versions_payload)?;
+
+            let confirmed_again = third_versions
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter().find(|entry| {
+                        entry
+                            .get("version_id")
+                            .and_then(|s| s.as_str())
+                            .map(|id| id == provisional_version_id)
+                            .unwrap_or(false)
+                    })
+                })
+                .and_then(|entry| entry.get("state"))
+                .and_then(|s| s.as_str())
+                .context("missing confirmed state after confirm")?;
+            assert_eq!(confirmed_again, "confirmed");
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
     async fn start_server(bind: &str) -> Result<Child> {
         let data_dir = fresh_data_dir("default-server");
         start_server_with_data_dir(bind, &data_dir).await

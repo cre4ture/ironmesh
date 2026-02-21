@@ -19,7 +19,9 @@ mod cluster;
 mod storage;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
-use storage::{PersistentStore, SnapshotInfo, StoreReadError};
+use storage::{
+    PersistentStore, PutOptions, SnapshotInfo, StoreReadError, VersionConsistencyState,
+};
 
 #[derive(Clone)]
 struct ServerState {
@@ -105,6 +107,11 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
         .route("/store/{key}", put(put_object).get(get_object))
+        .route("/versions/{key}", get(list_versions))
+        .route(
+            "/versions/{key}/confirm/{version_id}",
+            post(confirm_version),
+        )
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
         .route("/cluster/nodes/{node_id}", put(register_node))
@@ -218,6 +225,9 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
       <li><code>PUT /store/{{key}}</code> — store object bytes</li>
       <li><code>GET /store/{{key}}</code> — fetch object bytes from latest state</li>
       <li><code>GET /store/{{key}}?snapshot=&lt;id&gt;</code> — fetch object from snapshot state</li>
+    <li><code>GET /store/{{key}}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
+    <li><code>GET /versions/{{key}}</code> — list version DAG metadata</li>
+    <li><code>POST /versions/{{key}}/confirm/{{version_id}}</code> — mark provisional version as confirmed</li>
       <li><code>GET /cluster/status</code> — cluster summary</li>
       <li><code>GET /cluster/nodes</code> — known node list</li>
       <li><code>PUT /cluster/nodes/{{node_id}}</code> — register/update node metadata</li>
@@ -255,15 +265,40 @@ async fn list_snapshots(State(state): State<ServerState>) -> impl IntoResponse {
 #[derive(Debug, Deserialize)]
 struct ObjectGetQuery {
     snapshot: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PutObjectQuery {
+    state: Option<String>,
+    #[serde(default)]
+    parent: Vec<String>,
 }
 
 async fn put_object(
     State(state): State<ServerState>,
     Path(key): Path<String>,
+    Query(query): Query<PutObjectQuery>,
     payload: Bytes,
 ) -> impl IntoResponse {
+    let version_state = match query.state.as_deref() {
+        None | Some("confirmed") => VersionConsistencyState::Confirmed,
+        Some("provisional") => VersionConsistencyState::Provisional,
+        Some(_) => return StatusCode::BAD_REQUEST,
+    };
+
     let mut store = state.store.lock().await;
-    match store.put_object(&key, payload).await {
+    match store
+        .put_object_versioned(
+            &key,
+            payload,
+            PutOptions {
+                parent_version_ids: query.parent,
+                state: version_state,
+            },
+        )
+        .await
+    {
         Ok(outcome) => {
             drop(store);
 
@@ -273,6 +308,8 @@ async fn put_object(
             info!(
                 key = %key,
                 snapshot_id = %outcome.snapshot_id,
+                version_id = %outcome.version_id,
+                version_state = ?outcome.state,
                 new_chunks = outcome.new_chunks,
                 dedup_reused_chunks = outcome.dedup_reused_chunks,
                 "stored object"
@@ -292,7 +329,10 @@ async fn get_object(
     Query(query): Query<ObjectGetQuery>,
 ) -> impl IntoResponse {
     let store = state.store.lock().await;
-    match store.get_object(&key, query.snapshot.as_deref()).await {
+    match store
+        .get_object(&key, query.snapshot.as_deref(), query.version.as_deref())
+        .await
+    {
         Ok(bytes) => (StatusCode::OK, bytes).into_response(),
         Err(StoreReadError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(StoreReadError::Corrupt(msg)) => {
@@ -302,6 +342,33 @@ async fn get_object(
         Err(StoreReadError::Internal(err)) => {
             tracing::error!(key = %key, error = %err, "internal error while reading object");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn list_versions(State(state): State<ServerState>, Path(key): Path<String>) -> impl IntoResponse {
+    let store = state.store.lock().await;
+    match store.list_versions(&key).await {
+        Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(key = %key, error = %err, "failed to list versions");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn confirm_version(
+    State(state): State<ServerState>,
+    Path((key, version_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut store = state.store.lock().await;
+    match store.confirm_version(&key, &version_id).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(err) => {
+            tracing::error!(key = %key, version_id = %version_id, error = %err, "failed to confirm version");
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
