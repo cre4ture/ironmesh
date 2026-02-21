@@ -642,7 +642,11 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
         let mut cluster = state.cluster.lock().await;
         cluster.update_health_and_detect_offline_transition();
         let plan = cluster.replication_plan(&keys);
-        (plan.items.len(), plan.under_replicated, plan.over_replicated)
+        (
+            plan.items.len(),
+            plan.under_replicated,
+            plan.over_replicated,
+        )
     };
 
     let startup_repair_status = {
@@ -2203,11 +2207,10 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 mod tests {
     use super::{
         MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState, ServerState,
-        StartupRepairStatus,
-        build_internal_replication_put_url, build_store_index_entries, cluster, constant_time_eq,
-        expected_internal_token_for_node, internal_node_header_valid, internal_token_matches,
-        jittered_backoff_secs, parse_internal_node_tokens, run_startup_replication_repair_once,
-        should_trigger_autonomous_post_write_replication,
+        StartupRepairStatus, build_internal_replication_put_url, build_store_index_entries,
+        cluster, constant_time_eq, expected_internal_token_for_node, internal_node_header_valid,
+        internal_token_matches, jittered_backoff_secs, parse_internal_node_tokens,
+        run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
     };
     use common::NodeId;
     use std::path::PathBuf;
