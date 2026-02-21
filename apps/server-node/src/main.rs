@@ -51,6 +51,12 @@ struct RepairConfig {
     backoff_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PeerHeartbeatConfig {
+    enabled: bool,
+    interval_secs: u64,
+}
+
 impl RepairConfig {
     fn from_env() -> Self {
         let enabled = std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
@@ -79,6 +85,26 @@ impl RepairConfig {
             batch_size,
             max_retries,
             backoff_secs,
+        }
+    }
+}
+
+impl PeerHeartbeatConfig {
+    fn from_env() -> Self {
+        let enabled = std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+
+        let interval_secs = std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(15);
+
+        Self {
+            enabled,
+            interval_secs,
         }
     }
 }
@@ -171,6 +197,7 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
 
     let repair_config = RepairConfig::from_env();
+    let peer_heartbeat_config = PeerHeartbeatConfig::from_env();
 
     let policy = ReplicationPolicy {
         replication_factor,
@@ -264,6 +291,9 @@ async fn main() -> Result<()> {
     }
 
     spawn_replication_auditor(state.clone(), audit_interval_secs);
+    if peer_heartbeat_config.enabled {
+        spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
+    }
 
     let app = Router::new()
         .route("/", get(index))
@@ -374,6 +404,67 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
                     skipped_max_retries = report.skipped_max_retries,
                     "replication repair executor run"
                 );
+            }
+        }
+    });
+}
+
+fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+
+        loop {
+            ticker.tick().await;
+
+            let (local_descriptor, peers) = {
+                let mut cluster = state.cluster.lock().await;
+                cluster.update_health_and_detect_offline_transition();
+
+                let nodes = cluster.list_nodes();
+                let local_descriptor = nodes
+                    .iter()
+                    .find(|node| node.node_id == state.node_id)
+                    .cloned();
+                let peers = nodes
+                    .into_iter()
+                    .filter(|node| node.node_id != state.node_id)
+                    .collect::<Vec<_>>();
+
+                (local_descriptor, peers)
+            };
+
+            let Some(local_descriptor) = local_descriptor else {
+                continue;
+            };
+
+            let payload = OutboundNodeHeartbeatRequest {
+                free_bytes: Some(local_descriptor.free_bytes),
+                capacity_bytes: Some(local_descriptor.capacity_bytes),
+                labels: Some(local_descriptor.labels),
+            };
+
+            for peer in peers {
+                let base = peer.public_url.trim_end_matches('/');
+                let url = format!("{base}/cluster/nodes/{}/heartbeat", state.node_id);
+
+                match http.post(url).json(&payload).send().await {
+                    Ok(response) if response.status().is_success() => {}
+                    Ok(response) => {
+                        tracing::debug!(
+                            node_id = %peer.node_id,
+                            status = %response.status(),
+                            "peer heartbeat request rejected"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            node_id = %peer.node_id,
+                            error = %err,
+                            "failed sending peer heartbeat"
+                        );
+                    }
+                }
             }
         }
     });
@@ -773,6 +864,13 @@ struct RegisterNodeRequest {
 
 #[derive(Debug, Deserialize)]
 struct NodeHeartbeatRequest {
+    free_bytes: Option<u64>,
+    capacity_bytes: Option<u64>,
+    labels: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutboundNodeHeartbeatRequest {
     free_bytes: Option<u64>,
     capacity_bytes: Option<u64>,
     labels: Option<HashMap<String, String>>,

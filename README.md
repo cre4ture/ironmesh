@@ -142,6 +142,13 @@ Those bridges can be added incrementally without changing the workspace topology
 	- `PUT /cluster/nodes/{node_id}`
 	- `DELETE /cluster/nodes/{node_id}` (rejects local node id)
 
+### Autonomous peer heartbeats
+
+- Server nodes send periodic heartbeats to known peers by default.
+- Configuration:
+	- `IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED` (default: `true`)
+	- `IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS` (default: `15`)
+
 - Rejoin reconciliation endpoints:
 	- `GET /cluster/reconcile/export/provisional`
 	- `POST /cluster/reconcile/{node_id}`

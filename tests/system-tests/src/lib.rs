@@ -1930,6 +1930,8 @@ mod tests {
             command.env("IRONMESH_NODE_ID", node_id);
         }
 
+        command.env("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "false");
+
         for (key, value) in extra_env {
             command.env(key, value);
         }
