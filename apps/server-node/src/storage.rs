@@ -287,7 +287,7 @@ impl PersistentStore {
         })
     }
 
-    pub async fn confirm_version(&mut self, key: &str, version_id: &str) -> Result<bool> {
+    pub async fn commit_version(&mut self, key: &str, version_id: &str) -> Result<bool> {
         let mut index = match self.load_version_index(key).await? {
             Some(index) => index,
             None => return Ok(false),

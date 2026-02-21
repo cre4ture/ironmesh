@@ -297,6 +297,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_endpoint_enforces_quorum_mode() -> Result<()> {
+        let bind = "127.0.0.1:19086";
+        let data_dir = fresh_data_dir("version-commit-quorum");
+        let mut server = start_server_with_options(
+            bind,
+            &data_dir,
+            "00000000-0000-0000-0000-0000000000a1",
+            3,
+            Some("quorum"),
+            Some(1),
+        )
+        .await?;
+
+        let base_url = format!("http://{bind}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            register_node(
+                &client,
+                &base_url,
+                "00000000-0000-0000-0000-0000000000b2",
+                "http://127.0.0.1:29091",
+                "dc-b",
+                "rack-2",
+            )
+            .await?;
+            register_node(
+                &client,
+                &base_url,
+                "00000000-0000-0000-0000-0000000000c3",
+                "http://127.0.0.1:29092",
+                "dc-c",
+                "rack-3",
+            )
+            .await?;
+
+            client
+                .put(format!("{base_url}/store/quorum-key?state=provisional"))
+                .body("v1")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let versions_payload = client
+                .get(format!("{base_url}/versions/quorum-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            let versions: serde_json::Value = serde_json::from_str(&versions_payload)?;
+
+            let provisional_version_id = versions
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter().find(|entry| {
+                        entry
+                            .get("state")
+                            .and_then(|s| s.as_str())
+                            .map(|state| state == "provisional")
+                            .unwrap_or(false)
+                    })
+                })
+                .and_then(|entry| entry.get("version_id"))
+                .and_then(|v| v.as_str())
+                .context("missing provisional version id")?
+                .to_string();
+
+            sleep(Duration::from_millis(2_300)).await;
+            client
+                .get(format!("{base_url}/cluster/status"))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let rejected = client
+                .post(format!(
+                    "{base_url}/versions/quorum-key/commit/{provisional_version_id}"
+                ))
+                .send()
+                .await?;
+            assert_eq!(rejected.status(), StatusCode::CONFLICT);
+
+            let heartbeat_payload = serde_json::json!({
+                "free_bytes": 700_000,
+                "capacity_bytes": 1_000_000,
+                "labels": {
+                    "region": "local",
+                    "dc": "dc-b",
+                    "rack": "rack-2"
+                }
+            });
+
+            client
+                .post(format!(
+                    "{base_url}/cluster/nodes/00000000-0000-0000-0000-0000000000a1/heartbeat"
+                ))
+                .json(&heartbeat_payload)
+                .send()
+                .await?
+                .error_for_status()?;
+
+            client
+                .post(format!(
+                    "{base_url}/cluster/nodes/00000000-0000-0000-0000-0000000000b2/heartbeat"
+                ))
+                .json(&heartbeat_payload)
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let accepted = client
+                .post(format!(
+                    "{base_url}/versions/quorum-key/commit/{provisional_version_id}"
+                ))
+                .send()
+                .await?;
+            assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
     async fn multi_node_replication_plan_detects_missing_replicas() -> Result<()> {
         let bind_a = "127.0.0.1:19090";
         let bind_b = "127.0.0.1:19091";
@@ -392,10 +522,21 @@ mod tests {
         node_id: &str,
         replication_factor: usize,
     ) -> Result<Child> {
+        start_server_with_options(bind, data_dir, node_id, replication_factor, None, None).await
+    }
+
+    async fn start_server_with_options(
+        bind: &str,
+        data_dir: &Path,
+        node_id: &str,
+        replication_factor: usize,
+        metadata_commit_mode: Option<&str>,
+        heartbeat_timeout_secs: Option<u64>,
+    ) -> Result<Child> {
         let server_bin = binary_path("server-node")?;
 
         let mut command = Command::new(server_bin);
-        command
+        let command = command
             .env("IRONMESH_SERVER_BIND", bind)
             .env("IRONMESH_DATA_DIR", data_dir)
             .env(
@@ -404,6 +545,14 @@ mod tests {
             )
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+
+        if let Some(mode) = metadata_commit_mode {
+            command.env("IRONMESH_METADATA_COMMIT_MODE", mode);
+        }
+
+        if let Some(timeout) = heartbeat_timeout_secs {
+            command.env("IRONMESH_HEARTBEAT_TIMEOUT_SECS", timeout.to_string());
+        }
 
         if !node_id.is_empty() {
             command.env("IRONMESH_NODE_ID", node_id);

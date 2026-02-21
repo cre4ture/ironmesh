@@ -146,6 +146,29 @@ impl ClusterService {
         }
     }
 
+    pub fn metadata_commit_quorum_size(&self) -> usize {
+        let total = self.nodes.len();
+        if total == 0 {
+            return 0;
+        }
+        (total / 2) + 1
+    }
+
+    pub fn has_metadata_commit_quorum(&self) -> bool {
+        let required = self.metadata_commit_quorum_size();
+        if required == 0 {
+            return false;
+        }
+
+        let online = self
+            .nodes
+            .values()
+            .filter(|node| node.status == NodeStatus::Online)
+            .count();
+
+        online >= required
+    }
+
     pub fn update_health_and_detect_offline_transition(&mut self) -> bool {
         let now = unix_ts();
         let mut changed_to_offline = false;
@@ -404,5 +427,44 @@ mod tests {
             assert!(item.extra_nodes.len() <= 2);
             assert!(plan.under_replicated + plan.over_replicated >= 1);
         }
+    }
+
+    #[test]
+    fn metadata_commit_quorum_uses_majority_rule() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+
+        assert_eq!(svc.metadata_commit_quorum_size(), 2);
+        assert!(svc.has_metadata_commit_quorum());
+
+        if let Some(node) = svc.nodes.get_mut(&node_b) {
+            node.status = NodeStatus::Offline;
+        }
+
+        assert!(svc.has_metadata_commit_quorum());
+
+        if let Some(node) = svc.nodes.get_mut(&node_c) {
+            node.status = NodeStatus::Offline;
+        }
+
+        assert!(!svc.has_metadata_commit_quorum());
+    }
+
+    #[test]
+    fn metadata_commit_quorum_size_is_one_for_single_node() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+        svc.register_node(mk_node(local, "dc-a", "rack-1", 500));
+
+        assert_eq!(svc.metadata_commit_quorum_size(), 1);
+        assert!(svc.has_metadata_commit_quorum());
     }
 }

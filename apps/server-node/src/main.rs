@@ -26,6 +26,25 @@ struct ServerState {
     node_id: NodeId,
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
+    metadata_commit_mode: MetadataCommitMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MetadataCommitMode {
+    Local,
+    Quorum,
+}
+
+impl MetadataCommitMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "local" => Ok(Self::Local),
+            "quorum" => Ok(Self::Quorum),
+            _ => Err(anyhow::anyhow!(
+                "invalid IRONMESH_METADATA_COMMIT_MODE '{raw}', expected 'local' or 'quorum'"
+            )),
+        }
+    }
 }
 
 #[tokio::main]
@@ -80,6 +99,12 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(3);
 
+    let metadata_commit_mode = MetadataCommitMode::parse(
+        std::env::var("IRONMESH_METADATA_COMMIT_MODE")
+            .unwrap_or_else(|_| "local".to_string())
+            .as_str(),
+    )?;
+
     let policy = ReplicationPolicy {
         replication_factor,
         ..ReplicationPolicy::default()
@@ -100,6 +125,7 @@ async fn main() -> Result<()> {
         node_id,
         store: Arc::new(Mutex::new(PersistentStore::init(data_dir).await?)),
         cluster: Arc::new(Mutex::new(cluster)),
+        metadata_commit_mode,
     };
 
     spawn_replication_auditor(state.clone(), audit_interval_secs);
@@ -114,6 +140,7 @@ async fn main() -> Result<()> {
             "/versions/{key}/confirm/{version_id}",
             post(confirm_version),
         )
+        .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
         .route("/cluster/nodes/{node_id}", put(register_node))
@@ -230,9 +257,10 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
       <li><code>PUT /store/{{key}}</code> — store object bytes</li>
       <li><code>GET /store/{{key}}</code> — fetch object bytes from latest state</li>
       <li><code>GET /store/{{key}}?snapshot=&lt;id&gt;</code> — fetch object from snapshot state</li>
-    <li><code>GET /store/{{key}}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
-    <li><code>GET /versions/{{key}}</code> — list version DAG metadata</li>
-    <li><code>POST /versions/{{key}}/confirm/{{version_id}}</code> — mark provisional version as confirmed</li>
+            <li><code>GET /store/{{key}}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
+            <li><code>GET /versions/{{key}}</code> — list version DAG metadata</li>
+            <li><code>POST /versions/{{key}}/commit/{{version_id}}</code> — commit version (quorum policy aware)</li>
+            <li><code>POST /versions/{{key}}/confirm/{{version_id}}</code> — compatibility alias for commit endpoint</li>
       <li><code>GET /cluster/status</code> — cluster summary</li>
       <li><code>GET /cluster/nodes</code> — known node list</li>
       <li><code>PUT /cluster/nodes/{{node_id}}</code> — register/update node metadata</li>
@@ -370,12 +398,42 @@ async fn confirm_version(
     State(state): State<ServerState>,
     Path((key, version_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    commit_version_inner(state, key, version_id).await
+}
+
+async fn commit_version(
+    State(state): State<ServerState>,
+    Path((key, version_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    commit_version_inner(state, key, version_id).await
+}
+
+async fn commit_version_inner(state: ServerState, key: String, version_id: String) -> StatusCode {
+    if matches!(state.metadata_commit_mode, MetadataCommitMode::Quorum) {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+
+        if !cluster.has_metadata_commit_quorum() {
+            let summary = cluster.summary();
+            let quorum_required = cluster.metadata_commit_quorum_size();
+            tracing::warn!(
+                key = %key,
+                version_id = %version_id,
+                online_nodes = summary.online_nodes,
+                total_nodes = summary.total_nodes,
+                quorum_required,
+                "metadata commit rejected: quorum unavailable"
+            );
+            return StatusCode::CONFLICT;
+        }
+    }
+
     let mut store = state.store.lock().await;
-    match store.confirm_version(&key, &version_id).await {
+    match store.commit_version(&key, &version_id).await {
         Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => StatusCode::NOT_FOUND,
         Err(err) => {
-            tracing::error!(key = %key, version_id = %version_id, error = %err, "failed to confirm version");
+            tracing::error!(key = %key, version_id = %version_id, error = %err, "failed to commit version");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
