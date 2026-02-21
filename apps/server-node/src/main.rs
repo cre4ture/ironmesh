@@ -20,8 +20,8 @@ mod storage;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
-    PersistentStore, PutOptions, ReconcileVersionEntry, SnapshotInfo, StoreReadError,
-    VersionConsistencyState,
+    ObjectReadMode, PersistentStore, PutOptions, ReconcileVersionEntry, SnapshotInfo,
+    StoreReadError, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -265,10 +265,11 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
       <li><code>PUT /store/{{key}}</code> — store object bytes</li>
       <li><code>GET /store/{{key}}</code> — fetch object bytes from latest state</li>
       <li><code>GET /store/{{key}}?snapshot=&lt;id&gt;</code> — fetch object from snapshot state</li>
-            <li><code>GET /store/{{key}}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
-            <li><code>GET /versions/{{key}}</code> — list version DAG metadata</li>
-            <li><code>POST /versions/{{key}}/commit/{{version_id}}</code> — commit version (quorum policy aware)</li>
-            <li><code>POST /versions/{{key}}/confirm/{{version_id}}</code> — compatibility alias for commit endpoint</li>
+    <li><code>GET /store/{{key}}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
+    <li><code>GET /store/{{key}}?read_mode=preferred|confirmed_only|provisional_allowed</code> — read latest via explicit consistency mode</li>
+    <li><code>GET /versions/{{key}}</code> — list version DAG metadata</li>
+    <li><code>POST /versions/{{key}}/commit/{{version_id}}</code> — commit version (quorum policy aware)</li>
+    <li><code>POST /versions/{{key}}/confirm/{{version_id}}</code> — compatibility alias for commit endpoint</li>
       <li><code>GET /cluster/status</code> — cluster summary</li>
       <li><code>GET /cluster/nodes</code> — known node list</li>
       <li><code>PUT /cluster/nodes/{{node_id}}</code> — register/update node metadata</li>
@@ -276,8 +277,8 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
       <li><code>GET /cluster/placement/{{key}}</code> — deterministic placement decision</li>
       <li><code>GET /cluster/replication/plan</code> — current replication gaps/overages</li>
       <li><code>POST /cluster/replication/audit</code> — manual audit trigger</li>
-            <li><code>GET /cluster/reconcile/export/provisional</code> — export local provisional metadata for rejoin sync</li>
-            <li><code>POST /cluster/reconcile/{{node_id}}</code> — import provisional commits from a peer node</li>
+        <li><code>GET /cluster/reconcile/export/provisional</code> — export local provisional metadata for rejoin sync</li>
+        <li><code>POST /cluster/reconcile/{{node_id}}</code> — import provisional commits from a peer node</li>
     </ul>
   </main>
 </body>
@@ -309,6 +310,7 @@ async fn list_snapshots(State(state): State<ServerState>) -> impl IntoResponse {
 struct ObjectGetQuery {
     snapshot: Option<String>,
     version: Option<String>,
+    read_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,9 +374,21 @@ async fn get_object(
     Path(key): Path<String>,
     Query(query): Query<ObjectGetQuery>,
 ) -> impl IntoResponse {
+    let read_mode = match query.read_mode.as_deref() {
+        None | Some("preferred") => ObjectReadMode::Preferred,
+        Some("confirmed_only") => ObjectReadMode::ConfirmedOnly,
+        Some("provisional_allowed") => ObjectReadMode::ProvisionalAllowed,
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
     let store = state.store.lock().await;
     match store
-        .get_object(&key, query.snapshot.as_deref(), query.version.as_deref())
+        .get_object(
+            &key,
+            query.snapshot.as_deref(),
+            query.version.as_deref(),
+            read_mode,
+        )
         .await
     {
         Ok(bytes) => (StatusCode::OK, bytes).into_response(),

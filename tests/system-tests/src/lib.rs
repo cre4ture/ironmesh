@@ -298,6 +298,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_modes_respect_preferred_and_confirmed_visibility() -> Result<()> {
+        let bind = "127.0.0.1:19087";
+        let data_dir = fresh_data_dir("read-modes");
+        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let base_url = format!("http://{bind}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            client
+                .put(format!("{base_url}/store/read-mode-key"))
+                .body("confirmed-v1")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            client
+                .put(format!("{base_url}/store/read-mode-key?state=provisional"))
+                .body("provisional-v2")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let versions_payload = client
+                .get(format!("{base_url}/versions/read-mode-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            let versions: serde_json::Value = serde_json::from_str(&versions_payload)?;
+
+            let reason = versions
+                .get("preferred_head_reason")
+                .and_then(|v| v.as_str())
+                .context("missing preferred_head_reason")?;
+            assert_eq!(reason, "provisional_fallback_no_confirmed");
+
+            let preferred_default = client
+                .get(format!("{base_url}/store/read-mode-key"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert_eq!(preferred_default, "provisional-v2");
+
+            let preferred_explicit = client
+                .get(format!(
+                    "{base_url}/store/read-mode-key?read_mode=preferred"
+                ))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert_eq!(preferred_explicit, "provisional-v2");
+
+            let provisional_allowed = client
+                .get(format!(
+                    "{base_url}/store/read-mode-key?read_mode=provisional_allowed"
+                ))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert_eq!(provisional_allowed, "provisional-v2");
+
+            let confirmed_only = client
+                .get(format!(
+                    "{base_url}/store/read-mode-key?read_mode=confirmed_only"
+                ))
+                .send()
+                .await?;
+            assert_eq!(confirmed_only.status(), StatusCode::NOT_FOUND);
+
+            client
+                .put(format!(
+                    "{base_url}/store/confirmed-head-key?state=confirmed"
+                ))
+                .body("confirmed-head")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let confirmed_head = client
+                .get(format!(
+                    "{base_url}/store/confirmed-head-key?read_mode=confirmed_only"
+                ))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert_eq!(confirmed_head, "confirmed-head");
+
+            client
+                .put(format!(
+                    "{base_url}/store/provisional-only-key?state=provisional"
+                ))
+                .body("only-provisional")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let provisional_only_confirmed = client
+                .get(format!(
+                    "{base_url}/store/provisional-only-key?read_mode=confirmed_only"
+                ))
+                .send()
+                .await?;
+            assert_eq!(provisional_only_confirmed.status(), StatusCode::NOT_FOUND);
+
+            let bad_mode = client
+                .get(format!("{base_url}/store/read-mode-key?read_mode=unknown"))
+                .send()
+                .await?;
+            assert_eq!(bad_mode.status(), StatusCode::BAD_REQUEST);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
     async fn commit_endpoint_enforces_quorum_mode() -> Result<()> {
         let bind = "127.0.0.1:19086";
         let data_dir = fresh_data_dir("version-commit-quorum");

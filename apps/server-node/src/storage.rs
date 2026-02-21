@@ -72,8 +72,30 @@ pub struct VersionRecordSummary {
 pub struct VersionGraphSummary {
     pub key: String,
     pub preferred_head_version_id: Option<String>,
+    pub preferred_head_reason: Option<PreferredHeadReason>,
     pub head_version_ids: Vec<String>,
     pub versions: Vec<VersionRecordSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreferredHeadReason {
+    ConfirmedPreferredOverProvisional,
+    ProvisionalFallbackNoConfirmed,
+    DeterministicTiebreakVersionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectReadMode {
+    Preferred,
+    ConfirmedOnly,
+    ProvisionalAllowed,
+}
+
+impl Default for ObjectReadMode {
+    fn default() -> Self {
+        Self::Preferred
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -350,9 +372,12 @@ impl PersistentStore {
                 .then_with(|| b.version_id.cmp(&a.version_id))
         });
 
+        let preferred = choose_preferred_head_with_reason(&index);
+
         Ok(Some(VersionGraphSummary {
             key: index.key,
-            preferred_head_version_id: index.preferred_head_version_id,
+            preferred_head_version_id: preferred.as_ref().map(|(id, _)| id.clone()),
+            preferred_head_reason: preferred.map(|(_, reason)| reason),
             head_version_ids: index.head_version_ids,
             versions,
         }))
@@ -414,6 +439,7 @@ impl PersistentStore {
         key: &str,
         snapshot_id: Option<&str>,
         version_id: Option<&str>,
+        read_mode: ObjectReadMode,
     ) -> std::result::Result<Bytes, StoreReadError> {
         let manifest_hash = if let Some(version_id) = version_id {
             let index = self
@@ -428,19 +454,24 @@ impl PersistentStore {
                 .versions
                 .get(version_id)
                 .map(|record| record.manifest_hash.clone())
-        } else {
-            match snapshot_id {
-                Some(snapshot_id) => {
-                    let snapshot = self
-                        .read_snapshot(snapshot_id)
-                        .await
-                        .map_err(StoreReadError::Internal)?;
+        } else if let Some(snapshot_id) = snapshot_id {
+            let snapshot = self
+                .read_snapshot(snapshot_id)
+                .await
+                .map_err(StoreReadError::Internal)?;
 
-                    match snapshot {
-                        Some(snapshot) => snapshot.objects.get(key).cloned(),
-                        None => None,
-                    }
-                }
+            match snapshot {
+                Some(snapshot) => snapshot.objects.get(key).cloned(),
+                None => None,
+            }
+        } else {
+            let index = self
+                .load_version_index(key)
+                .await
+                .map_err(StoreReadError::Internal)?;
+
+            match index {
+                Some(index) => manifest_hash_for_read_mode(&index, read_mode),
                 None => self.current_state.objects.get(key).cloned(),
             }
         }
@@ -641,6 +672,12 @@ fn empty_version_index(key: &str) -> FileVersionIndex {
 }
 
 fn choose_preferred_head(index: &FileVersionIndex) -> Option<String> {
+    choose_preferred_head_with_reason(index).map(|(id, _)| id)
+}
+
+fn choose_preferred_head_with_reason(
+    index: &FileVersionIndex,
+) -> Option<(String, PreferredHeadReason)> {
     let mut heads: Vec<&FileVersionRecord> = index
         .head_version_ids
         .iter()
@@ -658,7 +695,66 @@ fn choose_preferred_head(index: &FileVersionIndex) -> Option<String> {
             .then_with(|| b.version_id.cmp(&a.version_id))
     });
 
-    heads.first().map(|record| record.version_id.clone())
+    let top = heads.first()?;
+
+    let tied_on_rank_and_time = heads.iter().skip(1).any(|entry| {
+        rank_state(&entry.state) == rank_state(&top.state)
+            && entry.created_at_unix == top.created_at_unix
+    });
+
+    let reason = if tied_on_rank_and_time {
+        PreferredHeadReason::DeterministicTiebreakVersionId
+    } else if top.state == VersionConsistencyState::Confirmed {
+        PreferredHeadReason::ConfirmedPreferredOverProvisional
+    } else {
+        PreferredHeadReason::ProvisionalFallbackNoConfirmed
+    };
+
+    Some((top.version_id.clone(), reason))
+}
+
+fn manifest_hash_for_read_mode(
+    index: &FileVersionIndex,
+    read_mode: ObjectReadMode,
+) -> Option<String> {
+    let mut heads: Vec<&FileVersionRecord> = index
+        .head_version_ids
+        .iter()
+        .filter_map(|head| index.versions.get(head))
+        .collect();
+
+    if heads.is_empty() {
+        return None;
+    }
+
+    let selected = match read_mode {
+        ObjectReadMode::Preferred => {
+            let preferred = choose_preferred_head(index)?;
+            index.versions.get(&preferred)
+        }
+        ObjectReadMode::ConfirmedOnly => {
+            heads.retain(|record| record.state == VersionConsistencyState::Confirmed);
+
+            heads.sort_by(|a, b| {
+                b.created_at_unix
+                    .cmp(&a.created_at_unix)
+                    .then_with(|| b.version_id.cmp(&a.version_id))
+            });
+
+            heads.first().copied()
+        }
+        ObjectReadMode::ProvisionalAllowed => {
+            heads.sort_by(|a, b| {
+                b.created_at_unix
+                    .cmp(&a.created_at_unix)
+                    .then_with(|| b.version_id.cmp(&a.version_id))
+            });
+
+            heads.first().copied()
+        }
+    };
+
+    selected.map(|record| record.manifest_hash.clone())
 }
 
 fn rank_state(state: &VersionConsistencyState) -> u8 {
@@ -778,5 +874,45 @@ mod tests {
     fn preferred_head_none_for_empty_heads() {
         let index = empty_version_index("k");
         assert!(choose_preferred_head(&index).is_none());
+    }
+
+    #[test]
+    fn preferred_head_reason_is_confirmed_preferred() {
+        let mut index = empty_version_index("k");
+        index.versions.insert(
+            "v-confirmed".to_string(),
+            mk_record("v-confirmed", VersionConsistencyState::Confirmed, 10),
+        );
+        index.versions.insert(
+            "v-provisional".to_string(),
+            mk_record("v-provisional", VersionConsistencyState::Provisional, 20),
+        );
+        index.head_version_ids = vec!["v-confirmed".to_string(), "v-provisional".to_string()];
+
+        let preferred = choose_preferred_head_with_reason(&index);
+        assert!(matches!(
+            preferred,
+            Some((_, PreferredHeadReason::ConfirmedPreferredOverProvisional))
+        ));
+    }
+
+    #[test]
+    fn preferred_head_reason_uses_tiebreak_when_needed() {
+        let mut index = empty_version_index("k");
+        index.versions.insert(
+            "v-aaa".to_string(),
+            mk_record("v-aaa", VersionConsistencyState::Confirmed, 10),
+        );
+        index.versions.insert(
+            "v-bbb".to_string(),
+            mk_record("v-bbb", VersionConsistencyState::Confirmed, 10),
+        );
+        index.head_version_ids = vec!["v-aaa".to_string(), "v-bbb".to_string()];
+
+        let preferred = choose_preferred_head_with_reason(&index);
+        assert!(matches!(
+            preferred,
+            Some((_, PreferredHeadReason::DeterministicTiebreakVersionId))
+        ));
     }
 }
