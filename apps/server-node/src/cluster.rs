@@ -1,0 +1,317 @@
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use common::NodeId;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus {
+    Online,
+    Offline,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeDescriptor {
+    pub node_id: NodeId,
+    pub public_url: String,
+    pub labels: HashMap<String, String>,
+    pub capacity_bytes: u64,
+    pub free_bytes: u64,
+    pub last_heartbeat_unix: u64,
+    pub status: NodeStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationPolicy {
+    pub replication_factor: usize,
+    pub min_distinct_labels: HashMap<String, usize>,
+}
+
+impl Default for ReplicationPolicy {
+    fn default() -> Self {
+        let mut min_distinct_labels = HashMap::new();
+        min_distinct_labels.insert("dc".to_string(), 1);
+        min_distinct_labels.insert("rack".to_string(), 1);
+
+        Self {
+            replication_factor: 3,
+            min_distinct_labels,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlacementDecision {
+    pub key: String,
+    pub selected_nodes: Vec<NodeId>,
+    pub replication_factor: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplicationPlanItem {
+    pub key: String,
+    pub desired_nodes: Vec<NodeId>,
+    pub current_nodes: Vec<NodeId>,
+    pub missing_nodes: Vec<NodeId>,
+    pub extra_nodes: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplicationPlan {
+    pub generated_at_unix: u64,
+    pub under_replicated: usize,
+    pub over_replicated: usize,
+    pub items: Vec<ReplicationPlanItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterSummary {
+    pub local_node_id: NodeId,
+    pub total_nodes: usize,
+    pub online_nodes: usize,
+    pub offline_nodes: usize,
+    pub policy: ReplicationPolicy,
+}
+
+pub struct ClusterService {
+    local_node: NodeId,
+    heartbeat_timeout_secs: u64,
+    policy: ReplicationPolicy,
+    nodes: HashMap<NodeId, NodeDescriptor>,
+    replicas_by_key: HashMap<String, HashSet<NodeId>>,
+}
+
+impl ClusterService {
+    pub fn new(local_node: NodeId, policy: ReplicationPolicy, heartbeat_timeout_secs: u64) -> Self {
+        Self {
+            local_node,
+            heartbeat_timeout_secs,
+            policy,
+            nodes: HashMap::new(),
+            replicas_by_key: HashMap::new(),
+        }
+    }
+
+    pub fn register_node(&mut self, mut descriptor: NodeDescriptor) {
+        descriptor.last_heartbeat_unix = unix_ts();
+        descriptor.status = NodeStatus::Online;
+        self.nodes.insert(descriptor.node_id, descriptor);
+    }
+
+    pub fn touch_heartbeat(
+        &mut self,
+        node_id: NodeId,
+        free_bytes: Option<u64>,
+        capacity_bytes: Option<u64>,
+        labels: Option<HashMap<String, String>>,
+    ) -> bool {
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.last_heartbeat_unix = unix_ts();
+            node.status = NodeStatus::Online;
+            if let Some(free) = free_bytes {
+                node.free_bytes = free;
+            }
+            if let Some(capacity) = capacity_bytes {
+                node.capacity_bytes = capacity;
+            }
+            if let Some(labels) = labels {
+                node.labels = labels;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn list_nodes(&self) -> Vec<NodeDescriptor> {
+        let mut nodes: Vec<_> = self.nodes.values().cloned().collect();
+        nodes.sort_by_key(|node| node.node_id);
+        nodes
+    }
+
+    pub fn summary(&self) -> ClusterSummary {
+        let online_nodes = self
+            .nodes
+            .values()
+            .filter(|node| node.status == NodeStatus::Online)
+            .count();
+
+        ClusterSummary {
+            local_node_id: self.local_node,
+            total_nodes: self.nodes.len(),
+            online_nodes,
+            offline_nodes: self.nodes.len().saturating_sub(online_nodes),
+            policy: self.policy.clone(),
+        }
+    }
+
+    pub fn update_health_and_detect_offline_transition(&mut self) -> bool {
+        let now = unix_ts();
+        let mut changed_to_offline = false;
+
+        for node in self.nodes.values_mut() {
+            let stale = now.saturating_sub(node.last_heartbeat_unix) > self.heartbeat_timeout_secs;
+            if stale && node.status != NodeStatus::Offline {
+                node.status = NodeStatus::Offline;
+                changed_to_offline = true;
+            }
+        }
+
+        changed_to_offline
+    }
+
+    pub fn note_replica(&mut self, key: impl Into<String>, node_id: NodeId) {
+        self.replicas_by_key
+            .entry(key.into())
+            .or_default()
+            .insert(node_id);
+    }
+
+    pub fn placement_for_key(&self, key: &str) -> PlacementDecision {
+        let selected_nodes = select_nodes_by_rendezvous(key, &self.nodes, &self.policy);
+        PlacementDecision {
+            key: key.to_string(),
+            selected_nodes,
+            replication_factor: self.policy.replication_factor,
+        }
+    }
+
+    pub fn replication_plan(&self, keys: &[String]) -> ReplicationPlan {
+        let mut items = Vec::new();
+
+        for key in keys {
+            let desired_nodes = select_nodes_by_rendezvous(key, &self.nodes, &self.policy);
+            let desired_set: HashSet<_> = desired_nodes.iter().copied().collect();
+
+            let current_set = self.replicas_by_key.get(key).cloned().unwrap_or_default();
+            let mut current_nodes: Vec<_> = current_set.iter().copied().collect();
+            current_nodes.sort();
+
+            let mut missing_nodes: Vec<_> = desired_set.difference(&current_set).copied().collect();
+            missing_nodes.sort();
+
+            let mut extra_nodes: Vec<_> = current_set.difference(&desired_set).copied().collect();
+            extra_nodes.sort_by_key(|node_id| self.nodes.get(node_id).map(|node| node.free_bytes).unwrap_or(0));
+
+            if !missing_nodes.is_empty() || !extra_nodes.is_empty() {
+                items.push(ReplicationPlanItem {
+                    key: key.clone(),
+                    desired_nodes,
+                    current_nodes,
+                    missing_nodes,
+                    extra_nodes,
+                });
+            }
+        }
+
+        let under_replicated = items
+            .iter()
+            .filter(|item| !item.missing_nodes.is_empty())
+            .count();
+        let over_replicated = items
+            .iter()
+            .filter(|item| !item.extra_nodes.is_empty())
+            .count();
+
+        ReplicationPlan {
+            generated_at_unix: unix_ts(),
+            under_replicated,
+            over_replicated,
+            items,
+        }
+    }
+}
+
+fn select_nodes_by_rendezvous(
+    key: &str,
+    nodes: &HashMap<NodeId, NodeDescriptor>,
+    policy: &ReplicationPolicy,
+) -> Vec<NodeId> {
+    let mut ranked: Vec<(NodeId, u64)> = nodes
+        .values()
+        .filter(|node| node.status == NodeStatus::Online)
+        .map(|node| {
+            let score = rendezvous_score(key, node.node_id);
+            (node.node_id, score)
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut selected = Vec::<NodeId>::new();
+    let mut seen_label_values: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for (node_id, _) in &ranked {
+        if selected.len() >= policy.replication_factor {
+            break;
+        }
+
+        let node = match nodes.get(node_id) {
+            Some(node) => node,
+            None => continue,
+        };
+
+        let helps_constraint = policy.min_distinct_labels.iter().any(|(label_key, min_needed)| {
+            let current_count = seen_label_values
+                .get(label_key)
+                .map(HashSet::len)
+                .unwrap_or(0);
+
+            if current_count >= *min_needed {
+                return false;
+            }
+
+            let value = node.labels.get(label_key).cloned().unwrap_or_else(|| "_unknown".to_string());
+            !seen_label_values
+                .get(label_key)
+                .map(|values| values.contains(&value))
+                .unwrap_or(false)
+        });
+
+        if helps_constraint || selected.len() < policy.min_distinct_labels.len() {
+            selected.push(*node_id);
+            for label_key in policy.min_distinct_labels.keys() {
+                let value = node
+                    .labels
+                    .get(label_key)
+                    .cloned()
+                    .unwrap_or_else(|| "_unknown".to_string());
+                seen_label_values
+                    .entry(label_key.clone())
+                    .or_default()
+                    .insert(value);
+            }
+        }
+    }
+
+    if selected.len() < policy.replication_factor {
+        for (node_id, _) in ranked {
+            if selected.len() >= policy.replication_factor {
+                break;
+            }
+            if !selected.contains(&node_id) {
+                selected.push(node_id);
+            }
+        }
+    }
+
+    selected
+}
+
+fn rendezvous_score(key: &str, node_id: NodeId) -> u64 {
+    let seed = format!("{key}:{node_id}");
+    let hash = blake3::hash(seed.as_bytes());
+    let bytes = hash.as_bytes();
+
+    u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

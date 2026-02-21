@@ -117,6 +117,10 @@ impl PersistentStore {
         self.current_state.objects.len()
     }
 
+    pub fn current_keys(&self) -> Vec<String> {
+        self.current_state.objects.keys().cloned().collect()
+    }
+
     pub async fn put_object(&mut self, key: &str, payload: Bytes) -> Result<PutResult> {
         let mut chunk_refs = Vec::new();
         let mut new_chunks = 0usize;
