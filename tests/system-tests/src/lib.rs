@@ -1051,6 +1051,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_replication_drop_accepts_valid_token_and_node_id() -> Result<()> {
+        let bind = "127.0.0.1:19116";
+        let node_id = "00000000-0000-0000-0000-0000000006e5";
+        let data_dir = fresh_data_dir("internal-auth-valid-token");
+
+        let mut server = start_server_with_env(
+            bind,
+            &data_dir,
+            node_id,
+            1,
+            &[("IRONMESH_INTERNAL_API_TOKEN", "secret-3")],
+        )
+        .await?;
+
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            let response = http
+                .post(format!("{base_url}/cluster/replication/drop"))
+                .query(&[("key", "missing-key")])
+                .header("x-ironmesh-node-id", node_id)
+                .header("x-ironmesh-internal-token", "secret-3")
+                .send()
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let report: serde_json::Value = response.json().await?;
+            assert_eq!(report.get("dropped").and_then(|v| v.as_bool()), Some(false));
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
     async fn rejoin_reconciliation_preserves_provisional_branches() -> Result<()> {
         let bind_a = "127.0.0.1:19100";
         let bind_b = "127.0.0.1:19101";
