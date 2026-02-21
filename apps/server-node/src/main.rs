@@ -2090,10 +2090,10 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
 #[cfg(test)]
 mod tests {
     use super::{
+        MetadataCommitMode, RepairConfig, RepairExecutorState, ServerState,
         build_store_index_entries, cluster, constant_time_eq, expected_internal_token_for_node,
         internal_node_header_valid, internal_token_matches, jittered_backoff_secs,
-        parse_internal_node_tokens, run_startup_replication_repair_once, MetadataCommitMode,
-        RepairConfig, RepairExecutorState, ServerState,
+        parse_internal_node_tokens, run_startup_replication_repair_once,
     };
     use common::NodeId;
     use std::path::PathBuf;
@@ -2241,7 +2241,9 @@ mod tests {
         let root = fresh_test_dir("startup-repair-main");
         let local_node_id = NodeId::new_v4();
 
-        let store = Arc::new(Mutex::new(PersistentStore::init(root.clone()).await.unwrap()));
+        let store = Arc::new(Mutex::new(
+            PersistentStore::init(root.clone()).await.unwrap(),
+        ));
 
         let mut service = cluster::ClusterService::new(
             local_node_id,
