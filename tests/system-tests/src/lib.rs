@@ -921,6 +921,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_replication_push_chunk_rejects_missing_token() -> Result<()> {
+        let bind = "127.0.0.1:19113";
+        let node_id = "00000000-0000-0000-0000-0000000006a1";
+        let data_dir = fresh_data_dir("internal-auth-missing-token");
+
+        let mut server = start_server_with_env(
+            bind,
+            &data_dir,
+            node_id,
+            1,
+            &[("IRONMESH_INTERNAL_API_TOKEN", "secret-1")],
+        )
+        .await?;
+
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            let response = http
+                .post(format!(
+                    "{base_url}/cluster/replication/push/chunk/deadbeef"
+                ))
+                .header("x-ironmesh-node-id", node_id)
+                .body("chunk")
+                .send()
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
+    async fn internal_replication_push_chunk_rejects_wrong_token() -> Result<()> {
+        let bind = "127.0.0.1:19114";
+        let node_id = "00000000-0000-0000-0000-0000000006b2";
+        let data_dir = fresh_data_dir("internal-auth-wrong-token");
+
+        let mut server = start_server_with_env(
+            bind,
+            &data_dir,
+            node_id,
+            1,
+            &[("IRONMESH_INTERNAL_API_TOKEN", "secret-2")],
+        )
+        .await?;
+
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            let response = http
+                .post(format!(
+                    "{base_url}/cluster/replication/push/chunk/deadbeef"
+                ))
+                .header("x-ironmesh-node-id", node_id)
+                .header("x-ironmesh-internal-token", "wrong-secret")
+                .body("chunk")
+                .send()
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
+    async fn internal_replication_push_chunk_rejects_token_node_mismatch() -> Result<()> {
+        let bind = "127.0.0.1:19115";
+        let controller_node_id = "00000000-0000-0000-0000-0000000006c3";
+        let caller_node_id = "00000000-0000-0000-0000-0000000006d4";
+        let data_dir = fresh_data_dir("internal-auth-node-mismatch");
+
+        let per_node_tokens =
+            format!("{controller_node_id}=token-controller,{caller_node_id}=token-caller");
+
+        let mut server = start_server_with_env(
+            bind,
+            &data_dir,
+            controller_node_id,
+            1,
+            &[("IRONMESH_INTERNAL_NODE_TOKENS", per_node_tokens.as_str())],
+        )
+        .await?;
+
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(
+                &http,
+                &base_url,
+                caller_node_id,
+                "http://127.0.0.1:29999",
+                "dc-caller",
+                "rack-caller",
+            )
+            .await?;
+
+            let response = http
+                .post(format!(
+                    "{base_url}/cluster/replication/push/chunk/deadbeef"
+                ))
+                .header("x-ironmesh-node-id", caller_node_id)
+                .header("x-ironmesh-internal-token", "token-controller")
+                .body("chunk")
+                .send()
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
     async fn rejoin_reconciliation_preserves_provisional_branches() -> Result<()> {
         let bind_a = "127.0.0.1:19100";
         let bind_b = "127.0.0.1:19101";
@@ -1267,6 +1397,46 @@ mod tests {
         metadata_commit_mode: Option<&str>,
         heartbeat_timeout_secs: Option<u64>,
     ) -> Result<Child> {
+        start_server_with_env_options(
+            bind,
+            data_dir,
+            node_id,
+            replication_factor,
+            metadata_commit_mode,
+            heartbeat_timeout_secs,
+            &[],
+        )
+        .await
+    }
+
+    async fn start_server_with_env(
+        bind: &str,
+        data_dir: &Path,
+        node_id: &str,
+        replication_factor: usize,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Child> {
+        start_server_with_env_options(
+            bind,
+            data_dir,
+            node_id,
+            replication_factor,
+            None,
+            None,
+            extra_env,
+        )
+        .await
+    }
+
+    async fn start_server_with_env_options(
+        bind: &str,
+        data_dir: &Path,
+        node_id: &str,
+        replication_factor: usize,
+        metadata_commit_mode: Option<&str>,
+        heartbeat_timeout_secs: Option<u64>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Child> {
         let server_bin = binary_path("server-node")?;
 
         let mut command = Command::new(server_bin);
@@ -1290,6 +1460,10 @@ mod tests {
 
         if !node_id.is_empty() {
             command.env("IRONMESH_NODE_ID", node_id);
+        }
+
+        for (key, value) in extra_env {
+            command.env(key, value);
         }
 
         let child = command.spawn().context("failed to spawn server-node")?;
