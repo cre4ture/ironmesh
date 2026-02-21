@@ -925,13 +925,14 @@ mod tests {
         let bind = "127.0.0.1:19113";
         let node_id = "00000000-0000-0000-0000-0000000006a1";
         let data_dir = fresh_data_dir("internal-auth-missing-token");
+        let node_tokens = format!("{node_id}=secret-1");
 
         let mut server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
             1,
-            &[("IRONMESH_INTERNAL_API_TOKEN", "secret-1")],
+            &[("IRONMESH_INTERNAL_NODE_TOKENS", node_tokens.as_str())],
         )
         .await?;
 
@@ -963,13 +964,14 @@ mod tests {
         let bind = "127.0.0.1:19114";
         let node_id = "00000000-0000-0000-0000-0000000006b2";
         let data_dir = fresh_data_dir("internal-auth-wrong-token");
+        let node_tokens = format!("{node_id}=secret-2");
 
         let mut server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
             1,
-            &[("IRONMESH_INTERNAL_API_TOKEN", "secret-2")],
+            &[("IRONMESH_INTERNAL_NODE_TOKENS", node_tokens.as_str())],
         )
         .await?;
 
@@ -1055,13 +1057,14 @@ mod tests {
         let bind = "127.0.0.1:19116";
         let node_id = "00000000-0000-0000-0000-0000000006e5";
         let data_dir = fresh_data_dir("internal-auth-valid-token");
+        let node_tokens = format!("{node_id}=secret-3");
 
         let mut server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
             1,
-            &[("IRONMESH_INTERNAL_API_TOKEN", "secret-3")],
+            &[("IRONMESH_INTERNAL_NODE_TOKENS", node_tokens.as_str())],
         )
         .await?;
 
@@ -1098,13 +1101,14 @@ mod tests {
         let node_id = "00000000-0000-0000-0000-0000000006f6";
         let unknown_node_id = "00000000-0000-0000-0000-0000000006a7";
         let data_dir = fresh_data_dir("internal-auth-unregistered-node");
+        let node_tokens = format!("{node_id}=secret-4,{unknown_node_id}=secret-4");
 
         let mut server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
             1,
-            &[("IRONMESH_INTERNAL_API_TOKEN", "secret-4")],
+            &[("IRONMESH_INTERNAL_NODE_TOKENS", node_tokens.as_str())],
         )
         .await?;
 

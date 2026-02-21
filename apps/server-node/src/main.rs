@@ -31,7 +31,6 @@ struct ServerState {
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     metadata_commit_mode: MetadataCommitMode,
-    internal_api_token: Option<String>,
     internal_node_tokens: HashMap<NodeId, String>,
     repair_config: RepairConfig,
     repair_state: Arc<Mutex<RepairExecutorState>>,
@@ -164,9 +163,6 @@ async fn main() -> Result<()> {
             .as_str(),
     )?;
 
-    let internal_api_token = std::env::var("IRONMESH_INTERNAL_API_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
     let internal_node_tokens = std::env::var("IRONMESH_INTERNAL_NODE_TOKENS")
         .ok()
         .map(|raw| parse_internal_node_tokens(raw.as_str()))
@@ -209,7 +205,6 @@ async fn main() -> Result<()> {
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         metadata_commit_mode,
-        internal_api_token,
         internal_node_tokens,
         repair_config,
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
@@ -1305,7 +1300,7 @@ async fn replicate_bundle_to_target(
     target_base_url: &str,
     bundle: &ReplicationExportBundle,
     store: &Arc<Mutex<PersistentStore>>,
-    internal_api_token: Option<String>,
+    internal_token: Option<String>,
     source_node_id: NodeId,
 ) -> Result<String> {
     let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
@@ -1345,7 +1340,7 @@ async fn replicate_bundle_to_target(
         })
         .body(bundle.manifest_bytes.clone());
 
-    if let Some(token) = internal_api_token {
+    if let Some(token) = internal_token {
         request = request.header("x-ironmesh-internal-token", token);
         request = request.header("x-ironmesh-node-id", source_node_id.to_string());
     }
@@ -1403,7 +1398,7 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
 }
 
 async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap) -> bool {
-    if state.internal_api_token.is_none() && state.internal_node_tokens.is_empty() {
+    if state.internal_node_tokens.is_empty() {
         return true;
     }
 
@@ -1438,33 +1433,25 @@ async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap
         return false;
     }
 
-    let expected = expected_internal_token_for_node(
-        state.internal_api_token.as_deref(),
-        &state.internal_node_tokens,
-        caller_node_id,
-    );
+    let Some(expected) =
+        expected_internal_token_for_node(&state.internal_node_tokens, caller_node_id)
+    else {
+        return false;
+    };
 
-    internal_token_matches(expected, provided_token)
+    internal_token_matches(Some(expected), provided_token)
 }
 
 fn internal_outbound_token(state: &ServerState) -> Option<String> {
-    expected_internal_token_for_node(
-        state.internal_api_token.as_deref(),
-        &state.internal_node_tokens,
-        state.node_id,
-    )
-    .map(ToString::to_string)
+    expected_internal_token_for_node(&state.internal_node_tokens, state.node_id)
+        .map(ToString::to_string)
 }
 
-fn expected_internal_token_for_node<'a>(
-    global_token: Option<&'a str>,
-    node_tokens: &'a HashMap<NodeId, String>,
+fn expected_internal_token_for_node(
+    node_tokens: &HashMap<NodeId, String>,
     node_id: NodeId,
-) -> Option<&'a str> {
-    node_tokens
-        .get(&node_id)
-        .map(|value| value.as_str())
-        .or(global_token)
+) -> Option<&str> {
+    node_tokens.get(&node_id).map(|value| value.as_str())
 }
 
 fn parse_internal_node_tokens(raw: &str) -> Result<HashMap<NodeId, String>> {
@@ -1555,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_token_auth_allows_when_unconfigured() {
+    fn internal_token_auth_without_expected_token_does_not_enforce_match() {
         assert!(internal_token_matches(None, None));
         assert!(internal_token_matches(None, Some("anything")));
     }
@@ -1589,12 +1576,19 @@ mod tests {
     }
 
     #[test]
-    fn expected_internal_token_prefers_node_specific_over_global() {
+    fn expected_internal_token_returns_none_when_node_missing() {
+        let node_tokens = HashMap::new();
+        let expected = expected_internal_token_for_node(&node_tokens, NodeId::new_v4());
+        assert_eq!(expected, None);
+    }
+
+    #[test]
+    fn expected_internal_token_returns_node_token() {
         let node = NodeId::new_v4();
         let mut node_tokens = HashMap::new();
         node_tokens.insert(node, "node-token".to_string());
 
-        let expected = expected_internal_token_for_node(Some("global-token"), &node_tokens, node);
+        let expected = expected_internal_token_for_node(&node_tokens, node);
         assert_eq!(expected, Some("node-token"));
     }
 }
