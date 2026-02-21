@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
@@ -30,12 +30,65 @@ struct ServerState {
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     metadata_commit_mode: MetadataCommitMode,
+    repair_config: RepairConfig,
+    repair_state: Arc<Mutex<RepairExecutorState>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum MetadataCommitMode {
     Local,
     Quorum,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RepairConfig {
+    enabled: bool,
+    batch_size: usize,
+    max_retries: u32,
+    backoff_secs: u64,
+}
+
+impl RepairConfig {
+    fn from_env() -> Self {
+        let enabled = std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        let batch_size = std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(32);
+
+        let max_retries = std::env::var("IRONMESH_REPLICATION_REPAIR_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3);
+
+        let backoff_secs = std::env::var("IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        Self {
+            enabled,
+            batch_size,
+            max_retries,
+            backoff_secs,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RepairExecutorState {
+    attempts: HashMap<String, RepairAttemptEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RepairAttemptEntry {
+    attempts: u32,
+    last_failure_unix: u64,
 }
 
 impl MetadataCommitMode {
@@ -108,6 +161,8 @@ async fn main() -> Result<()> {
             .as_str(),
     )?;
 
+    let repair_config = RepairConfig::from_env();
+
     let policy = ReplicationPolicy {
         replication_factor,
         ..ReplicationPolicy::default()
@@ -129,6 +184,8 @@ async fn main() -> Result<()> {
         store: Arc::new(Mutex::new(PersistentStore::init(data_dir).await?)),
         cluster: Arc::new(Mutex::new(cluster)),
         metadata_commit_mode,
+        repair_config,
+        repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
     };
 
     spawn_replication_auditor(state.clone(), audit_interval_secs);
@@ -199,6 +256,19 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
                     over_replicated = plan.over_replicated,
                     items = plan.items.len(),
                     "replication audit result"
+                );
+            }
+
+            if state.repair_config.enabled && !plan.items.is_empty() {
+                let report = execute_replication_repair_inner(&state, None).await;
+                info!(
+                    attempted = report.attempted_transfers,
+                    success = report.successful_transfers,
+                    failed = report.failed_transfers,
+                    skipped = report.skipped_items,
+                    skipped_backoff = report.skipped_backoff,
+                    skipped_max_retries = report.skipped_max_retries,
+                    "replication repair executor run"
                 );
             }
         }
@@ -610,9 +680,29 @@ struct ReplicationRepairReport {
     successful_transfers: usize,
     failed_transfers: usize,
     skipped_items: usize,
+    skipped_backoff: usize,
+    skipped_max_retries: usize,
 }
 
-async fn execute_replication_repair(State(state): State<ServerState>) -> impl IntoResponse {
+#[derive(Debug, Deserialize)]
+struct ReplicationRepairQuery {
+    batch_size: Option<usize>,
+}
+
+async fn execute_replication_repair(
+    State(state): State<ServerState>,
+    Query(query): Query<ReplicationRepairQuery>,
+) -> impl IntoResponse {
+    let batch_override = query.batch_size.filter(|v| *v > 0);
+    let report = execute_replication_repair_inner(&state, batch_override).await;
+
+    (StatusCode::OK, Json(report))
+}
+
+async fn execute_replication_repair_inner(
+    state: &ServerState,
+    batch_size_override: Option<usize>,
+) -> ReplicationRepairReport {
     let keys = {
         let store = state.store.lock().await;
         store
@@ -634,10 +724,21 @@ async fn execute_replication_repair(State(state): State<ServerState>) -> impl In
     let mut successful_transfers = 0usize;
     let mut failed_transfers = 0usize;
     let mut skipped_items = 0usize;
+    let mut skipped_backoff = 0usize;
+    let mut skipped_max_retries = 0usize;
+
+    let max_attempts = state.repair_config.max_retries;
+    let backoff_secs = state.repair_config.backoff_secs;
+    let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
+    let now = unix_ts();
 
     let http = reqwest::Client::new();
 
     for item in plan.items {
+        if attempted_transfers >= max_transfers {
+            break;
+        }
+
         let Some((key, version_id)) = parse_replication_subject(&item.key) else {
             skipped_items += 1;
             continue;
@@ -675,6 +776,10 @@ async fn execute_replication_repair(State(state): State<ServerState>) -> impl In
         };
 
         for target in item.missing_nodes {
+            if attempted_transfers >= max_transfers {
+                break;
+            }
+
             let Some(node) = node_by_id.get(&target) else {
                 failed_transfers += 1;
                 continue;
@@ -682,6 +787,24 @@ async fn execute_replication_repair(State(state): State<ServerState>) -> impl In
 
             if target == state.node_id {
                 continue;
+            }
+
+            let transfer_key = format!("{}|{}", item.key, target);
+
+            {
+                let repair_state = state.repair_state.lock().await;
+                if let Some(previous) = repair_state.attempts.get(&transfer_key) {
+                    if previous.attempts >= max_attempts {
+                        skipped_max_retries += 1;
+                        continue;
+                    }
+
+                    let elapsed = now.saturating_sub(previous.last_failure_unix);
+                    if elapsed < backoff_secs {
+                        skipped_backoff += 1;
+                        continue;
+                    }
+                }
             }
 
             attempted_transfers += 1;
@@ -702,23 +825,37 @@ async fn execute_replication_repair(State(state): State<ServerState>) -> impl In
                     } else {
                         cluster.note_replica(&key, target);
                     }
+
+                    let mut repair_state = state.repair_state.lock().await;
+                    repair_state.attempts.remove(&transfer_key);
                 }
                 _ => {
                     failed_transfers += 1;
+
+                    let mut repair_state = state.repair_state.lock().await;
+                    let entry =
+                        repair_state
+                            .attempts
+                            .entry(transfer_key)
+                            .or_insert(RepairAttemptEntry {
+                                attempts: 0,
+                                last_failure_unix: now,
+                            });
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    entry.last_failure_unix = now;
                 }
             }
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(ReplicationRepairReport {
-            attempted_transfers,
-            successful_transfers,
-            failed_transfers,
-            skipped_items,
-        }),
-    )
+    ReplicationRepairReport {
+        attempted_transfers,
+        successful_transfers,
+        failed_transfers,
+        skipped_items,
+        skipped_backoff,
+        skipped_max_retries,
+    }
 }
 
 fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> {
@@ -734,6 +871,13 @@ fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> 
     }
 
     Some((subject.to_string(), None))
+}
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 async fn run_cleanup(
