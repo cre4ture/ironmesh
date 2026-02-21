@@ -699,6 +699,8 @@ struct PutObjectQuery {
     state: Option<String>,
     #[serde(default)]
     parent: Vec<String>,
+    #[serde(default)]
+    internal_replication: bool,
 }
 
 async fn put_object(
@@ -741,7 +743,7 @@ async fn put_object(
                 warn!(error = %err, "failed to persist cluster replicas after put");
             }
 
-            if state.autonomous_replication_on_put_enabled {
+            if state.autonomous_replication_on_put_enabled && !query.internal_replication {
                 let state_for_repair = state.clone();
                 tokio::spawn(async move {
                     let report = execute_replication_repair_inner(&state_for_repair, None).await;
@@ -1856,7 +1858,10 @@ async fn replicate_bundle_to_target(
         VersionConsistencyState::Provisional => "provisional",
     };
 
-    let put_url = format!("{target_base_url}/store/{}?state={state_query}", bundle.key);
+    let put_url = format!(
+        "{target_base_url}/store/{}?state={state_query}&internal_replication=1",
+        bundle.key
+    );
     http.put(put_url)
         .body(assembled.freeze())
         .send()

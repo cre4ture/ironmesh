@@ -82,6 +82,18 @@ Validation added:
 - Unit test `startup_repair_noop_when_plan_is_empty`
 - Unit test `startup_repair_runs_when_gaps_exist`
 
+### 6) Internal replication loop guard
+
+Problem:
+
+- Internal repair transfer used regular `PUT /store/{key}` on target node.
+- Autonomous post-write replication treated that as user-originated write and re-triggered repair, creating replication feedback loops and high CPU.
+
+Fix:
+
+- Internal transfer writes now set `internal_replication=1` query flag.
+- `put_object` skips autonomous post-write repair trigger when `internal_replication` is set.
+
 ## Key Files Touched Recently
 
 - `apps/server-node/src/main.rs`
