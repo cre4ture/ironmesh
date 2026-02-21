@@ -1180,4 +1180,100 @@ mod tests {
             Some((_, PreferredHeadReason::DeterministicTiebreakVersionId))
         ));
     }
+
+    #[test]
+    fn preferred_head_reason_falls_back_to_provisional_when_no_confirmed() {
+        let mut index = empty_version_index("k");
+        index.versions.insert(
+            "v-old".to_string(),
+            mk_record("v-old", VersionConsistencyState::Provisional, 10),
+        );
+        index.versions.insert(
+            "v-new".to_string(),
+            mk_record("v-new", VersionConsistencyState::Provisional, 20),
+        );
+        index.head_version_ids = vec!["v-old".to_string(), "v-new".to_string()];
+
+        let preferred = choose_preferred_head_with_reason(&index);
+        assert!(matches!(
+            preferred,
+            Some((_, PreferredHeadReason::ProvisionalFallbackNoConfirmed))
+        ));
+    }
+
+    #[test]
+    fn manifest_hash_preferred_uses_confirmed_when_provisional_is_newer() {
+        let mut index = empty_version_index("k");
+        index.versions.insert(
+            "v-confirmed".to_string(),
+            mk_record("v-confirmed", VersionConsistencyState::Confirmed, 10),
+        );
+        index.versions.insert(
+            "v-provisional".to_string(),
+            mk_record("v-provisional", VersionConsistencyState::Provisional, 100),
+        );
+        index.head_version_ids = vec!["v-confirmed".to_string(), "v-provisional".to_string()];
+
+        let selected = manifest_hash_for_read_mode(&index, ObjectReadMode::Preferred);
+        assert_eq!(selected.as_deref(), Some("m-v-confirmed"));
+    }
+
+    #[test]
+    fn manifest_hash_confirmed_only_returns_none_without_confirmed_heads() {
+        let mut index = empty_version_index("k");
+        index.versions.insert(
+            "v1".to_string(),
+            mk_record("v1", VersionConsistencyState::Provisional, 10),
+        );
+        index.versions.insert(
+            "v2".to_string(),
+            mk_record("v2", VersionConsistencyState::Provisional, 20),
+        );
+        index.head_version_ids = vec!["v1".to_string(), "v2".to_string()];
+
+        let selected = manifest_hash_for_read_mode(&index, ObjectReadMode::ConfirmedOnly);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn manifest_hash_confirmed_only_picks_latest_confirmed_head() {
+        let mut index = empty_version_index("k");
+        index.versions.insert(
+            "v-confirmed-old".to_string(),
+            mk_record("v-confirmed-old", VersionConsistencyState::Confirmed, 10),
+        );
+        index.versions.insert(
+            "v-confirmed-new".to_string(),
+            mk_record("v-confirmed-new", VersionConsistencyState::Confirmed, 20),
+        );
+        index.versions.insert(
+            "v-provisional".to_string(),
+            mk_record("v-provisional", VersionConsistencyState::Provisional, 30),
+        );
+        index.head_version_ids = vec![
+            "v-confirmed-old".to_string(),
+            "v-confirmed-new".to_string(),
+            "v-provisional".to_string(),
+        ];
+
+        let selected = manifest_hash_for_read_mode(&index, ObjectReadMode::ConfirmedOnly);
+        assert_eq!(selected.as_deref(), Some("m-v-confirmed-new"));
+    }
+
+    #[test]
+    fn manifest_hash_provisional_allowed_picks_latest_head_regardless_of_state() {
+        let mut index = empty_version_index("k");
+        index.versions.insert(
+            "v-confirmed".to_string(),
+            mk_record("v-confirmed", VersionConsistencyState::Confirmed, 10),
+        );
+        index.versions.insert(
+            "v-provisional".to_string(),
+            mk_record("v-provisional", VersionConsistencyState::Provisional, 20),
+        );
+        index.head_version_ids = vec!["v-confirmed".to_string(), "v-provisional".to_string()];
+
+        let selected = manifest_hash_for_read_mode(&index, ObjectReadMode::ProvisionalAllowed);
+        assert_eq!(selected.as_deref(), Some("m-v-provisional"));
+    }
 }
