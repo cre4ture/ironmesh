@@ -6,6 +6,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::time::Duration;
+    use std::time::Instant;
     use std::time::SystemTime;
 
     use anyhow::{Context, Result, bail};
@@ -1338,6 +1339,126 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "performance measurement test; run manually"]
+    async fn manual_replication_repair_reports_small_payload_throughput() -> Result<()> {
+        let bind_a = "127.0.0.1:19141";
+        let bind_b = "127.0.0.1:19142";
+        let bind_c = "127.0.0.1:19143";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000008a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000008b2";
+        let node_id_c = "00000000-0000-0000-0000-0000000008c3";
+
+        let data_a = fresh_data_dir("repair-perf-a");
+        let data_b = fresh_data_dir("repair-perf-b");
+        let data_c = fresh_data_dir("repair-perf-c");
+
+        let env = [
+            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false"),
+            ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
+            ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
+        ];
+
+        let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 3, &env).await?;
+        let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 3, &env).await?;
+        let mut node_c = start_server_with_env(bind_c, &data_c, node_id_c, 3, &env).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let base_c = format!("http://{bind_c}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+            register_node(&http, &base_a, node_id_c, &base_c, "dc-c", "rack-3").await?;
+
+            let object_count = 12u64;
+            for idx in 0..object_count {
+                http.put(format!("{base_a}/store/repair-perf-key-{idx}"))
+                    .body("x")
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            let before_plan: serde_json::Value = http
+                .get(format!("{base_a}/cluster/replication/plan"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let before_under = before_plan
+                .get("under_replicated")
+                .and_then(|v| v.as_u64())
+                .context("missing under_replicated before perf repair")?;
+            assert!(before_under > 0, "expected under-replicated items before repair");
+
+            let start = Instant::now();
+            let repair_report: serde_json::Value = http
+                .post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let elapsed = start.elapsed();
+
+            let attempted = repair_report
+                .get("attempted_transfers")
+                .and_then(|v| v.as_u64())
+                .context("missing attempted_transfers in perf repair report")?;
+            let successful = repair_report
+                .get("successful_transfers")
+                .and_then(|v| v.as_u64())
+                .context("missing successful_transfers in perf repair report")?;
+
+            assert!(attempted > 0, "expected attempted transfers in perf test");
+            assert!(
+                successful > 0,
+                "expected successful transfers in perf test, report={repair_report:?}"
+            );
+
+            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+            let transfers_per_sec = attempted as f64 / elapsed_secs;
+
+            eprintln!(
+                "repair perf: attempted={attempted} successful={successful} elapsed_ms={} throughput={:.2} transfers/s",
+                elapsed.as_millis(),
+                transfers_per_sec
+            );
+
+            let after_plan: serde_json::Value = http
+                .get(format!("{base_a}/cluster/replication/plan"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let after_under = after_plan
+                .get("under_replicated")
+                .and_then(|v| v.as_u64())
+                .context("missing under_replicated after perf repair")?;
+            assert!(
+                after_under <= before_under,
+                "repair should not increase under-replication in perf test"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        stop_server(&mut node_c).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&data_c);
 
         result
     }

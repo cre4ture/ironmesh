@@ -212,6 +212,7 @@ Those bridges can be added incrementally without changing the workspace topology
 
 - On startup, the server can run a one-shot replication repair pass after a short delay to heal inconsistent states.
 - Configuration:
+	- `IRONMESH_REPLICATION_REPAIR_BATCH_SIZE` (default: `256`)
 	- `IRONMESH_STARTUP_REPAIR_ENABLED` (default: `true`)
 	- `IRONMESH_STARTUP_REPAIR_DELAY_SECS` (default: `5`)
 	- `IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED` (default: `false`)

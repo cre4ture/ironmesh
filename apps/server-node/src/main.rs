@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +19,12 @@ use bytes::{Bytes, BytesMut};
 use common::{HealthStatus, NodeId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tracing::Subscriber;
+use tracing::field::{Field, Visit};
 use tracing::{info, warn};
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 mod cluster;
 mod storage;
@@ -40,8 +47,101 @@ struct ServerState {
     replication_audit_interval_secs: u64,
     peer_heartbeat_config: PeerHeartbeatConfig,
     repair_config: RepairConfig,
+    log_buffer: Arc<LogBuffer>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
+}
+
+struct LogBuffer {
+    entries: StdMutex<VecDeque<String>>,
+    max_entries: usize,
+}
+
+impl LogBuffer {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: StdMutex::new(VecDeque::with_capacity(max_entries.max(1))),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    fn push(&self, line: String) {
+        let mut entries = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        entries.push_back(line);
+        while entries.len() > self.max_entries {
+            entries.pop_front();
+        }
+    }
+
+    fn recent(&self, limit: usize) -> Vec<String> {
+        let entries = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let keep = limit.max(1);
+        let skip = entries.len().saturating_sub(keep);
+        entries.iter().skip(skip).cloned().collect()
+    }
+}
+
+#[derive(Clone)]
+struct LogCaptureLayer {
+    buffer: Arc<LogBuffer>,
+}
+
+impl LogCaptureLayer {
+    fn new(buffer: Arc<LogBuffer>) -> Self {
+        Self { buffer }
+    }
+}
+
+struct EventFieldVisitor {
+    fields: Vec<String>,
+}
+
+impl EventFieldVisitor {
+    fn new() -> Self {
+        Self { fields: Vec::new() }
+    }
+}
+
+impl Visit for EventFieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.fields.push(format!("{}={:?}", field.name(), value));
+    }
+}
+
+impl<S> Layer<S> for LogCaptureLayer
+where
+    S: Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = EventFieldVisitor::new();
+        event.record(&mut visitor);
+        let metadata = event.metadata();
+
+        let line = if visitor.fields.is_empty() {
+            format!("{} {}", metadata.level(), metadata.target())
+        } else {
+            format!(
+                "{} {} {}",
+                metadata.level(),
+                metadata.target(),
+                visitor.fields.join(" ")
+            )
+        };
+
+        self.buffer.push(line);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,7 +199,7 @@ impl RepairConfig {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(32);
+            .unwrap_or(256);
 
         let max_retries = std::env::var("IRONMESH_REPLICATION_REPAIR_MAX_RETRIES")
             .ok()
@@ -195,10 +295,15 @@ impl MetadataCommitMode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .with_target(false)
-        .compact()
+    let log_buffer = Arc::new(LogBuffer::new(500));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .compact(),
+        )
+        .with(LogCaptureLayer::new(log_buffer.clone()))
         .init();
 
     let node_id = std::env::var("IRONMESH_NODE_ID")
@@ -328,6 +433,7 @@ async fn main() -> Result<()> {
         replication_audit_interval_secs: audit_interval_secs,
         peer_heartbeat_config,
         repair_config,
+        log_buffer,
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
     };
@@ -379,6 +485,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/logs", get(list_logs))
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
@@ -748,6 +855,7 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
     main {{ max-width: 860px; margin: 0 auto; }}
     code {{ background: #f4f4f4; padding: 0.2rem 0.4rem; border-radius: 0.2rem; }}
     ul {{ line-height: 1.6; }}
+        #server-logs {{ background: #f4f4f4; padding: 0.75rem; border-radius: 0.2rem; min-height: 12rem; max-height: 24rem; overflow: auto; white-space: pre-wrap; }}
   </style>
 </head>
 <body>
@@ -768,9 +876,13 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
             <li><strong>Repair busy-throttle</strong>: <code>{}</code>; in-flight requests now=<code>{}</code></li>
             <li><strong>Current replication backlog</strong>: plan items=<code>{}</code>, under-replicated=<code>{}</code>, over-replicated=<code>{}</code></li>
         </ul>
+        <h2>Server logs</h2>
+        <p>Recent in-memory log lines from this node.</p>
+        <pre id=\"server-logs\">loading…</pre>
     <h2>Available routes</h2>
     <ul>
       <li><code>GET /</code> — info page</li>
+            <li><code>GET /logs?limit=&lt;n&gt;</code> — latest server log lines</li>
       <li><code>GET /health</code> — node health JSON</li>
       <li><code>GET /snapshots</code> — snapshot metadata</li>
       <li><code>PUT /store/{{key}}</code> — store object bytes</li>
@@ -795,6 +907,25 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
             <li><code>POST /maintenance/cleanup?retention_secs=&lt;n&gt;&amp;dry_run=true|false</code> — retention-safe orphan cleanup for manifests/chunks</li>
     </ul>
   </main>
+    <script>
+        async function refreshServerLogs() {{
+            try {{
+                const response = await fetch('/logs?limit=200', {{ cache: 'no-store' }});
+                if (!response.ok) {{
+                    throw new Error('HTTP ' + response.status);
+                }}
+
+                const payload = await response.json();
+                const logs = Array.isArray(payload.entries) ? payload.entries : [];
+                document.getElementById('server-logs').textContent = logs.join('\\n') || 'no logs yet';
+            }} catch (error) {{
+                document.getElementById('server-logs').textContent = 'failed to load logs: ' + error;
+            }}
+        }}
+
+        refreshServerLogs();
+        setInterval(refreshServerLogs, 2000);
+    </script>
 </body>
 </html>\n",
         state.node_id,
@@ -821,6 +952,30 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
     );
 
     Html(body)
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct LogsResponse {
+    entries: Vec<String>,
+}
+
+async fn list_logs(
+    State(state): State<ServerState>,
+    Query(query): Query<LogsQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    (
+        StatusCode::OK,
+        Json(LogsResponse {
+            entries: state.log_buffer.recent(limit),
+        }),
+    )
+        .into_response()
 }
 
 async fn list_snapshots(State(state): State<ServerState>) -> impl IntoResponse {
@@ -898,6 +1053,7 @@ async fn put_object(
                 parent_version_ids: query.parent,
                 state: version_state,
                 inherit_preferred_parent: true,
+                create_snapshot: !query.internal_replication,
             },
         )
         .await
@@ -1865,6 +2021,8 @@ async fn execute_replication_repair_inner(
     let mut skipped_backoff = 0usize;
     let mut skipped_max_retries = 0usize;
     let mut last_error = None;
+    let mut replicas_state_dirty = false;
+    let mut repair_state_dirty = false;
 
     let max_attempts = state.repair_config.max_retries;
     let backoff_secs = state.repair_config.backoff_secs;
@@ -1958,21 +2116,12 @@ async fn execute_replication_repair_inner(
                     }
                     cluster.note_replica(format!("{key}@{remote_version_id}"), target);
                     drop(cluster);
-
-                    if let Err(err) = persist_cluster_replicas_state(state).await {
-                        warn!(
-                            error = %err,
-                            "failed to persist cluster replicas after repair success"
-                        );
-                    }
+                    replicas_state_dirty = true;
 
                     let mut repair_state = state.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
                     drop(repair_state);
-
-                    if let Err(err) = persist_repair_state(state).await {
-                        warn!(error = %err, "failed persisting repair attempts after success");
-                    }
+                    repair_state_dirty = true;
                 }
                 Err(err) => {
                     failed_transfers += 1;
@@ -1990,13 +2139,21 @@ async fn execute_replication_repair_inner(
                     entry.attempts = entry.attempts.saturating_add(1);
                     entry.last_failure_unix = now;
                     drop(repair_state);
-
-                    if let Err(err) = persist_repair_state(state).await {
-                        warn!(error = %err, "failed persisting repair attempts after failure");
-                    }
+                    repair_state_dirty = true;
                 }
             }
         }
+    }
+
+    if replicas_state_dirty && let Err(err) = persist_cluster_replicas_state(state).await {
+        warn!(
+            error = %err,
+            "failed to persist cluster replicas after repair run"
+        );
+    }
+
+    if repair_state_dirty && let Err(err) = persist_repair_state(state).await {
+        warn!(error = %err, "failed persisting repair attempts after repair run");
     }
 
     ReplicationRepairReport {
@@ -2552,6 +2709,7 @@ mod tests {
                 busy_inflight_threshold: 1,
                 busy_wait_millis: 100,
             },
+            log_buffer: Arc::new(super::LogBuffer::new(64)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         };
@@ -2567,6 +2725,7 @@ mod tests {
                             parent_version_ids: Vec::new(),
                             state: VersionConsistencyState::Confirmed,
                             inherit_preferred_parent: true,
+                            create_snapshot: true,
                         },
                     )
                     .await
@@ -2833,6 +2992,7 @@ async fn reconcile_from_node(
                         parent_version_ids: Vec::new(),
                         state: VersionConsistencyState::Provisional,
                         inherit_preferred_parent: false,
+                        create_snapshot: true,
                     },
                 )
                 .await

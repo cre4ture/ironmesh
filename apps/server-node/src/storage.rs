@@ -137,6 +137,7 @@ pub struct PutOptions {
     pub parent_version_ids: Vec<String>,
     pub state: VersionConsistencyState,
     pub inherit_preferred_parent: bool,
+    pub create_snapshot: bool,
 }
 
 impl Default for PutOptions {
@@ -145,6 +146,7 @@ impl Default for PutOptions {
             parent_version_ids: Vec::new(),
             state: VersionConsistencyState::Confirmed,
             inherit_preferred_parent: true,
+            create_snapshot: true,
         }
     }
 }
@@ -473,7 +475,11 @@ impl PersistentStore {
         self.sync_current_state_for_key_from_index(key, &index)?;
         self.persist_current_state().await?;
 
-        let snapshot_id = self.create_snapshot().await?;
+        let snapshot_id = if options.create_snapshot {
+            self.create_snapshot().await?
+        } else {
+            format!("snap-skipped-{version_id}")
+        };
 
         Ok(PutResult {
             snapshot_id,
@@ -1912,6 +1918,7 @@ mod tests {
                     parent_version_ids: Vec::new(),
                     state: VersionConsistencyState::Provisional,
                     inherit_preferred_parent: false,
+                    create_snapshot: true,
                 },
             )
             .await
