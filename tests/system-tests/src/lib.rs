@@ -2153,7 +2153,10 @@ mod tests {
             if path.exists() {
                 return Ok(path);
             }
-            bail!("{override_key} points to missing binary: {}", path.display());
+            bail!(
+                "{override_key} points to missing binary: {}",
+                path.display()
+            );
         }
 
         let artifact_path = match name {
