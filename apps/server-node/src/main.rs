@@ -313,7 +313,10 @@ async fn main() -> Result<()> {
 
     spawn_replication_auditor(state.clone(), audit_interval_secs);
     if state.repair_config.startup_repair_enabled {
-        spawn_startup_replication_repair(state.clone(), state.repair_config.startup_repair_delay_secs);
+        spawn_startup_replication_repair(
+            state.clone(),
+            state.repair_config.startup_repair_delay_secs,
+        );
     }
     if peer_heartbeat_config.enabled {
         spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
