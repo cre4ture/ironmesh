@@ -202,6 +202,12 @@ Those bridges can be added incrementally without changing the workspace topology
 	- `IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED` (default: `true`)
 	- `IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS` (default: `15`)
 
+### Autonomous replication on write
+
+- Successful `PUT /store/{key}` writes can trigger an immediate asynchronous replication repair pass.
+- Configuration:
+	- `IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED` (default: `true`)
+
 - Rejoin reconciliation endpoints:
 	- `GET /cluster/reconcile/export/provisional`
 	- `POST /cluster/reconcile/{node_id}`

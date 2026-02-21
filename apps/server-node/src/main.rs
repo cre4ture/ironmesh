@@ -33,6 +33,7 @@ struct ServerState {
     cluster: Arc<Mutex<ClusterService>>,
     metadata_commit_mode: MetadataCommitMode,
     internal_node_tokens: Arc<Mutex<HashMap<NodeId, String>>>,
+    autonomous_replication_on_put_enabled: bool,
     repair_config: RepairConfig,
     repair_state: Arc<Mutex<RepairExecutorState>>,
 }
@@ -197,6 +198,12 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
 
     let repair_config = RepairConfig::from_env();
+    let autonomous_replication_on_put_enabled = std::env::var(
+        "IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED",
+    )
+    .ok()
+    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+    .unwrap_or(true);
     let peer_heartbeat_config = PeerHeartbeatConfig::from_env();
 
     let policy = ReplicationPolicy {
@@ -252,6 +259,7 @@ async fn main() -> Result<()> {
         cluster: Arc::new(Mutex::new(cluster)),
         metadata_commit_mode,
         internal_node_tokens: Arc::new(Mutex::new(internal_node_tokens)),
+        autonomous_replication_on_put_enabled,
         repair_config,
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
     };
@@ -654,6 +662,24 @@ async fn put_object(
 
             if let Err(err) = persist_cluster_replicas_state(&state).await {
                 warn!(error = %err, "failed to persist cluster replicas after put");
+            }
+
+            if state.autonomous_replication_on_put_enabled {
+                let state_for_repair = state.clone();
+                tokio::spawn(async move {
+                    let report = execute_replication_repair_inner(&state_for_repair, None).await;
+                    if report.attempted_transfers > 0 || report.failed_transfers > 0 {
+                        info!(
+                            attempted = report.attempted_transfers,
+                            success = report.successful_transfers,
+                            failed = report.failed_transfers,
+                            skipped = report.skipped_items,
+                            skipped_backoff = report.skipped_backoff,
+                            skipped_max_retries = report.skipped_max_retries,
+                            "autonomous post-write replication run"
+                        );
+                    }
+                });
             }
 
             info!(

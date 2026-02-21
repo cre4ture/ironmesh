@@ -1116,6 +1116,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn autonomous_replication_after_put_populates_peer_without_manual_repair() -> Result<()> {
+        let bind_a = "127.0.0.1:19131";
+        let bind_b = "127.0.0.1:19132";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000007a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000007b2";
+
+        let data_a = fresh_data_dir("auto-repair-a");
+        let data_b = fresh_data_dir("auto-repair-b");
+
+        let mut node_a = start_server_with_env(
+            bind_a,
+            &data_a,
+            node_id_a,
+            2,
+            &[("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
+        )
+        .await?;
+        let mut node_b = start_server_with_env(
+            bind_b,
+            &data_b,
+            node_id_b,
+            2,
+            &[("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
+        )
+        .await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+
+            let payload = "autonomous-replication-payload";
+            http.put(format!("{base_a}/store/autonomous-repair-key"))
+                .body(payload)
+                .send()
+                .await?
+                .error_for_status()?;
+
+            wait_for_object_payload(
+                &http,
+                &base_b,
+                "autonomous-repair-key",
+                payload,
+                120,
+            )
+            .await?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
     async fn manual_replication_repair_respects_batch_size_limit() -> Result<()> {
         let bind_a = "127.0.0.1:19108";
         let bind_b = "127.0.0.1:19109";
@@ -2149,6 +2212,7 @@ mod tests {
         }
 
         command.env("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "false");
+        command.env("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false");
 
         for (key, value) in extra_env {
             command.env(key, value);
@@ -2291,6 +2355,30 @@ mod tests {
         bail!(
             "cluster did not report online_nodes={} at {base_url}/cluster/status",
             expected_online_nodes
+        );
+    }
+
+    async fn wait_for_object_payload(
+        http: &reqwest::Client,
+        base_url: &str,
+        key: &str,
+        expected_payload: &str,
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(resp) = http.get(format!("{base_url}/store/{key}")).send().await
+                && resp.status() == StatusCode::OK
+                && let Ok(body) = resp.text().await
+                && body == expected_payload
+            {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "object {key} did not replicate to expected payload at {base_url}/store/{key}"
         );
     }
 
