@@ -155,6 +155,10 @@ async fn main() -> Result<()> {
             post(trigger_replication_audit),
         )
         .route(
+            "/cluster/replication/repair",
+            post(execute_replication_repair),
+        )
+        .route(
             "/cluster/reconcile/export/provisional",
             get(export_provisional_versions),
         )
@@ -281,6 +285,7 @@ async fn index(State(state): State<ServerState>) -> Html<String> {
       <li><code>GET /cluster/placement/{{key}}</code> — deterministic placement decision</li>
       <li><code>GET /cluster/replication/plan</code> — current replication gaps/overages</li>
       <li><code>POST /cluster/replication/audit</code> — manual audit trigger</li>
+    <li><code>POST /cluster/replication/repair</code> — execute one-pass replica repair for missing placements</li>
         <li><code>GET /cluster/reconcile/export/provisional</code> — export local provisional metadata for rejoin sync</li>
         <li><code>POST /cluster/reconcile/{{node_id}}</code> — import provisional commits from a peer node</li>
             <li><code>POST /maintenance/cleanup?retention_secs=&lt;n&gt;&amp;dry_run=true|false</code> — retention-safe orphan cleanup for manifests/chunks</li>
@@ -597,6 +602,138 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
     );
 
     Json(plan)
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationRepairReport {
+    attempted_transfers: usize,
+    successful_transfers: usize,
+    failed_transfers: usize,
+    skipped_items: usize,
+}
+
+async fn execute_replication_repair(State(state): State<ServerState>) -> impl IntoResponse {
+    let keys = {
+        let store = state.store.lock().await;
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+    };
+
+    let (plan, nodes) = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        (cluster.replication_plan(&keys), cluster.list_nodes())
+    };
+
+    let node_by_id: HashMap<NodeId, NodeDescriptor> =
+        nodes.into_iter().map(|node| (node.node_id, node)).collect();
+
+    let mut attempted_transfers = 0usize;
+    let mut successful_transfers = 0usize;
+    let mut failed_transfers = 0usize;
+    let mut skipped_items = 0usize;
+
+    let http = reqwest::Client::new();
+
+    for item in plan.items {
+        let Some((key, version_id)) = parse_replication_subject(&item.key) else {
+            skipped_items += 1;
+            continue;
+        };
+
+        let (payload, version_state) = {
+            let store = state.store.lock().await;
+
+            let payload = match store
+                .get_object(&key, None, version_id.as_deref(), ObjectReadMode::Preferred)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    skipped_items += 1;
+                    continue;
+                }
+            };
+
+            let version_state = if let Some(version_id) = &version_id {
+                match store.list_versions(&key).await {
+                    Ok(Some(summary)) => summary
+                        .versions
+                        .iter()
+                        .find(|entry| &entry.version_id == version_id)
+                        .map(|entry| entry.state.clone())
+                        .unwrap_or(VersionConsistencyState::Confirmed),
+                    _ => VersionConsistencyState::Confirmed,
+                }
+            } else {
+                VersionConsistencyState::Confirmed
+            };
+
+            (payload, version_state)
+        };
+
+        for target in item.missing_nodes {
+            let Some(node) = node_by_id.get(&target) else {
+                failed_transfers += 1;
+                continue;
+            };
+
+            if target == state.node_id {
+                continue;
+            }
+
+            attempted_transfers += 1;
+            let state_query = match version_state {
+                VersionConsistencyState::Confirmed => "confirmed",
+                VersionConsistencyState::Provisional => "provisional",
+            };
+
+            let url = format!("{}/store/{}?state={}", node.public_url, key, state_query);
+            match http.put(url).body(payload.clone()).send().await {
+                Ok(response) if response.status().is_success() => {
+                    successful_transfers += 1;
+
+                    let mut cluster = state.cluster.lock().await;
+                    cluster.note_replica(&item.key, target);
+                    if let Some(version_id) = &version_id {
+                        cluster.note_replica(format!("{key}@{version_id}"), target);
+                    } else {
+                        cluster.note_replica(&key, target);
+                    }
+                }
+                _ => {
+                    failed_transfers += 1;
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(ReplicationRepairReport {
+            attempted_transfers,
+            successful_transfers,
+            failed_transfers,
+            skipped_items,
+        }),
+    )
+}
+
+fn parse_replication_subject(subject: &str) -> Option<(String, Option<String>)> {
+    if subject.is_empty() {
+        return None;
+    }
+
+    if let Some((key, version_id)) = subject.rsplit_once('@')
+        && !key.is_empty()
+        && !version_id.is_empty()
+    {
+        return Some((key.to_string(), Some(version_id.to_string())));
+    }
+
+    Some((subject.to_string(), None))
 }
 
 async fn run_cleanup(

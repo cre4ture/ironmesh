@@ -650,6 +650,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_replication_repair_reduces_missing_plan_items() -> Result<()> {
+        let bind_a = "127.0.0.1:19105";
+        let bind_b = "127.0.0.1:19106";
+        let bind_c = "127.0.0.1:19107";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000003a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000003b2";
+        let node_id_c = "00000000-0000-0000-0000-0000000003c3";
+
+        let data_a = fresh_data_dir("repair-a");
+        let data_b = fresh_data_dir("repair-b");
+        let data_c = fresh_data_dir("repair-c");
+
+        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let base_c = format!("http://{bind_c}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+            register_node(&http, &base_a, node_id_c, &base_c, "dc-c", "rack-3").await?;
+
+            http.put(format!("{base_a}/store/repair-key"))
+                .body("repair-payload")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let before_plan: serde_json::Value = http
+                .get(format!("{base_a}/cluster/replication/plan"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let before_under = before_plan
+                .get("under_replicated")
+                .and_then(|v| v.as_u64())
+                .context("missing under_replicated before repair")?;
+            assert!(before_under >= 1, "expected missing replicas before repair");
+
+            let repair_report: serde_json::Value = http
+                .post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let successful = repair_report
+                .get("successful_transfers")
+                .and_then(|v| v.as_u64())
+                .context("missing successful_transfers")?;
+            assert!(successful >= 1, "expected at least one successful transfer");
+
+            let after_plan: serde_json::Value = http
+                .get(format!("{base_a}/cluster/replication/plan"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let after_under = after_plan
+                .get("under_replicated")
+                .and_then(|v| v.as_u64())
+                .context("missing under_replicated after repair")?;
+
+            assert!(
+                after_under <= before_under,
+                "repair should not increase under-replication"
+            );
+
+            let b_read = http
+                .get(format!("{base_b}/store/repair-key"))
+                .send()
+                .await?;
+            let c_read = http
+                .get(format!("{base_c}/store/repair-key"))
+                .send()
+                .await?;
+            assert!(
+                b_read.status() == StatusCode::OK || c_read.status() == StatusCode::OK,
+                "expected at least one remote node to have replicated payload"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        stop_server(&mut node_c).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&data_c);
+
+        result
+    }
+
+    #[tokio::test]
     async fn rejoin_reconciliation_preserves_provisional_branches() -> Result<()> {
         let bind_a = "127.0.0.1:19100";
         let bind_b = "127.0.0.1:19101";
