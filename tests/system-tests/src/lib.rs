@@ -654,34 +654,8 @@ mod tests {
             register_node(&client, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
             register_node(&client, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
 
-            sleep(Duration::from_secs(5)).await;
-
-            let status_a: serde_json::Value = client
-                .get(format!("{base_a}/cluster/status"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let status_b: serde_json::Value = client
-                .get(format!("{base_b}/cluster/status"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-
-            let online_a = status_a
-                .get("online_nodes")
-                .and_then(|v| v.as_u64())
-                .context("missing online_nodes for node A")?;
-            let online_b = status_b
-                .get("online_nodes")
-                .and_then(|v| v.as_u64())
-                .context("missing online_nodes for node B")?;
-
-            assert_eq!(online_a, 2, "expected both nodes online on node A view");
-            assert_eq!(online_b, 2, "expected both nodes online on node B view");
+            wait_for_online_nodes(&client, &base_a, 2, 80).await?;
+            wait_for_online_nodes(&client, &base_b, 2, 80).await?;
 
             Ok::<(), anyhow::Error>(())
         }
@@ -2128,6 +2102,36 @@ mod tests {
         }
 
         bail!("service did not return {expected} at {url}");
+    }
+
+    async fn wait_for_online_nodes(
+        http: &reqwest::Client,
+        base_url: &str,
+        expected_online_nodes: u64,
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(resp) = http.get(format!("{base_url}/cluster/status")).send().await
+                && let Ok(ok_resp) = resp.error_for_status()
+                && let Ok(payload) = ok_resp.json::<serde_json::Value>().await
+            {
+                let online_nodes = payload
+                    .get("online_nodes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+
+                if online_nodes == expected_online_nodes {
+                    return Ok(());
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "cluster did not report online_nodes={} at {base_url}/cluster/status",
+            expected_online_nodes
+        );
     }
 
     async fn stop_server(child: &mut Child) {
