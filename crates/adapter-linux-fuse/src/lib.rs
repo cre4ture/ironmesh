@@ -52,9 +52,9 @@ pub fn map_sync_plan_to_fuse_actions(sync_plan: &SyncPlan) -> FuseActionPlan {
 
     for operation in &sync_plan.operations {
         let mapped = match operation {
-            SyncOperation::CreateDirectory { path } => FuseAction::EnsureDirectory {
-                path: path.clone(),
-            },
+            SyncOperation::CreateDirectory { path } => {
+                FuseAction::EnsureDirectory { path: path.clone() }
+            }
             SyncOperation::EnsurePlaceholder {
                 path,
                 remote_version,
