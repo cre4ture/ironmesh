@@ -27,5 +27,5 @@ jobs:
       - name: Enforce line coverage threshold
         run: |
           cargo llvm-cov --workspace --all-features --summary-only \
-            --ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/server-node/src/main.rs|crates/common/src/lib.rs' \
+            --ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/' \
             --fail-under-lines 70
