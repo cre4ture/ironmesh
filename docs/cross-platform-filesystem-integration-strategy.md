@@ -139,3 +139,48 @@ Out of scope for MVP:
   - `crates/adapter-linux-fuse` skeleton mapping `sync-core` operations to Linux/FUSE-oriented actions.
 - Next step:
   - Replace skeleton action execution with concrete FUSE callback handling in a dedicated runtime crate/module.
+
+## Linux FUSE MVP test (current)
+
+The Linux adapter now includes a feature-gated read-only FUSE runtime and mount CLI:
+
+- Crate: `crates/adapter-linux-fuse`
+- Binary: `adapter-linux-fuse-mount`
+- Cargo feature: `fuse-runtime`
+
+Example snapshot file:
+
+```json
+{
+  "local": [],
+  "remote": [
+    {
+      "path": "docs/readme.txt",
+      "kind": "File",
+      "version": "v1",
+      "content_hash": "h1"
+    },
+    {
+      "path": "docs/nested",
+      "kind": "Directory",
+      "version": null,
+      "content_hash": null
+    }
+  ]
+}
+```
+
+Mount command:
+
+```bash
+mkdir -p /tmp/ironmesh-mount
+cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+  --snapshot-file /tmp/snapshot.json \
+  --mountpoint /tmp/ironmesh-mount
+```
+
+Current runtime behavior:
+
+- Read-only filesystem.
+- Directories and placeholder files materialized from planned actions.
+- File reads trigger demo hydration content for placeholders.

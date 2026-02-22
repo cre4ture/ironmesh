@@ -5,5 +5,19 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+fuse-runtime = ["dep:anyhow", "dep:clap", "dep:fuser", "dep:libc", "dep:serde_json"]
+
 [dependencies]
 sync-core = { path = "../sync-core" }
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+fuser = { version = "0.14", default-features = false, optional = true }
+libc = { version = "0.2", optional = true }
+serde_json = { workspace = true, optional = true }
+
+[[bin]]
+name = "adapter-linux-fuse-mount"
+path = "src/bin/mount.rs"
+required-features = ["fuse-runtime"]
