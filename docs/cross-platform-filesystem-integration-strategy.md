@@ -184,3 +184,15 @@ Current runtime behavior:
 - Read-only filesystem.
 - Directories and placeholder files materialized from planned actions.
 - File reads trigger demo hydration content for placeholders.
+
+Direct server-node mode:
+
+```bash
+mkdir -p /tmp/ironmesh-mount-live
+cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+  --server-base-url http://127.0.0.1:18080 \
+  --mountpoint /tmp/ironmesh-mount-live
+```
+
+- `--server-base-url` loads namespace entries from `/store/index`.
+- File reads hydrate through live `GET /store/{key}` requests.

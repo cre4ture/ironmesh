@@ -7,7 +7,7 @@ authors.workspace = true
 
 [features]
 default = []
-fuse-runtime = ["dep:anyhow", "dep:clap", "dep:fuser", "dep:libc", "dep:serde_json"]
+fuse-runtime = ["dep:anyhow", "dep:clap", "dep:fuser", "dep:libc", "dep:reqwest", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 sync-core = { path = "../sync-core" }
@@ -16,6 +16,8 @@ clap = { workspace = true, optional = true }
 fuser = { version = "0.14", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
 serde_json = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { workspace = true, optional = true }
 
 [[bin]]
 name = "adapter-linux-fuse-mount"
