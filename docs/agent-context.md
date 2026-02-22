@@ -1,174 +1,84 @@
 # Agent Working Context (Compressed)
 
-Purpose: fast bootstrap for coding sessions without reloading full chat/tool history.
+Purpose: fast bootstrap for coding sessions without replaying full tool/chat history.
 
-## Repository Snapshot
+## Repository snapshot
 
 - Project: `ironmesh` (Rust workspace)
-- Primary backend node: `apps/server-node`
-- End-to-end/system tests: `tests/system-tests`
-- CI split:
-  - Stable lanes for root workspace checks/lints/tests
-  - Nightly lane for `tests/system-tests` with `-Z bindeps`
+- Primary backend: `apps/server-node`
+- Mobile: Android native shell + SAF provider under `apps/android-app/native`
+- Cross-platform filesystem work:
+  - Shared planner: `crates/sync-core`
+  - Linux adapter: `crates/adapter-linux-fuse`
 
-## Toolchain + Build Policy
+## Toolchain + CI policy
 
-- Nightly is pinned in `rust-toolchain.toml` (`nightly-2026-02-21`)
-- `bindeps` enabled in `.cargo/config.toml`
-- `tests/system-tests` is isolated from root workspace membership
-- `tests/system-tests/Cargo.lock` is tracked for reproducibility
+- Workspace toolchain pinned in `rust-toolchain.toml`: `nightly-2026-02-21`
+- CI check lanes include:
+  - Rust checks/lints/tests
+  - Android debug build + artifact (`android-debug-apk`)
+  - Linux FUSE mount binary build + artifact (`linux-fuse-mount-binary-ubuntu`)
+- Coverage gate excludes `crates/adapter-linux-fuse/` for current MVP stage.
 
-## Recent Behavior Fixes
+## Current state (latest implemented)
 
-### 1) System-test binary provisioning
+### Server + data plane
 
-- Removed nested in-test `cargo build` behavior
-- System-tests now use artifact dependencies for binaries
-- Binary resolution supports env overrides:
-  - `IRONMESH_SERVER_BIN`
-  - `IRONMESH_CLI_BIN`
+- Replication planner stabilized with low-churn semantics and tolerance controls.
+- Upload idempotency behavior improved (unchanged payload can reuse existing version).
+- Web/CLI browsing and snapshot/version flows expanded.
 
-### 2) Heartbeat test stabilization
+### Android
 
-- Replaced fixed sleeps with polling helper (`wait_for_online_nodes`)
-- Added resilience coverage for restart and repeated flap recovery
+- SAF `DocumentsProvider` implemented and build-compiling.
+- Base server URL now persisted via shared preferences and reused by SAF path.
+- Android CI build integrated and APK published as artifact.
 
-### 3) Automatic replication after upload
+### Linux FUSE
 
-Root cause: replication repair was periodic/audit-driven (long delay), so writes could remain under-replicated.
+- `sync-core` provides deterministic reconciliation operations.
+- `adapter-linux-fuse` now has:
+  - operation mapping tests
+  - feature-gated runtime (`fuse-runtime`)
+  - mount binary `adapter-linux-fuse-mount`
+  - snapshot mode (`--snapshot-file`)
+  - live server mode (`--server-base-url`) with `/store/index` listing + `GET /store/{key}` hydration
 
-Implemented:
+## Key files now authoritative
 
-- On successful `PUT /store/{key}`, server now can trigger immediate async repair pass
-- New config flag:
-  - `IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED` (default: `true`)
-- Existing periodic auditor remains unchanged
+- `crates/sync-core/src/lib.rs`
+- `crates/adapter-linux-fuse/src/lib.rs`
+- `crates/adapter-linux-fuse/src/bin/mount.rs`
+- `apps/android-app/native/app/src/main/java/io/ironmesh/android/ui/MainViewModel.kt`
+- `apps/android-app/native/app/src/main/java/io/ironmesh/android/data/IronmeshPreferences.kt`
+- `apps/android-app/native/app/src/main/java/io/ironmesh/android/saf/IronmeshDocumentsProvider.kt`
+- `.github/workflows/check.yml`
+- `.github/workflows/coverage.yml`
+- `docs/cross-platform-filesystem-integration-strategy.md`
+- `docs/cross-platform-handover.md`
 
-Validation added:
-
-- System test `autonomous_replication_after_put_populates_peer_without_manual_repair`
-
-### 4) Low-churn replication planning
-
-Problem:
-
-- Strict desired-vs-current set diff could suggest 3 transfers after a write on non-desired node (RF=3 with 4 nodes), producing temporary overreplication.
-
-Implemented:
-
-- Planner now preserves current replicas while under target and only backfills enough nodes to reach target count.
-- Extra replicas are only flagged when current replica count is above target count.
-
-Validation added:
-
-- Unit test `replication_plan_limits_backfill_when_current_replica_not_in_desired_set`
-- Unit test `replication_plan_handles_divergent_versions_for_same_key`
-- Unit test `list_replication_subjects_includes_all_heads_for_divergent_versions`
-
-### 5) Startup one-shot repair
-
-Implemented:
-
-- Server can run a one-shot replication repair pass shortly after startup.
-- Intended to heal inconsistent states after nodes reconnect (useful for tests and local cluster bring-up).
-
-Configuration:
-
-- `IRONMESH_STARTUP_REPAIR_ENABLED` (default: `true`)
-- `IRONMESH_STARTUP_REPAIR_DELAY_SECS` (default: `5`)
-
-Validation added:
-
-- Unit test `startup_repair_noop_when_plan_is_empty`
-- Unit test `startup_repair_runs_when_gaps_exist`
-
-### 6) Internal replication loop guard
-
-Problem:
-
-- Internal repair transfer used regular `PUT /store/{key}` on target node.
-- Autonomous post-write replication treated that as user-originated write and re-triggered repair, creating replication feedback loops and high CPU.
-
-Fix:
-
-- Internal transfer writes now set `internal_replication=1` query flag.
-- `put_object` skips autonomous post-write repair trigger when `internal_replication` is set.
-
-Validation added:
-
-- Unit test `autonomous_post_write_replication_trigger_guard_blocks_internal_writes`
-- Unit test `internal_replication_put_url_sets_internal_flag`
-
-### 7) Node web UI background-work overview
-
-Implemented on `GET /` page:
-
-- Active background workers (autonomous post-write replication, periodic audit, peer heartbeat).
-- Startup one-shot repair status (`scheduled`/`running`/`completed`/`no gaps`/`disabled`).
-- Current replication backlog summary (plan items, under-replicated, over-replicated).
-
-### 8) Adaptive repair busy-throttling
-
-Implemented:
-
-- Server tracks live in-flight request count via middleware.
-- Replication repair transfer attempts can wait until node load drops below a configured in-flight threshold.
-- UI background-work section now shows busy-throttle configuration and current in-flight count.
-
-Configuration:
-
-- `IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED` (default: `false`)
-- `IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
-- `IRONMESH_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)
-
-## Key Files Touched Recently
-
-- `apps/server-node/src/main.rs`
-- `tests/system-tests/src/lib.rs`
-- `tests/system-tests/Cargo.toml`
-- `README.md`
-- `docs/ci-runbook.md`
-- `justfile`
-- `rust-toolchain.toml`
-- `.cargo/config.toml`
-- `Cargo.toml` (workspace isolation for system-tests)
-- `.gitignore` + `tests/system-tests/Cargo.lock`
-
-## Fast Commands
-
-### Targeted nightly system test
-
-```bash
-cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml tests::autonomous_replication_after_put_populates_peer_without_manual_repair -- --nocapture
-```
-
-### Existing replication regression
-
-```bash
-cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml tests::manual_replication_repair_reduces_missing_plan_items -- --nocapture
-```
-
-### Stable workspace health
+## Quick validation commands
 
 ```bash
 cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p sync-core
+cargo test -p adapter-linux-fuse
+cargo check -p adapter-linux-fuse --features fuse-runtime
 ```
 
-## Session Efficiency Rules (Preferred)
+Linux mount smoke tests:
 
-- Search symbols/strings first, then read minimal line ranges
-- Avoid full-file dumps unless editing large blocks
-- Run narrow tests first; widen only if needed
-- Do not repeat unchanged context in updates
+```bash
+cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+  --snapshot-file /tmp/snapshot.json \
+  --mountpoint /tmp/ironmesh-mount
 
-## Update Protocol
+cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+  --server-base-url http://127.0.0.1:18080 \
+  --mountpoint /tmp/ironmesh-mount-live
+```
 
-When significant decisions/architecture changes happen, append or revise:
+## Immediate next objective
 
-1. What changed
-2. Why it changed
-3. How to validate quickly
-4. Which files are now source-of-truth
-
-Keep this file concise and current.
+- Implement Windows CFAPI adapter prototype using `sync-core` contracts.
+- Continue from handover doc checklist in `docs/cross-platform-handover.md`.

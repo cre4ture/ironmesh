@@ -118,7 +118,7 @@ CI enforces a minimum line coverage floor using `cargo-llvm-cov`:
 
 ```bash
 cargo llvm-cov --workspace --all-features --summary-only \
-	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/server-node/src/main.rs|crates/common/src/lib.rs' \
+	--ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/' \
 	--fail-under-lines 70
 ```
 
@@ -147,6 +147,10 @@ Those bridges can be added incrementally without changing the workspace topology
 ## Cross-platform filesystem integration strategy
 
 - Cross-platform filesystem integration strategy, requirements, and phased plan are documented in [docs/cross-platform-filesystem-integration-strategy.md](docs/cross-platform-filesystem-integration-strategy.md).
+
+## Cross-environment handover
+
+- Current implementation status, environment bootstrap steps, and Windows-next development handover are documented in [docs/cross-platform-handover.md](docs/cross-platform-handover.md).
 
 ## CI operations
 

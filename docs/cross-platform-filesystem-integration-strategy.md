@@ -55,8 +55,8 @@ Use a layered architecture:
 2. `transport-client` (existing `client-sdk` + wrappers)
    - Remote object listing/metadata/content operations.
 3. Platform adapters
-   - `adapter-windows-cfapi` (future)
-   - `adapter-linux-fuse` (future)
+  - `adapter-windows-cfapi` (next)
+  - `adapter-linux-fuse` (implemented MVP runtime)
    - `adapter-android-docs` (existing Kotlin provider now, Rust bridge future)
 
 ### Design rule
@@ -102,8 +102,8 @@ Out of scope for MVP:
 ## Planned phase sequence
 
 1. MVP (this change): shared planner + tests.
-2. Linux pilot: `adapter-linux-fuse` read-only mount using planner metadata decisions.
-3. Windows pilot: sync root registration + read/hydrate callback path.
+2. Linux pilot: `adapter-linux-fuse` read-only mount using planner metadata decisions. ✅
+3. Windows pilot: sync root registration + read/hydrate callback path. (next)
 4. Android alignment: map `DocumentsProvider` operations to the same planner contracts.
 5. Shared writeback queue + conflict resolution UX.
 
@@ -136,9 +136,13 @@ Out of scope for MVP:
 
 - Completed:
   - `crates/sync-core` with deterministic reconciliation planner + unit tests.
-  - `crates/adapter-linux-fuse` skeleton mapping `sync-core` operations to Linux/FUSE-oriented actions.
+  - `crates/adapter-linux-fuse` runtime with feature-gated read-only FUSE mount support.
+  - `adapter-linux-fuse-mount` CLI with two modes:
+    - `--snapshot-file` static snapshot mode.
+    - `--server-base-url` live namespace/hydration mode via `server-node` APIs.
+  - CI artifact publication for Ubuntu mount binary (`linux-fuse-mount-binary-ubuntu`).
 - Next step:
-  - Replace skeleton action execution with concrete FUSE callback handling in a dedicated runtime crate/module.
+  - Start Windows CFAPI adapter implementation against `sync-core` contracts.
 
 ## Linux FUSE MVP test (current)
 
@@ -183,7 +187,7 @@ Current runtime behavior:
 
 - Read-only filesystem.
 - Directories and placeholder files materialized from planned actions.
-- File reads trigger demo hydration content for placeholders.
+- File reads trigger hydration (demo hydrator in snapshot mode, live object fetch in server mode).
 
 Direct server-node mode:
 
