@@ -1,0 +1,14 @@
+body { font-family: system-ui, sans-serif; margin: 2rem; }
+main { max-width: 860px; margin: 0 auto; }
+code { background: #f4f4f4; padding: 0.2rem 0.4rem; border-radius: 0.2rem; }
+ul { line-height: 1.6; }
+#server-logs, #replication-plan-json, #replication-repair-json {
+  background: #f4f4f4;
+  padding: 0.75rem;
+  border-radius: 0.2rem;
+  min-height: 12rem;
+  max-height: 24rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+button { padding: 0.5rem 0.75rem; }

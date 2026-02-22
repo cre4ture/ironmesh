@@ -493,6 +493,8 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(ui::index))
+        .route("/ui/app.css", get(ui::app_css))
+        .route("/ui/app.js", get(ui::app_js))
         .route("/logs", get(ui::list_logs))
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ironmesh Server Node</title>
+  <link rel="stylesheet" href="/ui/app.css" />
+</head>
+<body>
+  <main>
+    <h1>ironmesh Server Node</h1>
+    <p>Node ID: <code>__NODE_ID__</code></p>
+    <p>Stored objects (latest state): <code>__OBJECT_COUNT__</code></p>
+    <p>Latest snapshot ID: <code>__LATEST_SNAPSHOT__</code></p>
+    <p>Data directory: <code>__STORAGE_DIR__</code></p>
+    <p>Cluster nodes online/total: <code>__CLUSTER_ONLINE__/__CLUSTER_TOTAL__</code></p>
+    <p>Replication factor target: <code>__REPLICATION_FACTOR__</code></p>
+
+    <h2>Background work</h2>
+    <ul>
+      <li><strong>Autonomous post-write replication</strong>: <code>__AUTONOMOUS_REPLICATION_ON_PUT__</code></li>
+      <li><strong>Periodic replication audit</strong>: <code>enabled (every __REPLICATION_AUDIT_INTERVAL_SECS__s)</code></li>
+      <li><strong>Autonomous peer heartbeat emitter</strong>: <code>__PEER_HEARTBEAT_STATUS__</code></li>
+      <li><strong>Startup one-shot repair</strong>: <code>__STARTUP_REPAIR_STATUS__</code> (delay: <code>__STARTUP_REPAIR_DELAY_SECS__s</code>)</li>
+      <li><strong>Repair busy-throttle</strong>: <code>__REPAIR_BUSY_THROTTLE_STATUS__</code>; in-flight requests now=<code>__CURRENT_INFLIGHT_REQUESTS__</code></li>
+      <li><strong>Current replication backlog</strong>: plan items=<code>__REPLICATION_PLAN_ITEMS__</code>, under-replicated=<code>__UNDER_REPLICATED__</code>, over-replicated=<code>__OVER_REPLICATED__</code></li>
+    </ul>
+
+    <h2>Replication plan</h2>
+    <p>Fetches the current plan from <code>GET /cluster/replication/plan</code>.</p>
+    <button id="fetch-replication-plan" type="button">Fetch current replication plan</button>
+    <pre id="replication-plan-json">click the button to load the current replication plan</pre>
+
+    <h2>Replication repair</h2>
+    <p>Manually triggers one replication repair pass via <code>POST /cluster/replication/repair</code>.</p>
+    <button id="trigger-replication-repair" type="button">Trigger replication repair</button>
+    <pre id="replication-repair-json">click the button to trigger manual replication repair</pre>
+
+    <h2>Server logs</h2>
+    <p>Recent in-memory log lines from this node.</p>
+    <pre id="server-logs">loading…</pre>
+
+    <h2>Available routes</h2>
+    <ul>
+      <li><code>GET /</code> — info page</li>
+      <li><code>GET /logs?limit=&lt;n&gt;</code> — latest server log lines</li>
+      <li><code>GET /health</code> — node health JSON</li>
+      <li><code>GET /snapshots</code> — snapshot metadata</li>
+      <li><code>PUT /store/{key}</code> — store object bytes</li>
+      <li><code>GET /store/{key}</code> — fetch object bytes from latest state</li>
+      <li><code>GET /store/{key}?snapshot=&lt;id&gt;</code> — fetch object from snapshot state</li>
+      <li><code>GET /store/{key}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
+      <li><code>GET /store/{key}?read_mode=preferred|confirmed_only|provisional_allowed</code> — read latest via explicit consistency mode</li>
+      <li><code>GET /versions/{key}</code> — list version DAG metadata</li>
+      <li><code>POST /versions/{key}/commit/{version_id}</code> — commit version (quorum policy aware)</li>
+      <li><code>POST /versions/{key}/confirm/{version_id}</code> — compatibility alias for commit endpoint</li>
+      <li><code>GET /cluster/status</code> — cluster summary</li>
+      <li><code>GET /cluster/nodes</code> — known node list</li>
+      <li><code>PUT /cluster/nodes/{node_id}</code> — register/update node metadata</li>
+      <li><code>DELETE /cluster/nodes/{node_id}</code> — remove node from cluster membership</li>
+      <li><code>POST /cluster/nodes/{node_id}/heartbeat</code> — refresh node liveness</li>
+      <li><code>GET /cluster/placement/{key}</code> — deterministic placement decision</li>
+      <li><code>GET /cluster/replication/plan</code> — current replication gaps/overages</li>
+      <li><code>POST /cluster/replication/audit</code> — manual audit trigger</li>
+      <li><code>POST /cluster/replication/repair</code> — execute one-pass replica repair for missing placements</li>
+      <li><code>GET /cluster/reconcile/export/provisional</code> — export local provisional metadata for rejoin sync</li>
+      <li><code>POST /cluster/reconcile/{node_id}</code> — import provisional commits from a peer node</li>
+      <li><code>POST /maintenance/cleanup?retention_secs=&lt;n&gt;&amp;dry_run=true|false</code> — retention-safe orphan cleanup for manifests/chunks</li>
+    </ul>
+  </main>
+  <script src="/ui/app.js"></script>
+</body>
+</html>
