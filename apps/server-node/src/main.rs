@@ -1019,6 +1019,7 @@ async fn put_object(
                 snapshot_id = %outcome.snapshot_id,
                 version_id = %outcome.version_id,
                 version_state = ?outcome.state,
+                created_new_version = outcome.created_new_version,
                 new_chunks = outcome.new_chunks,
                 dedup_reused_chunks = outcome.dedup_reused_chunks,
                 "stored object"

@@ -200,6 +200,7 @@ pub struct PutResult {
     pub state: VersionConsistencyState,
     pub new_chunks: usize,
     pub dedup_reused_chunks: usize,
+    pub created_new_version: bool,
 }
 
 pub struct PersistentStore {
@@ -493,7 +494,34 @@ impl PersistentStore {
                 state: existing.state.clone(),
                 new_chunks,
                 dedup_reused_chunks,
+                created_new_version: false,
             });
+        }
+
+        if options.explicit_version_id.is_none()
+            && let Some(preferred_head_id) = index.preferred_head_version_id.clone()
+            && let Some(preferred_head) = index.versions.get(&preferred_head_id)
+        {
+            let parent_context_matches =
+                if options.parent_version_ids.is_empty() && options.inherit_preferred_parent {
+                    true
+                } else {
+                    preferred_head.parent_version_ids == parent_version_ids
+                };
+
+            if preferred_head.manifest_hash == manifest_hash
+                && preferred_head.state == options.state
+                && parent_context_matches
+            {
+                return Ok(PutResult {
+                    snapshot_id: format!("snap-skipped-{preferred_head_id}"),
+                    version_id: preferred_head_id,
+                    state: preferred_head.state.clone(),
+                    new_chunks,
+                    dedup_reused_chunks,
+                    created_new_version: false,
+                });
+            }
         }
 
         let record = FileVersionRecord {
@@ -533,6 +561,7 @@ impl PersistentStore {
             state: options.state,
             new_chunks,
             dedup_reused_chunks,
+            created_new_version: true,
         })
     }
 

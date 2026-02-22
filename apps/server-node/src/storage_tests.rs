@@ -547,10 +547,51 @@ async fn explicit_version_id_is_idempotent_for_matching_manifest() {
 
     assert_eq!(first.version_id, "ver-fixed-1");
     assert_eq!(second.version_id, "ver-fixed-1");
+    assert!(first.created_new_version);
+    assert!(!second.created_new_version);
 
     let versions = store.list_versions("hello").await.unwrap().unwrap();
     assert_eq!(versions.versions.len(), 1);
     assert_eq!(versions.versions[0].version_id, "ver-fixed-1");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn unchanged_upload_reuses_preferred_head_version() {
+    let root = test_store_dir("unchanged-upload-reuses-version");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    let first = store
+        .put_object_versioned(
+            "hello",
+            Bytes::from_static(b"payload-a"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = store
+        .put_object_versioned(
+            "hello",
+            Bytes::from_static(b"payload-a"),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.version_id, second.version_id);
+    assert!(first.created_new_version);
+    assert!(!second.created_new_version);
+
+    let versions = store.list_versions("hello").await.unwrap().unwrap();
+    assert_eq!(versions.versions.len(), 1);
 
     let _ = fs::remove_dir_all(root).await;
 }
