@@ -93,3 +93,10 @@ jobs:
       - name: Build Android app
         working-directory: apps/android-app/native
         run: ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Upload Android debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: apps/android-app/native/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
