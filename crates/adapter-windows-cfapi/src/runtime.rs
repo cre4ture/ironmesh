@@ -2,6 +2,7 @@ use crate::{CfapiAction, CfapiActionPlan};
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRootRegistration {
@@ -28,6 +29,10 @@ pub trait Hydrator: Send + Sync + 'static {
     fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>>;
 }
 
+pub trait Uploader: Send + Sync + 'static {
+    fn upload(&self, path: &str, payload: &[u8]) -> Result<Option<String>>;
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DemoHydrator;
 
@@ -37,9 +42,19 @@ impl Hydrator for DemoHydrator {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default, Clone)]
+pub struct DemoUploader;
+
+impl Uploader for DemoUploader {
+    fn upload(&self, path: &str, payload: &[u8]) -> Result<Option<String>> {
+        eprintln!("demo upload: path={path} bytes={}", payload.len());
+        Ok(Some("demo-upload".to_string()))
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct CfapiRuntime {
-    remote_versions_by_path: BTreeMap<String, String>,
+    remote_versions_by_path: Mutex<BTreeMap<String, String>>,
 }
 
 impl CfapiRuntime {
@@ -65,12 +80,17 @@ impl CfapiRuntime {
         }
 
         Self {
-            remote_versions_by_path,
+            remote_versions_by_path: Mutex::new(remote_versions_by_path),
         }
     }
 
-    pub fn known_paths(&self) -> impl Iterator<Item = &str> {
-        self.remote_versions_by_path.keys().map(String::as_str)
+    pub fn known_paths(&self) -> Vec<String> {
+        self.remote_versions_by_path
+            .lock()
+            .expect("remote version map lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub fn handle_fetch_data(
@@ -79,12 +99,22 @@ impl CfapiRuntime {
         hydrator: &dyn Hydrator,
     ) -> Result<Vec<u8>> {
         let normalized = normalize_path(relative_path);
-        let remote_version = self
+        let remote_versions = self
             .remote_versions_by_path
+            .lock()
+            .expect("remote version map lock poisoned");
+        let remote_version = remote_versions
             .get(&normalized)
             .ok_or_else(|| anyhow!("unknown placeholder path: {relative_path}"))?;
 
         hydrator.hydrate(&normalized, remote_version)
+    }
+
+    pub fn set_remote_version(&self, relative_path: &str, remote_version: impl Into<String>) {
+        self.remote_versions_by_path
+            .lock()
+            .expect("remote version map lock poisoned")
+            .insert(normalize_path(relative_path), remote_version.into());
     }
 }
 
@@ -94,15 +124,19 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{CfapiAction, CfapiActionPlan, CfapiRuntime, Hydrator, SyncRootRegistration, normalize_path};
+    use super::{
+        CfapiAction, CfapiActionPlan, CfapiRuntime, Hydrator, SyncRootRegistration, Uploader,
+        normalize_path,
+    };
     use anyhow::{Result, anyhow};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::ptr::null;
     use std::slice;
+    use std::sync::Mutex;
     use windows_sys::Win32::Storage::CloudFilters::*;
     use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
 
@@ -124,6 +158,8 @@ mod windows_impl {
         sync_root: PathBuf,
         runtime: CfapiRuntime,
         hydrator: Box<dyn Hydrator>,
+        uploader: Box<dyn Uploader>,
+        hydrated_once_paths: Mutex<HashSet<String>>,
     }
 
     pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
@@ -266,6 +302,7 @@ mod windows_impl {
         registration: &SyncRootRegistration,
         runtime: CfapiRuntime,
         hydrator: Box<dyn Hydrator>,
+        uploader: Box<dyn Uploader>,
     ) -> Result<SyncRootConnection> {
         validate_registration(registration)?;
 
@@ -274,12 +311,18 @@ mod windows_impl {
             sync_root: registration.root_path.clone(),
             runtime,
             hydrator,
+            uploader,
+            hydrated_once_paths: Mutex::new(HashSet::new()),
         });
 
         let callback_table = vec![
             CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_FETCH_DATA,
                 Callback: Some(fetch_data_callback),
+            },
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
+                Callback: Some(file_close_completion_callback),
             },
             CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NONE,
@@ -336,8 +379,84 @@ mod windows_impl {
             }
         };
 
+        if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
+            hydrated_paths.insert(relative_path.clone());
+        }
+
         if let Err(err) = execute_transfer_data(callback_info_ref, callback_parameters, &payload) {
             eprintln!("cfapi transfer-data execution error: {err}");
+        }
+    }
+
+    unsafe extern "system" fn file_close_completion_callback(
+        callback_info: *const CF_CALLBACK_INFO,
+        callback_parameters: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        if callback_info.is_null() || callback_parameters.is_null() {
+            return;
+        }
+
+        let callback_info_ref = unsafe { &*callback_info };
+        let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
+        if context_ptr.is_null() {
+            return;
+        }
+        let context = unsafe { &*context_ptr };
+
+        let close_completion = unsafe { (*callback_parameters).Anonymous.CloseCompletion };
+        if (close_completion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
+            return;
+        }
+
+        let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
+        if normalized_path.is_empty() {
+            return;
+        }
+
+        let relative_path = path_to_relative(&context.sync_root, &normalized_path);
+
+        if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock()
+            && hydrated_paths.remove(&relative_path)
+        {
+            return;
+        }
+
+        let full_path = PathBuf::from(&normalized_path);
+        let metadata = match std::fs::metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return,
+        };
+        if metadata.is_dir() {
+            return;
+        }
+
+        let payload = match std::fs::read(&full_path) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("cfapi close-completion read error: path={normalized_path} error={err}");
+                return;
+            }
+        };
+
+        match context.uploader.upload(&relative_path, &payload) {
+            Ok(remote_version) => {
+                if let Some(version) = remote_version {
+                    context.runtime.set_remote_version(&relative_path, version);
+                }
+                eprintln!(
+                    "cfapi uploaded local file: path={} bytes={}",
+                    relative_path,
+                    payload.len()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "cfapi upload error: path={} bytes={} error={}",
+                    relative_path,
+                    payload.len(),
+                    err
+                );
+            }
         }
     }
 
@@ -468,12 +587,12 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn unregister_sync_root(_root_path: &Path) -> Result<()> {
+pub fn unregister_sync_root(_root_path: &std::path::Path) -> Result<()> {
     Err(anyhow!("CFAPI runtime is only available on Windows"))
 }
 
 #[cfg(not(windows))]
-pub fn apply_action_plan(_root_path: &Path, _plan: &CfapiActionPlan) -> Result<()> {
+pub fn apply_action_plan(_root_path: &std::path::Path, _plan: &CfapiActionPlan) -> Result<()> {
     Err(anyhow!("CFAPI runtime is only available on Windows"))
 }
 

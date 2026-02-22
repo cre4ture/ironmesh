@@ -1,6 +1,6 @@
 #![cfg(feature = "cfapi-runtime")]
 
-use crate::runtime::Hydrator;
+use crate::runtime::{Hydrator, Uploader};
 use anyhow::{Context, Result};
 use reqwest::Url;
 use reqwest::blocking::Client;
@@ -32,6 +32,21 @@ impl Hydrator for ServerNodeHydrator {
 
         let bytes = response.bytes().context("failed reading object bytes")?;
         Ok(bytes.to_vec())
+    }
+}
+
+impl Uploader for ServerNodeHydrator {
+    fn upload(&self, path: &str, payload: &[u8]) -> Result<Option<String>> {
+        let object_url = build_store_object_url(&self.base_url, path)?;
+        self.client
+            .put(object_url)
+            .body(payload.to_vec())
+            .send()
+            .with_context(|| format!("failed to upload object for path {path}"))?
+            .error_for_status()
+            .with_context(|| format!("server returned error while uploading path {path}"))?;
+
+        Ok(Some("server-head".to_string()))
     }
 }
 
