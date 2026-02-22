@@ -298,18 +298,12 @@ impl ClusterService {
             current_nodes.sort();
 
             let needed_replicas = target_replica_count.saturating_sub(current_set.len());
-            let mut missing_candidates: Vec<_> = desired_nodes
+            let missing_nodes: Vec<_> = desired_nodes
                 .iter()
                 .copied()
                 .filter(|node_id| !current_set.contains(node_id))
+                .take(needed_replicas)
                 .collect();
-            let missing_nodes: Vec<_> = if current_set.len() < target_replica_count {
-                missing_candidates
-                    .drain(..missing_candidates.len().min(needed_replicas))
-                    .collect()
-            } else {
-                missing_candidates
-            };
 
             let extra_nodes = if current_set.len() > target_replica_count {
                 let mut extra_nodes: Vec<_> =
@@ -321,19 +315,6 @@ impl ClusterService {
                         .unwrap_or(0)
                 });
                 extra_nodes
-            } else if current_set.len() == target_replica_count && !missing_nodes.is_empty() {
-                let mut extra_candidates: Vec<_> =
-                    current_set.difference(&desired_set).copied().collect();
-                extra_candidates.sort_by_key(|node_id| {
-                    self.nodes
-                        .get(node_id)
-                        .map(|node| node.free_bytes)
-                        .unwrap_or(0)
-                });
-                extra_candidates
-                    .into_iter()
-                    .take(missing_nodes.len())
-                    .collect()
             } else {
                 Vec::new()
             };
@@ -586,27 +567,42 @@ mod tests {
         svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
         svc.register_node(mk_node(node_c, "dc-c", "rack-3", 100));
 
-        svc.note_replica("k", node_a);
-        svc.note_replica("k", node_c);
+        svc.note_replica("k-sticky", node_a);
+        svc.note_replica("k-sticky", node_c);
+        svc.note_replica("k-missing", node_a);
+        svc.note_replica("k-extra", node_a);
+        svc.note_replica("k-extra", node_b);
+        svc.note_replica("k-extra", node_c);
 
-        let placement = svc.placement_for_key("k");
-        let expected_count = placement
-            .selected_nodes
+        let plan = svc.replication_plan(&[
+            "k-sticky".to_string(),
+            "k-missing".to_string(),
+            "k-extra".to_string(),
+        ]);
+
+        assert!(
+            plan.items.iter().all(|item| item.key != "k-sticky"),
+            "at target replica count we keep existing nodes without swap churn"
+        );
+
+        let missing_item = plan
+            .items
             .iter()
-            .filter(|node_id| [node_a, node_c].contains(node_id))
-            .count();
+            .find(|item| item.key == "k-missing")
+            .expect("missing-replica key should be planned");
+        assert!(!missing_item.missing_nodes.is_empty());
+        assert!(missing_item.extra_nodes.is_empty());
 
-        let plan = svc.replication_plan(&["k".to_string()]);
+        let extra_item = plan
+            .items
+            .iter()
+            .find(|item| item.key == "k-extra")
+            .expect("over-replicated key should be planned");
+        assert!(extra_item.missing_nodes.is_empty());
+        assert_eq!(extra_item.extra_nodes.len(), 1);
 
-        if expected_count == placement.selected_nodes.len() && expected_count == 2 {
-            assert!(plan.items.is_empty());
-        } else {
-            assert_eq!(plan.items.len(), 1);
-            let item = &plan.items[0];
-            assert!(item.missing_nodes.len() <= 2);
-            assert!(item.extra_nodes.len() <= 2);
-            assert!(plan.under_replicated + plan.over_replicated >= 1);
-        }
+        assert!(plan.under_replicated >= 1);
+        assert!(plan.over_replicated >= 1);
     }
 
     #[test]
