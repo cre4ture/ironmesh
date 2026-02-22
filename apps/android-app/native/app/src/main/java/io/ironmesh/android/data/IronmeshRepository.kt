@@ -3,6 +3,7 @@ package io.ironmesh.android.data
 import io.ironmesh.android.api.HealthResponse
 import io.ironmesh.android.api.IronmeshApi
 import io.ironmesh.android.api.ReplicationPlanResponse
+import io.ironmesh.android.api.StoreIndexEntry
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import okhttp3.MediaType.Companion.toMediaType
@@ -63,5 +64,39 @@ class IronmeshRepository {
 
     suspend fun getObject(baseUrl: String, key: String): String {
         return createApi(baseUrl).getObject(key).string()
+    }
+
+    suspend fun storeIndex(
+        baseUrl: String,
+        prefix: String? = null,
+        depth: Int = 1,
+        snapshot: String? = null,
+    ): List<StoreIndexEntry> {
+        return createApi(baseUrl)
+            .storeIndex(prefix = prefix, depth = depth, snapshot = snapshot)
+            .entries
+    }
+
+    suspend fun putObjectBytes(baseUrl: String, key: String, payload: ByteArray): Int {
+        val body = payload.toRequestBody("application/octet-stream".toMediaType())
+        val response = createApi(baseUrl).putObject(key, body)
+        if (!response.isSuccessful) {
+            throw IllegalStateException("PUT failed with HTTP ${response.code()}")
+        }
+        return response.code()
+    }
+
+    suspend fun getObjectBytes(
+        baseUrl: String,
+        key: String,
+        snapshot: String? = null,
+        version: String? = null,
+    ): ByteArray {
+        val response = createApi(baseUrl).getObjectBinary(key, snapshot = snapshot, version = version)
+        if (!response.isSuccessful) {
+            throw IllegalStateException("GET failed with HTTP ${response.code()}")
+        }
+        return response.body()?.bytes()
+            ?: throw IllegalStateException("GET failed: empty response body")
     }
 }
