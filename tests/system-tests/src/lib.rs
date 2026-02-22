@@ -1,3 +1,4 @@
+mod cfapi_monitor_test;
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

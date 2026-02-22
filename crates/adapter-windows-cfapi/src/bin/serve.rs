@@ -53,7 +53,8 @@ fn main() -> anyhow::Result<()> {
 
     let runtime = CfapiRuntime::from_action_plan(&action_plan);
     let hydrator = Box::new(ServerNodeHydrator::new(client.clone(), base_url.clone()));
-    let uploader = Box::new(ServerNodeHydrator::new(client, base_url));
+    use std::sync::Arc;
+    let uploader = Arc::new(ServerNodeHydrator::new(client, base_url));
     let _connection = connect_sync_root(&registration, runtime, hydrator, uploader)?;
 
     eprintln!("connected to CFAPI callbacks; serving hydration requests");

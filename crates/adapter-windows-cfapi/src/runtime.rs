@@ -3,6 +3,7 @@ use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::os::windows::ffi::OsStrExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRootRegistration {
@@ -123,6 +124,38 @@ fn normalize_path(path: &str) -> String {
 }
 
 #[cfg(windows)]
+pub fn create_placeholder(sync_root: &std::path::Path, rel_path: &str) -> anyhow::Result<()> {
+    use windows_sys::Win32::Storage::CloudFilters::*;
+    use std::ptr::null_mut;
+    let full_path = sync_root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()));
+    let wide: Vec<u16> = full_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut create_info = CF_PLACEHOLDER_CREATE_INFO {
+        RelativeFileName: wide.as_ptr(),
+        Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+        FileIdentity: null_mut(),
+        FileIdentityLength: 0,
+        FsMetadata: unsafe { std::mem::zeroed() },
+        Result: 0,
+        CreateUsn: 0,
+    };
+    let hr = unsafe {
+        CfCreatePlaceholders(
+            sync_root.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>().as_ptr(),
+            &mut create_info,
+            1,
+            CF_CREATE_FLAG_STOP_ON_ERROR,
+            std::ptr::null_mut(),
+        )
+    };
+    hresult_to_result(hr, "CfCreatePlaceholders (monitor)")
+}
+pub fn hresult_to_result(hr: i32, operation: &str) -> anyhow::Result<()> {
+    if hr == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{} failed with HRESULT 0x{:08x}", operation, hr))
+    }
+}
 mod windows_impl {
     use super::{
         CfapiAction, CfapiActionPlan, CfapiRuntime, Hydrator, SyncRootRegistration, Uploader,
@@ -158,7 +191,7 @@ mod windows_impl {
         sync_root: PathBuf,
         runtime: CfapiRuntime,
         hydrator: Box<dyn Hydrator>,
-        uploader: Box<dyn Uploader>,
+        uploader: std::sync::Arc<dyn Uploader>,
         hydrated_once_paths: Mutex<HashSet<String>>,
     }
 
@@ -233,6 +266,10 @@ mod windows_impl {
                     remote_version,
                 } => {
                     let normalized = normalize_path(path);
+                    let full_path = root_path.join(normalized.replace('/', "\\"));
+                    if full_path.exists() {
+                        continue;
+                    }
                     if let Some(parent) = Path::new(&normalized).parent() {
                         if !parent.as_os_str().is_empty() {
                             std::fs::create_dir_all(root_path.join(parent))?;
@@ -302,16 +339,278 @@ mod windows_impl {
         registration: &SyncRootRegistration,
         runtime: CfapiRuntime,
         hydrator: Box<dyn Hydrator>,
-        uploader: Box<dyn Uploader>,
+        uploader: std::sync::Arc<dyn Uploader>,
     ) -> Result<SyncRootConnection> {
-        validate_registration(registration)?;
+        let sync_root = registration.root_path.clone();
+        eprintln!("startup-scan: scanning {} for pre-existing files", sync_root.display());
+        let walker = walkdir::WalkDir::new(&sync_root).into_iter();
+        for entry in walker {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                let rel_path = path_to_relative(&sync_root, &path.to_string_lossy());
+                if rel_path.is_empty() { continue; }
+                let metadata = match std::fs::metadata(path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                    if metadata.is_dir() {
+                    eprintln!("startup-scan: uploading directory {}", rel_path);
+                    if let Ok(Some(version)) = uploader.upload(&rel_path, b"<DIR>") {
+                        runtime.set_remote_version(&rel_path, version);
+                    }
+                } else {
+                    // Skip files that are already CFAPI placeholders
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
+                    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+                    let attrs = metadata.file_attributes();
+                    let is_placeholder = (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0) || (attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0);
+                    if is_placeholder {
+                        eprintln!("startup-scan: skipping placeholder file {}", rel_path);
+                        continue;
+                    }
+                    match std::fs::read(path) {
+                        Ok(data) => {
+                            eprintln!("startup-scan: uploading file {} ({} bytes)", rel_path, data.len());
+                            match uploader.upload(&rel_path, &data) {
+                                Ok(Some(version)) => {
+                                    runtime.set_remote_version(&rel_path, version);
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    eprintln!("startup-scan: upload failed for {}: {}", rel_path, err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("startup-scan: failed to read {}: {}", rel_path, err);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Spawn a background thread to monitor the sync root for new files/folders
+        // use std::sync::Arc; // Removed unused import
+        use crate::runtime::create_placeholder;
+        let sync_root_clone = sync_root.clone();
+        let uploader_thread = uploader.clone();
+
+        // Perform a synchronous pre-conversion pass: try to convert existing
+        // materialized files to CFAPI placeholders before startup-scan uploads
+        // to avoid a race where startup-scan uploads files before conversion.
+        {
+            use walkdir::WalkDir;
+            use std::os::windows::fs::MetadataExt;
+            use std::os::windows::io::AsRawHandle;
+            use std::ptr::null_mut;
+            let walker = WalkDir::new(&sync_root_clone).into_iter();
+            for entry in walker {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    let rel_path = path_to_relative(&sync_root_clone, &path.to_string_lossy());
+                    if rel_path.is_empty() { continue; }
+                    let metadata = match std::fs::metadata(path) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if metadata.is_dir() { continue; }
+                    // Skip if already placeholder
+                    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
+                    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+                    let attrs = metadata.file_attributes();
+                    let is_placeholder = (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0) || (attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0);
+                    if is_placeholder { continue; }
+
+                    let file_path = sync_root_clone.join(&rel_path);
+                    match std::fs::OpenOptions::new().read(true).write(true).open(&file_path) {
+                        Ok(fh_file) => {
+                            let raw = fh_file.as_raw_handle();
+                            let handle = raw as windows_sys::Win32::Foundation::HANDLE;
+                            // Query placeholder info; if present skip conversion
+                            let mut info_buf = vec![0u8; 256];
+                            let mut returned: u32 = 0;
+                            let hr_info = unsafe { CfGetPlaceholderInfo(handle, 0, info_buf.as_mut_ptr() as *mut c_void, info_buf.len() as u32, &mut returned) };
+                            if hr_info == 0 {
+                                if returned > 0 {
+                                    eprintln!("pre-convert: file {} already has placeholder info returned={} skipping", rel_path, returned);
+                                    continue;
+                                }
+                            }
+                            let hr = unsafe { CfConvertToPlaceholder(handle, std::ptr::null(), 0, 0, null_mut(), null_mut()) };
+                            if hr == 0 {
+                                eprintln!("pre-convert: converted {}", rel_path);
+                            } else {
+                                eprintln!("pre-convert: failed to convert {} hr=0x{:08x}", rel_path, hr as u32);
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+
+        std::thread::spawn(move || {
+            use std::collections::HashSet;
+            use std::time::Duration;
+            let mut seen: HashSet<String> = HashSet::new();
+            loop {
+                let walker = walkdir::WalkDir::new(&sync_root_clone).into_iter();
+                for entry in walker {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        let rel_path = path_to_relative(&sync_root_clone, &path.to_string_lossy());
+                        if rel_path.is_empty() { continue; }
+                        if seen.contains(&rel_path) { continue; }
+                        let metadata = match std::fs::metadata(path) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        if metadata.is_dir() {
+                            eprintln!("monitor: detected new directory {}", rel_path);
+                            let _ = uploader_thread.upload(&rel_path, b"<DIR>");
+                        } else {
+                            // Check if file is already a CFAPI placeholder using Windows file attributes
+                            use std::os::windows::fs::MetadataExt;
+                            use windows_sys::Win32::Storage::CloudFilters::*;
+                            const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
+                            const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+                            let attrs = metadata.file_attributes();
+                            let is_placeholder = (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0) || (attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0);
+                            let file_path = sync_root_clone.join(&rel_path);
+                            if is_placeholder {
+                                eprintln!("monitor: skipping placeholder creation for CFAPI placeholder file {}", rel_path);
+                            } else if file_path.exists() {
+                                // File is materialized, convert to placeholder using a file HANDLE
+                                use std::os::windows::io::AsRawHandle;
+                                // Diagnostic info before conversion
+                                {
+                                    use std::os::windows::fs::MetadataExt;
+                                    let attrs = metadata.file_attributes();
+                                    eprintln!("monitor: attempting convert path={} attrs=0x{:08x} size={}", file_path.display(), attrs, metadata.len());
+                                }
+                                match std::fs::OpenOptions::new().read(true).write(true).open(&file_path) {
+                                    Ok(fh_file) => {
+                                        let raw = fh_file.as_raw_handle();
+                                        let handle = raw as windows_sys::Win32::Foundation::HANDLE;
+
+                                        // Diagnostic: query placeholder info before conversion
+                                        let mut info_buf = vec![0u8; 1024];
+                                        let mut returned: u32 = 0;
+                                        let hr_info = unsafe {
+                                            CfGetPlaceholderInfo(handle, 0, info_buf.as_mut_ptr() as *mut c_void, info_buf.len() as u32, &mut returned)
+                                        };
+                                        if hr_info == 0 {
+                                            eprintln!("monitor: CfGetPlaceholderInfo pre-convert succeeded for {} returned={}", rel_path, returned);
+                                        } else {
+                                            eprintln!("monitor: CfGetPlaceholderInfo pre-convert failed for {} hr=0x{:08x}", rel_path, hr_info as u32);
+                                        }
+
+                                        // If CfGetPlaceholderInfo returned data, the file already has
+                                        // placeholder information and conversion is not needed.
+                                        if hr_info == 0 && returned > 0 {
+                                            eprintln!("monitor: skipping convert for {} because placeholder info present (returned={})", rel_path, returned);
+                                        } else {
+                                            let hr = unsafe { CfConvertToPlaceholder(handle, std::ptr::null(), 0, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+                                            if hr == 0 {
+                                                eprintln!("monitor: converted materialized file to placeholder: {}", rel_path);
+                                            } else {
+                                                eprintln!("monitor: failed to convert materialized file to placeholder {}: HRESULT 0x{:08x}", rel_path, hr as u32);
+                                                // Additional diagnostic: print file attributes and size again
+                                                if let Ok(m) = std::fs::metadata(&file_path) {
+                                                    use std::os::windows::fs::MetadataExt;
+                                                    let attrs = m.file_attributes();
+                                                    eprintln!("monitor: post-fail attrs=0x{:08x} size={}", attrs, m.len());
+                                                }
+
+                                                // Diagnostic: query placeholder info after conversion attempt
+                                                let mut info_buf2 = vec![0u8; 1024];
+                                                let mut returned2: u32 = 0;
+                                                let hr_info2 = unsafe { CfGetPlaceholderInfo(handle, 0, info_buf2.as_mut_ptr() as *mut c_void, info_buf2.len() as u32, &mut returned2) };
+                                                if hr_info2 == 0 {
+                                                    eprintln!("monitor: CfGetPlaceholderInfo post-convert succeeded for {} returned={}", rel_path, returned2);
+                                                } else {
+                                                    eprintln!("monitor: CfGetPlaceholderInfo post-convert failed for {} hr=0x{:08x}", rel_path, hr_info2 as u32);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("monitor: failed to open materialized file {} for conversion: {}", rel_path, err);
+                                    }
+                                }
+                            } else {
+                                // File does not exist, create placeholder
+                                if let Err(e) = create_placeholder(&sync_root_clone, &rel_path) {
+                                    eprintln!("monitor: failed to create placeholder for {}: {}", rel_path, e);
+                                } else {
+                                    eprintln!("monitor: created placeholder for {}", rel_path);
+                                }
+                            }
+                        }
+                        seen.insert(rel_path);
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+
+        // Startup scan: enumerate and upload pre-existing files and directories
+        let sync_root = registration.root_path.clone();
+        eprintln!("startup-scan: scanning {} for pre-existing files", sync_root.display());
+        let walker = walkdir::WalkDir::new(&sync_root).into_iter();
+        for entry in walker {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                let rel_path = path_to_relative(&sync_root, &path.to_string_lossy());
+                if rel_path.is_empty() { continue; }
+                let metadata = match std::fs::metadata(path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if metadata.is_dir() {
+                    eprintln!("startup-scan: uploading directory {}", rel_path);
+                    if let Ok(Some(version)) = uploader.upload(&rel_path, b"<DIR>") {
+                        runtime.set_remote_version(&rel_path, version);
+                    }
+                } else {
+                    // Skip files that are already CFAPI placeholders
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
+                    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+                    let attrs = metadata.file_attributes();
+                    let is_placeholder = (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0) || (attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0);
+                    if is_placeholder {
+                        eprintln!("startup-scan: skipping placeholder file {}", rel_path);
+                        continue;
+                    }
+                    match std::fs::read(path) {
+                        Ok(data) => {
+                            eprintln!("startup-scan: uploading file {} ({} bytes)", rel_path, data.len());
+                            match uploader.upload(&rel_path, &data) {
+                                Ok(Some(version)) => {
+                                    runtime.set_remote_version(&rel_path, version);
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    eprintln!("startup-scan: upload failed for {}: {}", rel_path, err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("startup-scan: failed to read {}: {}", rel_path, err);
+                        }
+                    }
+                }
+            }
+        }
 
         let root_path = utf16_path(&registration.root_path);
         let mut callback_context = Box::new(CallbackContext {
             sync_root: registration.root_path.clone(),
             runtime,
             hydrator,
-            uploader,
+            uploader: uploader.clone(),
             hydrated_once_paths: Mutex::new(HashSet::new()),
         });
 
@@ -393,51 +692,73 @@ mod windows_impl {
         callback_parameters: *const CF_CALLBACK_PARAMETERS,
     ) {
         if callback_info.is_null() || callback_parameters.is_null() {
+            eprintln!("close-completion: null callback_info or callback_parameters");
             return;
         }
 
         let callback_info_ref = unsafe { &*callback_info };
         let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
         if context_ptr.is_null() {
+            eprintln!("close-completion: null context ptr");
             return;
         }
         let context = unsafe { &*context_ptr };
 
         let close_completion = unsafe { (*callback_parameters).Anonymous.CloseCompletion };
+        eprintln!("close-completion: flags={:x} path={}", close_completion.Flags, string_from_pcwstr(callback_info_ref.NormalizedPath));
         if (close_completion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
+            eprintln!("close-completion: file deleted, skipping upload");
             return;
         }
 
         let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
         if normalized_path.is_empty() {
+            eprintln!("close-completion: empty normalized path");
             return;
         }
 
         let relative_path = path_to_relative(&context.sync_root, &normalized_path);
+        eprintln!("close-completion: relative_path={}", relative_path);
 
-        if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock()
-            && hydrated_paths.remove(&relative_path)
-        {
-            return;
-        }
+        // Remove hydrated_once_paths logic: always handle upload for any file closed in sync root
+        // This allows new files and folders to be uploaded, matching OneDrive behavior
+        // Log for diagnostics
+        eprintln!("close-completion: checking upload for {}", relative_path);
 
-        let full_path = PathBuf::from(&normalized_path);
+        // Resolve full path relative to the registered sync root to handle
+        // CFAPI NormalizedPath values that may omit the drive letter and
+        // start with a leading backslash (e.g. "\\ironmesh-sync2\\file.txt").
+        let full_path = context.sync_root.join(&relative_path);
         let metadata = match std::fs::metadata(&full_path) {
             Ok(metadata) => metadata,
-            Err(_) => return,
+            Err(err) => {
+                eprintln!("close-completion: metadata error for {}: {}", full_path.display(), err);
+                return;
+            },
         };
         if metadata.is_dir() {
+            eprintln!("close-completion: {} is a directory, uploading directory metadata", normalized_path);
+            // Optionally: upload directory metadata or create remote folder
+            match context.uploader.upload(&relative_path, b"<DIR>") {
+                Ok(_) => {
+                    eprintln!("cfapi uploaded directory: path={}", relative_path);
+                }
+                Err(err) => {
+                    eprintln!("cfapi upload error (dir): path={} error={}", relative_path, err);
+                }
+            }
             return;
         }
 
         let payload = match std::fs::read(&full_path) {
             Ok(data) => data,
             Err(err) => {
-                eprintln!("cfapi close-completion read error: path={normalized_path} error={err}");
+                eprintln!("cfapi close-completion read error: path={} error={}", full_path.display(), err);
                 return;
             }
         };
 
+        eprintln!("close-completion: uploading {} ({} bytes)", relative_path, payload.len());
         match context.uploader.upload(&relative_path, &payload) {
             Ok(remote_version) => {
                 if let Some(version) = remote_version {
@@ -561,7 +882,20 @@ mod windows_impl {
         let mut candidate = normalized_path.replace('/', "\\");
         if let Some(stripped) = candidate.strip_prefix(&normalized_root) {
             candidate = stripped.to_string();
+        } else {
+            // CFAPI sometimes provides a NormalizedPath that starts with a leading
+            // backslash and the sync-root name (e.g. "\\ironmesh-sync2\\file.txt").
+            // In that case, strip the leading separators and then remove the
+            // sync-root folder name if present.
+            let trimmed_leading = candidate.trim_start_matches(['\\', '/']).to_string();
+            if let Some(root_name_os) = sync_root.file_name() {
+                let root_name = root_name_os.to_string_lossy();
+                if let Some(stripped) = trimmed_leading.strip_prefix(root_name.as_ref()) {
+                    candidate = stripped.to_string();
+                }
+            }
         }
+
         normalize_path(candidate.trim_start_matches(['\\', '/']))
     }
 }
