@@ -19,8 +19,9 @@ data class MainUiState(
 
 class MainViewModel(
     application: Application,
-    private val repository: IronmeshRepository = IronmeshRepository(),
 ) : AndroidViewModel(application) {
+
+    private val repository = IronmeshRepository()
 
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
         private set
