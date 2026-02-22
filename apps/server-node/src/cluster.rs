@@ -795,7 +795,7 @@ mod tests {
 
         let mut selected_key = None;
         for idx in 0..10_000 {
-            let candidate = format!("hello@ver-{idx}");
+            let candidate = format!("hello-{idx}");
             let placement = svc.placement_for_key(&candidate);
             if placement.selected_nodes.len() == 3 && !placement.selected_nodes.contains(&node_a) {
                 selected_key = Some(candidate);
