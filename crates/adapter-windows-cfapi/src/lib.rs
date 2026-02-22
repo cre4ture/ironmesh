@@ -96,6 +96,9 @@ pub fn map_sync_plan_to_cfapi_actions(sync_plan: &SyncPlan) -> CfapiActionPlan {
 #[cfg(feature = "cfapi-runtime")]
 pub mod runtime;
 
+#[cfg(feature = "cfapi-runtime")]
+pub mod live;
+
 #[cfg(test)]
 mod tests {
     use super::*;

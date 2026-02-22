@@ -7,12 +7,15 @@ authors.workspace = true
 
 [features]
 default = []
-cfapi-runtime = ["dep:anyhow", "dep:clap", "dep:windows-sys"]
+cfapi-runtime = ["dep:anyhow", "dep:clap", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:windows-sys"]
 
 [dependencies]
 sync-core = { path = "../sync-core" }
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 windows-sys = { version = "0.61", optional = true, features = [
 	"Win32_Foundation",
 	"Win32_Storage_CloudFilters",
