@@ -56,6 +56,27 @@
     </section>
 
     <section>
+      <h2>Store: Binary File Upload / Download</h2>
+      <p class="muted">Supports binary files (e.g. images around 5MB and larger) without text conversion.</p>
+      <div class="row">
+        <div>
+          <label for="binary-upload-key">Upload key</label>
+          <input id="binary-upload-key" placeholder="images/photo.jpg" />
+          <label for="binary-upload-file">File</label>
+          <input id="binary-upload-file" type="file" />
+          <div class="actions"><button onclick="uploadBinaryFile()">Upload Binary File</button></div>
+        </div>
+        <div>
+          <label for="binary-download-key">Download key</label>
+          <input id="binary-download-key" placeholder="images/photo.jpg" />
+          <label for="binary-download-name">Save as filename (optional)</label>
+          <input id="binary-download-name" placeholder="photo.jpg" />
+          <div class="actions"><button onclick="downloadBinaryFile()">Download Binary File</button></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
       <h2>File Explorer</h2>
       <p class="muted">Keys are treated as virtual paths; <code>/</code> acts as directory separator.</p>
       <div class="explorer-grid">
@@ -113,6 +134,93 @@
         const payload = await fetchJson('/api/store/get?key=' + encodeURIComponent(key));
         document.getElementById('get-value').value = payload.value || '';
         show('status-output', payload);
+      } catch (err) {
+        show('status-output', { error: err.message });
+      }
+    }
+
+    async function uploadBinaryFile() {
+      const keyInput = document.getElementById('binary-upload-key');
+      const fileInput = document.getElementById('binary-upload-file');
+      const file = fileInput.files && fileInput.files[0];
+
+      if (!file) {
+        show('status-output', { error: 'Please select a file to upload.' });
+        return;
+      }
+
+      const key = (keyInput.value || file.name || '').trim();
+      if (!key) {
+        show('status-output', { error: 'Upload key must not be empty.' });
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/store/put-binary?key=' + encodeURIComponent(key), {
+          method: 'POST',
+          body: file,
+          headers: {
+            'content-type': file.type || 'application/octet-stream'
+          }
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || JSON.stringify(payload));
+        }
+        keyInput.value = key;
+        show('status-output', {
+          ...payload,
+          uploaded_filename: file.name,
+          uploaded_type: file.type || 'application/octet-stream'
+        });
+      } catch (err) {
+        show('status-output', { error: err.message });
+      }
+    }
+
+    async function downloadBinaryFile() {
+      const key = document.getElementById('binary-download-key').value.trim();
+      const preferredName = document.getElementById('binary-download-name').value.trim();
+      if (!key) {
+        show('status-output', { error: 'Download key must not be empty.' });
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/store/get-binary?key=' + encodeURIComponent(key));
+        if (!response.ok) {
+          let errorPayload;
+          try {
+            errorPayload = await response.json();
+          } catch {
+            errorPayload = { error: `HTTP ${response.status}` };
+          }
+          throw new Error(errorPayload.error || JSON.stringify(errorPayload));
+        }
+
+        const blob = await response.blob();
+        let filename = preferredName;
+        if (!filename) {
+          const disposition = response.headers.get('content-disposition') || '';
+          const match = disposition.match(/filename="([^"]+)"/i);
+          filename = (match && match[1]) || key.split('/').pop() || 'download.bin';
+        }
+
+        const objectUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = objectUrl;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        URL.revokeObjectURL(objectUrl);
+
+        show('status-output', {
+          key,
+          saved_as: filename,
+          size_bytes: blob.size,
+          type: blob.type || 'application/octet-stream'
+        });
       } catch (err) {
         show('status-output', { error: err.message });
       }
@@ -258,7 +366,7 @@
         controlsHtml: `
           <label for="snapshot-id">Snapshot ID</label>
           <select id="snapshot-id"></select>
-          <p class="muted">Directory listing uses current key index; reads use selected snapshot.</p>
+          <p class="muted">Directory listing and reads both use selected snapshot.</p>
         `,
         loadEntries: async (path, root) => {
           const select = root.querySelector('#snapshot-id');

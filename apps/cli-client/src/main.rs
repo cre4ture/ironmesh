@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -130,6 +131,8 @@ async fn main() -> Result<()> {
                 .route("/api/store/list", get(web_store_list))
                 .route("/api/store/get", get(web_store_get))
                 .route("/api/store/put", post(web_store_put))
+                .route("/api/store/get-binary", get(web_store_get_binary))
+                .route("/api/store/put-binary", post(web_store_put_binary))
                 .route(
                     "/api/ping",
                     get(|| async {
@@ -168,6 +171,18 @@ struct WebStoreGetQuery {
 struct WebStorePutRequest {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreBinaryGetQuery {
+    key: String,
+    snapshot: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreBinaryPutQuery {
+    key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,4 +426,93 @@ async fn web_store_put(
             .into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
+}
+
+async fn web_store_put_binary(
+    State(state): State<WebState>,
+    Query(query): Query<WebStoreBinaryPutQuery>,
+    payload: Bytes,
+) -> impl IntoResponse {
+    if query.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    match state.client.put(query.key.clone(), payload).await {
+        Ok(meta) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "key": meta.key,
+                "size_bytes": meta.size_bytes
+            })),
+        )
+            .into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+async fn web_store_get_binary(
+    State(state): State<WebState>,
+    Query(query): Query<WebStoreBinaryGetQuery>,
+) -> impl IntoResponse {
+    if query.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    let payload = if query.snapshot.is_none() && query.version.is_none() {
+        match state.client.get_cached_or_fetch(&query.key).await {
+            Ok(bytes) => bytes,
+            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        }
+    } else {
+        let mut request = state.http.get(format!(
+            "{}/store/{}",
+            state.server_url.trim_end_matches('/'),
+            query.key
+        ));
+        if let Some(snapshot) = query.snapshot.as_deref() {
+            request = request.query(&[("snapshot", snapshot)]);
+        }
+        if let Some(version) = query.version.as_deref() {
+            request = request.query(&[("version", version)]);
+        }
+
+        match request.send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(ok) => match ok.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+                },
+                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            },
+            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        }
+    };
+
+    let fallback_name = query
+        .key
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("object.bin");
+    let filename = fallback_name.replace('"', "_");
+    let content_disposition = format!("attachment; filename=\"{filename}\"");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    match HeaderValue::from_str(&content_disposition) {
+        Ok(value) => {
+            headers.insert(CONTENT_DISPOSITION, value);
+        }
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid content-disposition header: {err}"),
+            );
+        }
+    }
+
+    (StatusCode::OK, headers, payload).into_response()
 }
