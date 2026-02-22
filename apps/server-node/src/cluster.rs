@@ -298,12 +298,18 @@ impl ClusterService {
             current_nodes.sort();
 
             let needed_replicas = target_replica_count.saturating_sub(current_set.len());
-            let missing_nodes: Vec<_> = desired_nodes
+            let mut missing_candidates: Vec<_> = desired_nodes
                 .iter()
                 .copied()
                 .filter(|node_id| !current_set.contains(node_id))
-                .take(needed_replicas)
                 .collect();
+            let missing_nodes: Vec<_> = if current_set.len() < target_replica_count {
+                missing_candidates
+                    .drain(..missing_candidates.len().min(needed_replicas))
+                    .collect()
+            } else {
+                missing_candidates
+            };
 
             let extra_nodes = if current_set.len() > target_replica_count {
                 let mut extra_nodes: Vec<_> =
@@ -315,6 +321,19 @@ impl ClusterService {
                         .unwrap_or(0)
                 });
                 extra_nodes
+            } else if current_set.len() == target_replica_count && !missing_nodes.is_empty() {
+                let mut extra_candidates: Vec<_> =
+                    current_set.difference(&desired_set).copied().collect();
+                extra_candidates.sort_by_key(|node_id| {
+                    self.nodes
+                        .get(node_id)
+                        .map(|node| node.free_bytes)
+                        .unwrap_or(0)
+                });
+                extra_candidates
+                    .into_iter()
+                    .take(missing_nodes.len())
+                    .collect()
             } else {
                 Vec::new()
             };
