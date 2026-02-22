@@ -1,12 +1,14 @@
 package io.ironmesh.android.ui
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import kotlinx.coroutines.launch
 
 data class MainUiState(
-    val baseUrl: String = "http://10.0.2.2:18080",
+    val baseUrl: String = IronmeshPreferences.DEFAULT_BASE_URL,
     val key: String = "demo-key",
     val payload: String = "hello from android",
     val status: String = "Ready",
@@ -16,14 +18,21 @@ data class MainUiState(
 )
 
 class MainViewModel(
+    application: Application,
     private val repository: IronmeshRepository = IronmeshRepository(),
-) : ViewModel() {
+) : AndroidViewModel(application) {
 
     var uiState = androidx.compose.runtime.mutableStateOf(MainUiState())
         private set
 
+    init {
+        val persistedBaseUrl = IronmeshPreferences.getBaseUrl(getApplication())
+        uiState.value = uiState.value.copy(baseUrl = persistedBaseUrl)
+    }
+
     fun updateBaseUrl(value: String) {
         uiState.value = uiState.value.copy(baseUrl = value)
+        IronmeshPreferences.setBaseUrl(getApplication(), value)
     }
 
     fun updateKey(value: String) {

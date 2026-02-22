@@ -7,6 +7,7 @@ import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
 import android.webkit.MimeTypeMap
+import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import kotlinx.coroutines.runBlocking
 import java.io.FileNotFoundException
@@ -183,10 +184,8 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     }
 
     private fun resolveBaseUrl(): String {
-        val context = context ?: return DEFAULT_BASE_URL
-        val prefs = context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
-        val configured = prefs.getString(PREF_BASE_URL, null)
-        return repository.sanitizeBaseUrl(configured ?: DEFAULT_BASE_URL)
+        val context = context ?: return IronmeshPreferences.DEFAULT_BASE_URL
+        return repository.sanitizeBaseUrl(IronmeshPreferences.getBaseUrl(context))
     }
 
     private fun resolveRootProjection(projection: Array<out String>?): Array<String> {
@@ -270,8 +269,5 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     private companion object {
         private const val ROOT_ID = "ironmesh-root"
         private const val ROOT_TITLE = "Ironmesh"
-        private const val DEFAULT_BASE_URL = "http://10.0.2.2:18080"
-        private const val PREFS_NAME = "ironmesh_prefs"
-        private const val PREF_BASE_URL = "base_url"
     }
 }
