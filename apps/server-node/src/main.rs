@@ -356,6 +356,10 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(3);
+    let accepted_over_replication_items = std::env::var("IRONMESH_ACCEPTED_OVER_REPLICATION_ITEMS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
 
     let metadata_commit_mode = MetadataCommitMode::parse(
         std::env::var("IRONMESH_METADATA_COMMIT_MODE")
@@ -384,6 +388,7 @@ async fn main() -> Result<()> {
 
     let policy = ReplicationPolicy {
         replication_factor,
+        accepted_over_replication_items,
         ..ReplicationPolicy::default()
     };
 

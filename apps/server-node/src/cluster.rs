@@ -26,6 +26,7 @@ pub struct NodeDescriptor {
 pub struct ReplicationPolicy {
     pub replication_factor: usize,
     pub min_distinct_labels: HashMap<String, usize>,
+    pub accepted_over_replication_items: usize,
 }
 
 impl Default for ReplicationPolicy {
@@ -37,8 +38,17 @@ impl Default for ReplicationPolicy {
         Self {
             replication_factor: 3,
             min_distinct_labels,
+            accepted_over_replication_items: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationCleanupOption {
+    None,
+    DeferredWithinTolerance,
+    Recommended,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +65,8 @@ pub struct ReplicationPlanItem {
     pub current_nodes: Vec<NodeId>,
     pub missing_nodes: Vec<NodeId>,
     pub extra_nodes: Vec<NodeId>,
+    pub cleanup_option: ReplicationCleanupOption,
+    pub deferred_extra_nodes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +74,8 @@ pub struct ReplicationPlan {
     pub generated_at_unix: u64,
     pub under_replicated: usize,
     pub over_replicated: usize,
+    pub cleanup_deferred_items: usize,
+    pub cleanup_deferred_extra_nodes: usize,
     pub items: Vec<ReplicationPlanItem>,
 }
 
@@ -285,6 +299,7 @@ impl ClusterService {
 
     pub fn replication_plan(&self, keys: &[String]) -> ReplicationPlan {
         let mut items = Vec::new();
+        let mut remaining_tolerated_extra = self.policy.accepted_over_replication_items;
 
         for key in keys {
             let placement_key = replication_placement_key(key);
@@ -305,7 +320,7 @@ impl ClusterService {
                 .take(needed_replicas)
                 .collect();
 
-            let extra_nodes = if current_set.len() > target_replica_count {
+            let raw_extra_nodes = if current_set.len() > target_replica_count {
                 let mut extra_nodes: Vec<_> =
                     current_set.difference(&desired_set).copied().collect();
                 extra_nodes.sort_by_key(|node_id| {
@@ -319,13 +334,31 @@ impl ClusterService {
                 Vec::new()
             };
 
-            if !missing_nodes.is_empty() || !extra_nodes.is_empty() {
+            let deferred_extra_nodes = raw_extra_nodes.len().min(remaining_tolerated_extra);
+            remaining_tolerated_extra =
+                remaining_tolerated_extra.saturating_sub(deferred_extra_nodes);
+            let planned_extra_nodes = raw_extra_nodes.len().saturating_sub(deferred_extra_nodes);
+            let extra_nodes = raw_extra_nodes
+                .into_iter()
+                .take(planned_extra_nodes)
+                .collect::<Vec<_>>();
+            let cleanup_option = if !extra_nodes.is_empty() {
+                ReplicationCleanupOption::Recommended
+            } else if deferred_extra_nodes > 0 {
+                ReplicationCleanupOption::DeferredWithinTolerance
+            } else {
+                ReplicationCleanupOption::None
+            };
+
+            if !missing_nodes.is_empty() || !extra_nodes.is_empty() || deferred_extra_nodes > 0 {
                 items.push(ReplicationPlanItem {
                     key: key.clone(),
                     desired_nodes,
                     current_nodes,
                     missing_nodes,
                     extra_nodes,
+                    cleanup_option,
+                    deferred_extra_nodes,
                 });
             }
         }
@@ -338,11 +371,18 @@ impl ClusterService {
             .iter()
             .filter(|item| !item.extra_nodes.is_empty())
             .count();
+        let cleanup_deferred_items = items
+            .iter()
+            .filter(|item| item.deferred_extra_nodes > 0)
+            .count();
+        let cleanup_deferred_extra_nodes = items.iter().map(|item| item.deferred_extra_nodes).sum();
 
         ReplicationPlan {
             generated_at_unix: unix_ts(),
             under_replicated,
             over_replicated,
+            cleanup_deferred_items,
+            cleanup_deferred_extra_nodes,
             items,
         }
     }
@@ -966,5 +1006,50 @@ mod tests {
         assert_eq!(version_b.current_nodes, vec![node_b]);
         assert_eq!(version_b.missing_nodes.len(), 2);
         assert!(version_b.extra_nodes.is_empty());
+    }
+
+    #[test]
+    fn replication_plan_defers_over_replication_within_tolerance_budget() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 2,
+                accepted_over_replication_items: 2,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+
+        svc.note_replica("k1", node_a);
+        svc.note_replica("k1", node_b);
+        svc.note_replica("k1", node_c);
+        svc.note_replica("k2", node_a);
+        svc.note_replica("k2", node_b);
+        svc.note_replica("k2", node_c);
+
+        let plan = svc.replication_plan(&["k1".to_string(), "k2".to_string()]);
+
+        assert_eq!(plan.over_replicated, 0);
+        assert_eq!(plan.cleanup_deferred_items, 2);
+        assert_eq!(plan.cleanup_deferred_extra_nodes, 2);
+
+        for item in &plan.items {
+            assert!(item.missing_nodes.is_empty());
+            assert!(item.extra_nodes.is_empty());
+            assert_eq!(
+                item.cleanup_option,
+                ReplicationCleanupOption::DeferredWithinTolerance
+            );
+            assert_eq!(item.deferred_extra_nodes, 1);
+        }
     }
 }
