@@ -128,3 +128,19 @@ jobs:
           name: linux-fuse-mount-binary-ubuntu
           path: target/release/adapter-linux-fuse-mount
           if-no-files-found: error
+
+  windows-cfapi-check:
+    runs-on: windows-latest
+    needs: workspace-check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Windows CFAPI adapter crate
+        run: cargo check -p adapter-windows-cfapi --all-targets --features cfapi-runtime

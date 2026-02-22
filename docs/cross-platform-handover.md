@@ -25,10 +25,16 @@ This document is the handover package for continuing cross-platform filesystem i
 - CI artifacts:
   - Android debug APK artifact: `android-debug-apk`.
   - Ubuntu FUSE binary artifact: `linux-fuse-mount-binary-ubuntu`.
+- Windows CFAPI adapter MVP foundation:
+  - `crates/adapter-windows-cfapi` crate created and wired into workspace.
+  - Operation mapping tests equivalent to Linux adapter.
+  - Runtime uses CFAPI registration (`CfRegisterSyncRoot`), placeholder creation (`CfCreatePlaceholders`), and fetch-data callback transfer (`CfExecute`).
+  - Registration utility binary: `adapter-windows-cfapi-register`.
+  - Windows compile check lane added to CI.
 
 ### Not implemented yet
 
-- Windows Cloud Files API (CFAPI) adapter.
+- Windows CFAPI full live-server integration (namespace/object hydration from `server-node` in callback path).
 - Linux write path (current runtime is read-only).
 - Android Rust-bridge alignment to consume `sync-core` directly.
 
@@ -140,3 +146,13 @@ Implement `adapter-windows-cfapi` with:
 1. crate skeleton + compile-only CI on Windows,
 2. operation mapping tests equivalent to Linux adapter,
 3. minimal sync-root registration and read/hydrate callback path.
+
+Status: complete.
+
+## Suggested next task on Windows
+
+Integrate live namespace/object fetch from `server-node` into the CFAPI runtime flow:
+
+1. fetch remote namespace and materialize placeholders under sync root,
+2. resolve file identity -> object key mapping in callback context,
+3. hydrate callback bytes from `GET /store/{key}` for requested ranges.
