@@ -153,7 +153,7 @@ mod windows_impl {
                 Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
             },
             Population: CF_POPULATION_POLICY {
-                Primary: CF_POPULATION_POLICY_PARTIAL,
+                Primary: CF_POPULATION_POLICY_FULL,
                 Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
             },
             InSync: CF_INSYNC_POLICY_NONE,
@@ -166,7 +166,7 @@ mod windows_impl {
                 root_path.as_ptr(),
                 &registration_desc,
                 &policies,
-                CF_REGISTER_FLAG_NONE,
+                CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT | CF_REGISTER_FLAG_UPDATE,
             )
         };
 
