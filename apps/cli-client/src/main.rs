@@ -122,6 +122,8 @@ async fn main() -> Result<()> {
                 .route("/", get(web_static_index))
                 .route("/{*path}", get(web_static_file))
                 .route("/api/health", get(web_health))
+                .route("/api/snapshots", get(web_snapshots))
+                .route("/api/versions", get(web_versions))
                 .route("/api/cluster/status", get(web_cluster_status))
                 .route("/api/cluster/nodes", get(web_cluster_nodes))
                 .route("/api/cluster/replication/plan", get(web_replication_plan))
@@ -157,12 +159,19 @@ struct WebStoreListQuery {
 #[derive(Debug, Deserialize)]
 struct WebStoreGetQuery {
     key: String,
+    snapshot: Option<String>,
+    version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WebStorePutRequest {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebVersionsQuery {
+    key: String,
 }
 
 async fn print_json_endpoint(http: &Client, server_url: &str, path: &str) -> Result<()> {
@@ -250,6 +259,28 @@ async fn web_health(State(state): State<WebState>) -> impl IntoResponse {
     }
 }
 
+async fn web_snapshots(State(state): State<WebState>) -> impl IntoResponse {
+    match fetch_server_json(&state.http, &state.server_url, "/snapshots").await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+async fn web_versions(
+    State(state): State<WebState>,
+    Query(query): Query<WebVersionsQuery>,
+) -> impl IntoResponse {
+    if query.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    let path = format!("/versions/{}", query.key);
+    match fetch_server_json(&state.http, &state.server_url, &path).await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
 async fn web_cluster_status(State(state): State<WebState>) -> impl IntoResponse {
     match fetch_server_json(&state.http, &state.server_url, "/cluster/status").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
@@ -302,15 +333,53 @@ async fn web_store_get(
     State(state): State<WebState>,
     Query(query): Query<WebStoreGetQuery>,
 ) -> impl IntoResponse {
-    match state.client.get_cached_or_fetch(&query.key).await {
-        Ok(payload) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "key": query.key,
-                "value": String::from_utf8_lossy(&payload)
-            })),
-        )
-            .into_response(),
+    if query.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    if query.snapshot.is_none() && query.version.is_none() {
+        return match state.client.get_cached_or_fetch(&query.key).await {
+            Ok(payload) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "key": query.key,
+                    "value": String::from_utf8_lossy(&payload)
+                })),
+            )
+                .into_response(),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        };
+    }
+
+    let mut request = state.http.get(format!(
+        "{}/store/{}",
+        state.server_url.trim_end_matches('/'),
+        query.key
+    ));
+    if let Some(snapshot) = query.snapshot.as_deref() {
+        request = request.query(&[("snapshot", snapshot)]);
+    }
+    if let Some(version) = query.version.as_deref() {
+        request = request.query(&[("version", version)]);
+    }
+
+    match request.send().await {
+        Ok(response) => match response.error_for_status() {
+            Ok(ok) => match ok.bytes().await {
+                Ok(payload) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "key": query.key,
+                        "snapshot": query.snapshot,
+                        "version": query.version,
+                        "value": String::from_utf8_lossy(&payload)
+                    })),
+                )
+                    .into_response(),
+                Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            },
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        },
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }

@@ -18,6 +18,17 @@
     button { padding: 0.5rem 0.8rem; border: 1px solid #888; border-radius: 6px; background: #f5f5f5; cursor: pointer; }
     pre { background: #111; color: #f2f2f2; padding: 0.8rem; border-radius: 6px; overflow: auto; }
     .muted { color: #666; font-size: 0.92rem; }
+    .explorer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    .explorer { border: 1px solid #ddd; border-radius: 6px; padding: 0.75rem; }
+    .explorer h3 { margin: 0 0 0.4rem; }
+    .explorer-path { font-size: 0.9rem; color: #444; margin-bottom: 0.4rem; }
+    .explorer-list { border: 1px solid #ddd; border-radius: 6px; min-height: 140px; max-height: 260px; overflow: auto; background: #fcfcfc; }
+    .explorer-item { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid #eee; background: transparent; padding: 0.45rem 0.55rem; border-radius: 0; }
+    .explorer-item:last-child { border-bottom: 0; }
+    .explorer-item:hover { background: #f0f0f0; }
+    .explorer-empty { padding: 0.55rem; color: #666; }
+    .explorer-output { min-height: 120px; }
+    @media (max-width: 900px) { .explorer-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -45,20 +56,13 @@
     </section>
 
     <section>
-      <h2>Store: Browse by Prefix / Depth</h2>
-      <p class="muted">Use slash-separated keys as virtual directories.</p>
-      <div class="row">
-        <div>
-          <label for="list-prefix">Prefix</label>
-          <input id="list-prefix" placeholder="docs" />
-        </div>
-        <div>
-          <label for="list-depth">Depth</label>
-          <input id="list-depth" type="number" min="1" value="1" />
-        </div>
+      <h2>File Explorer</h2>
+      <p class="muted">Keys are treated as virtual paths; <code>/</code> acts as directory separator.</p>
+      <div class="explorer-grid">
+        <div class="explorer" id="current-explorer"></div>
+        <div class="explorer" id="snapshot-explorer"></div>
       </div>
-      <div class="actions"><button onclick="listKeys()">List Keys</button></div>
-      <pre id="list-output">(no data yet)</pre>
+      <div class="explorer" id="version-explorer" style="margin-top: 0.75rem"></div>
     </section>
 
     <section>
@@ -114,17 +118,205 @@
       }
     }
 
-    async function listKeys() {
-      const prefix = document.getElementById('list-prefix').value;
-      const depth = document.getElementById('list-depth').value || '1';
-      const query = new URLSearchParams({ depth });
+    async function listStoreEntries(prefix) {
+      const query = new URLSearchParams({ depth: '1' });
       if (prefix) query.set('prefix', prefix);
-      try {
-        const payload = await fetchJson('/api/store/list?' + query.toString());
-        show('list-output', payload);
-      } catch (err) {
-        show('list-output', { error: err.message });
+      const payload = await fetchJson('/api/store/list?' + query.toString());
+      return Array.isArray(payload.entries) ? payload.entries : [];
+    }
+
+    function childEntriesForPath(entries, path) {
+      const normalized = path ? path.replace(/\/$/, '') + '/' : '';
+      return entries
+        .filter(entry => {
+          const target = entry.path || '';
+          if (!normalized) {
+            return target.length > 0;
+          }
+          return target.startsWith(normalized) && target !== normalized;
+        })
+        .map(entry => {
+          const fullPath = entry.path;
+          const stripped = normalized ? fullPath.slice(normalized.length) : fullPath;
+          const label = stripped.replace(/\/$/, '');
+          return {
+            label: label.includes('/') ? label.split('/')[0] : label,
+            fullPath,
+            isDir: entry.entry_type === 'prefix' || fullPath.endsWith('/'),
+          };
+        })
+        .filter((entry, index, arr) => arr.findIndex(other => other.fullPath === entry.fullPath) === index)
+        .sort((a, b) => {
+          if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+          return a.label.localeCompare(b.label);
+        });
+    }
+
+    function createExplorer(rootId, options) {
+      const root = document.getElementById(rootId);
+      let currentPath = '';
+
+      root.innerHTML = `
+        <h3>${options.title}</h3>
+        ${options.controlsHtml || ''}
+        <div class="explorer-path" data-path></div>
+        <div class="explorer-list" data-list></div>
+        <pre class="explorer-output" data-output>(select a file)</pre>
+      `;
+
+      const pathEl = root.querySelector('[data-path]');
+      const listEl = root.querySelector('[data-list]');
+      const outputEl = root.querySelector('[data-output]');
+
+      function showOutput(value) {
+        outputEl.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
       }
+
+      async function render() {
+        pathEl.textContent = currentPath ? `/${currentPath}` : '/';
+        listEl.innerHTML = '<div class="explorer-empty">loading...</div>';
+
+        try {
+          const entries = await options.loadEntries(currentPath, root);
+          const visible = options.transformEntries
+            ? options.transformEntries(entries, currentPath)
+            : childEntriesForPath(entries, currentPath);
+
+          listEl.innerHTML = '';
+
+          if (currentPath) {
+            const upBtn = document.createElement('button');
+            upBtn.className = 'explorer-item';
+            upBtn.textContent = '📁 ..';
+            upBtn.onclick = () => {
+              const parts = currentPath.split('/').filter(Boolean);
+              parts.pop();
+              currentPath = parts.join('/');
+              render();
+            };
+            listEl.appendChild(upBtn);
+          }
+
+          if (!visible.length) {
+            const empty = document.createElement('div');
+            empty.className = 'explorer-empty';
+            empty.textContent = '(empty)';
+            listEl.appendChild(empty);
+            return;
+          }
+
+          for (const entry of visible) {
+            const btn = document.createElement('button');
+            btn.className = 'explorer-item';
+            btn.textContent = `${entry.isDir ? '📁' : '📄'} ${entry.label}`;
+            btn.onclick = async () => {
+              if (entry.isDir) {
+                currentPath = entry.fullPath.replace(/\/$/, '');
+                render();
+                return;
+              }
+              showOutput('loading...');
+              try {
+                const payload = await options.readFile(entry.fullPath, root);
+                showOutput(payload);
+              } catch (err) {
+                showOutput({ error: err.message });
+              }
+            };
+            listEl.appendChild(btn);
+          }
+        } catch (err) {
+          listEl.innerHTML = '<div class="explorer-empty">(failed to load)</div>';
+          showOutput({ error: err.message });
+        }
+      }
+
+      root.refreshExplorer = render;
+      render();
+      return { refresh: render };
+    }
+
+    async function fetchSnapshots() {
+      const payload = await fetchJson('/api/snapshots');
+      return Array.isArray(payload) ? payload : [];
+    }
+
+    async function fetchVersionsForKey(key) {
+      return fetchJson('/api/versions?key=' + encodeURIComponent(key));
+    }
+
+    function wireExplorers() {
+      createExplorer('current-explorer', {
+        title: 'Current Data',
+        loadEntries: (path) => listStoreEntries(path),
+        readFile: (fullPath) => fetchJson('/api/store/get?key=' + encodeURIComponent(fullPath)),
+      });
+
+      createExplorer('snapshot-explorer', {
+        title: 'Snapshots',
+        controlsHtml: `
+          <label for="snapshot-id">Snapshot ID</label>
+          <select id="snapshot-id"></select>
+          <p class="muted">Directory listing uses current key index; reads use selected snapshot.</p>
+        `,
+        loadEntries: async (path, root) => {
+          const select = root.querySelector('#snapshot-id');
+          if (!select.dataset.loaded) {
+            const snapshots = await fetchSnapshots();
+            select.innerHTML = snapshots
+              .map(s => `<option value="${s.id}">${s.id}</option>`)
+              .join('') || '<option value="">(no snapshots)</option>';
+            select.dataset.loaded = '1';
+            select.onchange = () => root.refreshExplorer();
+          }
+          return listStoreEntries(path);
+        },
+        readFile: (fullPath, root) => {
+          const snapshotId = root.querySelector('#snapshot-id').value;
+          const query = new URLSearchParams({ key: fullPath });
+          if (snapshotId) query.set('snapshot', snapshotId);
+          return fetchJson('/api/store/get?' + query.toString());
+        },
+      });
+
+      createExplorer('version-explorer', {
+        title: 'Earlier Versions',
+        controlsHtml: `
+          <label for="version-key">Key</label>
+          <input id="version-key" placeholder="docs/readme.txt" />
+          <div class="actions"><button type="button" id="load-versions">Load Versions</button></div>
+        `,
+        loadEntries: async (_path, root) => {
+          const keyInput = root.querySelector('#version-key');
+          const key = keyInput.value.trim();
+          const button = root.querySelector('#load-versions');
+          if (!button.dataset.wired) {
+            button.dataset.wired = '1';
+            button.onclick = () => root.refreshExplorer();
+          }
+          if (!key) {
+            return [];
+          }
+
+          const graph = await fetchVersionsForKey(key);
+          const versions = Array.isArray(graph.versions) ? graph.versions : [];
+          return versions.map(v => ({
+            path: `${v.version_id}`,
+            entry_type: 'key',
+            meta: v,
+          }));
+        },
+        transformEntries: (entries) => entries.map(entry => ({
+          label: `${entry.path}`,
+          fullPath: entry.path,
+          isDir: false,
+        })),
+        readFile: (versionId, root) => {
+          const key = root.querySelector('#version-key').value.trim();
+          const query = new URLSearchParams({ key, version: versionId });
+          return fetchJson('/api/store/get?' + query.toString());
+        },
+      });
     }
 
     async function fetchHealth() {
@@ -146,6 +338,8 @@
       try { show('status-output', await fetchJson('/api/cluster/replication/plan')); }
       catch (err) { show('status-output', { error: err.message }); }
     }
+
+    wireExplorers();
   </script>
 </body>
 </html>
