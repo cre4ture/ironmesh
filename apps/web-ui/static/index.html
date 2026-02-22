@@ -277,8 +277,32 @@
       const listEl = root.querySelector('[data-list]');
       const outputEl = root.querySelector('[data-output]');
 
+      function truncateExplorerPreview(value) {
+        const limit = 256;
+        if (typeof value === 'string') {
+          return value.length > limit
+            ? `${value.slice(0, limit)}… (truncated, ${value.length} chars total)`
+            : value;
+        }
+
+        if (value && typeof value === 'object' && typeof value.value === 'string') {
+          const original = value.value;
+          if (original.length > limit) {
+            return {
+              ...value,
+              value: `${original.slice(0, limit)}…`,
+              truncated: true,
+              original_length: original.length,
+            };
+          }
+        }
+
+        return value;
+      }
+
       function showOutput(value) {
-        outputEl.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+        const preview = truncateExplorerPreview(value);
+        outputEl.textContent = typeof preview === 'string' ? preview : JSON.stringify(preview, null, 2);
       }
 
       async function render() {
