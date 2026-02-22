@@ -357,6 +357,21 @@ impl PersistentStore {
         self.current_state.objects.keys().cloned().collect()
     }
 
+    pub async fn snapshot_keys(&self, snapshot_id: &str) -> Result<Option<Vec<String>>> {
+        let snapshot_path = self.snapshots_dir.join(format!("{snapshot_id}.json"));
+        if !fs::try_exists(&snapshot_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&snapshot_path).await?;
+        let manifest = serde_json::from_slice::<SnapshotManifest>(&payload)
+            .with_context(|| format!("invalid snapshot manifest {}", snapshot_path.display()))?;
+
+        let mut keys: Vec<String> = manifest.objects.keys().cloned().collect();
+        keys.sort();
+        Ok(Some(keys))
+    }
+
     pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
         let mut subjects: HashSet<String> = self.current_state.objects.keys().cloned().collect();
 

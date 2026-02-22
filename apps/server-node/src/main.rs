@@ -911,6 +911,7 @@ struct ObjectGetQuery {
 struct StoreIndexQuery {
     prefix: Option<String>,
     depth: Option<usize>,
+    snapshot: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1040,7 +1041,18 @@ async fn list_store_index(
 
     let keys = {
         let store = state.store.lock().await;
-        store.current_keys()
+        if let Some(snapshot_id) = query.snapshot.as_deref() {
+            match store.snapshot_keys(snapshot_id).await {
+                Ok(Some(keys)) => keys,
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(err) => {
+                    tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to list snapshot key index");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        } else {
+            store.current_keys()
+        }
     };
 
     let entries = build_store_index_entries(&keys, &prefix, depth);

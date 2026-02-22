@@ -154,6 +154,7 @@ async fn main() -> Result<()> {
 struct WebStoreListQuery {
     prefix: Option<String>,
     depth: Option<usize>,
+    snapshot: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,6 +316,9 @@ async fn web_store_list(
         .query(&[("depth", query.depth.unwrap_or(1).max(1).to_string())]);
     if let Some(prefix) = &query.prefix {
         request = request.query(&[("prefix", prefix)]);
+    }
+    if let Some(snapshot) = &query.snapshot {
+        request = request.query(&[("snapshot", snapshot)]);
     }
 
     match request.send().await {
