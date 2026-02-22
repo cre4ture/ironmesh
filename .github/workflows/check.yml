@@ -72,3 +72,24 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --workspace --exclude system-tests
+
+  android-build:
+    runs-on: ubuntu-latest
+    needs: workspace-check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Android app
+        working-directory: apps/android-app/native
+        run: ./gradlew --no-daemon :app:assembleDebug
