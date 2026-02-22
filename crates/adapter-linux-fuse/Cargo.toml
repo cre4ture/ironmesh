@@ -1,0 +1,9 @@
+[package]
+name = "adapter-linux-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sync-core = { path = "../sync-core" }

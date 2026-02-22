@@ -2,6 +2,8 @@
 members = [
     "crates/common",
     "crates/client-sdk",
+    "crates/sync-core",
+    "crates/adapter-linux-fuse",
     "apps/server-node",
     "apps/cli-client",
     "apps/web-ui",
