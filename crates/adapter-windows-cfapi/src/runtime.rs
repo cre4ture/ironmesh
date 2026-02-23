@@ -203,6 +203,14 @@ struct CallbackContext {
     hydrator: Box<dyn Hydrator>,
     uploader: std::sync::Arc<dyn Uploader>,
     hydrated_once_paths: Mutex<HashSet<String>>,
+    /// Map of request key -> recorded open info (flags + initial metadata)
+    opens: Mutex<std::collections::HashMap<u64, OpenInfo>>,
+}
+
+struct OpenInfo {
+    flags: u32,
+    size: u64,
+    mtime_secs: u64,
 }
 
 pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
@@ -504,15 +512,20 @@ pub fn connect_sync_root(
     std::thread::spawn(move || monitor_sync_root_changes(sync_root_clone, uploader_thread));
 
     let root_path = utf16_path(&registration.root_path);
-    let mut callback_context = Box::new(CallbackContext {
+        let mut callback_context = Box::new(CallbackContext {
         sync_root: registration.root_path.clone(),
         runtime,
         hydrator,
         uploader: uploader.clone(),
-        hydrated_once_paths: Mutex::new(HashSet::new()),
+            hydrated_once_paths: Mutex::new(HashSet::new()),
+            opens: Mutex::new(std::collections::HashMap::new()),
     });
 
     let callback_table = vec![
+            CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION,
+                Callback: Some(file_open_callback),
+            },
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_FETCH_DATA,
             Callback: Some(fetch_data_callback),
@@ -605,6 +618,45 @@ unsafe extern "system" fn fetch_data_callback(
     }
 }
 
+unsafe extern "system" fn file_open_callback(
+    callback_info: *const CF_CALLBACK_INFO,
+    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+) {
+    if callback_info.is_null() || callback_parameters.is_null() {
+        return;
+    }
+
+    let callback_info_ref = unsafe { &*callback_info };
+    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
+    if context_ptr.is_null() {
+        return;
+    }
+    let context = unsafe { &*context_ptr };
+
+    // Record the OpenCompletion flags keyed by RequestKey so close-completion
+    // can consult them if needed. Note: CF provides OpenCompletion flags, not
+    // the full desired-access mask, so this is best-effort tracking.
+    let request_key = callback_info_ref.RequestKey as u64;
+    let open_flags = unsafe { (*callback_parameters).Anonymous.OpenCompletion.Flags } as u32;
+
+    // Capture initial metadata (size + mtime) if available so we can detect writes.
+    let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
+    let relative = path_to_relative(&context.sync_root, &normalized_path);
+    let full_path = context.sync_root.join(&relative);
+    let (size, mtime_secs) = match std::fs::metadata(&full_path) {
+        Ok(m) => {
+            let size = m.len();
+            let mtime_secs = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            (size, mtime_secs)
+        }
+        Err(_) => (0u64, 0u64),
+    };
+
+    if let Ok(mut opens) = context.opens.lock() {
+        opens.insert(request_key, OpenInfo { flags: open_flags, size, mtime_secs });
+    }
+}
+
 unsafe extern "system" fn file_close_completion_callback(
     callback_info: *const CF_CALLBACK_INFO,
     callback_parameters: *const CF_CALLBACK_PARAMETERS,
@@ -641,6 +693,37 @@ unsafe extern "system" fn file_close_completion_callback(
     let relative_path = path_to_relative(&context.sync_root, &normalized_path);
     eprintln!("close-completion: relative_path={}", relative_path);
 
+    let full_path = context.sync_root.join(&relative_path);
+
+    // If we recorded an open for this request, consult it. If the open did not
+    // request write access, skip upload. If it did request write access, compare
+    // initial metadata to current metadata and skip upload when unchanged.
+    let request_key = callback_info_ref.RequestKey as u64;
+    if let Ok(mut opens) = context.opens.lock() {
+        if let Some(open_info) = opens.remove(&request_key) {
+            // CF provides open completion flags; check for write access flag.
+            if (open_info.flags & CF_OPEN_FILE_FLAG_WRITE_ACCESS as u32) == 0 {
+                eprintln!(
+                    "close-completion: open flags indicate no write access (flags=0x{:08x}); skipping upload",
+                    open_info.flags
+                );
+                return;
+            }
+
+            // We saw a write-capable open; check if file changed since open.
+            if let Ok(metadata) = std::fs::metadata(&full_path) {
+                let size = metadata.len();
+                let mtime_secs = metadata.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                if size == open_info.size && mtime_secs == open_info.mtime_secs {
+                    eprintln!("close-completion: file opened write-capable but unchanged; skipping upload");
+                    return;
+                }
+            } else {
+                // If metadata now unavailable but open existed, proceed to upload as a fallback.
+            }
+        }
+    }
+
     // Remove hydrated_once_paths logic: always handle upload for any file closed in sync root
     // This allows new files and folders to be uploaded, matching OneDrive behavior
     // Log for diagnostics
@@ -649,7 +732,6 @@ unsafe extern "system" fn file_close_completion_callback(
     // Resolve full path relative to the registered sync root to handle
     // CFAPI NormalizedPath values that may omit the drive letter and
     // start with a leading backslash (e.g. "\\ironmesh-sync2\\file.txt").
-    let full_path = context.sync_root.join(&relative_path);
     let metadata = match std::fs::metadata(&full_path) {
         Ok(metadata) => metadata,
         Err(err) => {
