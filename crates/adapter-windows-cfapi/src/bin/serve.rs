@@ -1,7 +1,9 @@
 #[cfg(feature = "cfapi-runtime")]
 use adapter_windows_cfapi::WindowsCfapiAdapter;
 #[cfg(feature = "cfapi-runtime")]
-use adapter_windows_cfapi::live::{ServerNodeHydrator, load_snapshot_from_server, normalize_base_url};
+use adapter_windows_cfapi::live::{
+    ServerNodeHydrator, load_snapshot_from_server, normalize_base_url,
+};
 #[cfg(feature = "cfapi-runtime")]
 use adapter_windows_cfapi::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
@@ -39,17 +41,22 @@ struct Args {
 #[cfg(feature = "cfapi-runtime")]
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let registration = SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
+    let registration =
+        SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
 
     let base_url = normalize_base_url(&args.server_base_url)?;
     let client = Client::new();
 
-    let snapshot = load_snapshot_from_server(&client, &base_url, args.prefix.as_deref(), args.depth)?;
+    let snapshot =
+        load_snapshot_from_server(&client, &base_url, args.prefix.as_deref(), args.depth)?;
     let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
     let action_plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
 
     apply_action_plan(&registration.root_path, &action_plan)?;
-    eprintln!("materialized {} planned entries under sync root", action_plan.actions.len());
+    eprintln!(
+        "materialized {} planned entries under sync root",
+        action_plan.actions.len()
+    );
 
     let runtime = CfapiRuntime::from_action_plan(&action_plan);
     let hydrator = Box::new(ServerNodeHydrator::new(client.clone(), base_url.clone()));

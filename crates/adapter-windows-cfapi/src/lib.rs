@@ -52,9 +52,9 @@ pub fn map_sync_plan_to_cfapi_actions(sync_plan: &SyncPlan) -> CfapiActionPlan {
 
     for operation in &sync_plan.operations {
         let mapped = match operation {
-            SyncOperation::CreateDirectory { path } => CfapiAction::EnsureDirectory {
-                path: path.clone(),
-            },
+            SyncOperation::CreateDirectory { path } => {
+                CfapiAction::EnsureDirectory { path: path.clone() }
+            }
             SyncOperation::EnsurePlaceholder {
                 path,
                 remote_version,

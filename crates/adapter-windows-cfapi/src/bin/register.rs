@@ -19,7 +19,8 @@ struct Args {
 #[cfg(feature = "cfapi-runtime")]
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let registration = SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
+    let registration =
+        SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
     register_sync_root(&registration)
 }
 

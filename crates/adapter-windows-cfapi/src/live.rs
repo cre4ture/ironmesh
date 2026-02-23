@@ -158,6 +158,9 @@ mod tests {
     fn object_url_builder_escapes_segments() {
         let base = normalize_base_url("http://127.0.0.1:18080/").expect("valid base");
         let url = build_store_object_url(&base, "docs/read me.txt").expect("object url");
-        assert_eq!(url.as_str(), "http://127.0.0.1:18080/store/docs/read%20me.txt");
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:18080/store/docs/read%20me.txt"
+        );
     }
 }
