@@ -94,6 +94,7 @@ pub fn map_sync_plan_to_cfapi_actions(sync_plan: &SyncPlan) -> CfapiActionPlan {
 }
 
 pub mod runtime;
+pub mod helpers;
 
 pub mod live;
 

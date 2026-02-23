@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use crate::helpers::{utf16_path, utf16_string, normalize_path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRootRegistration {
@@ -122,11 +123,7 @@ impl CfapiRuntime {
     }
 }
 
-fn normalize_path(path: &str) -> String {
-    path.trim()
-        .trim_start_matches(['/', '\\'])
-        .replace('\\', "/")
-}
+// `normalize_path` now lives in `helpers.rs`.
 
 pub fn create_placeholder(sync_root: &std::path::Path, rel_path: &str) -> anyhow::Result<()> {
     use std::ptr::null_mut;
@@ -170,23 +167,15 @@ pub fn hresult_to_result(hr: i32, operation: &str) -> anyhow::Result<()> {
         ))
     }
 }
-mod windows_impl {
-    use super::{
-        CfapiAction, CfapiActionPlan, CfapiRuntime, Hydrator, SyncRootRegistration, Uploader,
-        normalize_path,
-    };
-    use anyhow::{Result, anyhow};
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{HashSet};
     use std::ffi::c_void;
-    use std::fs::File;
+    
     use std::mem::{size_of, zeroed};
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
-    use std::os::windows::io::AsRawHandle;
-    use std::path::{Path, PathBuf};
+    
+    use std::path::{Path, };
     use std::ptr::null;
-    use std::slice;
-    use std::sync::Mutex;
+    
     use windows_sys::Win32::Storage::CloudFilters::*;
     use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
 
@@ -290,11 +279,10 @@ mod windows_impl {
                     if full_path.exists() {
                         continue;
                     }
-                    if let Some(parent) = Path::new(&normalized).parent() {
-                        if !parent.as_os_str().is_empty() {
+                    if let Some(parent) = Path::new(&normalized).parent()
+                        && !parent.as_os_str().is_empty() {
                             std::fs::create_dir_all(root_path.join(parent))?;
                         }
-                    }
                     placeholders.insert(normalized, remote_version.clone());
                 }
                 CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
@@ -313,8 +301,10 @@ mod windows_impl {
 
         let mut inputs = Vec::with_capacity(placeholders.len());
         for (relative_path, remote_version) in placeholders {
-            let mut basic_info = FILE_BASIC_INFO::default();
-            basic_info.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+            let basic_info = FILE_BASIC_INFO {
+                FileAttributes: FILE_ATTRIBUTE_NORMAL,
+                ..Default::default()
+            };
             let metadata = CF_FS_METADATA {
                 BasicInfo: basic_info,
                 FileSize: 0,
@@ -362,72 +352,8 @@ mod windows_impl {
         seen: std::collections::HashSet<String>,
     }
 
-    fn cf_convert_to_placeholder(file: &File) -> Result<()> {
-        let hr = unsafe {
-            CfConvertToPlaceholder(
-                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-                std::ptr::null(),
-                0,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        hresult_to_result(hr, "CfConvertToPlaceholder")
-    }
-
-    // same for CfGetPlaceholderInfo
-    fn cf_get_placeholder_info(file: &File) -> Result<u32> {
-        let mut info_buf = vec![0u8; 1024];
-        let mut returned: u32 = 0;
-        let hr_info = unsafe {
-            CfGetPlaceholderInfo(
-                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-                0,
-                info_buf.as_mut_ptr() as *mut c_void,
-                info_buf.len() as u32,
-                &mut returned,
-            )
-        };
-        hresult_to_result(hr_info, "CfGetPlaceholderInfo")?;
-        Ok(returned)
-    }
-
-    // Helper: query CfGetPlaceholderInfo and log diagnostic messages
-    fn get_and_log_placeholder_info(
-        file: &File,
-        label: &str,
-        rel_path: &str,
-    ) -> Result<u32> {
-        let result = cf_get_placeholder_info(file);
-        match result {
-            Ok(returned) => {
-                eprintln!(
-                    "{}: CfGetPlaceholderInfo for {}: returned={}",
-                    label, rel_path, returned
-                );
-                Ok(returned)
-            }
-            Err(err) => {
-                eprintln!(
-                    "{}: CfGetPlaceholderInfo error for {}: {}",
-                    label, rel_path, err
-                );
-                Err(err)
-            }
-        }
-    }
-
-    fn is_placeholder(file: &File) -> bool {
-        get_and_log_placeholder_info(&file, "", "").unwrap_or(0) > 0
-    }
-
-    fn path_is_placeholder(path: &Path) -> bool {
-        match File::open(path) {
-            Ok(file) => is_placeholder(&file),
-            Err(_) => false,
-        }
-    }
+    // CFAPI placeholder helpers moved to `helpers.rs`
+    use crate::helpers::{cf_convert_to_placeholder, is_placeholder, path_is_placeholder};
 
     fn try_convert_materialized_file(file_path: &Path, rel_path: &str, metadata: &std::fs::Metadata) {
         {
@@ -455,7 +381,7 @@ mod windows_impl {
                             "x: failed to convert materialized file to placeholder {}: {:?}",
                             rel_path, result.err()
                         );
-                        if let Ok(m) = std::fs::metadata(&file_path) {
+                        if let Ok(m) = std::fs::metadata(file_path) {
                             let attrs = m.file_attributes();
                             eprintln!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
                         }
@@ -488,12 +414,10 @@ mod windows_impl {
 
         pub fn walk(&mut self) {
             let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
-            for entry in walker {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
-                    self.handle_entry(path, rel_path);
-                }
+            for entry in walker.flatten() {
+                let path = entry.path();
+                let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
+                self.handle_entry(path, rel_path);
             }
         }
 
@@ -519,7 +443,7 @@ mod windows_impl {
                     );
                 } else if path.exists() {
                     // File is materialized, convert to placeholder using a file HANDLE
-                    try_convert_materialized_file(&path, &rel_path, &metadata);
+                    try_convert_materialized_file(path, &rel_path, &metadata);
                 } else {
                     // File does not exist, create placeholder
                     use crate::runtime::create_placeholder;
@@ -613,10 +537,26 @@ mod windows_impl {
         })
     }
 
+    fn string_from_pcwstr(value: windows_sys::core::PCWSTR) -> String {
+        if value.is_null() {
+            return String::new();
+        }
+
+        let mut len = 0usize;
+        unsafe {
+            while *value.add(len) != 0 {
+                len += 1;
+            }
+            let raw = std::slice::from_raw_parts(value, len);
+            String::from_utf16_lossy(raw)
+        }
+    }
+
+
     unsafe extern "system" fn fetch_data_callback(
         callback_info: *const CF_CALLBACK_INFO,
         callback_parameters: *const CF_CALLBACK_PARAMETERS,
-    ) {
+    ) { 
         if callback_info.is_null() || callback_parameters.is_null() {
             return;
         }
@@ -654,7 +594,7 @@ mod windows_impl {
     unsafe extern "system" fn file_close_completion_callback(
         callback_info: *const CF_CALLBACK_INFO,
         callback_parameters: *const CF_CALLBACK_PARAMETERS,
-    ) {
+    ) { 
         if callback_info.is_null() || callback_parameters.is_null() {
             eprintln!("close-completion: null callback_info or callback_parameters");
             return;
@@ -667,19 +607,19 @@ mod windows_impl {
             return;
         }
         let context = unsafe { &*context_ptr };
+        let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
 
         let close_completion = unsafe { (*callback_parameters).Anonymous.CloseCompletion };
         eprintln!(
             "close-completion: flags={:x} path={}",
             close_completion.Flags,
-            string_from_pcwstr(callback_info_ref.NormalizedPath)
+            normalized_path
         );
         if (close_completion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
             eprintln!("close-completion: file deleted, skipping upload");
             return;
         }
 
-        let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
         if normalized_path.is_empty() {
             eprintln!("close-completion: empty normalized path");
             return;
@@ -810,17 +750,6 @@ mod windows_impl {
         hresult_to_result(hr, "CfExecute")
     }
 
-    fn hresult_to_result(hr: i32, operation: &str) -> Result<()> {
-        if hr >= 0 {
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "{operation} failed with HRESULT 0x{:08X}",
-                hr as u32
-            ))
-        }
-    }
-
     fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
         if registration.sync_root_id.trim().is_empty() {
             return Err(anyhow!("sync root id cannot be empty"));
@@ -834,31 +763,7 @@ mod windows_impl {
         Ok(())
     }
 
-    fn utf16_string(value: &str) -> Vec<u16> {
-        value.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    fn utf16_path(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    fn string_from_pcwstr(value: windows_sys::core::PCWSTR) -> String {
-        if value.is_null() {
-            return String::new();
-        }
-
-        let mut len = 0usize;
-        unsafe {
-            while *value.add(len) != 0 {
-                len += 1;
-            }
-            let raw = slice::from_raw_parts(value, len);
-            String::from_utf16_lossy(raw)
-        }
-    }
+    // UTF-16 and PCWSTR helpers moved to `helpers.rs`.
 
     fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
         let normalized_root = sync_root
@@ -887,13 +792,6 @@ mod windows_impl {
 
         normalize_path(candidate.trim_start_matches(['\\', '/']))
     }
-}
-
-pub use windows_impl::{
-    SyncRootConnection, apply_action_plan, connect_sync_root, register_sync_root,
-    unregister_sync_root,
-};
-
 
 #[cfg(test)]
 mod tests {
