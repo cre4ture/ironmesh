@@ -47,3 +47,21 @@ Use this pattern for future commits:
 - [ ] No unrelated formatting or refactor noise
 - [ ] Docs updated for behavior/interface changes
 - [ ] Next step is explicitly stated
+
+## Clean code and commit review
+
+- Follow clean code principles for all changes. Keep functions small, focused, and readable.
+- If a function grows too large or takes on multiple responsibilities, split it into smaller helper functions or modules.
+- Prefer explicit, descriptive names and minimize nested/complex branching — refactor into smaller units where helpful.
+- Before each commit perform a quick clean-code review: check for long functions, duplicated logic, unclear names, and missing error handling.
+- Major clean-code violations must be addressed before committing (e.g., functions >~200 LOC, duplicated complex logic, unclear ownership or lifetimes that risk bugs).
+- Include a short note in the commit message when a non-trivial refactor/split was performed, referencing the reason (readability, testability, or performance).
+
+Example pre-commit checklist (add to PR description or commit message when applicable):
+
+- [ ] Long functions split into smaller units where appropriate
+- [ ] Duplicated logic extracted into helpers
+- [ ] Side-effects and I/O isolated from pure logic
+- [ ] Error handling is explicit and informative
+- [ ] Unit tests added/updated for refactored components
+
