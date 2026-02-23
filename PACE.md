@@ -65,3 +65,5 @@ Example pre-commit checklist (add to PR description or commit message when appli
 - [ ] Error handling is explicit and informative
 - [ ] Unit tests added/updated for refactored components
 
+- Large files should be split into modules or crates to keep focus clear and reduce review and maintenance cost.
+
