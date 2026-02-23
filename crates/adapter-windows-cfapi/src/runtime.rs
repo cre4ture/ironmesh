@@ -478,15 +478,19 @@ mod windows_impl {
         pub fn run(&mut self) {
             use std::time::Duration;
             loop {
-                let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
-                for entry in walker {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
-                        self.handle_entry(path, rel_path);
-                    }
-                }
+                self.walk();
                 std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+
+        pub fn walk(&mut self) {
+            let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
+            for entry in walker {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
+                    self.handle_entry(path, rel_path);
+                }
             }
         }
 
@@ -551,7 +555,7 @@ mod windows_impl {
             sync_root.display()
         );
         let mut startup_monitor = SyncRootMonitor::new("startup-scan", sync_root.clone(), uploader.clone());
-        startup_monitor.run();
+        startup_monitor.walk();
 
         // Spawn a background thread to monitor the sync root for new files/folders
         // use std::sync::Arc; // Removed unused import
@@ -559,64 +563,6 @@ mod windows_impl {
         let uploader_thread = uploader.clone();
 
         std::thread::spawn(move || monitor_sync_root_changes(sync_root_clone, uploader_thread));
-
-        // Startup scan: enumerate and upload pre-existing files and directories
-        let sync_root = registration.root_path.clone();
-        eprintln!(
-            "startup-scan: scanning {} for pre-existing files",
-            sync_root.display()
-        );
-        let walker = walkdir::WalkDir::new(&sync_root).into_iter();
-        for entry in walker {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                let rel_path = path_to_relative(&sync_root, &path.to_string_lossy());
-                if rel_path.is_empty() {
-                    continue;
-                }
-                let metadata = match std::fs::metadata(path) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if metadata.is_dir() {
-                    eprintln!("startup-scan: uploading directory {}", rel_path);
-                    if let Ok(Some(version)) = uploader.upload(&rel_path, b"<DIR>") {
-                        runtime.set_remote_version(&rel_path, version);
-                    }
-                } else {
-                    // Skip files that are already CFAPI placeholders
-                    let is_placeholder = path_is_placeholder(path);
-                    if is_placeholder {
-                        eprintln!("startup-scan: skipping placeholder file {}", rel_path);
-                        continue;
-                    }
-                    match std::fs::read(path) {
-                        Ok(data) => {
-                            eprintln!(
-                                "startup-scan: uploading file {} ({} bytes)",
-                                rel_path,
-                                data.len()
-                            );
-                            match uploader.upload(&rel_path, &data) {
-                                Ok(Some(version)) => {
-                                    runtime.set_remote_version(&rel_path, version);
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    eprintln!(
-                                        "startup-scan: upload failed for {}: {}",
-                                        rel_path, err
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("startup-scan: failed to read {}: {}", rel_path, err);
-                        }
-                    }
-                }
-            }
-        }
 
         let root_path = utf16_path(&registration.root_path);
         let mut callback_context = Box::new(CallbackContext {
@@ -654,6 +600,8 @@ mod windows_impl {
             )
         };
         hresult_to_result(hr, "CfConnectSyncRoot")?;
+
+        eprintln!("connected to CFAPI callbacks with connection key {}", connection_key);
 
         Ok(SyncRootConnection {
             connection_key,
