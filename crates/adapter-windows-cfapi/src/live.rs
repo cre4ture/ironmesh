@@ -1,5 +1,3 @@
-#![cfg(feature = "cfapi-runtime")]
-
 use crate::runtime::{Hydrator, Uploader};
 use anyhow::{Context, Result};
 use reqwest::Url;

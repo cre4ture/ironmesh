@@ -1,3 +1,4 @@
+
 [package]
 name = "adapter-windows-cfapi"
 version.workspace = true
@@ -5,18 +6,15 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[features]
-default = []
-cfapi-runtime = ["dep:anyhow", "dep:clap", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:windows-sys"]
-
-[dependencies]
+# Only build this crate on Windows
+[target.'cfg(windows)'.dependencies]
 sync-core = { path = "../sync-core" }
-anyhow = { workspace = true, optional = true }
-clap = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }
-serde = { workspace = true, optional = true, features = ["derive"] }
-serde_json = { workspace = true, optional = true }
-windows-sys = { version = "0.61", optional = true, features = [
+anyhow = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+windows-sys = { version = "0.61", features = [
 	"Win32_Foundation",
 	"Win32_Storage_CloudFilters",
 	"Win32_Storage_FileSystem",
@@ -24,3 +22,7 @@ windows-sys = { version = "0.61", optional = true, features = [
 	"Win32_System_IO",
 ] }
 walkdir = "2.3"
+
+# Prevent compilation on non-Windows targets
+[target.'cfg(not(windows))'.dependencies]
+# No dependencies; crate will not build

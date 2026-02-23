@@ -1,25 +1,16 @@
-#[cfg(feature = "cfapi-runtime")]
 use adapter_windows_cfapi::WindowsCfapiAdapter;
-#[cfg(feature = "cfapi-runtime")]
 use adapter_windows_cfapi::live::{
     ServerNodeHydrator, load_snapshot_from_server, normalize_base_url,
 };
-#[cfg(feature = "cfapi-runtime")]
 use adapter_windows_cfapi::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
 };
-#[cfg(feature = "cfapi-runtime")]
 use clap::Parser;
-#[cfg(feature = "cfapi-runtime")]
 use reqwest::blocking::Client;
-#[cfg(feature = "cfapi-runtime")]
 use std::thread;
-#[cfg(feature = "cfapi-runtime")]
 use std::time::Duration;
-#[cfg(feature = "cfapi-runtime")]
 use sync_core::SyncPolicy;
 
-#[cfg(feature = "cfapi-runtime")]
 #[derive(Debug, Parser)]
 #[command(name = "adapter-windows-cfapi-serve")]
 #[command(about = "Connect CFAPI callbacks and serve on-demand hydration from server-node")]
@@ -38,7 +29,6 @@ struct Args {
     depth: usize,
 }
 
-#[cfg(feature = "cfapi-runtime")]
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let registration =
@@ -68,10 +58,4 @@ fn main() -> anyhow::Result<()> {
     loop {
         thread::sleep(Duration::from_secs(60));
     }
-}
-
-#[cfg(not(feature = "cfapi-runtime"))]
-fn main() {
-    eprintln!("binary requires the `cfapi-runtime` feature");
-    std::process::exit(1);
 }

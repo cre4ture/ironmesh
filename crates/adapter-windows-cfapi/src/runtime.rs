@@ -128,7 +128,6 @@ fn normalize_path(path: &str) -> String {
         .replace('\\', "/")
 }
 
-#[cfg(windows)]
 pub fn create_placeholder(sync_root: &std::path::Path, rel_path: &str) -> anyhow::Result<()> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Storage::CloudFilters::*;
@@ -181,6 +180,7 @@ mod windows_impl {
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::ptr::null;
     use std::slice;
@@ -394,6 +394,62 @@ mod windows_impl {
             || (attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0)
     }
 
+    fn try_convert_materialized_file(file_path: &Path, rel_path: &str, metadata: &std::fs::Metadata) {
+        use std::os::windows::io::AsRawHandle;
+        {
+            let attrs = metadata.file_attributes();
+            eprintln!(
+                "monitor: attempting convert path={} attrs=0x{:08x} size={}",
+                file_path.display(),
+                attrs,
+                metadata.len()
+            );
+        }
+        match std::fs::OpenOptions::new().read(true).write(true).open(file_path) {
+            Ok(fh_file) => {
+                let raw = fh_file.as_raw_handle();
+                let handle = raw as windows_sys::Win32::Foundation::HANDLE;
+
+                let (hr_info, returned) = get_and_log_placeholder_info(handle, "monitor: pre-convert", rel_path);
+
+                if hr_info == 0 && returned > 0 {
+                    eprintln!(
+                        "monitor: skipping convert for {} because placeholder info present (returned={})",
+                        rel_path, returned
+                    );
+                } else {
+                    let hr = unsafe {
+                        CfConvertToPlaceholder(
+                            handle,
+                            std::ptr::null(),
+                            0,
+                            0,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if hr == 0 {
+                        eprintln!("monitor: converted materialized file to placeholder: {}", rel_path);
+                    } else {
+                        eprintln!(
+                            "monitor: failed to convert materialized file to placeholder {}: HRESULT 0x{:08x}",
+                            rel_path, hr as u32
+                        );
+                        if let Ok(m) = std::fs::metadata(&file_path) {
+                            let attrs = m.file_attributes();
+                            eprintln!("monitor: post-fail attrs=0x{:08x} size={}", attrs, m.len());
+                        }
+
+                        let (_hr_info2, _returned2) = get_and_log_placeholder_info(handle, "monitor: post-convert", rel_path);
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("monitor: failed to open materialized file {} for conversion: {}", rel_path, err);
+            }
+        }
+    }
+
     impl SyncRootMonitor {
         pub fn new(sync_root: PathBuf, uploader: std::sync::Arc<dyn Uploader>) -> Self {
             Self {
@@ -432,7 +488,6 @@ mod windows_impl {
             } else {
                 // Check if file is already a CFAPI placeholder using Windows file attributes
                 use std::os::windows::fs::MetadataExt;
-                use windows_sys::Win32::Storage::CloudFilters::*;
                 let attrs = metadata.file_attributes();
                 let is_placeholder = is_cfapi_placeholder(attrs);
                 let file_path = self.sync_root.join(&rel_path);
@@ -443,86 +498,14 @@ mod windows_impl {
                     );
                 } else if file_path.exists() {
                     // File is materialized, convert to placeholder using a file HANDLE
-                    use std::os::windows::io::AsRawHandle;
-                    {
-                        let attrs = metadata.file_attributes();
-                        eprintln!(
-                            "monitor: attempting convert path={} attrs=0x{:08x} size={}",
-                            file_path.display(),
-                            attrs,
-                            metadata.len()
-                        );
-                    }
-                    match std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&file_path)
-                    {
-                        Ok(fh_file) => {
-                            let raw = fh_file.as_raw_handle();
-                            let handle = raw as windows_sys::Win32::Foundation::HANDLE;
-
-                            // Diagnostic: query placeholder info before conversion
-                            let (hr_info, returned) = get_and_log_placeholder_info(
-                                handle,
-                                "monitor: pre-convert",
-                                &rel_path,
-                            );
-
-                            // If CfGetPlaceholderInfo returned data, the file already has
-                            // placeholder information and conversion is not needed.
-                            if hr_info == 0 && returned > 0 {
-                                eprintln!(
-                                    "monitor: skipping convert for {} because placeholder info present (returned={})",
-                                    rel_path, returned
-                                );
-                            } else {
-                                let hr = unsafe {
-                                    CfConvertToPlaceholder(
-                                        handle,
-                                        std::ptr::null(),
-                                        0,
-                                        0,
-                                        std::ptr::null_mut(),
-                                        std::ptr::null_mut(),
-                                    )
-                                };
-                                if hr == 0 {
-                                    eprintln!(
-                                        "monitor: converted materialized file to placeholder: {}",
-                                        rel_path
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "monitor: failed to convert materialized file to placeholder {}: HRESULT 0x{:08x}",
-                                        rel_path, hr as u32
-                                    );
-                                    // Additional diagnostic: print file attributes and size again
-                                    if let Ok(m) = std::fs::metadata(&file_path) {
-                                        let attrs = m.file_attributes();
-                                        eprintln!(
-                                            "monitor: post-fail attrs=0x{:08x} size={}",
-                                            attrs,
-                                            m.len()
-                                        );
-                                    }
-
-                                    // Diagnostic: query placeholder info after conversion attempt
-                                    let (_hr_info2, returned2) = get_and_log_placeholder_info(
-                                        handle,
-                                        "monitor: post-convert",
-                                        &rel_path,
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "monitor: failed to open materialized file {} for conversion: {}",
-                                rel_path, err
-                            );
-                        }
-                    }
+                    let attrs = metadata.file_attributes();
+                    eprintln!(
+                        "monitor: attempting convert path={} attrs=0x{:08x} size={}",
+                        file_path.display(),
+                        attrs,
+                        metadata.len()
+                    );
+                    try_convert_materialized_file(&file_path, &rel_path, &metadata);
                 } else {
                     // File does not exist, create placeholder
                     use crate::runtime::create_placeholder;
@@ -1076,35 +1059,11 @@ mod windows_impl {
     }
 }
 
-#[cfg(windows)]
 pub use windows_impl::{
     SyncRootConnection, apply_action_plan, connect_sync_root, register_sync_root,
     unregister_sync_root,
 };
 
-#[cfg(not(windows))]
-pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
-    if registration.sync_root_id.trim().is_empty() {
-        return Err(anyhow!("sync root id cannot be empty"));
-    }
-    if registration.display_name.trim().is_empty() {
-        return Err(anyhow!("display name cannot be empty"));
-    }
-    if registration.root_path.as_os_str().is_empty() {
-        return Err(anyhow!("root path cannot be empty"));
-    }
-    Err(anyhow!("CFAPI runtime is only available on Windows"))
-}
-
-#[cfg(not(windows))]
-pub fn unregister_sync_root(_root_path: &std::path::Path) -> Result<()> {
-    Err(anyhow!("CFAPI runtime is only available on Windows"))
-}
-
-#[cfg(not(windows))]
-pub fn apply_action_plan(_root_path: &std::path::Path, _plan: &CfapiActionPlan) -> Result<()> {
-    Err(anyhow!("CFAPI runtime is only available on Windows"))
-}
 
 #[cfg(test)]
 mod tests {
