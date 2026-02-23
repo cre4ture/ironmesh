@@ -2,6 +2,7 @@ use adapter_windows_cfapi::WindowsCfapiAdapter;
 use adapter_windows_cfapi::live::{
     ServerNodeHydrator, load_snapshot_from_server, normalize_base_url,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use adapter_windows_cfapi::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
 };
@@ -55,7 +56,20 @@ fn main() -> anyhow::Result<()> {
     let _connection = connect_sync_root(&registration, runtime, hydrator, uploader)?;
 
     eprintln!("connected to CFAPI callbacks; serving hydration requests");
-    loop {
-        thread::sleep(Duration::from_secs(60));
+    let running = std::sync::Arc::new(AtomicBool::new(true));
+    {
+        let r = running.clone();
+        ctrlc::set_handler(move || {
+            eprintln!("received Ctrl+C, shutting down");
+            r.store(false, Ordering::SeqCst);
+        })?;
     }
+
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    eprintln!("shutting down; dropping connection and exiting");
+    drop(_connection);
+    Ok(())
 }

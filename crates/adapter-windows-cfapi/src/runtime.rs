@@ -201,6 +201,9 @@ mod windows_impl {
             unsafe {
                 let _ = CfDisconnectSyncRoot(self.connection_key);
             }
+            eprintln!(
+                "dropped CFAPI connection with key {}, disconnected from sync root",
+                self.connection_key)
         }
     }
 
