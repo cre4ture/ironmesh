@@ -2,12 +2,12 @@ use adapter_windows_cfapi::WindowsCfapiAdapter;
 use adapter_windows_cfapi::live::{
     ServerNodeHydrator, load_snapshot_from_server, normalize_base_url,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use adapter_windows_cfapi::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
 };
 use clap::Parser;
 use reqwest::blocking::Client;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use sync_core::SyncPolicy;

@@ -1,6 +1,6 @@
-use std::path::Path;
-use std::os::windows::ffi::OsStrExt;
 use anyhow::Result;
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 
 pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
@@ -20,9 +20,9 @@ pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
 }
 
 pub fn cf_get_placeholder_info(file: &std::fs::File) -> Result<u32> {
+    use core::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::CloudFilters::CfGetPlaceholderInfo;
-    use core::ffi::c_void;
 
     let mut info_buf = vec![0u8; 1024];
     let mut returned: u32 = 0;
@@ -46,11 +46,17 @@ pub fn get_and_log_placeholder_info(
 ) -> Result<u32> {
     match cf_get_placeholder_info(file) {
         Ok(returned) => {
-            eprintln!("{}: CfGetPlaceholderInfo for {}: returned={}", label, rel_path, returned);
+            eprintln!(
+                "{}: CfGetPlaceholderInfo for {}: returned={}",
+                label, rel_path, returned
+            );
             Ok(returned)
         }
         Err(err) => {
-            eprintln!("{}: CfGetPlaceholderInfo error for {}: {}", label, rel_path, err);
+            eprintln!(
+                "{}: CfGetPlaceholderInfo error for {}: {}",
+                label, rel_path, err
+            );
             Err(err)
         }
     }
@@ -71,7 +77,10 @@ fn hresult_nonneg(hr: i32, operation: &str) -> Result<()> {
     if hr >= 0 {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("{operation} failed with HRESULT 0x{:08X}", hr as u32))
+        Err(anyhow::anyhow!(
+            "{operation} failed with HRESULT 0x{:08X}",
+            hr as u32
+        ))
     }
 }
 
@@ -91,4 +100,3 @@ pub fn utf16_path(path: &Path) -> Vec<u16> {
         .chain(std::iter::once(0))
         .collect()
 }
-

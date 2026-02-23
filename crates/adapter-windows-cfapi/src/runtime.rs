@@ -1,10 +1,10 @@
+use crate::helpers::{normalize_path, utf16_path, utf16_string};
 use crate::{CfapiAction, CfapiActionPlan};
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use crate::helpers::{utf16_path, utf16_string, normalize_path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRootRegistration {
@@ -167,631 +167,644 @@ pub fn hresult_to_result(hr: i32, operation: &str) -> anyhow::Result<()> {
         ))
     }
 }
-    use std::collections::{HashSet};
-    use std::ffi::c_void;
-    
-    use std::mem::{size_of, zeroed};
-    use std::os::windows::fs::MetadataExt;
-    
-    use std::path::{Path, };
-    use std::ptr::null;
-    
-    use windows_sys::Win32::Storage::CloudFilters::*;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
+use std::collections::HashSet;
+use std::ffi::c_void;
 
-    pub struct SyncRootConnection {
-        connection_key: CF_CONNECTION_KEY,
-        _callback_table: Box<[CF_CALLBACK_REGISTRATION]>,
-        _callback_context: Box<CallbackContext>,
+use std::mem::{size_of, zeroed};
+use std::os::windows::fs::MetadataExt;
+
+use std::path::Path;
+use std::ptr::null;
+
+use windows_sys::Win32::Storage::CloudFilters::*;
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
+
+pub struct SyncRootConnection {
+    connection_key: CF_CONNECTION_KEY,
+    _callback_table: Box<[CF_CALLBACK_REGISTRATION]>,
+    _callback_context: Box<CallbackContext>,
+}
+
+impl Drop for SyncRootConnection {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CfDisconnectSyncRoot(self.connection_key);
+        }
+        eprintln!(
+            "dropped CFAPI connection with key {}, disconnected from sync root",
+            self.connection_key
+        )
     }
+}
 
-    impl Drop for SyncRootConnection {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = CfDisconnectSyncRoot(self.connection_key);
+struct CallbackContext {
+    sync_root: PathBuf,
+    runtime: CfapiRuntime,
+    hydrator: Box<dyn Hydrator>,
+    uploader: std::sync::Arc<dyn Uploader>,
+    hydrated_once_paths: Mutex<HashSet<String>>,
+}
+
+pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
+    validate_registration(registration)?;
+    std::fs::create_dir_all(&registration.root_path)?;
+
+    let root_path = utf16_path(&registration.root_path);
+    let provider_name = utf16_string(&registration.display_name);
+    let provider_version = utf16_string("0.1.0");
+    let sync_root_identity = registration.sync_root_id.as_bytes();
+
+    let registration_desc = CF_SYNC_REGISTRATION {
+        StructSize: size_of::<CF_SYNC_REGISTRATION>() as u32,
+        ProviderName: provider_name.as_ptr(),
+        ProviderVersion: provider_version.as_ptr(),
+        SyncRootIdentity: sync_root_identity.as_ptr().cast::<c_void>(),
+        SyncRootIdentityLength: sync_root_identity.len() as u32,
+        FileIdentity: sync_root_identity.as_ptr().cast::<c_void>(),
+        FileIdentityLength: sync_root_identity.len() as u32,
+        ProviderId: unsafe { zeroed() },
+    };
+
+    let policies = CF_SYNC_POLICIES {
+        StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
+        Hydration: CF_HYDRATION_POLICY {
+            Primary: CF_HYDRATION_POLICY_PROGRESSIVE,
+            Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
+        },
+        Population: CF_POPULATION_POLICY {
+            Primary: CF_POPULATION_POLICY_FULL,
+            Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
+        },
+        InSync: CF_INSYNC_POLICY_NONE,
+        HardLink: CF_HARDLINK_POLICY_NONE,
+        PlaceholderManagement: CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT,
+    };
+
+    let hr = unsafe {
+        CfRegisterSyncRoot(
+            root_path.as_ptr(),
+            &registration_desc,
+            &policies,
+            CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT | CF_REGISTER_FLAG_UPDATE,
+        )
+    };
+
+    hresult_to_result(hr, "CfRegisterSyncRoot")
+}
+
+pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
+    let root_path_utf16 = utf16_path(root_path);
+    let hr = unsafe { CfUnregisterSyncRoot(root_path_utf16.as_ptr()) };
+    hresult_to_result(hr, "CfUnregisterSyncRoot")
+}
+
+pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()> {
+    std::fs::create_dir_all(root_path)?;
+
+    let mut placeholders: BTreeMap<String, String> = BTreeMap::new();
+    for action in &plan.actions {
+        match action {
+            CfapiAction::EnsureDirectory { path } => {
+                std::fs::create_dir_all(root_path.join(path.replace('/', "\\")))?;
             }
-            eprintln!(
-                "dropped CFAPI connection with key {}, disconnected from sync root",
-                self.connection_key)
+            CfapiAction::EnsurePlaceholder {
+                path,
+                remote_version,
+            }
+            | CfapiAction::HydrateOnDemand {
+                path,
+                remote_version,
+            } => {
+                let normalized = normalize_path(path);
+                let full_path = root_path.join(normalized.replace('/', "\\"));
+                if full_path.exists() {
+                    continue;
+                }
+                if let Some(parent) = Path::new(&normalized).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(root_path.join(parent))?;
+                }
+                placeholders.insert(normalized, remote_version.clone());
+            }
+            CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
         }
     }
 
-    struct CallbackContext {
-        sync_root: PathBuf,
-        runtime: CfapiRuntime,
-        hydrator: Box<dyn Hydrator>,
-        uploader: std::sync::Arc<dyn Uploader>,
-        hydrated_once_paths: Mutex<HashSet<String>>,
+    if placeholders.is_empty() {
+        return Ok(());
     }
 
-    pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
-        validate_registration(registration)?;
-        std::fs::create_dir_all(&registration.root_path)?;
-
-        let root_path = utf16_path(&registration.root_path);
-        let provider_name = utf16_string(&registration.display_name);
-        let provider_version = utf16_string("0.1.0");
-        let sync_root_identity = registration.sync_root_id.as_bytes();
-
-        let registration_desc = CF_SYNC_REGISTRATION {
-            StructSize: size_of::<CF_SYNC_REGISTRATION>() as u32,
-            ProviderName: provider_name.as_ptr(),
-            ProviderVersion: provider_version.as_ptr(),
-            SyncRootIdentity: sync_root_identity.as_ptr().cast::<c_void>(),
-            SyncRootIdentityLength: sync_root_identity.len() as u32,
-            FileIdentity: sync_root_identity.as_ptr().cast::<c_void>(),
-            FileIdentityLength: sync_root_identity.len() as u32,
-            ProviderId: unsafe { zeroed() },
-        };
-
-        let policies = CF_SYNC_POLICIES {
-            StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
-            Hydration: CF_HYDRATION_POLICY {
-                Primary: CF_HYDRATION_POLICY_PROGRESSIVE,
-                Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
-            },
-            Population: CF_POPULATION_POLICY {
-                Primary: CF_POPULATION_POLICY_FULL,
-                Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
-            },
-            InSync: CF_INSYNC_POLICY_NONE,
-            HardLink: CF_HARDLINK_POLICY_NONE,
-            PlaceholderManagement: CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT,
-        };
-
-        let hr = unsafe {
-            CfRegisterSyncRoot(
-                root_path.as_ptr(),
-                &registration_desc,
-                &policies,
-                CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT | CF_REGISTER_FLAG_UPDATE,
-            )
-        };
-
-        hresult_to_result(hr, "CfRegisterSyncRoot")
+    struct PlaceholderInput {
+        relative_name_utf16: Vec<u16>,
+        identity: Vec<u8>,
+        metadata: CF_FS_METADATA,
     }
 
-    pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
-        let root_path_utf16 = utf16_path(root_path);
-        let hr = unsafe { CfUnregisterSyncRoot(root_path_utf16.as_ptr()) };
-        hresult_to_result(hr, "CfUnregisterSyncRoot")
+    let mut inputs = Vec::with_capacity(placeholders.len());
+    for (relative_path, remote_version) in placeholders {
+        let basic_info = FILE_BASIC_INFO {
+            FileAttributes: FILE_ATTRIBUTE_NORMAL,
+            ..Default::default()
+        };
+        let metadata = CF_FS_METADATA {
+            BasicInfo: basic_info,
+            FileSize: 0,
+        };
+
+        inputs.push(PlaceholderInput {
+            relative_name_utf16: utf16_string(&relative_path),
+            identity: remote_version.into_bytes(),
+            metadata,
+        });
     }
 
-    pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()> {
-        std::fs::create_dir_all(root_path)?;
+    let mut create_infos = Vec::with_capacity(inputs.len());
+    for input in &mut inputs {
+        create_infos.push(CF_PLACEHOLDER_CREATE_INFO {
+            RelativeFileName: input.relative_name_utf16.as_ptr(),
+            FsMetadata: input.metadata,
+            FileIdentity: input.identity.as_ptr().cast::<c_void>(),
+            FileIdentityLength: input.identity.len() as u32,
+            Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+            Result: 0,
+            CreateUsn: 0,
+        });
+    }
 
-        let mut placeholders: BTreeMap<String, String> = BTreeMap::new();
-        for action in &plan.actions {
-            match action {
-                CfapiAction::EnsureDirectory { path } => {
-                    std::fs::create_dir_all(root_path.join(path.replace('/', "\\")))?;
-                }
-                CfapiAction::EnsurePlaceholder {
-                    path,
-                    remote_version,
-                }
-                | CfapiAction::HydrateOnDemand {
-                    path,
-                    remote_version,
-                } => {
-                    let normalized = normalize_path(path);
-                    let full_path = root_path.join(normalized.replace('/', "\\"));
-                    if full_path.exists() {
-                        continue;
+    let base_path = utf16_path(root_path);
+    let mut entries_processed = 0u32;
+    let hr = unsafe {
+        CfCreatePlaceholders(
+            base_path.as_ptr(),
+            create_infos.as_mut_ptr(),
+            create_infos.len() as u32,
+            CF_CREATE_FLAG_STOP_ON_ERROR,
+            &mut entries_processed,
+        )
+    };
+
+    hresult_to_result(hr, "CfCreatePlaceholders")
+}
+
+pub struct SyncRootMonitor {
+    name: String,
+    sync_root: PathBuf,
+    uploader: std::sync::Arc<dyn Uploader>,
+    seen: std::collections::HashSet<String>,
+}
+
+// CFAPI placeholder helpers moved to `helpers.rs`
+use crate::helpers::{cf_convert_to_placeholder, is_placeholder, path_is_placeholder};
+
+fn try_convert_materialized_file(file_path: &Path, rel_path: &str, metadata: &std::fs::Metadata) {
+    {
+        let attrs = metadata.file_attributes();
+        eprintln!(
+            "monitor: attempting convert path={} attrs=0x{:08x} size={}",
+            file_path.display(),
+            attrs,
+            metadata.len()
+        );
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file_path)
+    {
+        Ok(fh_file) => {
+            if is_placeholder(&fh_file) {
+                eprintln!(
+                    "x: skipping convert for {} because placeholder info present",
+                    rel_path
+                );
+            } else {
+                let result = cf_convert_to_placeholder(&fh_file);
+                if result.is_ok() {
+                    eprintln!(
+                        "x: converted materialized file to placeholder: {}",
+                        rel_path
+                    );
+                } else {
+                    eprintln!(
+                        "x: failed to convert materialized file to placeholder {}: {:?}",
+                        rel_path,
+                        result.err()
+                    );
+                    if let Ok(m) = std::fs::metadata(file_path) {
+                        let attrs = m.file_attributes();
+                        eprintln!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
                     }
-                    if let Some(parent) = Path::new(&normalized).parent()
-                        && !parent.as_os_str().is_empty() {
-                            std::fs::create_dir_all(root_path.join(parent))?;
-                        }
-                    placeholders.insert(normalized, remote_version.clone());
                 }
-                CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
             }
         }
-
-        if placeholders.is_empty() {
-            return Ok(());
-        }
-
-        struct PlaceholderInput {
-            relative_name_utf16: Vec<u16>,
-            identity: Vec<u8>,
-            metadata: CF_FS_METADATA,
-        }
-
-        let mut inputs = Vec::with_capacity(placeholders.len());
-        for (relative_path, remote_version) in placeholders {
-            let basic_info = FILE_BASIC_INFO {
-                FileAttributes: FILE_ATTRIBUTE_NORMAL,
-                ..Default::default()
-            };
-            let metadata = CF_FS_METADATA {
-                BasicInfo: basic_info,
-                FileSize: 0,
-            };
-
-            inputs.push(PlaceholderInput {
-                relative_name_utf16: utf16_string(&relative_path),
-                identity: remote_version.into_bytes(),
-                metadata,
-            });
-        }
-
-        let mut create_infos = Vec::with_capacity(inputs.len());
-        for input in &mut inputs {
-            create_infos.push(CF_PLACEHOLDER_CREATE_INFO {
-                RelativeFileName: input.relative_name_utf16.as_ptr(),
-                FsMetadata: input.metadata,
-                FileIdentity: input.identity.as_ptr().cast::<c_void>(),
-                FileIdentityLength: input.identity.len() as u32,
-                Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
-                Result: 0,
-                CreateUsn: 0,
-            });
-        }
-
-        let base_path = utf16_path(root_path);
-        let mut entries_processed = 0u32;
-        let hr = unsafe {
-            CfCreatePlaceholders(
-                base_path.as_ptr(),
-                create_infos.as_mut_ptr(),
-                create_infos.len() as u32,
-                CF_CREATE_FLAG_STOP_ON_ERROR,
-                &mut entries_processed,
-            )
-        };
-
-        hresult_to_result(hr, "CfCreatePlaceholders")
-    }
-
-    pub struct SyncRootMonitor {
-        name: String,
-        sync_root: PathBuf,
-        uploader: std::sync::Arc<dyn Uploader>,
-        seen: std::collections::HashSet<String>,
-    }
-
-    // CFAPI placeholder helpers moved to `helpers.rs`
-    use crate::helpers::{cf_convert_to_placeholder, is_placeholder, path_is_placeholder};
-
-    fn try_convert_materialized_file(file_path: &Path, rel_path: &str, metadata: &std::fs::Metadata) {
-        {
-            let attrs = metadata.file_attributes();
+        Err(err) => {
             eprintln!(
-                "monitor: attempting convert path={} attrs=0x{:08x} size={}",
-                file_path.display(),
-                attrs,
-                metadata.len()
+                "x: failed to open materialized file {} for conversion: {}",
+                rel_path, err
             );
         }
-        match std::fs::OpenOptions::new().read(true).write(true).open(file_path) {
-            Ok(fh_file) => {
-                if is_placeholder(&fh_file) {
-                    eprintln!(
-                        "x: skipping convert for {} because placeholder info present",
-                        rel_path
-                    );
-                } else {
-                    let result = cf_convert_to_placeholder(&fh_file);
-                    if result.is_ok() {
-                        eprintln!("x: converted materialized file to placeholder: {}", rel_path);
-                    } else {
-                        eprintln!(
-                            "x: failed to convert materialized file to placeholder {}: {:?}",
-                            rel_path, result.err()
-                        );
-                        if let Ok(m) = std::fs::metadata(file_path) {
-                            let attrs = m.file_attributes();
-                            eprintln!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("x: failed to open materialized file {} for conversion: {}", rel_path, err);
-            }
+    }
+}
+
+impl SyncRootMonitor {
+    pub fn new(name: &str, sync_root: PathBuf, uploader: std::sync::Arc<dyn Uploader>) -> Self {
+        Self {
+            name: name.to_string(),
+            sync_root,
+            uploader,
+            seen: std::collections::HashSet::new(),
         }
     }
 
-    impl SyncRootMonitor {
-        pub fn new(name: &str, sync_root: PathBuf, uploader: std::sync::Arc<dyn Uploader>) -> Self {
-            Self {
-                name: name.to_string(),
-                sync_root,
-                uploader,
-                seen: std::collections::HashSet::new(),
-            }
-        }
-
-        pub fn run(&mut self) {
-            use std::time::Duration;
-            loop {
-                self.walk();
-                std::thread::sleep(Duration::from_secs(5));
-            }
-        }
-
-        pub fn walk(&mut self) {
-            let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
-            for entry in walker.flatten() {
-                let path = entry.path();
-                let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
-                self.handle_entry(path, rel_path);
-            }
-        }
-
-        fn handle_entry(&mut self, path: &std::path::Path, rel_path: String) {
-            if rel_path.is_empty() || self.seen.contains(&rel_path) {
-                return;
-            }
-            let metadata = match std::fs::metadata(path) {
-                Ok(m) => m,
-                Err(_) => return,
-            };
-            if metadata.is_dir() {
-                eprintln!("{}: detected new directory {}", self.name, rel_path);
-                let _ = self.uploader.upload(&rel_path, b"<DIR>");
-            } else {
-                // Check if file is already a CFAPI placeholder using Windows file attributes
-                let is_placeholder = path_is_placeholder(path);
-                if is_placeholder {
-                    eprintln!(
-                        "{}: skipping placeholder creation for CFAPI placeholder file {}",
-                        self.name,
-                        rel_path
-                    );
-                } else if path.exists() {
-                    // File is materialized, convert to placeholder using a file HANDLE
-                    try_convert_materialized_file(path, &rel_path, &metadata);
-                } else {
-                    // File does not exist, create placeholder
-                    use crate::runtime::create_placeholder;
-                    if let Err(e) = create_placeholder(&self.sync_root, &rel_path) {
-                        eprintln!(
-                            "{}: failed to create placeholder for {}: {}",
-                            self.name, 
-                            rel_path, e
-                        );
-                    } else {
-                        eprintln!("{}: created placeholder for {}", self.name, rel_path);
-                    }
-                }
-            }
-            self.seen.insert(rel_path);
+    pub fn run(&mut self) {
+        use std::time::Duration;
+        loop {
+            self.walk();
+            std::thread::sleep(Duration::from_secs(5));
         }
     }
 
-    fn monitor_sync_root_changes(
-        sync_root_clone: PathBuf,
-        uploader_thread: std::sync::Arc<dyn Uploader>,
-    ) {
-        let mut monitor = SyncRootMonitor::new("monitor", sync_root_clone, uploader_thread);
-        monitor.run();
-    }
-
-    pub fn connect_sync_root(
-        registration: &SyncRootRegistration,
-        runtime: CfapiRuntime,
-        hydrator: Box<dyn Hydrator>,
-        uploader: std::sync::Arc<dyn Uploader>,
-    ) -> Result<SyncRootConnection> {
-        let sync_root = registration.root_path.clone();
-        eprintln!(
-            "startup-scan: scanning {} for pre-existing files",
-            sync_root.display()
-        );
-        let mut startup_monitor = SyncRootMonitor::new("startup-scan", sync_root.clone(), uploader.clone());
-        startup_monitor.walk();
-
-        // Spawn a background thread to monitor the sync root for new files/folders
-        // use std::sync::Arc; // Removed unused import
-        let sync_root_clone = sync_root.clone();
-        let uploader_thread = uploader.clone();
-
-        std::thread::spawn(move || monitor_sync_root_changes(sync_root_clone, uploader_thread));
-
-        let root_path = utf16_path(&registration.root_path);
-        let mut callback_context = Box::new(CallbackContext {
-            sync_root: registration.root_path.clone(),
-            runtime,
-            hydrator,
-            uploader: uploader.clone(),
-            hydrated_once_paths: Mutex::new(HashSet::new()),
-        });
-
-        let callback_table = vec![
-            CF_CALLBACK_REGISTRATION {
-                Type: CF_CALLBACK_TYPE_FETCH_DATA,
-                Callback: Some(fetch_data_callback),
-            },
-            CF_CALLBACK_REGISTRATION {
-                Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
-                Callback: Some(file_close_completion_callback),
-            },
-            CF_CALLBACK_REGISTRATION {
-                Type: CF_CALLBACK_TYPE_NONE,
-                Callback: None,
-            },
-        ]
-        .into_boxed_slice();
-
-        let mut connection_key: CF_CONNECTION_KEY = 0;
-        let hr = unsafe {
-            CfConnectSyncRoot(
-                root_path.as_ptr(),
-                callback_table.as_ptr(),
-                (&mut *callback_context as *mut CallbackContext).cast::<c_void>(),
-                CF_CONNECT_FLAG_NONE,
-                &mut connection_key,
-            )
-        };
-        hresult_to_result(hr, "CfConnectSyncRoot")?;
-
-        eprintln!("connected to CFAPI callbacks with connection key {}", connection_key);
-
-        Ok(SyncRootConnection {
-            connection_key,
-            _callback_table: callback_table,
-            _callback_context: callback_context,
-        })
-    }
-
-    fn string_from_pcwstr(value: windows_sys::core::PCWSTR) -> String {
-        if value.is_null() {
-            return String::new();
-        }
-
-        let mut len = 0usize;
-        unsafe {
-            while *value.add(len) != 0 {
-                len += 1;
-            }
-            let raw = std::slice::from_raw_parts(value, len);
-            String::from_utf16_lossy(raw)
+    pub fn walk(&mut self) {
+        let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
+        for entry in walker.flatten() {
+            let path = entry.path();
+            let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
+            self.handle_entry(path, rel_path);
         }
     }
 
-
-    unsafe extern "system" fn fetch_data_callback(
-        callback_info: *const CF_CALLBACK_INFO,
-        callback_parameters: *const CF_CALLBACK_PARAMETERS,
-    ) { 
-        if callback_info.is_null() || callback_parameters.is_null() {
+    fn handle_entry(&mut self, path: &std::path::Path, rel_path: String) {
+        if rel_path.is_empty() || self.seen.contains(&rel_path) {
             return;
         }
-
-        let callback_info_ref = unsafe { &*callback_info };
-        let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
-        if context_ptr.is_null() {
-            return;
-        }
-        let context = unsafe { &*context_ptr };
-
-        let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
-        let relative_path = path_to_relative(&context.sync_root, &normalized_path);
-
-        let payload = match context
-            .runtime
-            .handle_fetch_data(&relative_path, context.hydrator.as_ref())
-        {
-            Ok(data) => data,
-            Err(err) => {
-                eprintln!("cfapi fetch-data hydration error: {err}");
-                return;
-            }
-        };
-
-        if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
-            hydrated_paths.insert(relative_path.clone());
-        }
-
-        if let Err(err) = execute_transfer_data(callback_info_ref, callback_parameters, &payload) {
-            eprintln!("cfapi transfer-data execution error: {err}");
-        }
-    }
-
-    unsafe extern "system" fn file_close_completion_callback(
-        callback_info: *const CF_CALLBACK_INFO,
-        callback_parameters: *const CF_CALLBACK_PARAMETERS,
-    ) { 
-        if callback_info.is_null() || callback_parameters.is_null() {
-            eprintln!("close-completion: null callback_info or callback_parameters");
-            return;
-        }
-
-        let callback_info_ref = unsafe { &*callback_info };
-        let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
-        if context_ptr.is_null() {
-            eprintln!("close-completion: null context ptr");
-            return;
-        }
-        let context = unsafe { &*context_ptr };
-        let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
-
-        let close_completion = unsafe { (*callback_parameters).Anonymous.CloseCompletion };
-        eprintln!(
-            "close-completion: flags={:x} path={}",
-            close_completion.Flags,
-            normalized_path
-        );
-        if (close_completion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
-            eprintln!("close-completion: file deleted, skipping upload");
-            return;
-        }
-
-        if normalized_path.is_empty() {
-            eprintln!("close-completion: empty normalized path");
-            return;
-        }
-
-        let relative_path = path_to_relative(&context.sync_root, &normalized_path);
-        eprintln!("close-completion: relative_path={}", relative_path);
-
-        // Remove hydrated_once_paths logic: always handle upload for any file closed in sync root
-        // This allows new files and folders to be uploaded, matching OneDrive behavior
-        // Log for diagnostics
-        eprintln!("close-completion: checking upload for {}", relative_path);
-
-        // Resolve full path relative to the registered sync root to handle
-        // CFAPI NormalizedPath values that may omit the drive letter and
-        // start with a leading backslash (e.g. "\\ironmesh-sync2\\file.txt").
-        let full_path = context.sync_root.join(&relative_path);
-        let metadata = match std::fs::metadata(&full_path) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                eprintln!(
-                    "close-completion: metadata error for {}: {}",
-                    full_path.display(),
-                    err
-                );
-                return;
-            }
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return,
         };
         if metadata.is_dir() {
-            eprintln!(
-                "close-completion: {} is a directory, uploading directory metadata",
-                normalized_path
-            );
-            // Optionally: upload directory metadata or create remote folder
-            match context.uploader.upload(&relative_path, b"<DIR>") {
-                Ok(_) => {
-                    eprintln!("cfapi uploaded directory: path={}", relative_path);
-                }
-                Err(err) => {
+            eprintln!("{}: detected new directory {}", self.name, rel_path);
+            let _ = self.uploader.upload(&rel_path, b"<DIR>");
+        } else {
+            // Check if file is already a CFAPI placeholder using Windows file attributes
+            let is_placeholder = path_is_placeholder(path);
+            if is_placeholder {
+                eprintln!(
+                    "{}: skipping placeholder creation for CFAPI placeholder file {}",
+                    self.name, rel_path
+                );
+            } else if path.exists() {
+                // File is materialized, convert to placeholder using a file HANDLE
+                try_convert_materialized_file(path, &rel_path, &metadata);
+            } else {
+                // File does not exist, create placeholder
+                use crate::runtime::create_placeholder;
+                if let Err(e) = create_placeholder(&self.sync_root, &rel_path) {
                     eprintln!(
-                        "cfapi upload error (dir): path={} error={}",
-                        relative_path, err
+                        "{}: failed to create placeholder for {}: {}",
+                        self.name, rel_path, e
                     );
+                } else {
+                    eprintln!("{}: created placeholder for {}", self.name, rel_path);
                 }
             }
+        }
+        self.seen.insert(rel_path);
+    }
+}
+
+fn monitor_sync_root_changes(
+    sync_root_clone: PathBuf,
+    uploader_thread: std::sync::Arc<dyn Uploader>,
+) {
+    let mut monitor = SyncRootMonitor::new("monitor", sync_root_clone, uploader_thread);
+    monitor.run();
+}
+
+pub fn connect_sync_root(
+    registration: &SyncRootRegistration,
+    runtime: CfapiRuntime,
+    hydrator: Box<dyn Hydrator>,
+    uploader: std::sync::Arc<dyn Uploader>,
+) -> Result<SyncRootConnection> {
+    let sync_root = registration.root_path.clone();
+    eprintln!(
+        "startup-scan: scanning {} for pre-existing files",
+        sync_root.display()
+    );
+    let mut startup_monitor =
+        SyncRootMonitor::new("startup-scan", sync_root.clone(), uploader.clone());
+    startup_monitor.walk();
+
+    // Spawn a background thread to monitor the sync root for new files/folders
+    // use std::sync::Arc; // Removed unused import
+    let sync_root_clone = sync_root.clone();
+    let uploader_thread = uploader.clone();
+
+    std::thread::spawn(move || monitor_sync_root_changes(sync_root_clone, uploader_thread));
+
+    let root_path = utf16_path(&registration.root_path);
+    let mut callback_context = Box::new(CallbackContext {
+        sync_root: registration.root_path.clone(),
+        runtime,
+        hydrator,
+        uploader: uploader.clone(),
+        hydrated_once_paths: Mutex::new(HashSet::new()),
+    });
+
+    let callback_table = vec![
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_FETCH_DATA,
+            Callback: Some(fetch_data_callback),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
+            Callback: Some(file_close_completion_callback),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NONE,
+            Callback: None,
+        },
+    ]
+    .into_boxed_slice();
+
+    let mut connection_key: CF_CONNECTION_KEY = 0;
+    let hr = unsafe {
+        CfConnectSyncRoot(
+            root_path.as_ptr(),
+            callback_table.as_ptr(),
+            (&mut *callback_context as *mut CallbackContext).cast::<c_void>(),
+            CF_CONNECT_FLAG_NONE,
+            &mut connection_key,
+        )
+    };
+    hresult_to_result(hr, "CfConnectSyncRoot")?;
+
+    eprintln!(
+        "connected to CFAPI callbacks with connection key {}",
+        connection_key
+    );
+
+    Ok(SyncRootConnection {
+        connection_key,
+        _callback_table: callback_table,
+        _callback_context: callback_context,
+    })
+}
+
+fn string_from_pcwstr(value: windows_sys::core::PCWSTR) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+
+    let mut len = 0usize;
+    unsafe {
+        while *value.add(len) != 0 {
+            len += 1;
+        }
+        let raw = std::slice::from_raw_parts(value, len);
+        String::from_utf16_lossy(raw)
+    }
+}
+
+unsafe extern "system" fn fetch_data_callback(
+    callback_info: *const CF_CALLBACK_INFO,
+    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+) {
+    if callback_info.is_null() || callback_parameters.is_null() {
+        return;
+    }
+
+    let callback_info_ref = unsafe { &*callback_info };
+    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
+    if context_ptr.is_null() {
+        return;
+    }
+    let context = unsafe { &*context_ptr };
+
+    let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
+    let relative_path = path_to_relative(&context.sync_root, &normalized_path);
+
+    let payload = match context
+        .runtime
+        .handle_fetch_data(&relative_path, context.hydrator.as_ref())
+    {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("cfapi fetch-data hydration error: {err}");
             return;
         }
+    };
 
-        let payload = match std::fs::read(&full_path) {
-            Ok(data) => data,
-            Err(err) => {
-                eprintln!(
-                    "cfapi close-completion read error: path={} error={}",
-                    full_path.display(),
-                    err
-                );
-                return;
-            }
-        };
+    if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
+        hydrated_paths.insert(relative_path.clone());
+    }
 
+    if let Err(err) = execute_transfer_data(callback_info_ref, callback_parameters, &payload) {
+        eprintln!("cfapi transfer-data execution error: {err}");
+    }
+}
+
+unsafe extern "system" fn file_close_completion_callback(
+    callback_info: *const CF_CALLBACK_INFO,
+    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+) {
+    if callback_info.is_null() || callback_parameters.is_null() {
+        eprintln!("close-completion: null callback_info or callback_parameters");
+        return;
+    }
+
+    let callback_info_ref = unsafe { &*callback_info };
+    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
+    if context_ptr.is_null() {
+        eprintln!("close-completion: null context ptr");
+        return;
+    }
+    let context = unsafe { &*context_ptr };
+    let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
+
+    let close_completion = unsafe { (*callback_parameters).Anonymous.CloseCompletion };
+    eprintln!(
+        "close-completion: flags={:x} path={}",
+        close_completion.Flags, normalized_path
+    );
+    if (close_completion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
+        eprintln!("close-completion: file deleted, skipping upload");
+        return;
+    }
+
+    if normalized_path.is_empty() {
+        eprintln!("close-completion: empty normalized path");
+        return;
+    }
+
+    let relative_path = path_to_relative(&context.sync_root, &normalized_path);
+    eprintln!("close-completion: relative_path={}", relative_path);
+
+    // Remove hydrated_once_paths logic: always handle upload for any file closed in sync root
+    // This allows new files and folders to be uploaded, matching OneDrive behavior
+    // Log for diagnostics
+    eprintln!("close-completion: checking upload for {}", relative_path);
+
+    // Resolve full path relative to the registered sync root to handle
+    // CFAPI NormalizedPath values that may omit the drive letter and
+    // start with a leading backslash (e.g. "\\ironmesh-sync2\\file.txt").
+    let full_path = context.sync_root.join(&relative_path);
+    let metadata = match std::fs::metadata(&full_path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            eprintln!(
+                "close-completion: metadata error for {}: {}",
+                full_path.display(),
+                err
+            );
+            return;
+        }
+    };
+    if metadata.is_dir() {
         eprintln!(
-            "close-completion: uploading {} ({} bytes)",
-            relative_path,
-            payload.len()
+            "close-completion: {} is a directory, uploading directory metadata",
+            normalized_path
         );
-        match context.uploader.upload(&relative_path, &payload) {
-            Ok(remote_version) => {
-                if let Some(version) = remote_version {
-                    context.runtime.set_remote_version(&relative_path, version);
-                }
-                eprintln!(
-                    "cfapi uploaded local file: path={} bytes={}",
-                    relative_path,
-                    payload.len()
-                );
+        // Optionally: upload directory metadata or create remote folder
+        match context.uploader.upload(&relative_path, b"<DIR>") {
+            Ok(_) => {
+                eprintln!("cfapi uploaded directory: path={}", relative_path);
             }
             Err(err) => {
                 eprintln!(
-                    "cfapi upload error: path={} bytes={} error={}",
-                    relative_path,
-                    payload.len(),
-                    err
+                    "cfapi upload error (dir): path={} error={}",
+                    relative_path, err
                 );
             }
         }
+        return;
     }
 
-    fn execute_transfer_data(
-        callback_info: &CF_CALLBACK_INFO,
-        callback_parameters: *const CF_CALLBACK_PARAMETERS,
-        payload: &[u8],
-    ) -> Result<()> {
-        let fetch_data = unsafe { (*callback_parameters).Anonymous.FetchData };
-        let required_offset = fetch_data.RequiredFileOffset.max(0) as usize;
-        let required_length = fetch_data.RequiredLength.max(0) as usize;
+    let payload = match std::fs::read(&full_path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "cfapi close-completion read error: path={} error={}",
+                full_path.display(),
+                err
+            );
+            return;
+        }
+    };
 
-        let start = required_offset.min(payload.len());
-        let max_len = payload.len().saturating_sub(start);
-        let transfer_len = required_length.min(max_len);
-        let transfer_slice = &payload[start..start + transfer_len];
-
-        let transfer_data = CF_OPERATION_PARAMETERS_0_0 {
-            Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-            CompletionStatus: 0,
-            Buffer: transfer_slice.as_ptr().cast::<c_void>(),
-            Offset: required_offset as i64,
-            Length: transfer_slice.len() as i64,
-        };
-
-        let mut op_params = CF_OPERATION_PARAMETERS {
-            ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
-            Anonymous: CF_OPERATION_PARAMETERS_0 {
-                TransferData: transfer_data,
-            },
-        };
-
-        let op_info = CF_OPERATION_INFO {
-            StructSize: size_of::<CF_OPERATION_INFO>() as u32,
-            Type: CF_OPERATION_TYPE_TRANSFER_DATA,
-            ConnectionKey: callback_info.ConnectionKey,
-            TransferKey: callback_info.TransferKey,
-            CorrelationVector: callback_info.CorrelationVector,
-            SyncStatus: null(),
-            RequestKey: callback_info.RequestKey,
-        };
-
-        let hr = unsafe { CfExecute(&op_info, &mut op_params) };
-        hresult_to_result(hr, "CfExecute")
+    eprintln!(
+        "close-completion: uploading {} ({} bytes)",
+        relative_path,
+        payload.len()
+    );
+    match context.uploader.upload(&relative_path, &payload) {
+        Ok(remote_version) => {
+            if let Some(version) = remote_version {
+                context.runtime.set_remote_version(&relative_path, version);
+            }
+            eprintln!(
+                "cfapi uploaded local file: path={} bytes={}",
+                relative_path,
+                payload.len()
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "cfapi upload error: path={} bytes={} error={}",
+                relative_path,
+                payload.len(),
+                err
+            );
+        }
     }
+}
 
-    fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
-        if registration.sync_root_id.trim().is_empty() {
-            return Err(anyhow!("sync root id cannot be empty"));
-        }
-        if registration.display_name.trim().is_empty() {
-            return Err(anyhow!("display name cannot be empty"));
-        }
-        if registration.root_path.as_os_str().is_empty() {
-            return Err(anyhow!("root path cannot be empty"));
-        }
-        Ok(())
+fn execute_transfer_data(
+    callback_info: &CF_CALLBACK_INFO,
+    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+    payload: &[u8],
+) -> Result<()> {
+    let fetch_data = unsafe { (*callback_parameters).Anonymous.FetchData };
+    let required_offset = fetch_data.RequiredFileOffset.max(0) as usize;
+    let required_length = fetch_data.RequiredLength.max(0) as usize;
+
+    let start = required_offset.min(payload.len());
+    let max_len = payload.len().saturating_sub(start);
+    let transfer_len = required_length.min(max_len);
+    let transfer_slice = &payload[start..start + transfer_len];
+
+    let transfer_data = CF_OPERATION_PARAMETERS_0_0 {
+        Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+        CompletionStatus: 0,
+        Buffer: transfer_slice.as_ptr().cast::<c_void>(),
+        Offset: required_offset as i64,
+        Length: transfer_slice.len() as i64,
+    };
+
+    let mut op_params = CF_OPERATION_PARAMETERS {
+        ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            TransferData: transfer_data,
+        },
+    };
+
+    let op_info = CF_OPERATION_INFO {
+        StructSize: size_of::<CF_OPERATION_INFO>() as u32,
+        Type: CF_OPERATION_TYPE_TRANSFER_DATA,
+        ConnectionKey: callback_info.ConnectionKey,
+        TransferKey: callback_info.TransferKey,
+        CorrelationVector: callback_info.CorrelationVector,
+        SyncStatus: null(),
+        RequestKey: callback_info.RequestKey,
+    };
+
+    let hr = unsafe { CfExecute(&op_info, &mut op_params) };
+    hresult_to_result(hr, "CfExecute")
+}
+
+fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
+    if registration.sync_root_id.trim().is_empty() {
+        return Err(anyhow!("sync root id cannot be empty"));
     }
+    if registration.display_name.trim().is_empty() {
+        return Err(anyhow!("display name cannot be empty"));
+    }
+    if registration.root_path.as_os_str().is_empty() {
+        return Err(anyhow!("root path cannot be empty"));
+    }
+    Ok(())
+}
 
-    // UTF-16 and PCWSTR helpers moved to `helpers.rs`.
+// UTF-16 and PCWSTR helpers moved to `helpers.rs`.
 
-    fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
-        let normalized_root = sync_root
-            .as_os_str()
-            .to_string_lossy()
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_string();
+fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
+    let normalized_root = sync_root
+        .as_os_str()
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
 
-        let mut candidate = normalized_path.replace('/', "\\");
-        if let Some(stripped) = candidate.strip_prefix(&normalized_root) {
-            candidate = stripped.to_string();
-        } else {
-            // CFAPI sometimes provides a NormalizedPath that starts with a leading
-            // backslash and the sync-root name (e.g. "\\ironmesh-sync2\\file.txt").
-            // In that case, strip the leading separators and then remove the
-            // sync-root folder name if present.
-            let trimmed_leading = candidate.trim_start_matches(['\\', '/']).to_string();
-            if let Some(root_name_os) = sync_root.file_name() {
-                let root_name = root_name_os.to_string_lossy();
-                if let Some(stripped) = trimmed_leading.strip_prefix(root_name.as_ref()) {
-                    candidate = stripped.to_string();
-                }
+    let mut candidate = normalized_path.replace('/', "\\");
+    if let Some(stripped) = candidate.strip_prefix(&normalized_root) {
+        candidate = stripped.to_string();
+    } else {
+        // CFAPI sometimes provides a NormalizedPath that starts with a leading
+        // backslash and the sync-root name (e.g. "\\ironmesh-sync2\\file.txt").
+        // In that case, strip the leading separators and then remove the
+        // sync-root folder name if present.
+        let trimmed_leading = candidate.trim_start_matches(['\\', '/']).to_string();
+        if let Some(root_name_os) = sync_root.file_name() {
+            let root_name = root_name_os.to_string_lossy();
+            if let Some(stripped) = trimmed_leading.strip_prefix(root_name.as_ref()) {
+                candidate = stripped.to_string();
             }
         }
-
-        normalize_path(candidate.trim_start_matches(['\\', '/']))
     }
+
+    normalize_path(candidate.trim_start_matches(['\\', '/']))
+}
 
 #[cfg(test)]
 mod tests {
