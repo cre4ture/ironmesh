@@ -1,7 +1,11 @@
 use super::*;
 
 fn test_store_dir(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("ironmesh-{name}-{}", unix_ts_nanos()))
+    std::env::temp_dir().join(format!(
+        "ironmesh-{name}-{}-{}",
+        std::process::id(),
+        unix_ts_nanos()
+    ))
 }
 
 fn mk_record(
@@ -495,6 +499,53 @@ async fn list_replication_subjects_includes_all_heads_for_divergent_versions() {
     assert!(subjects.contains(&"hello".to_string()));
     assert!(subjects.contains(&format!("hello@{}", first.version_id)));
     assert!(subjects.contains(&format!("hello@{}", second.version_id)));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn tombstone_creates_tombstone_version_and_removes_current_key() {
+    let root = test_store_dir("tombstone-storage");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    let _put = store
+        .put_object_versioned(
+            "will-delete",
+            Bytes::from_static(b"to-be-deleted"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    // verify it's readable
+    let read = store
+        .get_object("will-delete", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(read.as_ref(), b"to-be-deleted");
+
+    // tombstone
+    let tomb_id = store
+        .tombstone_object("will-delete", PutOptions::default())
+        .await
+        .unwrap();
+
+    // version index should contain tombstone entry
+    let versions = store.list_versions("will-delete").await.unwrap().unwrap();
+    assert!(versions.versions.iter().any(|v| v.version_id == tomb_id));
+
+    // current keys should not include the key after tombstone
+    let keys = store.current_keys();
+    assert!(!keys.contains(&"will-delete".to_string()));
+
+    // reading the object via store should return NotFound
+    let read_after = store
+        .get_object("will-delete", None, None, ObjectReadMode::Preferred)
+        .await;
+    match read_after {
+        Err(super::StoreReadError::NotFound) => {}
+        other => panic!("expected NotFound after tombstone, got: {:?}", other),
+    }
 
     let _ = fs::remove_dir_all(root).await;
 }

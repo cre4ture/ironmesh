@@ -504,7 +504,10 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
-        .route("/store/{key}", put(put_object).get(get_object))
+        .route(
+            "/store/{key}",
+            put(put_object).get(get_object).delete(delete_object),
+        )
         .route("/versions/{key}", get(list_versions))
         .route(
             "/versions/{key}/confirm/{version_id}",
@@ -1028,6 +1031,80 @@ async fn put_object(
         }
         Err(err) => {
             tracing::error!(error = %err, key = %key, "failed to store object");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn delete_object(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+    Query(query): Query<PutObjectQuery>,
+) -> impl IntoResponse {
+    if query.version_id.is_some() && !query.internal_replication {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let version_state = match query.state.as_deref() {
+        None | Some("confirmed") => VersionConsistencyState::Confirmed,
+        Some("provisional") => VersionConsistencyState::Provisional,
+        Some(_) => return StatusCode::BAD_REQUEST,
+    };
+
+    let mut store = state.store.lock().await;
+    match store
+        .tombstone_object(
+            &key,
+            PutOptions {
+                parent_version_ids: query.parent,
+                state: version_state,
+                inherit_preferred_parent: true,
+                create_snapshot: !query.internal_replication,
+                explicit_version_id: query.version_id,
+            },
+        )
+        .await
+    {
+        Ok(version_id) => {
+            drop(store);
+
+            let mut cluster = state.cluster.lock().await;
+            cluster.note_replica(&key, state.node_id);
+            cluster.note_replica(format!("{}@{}", key, version_id), state.node_id);
+            drop(cluster);
+
+            if let Err(err) = persist_cluster_replicas_state(&state).await {
+                warn!(error = %err, "failed to persist cluster replicas after tombstone");
+            }
+
+            if should_trigger_autonomous_post_write_replication(
+                state.autonomous_replication_on_put_enabled,
+                query.internal_replication,
+            ) {
+                let state_for_repair = state.clone();
+                tokio::spawn(async move {
+                    let report =
+                        replication::execute_replication_repair_inner(&state_for_repair, None)
+                            .await;
+                    if report.attempted_transfers > 0 || report.failed_transfers > 0 {
+                        info!(
+                            attempted = report.attempted_transfers,
+                            success = report.successful_transfers,
+                            failed = report.failed_transfers,
+                            skipped = report.skipped_items,
+                            skipped_backoff = report.skipped_backoff,
+                            skipped_max_retries = report.skipped_max_retries,
+                            "autonomous post-write replication run"
+                        );
+                    }
+                });
+            }
+
+            info!(key = %key, version_id = %version_id, "tombstoned object");
+            StatusCode::CREATED
+        }
+        Err(err) => {
+            tracing::error!(error = %err, key = %key, "failed to tombstone object");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

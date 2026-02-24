@@ -214,6 +214,52 @@ async fn startup_repair_runs_when_gaps_exist() {
     cleanup_test_state(&state).await;
 }
 
+#[tokio::test]
+async fn delete_object_handler_marks_tombstone_and_removes_current_key() {
+    let state = build_test_state(1, false).await;
+
+    // put an object into underlying store
+    let key = "handler-delete-key".to_string();
+    {
+        let mut locked = state.store.lock().await;
+        locked
+            .put_object_versioned(
+                &key,
+                bytes::Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // call handler directly
+    let query = axum::extract::Query(super::PutObjectQuery {
+        state: Some("confirmed".to_string()),
+        parent: Vec::new(),
+        version_id: None,
+        internal_replication: false,
+    });
+
+    let resp = super::delete_object(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(key.clone()),
+        query,
+    )
+    .await;
+
+    let response = axum::response::IntoResponse::into_response(resp);
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    // ensure underlying store current keys no longer include the key
+    let keys = {
+        let store = state.store.lock().await;
+        store.current_keys()
+    };
+    assert!(!keys.contains(&key));
+
+    cleanup_test_state(&state).await;
+}
+
 async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerState {
     let root = fresh_test_dir("startup-repair-main");
     let local_node_id = NodeId::new_v4();

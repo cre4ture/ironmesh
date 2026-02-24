@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
+const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkRef {
@@ -976,6 +977,10 @@ impl PersistentStore {
         }
         .ok_or(StoreReadError::NotFound)?;
 
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Err(StoreReadError::NotFound);
+        }
+
         let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
 
         if !fs::try_exists(&manifest_path)
@@ -1043,6 +1048,88 @@ impl PersistentStore {
         }
 
         Ok(assembled.freeze())
+    }
+
+    pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
+        let mut index = self
+            .load_version_index(key)
+            .await?
+            .unwrap_or_else(|| empty_version_index(key));
+
+        let parent_version_ids = if options.parent_version_ids.is_empty() {
+            if options.inherit_preferred_parent {
+                index
+                    .preferred_head_version_id
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        } else {
+            options.parent_version_ids.clone()
+        };
+
+        for parent in &parent_version_ids {
+            if !index.versions.contains_key(parent) {
+                bail!("parent version does not exist for key={key}: {parent}");
+            }
+        }
+
+        let version_id = options
+            .explicit_version_id
+            .clone()
+            .unwrap_or_else(|| format!("tomb-{}", unix_ts_nanos()));
+
+        if let Some(existing) = index.versions.get(&version_id) {
+            if existing.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+                bail!(
+                    "version id collision for key={key} version_id={version_id}: different manifest"
+                );
+            }
+
+            self.sync_current_state_for_key_from_index(key, &index)?;
+            self.persist_current_state().await?;
+
+            let _snapshot_id = if options.create_snapshot {
+                self.create_snapshot().await?
+            } else {
+                format!("snap-skipped-{version_id}")
+            };
+
+            return Ok(existing.version_id.clone());
+        }
+
+        let record = FileVersionRecord {
+            version_id: version_id.clone(),
+            key: key.to_string(),
+            manifest_hash: TOMBSTONE_MANIFEST_HASH.to_string(),
+            parent_version_ids: parent_version_ids.clone(),
+            state: options.state.clone(),
+            created_at_unix: unix_ts(),
+        };
+
+        index.versions.insert(version_id.clone(), record);
+
+        let mut heads: HashSet<String> = index.head_version_ids.into_iter().collect();
+        for parent in &parent_version_ids {
+            heads.remove(parent);
+        }
+        heads.insert(version_id.clone());
+
+        index.head_version_ids = heads.into_iter().collect();
+        index.head_version_ids.sort();
+        index.preferred_head_version_id = choose_preferred_head(&index);
+
+        self.persist_version_index(key, &index).await?;
+        self.sync_current_state_for_key_from_index(key, &index)?;
+        self.persist_current_state().await?;
+
+        if options.create_snapshot {
+            self.create_snapshot().await?;
+        }
+
+        Ok(version_id)
     }
 
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
@@ -1198,6 +1285,11 @@ impl PersistentStore {
             .with_context(|| {
                 format!("preferred head {preferred_head} missing in index for key={key}")
             })?;
+
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            self.current_state.objects.remove(key);
+            return Ok(());
+        }
 
         self.current_state
             .objects

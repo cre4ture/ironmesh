@@ -2,14 +2,16 @@
 
 use clap::{Parser, Subcommand};
 use reqwest::blocking::Client;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use std::sync::Arc;
 
 use crate::adapter::WindowsCfapiAdapter;
 use crate::live::{ServerNodeHydrator, load_snapshot_from_server, normalize_base_url};
-use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root, register_sync_root};
+use crate::runtime::{
+    CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root, register_sync_root,
+};
 use sync_core::SyncPolicy;
 
 #[derive(Debug, Parser)]
@@ -57,17 +59,20 @@ pub fn cli_main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Register(args) => {
-            let registration = SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
+            let registration =
+                SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
             register_sync_root(&registration)
         }
 
         Commands::Serve(args) => {
-            let registration = SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
+            let registration =
+                SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
 
             let base_url = normalize_base_url(&args.server_base_url)?;
             let client = Client::new();
 
-            let snapshot = load_snapshot_from_server(&client, &base_url, args.prefix.as_deref(), args.depth)?;
+            let snapshot =
+                load_snapshot_from_server(&client, &base_url, args.prefix.as_deref(), args.depth)?;
             let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
             let action_plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
 

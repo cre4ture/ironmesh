@@ -1,12 +1,8 @@
 #![cfg(windows)]
 
 use crate::adapter::WindowsCfapiAdapter;
-use crate::live::{
-    ServerNodeHydrator, load_snapshot_from_server, normalize_base_url,
-};
-use crate::runtime::{
-    CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
-};
+use crate::live::{ServerNodeHydrator, load_snapshot_from_server, normalize_base_url};
+use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root};
 use clap::Parser;
 use reqwest::blocking::Client;
 use std::sync::atomic::{AtomicBool, Ordering};
