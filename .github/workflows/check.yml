@@ -90,8 +90,7 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Restore Android keystore (optional)
-        if: ${{ secrets.ANDROID_KEYSTORE_B64 != '' }}
+      - name: Restore Android keystore
         run: |
           mkdir -p $HOME/.android
           echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 --decode > $HOME/.android/debug.keystore
