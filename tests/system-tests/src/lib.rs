@@ -2242,7 +2242,7 @@ mod tests {
         result
     }
 
-    async fn start_server(bind: &str) -> Result<Child> {
+    pub async fn start_server(bind: &str) -> Result<Child> {
         let data_dir = fresh_data_dir("default-server");
         start_server_with_data_dir(bind, &data_dir).await
     }
@@ -2504,7 +2504,7 @@ mod tests {
         );
     }
 
-    async fn stop_server(child: &mut Child) {
+    pub async fn stop_server(child: &mut Child) {
         let _ = child.kill().await;
         let _ = child.wait().await;
     }

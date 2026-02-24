@@ -1,19 +1,20 @@
+#![cfg(windows)]
 #[cfg(test)]
 mod cfapi_monitor_test {
-    use std::fs::{self, File};
+    use std::fs::File;
     use std::io::Write;
-    use std::thread;
     use std::time::Duration;
-    use reqwest::blocking::Client;
-    use crate::{start_server, stop_server};
+    use reqwest::Client;
+    use crate::tests::{start_server, stop_server};
 
-    #[test]
-    fn test_cfapi_monitor_detects_new_and_modified_file() {
+    #[tokio::test]
+    async fn test_cfapi_monitor_detects_new_and_modified_file() {
         let bind = "127.0.0.1:19090";
-        let mut server = start_server(bind).expect("Failed to start local server-node");
+        let mut server = start_server(bind).await.expect("Failed to start local server-node");
         let base_url = format!("http://{bind}");
-        let sync_root = "C:/ironmesh-sync2";
-        let test_file = format!("{}/monitor_test.txt", sync_root);
+        let sync_root = std::env::temp_dir().join("ironmesh-sync2");
+        std::fs::create_dir_all(&sync_root).expect("Failed to create sync root");
+        let test_file = sync_root.join("monitor_test.txt");
         let server_url = format!("{}/store/monitor_test.txt", base_url);
         let client = Client::new();
 
@@ -23,9 +24,9 @@ mod cfapi_monitor_test {
         file.sync_all().expect("Failed to sync file");
 
         // Wait for monitor to detect and upload
-        thread::sleep(Duration::from_secs(10));
-        let resp = client.get(&server_url).send().expect("Failed to GET file");
-        let body = resp.text().expect("Failed to read response body");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let resp = client.get(&server_url).send().await.expect("Failed to GET file");
+        let body = resp.text().await.expect("Failed to read response body");
         assert!(body.contains("initial content"), "Initial content not found on server");
 
         // Step 2: Modify file
@@ -34,11 +35,11 @@ mod cfapi_monitor_test {
         file.sync_all().expect("Failed to sync file");
 
         // Wait for monitor to detect and upload
-        thread::sleep(Duration::from_secs(10));
-        let resp = client.get(&server_url).send().expect("Failed to GET file after modification");
-        let body = resp.text().expect("Failed to read response body");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let resp = client.get(&server_url).send().await.expect("Failed to GET file after modification");
+        let body = resp.text().await.expect("Failed to read response body");
         assert!(body.contains("modified content"), "Modified content not found on server");
 
-        stop_server(&mut server).expect("Failed to stop local server-node");
+        stop_server(&mut server).await;
     }
 }

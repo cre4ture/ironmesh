@@ -120,13 +120,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build Linux FUSE mount binary
-        run: cargo build -p adapter-linux-fuse --bin adapter-linux-fuse-mount --release
+        run: cargo build -p os-integration --bin os-integration --release
 
       - name: Upload Linux FUSE mount binary
         uses: actions/upload-artifact@v4
         with:
           name: linux-fuse-mount-binary-ubuntu
-          path: target/release/adapter-linux-fuse-mount
+          path: target/release/os-integration
           if-no-files-found: error
 
   windows-cfapi-check:
