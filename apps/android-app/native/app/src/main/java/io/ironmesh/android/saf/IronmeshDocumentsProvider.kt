@@ -10,6 +10,8 @@ import android.webkit.MimeTypeMap
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import kotlinx.coroutines.runBlocking
+import android.util.Log
+import java.io.IOException
 import java.io.FileNotFoundException
 
 class IronmeshDocumentsProvider : DocumentsProvider() {
@@ -134,10 +136,16 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
 
             Thread {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { output ->
-                    runBlocking {
-                        repository.streamObjectTo(resolveBaseUrl(), target.path, output)
+                    try {
+                        runBlocking {
+                            repository.streamObjectTo(resolveBaseUrl(), target.path, output)
+                        }
+                        output.flush()
+                    } catch (e: IOException) {
+                        Log.w(TAG, "Client closed pipe while streaming: ${e.message}")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error streaming object", e)
                     }
-                    output.flush()
                 }
             }.start()
 
@@ -265,6 +273,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     )
 
     private companion object {
+        private const val TAG = "IronmeshDocumentsProvider"
         private const val ROOT_ID = "ironmesh-root"
         private const val ROOT_TITLE = "Ironmesh"
     }
