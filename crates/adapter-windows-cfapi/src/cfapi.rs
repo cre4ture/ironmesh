@@ -1,7 +1,7 @@
-use anyhow::Result;
-use std::path::Path;
-use std::os::windows::fs::MetadataExt;
 use crate::helpers::hresult_nonneg;
+use anyhow::Result;
+use std::os::windows::fs::MetadataExt;
+use std::path::Path;
 
 pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
@@ -63,7 +63,6 @@ pub fn get_and_log_placeholder_info(
     }
 }
 
-
 pub fn is_placeholder(file: &std::fs::File) -> bool {
     get_and_log_placeholder_info(file, "", "").unwrap_or(0) > 0
 }
@@ -75,7 +74,11 @@ pub fn path_is_placeholder(path: &Path) -> bool {
     }
 }
 
-pub fn try_convert_materialized_file(file_path: &Path, rel_path: &str, metadata: &std::fs::Metadata) {
+pub fn try_convert_materialized_file(
+    file_path: &Path,
+    rel_path: &str,
+    metadata: &std::fs::Metadata,
+) {
     {
         let attrs = metadata.file_attributes();
         eprintln!(

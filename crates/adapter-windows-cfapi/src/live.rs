@@ -45,7 +45,9 @@ impl Uploader for ServerNodeHydrator {
 
         let mut buf = Vec::with_capacity(std::cmp::min(length as usize, 8192));
         let mut limited = reader.take(length);
-        limited.read_to_end(&mut buf).with_context(|| format!("failed reading payload for upload {path}"))?;
+        limited
+            .read_to_end(&mut buf)
+            .with_context(|| format!("failed reading payload for upload {path}"))?;
 
         self.client
             .put(object_url)

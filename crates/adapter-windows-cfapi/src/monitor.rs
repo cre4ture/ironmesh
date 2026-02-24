@@ -1,6 +1,5 @@
-
-use std::path::PathBuf;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cfapi::{path_is_placeholder, try_convert_materialized_file};
@@ -52,7 +51,9 @@ impl SyncRootMonitor {
         if metadata.is_dir() {
             eprintln!("{}: detected new directory {}", self.name, rel_path);
             let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
-            let _ = self.uploader.upload_reader(&rel_path, &mut cursor, b"<DIR>".len() as u64);
+            let _ = self
+                .uploader
+                .upload_reader(&rel_path, &mut cursor, b"<DIR>".len() as u64);
         } else {
             // Check if file is already a CFAPI placeholder using Windows file attributes
             let is_placeholder = path_is_placeholder(path);

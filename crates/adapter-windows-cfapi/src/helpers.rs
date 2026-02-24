@@ -2,7 +2,6 @@ use anyhow::Result;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-
 pub(crate) fn hresult_nonneg(hr: i32, operation: &str) -> Result<()> {
     if hr >= 0 {
         Ok(())
@@ -30,7 +29,6 @@ pub fn utf16_path(path: &Path) -> Vec<u16> {
         .chain(std::iter::once(0))
         .collect()
 }
-
 
 pub fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
     let normalized_root = sync_root

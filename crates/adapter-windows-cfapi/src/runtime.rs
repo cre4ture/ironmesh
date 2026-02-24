@@ -1,6 +1,6 @@
-use crate::helpers::{normalize_path, utf16_path, utf16_string, path_to_relative};
-use crate::monitor::SyncRootMonitor;
 use crate::adapter::{CfapiAction, CfapiActionPlan};
+use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
+use crate::monitor::SyncRootMonitor;
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::os::windows::ffi::OsStrExt;
@@ -402,20 +402,20 @@ pub fn connect_sync_root(
     });
 
     let root_path = utf16_path(&registration.root_path);
-        let mut callback_context = Box::new(CallbackContext {
+    let mut callback_context = Box::new(CallbackContext {
         sync_root: registration.root_path.clone(),
         runtime,
         hydrator,
         uploader: uploader.clone(),
-            hydrated_once_paths: Mutex::new(HashSet::new()),
-            opens: Mutex::new(std::collections::HashMap::new()),
+        hydrated_once_paths: Mutex::new(HashSet::new()),
+        opens: Mutex::new(std::collections::HashMap::new()),
     });
 
     let callback_table = vec![
-            CF_CALLBACK_REGISTRATION {
-                Type: CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION,
-                Callback: Some(callback_file_open),
-            },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION,
+            Callback: Some(callback_file_open),
+        },
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_FETCH_DATA,
             Callback: Some(callback_fetch_data),
@@ -536,14 +536,26 @@ unsafe extern "system" fn callback_file_open(
     let (size, mtime_secs) = match std::fs::metadata(&full_path) {
         Ok(m) => {
             let size = m.len();
-            let mtime_secs = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            let mtime_secs = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             (size, mtime_secs)
         }
         Err(_) => (0u64, 0u64),
     };
 
     if let Ok(mut opens) = context.opens.lock() {
-        opens.insert(request_key, OpenInfo { flags: open_flags, size, mtime_secs });
+        opens.insert(
+            request_key,
+            OpenInfo {
+                flags: open_flags,
+                size,
+                mtime_secs,
+            },
+        );
     }
 }
 
@@ -603,9 +615,16 @@ unsafe extern "system" fn callback_file_close_completion(
             // We saw a write-capable open; check if file changed since open.
             if let Ok(metadata) = std::fs::metadata(&full_path) {
                 let size = metadata.len();
-                let mtime_secs = metadata.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                let mtime_secs = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 if size == open_info.size && mtime_secs == open_info.mtime_secs {
-                    eprintln!("close-completion: file opened write-capable but unchanged; skipping upload");
+                    eprintln!(
+                        "close-completion: file opened write-capable but unchanged; skipping upload"
+                    );
                     return;
                 }
             } else {
