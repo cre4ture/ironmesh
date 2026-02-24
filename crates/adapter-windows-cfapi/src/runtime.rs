@@ -1,5 +1,6 @@
-use crate::helpers::{normalize_path, utf16_path, utf16_string};
-use crate::{CfapiAction, CfapiActionPlan};
+use crate::helpers::{normalize_path, utf16_path, utf16_string, path_to_relative};
+use crate::monitor::SyncRootMonitor;
+use crate::adapter::{CfapiAction, CfapiActionPlan};
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::os::windows::ffi::OsStrExt;
@@ -32,7 +33,12 @@ pub trait Hydrator: Send + Sync + 'static {
 }
 
 pub trait Uploader: Send + Sync + 'static {
-    fn upload(&self, path: &str, payload: &[u8]) -> Result<Option<String>>;
+    fn upload_reader(
+        &self,
+        path: &str,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<Option<String>>;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -51,8 +57,25 @@ impl Hydrator for DemoHydrator {
 pub struct DemoUploader;
 
 impl Uploader for DemoUploader {
-    fn upload(&self, path: &str, payload: &[u8]) -> Result<Option<String>> {
-        eprintln!("demo upload: path={path} bytes={}", payload.len());
+    fn upload_reader(
+        &self,
+        path: &str,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<Option<String>> {
+        // Read from the provided reader in chunks to avoid a single large allocation
+        let mut read_bytes = 0usize;
+        let mut buffer = [0u8; 8192];
+        while read_bytes < length as usize {
+            let to_read = std::cmp::min(buffer.len(), length as usize - read_bytes);
+            let n = reader.read(&mut buffer[..to_read]).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            read_bytes += n;
+        }
+
+        eprintln!("demo upload: path={} bytes={}", path, read_bytes);
         Ok(Some("demo-upload".to_string()))
     }
 }
@@ -171,7 +194,6 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 
 use std::mem::{size_of, zeroed};
-use std::os::windows::fs::MetadataExt;
 
 use std::path::Path;
 use std::ptr::null;
@@ -355,140 +377,6 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
     hresult_to_result(hr, "CfCreatePlaceholders")
 }
 
-pub struct SyncRootMonitor {
-    name: String,
-    sync_root: PathBuf,
-    uploader: std::sync::Arc<dyn Uploader>,
-    seen: std::collections::HashSet<String>,
-}
-
-// CFAPI placeholder helpers moved to `helpers.rs`
-use crate::helpers::{cf_convert_to_placeholder, is_placeholder, path_is_placeholder};
-
-fn try_convert_materialized_file(file_path: &Path, rel_path: &str, metadata: &std::fs::Metadata) {
-    {
-        let attrs = metadata.file_attributes();
-        eprintln!(
-            "monitor: attempting convert path={} attrs=0x{:08x} size={}",
-            file_path.display(),
-            attrs,
-            metadata.len()
-        );
-    }
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(file_path)
-    {
-        Ok(fh_file) => {
-            if is_placeholder(&fh_file) {
-                eprintln!(
-                    "x: skipping convert for {} because placeholder info present",
-                    rel_path
-                );
-            } else {
-                let result = cf_convert_to_placeholder(&fh_file);
-                if result.is_ok() {
-                    eprintln!(
-                        "x: converted materialized file to placeholder: {}",
-                        rel_path
-                    );
-                } else {
-                    eprintln!(
-                        "x: failed to convert materialized file to placeholder {}: {:?}",
-                        rel_path,
-                        result.err()
-                    );
-                    if let Ok(m) = std::fs::metadata(file_path) {
-                        let attrs = m.file_attributes();
-                        eprintln!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            eprintln!(
-                "x: failed to open materialized file {} for conversion: {}",
-                rel_path, err
-            );
-        }
-    }
-}
-
-impl SyncRootMonitor {
-    pub fn new(name: &str, sync_root: PathBuf, uploader: std::sync::Arc<dyn Uploader>) -> Self {
-        Self {
-            name: name.to_string(),
-            sync_root,
-            uploader,
-            seen: std::collections::HashSet::new(),
-        }
-    }
-
-    pub fn run(&mut self) {
-        use std::time::Duration;
-        loop {
-            self.walk();
-            std::thread::sleep(Duration::from_secs(5));
-        }
-    }
-
-    pub fn walk(&mut self) {
-        let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
-        for entry in walker.flatten() {
-            let path = entry.path();
-            let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
-            self.handle_entry(path, rel_path);
-        }
-    }
-
-    fn handle_entry(&mut self, path: &std::path::Path, rel_path: String) {
-        if rel_path.is_empty() || self.seen.contains(&rel_path) {
-            return;
-        }
-        let metadata = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        if metadata.is_dir() {
-            eprintln!("{}: detected new directory {}", self.name, rel_path);
-            let _ = self.uploader.upload(&rel_path, b"<DIR>");
-        } else {
-            // Check if file is already a CFAPI placeholder using Windows file attributes
-            let is_placeholder = path_is_placeholder(path);
-            if is_placeholder {
-                eprintln!(
-                    "{}: skipping placeholder creation for CFAPI placeholder file {}",
-                    self.name, rel_path
-                );
-            } else if path.exists() {
-                // File is materialized, convert to placeholder using a file HANDLE
-                try_convert_materialized_file(path, &rel_path, &metadata);
-            } else {
-                // File does not exist, create placeholder
-                use crate::runtime::create_placeholder;
-                if let Err(e) = create_placeholder(&self.sync_root, &rel_path) {
-                    eprintln!(
-                        "{}: failed to create placeholder for {}: {}",
-                        self.name, rel_path, e
-                    );
-                } else {
-                    eprintln!("{}: created placeholder for {}", self.name, rel_path);
-                }
-            }
-        }
-        self.seen.insert(rel_path);
-    }
-}
-
-fn monitor_sync_root_changes(
-    sync_root_clone: PathBuf,
-    uploader_thread: std::sync::Arc<dyn Uploader>,
-) {
-    let mut monitor = SyncRootMonitor::new("monitor", sync_root_clone, uploader_thread);
-    monitor.run();
-}
-
 pub fn connect_sync_root(
     registration: &SyncRootRegistration,
     runtime: CfapiRuntime,
@@ -509,7 +397,9 @@ pub fn connect_sync_root(
     let sync_root_clone = sync_root.clone();
     let uploader_thread = uploader.clone();
 
-    std::thread::spawn(move || monitor_sync_root_changes(sync_root_clone, uploader_thread));
+    std::thread::spawn(move || {
+        SyncRootMonitor::new("monitor", sync_root_clone, uploader_thread).run();
+    });
 
     let root_path = utf16_path(&registration.root_path);
         let mut callback_context = Box::new(CallbackContext {
@@ -524,15 +414,15 @@ pub fn connect_sync_root(
     let callback_table = vec![
             CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION,
-                Callback: Some(file_open_callback),
+                Callback: Some(callback_file_open),
             },
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_FETCH_DATA,
-            Callback: Some(fetch_data_callback),
+            Callback: Some(callback_fetch_data),
         },
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
-            Callback: Some(file_close_completion_callback),
+            Callback: Some(callback_file_close_completion),
         },
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_NONE,
@@ -580,7 +470,7 @@ fn string_from_pcwstr(value: windows_sys::core::PCWSTR) -> String {
     }
 }
 
-unsafe extern "system" fn fetch_data_callback(
+unsafe extern "system" fn callback_fetch_data(
     callback_info: *const CF_CALLBACK_INFO,
     callback_parameters: *const CF_CALLBACK_PARAMETERS,
 ) {
@@ -618,7 +508,7 @@ unsafe extern "system" fn fetch_data_callback(
     }
 }
 
-unsafe extern "system" fn file_open_callback(
+unsafe extern "system" fn callback_file_open(
     callback_info: *const CF_CALLBACK_INFO,
     callback_parameters: *const CF_CALLBACK_PARAMETERS,
 ) {
@@ -657,7 +547,7 @@ unsafe extern "system" fn file_open_callback(
     }
 }
 
-unsafe extern "system" fn file_close_completion_callback(
+unsafe extern "system" fn callback_file_close_completion(
     callback_info: *const CF_CALLBACK_INFO,
     callback_parameters: *const CF_CALLBACK_PARAMETERS,
 ) {
@@ -749,7 +639,11 @@ unsafe extern "system" fn file_close_completion_callback(
             normalized_path
         );
         // Optionally: upload directory metadata or create remote folder
-        match context.uploader.upload(&relative_path, b"<DIR>") {
+        let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
+        match context
+            .uploader
+            .upload_reader(&relative_path, &mut cursor, b"<DIR>".len() as u64)
+        {
             Ok(_) => {
                 eprintln!("cfapi uploaded directory: path={}", relative_path);
             }
@@ -763,11 +657,11 @@ unsafe extern "system" fn file_close_completion_callback(
         return;
     }
 
-    let payload = match std::fs::read(&full_path) {
-        Ok(data) => data,
+    let file = match std::fs::File::open(&full_path) {
+        Ok(f) => f,
         Err(err) => {
             eprintln!(
-                "cfapi close-completion read error: path={} error={}",
+                "cfapi close-completion open error: path={} error={}",
                 full_path.display(),
                 err
             );
@@ -778,9 +672,14 @@ unsafe extern "system" fn file_close_completion_callback(
     eprintln!(
         "close-completion: uploading {} ({} bytes)",
         relative_path,
-        payload.len()
+        metadata.len()
     );
-    match context.uploader.upload(&relative_path, &payload) {
+
+    let mut reader = file;
+    match context
+        .uploader
+        .upload_reader(&relative_path, &mut reader, metadata.len())
+    {
         Ok(remote_version) => {
             if let Some(version) = remote_version {
                 context.runtime.set_remote_version(&relative_path, version);
@@ -788,14 +687,14 @@ unsafe extern "system" fn file_close_completion_callback(
             eprintln!(
                 "cfapi uploaded local file: path={} bytes={}",
                 relative_path,
-                payload.len()
+                metadata.len()
             );
         }
         Err(err) => {
             eprintln!(
                 "cfapi upload error: path={} bytes={} error={}",
                 relative_path,
-                payload.len(),
+                metadata.len(),
                 err
             );
         }
@@ -856,36 +755,6 @@ fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
         return Err(anyhow!("root path cannot be empty"));
     }
     Ok(())
-}
-
-// UTF-16 and PCWSTR helpers moved to `helpers.rs`.
-
-fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
-    let normalized_root = sync_root
-        .as_os_str()
-        .to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_string();
-
-    let mut candidate = normalized_path.replace('/', "\\");
-    if let Some(stripped) = candidate.strip_prefix(&normalized_root) {
-        candidate = stripped.to_string();
-    } else {
-        // CFAPI sometimes provides a NormalizedPath that starts with a leading
-        // backslash and the sync-root name (e.g. "\\ironmesh-sync2\\file.txt").
-        // In that case, strip the leading separators and then remove the
-        // sync-root folder name if present.
-        let trimmed_leading = candidate.trim_start_matches(['\\', '/']).to_string();
-        if let Some(root_name_os) = sync_root.file_name() {
-            let root_name = root_name_os.to_string_lossy();
-            if let Some(stripped) = trimmed_leading.strip_prefix(root_name.as_ref()) {
-                candidate = stripped.to_string();
-            }
-        }
-    }
-
-    normalize_path(candidate.trim_start_matches(['\\', '/']))
 }
 
 #[cfg(test)]

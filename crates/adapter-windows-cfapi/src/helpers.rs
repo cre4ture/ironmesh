@@ -2,78 +2,8 @@ use anyhow::Result;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::CloudFilters::CfConvertToPlaceholder;
 
-    let hr = unsafe {
-        CfConvertToPlaceholder(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            std::ptr::null(),
-            0,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    hresult_nonneg(hr, "CfConvertToPlaceholder")
-}
-
-pub fn cf_get_placeholder_info(file: &std::fs::File) -> Result<u32> {
-    use core::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::CloudFilters::CfGetPlaceholderInfo;
-
-    let mut info_buf = vec![0u8; 1024];
-    let mut returned: u32 = 0;
-    let hr_info = unsafe {
-        CfGetPlaceholderInfo(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            0,
-            info_buf.as_mut_ptr() as *mut c_void,
-            info_buf.len() as u32,
-            &mut returned,
-        )
-    };
-    hresult_nonneg(hr_info, "CfGetPlaceholderInfo")?;
-    Ok(returned)
-}
-
-pub fn get_and_log_placeholder_info(
-    file: &std::fs::File,
-    label: &str,
-    rel_path: &str,
-) -> Result<u32> {
-    match cf_get_placeholder_info(file) {
-        Ok(returned) => {
-            eprintln!(
-                "{}: CfGetPlaceholderInfo for {}: returned={}",
-                label, rel_path, returned
-            );
-            Ok(returned)
-        }
-        Err(err) => {
-            eprintln!(
-                "{}: CfGetPlaceholderInfo error for {}: {}",
-                label, rel_path, err
-            );
-            Err(err)
-        }
-    }
-}
-
-pub fn is_placeholder(file: &std::fs::File) -> bool {
-    get_and_log_placeholder_info(file, "", "").unwrap_or(0) > 0
-}
-
-pub fn path_is_placeholder(path: &Path) -> bool {
-    match std::fs::File::open(path) {
-        Ok(file) => is_placeholder(&file),
-        Err(_) => false,
-    }
-}
-
-fn hresult_nonneg(hr: i32, operation: &str) -> Result<()> {
+pub(crate) fn hresult_nonneg(hr: i32, operation: &str) -> Result<()> {
     if hr >= 0 {
         Ok(())
     } else {
@@ -99,4 +29,33 @@ pub fn utf16_path(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+
+pub fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
+    let normalized_root = sync_root
+        .as_os_str()
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
+
+    let mut candidate = normalized_path.replace('/', "\\");
+    if let Some(stripped) = candidate.strip_prefix(&normalized_root) {
+        candidate = stripped.to_string();
+    } else {
+        // CFAPI sometimes provides a NormalizedPath that starts with a leading
+        // backslash and the sync-root name (e.g. "\\ironmesh-sync2\\file.txt").
+        // In that case, strip the leading separators and then remove the
+        // sync-root folder name if present.
+        let trimmed_leading = candidate.trim_start_matches(['\\', '/']).to_string();
+        if let Some(root_name_os) = sync_root.file_name() {
+            let root_name = root_name_os.to_string_lossy();
+            if let Some(stripped) = trimmed_leading.strip_prefix(root_name.as_ref()) {
+                candidate = stripped.to_string();
+            }
+        }
+    }
+
+    normalize_path(candidate.trim_start_matches(['\\', '/']))
 }

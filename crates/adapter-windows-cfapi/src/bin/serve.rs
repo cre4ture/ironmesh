@@ -1,4 +1,4 @@
-use adapter_windows_cfapi::WindowsCfapiAdapter;
+use adapter_windows_cfapi::adapter::WindowsCfapiAdapter;
 use adapter_windows_cfapi::live::{
     ServerNodeHydrator, load_snapshot_from_server, normalize_base_url,
 };

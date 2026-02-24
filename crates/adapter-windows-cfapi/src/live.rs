@@ -34,11 +34,22 @@ impl Hydrator for ServerNodeHydrator {
 }
 
 impl Uploader for ServerNodeHydrator {
-    fn upload(&self, path: &str, payload: &[u8]) -> Result<Option<String>> {
+    fn upload_reader(
+        &self,
+        path: &str,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<Option<String>> {
+        use std::io::Read;
         let object_url = build_store_object_url(&self.base_url, path)?;
+
+        let mut buf = Vec::with_capacity(std::cmp::min(length as usize, 8192));
+        let mut limited = reader.take(length);
+        limited.read_to_end(&mut buf).with_context(|| format!("failed reading payload for upload {path}"))?;
+
         self.client
             .put(object_url)
-            .body(payload.to_vec())
+            .body(buf)
             .send()
             .with_context(|| format!("failed to upload object for path {path}"))?
             .error_for_status()
