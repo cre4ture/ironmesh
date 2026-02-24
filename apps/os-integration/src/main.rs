@@ -1,6 +1,6 @@
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    adapter_windows_cfapi::serve::serve_main()
+    adapter_windows_cfapi::cli::cli_main()
 }
 
 #[cfg(not(windows))]
