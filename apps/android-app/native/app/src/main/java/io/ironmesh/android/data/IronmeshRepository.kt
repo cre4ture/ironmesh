@@ -7,11 +7,15 @@ import io.ironmesh.android.api.StoreIndexEntry
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody
+import okio.source
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
+import java.io.OutputStream
 
 class IronmeshRepository {
     fun sanitizeBaseUrl(input: String): String {
@@ -86,6 +90,28 @@ class IronmeshRepository {
         return response.code()
     }
 
+    suspend fun streamPutObject(
+        baseUrl: String,
+        key: String,
+        input: java.io.InputStream,
+    ): Int {
+        val body = object : RequestBody() {
+            override fun contentType() = "application/octet-stream".toMediaTypeOrNull()
+
+            override fun writeTo(sink: okio.BufferedSink) {
+                input.source().use { source ->
+                    sink.writeAll(source)
+                }
+            }
+        }
+
+        val response = createApi(baseUrl).putObject(key, body)
+        if (!response.isSuccessful) {
+            throw IllegalStateException("PUT failed with HTTP ${response.code()}")
+        }
+        return response.code()
+    }
+
     suspend fun getObjectBytes(
         baseUrl: String,
         key: String,
@@ -98,5 +124,22 @@ class IronmeshRepository {
         }
         return response.body()?.bytes()
             ?: throw IllegalStateException("GET failed: empty response body")
+    }
+
+    suspend fun streamObjectTo(
+        baseUrl: String,
+        key: String,
+        output: OutputStream,
+        snapshot: String? = null,
+        version: String? = null,
+    ) {
+        val response = createApi(baseUrl).getObjectBinary(key, snapshot = snapshot, version = version)
+        if (!response.isSuccessful) {
+            throw IllegalStateException("GET failed with HTTP ${response.code()}")
+        }
+        val body = response.body() ?: throw IllegalStateException("GET failed: empty response body")
+        body.byteStream().use { input ->
+            input.copyTo(output)
+        }
     }
 }

@@ -120,9 +120,8 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
 
             Thread {
                 ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
-                    val bytes = input.readBytes()
                     runBlocking {
-                        repository.putObjectBytes(resolveBaseUrl(), target.path, bytes)
+                        repository.streamPutObject(resolveBaseUrl(), target.path, input)
                     }
                 }
             }.start()
@@ -135,10 +134,9 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
 
             Thread {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { output ->
-                    val bytes = runBlocking {
-                        repository.getObjectBytes(resolveBaseUrl(), target.path)
+                    runBlocking {
+                        repository.streamObjectTo(resolveBaseUrl(), target.path, output)
                     }
-                    output.write(bytes)
                     output.flush()
                 }
             }.start()
