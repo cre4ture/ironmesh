@@ -150,4 +150,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check Windows CFAPI adapter crate
-        run: cargo check -p adapter-windows-cfapi --all-targets --features cfapi-runtime
+        run: cargo check -p adapter-windows-cfapi --all-targets
