@@ -14,7 +14,7 @@ This document is the handover package for continuing cross-platform filesystem i
 - Linux adapter MVP:
   - `crates/adapter-linux-fuse`
   - Action mapping from `sync-core` operations.
-  - Feature-gated FUSE runtime (`fuse-runtime`).
+  - FUSE runtime.
   - Mount CLI binary `adapter-linux-fuse-mount`.
   - Two mount modes:
     - `--snapshot-file`: static snapshot input.
@@ -61,7 +61,7 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p sync-core
 cargo test -p adapter-linux-fuse
-cargo check -p adapter-linux-fuse --features fuse-runtime
+cargo check -p adapter-linux-fuse
 ```
 
 ### Linux manual runtime checks
@@ -70,7 +70,7 @@ Snapshot mode:
 
 ```bash
 mkdir -p /tmp/ironmesh-mount
-cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+cargo run -p adapter-linux-fuse --bin adapter-linux-fuse-mount -- \
   --snapshot-file /tmp/snapshot.json \
   --mountpoint /tmp/ironmesh-mount
 ```
@@ -79,7 +79,7 @@ Live server mode:
 
 ```bash
 mkdir -p /tmp/ironmesh-mount-live
-cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+cargo run -p adapter-linux-fuse --bin adapter-linux-fuse-mount -- \
   --server-base-url http://127.0.0.1:18080 \
   --mountpoint /tmp/ironmesh-mount-live
 ```

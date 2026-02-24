@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use adapter_windows_cfapi::adapter::WindowsCfapiAdapter;
 use adapter_windows_cfapi::live::{
     ServerNodeHydrator, load_snapshot_from_server, normalize_base_url,
@@ -30,7 +32,7 @@ struct Args {
     depth: usize,
 }
 
-fn main() -> anyhow::Result<()> {
+pub fn serve_main() -> anyhow::Result<()> {
     let args = Args::parse();
     let registration =
         SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);

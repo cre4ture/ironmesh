@@ -21,7 +21,7 @@ windows-sys = { version = "0.61", features = [
 	"Win32_System_CorrelationVector",
 	"Win32_System_IO",
 ] }
-	ctrlc = "3"
+ctrlc = "3"
 walkdir = "2.3"
 
 # Prevent compilation on non-Windows targets

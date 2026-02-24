@@ -1,0 +1,11 @@
+[package]
+name = "os-integration"
+version = "0.1.0"
+edition = "2024"
+authors = ["ironmesh contributors"]
+description = "OS integration hello-world app"
+
+[dependencies]
+anyhow.workspace = true
+adapter-linux-fuse = { path = "../../crates/adapter-linux-fuse" }
+adapter-windows-cfapi = { path = "../../crates/adapter-windows-cfapi" }

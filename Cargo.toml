@@ -10,6 +10,7 @@ members = [
     "apps/web-ui",
     "apps/android-app",
     "apps/ios-app",
+    "apps/os-integration",
 ]
 resolver = "2"
 exclude = ["tests/system-tests"]

@@ -39,7 +39,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - `sync-core` provides deterministic reconciliation operations.
 - `adapter-linux-fuse` now has:
   - operation mapping tests
-  - feature-gated runtime (`fuse-runtime`)
+  - runtime
   - mount binary `adapter-linux-fuse-mount`
   - snapshot mode (`--snapshot-file`)
   - live server mode (`--server-base-url`) with `/store/index` listing + `GET /store/{key}` hydration
@@ -63,17 +63,17 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 cargo check --workspace
 cargo test -p sync-core
 cargo test -p adapter-linux-fuse
-cargo check -p adapter-linux-fuse --features fuse-runtime
+cargo check -p adapter-linux-fuse
 ```
 
 Linux mount smoke tests:
 
 ```bash
-cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+cargo run -p adapter-linux-fuse --bin adapter-linux-fuse-mount -- \
   --snapshot-file /tmp/snapshot.json \
   --mountpoint /tmp/ironmesh-mount
 
-cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+cargo run -p adapter-linux-fuse --bin adapter-linux-fuse-mount -- \
   --server-base-url http://127.0.0.1:18080 \
   --mountpoint /tmp/ironmesh-mount-live
 ```

@@ -1,7 +1,7 @@
-#![cfg(feature = "fuse-runtime")]
+#![cfg(not(windows))]
 
-use adapter_linux_fuse::LinuxFuseAdapter;
-use adapter_linux_fuse::runtime::{FuseMountConfig, Hydrator, mount_action_plan};
+use crate::LinuxFuseAdapter;
+use crate::runtime::{FuseMountConfig, Hydrator, mount_action_plan};
 use anyhow::{Context, Result};
 use clap::Parser;
 use reqwest::Url;
@@ -33,7 +33,7 @@ struct Args {
     depth: i32,
 }
 
-fn main() -> Result<()> {
+pub fn mount_main() -> Result<()> {
     let args = Args::parse();
 
     let mode_count =

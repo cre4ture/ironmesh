@@ -1,3 +1,7 @@
+#![cfg(not(windows))]
+
+pub mod mount_main;
+
 use sync_core::{SyncOperation, SyncPlan, SyncPolicy, SyncSnapshot, plan_sync};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +96,6 @@ pub fn map_sync_plan_to_fuse_actions(sync_plan: &SyncPlan) -> FuseActionPlan {
     FuseActionPlan { actions }
 }
 
-#[cfg(feature = "fuse-runtime")]
 pub mod runtime {
     use super::FuseActionPlan;
     use crate::FuseAction;

@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use adapter_windows_cfapi::runtime::{SyncRootRegistration, register_sync_root};
 use clap::Parser;
 
@@ -13,7 +15,7 @@ struct Args {
     root_path: String,
 }
 
-fn main() -> anyhow::Result<()> {
+pub fn register_main() -> anyhow::Result<()> {
     let args = Args::parse();
     let registration =
         SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);

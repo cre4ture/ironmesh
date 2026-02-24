@@ -57,7 +57,7 @@ Use a layered architecture:
 3. Platform adapters
   - `adapter-windows-cfapi` (next)
   - `adapter-linux-fuse` (implemented MVP runtime)
-   - `adapter-android-docs` (existing Kotlin provider now, Rust bridge future)
+  - `adapter-android-docs` (existing Kotlin provider now, Rust bridge future)
 
 ### Design rule
 
