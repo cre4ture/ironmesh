@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use adapter_windows_cfapi::runtime::{SyncRootRegistration, register_sync_root};
+use crate::runtime::{SyncRootRegistration, register_sync_root};
 use clap::Parser;
 
 #[derive(Debug, Parser)]

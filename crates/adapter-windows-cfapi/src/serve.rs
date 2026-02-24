@@ -1,10 +1,10 @@
 #![cfg(windows)]
 
-use adapter_windows_cfapi::adapter::WindowsCfapiAdapter;
-use adapter_windows_cfapi::live::{
+use crate::adapter::WindowsCfapiAdapter;
+use crate::live::{
     ServerNodeHydrator, load_snapshot_from_server, normalize_base_url,
 };
-use adapter_windows_cfapi::runtime::{
+use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
 };
 use clap::Parser;
