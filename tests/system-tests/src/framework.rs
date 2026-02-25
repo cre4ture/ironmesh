@@ -17,6 +17,15 @@ impl ChildGuard {
     pub fn new(child: Child) -> Self {
         Self { child: Some(child) }
     }
+
+    pub async fn stop(&mut self) -> Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            child.kill().await.context("failed to kill child process")?;
+            child.wait().await.context("failed to wait for child process to exit")?;
+            self.child = None;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ChildGuard {
@@ -334,6 +343,10 @@ pub async fn wait_for_object_payload(
     }
 
     bail!("object {key} did not replicate to expected payload at {base_url}/store/{key}");
+}
+
+pub async fn stop_server(child: &mut ChildGuard) {
+    child.stop().await.ok();
 }
 
 pub fn binary_path(name: &str) -> Result<PathBuf> {
