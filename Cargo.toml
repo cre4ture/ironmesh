@@ -11,9 +11,9 @@ members = [
     "apps/android-app",
     "apps/ios-app",
     "apps/os-integration",
+    "tests/system-tests",
 ]
 resolver = "2"
-exclude = ["tests/system-tests"]
 
 [workspace.package]
 version = "0.1.0"

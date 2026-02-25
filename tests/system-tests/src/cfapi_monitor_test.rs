@@ -1,11 +1,12 @@
 #![cfg(windows)]
+
 #[cfg(test)]
 mod cfapi_monitor_test {
     use std::fs::File;
     use std::io::Write;
     use std::time::Duration;
     use reqwest::Client;
-    use crate::tests::{start_server, stop_server};
+    use crate::framework::{start_server, stop_server};
 
     #[tokio::test]
     async fn test_cfapi_monitor_detects_new_and_modified_file() {
