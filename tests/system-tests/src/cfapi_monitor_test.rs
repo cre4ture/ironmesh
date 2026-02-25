@@ -2,16 +2,18 @@
 
 #[cfg(test)]
 mod cfapi_monitor_test {
+    use crate::framework::{start_server, stop_server};
+    use reqwest::Client;
     use std::fs::File;
     use std::io::Write;
     use std::time::Duration;
-    use reqwest::Client;
-    use crate::framework::{start_server, stop_server};
 
     #[tokio::test]
     async fn test_cfapi_monitor_detects_new_and_modified_file() {
         let bind = "127.0.0.1:19090";
-        let mut server = start_server(bind).await.expect("Failed to start local server-node");
+        let mut server = start_server(bind)
+            .await
+            .expect("Failed to start local server-node");
         let base_url = format!("http://{bind}");
         let sync_root = std::env::temp_dir().join("ironmesh-sync2");
         std::fs::create_dir_all(&sync_root).expect("Failed to create sync root");
@@ -26,9 +28,16 @@ mod cfapi_monitor_test {
 
         // Wait for monitor to detect and upload
         tokio::time::sleep(Duration::from_secs(10)).await;
-        let resp = client.get(&server_url).send().await.expect("Failed to GET file");
+        let resp = client
+            .get(&server_url)
+            .send()
+            .await
+            .expect("Failed to GET file");
         let body = resp.text().await.expect("Failed to read response body");
-        assert!(body.contains("initial content"), "Initial content not found on server");
+        assert!(
+            body.contains("initial content"),
+            "Initial content not found on server"
+        );
 
         // Step 2: Modify file
         let mut file = File::create(&test_file).expect("Failed to open file for modification");
@@ -37,9 +46,16 @@ mod cfapi_monitor_test {
 
         // Wait for monitor to detect and upload
         tokio::time::sleep(Duration::from_secs(10)).await;
-        let resp = client.get(&server_url).send().await.expect("Failed to GET file after modification");
+        let resp = client
+            .get(&server_url)
+            .send()
+            .await
+            .expect("Failed to GET file after modification");
         let body = resp.text().await.expect("Failed to read response body");
-        assert!(body.contains("modified content"), "Modified content not found on server");
+        assert!(
+            body.contains("modified content"),
+            "Modified content not found on server"
+        );
 
         stop_server(&mut server).await;
     }

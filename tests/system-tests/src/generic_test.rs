@@ -9,13 +9,13 @@ mod tests {
     use std::time::Instant;
     use std::time::SystemTime;
 
+    use crate::framework::*;
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
     use client_sdk::ClientNode;
     use reqwest::StatusCode;
     use tokio::process::{Child, Command};
     use tokio::time::sleep;
-    use crate::framework::*;
 
     #[tokio::test]
     async fn sdk_roundtrip_against_live_server() -> Result<()> {
@@ -1159,14 +1159,7 @@ mod tests {
                 .await?
                 .error_for_status()?;
 
-            wait_for_object_payload(
-                &http,
-                &base_b,
-                "autonomous-repair-key",
-                payload,
-                120,
-            )
-            .await?;
+            wait_for_object_payload(&http, &base_b, "autonomous-repair-key", payload, 120).await?;
 
             Ok::<(), anyhow::Error>(())
         }
@@ -2241,5 +2234,4 @@ mod tests {
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
-
 }
