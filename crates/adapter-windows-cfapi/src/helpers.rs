@@ -37,9 +37,21 @@ pub fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_string();
+    let normalized_root_without_drive = normalized_root
+        .strip_prefix("\\\\")
+        .map(|_| normalized_root.as_str())
+        .unwrap_or_else(|| {
+            if normalized_root.as_bytes().get(1) == Some(&b':') {
+                &normalized_root[2..]
+            } else {
+                normalized_root.as_str()
+            }
+        });
 
     let mut candidate = normalized_path.replace('/', "\\");
     if let Some(stripped) = candidate.strip_prefix(&normalized_root) {
+        candidate = stripped.to_string();
+    } else if let Some(stripped) = candidate.strip_prefix(normalized_root_without_drive) {
         candidate = stripped.to_string();
     } else {
         // CFAPI sometimes provides a NormalizedPath that starts with a leading
@@ -56,4 +68,40 @@ pub fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
     }
 
     normalize_path(candidate.trim_start_matches(['\\', '/']))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_to_relative;
+    use std::path::Path;
+
+    #[test]
+    fn path_to_relative_strips_full_root_prefix_with_drive() {
+        let sync_root = Path::new(r"C:\Users\hornu\AppData\Local\Temp\ironmesh-sync");
+        let normalized_path =
+            r"C:\Users\hornu\AppData\Local\Temp\ironmesh-sync\docs\readme.txt";
+
+        let relative = path_to_relative(sync_root, normalized_path);
+        assert_eq!(relative, "docs/readme.txt");
+    }
+
+    #[test]
+    fn path_to_relative_handles_root_name_prefixed_path() {
+        let sync_root = Path::new(r"C:\sync\ironmesh-sync2");
+        let normalized_path = r"\ironmesh-sync2\folder\file.txt";
+
+        let relative = path_to_relative(sync_root, normalized_path);
+        assert_eq!(relative, "folder/file.txt");
+    }
+
+    #[test]
+    fn path_to_relative_handles_missing_drive_letter_in_normalized_path() {
+        let sync_root = Path::new(
+            r"C:\Users\hornu\AppData\Local\Temp\ironmesh-cfapi-monitor-sync-root-1772014035705750400",
+        );
+        let normalized_path = r"\Users\hornu\AppData\Local\Temp\ironmesh-cfapi-monitor-sync-root-1772014035705750400\monitor_test.txt";
+
+        let relative = path_to_relative(sync_root, normalized_path);
+        assert_eq!(relative, "monitor_test.txt");
+    }
 }

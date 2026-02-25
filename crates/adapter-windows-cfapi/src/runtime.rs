@@ -593,7 +593,8 @@ unsafe extern "system" fn callback_file_close_completion(
     }
 
     let relative_path = path_to_relative(&context.sync_root, &normalized_path);
-    eprintln!("close-completion: relative_path={}", relative_path);
+    eprintln!("close-completion: relative_path={}, normalized_path={}, sync_root={:?}",
+        relative_path, normalized_path, context.sync_root);
 
     let full_path = context.sync_root.join(&relative_path);
 
@@ -606,10 +607,10 @@ unsafe extern "system" fn callback_file_close_completion(
             // CF provides open completion flags; check for write access flag.
             if (open_info.flags & CF_OPEN_FILE_FLAG_WRITE_ACCESS as u32) == 0 {
                 eprintln!(
-                    "close-completion: open flags indicate no write access (flags=0x{:08x}); skipping upload",
+                    "close-completion: open flags indicate no write access (flags=0x{:08x}); doing upload anyway",
                     open_info.flags
                 );
-                return;
+                // return;
             }
 
             // We saw a write-capable open; check if file changed since open.
@@ -623,9 +624,9 @@ unsafe extern "system" fn callback_file_close_completion(
                     .unwrap_or(0);
                 if size == open_info.size && mtime_secs == open_info.mtime_secs {
                     eprintln!(
-                        "close-completion: file opened write-capable but unchanged; skipping upload"
+                        "close-completion: file opened write-capable but unchanged; doing upload anyway"
                     );
-                    return;
+                    // return;
                 }
             } else {
                 // If metadata now unavailable but open existed, proceed to upload as a fallback.

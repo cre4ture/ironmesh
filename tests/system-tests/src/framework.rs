@@ -197,6 +197,54 @@ pub async fn start_cli_web(bind: &str) -> Result<Child> {
     Ok(child)
 }
 
+#[cfg(windows)]
+pub async fn start_cfapi_adapter(
+    sync_root_id: &str,
+    display_name: &str,
+    root_path: &Path,
+    server_base_url: &str,
+) -> Result<Child> {
+    let os_integration_bin = binary_path("os-integration")?;
+    let root_path_arg = root_path.to_string_lossy().to_string();
+
+    let register_output = Command::new(&os_integration_bin)
+        .arg("register")
+        .arg("--sync-root-id")
+        .arg(sync_root_id)
+        .arg("--display-name")
+        .arg(display_name)
+        .arg("--root-path")
+        .arg(&root_path_arg)
+        .output()
+        .await
+        .context("failed to execute os-integration register")?;
+
+    if !register_output.status.success() {
+        bail!(
+            "os-integration register failed: {}",
+            String::from_utf8_lossy(&register_output.stderr)
+        );
+    }
+
+    let child = Command::new(os_integration_bin)
+        .arg("serve")
+        .arg("--sync-root-id")
+        .arg(sync_root_id)
+        .arg("--display-name")
+        .arg(display_name)
+        .arg("--root-path")
+        .arg(&root_path_arg)
+        .arg("--server-base-url")
+        .arg(server_base_url)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to spawn os-integration serve")?;
+
+    sleep(Duration::from_secs(2)).await;
+    Ok(child)
+}
+
 pub async fn wait_for_server(bind: &str, retries: usize) -> Result<()> {
     let health_url = format!("http://{bind}/health");
     wait_for_url_status(&health_url, StatusCode::OK, retries).await
@@ -278,6 +326,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     let override_key = match name {
         "server-node" => "IRONMESH_SERVER_BIN",
         "cli-client" => "IRONMESH_CLI_BIN",
+        "os-integration" => "IRONMESH_OS_INTEGRATION_BIN",
         _ => "",
     };
 
@@ -297,6 +346,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     let artifact_path = match name {
         "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_server-node"),
         "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_cli-client"),
+        "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_os-integration"),
         _ => None,
     };
 
@@ -309,10 +359,11 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
 
     if !path.exists() {
         bail!(
-            "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{} overrides)",
+            "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{}/{} overrides)",
             path.display(),
             "IRONMESH_SERVER_BIN",
-            "IRONMESH_CLI_BIN"
+            "IRONMESH_CLI_BIN",
+            "IRONMESH_OS_INTEGRATION_BIN"
         );
     }
 
