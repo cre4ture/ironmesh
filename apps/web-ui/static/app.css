@@ -1,0 +1,28 @@
+body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #fafafa; }
+    main { max-width: 960px; margin: 0 auto; }
+    section { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    h1, h2 { margin-top: 0; }
+    label { display: block; margin: 0.4rem 0 0.2rem; font-weight: 600; }
+    input, textarea, button, select { font: inherit; }
+    input, textarea, select { width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+    textarea { min-height: 110px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    .actions { margin-top: 0.6rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    button { padding: 0.5rem 0.8rem; border: 1px solid #888; border-radius: 6px; background: #f5f5f5; cursor: pointer; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    pre { background: #111; color: #f2f2f2; padding: 0.8rem; border-radius: 6px; overflow: auto; }
+    .muted { color: #666; font-size: 0.92rem; }
+    .explorer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    .explorer { border: 1px solid #ddd; border-radius: 6px; padding: 0.75rem; }
+    .explorer h3 { margin: 0 0 0.4rem; }
+    .explorer-path { font-size: 0.9rem; color: #444; margin-bottom: 0.4rem; }
+    .explorer-list { border: 1px solid #ddd; border-radius: 6px; min-height: 140px; max-height: 260px; overflow: auto; background: #fcfcfc; }
+    .explorer-item { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid #eee; background: transparent; padding: 0.45rem 0.55rem; border-radius: 0; }
+    .explorer-item:last-child { border-bottom: 0; }
+    .explorer-item:hover { background: #f0f0f0; }
+    .explorer-empty { padding: 0.55rem; color: #666; }
+    .explorer-output { min-height: 120px; }
+    @media (max-width: 900px) {
+      .row { grid-template-columns: 1fr; }
+      .explorer-grid { grid-template-columns: 1fr; }
+    }
