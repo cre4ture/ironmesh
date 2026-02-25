@@ -504,6 +504,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/delete", post(delete_object_by_query))
         .route(
             "/store/{key}",
             put(put_object).get(get_object).delete(delete_object),
@@ -941,11 +942,44 @@ struct PutObjectQuery {
     internal_replication: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeleteObjectByQuery {
+    key: String,
+    state: Option<String>,
+    #[serde(default)]
+    parent: Vec<String>,
+    version_id: Option<String>,
+    #[serde(default)]
+    internal_replication: bool,
+}
+
 fn should_trigger_autonomous_post_write_replication(
     autonomous_replication_on_put_enabled: bool,
     internal_replication: bool,
 ) -> bool {
     autonomous_replication_on_put_enabled && !internal_replication
+}
+
+async fn delete_object_by_query(
+    State(state): State<ServerState>,
+    Query(query): Query<DeleteObjectByQuery>,
+) -> Response {
+    if query.key.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    delete_object(
+        State(state),
+        Path(query.key),
+        Query(PutObjectQuery {
+            state: query.state,
+            parent: query.parent,
+            version_id: query.version_id,
+            internal_replication: query.internal_replication,
+        }),
+    )
+    .await
+    .into_response()
 }
 
 async fn put_object(

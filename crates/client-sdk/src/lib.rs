@@ -25,7 +25,7 @@ impl ClientNode {
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
         let key = key.into();
-        let url = format!("{}/store/{}", self.server_base_url, key);
+        let url = self.store_key_url(&key)?;
 
         self.http
             .put(url)
@@ -46,7 +46,7 @@ impl ClientNode {
 
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Bytes> {
         let key = key.as_ref();
-        let url = format!("{}/store/{}", self.server_base_url, key);
+        let url = self.store_key_url(key)?;
 
         let payload = self
             .http
@@ -99,5 +99,19 @@ impl ClientNode {
         }
 
         Ok(())
+    }
+
+    fn store_key_url(&self, key: &str) -> Result<String> {
+        let mut url = reqwest::Url::parse(&self.server_base_url)
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("server URL cannot be a base"))?;
+        segments.push("store");
+        segments.push(key);
+        drop(segments);
+
+        Ok(url.to_string())
     }
 }

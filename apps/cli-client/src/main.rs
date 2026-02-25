@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
@@ -131,6 +131,7 @@ async fn main() -> Result<()> {
                 .route("/api/store/list", get(web_store_list))
                 .route("/api/store/get", get(web_store_get))
                 .route("/api/store/put", post(web_store_put))
+                .route("/api/store/delete", delete(web_store_delete))
                 .route("/api/store/get-binary", get(web_store_get_binary))
                 .route("/api/store/put-binary", post(web_store_put_binary))
                 .route(
@@ -171,6 +172,11 @@ struct WebStoreGetQuery {
 struct WebStorePutRequest {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreDeleteQuery {
+    key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +223,50 @@ async fn fetch_server_json(
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
+}
+
+fn build_server_object_url(server_url: &str, key: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(server_url.trim_end_matches('/'))
+        .with_context(|| format!("invalid server URL: {server_url}"))?;
+
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| anyhow!("server URL cannot be a base"))?;
+    segments.push("store");
+    segments.push(key);
+    drop(segments);
+
+    Ok(url.to_string())
+}
+
+fn build_server_versions_url(server_url: &str, key: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(server_url.trim_end_matches('/'))
+        .with_context(|| format!("invalid server URL: {server_url}"))?;
+
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| anyhow!("server URL cannot be a base"))?;
+    segments.push("versions");
+    segments.push(key);
+    drop(segments);
+
+    Ok(url.to_string())
+}
+
+fn build_server_store_delete_url(server_url: &str, key: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(server_url.trim_end_matches('/'))
+        .with_context(|| format!("invalid server URL: {server_url}"))?;
+
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("server URL cannot be a base"))?;
+        segments.push("store");
+        segments.push("delete");
+    }
+    url.query_pairs_mut().append_pair("key", key);
+
+    Ok(url.to_string())
 }
 
 fn content_type_for(path: &str) -> &'static str {
@@ -290,9 +340,19 @@ async fn web_versions(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
-    let path = format!("/versions/{}", query.key);
-    match fetch_server_json(&state.http, &state.server_url, &path).await {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+    let versions_url = match build_server_versions_url(&state.server_url, &query.key) {
+        Ok(url) => url,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    match state.http.get(versions_url).send().await {
+        Ok(response) => match response.error_for_status() {
+            Ok(ok) => match ok.json::<serde_json::Value>().await {
+                Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+                Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            },
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        },
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -370,11 +430,12 @@ async fn web_store_get(
         };
     }
 
-    let mut request = state.http.get(format!(
-        "{}/store/{}",
-        state.server_url.trim_end_matches('/'),
-        query.key
-    ));
+    let object_url = match build_server_object_url(&state.server_url, &query.key) {
+        Ok(url) => url,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let mut request = state.http.get(object_url);
     if let Some(snapshot) = query.snapshot.as_deref() {
         request = request.query(&[("snapshot", snapshot)]);
     }
@@ -428,6 +489,77 @@ async fn web_store_put(
     }
 }
 
+async fn web_store_delete(
+    State(state): State<WebState>,
+    Query(query): Query<WebStoreDeleteQuery>,
+) -> impl IntoResponse {
+    if query.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    let delete_url = match build_server_store_delete_url(&state.server_url, &query.key) {
+        Ok(url) => url,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let primary_result = state.http.post(delete_url).send().await;
+    let fallback_to_legacy_delete = match primary_result {
+        Ok(response) if response.status().is_success() => false,
+        Ok(response)
+            if response.status() == StatusCode::METHOD_NOT_ALLOWED
+                || response.status() == StatusCode::NOT_FOUND =>
+        {
+            true
+        }
+        Ok(response) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "delete endpoint rejected request: HTTP {} ({})",
+                    response.status(),
+                    response.url()
+                ),
+            );
+        }
+        Err(_) => true,
+    };
+
+    if !fallback_to_legacy_delete {
+        let _ = state.client.remove_cached(&query.key).await;
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "key": query.key,
+                "deleted": true
+            })),
+        )
+            .into_response();
+    }
+
+    let object_url = match build_server_object_url(&state.server_url, &query.key) {
+        Ok(url) => url,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    match state.http.delete(object_url).send().await {
+        Ok(response) => match response.error_for_status() {
+            Ok(_) => {
+                let _ = state.client.remove_cached(&query.key).await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "key": query.key,
+                        "deleted": true
+                    })),
+                )
+                    .into_response()
+            }
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        },
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
 async fn web_store_put_binary(
     State(state): State<WebState>,
     Query(query): Query<WebStoreBinaryPutQuery>,
@@ -464,11 +596,12 @@ async fn web_store_get_binary(
             Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
         }
     } else {
-        let mut request = state.http.get(format!(
-            "{}/store/{}",
-            state.server_url.trim_end_matches('/'),
-            query.key
-        ));
+        let object_url = match build_server_object_url(&state.server_url, &query.key) {
+            Ok(url) => url,
+            Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+        };
+
+        let mut request = state.http.get(object_url);
         if let Some(snapshot) = query.snapshot.as_deref() {
             request = request.query(&[("snapshot", snapshot)]);
         }

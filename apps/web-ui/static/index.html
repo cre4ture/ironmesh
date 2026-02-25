@@ -10,12 +10,13 @@
     section { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
     h1, h2 { margin-top: 0; }
     label { display: block; margin: 0.4rem 0 0.2rem; font-weight: 600; }
-    input, textarea, button { font: inherit; }
-    input, textarea { width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+    input, textarea, button, select { font: inherit; }
+    input, textarea, select { width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
     textarea { min-height: 110px; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
     .actions { margin-top: 0.6rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
     button { padding: 0.5rem 0.8rem; border: 1px solid #888; border-radius: 6px; background: #f5f5f5; cursor: pointer; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
     pre { background: #111; color: #f2f2f2; padding: 0.8rem; border-radius: 6px; overflow: auto; }
     .muted { color: #666; font-size: 0.92rem; }
     .explorer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
@@ -28,7 +29,10 @@
     .explorer-item:hover { background: #f0f0f0; }
     .explorer-empty { padding: 0.55rem; color: #666; }
     .explorer-output { min-height: 120px; }
-    @media (max-width: 900px) { .explorer-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 900px) {
+      .row { grid-template-columns: 1fr; }
+      .explorer-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -78,7 +82,7 @@
 
     <section>
       <h2>File Explorer</h2>
-      <p class="muted">Keys are treated as virtual paths; <code>/</code> acts as directory separator.</p>
+      <p class="muted">Keys are treated as virtual paths; folder markers use trailing slash keys like <code>path/to/folder/</code> with empty payload.</p>
       <div class="explorer-grid">
         <div class="explorer" id="current-explorer"></div>
         <div class="explorer" id="snapshot-explorer"></div>
@@ -99,6 +103,8 @@
   </main>
 
   <script>
+    let currentExplorer = null;
+
     async function fetchJson(url, options) {
       const response = await fetch(url, options);
       const payload = await response.json();
@@ -113,6 +119,39 @@
         typeof value === 'string' ? value : JSON.stringify(value, null, 2);
     }
 
+    function normalizePath(path) {
+      return (path || '')
+        .split('/')
+        .map(segment => segment.trim())
+        .filter(Boolean)
+        .join('/');
+    }
+
+    function parentPath(path) {
+      const parts = normalizePath(path).split('/').filter(Boolean);
+      parts.pop();
+      return parts.join('/');
+    }
+
+    function folderMarkerKey(path) {
+      const normalized = normalizePath(path);
+      return normalized ? normalized + '/' : '';
+    }
+
+    function joinPath(basePath, childPath) {
+      const base = normalizePath(basePath);
+      const child = normalizePath(childPath);
+      if (!base) return child;
+      if (!child) return base;
+      return base + '/' + child;
+    }
+
+    async function refreshCurrentExplorer() {
+      if (currentExplorer && typeof currentExplorer.refresh === 'function') {
+        await currentExplorer.refresh();
+      }
+    }
+
     async function uploadObject() {
       const key = document.getElementById('put-key').value;
       const value = document.getElementById('put-value').value;
@@ -123,6 +162,7 @@
           body: JSON.stringify({ key, value })
         });
         show('status-output', payload);
+        await refreshCurrentExplorer();
       } catch (err) {
         show('status-output', { error: err.message });
       }
@@ -173,6 +213,7 @@
           uploaded_filename: file.name,
           uploaded_type: file.type || 'application/octet-stream'
         });
+        await refreshCurrentExplorer();
       } catch (err) {
         show('status-output', { error: err.message });
       }
@@ -193,7 +234,7 @@
           try {
             errorPayload = await response.json();
           } catch {
-            errorPayload = { error: `HTTP ${response.status}` };
+            errorPayload = { error: 'HTTP ' + response.status };
           }
           throw new Error(errorPayload.error || JSON.stringify(errorPayload));
         }
@@ -226,34 +267,66 @@
       }
     }
 
+    async function createFolderMarker(path) {
+      const markerKey = folderMarkerKey(path);
+      if (!markerKey) {
+        throw new Error('Folder path must not be empty.');
+      }
+
+      return fetchJson('/api/store/put', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: markerKey, value: '' }),
+      });
+    }
+
+    async function deleteObjectKey(key) {
+      const query = new URLSearchParams({ key });
+      return fetchJson('/api/store/delete?' + query.toString(), { method: 'DELETE' });
+    }
+
+    async function deleteFolderMarker(path) {
+      const markerKey = folderMarkerKey(path);
+      if (!markerKey) {
+        throw new Error('Cannot delete root folder.');
+      }
+      return deleteObjectKey(markerKey);
+    }
+
     async function listStoreEntries(prefix, snapshot) {
       const query = new URLSearchParams({ depth: '1' });
-      if (prefix) query.set('prefix', prefix);
+      const normalizedPrefix = normalizePath(prefix);
+      if (normalizedPrefix) query.set('prefix', folderMarkerKey(normalizedPrefix));
       if (snapshot) query.set('snapshot', snapshot);
       const payload = await fetchJson('/api/store/list?' + query.toString());
       return Array.isArray(payload.entries) ? payload.entries : [];
     }
 
     function childEntriesForPath(entries, path) {
-      const normalized = path ? path.replace(/\/$/, '') + '/' : '';
+      const normalizedPath = normalizePath(path);
+      const basePrefix = normalizedPath ? normalizedPath + '/' : '';
+
       return entries
         .filter(entry => {
-          const target = entry.path || '';
-          if (!normalized) {
-            return target.length > 0;
-          }
-          return target.startsWith(normalized) && target !== normalized;
+          const target = String(entry.path || '');
+          if (!target) return false;
+          if (!basePrefix) return true;
+          return target.startsWith(basePrefix) && target !== basePrefix;
         })
         .map(entry => {
-          const fullPath = entry.path;
-          const stripped = normalized ? fullPath.slice(normalized.length) : fullPath;
-          const label = stripped.replace(/\/$/, '');
+          const rawPath = String(entry.path || '');
+          const stripped = basePrefix ? rawPath.slice(basePrefix.length) : rawPath;
+          const withoutTrailing = stripped.replace(/\/$/, '');
+          const label = withoutTrailing.includes('/') ? withoutTrailing.split('/')[0] : withoutTrailing;
+          const isDir = entry.entry_type === 'prefix' || rawPath.endsWith('/');
+          const itemPath = joinPath(normalizedPath, label);
           return {
-            label: label.includes('/') ? label.split('/')[0] : label,
-            fullPath,
-            isDir: entry.entry_type === 'prefix' || fullPath.endsWith('/'),
+            label,
+            fullPath: isDir ? folderMarkerKey(itemPath) : itemPath,
+            isDir,
           };
         })
+        .filter(entry => entry.label.length > 0)
         .filter((entry, index, arr) => arr.findIndex(other => other.fullPath === entry.fullPath) === index)
         .sort((a, b) => {
           if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
@@ -281,7 +354,7 @@
         const limit = 256;
         if (typeof value === 'string') {
           return value.length > limit
-            ? `${value.slice(0, limit)}… (truncated, ${value.length} chars total)`
+            ? `${value.slice(0, limit)}... (truncated, ${value.length} chars total)`
             : value;
         }
 
@@ -290,7 +363,7 @@
           if (original.length > limit) {
             return {
               ...value,
-              value: `${original.slice(0, limit)}…`,
+              value: `${original.slice(0, limit)}...`,
               truncated: true,
               original_length: original.length,
             };
@@ -305,8 +378,26 @@
         outputEl.textContent = typeof preview === 'string' ? preview : JSON.stringify(preview, null, 2);
       }
 
+      const explorerApi = {
+        root,
+        getCurrentPath: () => currentPath,
+        setCurrentPath: (path) => {
+          currentPath = normalizePath(path);
+        },
+        refresh: render,
+        showOutput,
+      };
+
+      if (typeof options.onReady === 'function') {
+        options.onReady(explorerApi);
+      }
+
       async function render() {
-        pathEl.textContent = currentPath ? `/${currentPath}` : '/';
+        pathEl.textContent = currentPath ? '/' + currentPath : '/';
+        if (typeof options.onRender === 'function') {
+          options.onRender(explorerApi);
+        }
+
         listEl.innerHTML = '<div class="explorer-empty">loading...</div>';
 
         try {
@@ -320,11 +411,9 @@
           if (currentPath) {
             const upBtn = document.createElement('button');
             upBtn.className = 'explorer-item';
-            upBtn.textContent = '📁 ..';
+            upBtn.textContent = '[DIR] ..';
             upBtn.onclick = () => {
-              const parts = currentPath.split('/').filter(Boolean);
-              parts.pop();
-              currentPath = parts.join('/');
+              currentPath = parentPath(currentPath);
               render();
             };
             listEl.appendChild(upBtn);
@@ -341,13 +430,14 @@
           for (const entry of visible) {
             const btn = document.createElement('button');
             btn.className = 'explorer-item';
-            btn.textContent = `${entry.isDir ? '📁' : '📄'} ${entry.label}`;
+            btn.textContent = `${entry.isDir ? '[DIR]' : '[FILE]'} ${entry.label}`;
             btn.onclick = async () => {
               if (entry.isDir) {
-                currentPath = entry.fullPath.replace(/\/$/, '');
+                currentPath = normalizePath(entry.fullPath);
                 render();
                 return;
               }
+
               showOutput('loading...');
               try {
                 const payload = await options.readFile(entry.fullPath, root);
@@ -366,7 +456,7 @@
 
       root.refreshExplorer = render;
       render();
-      return { refresh: render };
+      return explorerApi;
     }
 
     async function fetchSnapshots() {
@@ -379,10 +469,109 @@
     }
 
     function wireExplorers() {
-      createExplorer('current-explorer', {
+      currentExplorer = createExplorer('current-explorer', {
         title: 'Current Data',
+        controlsHtml: `
+          <p class="muted">Current folder: <code data-folder-path>/</code></p>
+          <div class="actions">
+            <button type="button" data-nav-root>Root</button>
+            <button type="button" data-nav-up>Up</button>
+            <button type="button" data-refresh-current>Refresh</button>
+          </div>
+          <label>New folder name</label>
+          <input data-folder-name placeholder="new-folder" />
+          <div class="actions">
+            <button type="button" data-create-folder>Create Folder</button>
+            <button type="button" data-delete-folder>Delete Current Folder</button>
+          </div>
+          <p class="muted">Delete removes only the marker key; files under the prefix are not deleted.</p>
+        `,
         loadEntries: (path) => listStoreEntries(path, null),
         readFile: (fullPath) => fetchJson('/api/store/get?key=' + encodeURIComponent(fullPath)),
+        onReady: (api) => {
+          if (api.root.dataset.folderControlsWired) return;
+          api.root.dataset.folderControlsWired = '1';
+
+          const rootBtn = api.root.querySelector('[data-nav-root]');
+          const upBtn = api.root.querySelector('[data-nav-up]');
+          const refreshBtn = api.root.querySelector('[data-refresh-current]');
+          const folderInput = api.root.querySelector('[data-folder-name]');
+          const createBtn = api.root.querySelector('[data-create-folder]');
+          const deleteBtn = api.root.querySelector('[data-delete-folder]');
+
+          rootBtn.onclick = async () => {
+            api.setCurrentPath('');
+            await api.refresh();
+          };
+
+          upBtn.onclick = async () => {
+            api.setCurrentPath(parentPath(api.getCurrentPath()));
+            await api.refresh();
+          };
+
+          refreshBtn.onclick = async () => {
+            await api.refresh();
+          };
+
+          createBtn.onclick = async () => {
+            const folderName = folderInput.value.trim();
+            if (!normalizePath(folderName)) {
+              api.showOutput({ error: 'Folder name must not be empty.' });
+              return;
+            }
+
+            const folderPath = joinPath(api.getCurrentPath(), folderName);
+            const marker = folderMarkerKey(folderPath);
+            api.showOutput('creating folder marker ' + marker + ' ...');
+
+            try {
+              const payload = await createFolderMarker(folderPath);
+              folderInput.value = '';
+              show('status-output', payload);
+              await api.refresh();
+              api.showOutput({ action: 'created_folder_marker', marker_key: marker });
+            } catch (err) {
+              api.showOutput({ error: err.message });
+            }
+          };
+
+          deleteBtn.onclick = async () => {
+            const folderPath = api.getCurrentPath();
+            if (!folderPath) {
+              api.showOutput({ error: 'Navigate into a folder before deleting.' });
+              return;
+            }
+
+            const marker = folderMarkerKey(folderPath);
+            api.showOutput('deleting folder marker ' + marker + ' ...');
+
+            try {
+              const payload = await deleteFolderMarker(folderPath);
+              api.setCurrentPath(parentPath(folderPath));
+              show('status-output', payload);
+              await api.refresh();
+              api.showOutput({ action: 'deleted_folder_marker', marker_key: marker });
+            } catch (err) {
+              api.showOutput({ error: err.message });
+            }
+          };
+        },
+        onRender: (api) => {
+          const pathCode = api.root.querySelector('[data-folder-path]');
+          const upBtn = api.root.querySelector('[data-nav-up]');
+          const deleteBtn = api.root.querySelector('[data-delete-folder]');
+          const path = api.getCurrentPath();
+
+          if (pathCode) {
+            pathCode.textContent = path ? '/' + path : '/';
+          }
+          if (upBtn) {
+            upBtn.disabled = !path;
+          }
+          if (deleteBtn) {
+            deleteBtn.disabled = !path;
+          }
+        },
       });
 
       createExplorer('snapshot-explorer', {
