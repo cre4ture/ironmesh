@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 mod framework;
 
 #[cfg(windows)]

@@ -602,8 +602,8 @@ unsafe extern "system" fn callback_file_close_completion(
     // request write access, skip upload. If it did request write access, compare
     // initial metadata to current metadata and skip upload when unchanged.
     let request_key = callback_info_ref.RequestKey as u64;
-    if let Ok(mut opens) = context.opens.lock() {
-        if let Some(open_info) = opens.remove(&request_key) {
+    if let Ok(mut opens) = context.opens.lock()
+        && let Some(open_info) = opens.remove(&request_key) {
             // CF provides open completion flags; check for write access flag.
             if (open_info.flags & CF_OPEN_FILE_FLAG_WRITE_ACCESS as u32) == 0 {
                 eprintln!(
@@ -632,7 +632,6 @@ unsafe extern "system" fn callback_file_close_completion(
                 // If metadata now unavailable but open existed, proceed to upload as a fallback.
             }
         }
-    }
 
     // Remove hydrated_once_paths logic: always handle upload for any file closed in sync root
     // This allows new files and folders to be uploaded, matching OneDrive behavior
