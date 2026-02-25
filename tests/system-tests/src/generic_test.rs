@@ -16,7 +16,7 @@ mod tests {
     async fn sdk_roundtrip_against_live_server() -> Result<()> {
         let bind = "127.0.0.1:19080";
         let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let _server = start_server(bind).await?;
 
         let client = ClientNode::new(&base_url);
         let key = "sdk-roundtrip";
@@ -25,8 +25,6 @@ mod tests {
         client.put(key, value.clone()).await?;
         let fetched = client.get(key).await?;
         assert_eq!(fetched, value);
-
-        stop_server(&mut server).await;
         Ok(())
     }
 
@@ -34,7 +32,7 @@ mod tests {
     async fn cli_put_then_get_against_live_server() -> Result<()> {
         let bind = "127.0.0.1:19081";
         let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let _server = start_server(bind).await?;
 
         run_cli(&[
             "--server-url",
@@ -47,15 +45,13 @@ mod tests {
 
         let output = run_cli(&["--server-url", &base_url, "get", "cli-roundtrip"]).await?;
         assert!(output.contains("hello-from-cli"));
-
-        stop_server(&mut server).await;
         Ok(())
     }
 
     #[tokio::test]
     async fn cli_web_interface_ping() -> Result<()> {
         let bind = "127.0.0.1:19082";
-        let mut cli_web = start_cli_web(bind).await?;
+        let _cli_web = start_cli_web(bind).await?;
 
         let ping_url = format!("http://{bind}/api/ping");
         let body = reqwest::get(&ping_url)
@@ -69,8 +65,6 @@ mod tests {
 
         assert!(body.contains("\"ok\":true"));
         assert!(body.contains("cli-client-web"));
-
-        stop_server(&mut cli_web).await;
         Ok(())
     }
 
@@ -78,7 +72,7 @@ mod tests {
     async fn snapshot_time_travel_read_via_http() -> Result<()> {
         let bind = "127.0.0.1:19083";
         let data_dir = fresh_data_dir("snapshot-time-travel");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let _server = start_server_with_data_dir(bind, &data_dir).await?;
         let base_url = format!("http://{bind}");
         let client = reqwest::Client::new();
 
@@ -122,8 +116,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -132,7 +124,7 @@ mod tests {
     async fn store_index_lists_keys_by_prefix_and_depth() -> Result<()> {
         let bind = "127.0.0.1:19122";
         let data_dir = fresh_data_dir("store-index");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let _server = start_server_with_data_dir(bind, &data_dir).await?;
         let base_url = format!("http://{bind}");
         let client = reqwest::Client::new();
 
@@ -177,8 +169,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -187,7 +177,7 @@ mod tests {
     async fn corrupted_chunk_returns_conflict() -> Result<()> {
         let bind = "127.0.0.1:19084";
         let data_dir = fresh_data_dir("corrupt-detection");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let _server = start_server_with_data_dir(bind, &data_dir).await?;
         let base_url = format!("http://{bind}");
         let client = reqwest::Client::new();
 
@@ -216,8 +206,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -226,7 +214,7 @@ mod tests {
     async fn version_graph_and_confirm_flow() -> Result<()> {
         let bind = "127.0.0.1:19085";
         let data_dir = fresh_data_dir("version-graph");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let _server = start_server_with_data_dir(bind, &data_dir).await?;
         let base_url = format!("http://{bind}");
         let client = reqwest::Client::new();
 
@@ -341,8 +329,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -351,7 +337,7 @@ mod tests {
     async fn read_modes_respect_preferred_and_confirmed_visibility() -> Result<()> {
         let bind = "127.0.0.1:19087";
         let data_dir = fresh_data_dir("read-modes");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let _server = start_server_with_data_dir(bind, &data_dir).await?;
         let base_url = format!("http://{bind}");
         let client = reqwest::Client::new();
 
@@ -470,8 +456,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -480,7 +464,7 @@ mod tests {
     async fn commit_endpoint_enforces_quorum_mode() -> Result<()> {
         let bind = "127.0.0.1:19086";
         let data_dir = fresh_data_dir("version-commit-quorum");
-        let mut server = start_server_with_options(
+        let _server = start_server_with_options(
             bind,
             &data_dir,
             "00000000-0000-0000-0000-0000000000a1",
@@ -600,8 +584,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -621,7 +603,7 @@ mod tests {
             ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
-        let mut node_a = start_server_with_env_options(
+        let _node_a = start_server_with_env_options(
             bind_a,
             &data_a,
             node_id_a,
@@ -632,7 +614,7 @@ mod tests {
         )
         .await?;
 
-        let mut node_b = start_server_with_env_options(
+        let _node_b = start_server_with_env_options(
             bind_b,
             &data_b,
             node_id_b,
@@ -657,9 +639,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
 
@@ -681,7 +660,7 @@ mod tests {
             ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
-        let mut node_a = start_server_with_env_options(
+        let _node_a = start_server_with_env_options(
             bind_a,
             &data_a,
             node_id_a,
@@ -712,8 +691,6 @@ mod tests {
             register_node(&client, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
 
             wait_for_online_nodes(&client, &base_a, 2, 80).await?;
-
-            stop_server(&mut node_b).await;
             wait_for_online_nodes(&client, &base_a, 1, 80).await?;
 
             node_b = start_server_with_env_options(
@@ -736,9 +713,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
 
@@ -760,7 +734,7 @@ mod tests {
             ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
-        let mut node_a = start_server_with_env_options(
+        let _node_a = start_server_with_env_options(
             bind_a,
             &data_a,
             node_id_a,
@@ -793,7 +767,6 @@ mod tests {
             wait_for_online_nodes(&client, &base_a, 2, 80).await?;
 
             for _ in 0..2 {
-                stop_server(&mut node_b).await;
                 wait_for_online_nodes(&client, &base_a, 1, 80).await?;
 
                 node_b = start_server_with_env_options(
@@ -817,9 +790,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
 
@@ -840,9 +810,9 @@ mod tests {
         let data_b = fresh_data_dir("multi-node-b");
         let data_c = fresh_data_dir("multi-node-c");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
-        let mut node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
+        let _node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let _node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let _node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -908,10 +878,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
-        stop_server(&mut node_c).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
@@ -926,7 +892,7 @@ mod tests {
         let remove_node_id = "00000000-0000-0000-0000-0000000000e2";
 
         let data_dir = fresh_data_dir("node-decommission");
-        let mut server = start_server_with_config(bind, &data_dir, local_node_id, 2).await?;
+        let _server = start_server_with_config(bind, &data_dir, local_node_id, 2).await?;
 
         let base_url = format!("http://{bind}");
         let http = reqwest::Client::new();
@@ -999,8 +965,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1019,9 +983,9 @@ mod tests {
         let data_b = fresh_data_dir("repair-b");
         let data_c = fresh_data_dir("repair-c");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
-        let mut node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
+        let _node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let _node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let _node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -1101,10 +1065,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
-        stop_server(&mut node_c).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
@@ -1123,7 +1083,7 @@ mod tests {
         let data_a = fresh_data_dir("auto-repair-a");
         let data_b = fresh_data_dir("auto-repair-b");
 
-        let mut node_a = start_server_with_env(
+        let _node_a = start_server_with_env(
             bind_a,
             &data_a,
             node_id_a,
@@ -1131,7 +1091,7 @@ mod tests {
             &[("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
         )
         .await?;
-        let mut node_b = start_server_with_env(
+        let _node_b = start_server_with_env(
             bind_b,
             &data_b,
             node_id_b,
@@ -1159,9 +1119,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
 
@@ -1182,9 +1139,9 @@ mod tests {
         let data_b = fresh_data_dir("repair-batch-b");
         let data_c = fresh_data_dir("repair-batch-c");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
-        let mut node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
+        let _node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let _node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let _node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -1224,10 +1181,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
-        stop_server(&mut node_c).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
@@ -1246,8 +1199,8 @@ mod tests {
         let data_a = fresh_data_dir("repair-version-a");
         let data_b = fresh_data_dir("repair-version-b");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let _node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let _node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -1323,9 +1276,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
 
@@ -1353,9 +1303,9 @@ mod tests {
             ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
         ];
 
-        let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 3, &env).await?;
-        let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 3, &env).await?;
-        let mut node_c = start_server_with_env(bind_c, &data_c, node_id_c, 3, &env).await?;
+        let _node_a = start_server_with_env(bind_a, &data_a, node_id_a, 3, &env).await?;
+        let _node_b = start_server_with_env(bind_b, &data_b, node_id_b, 3, &env).await?;
+        let _node_c = start_server_with_env(bind_c, &data_c, node_id_c, 3, &env).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -1441,10 +1391,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
-        stop_server(&mut node_c).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
@@ -1459,7 +1405,7 @@ mod tests {
         let data_dir = fresh_data_dir("internal-auth-missing-token");
         let node_tokens = format!("{node_id}=secret-1");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
@@ -1485,8 +1431,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1498,7 +1442,7 @@ mod tests {
         let data_dir = fresh_data_dir("internal-auth-wrong-token");
         let node_tokens = format!("{node_id}=secret-2");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
@@ -1525,8 +1469,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1541,7 +1483,7 @@ mod tests {
         let per_node_tokens =
             format!("{controller_node_id}=token-controller,{caller_node_id}=token-caller");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             controller_node_id,
@@ -1578,8 +1520,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1591,7 +1531,7 @@ mod tests {
         let data_dir = fresh_data_dir("internal-auth-valid-token");
         let node_tokens = format!("{node_id}=secret-3");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
@@ -1620,8 +1560,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1635,7 +1573,7 @@ mod tests {
         let data_dir = fresh_data_dir("internal-auth-unregistered-node");
         let node_tokens = format!("{node_id}=secret-4,{unknown_node_id}=secret-4");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
@@ -1661,8 +1599,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1677,7 +1613,7 @@ mod tests {
         let per_node_tokens =
             format!("{controller_node_id}=token-controller,{caller_node_id}=token-caller");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             controller_node_id,
@@ -1716,8 +1652,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1729,7 +1663,7 @@ mod tests {
         let data_dir = fresh_data_dir("internal-auth-malformed-node-id");
         let node_tokens = format!("{node_id}=secret-5");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             node_id,
@@ -1754,8 +1688,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1769,7 +1701,7 @@ mod tests {
         let data_dir = fresh_data_dir("internal-auth-registered-no-token");
         let node_tokens = format!("{controller_node_id}=secret-controller");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             controller_node_id,
@@ -1804,8 +1736,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1819,7 +1749,7 @@ mod tests {
         let node_tokens =
             format!("{controller_node_id}=controller-token,{caller_node_id}=old-token");
 
-        let mut server = start_server_with_env(
+        let _server = start_server_with_env(
             bind,
             &data_dir,
             controller_node_id,
@@ -1903,8 +1833,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
@@ -1920,8 +1848,8 @@ mod tests {
         let data_a = fresh_data_dir("rejoin-a");
         let data_b = fresh_data_dir("rejoin-b");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let _node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let _node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -2016,9 +1944,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
 
@@ -2036,8 +1961,8 @@ mod tests {
         let data_a = fresh_data_dir("reconcile-idempotent-a");
         let data_b = fresh_data_dir("reconcile-idempotent-b");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let _node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let _node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -2120,9 +2045,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut node_a).await;
-        stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
 
@@ -2133,7 +2055,7 @@ mod tests {
     async fn maintenance_cleanup_removes_orphans_and_keeps_live_data() -> Result<()> {
         let bind = "127.0.0.1:19102";
         let data_dir = fresh_data_dir("maintenance-cleanup");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let _server = start_server_with_data_dir(bind, &data_dir).await?;
         let base_url = format!("http://{bind}");
         let client = reqwest::Client::new();
 
@@ -2224,9 +2146,11 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         }
         .await;
-
-        stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
     }
 }
+
+
+
+

@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod cfapi_monitor_test {
-    use crate::framework::{fresh_data_dir, start_cfapi_adapter, start_server, stop_server};
+    use crate::framework::{fresh_data_dir, start_cfapi_adapter, start_server};
     use reqwest::Client;
     use std::fs::File;
     use std::io::Write;
@@ -11,7 +11,7 @@ mod cfapi_monitor_test {
     #[tokio::test]
     async fn test_cfapi_monitor_detects_new_and_modified_file() {
         let bind = "127.0.0.1:19090";
-        let mut server = start_server(bind)
+        let _server = start_server(bind)
             .await
             .expect("Failed to start local server-node");
 
@@ -29,7 +29,7 @@ mod cfapi_monitor_test {
         file.sync_all().expect("Failed to sync file");
 
         // start CFAPI adapter to monitor the sync root and upload changes to server
-        let mut adapter = start_cfapi_adapter(
+        let _adapter = start_cfapi_adapter(
             "ironmesh.systemtest.syncroot",
             "ironmesh System Test Sync Root",
             &sync_root,
@@ -70,8 +70,6 @@ mod cfapi_monitor_test {
             body.contains("modified content"),
             "Modified content not found on server"
         );
-
-        stop_server(&mut adapter).await;
-        stop_server(&mut server).await;
     }
 }
+

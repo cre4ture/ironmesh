@@ -9,12 +9,30 @@ use std::time::{Duration, SystemTime};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
-pub async fn start_server(bind: &str) -> Result<Child> {
+pub struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    pub fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+pub async fn start_server(bind: &str) -> Result<ChildGuard> {
     let data_dir = fresh_data_dir("default-server");
     start_server_with_data_dir(bind, &data_dir).await
 }
 
-pub async fn start_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<Child> {
+pub async fn start_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
     start_server_with_config(bind, data_dir, "", 3).await
 }
 
@@ -23,7 +41,7 @@ pub async fn start_server_with_config(
     data_dir: &Path,
     node_id: &str,
     replication_factor: usize,
-) -> Result<Child> {
+) -> Result<ChildGuard> {
     start_server_with_options(bind, data_dir, node_id, replication_factor, None, None).await
 }
 
@@ -34,7 +52,7 @@ pub async fn start_server_with_options(
     replication_factor: usize,
     metadata_commit_mode: Option<&str>,
     heartbeat_timeout_secs: Option<u64>,
-) -> Result<Child> {
+) -> Result<ChildGuard> {
     start_server_with_env_options(
         bind,
         data_dir,
@@ -53,7 +71,7 @@ pub async fn start_server_with_env(
     node_id: &str,
     replication_factor: usize,
     extra_env: &[(&str, &str)],
-) -> Result<Child> {
+) -> Result<ChildGuard> {
     start_server_with_env_options(
         bind,
         data_dir,
@@ -74,7 +92,7 @@ pub async fn start_server_with_env_options(
     metadata_commit_mode: Option<&str>,
     heartbeat_timeout_secs: Option<u64>,
     extra_env: &[(&str, &str)],
-) -> Result<Child> {
+) -> Result<ChildGuard> {
     let server_bin = binary_path("server-node")?;
 
     let mut command = Command::new(server_bin);
@@ -110,7 +128,7 @@ pub async fn start_server_with_env_options(
     let child = command.spawn().context("failed to spawn server-node")?;
 
     wait_for_server(bind, 40).await?;
-    Ok(child)
+    Ok(ChildGuard::new(child))
 }
 
 pub async fn register_node(
@@ -181,7 +199,7 @@ pub async fn run_cli(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-pub async fn start_cli_web(bind: &str) -> Result<Child> {
+pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {
     let cli_bin = binary_path("cli-client")?;
 
     let child = Command::new(cli_bin)
@@ -190,11 +208,12 @@ pub async fn start_cli_web(bind: &str) -> Result<Child> {
         .arg(bind)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .context("failed to spawn cli-client serve-web")?;
 
     wait_for_url_status(&format!("http://{bind}/api/ping"), StatusCode::OK, 40).await?;
-    Ok(child)
+    Ok(ChildGuard::new(child))
 }
 
 #[cfg(windows)]
@@ -203,7 +222,7 @@ pub async fn start_cfapi_adapter(
     display_name: &str,
     root_path: &Path,
     server_base_url: &str,
-) -> Result<Child> {
+) -> Result<ChildGuard> {
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
 
@@ -242,7 +261,7 @@ pub async fn start_cfapi_adapter(
         .context("failed to spawn os-integration serve")?;
 
     sleep(Duration::from_secs(2)).await;
-    Ok(child)
+    Ok(ChildGuard::new(child))
 }
 
 pub async fn wait_for_server(bind: &str, retries: usize) -> Result<()> {
@@ -315,11 +334,6 @@ pub async fn wait_for_object_payload(
     }
 
     bail!("object {key} did not replicate to expected payload at {base_url}/store/{key}");
-}
-
-pub async fn stop_server(child: &mut Child) {
-    let _ = child.kill().await;
-    let _ = child.wait().await;
 }
 
 pub fn binary_path(name: &str) -> Result<PathBuf> {
