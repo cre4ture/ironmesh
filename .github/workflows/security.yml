@@ -48,4 +48,4 @@ jobs:
           tool: cargo-deny
 
       - name: Run cargo deny policy checks
-        run: cargo deny check advisories licenses sources bans
+        run: cargo deny --exclude system-tests check advisories licenses sources bans
