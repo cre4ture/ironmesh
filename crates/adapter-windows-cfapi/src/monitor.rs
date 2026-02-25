@@ -66,11 +66,12 @@ impl SyncRootMonitor {
                 // File is materialized, convert to placeholder using a file HANDLE
                 try_convert_materialized_file(path, &rel_path, &metadata);
                 // upload content to server
-                if let Err(e) = self.uploader.upload_reader(&rel_path, &mut std::fs::File::open(path).unwrap(), metadata.len()) {
-                    eprintln!(
-                        "{}: failed to upload file {}: {}",
-                        self.name, rel_path, e
-                    );
+                if let Err(e) = self.uploader.upload_reader(
+                    &rel_path,
+                    &mut std::fs::File::open(path).unwrap(),
+                    metadata.len(),
+                ) {
+                    eprintln!("{}: failed to upload file {}: {}", self.name, rel_path, e);
                 } else {
                     eprintln!("{}: uploaded file {}", self.name, rel_path);
                 }

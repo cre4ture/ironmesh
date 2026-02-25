@@ -72,4 +72,3 @@ mod cfapi_monitor_test {
         );
     }
 }
-

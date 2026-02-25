@@ -78,8 +78,7 @@ mod tests {
     #[test]
     fn path_to_relative_strips_full_root_prefix_with_drive() {
         let sync_root = Path::new(r"C:\Users\hornu\AppData\Local\Temp\ironmesh-sync");
-        let normalized_path =
-            r"C:\Users\hornu\AppData\Local\Temp\ironmesh-sync\docs\readme.txt";
+        let normalized_path = r"C:\Users\hornu\AppData\Local\Temp\ironmesh-sync\docs\readme.txt";
 
         let relative = path_to_relative(sync_root, normalized_path);
         assert_eq!(relative, "docs/readme.txt");

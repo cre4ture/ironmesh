@@ -593,8 +593,10 @@ unsafe extern "system" fn callback_file_close_completion(
     }
 
     let relative_path = path_to_relative(&context.sync_root, &normalized_path);
-    eprintln!("close-completion: relative_path={}, normalized_path={}, sync_root={:?}",
-        relative_path, normalized_path, context.sync_root);
+    eprintln!(
+        "close-completion: relative_path={}, normalized_path={}, sync_root={:?}",
+        relative_path, normalized_path, context.sync_root
+    );
 
     let full_path = context.sync_root.join(&relative_path);
 
@@ -603,35 +605,36 @@ unsafe extern "system" fn callback_file_close_completion(
     // initial metadata to current metadata and skip upload when unchanged.
     let request_key = callback_info_ref.RequestKey as u64;
     if let Ok(mut opens) = context.opens.lock()
-        && let Some(open_info) = opens.remove(&request_key) {
-            // CF provides open completion flags; check for write access flag.
-            if (open_info.flags & CF_OPEN_FILE_FLAG_WRITE_ACCESS as u32) == 0 {
+        && let Some(open_info) = opens.remove(&request_key)
+    {
+        // CF provides open completion flags; check for write access flag.
+        if (open_info.flags & CF_OPEN_FILE_FLAG_WRITE_ACCESS as u32) == 0 {
+            eprintln!(
+                "close-completion: open flags indicate no write access (flags=0x{:08x}); doing upload anyway",
+                open_info.flags
+            );
+            // return;
+        }
+
+        // We saw a write-capable open; check if file changed since open.
+        if let Ok(metadata) = std::fs::metadata(&full_path) {
+            let size = metadata.len();
+            let mtime_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if size == open_info.size && mtime_secs == open_info.mtime_secs {
                 eprintln!(
-                    "close-completion: open flags indicate no write access (flags=0x{:08x}); doing upload anyway",
-                    open_info.flags
+                    "close-completion: file opened write-capable but unchanged; doing upload anyway"
                 );
                 // return;
             }
-
-            // We saw a write-capable open; check if file changed since open.
-            if let Ok(metadata) = std::fs::metadata(&full_path) {
-                let size = metadata.len();
-                let mtime_secs = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                if size == open_info.size && mtime_secs == open_info.mtime_secs {
-                    eprintln!(
-                        "close-completion: file opened write-capable but unchanged; doing upload anyway"
-                    );
-                    // return;
-                }
-            } else {
-                // If metadata now unavailable but open existed, proceed to upload as a fallback.
-            }
+        } else {
+            // If metadata now unavailable but open existed, proceed to upload as a fallback.
         }
+    }
 
     // Remove hydrated_once_paths logic: always handle upload for any file closed in sync root
     // This allows new files and folders to be uploaded, matching OneDrive behavior
