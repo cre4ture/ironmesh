@@ -10,12 +10,9 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use client_sdk::ClientNode;
+use client_sdk::{ClientNode, UploadMode};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-
-const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
-const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
+use serde::Deserialize;
 
 #[derive(Clone)]
 struct WebState {
@@ -199,24 +196,6 @@ struct WebVersionsQuery {
     key: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct StoreChunkUploadResponse {
-    hash: String,
-    size_bytes: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct CompleteStoreUploadRequest {
-    total_size_bytes: usize,
-    chunks: Vec<CompleteStoreUploadChunkRef>,
-}
-
-#[derive(Debug, Serialize)]
-struct CompleteStoreUploadChunkRef {
-    hash: String,
-    size_bytes: usize,
-}
-
 async fn print_json_endpoint(http: &Client, server_url: &str, path: &str) -> Result<()> {
     let value = fetch_server_json(http, server_url, path).await?;
     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -286,37 +265,6 @@ fn build_server_store_delete_url(server_url: &str, key: &str) -> Result<String> 
         segments.push("delete");
     }
     url.query_pairs_mut().append_pair("key", key);
-
-    Ok(url.to_string())
-}
-
-fn build_server_store_chunk_upload_url(server_url: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(server_url.trim_end_matches('/'))
-        .with_context(|| format!("invalid server URL: {server_url}"))?;
-
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| anyhow!("server URL cannot be a base"))?;
-        segments.push("store-chunks");
-        segments.push("upload");
-    }
-
-    Ok(url.to_string())
-}
-
-fn build_server_store_complete_url(server_url: &str, key: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(server_url.trim_end_matches('/'))
-        .with_context(|| format!("invalid server URL: {server_url}"))?;
-
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| anyhow!("server URL cannot be a base"))?;
-        segments.push("store");
-        segments.push(key);
-    }
-    url.query_pairs_mut().append_pair("complete", "");
 
     Ok(url.to_string())
 }
@@ -621,87 +569,26 @@ async fn web_store_put_binary(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
-    if payload.len() > LARGE_UPLOAD_THRESHOLD_BYTES {
-        let chunk_upload_url = match build_server_store_chunk_upload_url(&state.server_url) {
-            Ok(url) => url,
-            Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
-        };
-        let complete_url = match build_server_store_complete_url(&state.server_url, &query.key) {
-            Ok(url) => url,
-            Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
-        };
-
-        let mut chunk_refs = Vec::new();
-        for chunk in payload.chunks(CHUNK_UPLOAD_SIZE_BYTES) {
-            let upload_result = state
-                .http
-                .post(&chunk_upload_url)
-                .body(chunk.to_vec())
-                .send()
-                .await;
-
-            let response = match upload_result {
-                Ok(response) => response,
-                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    match state.client.put_large_aware(query.key.clone(), payload).await {
+        Ok(report) => {
+            let upload_mode = match report.upload_mode {
+                UploadMode::Direct => "direct",
+                UploadMode::Chunked => "chunked",
             };
 
-            let response = match response.error_for_status() {
-                Ok(ok) => ok,
-                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-            };
-
-            let uploaded = match response.json::<StoreChunkUploadResponse>().await {
-                Ok(value) => value,
-                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-            };
-
-            chunk_refs.push(CompleteStoreUploadChunkRef {
-                hash: uploaded.hash,
-                size_bytes: uploaded.size_bytes,
-            });
-        }
-
-        let complete_payload = CompleteStoreUploadRequest {
-            total_size_bytes: payload.len(),
-            chunks: chunk_refs,
-        };
-
-        match state
-            .http
-            .post(complete_url)
-            .json(&complete_payload)
-            .send()
-            .await
-        {
-            Ok(response) => match response.error_for_status() {
-                Ok(_) => (
-                    StatusCode::CREATED,
-                    Json(serde_json::json!({
-                        "key": query.key,
-                        "size_bytes": payload.len(),
-                        "upload_mode": "chunked",
-                        "chunk_size_bytes": CHUNK_UPLOAD_SIZE_BYTES,
-                        "chunk_count": complete_payload.chunks.len(),
-                    })),
-                )
-                    .into_response(),
-                Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-            },
-            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-        }
-    } else {
-        match state.client.put(query.key.clone(), payload).await {
-            Ok(meta) => (
+            (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
-                    "key": meta.key,
-                    "size_bytes": meta.size_bytes,
-                    "upload_mode": "direct",
+                    "key": report.meta.key,
+                    "size_bytes": report.meta.size_bytes,
+                    "upload_mode": upload_mode,
+                    "chunk_size_bytes": report.chunk_size_bytes,
+                    "chunk_count": report.chunk_count,
                 })),
             )
-                .into_response(),
-            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+                .into_response()
         }
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
 

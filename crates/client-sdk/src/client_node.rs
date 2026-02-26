@@ -6,7 +6,7 @@ use bytes::Bytes;
 use common::{CacheEntry, StorageObjectMeta};
 use tokio::sync::RwLock;
 
-use crate::ironmesh_client::IronMeshClient;
+use crate::ironmesh_client::{IronMeshClient, UploadResult};
 
 #[derive(Clone)]
 pub struct ClientNode {
@@ -28,6 +28,13 @@ impl ClientNode {
 
         self.cache.write().await.insert(key.clone(), data.clone());
         Ok(meta)
+    }
+
+    pub async fn put_large_aware(&self, key: impl Into<String>, data: Bytes) -> Result<UploadResult> {
+        let key = key.into();
+        let report = self.client.put_large_aware(key.clone(), data.clone()).await?;
+        self.cache.write().await.insert(key, data);
+        Ok(report)
     }
 
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Bytes> {
