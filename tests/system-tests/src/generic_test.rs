@@ -52,6 +52,73 @@ mod tests {
         Ok(())
     }
 
+    async fn run_server_store_put_get_payload_case(
+        bind: &str,
+        data_dir_suffix: &str,
+        payload_len: usize,
+    ) -> Result<()> {
+        let data_dir = fresh_data_dir(data_dir_suffix);
+        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
+        let base_url = format!("http://{bind}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            let key = "large-payload.bin";
+            let put_url = format!("{base_url}/store/{key}");
+            let get_url = format!("{base_url}/store/{key}");
+
+            let mut payload = vec![b'X'; payload_len];
+            payload[0..6].copy_from_slice(b"BEGIN:");
+            payload[payload_len - 4..payload_len].copy_from_slice(b":END");
+            let payload = Bytes::from(payload);
+
+            client
+                .put(&put_url)
+                .body(payload.clone())
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let fetched = client
+                .get(&get_url)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+
+            assert_eq!(fetched.len(), payload.len());
+            assert_eq!(fetched, payload);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        result
+    }
+
+    #[tokio::test]
+    async fn server_store_put_get_payload_small() -> Result<()> {
+        run_server_store_put_get_payload_case(
+            "127.0.0.1:19123",
+            "server-small-payload",
+            1024,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn server_store_put_get_payload_large_over_5mb() -> Result<()> {
+        run_server_store_put_get_payload_case(
+            "127.0.0.1:19124",
+            "server-large-payload",
+            5 * 1024 * 1024 + 1024,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn cli_web_interface_ping() -> Result<()> {
         let bind = "127.0.0.1:19082";
