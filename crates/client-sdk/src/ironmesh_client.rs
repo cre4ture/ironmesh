@@ -3,6 +3,7 @@ use bytes::Bytes;
 use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
@@ -154,6 +155,97 @@ impl IronMeshClient {
                 chunk_count: None,
             })
         }
+    }
+
+    pub fn put_large_aware_reader(
+        &self,
+        key: impl Into<String>,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<UploadResult> {
+        let key = key.into();
+
+        if length <= LARGE_UPLOAD_THRESHOLD_BYTES as u64 {
+            let mut buf = Vec::with_capacity(std::cmp::min(length as usize, 8192));
+            let mut limited = reader.take(length);
+            std::io::Read::read_to_end(&mut limited, &mut buf)
+                .with_context(|| format!("failed reading payload for key={key}"))?;
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to create runtime for upload")?;
+            return runtime.block_on(self.put_large_aware(key, Bytes::from(buf)));
+        }
+
+        let chunk_upload_url = self.store_chunk_upload_url()?;
+        let complete_url = self.store_complete_url(&key)?;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for upload")?;
+
+        let mut uploaded_total = 0u64;
+        let mut chunk_refs = Vec::new();
+
+        loop {
+            let mut chunk = vec![0u8; CHUNK_UPLOAD_SIZE_BYTES];
+            let read_bytes = reader
+                .read(&mut chunk)
+                .with_context(|| format!("failed reading chunk for key={key}"))?;
+            if read_bytes == 0 {
+                break;
+            }
+
+            chunk.truncate(read_bytes);
+            uploaded_total = uploaded_total
+                .checked_add(read_bytes as u64)
+                .context("uploaded byte count overflow")?;
+
+            let response = runtime
+                .block_on(self.http.post(&chunk_upload_url).body(chunk).send())
+                .with_context(|| format!("failed to upload chunk for key={key}"))?
+                .error_for_status()
+                .with_context(|| format!("chunk upload rejected for key={key}"))?;
+
+            let uploaded = runtime
+                .block_on(response.json::<StoreChunkUploadResponse>())
+                .with_context(|| format!("failed to parse chunk upload response for {key}"))?;
+
+            chunk_refs.push(CompleteStoreUploadChunkRef {
+                hash: uploaded.hash,
+                size_bytes: uploaded.size_bytes,
+            });
+        }
+
+        if uploaded_total != length {
+            anyhow::bail!(
+                "short read while uploading {key}: expected={length} actual={uploaded_total}"
+            );
+        }
+
+        let complete_payload = CompleteStoreUploadRequest {
+            total_size_bytes: usize::try_from(length)
+                .with_context(|| format!("payload too large to represent for key={key}"))?,
+            chunks: chunk_refs,
+        };
+
+        runtime
+            .block_on(self.http.post(complete_url).json(&complete_payload).send())
+            .with_context(|| format!("failed to finalize chunked upload for key={key}"))?
+            .error_for_status()
+            .with_context(|| format!("chunked finalize rejected for key={key}"))?;
+
+        Ok(UploadResult {
+            meta: StorageObjectMeta {
+                key,
+                size_bytes: complete_payload.total_size_bytes,
+            },
+            upload_mode: UploadMode::Chunked,
+            chunk_size_bytes: Some(CHUNK_UPLOAD_SIZE_BYTES),
+            chunk_count: Some(complete_payload.chunks.len()),
+        })
     }
 
     fn store_key_url(&self, key: &str) -> Result<String> {
