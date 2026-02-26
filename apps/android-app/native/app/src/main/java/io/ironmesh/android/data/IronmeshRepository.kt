@@ -58,6 +58,14 @@ class IronmeshRepository {
     }
 
     suspend fun putObject(baseUrl: String, key: String, payload: String): Int {
+        if (RustClientBridge.isAvailable()) {
+            return RustClientBridge.putObject(
+                sanitizeBaseUrl(baseUrl),
+                key,
+                payload.toByteArray(Charsets.UTF_8),
+            )
+        }
+
         val body = payload.toRequestBody("application/octet-stream".toMediaType())
         val response = createApi(baseUrl).putObject(key, body)
         if (!response.isSuccessful) {
@@ -67,6 +75,10 @@ class IronmeshRepository {
     }
 
     suspend fun getObject(baseUrl: String, key: String): String {
+        if (RustClientBridge.isAvailable()) {
+            return RustClientBridge.getObject(sanitizeBaseUrl(baseUrl), key)
+                .toString(Charsets.UTF_8)
+        }
         return createApi(baseUrl).getObject(key).string()
     }
 
@@ -82,6 +94,10 @@ class IronmeshRepository {
     }
 
     suspend fun putObjectBytes(baseUrl: String, key: String, payload: ByteArray): Int {
+        if (RustClientBridge.isAvailable()) {
+            return RustClientBridge.putObject(sanitizeBaseUrl(baseUrl), key, payload)
+        }
+
         val body = payload.toRequestBody("application/octet-stream".toMediaType())
         val response = createApi(baseUrl).putObject(key, body)
         if (!response.isSuccessful) {
@@ -118,6 +134,10 @@ class IronmeshRepository {
         snapshot: String? = null,
         version: String? = null,
     ): ByteArray {
+        if (snapshot == null && version == null && RustClientBridge.isAvailable()) {
+            return RustClientBridge.getObject(sanitizeBaseUrl(baseUrl), key)
+        }
+
         val response = createApi(baseUrl).getObjectBinary(key, snapshot = snapshot, version = version)
         if (!response.isSuccessful) {
             throw IllegalStateException("GET failed with HTTP ${response.code()}")

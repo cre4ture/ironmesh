@@ -3,9 +3,54 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val rustAbiTargets = listOf("arm64-v8a", "x86_64")
+val rustJniOutDir = layout.buildDirectory.dir("generated/rustJniLibs")
+val workspaceRoot = rootProject.layout.projectDirectory.dir("../../..").asFile
+val rustManifestPath = "apps/android-app/Cargo.toml"
+
+val buildRustJniLibs by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Build Rust JNI library for Android ABIs via cargo-ndk"
+    workingDir = workspaceRoot
+
+    doFirst {
+        rustJniOutDir.get().asFile.mkdirs()
+        
+        // Access NDK directory only at execution time to avoid configuration errors
+        val ndkDir = project.extensions.getByType<com.android.build.gradle.BaseExtension>().ndkDirectory
+        if (ndkDir == null || !ndkDir.exists()) {
+            throw GradleException(
+                "NDK is not installed or not found. Please ensure 'ndkVersion' is set correctly " +
+                "in build.gradle.kts and installed via the Android SDK Manager."
+            )
+        }
+        environment("ANDROID_NDK_HOME", ndkDir.absolutePath)
+        
+        val releaseBuild = gradle.startParameter.taskNames.any {
+            it.contains("Release", ignoreCase = true)
+        }
+
+        val args = mutableListOf("cargo", "ndk", "-o", rustJniOutDir.get().asFile.absolutePath)
+        rustAbiTargets.forEach { abi ->
+            args.add("-t")
+            args.add(abi)
+        }
+        args.add("build")
+        args.add("--manifest-path")
+        args.add(rustManifestPath)
+        if (releaseBuild) {
+            args.add("--release")
+        }
+        commandLine(args)
+    }
+}
+
 android {
     namespace = "io.ironmesh.android"
     compileSdk = 34
+    
+    // Ensure AGP knows which version to use/download
+    ndkVersion = "26.1.10909125"
 
     defaultConfig {
         applicationId = "io.ironmesh.android"
@@ -15,6 +60,10 @@ android {
         versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += rustAbiTargets
+        }
     }
 
     buildTypes {
@@ -49,6 +98,16 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDir(rustJniOutDir)
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn(buildRustJniLibs)
 }
 
 dependencies {
