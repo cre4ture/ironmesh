@@ -4,12 +4,12 @@ use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
 
 #[derive(Clone)]
-pub struct Client {
+pub struct IronMeshClient {
     http: HttpClient,
     server_base_url: String,
 }
 
-impl Client {
+impl IronMeshClient {
     pub fn new(server_base_url: impl Into<String>) -> Self {
         Self {
             http: HttpClient::new(),

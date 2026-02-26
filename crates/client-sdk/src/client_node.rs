@@ -6,18 +6,18 @@ use bytes::Bytes;
 use common::{CacheEntry, StorageObjectMeta};
 use tokio::sync::RwLock;
 
-use crate::client::Client;
+use crate::ironmesh_client::IronMeshClient;
 
 #[derive(Clone)]
 pub struct ClientNode {
-    client: Client,
+    client: IronMeshClient,
     cache: Arc<RwLock<HashMap<String, Bytes>>>,
 }
 
 impl ClientNode {
     pub fn new(server_base_url: impl Into<String>) -> Self {
         Self {
-            client: Client::new(server_base_url),
+            client: IronMeshClient::new(server_base_url),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
