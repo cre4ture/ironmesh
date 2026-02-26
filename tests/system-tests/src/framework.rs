@@ -21,7 +21,10 @@ impl ChildGuard {
     pub async fn stop(&mut self) -> Result<()> {
         if let Some(child) = self.child.as_mut() {
             child.kill().await.context("failed to kill child process")?;
-            child.wait().await.context("failed to wait for child process to exit")?;
+            child
+                .wait()
+                .await
+                .context("failed to wait for child process to exit")?;
             self.child = None;
         }
         Ok(())
