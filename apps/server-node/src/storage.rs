@@ -171,6 +171,12 @@ pub struct ReplicationChunkInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadChunkRef {
+    pub hash: String,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationManifestPayload {
     pub key: String,
     pub total_size_bytes: usize,
@@ -443,13 +449,103 @@ impl PersistentStore {
             write_atomic(&manifest_path, &manifest_bytes).await?;
         }
 
+        self.finalize_put_from_manifest_hash(
+            key,
+            &manifest_hash,
+            options,
+            new_chunks,
+            dedup_reused_chunks,
+        )
+        .await
+    }
+
+    pub async fn put_object_from_chunks(
+        &mut self,
+        key: &str,
+        total_size_bytes: usize,
+        chunk_refs: &[UploadChunkRef],
+        options: PutOptions,
+    ) -> Result<PutResult> {
+        let computed_total_size_bytes = chunk_refs.iter().try_fold(0usize, |acc, chunk_ref| {
+            acc.checked_add(chunk_ref.size_bytes).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "chunk size overflow while validating upload for key={key} hash={}",
+                    chunk_ref.hash
+                )
+            })
+        })?;
+
+        if computed_total_size_bytes != total_size_bytes {
+            bail!(
+                "total_size_bytes mismatch for key={key}: expected={total_size_bytes} computed={computed_total_size_bytes}"
+            );
+        }
+
+        for chunk in chunk_refs {
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            if !fs::try_exists(&chunk_path).await? {
+                bail!("upload manifest references missing chunk hash={}", chunk.hash);
+            }
+
+            let metadata = fs::metadata(&chunk_path).await?;
+            if metadata.len() != chunk.size_bytes as u64 {
+                bail!(
+                    "upload chunk size mismatch hash={} expected={} actual={}",
+                    chunk.hash,
+                    chunk.size_bytes,
+                    metadata.len()
+                );
+            }
+        }
+
+        let manifest = ObjectManifest {
+            key: key.to_string(),
+            total_size_bytes,
+            created_at_unix: unix_ts(),
+            chunks: chunk_refs
+                .iter()
+                .map(|chunk| ChunkRef {
+                    hash: chunk.hash.clone(),
+                    size_bytes: chunk.size_bytes,
+                })
+                .collect(),
+        };
+
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_hash = hash_hex(&manifest_bytes);
+        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+
+        if !fs::try_exists(&manifest_path).await? {
+            write_atomic(&manifest_path, &manifest_bytes).await?;
+        }
+
+        self.finalize_put_from_manifest_hash(key, &manifest_hash, options, 0, 0)
+            .await
+    }
+
+    async fn finalize_put_from_manifest_hash(
+        &mut self,
+        key: &str,
+        manifest_hash: &str,
+        options: PutOptions,
+        new_chunks: usize,
+        dedup_reused_chunks: usize,
+    ) -> Result<PutResult> {
+        let PutOptions {
+            parent_version_ids: requested_parent_version_ids,
+            state: requested_state,
+            inherit_preferred_parent,
+            create_snapshot,
+            explicit_version_id,
+        } = options;
+
         let mut index = self
             .load_version_index(key)
             .await?
             .unwrap_or_else(|| empty_version_index(key));
 
-        let parent_version_ids = if options.parent_version_ids.is_empty() {
-            if options.inherit_preferred_parent {
+        let parent_version_ids = if requested_parent_version_ids.is_empty() {
+            if inherit_preferred_parent {
                 index
                     .preferred_head_version_id
                     .iter()
@@ -459,7 +555,7 @@ impl PersistentStore {
                 Vec::new()
             }
         } else {
-            options.parent_version_ids.clone()
+            requested_parent_version_ids.clone()
         };
 
         for parent in &parent_version_ids {
@@ -468,8 +564,7 @@ impl PersistentStore {
             }
         }
 
-        let version_id = options
-            .explicit_version_id
+        let version_id = explicit_version_id
             .clone()
             .unwrap_or_else(|| format!("ver-{}-{}", unix_ts_nanos(), &manifest_hash[..12]));
 
@@ -483,7 +578,7 @@ impl PersistentStore {
             self.sync_current_state_for_key_from_index(key, &index)?;
             self.persist_current_state().await?;
 
-            let snapshot_id = if options.create_snapshot {
+            let snapshot_id = if create_snapshot {
                 self.create_snapshot().await?
             } else {
                 format!("snap-skipped-{version_id}")
@@ -499,19 +594,20 @@ impl PersistentStore {
             });
         }
 
-        if options.explicit_version_id.is_none()
+        if explicit_version_id.is_none()
             && let Some(preferred_head_id) = index.preferred_head_version_id.clone()
             && let Some(preferred_head) = index.versions.get(&preferred_head_id)
         {
-            let parent_context_matches =
-                if options.parent_version_ids.is_empty() && options.inherit_preferred_parent {
-                    true
-                } else {
-                    preferred_head.parent_version_ids == parent_version_ids
-                };
+            let parent_context_matches = if requested_parent_version_ids.is_empty()
+                && inherit_preferred_parent
+            {
+                true
+            } else {
+                preferred_head.parent_version_ids == parent_version_ids
+            };
 
             if preferred_head.manifest_hash == manifest_hash
-                && preferred_head.state == options.state
+                && preferred_head.state == requested_state
                 && parent_context_matches
             {
                 return Ok(PutResult {
@@ -528,9 +624,9 @@ impl PersistentStore {
         let record = FileVersionRecord {
             version_id: version_id.clone(),
             key: key.to_string(),
-            manifest_hash: manifest_hash.clone(),
+            manifest_hash: manifest_hash.to_string(),
             parent_version_ids: parent_version_ids.clone(),
-            state: options.state.clone(),
+            state: requested_state.clone(),
             created_at_unix: unix_ts(),
         };
 
@@ -550,7 +646,7 @@ impl PersistentStore {
         self.sync_current_state_for_key_from_index(key, &index)?;
         self.persist_current_state().await?;
 
-        let snapshot_id = if options.create_snapshot {
+        let snapshot_id = if create_snapshot {
             self.create_snapshot().await?
         } else {
             format!("snap-skipped-{version_id}")
@@ -559,7 +655,7 @@ impl PersistentStore {
         Ok(PutResult {
             snapshot_id,
             version_id,
-            state: options.state,
+            state: requested_state,
             new_chunks,
             dedup_reused_chunks,
             created_new_version: true,
@@ -742,6 +838,12 @@ impl PersistentStore {
 
         write_atomic(&chunk_path, payload).await?;
         Ok(true)
+    }
+
+    pub async fn ingest_chunk_auto(&self, payload: &[u8]) -> Result<(String, bool)> {
+        let hash = hash_hex(payload);
+        let stored = self.ingest_chunk(&hash, payload).await?;
+        Ok((hash, stored))
     }
 
     pub async fn import_replica_manifest(

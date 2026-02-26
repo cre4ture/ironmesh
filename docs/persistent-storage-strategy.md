@@ -59,6 +59,16 @@ On every read:
 - `PUT /store/{key}`
   - Stores bytes into chunked, deduplicated persistent storage.
   - Automatically updates current state and creates a snapshot.
+  - Best for smaller payloads where a single request body is acceptable.
+
+- `POST /store-chunks/upload`
+  - Uploads one content chunk and returns its `BLAKE3` hash plus dedup info.
+  - Intended for chunked/resumable clients and large files.
+
+- `POST /store/{key}?complete`
+  - Finalizes an object version from previously uploaded chunk refs.
+  - Automatically updates current state and creates a snapshot.
+  - Supports the same versioning query options as `PUT /store/{key}` (`state`, `parent`, `version_id`, `internal_replication`).
 
 - `GET /store/{key}`
   - Reads latest version from current state.
@@ -81,3 +91,4 @@ On every read:
 - Configurable chunking strategy (content-defined chunking for improved dedup).
 - Refcount + garbage collection for unreferenced chunks.
 - Signed snapshot manifests for stronger tamper evidence.
+- Resumable upload session metadata persisted on disk (for crash-safe resume across restarts).

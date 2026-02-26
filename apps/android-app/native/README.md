@@ -8,6 +8,7 @@ This is a standalone Kotlin Android app scaffold for local testing of `server-no
 - Health check (`GET /health`)
 - Replication plan summary (`GET /cluster/replication/plan`)
 - Upload object (`PUT /store/{key}`)
+- Large upload path (`POST /store-chunks/upload` + `POST /store/{key}?complete`)
 - Download object (`GET /store/{key}`)
 
 ## Open in Android Studio

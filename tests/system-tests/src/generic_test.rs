@@ -1,5 +1,8 @@
 #[cfg(test)]
 mod tests {
+    const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
+    const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
+
     use std::collections::HashSet;
     use std::fs;
     use std::time::Duration;
@@ -72,12 +75,16 @@ mod tests {
             payload[payload_len - 4..payload_len].copy_from_slice(b":END");
             let payload = Bytes::from(payload);
 
-            client
-                .put(&put_url)
-                .body(payload.clone())
-                .send()
-                .await?
-                .error_for_status()?;
+            if payload_len > CHUNK_UPLOAD_THRESHOLD_BYTES {
+                put_store_chunked(&client, &base_url, key, &payload).await?;
+            } else {
+                client
+                    .put(&put_url)
+                    .body(payload.clone())
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
 
             let fetched = client
                 .get(&get_url)
@@ -97,6 +104,54 @@ mod tests {
         stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&data_dir);
         result
+    }
+
+    async fn put_store_chunked(
+        client: &reqwest::Client,
+        base_url: &str,
+        key: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        let mut uploaded_chunks = Vec::new();
+
+        for chunk in payload.chunks(CHUNK_UPLOAD_SIZE_BYTES) {
+            let response: serde_json::Value = client
+                .post(format!("{base_url}/store-chunks/upload"))
+                .body(chunk.to_vec())
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let hash = response
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .context("chunk upload response missing hash")?;
+            let size_bytes = response
+                .get("size_bytes")
+                .and_then(|v| v.as_u64())
+                .context("chunk upload response missing size_bytes")?;
+
+            uploaded_chunks.push(serde_json::json!({
+                "hash": hash,
+                "size_bytes": size_bytes,
+            }));
+        }
+
+        let complete_payload = serde_json::json!({
+            "total_size_bytes": payload.len(),
+            "chunks": uploaded_chunks,
+        });
+
+        client
+            .post(format!("{base_url}/store/{key}?complete"))
+            .json(&complete_payload)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
     }
 
     #[tokio::test]

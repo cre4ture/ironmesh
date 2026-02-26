@@ -34,7 +34,7 @@ mod ui;
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
     ObjectReadMode, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    StoreReadError, VersionConsistencyState,
+    StoreReadError, UploadChunkRef, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -505,9 +505,13 @@ async fn main() -> Result<()> {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/delete", post(delete_object_by_query))
+        .route("/store-chunks/upload", post(upload_store_chunk))
         .route(
             "/store/{key}",
-            put(put_object).get(get_object).delete(delete_object),
+            put(put_object)
+                .get(get_object)
+                .delete(delete_object)
+                .post(complete_chunked_upload),
         )
         .route("/versions/{key}", get(list_versions))
         .route(
@@ -953,6 +957,30 @@ struct DeleteObjectByQuery {
     internal_replication: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct StoreChunkUploadResponse {
+    hash: String,
+    size_bytes: usize,
+    stored: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteStoreUploadRequest {
+    total_size_bytes: usize,
+    chunks: Vec<UploadChunkRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteStoreUploadQuery {
+    state: Option<String>,
+    #[serde(default)]
+    parent: Vec<String>,
+    version_id: Option<String>,
+    #[serde(default)]
+    internal_replication: bool,
+    complete: Option<String>,
+}
+
 fn should_trigger_autonomous_post_write_replication(
     autonomous_replication_on_put_enabled: bool,
     internal_replication: bool,
@@ -1065,6 +1093,129 @@ async fn put_object(
         }
         Err(err) => {
             tracing::error!(error = %err, key = %key, "failed to store object");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn upload_store_chunk(State(state): State<ServerState>, payload: Bytes) -> impl IntoResponse {
+    if payload.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let store = state.store.lock().await;
+    match store.ingest_chunk_auto(&payload).await {
+        Ok((hash, stored)) => (
+            StatusCode::OK,
+            Json(StoreChunkUploadResponse {
+                hash,
+                size_bytes: payload.len(),
+                stored,
+            }),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to ingest store chunk upload");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+async fn complete_chunked_upload(
+    State(state): State<ServerState>,
+    Path(key): Path<String>,
+    Query(query): Query<CompleteStoreUploadQuery>,
+    Json(payload): Json<CompleteStoreUploadRequest>,
+) -> impl IntoResponse {
+    if query.complete.is_none() {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    if query.version_id.is_some() && !query.internal_replication {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let version_state = match query.state.as_deref() {
+        None | Some("confirmed") => VersionConsistencyState::Confirmed,
+        Some("provisional") => VersionConsistencyState::Provisional,
+        Some(_) => return StatusCode::BAD_REQUEST,
+    };
+
+    let mut store = state.store.lock().await;
+    match store
+        .put_object_from_chunks(
+            &key,
+            payload.total_size_bytes,
+            &payload.chunks,
+            PutOptions {
+                parent_version_ids: query.parent,
+                state: version_state,
+                inherit_preferred_parent: true,
+                create_snapshot: !query.internal_replication,
+                explicit_version_id: query.version_id,
+            },
+        )
+        .await
+    {
+        Ok(outcome) => {
+            drop(store);
+
+            let mut cluster = state.cluster.lock().await;
+            cluster.note_replica(&key, state.node_id);
+            cluster.note_replica(
+                format!("{}@{}", key, outcome.version_id.as_str()),
+                state.node_id,
+            );
+            drop(cluster);
+
+            if let Err(err) = persist_cluster_replicas_state(&state).await {
+                warn!(
+                    error = %err,
+                    "failed to persist cluster replicas after chunked upload complete"
+                );
+            }
+
+            if should_trigger_autonomous_post_write_replication(
+                state.autonomous_replication_on_put_enabled,
+                query.internal_replication,
+            ) {
+                let state_for_repair = state.clone();
+                tokio::spawn(async move {
+                    let report =
+                        replication::execute_replication_repair_inner(&state_for_repair, None)
+                            .await;
+                    if report.attempted_transfers > 0 || report.failed_transfers > 0 {
+                        info!(
+                            attempted = report.attempted_transfers,
+                            success = report.successful_transfers,
+                            failed = report.failed_transfers,
+                            skipped = report.skipped_items,
+                            skipped_backoff = report.skipped_backoff,
+                            skipped_max_retries = report.skipped_max_retries,
+                            "autonomous post-write replication run"
+                        );
+                    }
+                });
+            }
+
+            info!(
+                key = %key,
+                snapshot_id = %outcome.snapshot_id,
+                version_id = %outcome.version_id,
+                version_state = ?outcome.state,
+                created_new_version = outcome.created_new_version,
+                new_chunks = outcome.new_chunks,
+                dedup_reused_chunks = outcome.dedup_reused_chunks,
+                "stored object from chunked upload"
+            );
+            StatusCode::CREATED
+        }
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                key = %key,
+                "failed to finalize chunked object upload"
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

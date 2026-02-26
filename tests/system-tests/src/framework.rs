@@ -137,9 +137,15 @@ pub async fn start_server_with_env_options(
         command.env(key, value);
     }
 
-    let child = command.spawn().context("failed to spawn server-node")?;
+    let mut child = command.spawn().context("failed to spawn server-node")?;
 
     wait_for_server(bind, 40).await?;
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to query server-node process state")?
+    {
+        bail!("server-node exited early on {bind} with status {status}");
+    }
     Ok(ChildGuard::new(child))
 }
 
