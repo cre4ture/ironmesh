@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
+    const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
     const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 
     use std::collections::HashSet;
