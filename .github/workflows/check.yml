@@ -80,6 +80,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Rust toolchain with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -89,6 +97,19 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK (side by side)
+        run: sdkmanager --install "ndk;27.1.12297006"
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@cargo-ndk
+
+      - name: Verify Android native toolchain
+        run: |
+          cargo --version
+          cargo ndk --version
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls -la "$ANDROID_SDK_ROOT/ndk"
 
       - name: Restore Android keystore
         run: |
