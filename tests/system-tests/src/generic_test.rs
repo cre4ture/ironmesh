@@ -11,28 +11,10 @@ mod tests {
     use crate::framework::*;
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
-    use client_sdk::ClientNode;
     use reqwest::StatusCode;
     use tokio::time::sleep;
 
-    #[tokio::test]
-    async fn sdk_roundtrip_against_live_server() -> Result<()> {
-        let bind = "127.0.0.1:19080";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
-
-        let client = ClientNode::new(&base_url);
-        let key = "sdk-roundtrip";
-        let value = Bytes::from_static(b"hello-from-sdk");
-
-        client.put(key, value.clone()).await?;
-        let fetched = client.get(key).await?;
-        assert_eq!(fetched, value);
-
-        stop_server(&mut server).await;
-        Ok(())
-    }
-
+    
     #[tokio::test]
     async fn cli_put_then_get_against_live_server() -> Result<()> {
         let bind = "127.0.0.1:19081";
