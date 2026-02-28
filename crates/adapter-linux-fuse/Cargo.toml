@@ -10,13 +10,13 @@ default = []
 
 [target.'cfg(not(windows))'.dependencies]
 sync-core = { path = "../sync-core" }
+client-sdk = { path = "../client-sdk" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 fuser = { version = "0.14", default-features = false }
 libc = { version = "0.2" }
 serde_json = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }
-serde = { workspace = true }
 
 # Prevent compilation on Windows targets
 [target.'cfg(windows)'.dependencies]

@@ -4,6 +4,7 @@ import io.ironmesh.android.api.HealthResponse
 import io.ironmesh.android.api.IronmeshApi
 import io.ironmesh.android.api.ReplicationPlanResponse
 import io.ironmesh.android.api.StoreIndexEntry
+import io.ironmesh.android.api.StoreIndexResponse
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import okhttp3.MediaType.Companion.toMediaType
@@ -94,9 +95,25 @@ class IronmeshRepository {
         depth: Int = 1,
         snapshot: String? = null,
     ): List<StoreIndexEntry> {
-        return createApi(baseUrl)
-            .storeIndex(prefix = prefix, depth = depth, snapshot = snapshot)
-            .entries
+        if (!RustClientBridge.isAvailable()) {
+            throw IllegalStateException("Rust client bridge is not available")
+        }
+
+        val responseJson = RustClientBridge.storeIndex(
+            sanitizeBaseUrl(baseUrl),
+            prefix,
+            depth.coerceAtLeast(1),
+            snapshot,
+        )
+
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(StoreIndexResponse::class.java)
+
+        val parsed = adapter.fromJson(responseJson)
+            ?: throw IllegalStateException("storeIndex failed: empty response")
+        return parsed.entries
     }
 
     suspend fun putObjectBytes(baseUrl: String, key: String, payload: ByteArray): Int {

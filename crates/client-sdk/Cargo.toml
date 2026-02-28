@@ -11,5 +11,6 @@ bytes.workspace = true
 common = { path = "../common" }
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
+sync-core = { path = "../sync-core" }
 tokio.workspace = true
 uuid.workspace = true

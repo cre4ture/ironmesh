@@ -3,8 +3,7 @@ use anyhow::{Context, Result};
 use client_sdk::IronMeshClient;
 use reqwest::Url;
 use reqwest::blocking::Client;
-use serde::Deserialize;
-use sync_core::{NamespaceEntry, SyncSnapshot};
+use sync_core::SyncSnapshot;
 
 #[derive(Debug, Clone)]
 pub struct ServerNodeHydrator {
@@ -49,17 +48,6 @@ impl Uploader for ServerNodeHydrator {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct StoreIndexResponse {
-    entries: Vec<StoreIndexEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StoreIndexEntry {
-    path: String,
-    entry_type: String,
-}
-
 pub fn normalize_base_url(input: &str) -> Result<Url> {
     let trimmed = input.trim();
     let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -76,54 +64,12 @@ pub fn normalize_base_url(input: &str) -> Result<Url> {
 }
 
 pub fn load_snapshot_from_server(
-    client: &Client,
     base_url: &Url,
     prefix: Option<&str>,
     depth: usize,
 ) -> Result<SyncSnapshot> {
-    let endpoint = base_url
-        .join("store/index")
-        .context("failed to compose store/index url")?;
-
-    let response = client
-        .get(endpoint)
-        .query(&[("depth", depth.max(1).to_string())])
-        .query(&[("prefix", prefix.unwrap_or_default().to_string())])
-        .send()
-        .context("failed calling /store/index")?
-        .error_for_status()
-        .context("/store/index returned non-success status")?;
-
-    let payload: StoreIndexResponse = response
-        .json()
-        .context("failed parsing /store/index response")?;
-
-    Ok(snapshot_from_index_entries(payload.entries))
-}
-
-fn snapshot_from_index_entries(entries: Vec<StoreIndexEntry>) -> SyncSnapshot {
-    let mut remote = Vec::with_capacity(entries.len());
-
-    for entry in entries {
-        if entry.entry_type == "prefix" {
-            let directory_path = entry.path.trim_end_matches('/').to_string();
-            if !directory_path.is_empty() {
-                remote.push(NamespaceEntry::directory(directory_path));
-            }
-            continue;
-        }
-
-        remote.push(NamespaceEntry::file(
-            entry.path.clone(),
-            "server-head",
-            format!("server-head:{}", entry.path),
-        ));
-    }
-
-    SyncSnapshot {
-        local: Vec::new(),
-        remote,
-    }
+    let sdk = IronMeshClient::new(base_url.as_str());
+    sdk.load_snapshot_from_server_blocking(prefix, depth, None)
 }
 
 pub fn build_store_object_url(base_url: &Url, key: &str) -> Result<Url> {

@@ -4,6 +4,7 @@ use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use sync_core::{NamespaceEntry, SyncSnapshot};
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
@@ -32,6 +33,24 @@ pub struct UploadResult {
 struct StoreChunkUploadResponse {
     hash: String,
     size_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreIndexEntry {
+    pub path: String,
+    pub entry_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreIndexResponse {
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub depth: usize,
+    #[serde(default)]
+    pub entry_count: usize,
+    #[serde(default)]
+    pub entries: Vec<StoreIndexEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,6 +122,72 @@ impl IronMeshClient {
             .bytes()
             .await
             .with_context(|| format!("failed to read payload for key={key}"))
+    }
+
+    pub async fn store_index(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+    ) -> Result<StoreIndexResponse> {
+        let url = self.store_index_url()?;
+
+        let mut request = self
+            .http
+            .get(url)
+            .query(&[("depth", depth.max(1).to_string())]);
+        if let Some(prefix) = prefix {
+            request = request.query(&[("prefix", prefix)]);
+        }
+        if let Some(snapshot) = snapshot {
+            request = request.query(&[("snapshot", snapshot)]);
+        }
+
+        request
+            .send()
+            .await
+            .context("failed to request /store/index")?
+            .error_for_status()
+            .context("/store/index returned non-success status")?
+            .json::<StoreIndexResponse>()
+            .await
+            .context("failed to parse /store/index response")
+    }
+
+    pub fn store_index_blocking(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+    ) -> Result<StoreIndexResponse> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for store index request")?;
+        runtime.block_on(self.store_index(prefix, depth, snapshot))
+    }
+
+    pub async fn load_snapshot_from_server(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+    ) -> Result<SyncSnapshot> {
+        let response = self.store_index(prefix, depth, snapshot).await?;
+        Ok(snapshot_from_store_index_entries(response.entries))
+    }
+
+    pub fn load_snapshot_from_server_blocking(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+    ) -> Result<SyncSnapshot> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for snapshot load")?;
+        runtime.block_on(self.load_snapshot_from_server(prefix, depth, snapshot))
     }
 
     pub async fn put_large_aware(
@@ -342,6 +427,21 @@ impl IronMeshClient {
         Ok(url.to_string())
     }
 
+    fn store_index_url(&self) -> Result<String> {
+        let mut url = reqwest::Url::parse(&self.server_base_url)
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("index");
+        }
+
+        Ok(url.to_string())
+    }
+
     fn store_chunk_upload_url(&self) -> Result<String> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
@@ -371,5 +471,70 @@ impl IronMeshClient {
         url.query_pairs_mut().append_pair("complete", "");
 
         Ok(url.to_string())
+    }
+}
+
+pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncSnapshot {
+    let mut remote = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        if entry.entry_type == "prefix" {
+            let directory_path = entry.path.trim_end_matches('/').to_string();
+            if !directory_path.is_empty() {
+                remote.push(NamespaceEntry::directory(directory_path));
+            }
+            continue;
+        }
+
+        remote.push(NamespaceEntry::file(
+            entry.path.clone(),
+            "server-head",
+            format!("server-head:{}", entry.path),
+        ));
+    }
+
+    SyncSnapshot {
+        local: Vec::new(),
+        remote,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_url_builder_escapes_segments() {
+        let client = IronMeshClient::new("http://127.0.0.1:18080/");
+        let url = client
+            .store_key_url("read me.txt")
+            .expect("object url should build");
+        assert_eq!(url, "http://127.0.0.1:18080/store/read%20me.txt");
+    }
+
+    #[test]
+    fn snapshot_conversion_maps_prefix_and_keys() {
+        let snapshot = snapshot_from_store_index_entries(vec![
+            StoreIndexEntry {
+                path: "docs/".to_string(),
+                entry_type: "prefix".to_string(),
+            },
+            StoreIndexEntry {
+                path: "docs/readme.txt".to_string(),
+                entry_type: "key".to_string(),
+            },
+        ]);
+
+        assert_eq!(snapshot.local.len(), 0);
+        assert_eq!(snapshot.remote.len(), 2);
+        assert_eq!(snapshot.remote[0], NamespaceEntry::directory("docs"));
+        assert_eq!(
+            snapshot.remote[1],
+            NamespaceEntry::file(
+                "docs/readme.txt",
+                "server-head",
+                "server-head:docs/readme.txt"
+            )
+        );
     }
 }

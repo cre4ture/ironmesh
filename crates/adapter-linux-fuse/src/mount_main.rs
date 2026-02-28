@@ -4,12 +4,12 @@ use crate::LinuxFuseAdapter;
 use crate::runtime::{FuseMountConfig, Hydrator, mount_action_plan};
 use anyhow::{Context, Result};
 use clap::Parser;
+use client_sdk::IronMeshClient;
 use reqwest::Url;
 use reqwest::blocking::Client;
-use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
-use sync_core::{NamespaceEntry, SyncPolicy, SyncSnapshot};
+use sync_core::{SyncPolicy, SyncSnapshot};
 
 #[derive(Debug, Parser)]
 #[command(name = "adapter-linux-fuse-mount")]
@@ -30,7 +30,7 @@ struct Args {
     #[arg(long)]
     prefix: Option<String>,
     #[arg(long, default_value_t = 64)]
-    depth: i32,
+    depth: usize,
 }
 
 pub fn mount_main() -> Result<()> {
@@ -53,8 +53,9 @@ pub fn mount_main() -> Result<()> {
             (snapshot, Box::new(DemoHydrator))
         } else {
             let base_url = normalize_base_url(args.server_base_url.as_deref().unwrap_or_default())?;
+            let sdk = IronMeshClient::new(base_url.as_str());
             let snapshot =
-                load_snapshot_from_server(&client, &base_url, args.prefix.clone(), args.depth)?;
+                sdk.load_snapshot_from_server_blocking(args.prefix.as_deref(), args.depth, None)?;
             (
                 snapshot,
                 Box::new(ServerNodeHydrator {
@@ -107,17 +108,6 @@ impl Hydrator for ServerNodeHydrator {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct StoreIndexResponse {
-    entries: Vec<StoreIndexEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StoreIndexEntry {
-    path: String,
-    entry_type: String,
-}
-
 fn normalize_base_url(input: &str) -> Result<Url> {
     let trimmed = input.trim();
     let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -131,51 +121,6 @@ fn normalize_base_url(input: &str) -> Result<Url> {
         format!("{with_scheme}/")
     };
     Url::parse(&url).with_context(|| format!("invalid server base url: {input}"))
-}
-
-fn load_snapshot_from_server(
-    client: &Client,
-    base_url: &Url,
-    prefix: Option<String>,
-    depth: i32,
-) -> Result<SyncSnapshot> {
-    let endpoint = base_url
-        .join("store/index")
-        .context("failed to compose store/index url")?;
-
-    let response = client
-        .get(endpoint)
-        .query(&[("depth", depth.to_string())])
-        .query(&[("prefix", prefix.unwrap_or_default())])
-        .send()
-        .context("failed calling /store/index")?
-        .error_for_status()
-        .context("/store/index returned non-success status")?;
-
-    let payload: StoreIndexResponse = response
-        .json()
-        .context("failed parsing /store/index response")?;
-
-    let mut remote = Vec::with_capacity(payload.entries.len());
-    for entry in payload.entries {
-        if entry.entry_type == "prefix" {
-            let directory_path = entry.path.trim_end_matches('/').to_string();
-            if !directory_path.is_empty() {
-                remote.push(NamespaceEntry::directory(directory_path));
-            }
-        } else {
-            remote.push(NamespaceEntry::file(
-                entry.path.clone(),
-                "server-head",
-                format!("server-head:{}", entry.path),
-            ));
-        }
-    }
-
-    Ok(SyncSnapshot {
-        local: Vec::new(),
-        remote,
-    })
 }
 
 fn build_store_object_url(base_url: &Url, key: &str) -> Result<Url> {

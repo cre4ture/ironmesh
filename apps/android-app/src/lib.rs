@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use client_sdk::ClientNode;
+use client_sdk::{ClientNode, IronMeshClient};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jbyte, jbyteArray, jint, jstring};
@@ -225,12 +225,9 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
         let version = optional_jstring(&mut env, version)?;
         let rt = runtime()?;
         let client = ClientNode::new(base_url);
-        let bytes = rt.block_on(client.get_with_selector(
-            key,
-            snapshot.as_deref(),
-            version.as_deref(),
-        ))?
-        .to_vec();
+        let bytes = rt
+            .block_on(client.get_with_selector(key, snapshot.as_deref(), version.as_deref()))?
+            .to_vec();
         Ok(bytes)
     })();
 
@@ -253,7 +250,50 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamPutObject<'local>(
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_storeIndex(
+    mut env: JNIEnv,
+    _class: JClass,
+    base_url: JString,
+    prefix: jstring,
+    depth: jint,
+    snapshot: jstring,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let base_url: String = env.get_string(&base_url)?.into();
+        let prefix = optional_jstring(&mut env, prefix)?;
+        let snapshot = optional_jstring(&mut env, snapshot)?;
+        let sdk = IronMeshClient::new(base_url);
+        let response = sdk.store_index_blocking(
+            prefix.as_deref(),
+            usize::try_from(depth).unwrap_or(1).max(1),
+            snapshot.as_deref(),
+        )?;
+
+        serde_json::to_string(&response).context("failed to serialize store index response")
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!("rust storeIndex failed to create java string: {err:#}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(&mut env, format!("rust storeIndex failed: {err:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamPutObject<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     base_url: JString<'local>,
@@ -279,7 +319,9 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamObjectTo<'local>(
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamObjectTo<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     base_url: JString<'local>,
@@ -295,12 +337,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let version = optional_jstring(&mut env, version)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
         let client = ClientNode::new(base_url);
-        client.get_with_selector_writer(
-            key,
-            snapshot.as_deref(),
-            version.as_deref(),
-            &mut writer,
-        )
+        client.get_with_selector_writer(key, snapshot.as_deref(), version.as_deref(), &mut writer)
     })();
 
     if let Err(err) = result {

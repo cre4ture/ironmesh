@@ -21,6 +21,14 @@ object RustClientBridge {
     ): ByteArray
 
     @JvmStatic
+    external fun storeIndex(
+        baseUrl: String,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+    ): String
+
+    @JvmStatic
     external fun streamPutObject(
         baseUrl: String,
         key: String,

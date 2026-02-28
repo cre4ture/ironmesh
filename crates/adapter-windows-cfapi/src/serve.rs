@@ -36,8 +36,7 @@ pub fn serve_main() -> anyhow::Result<()> {
     let base_url = normalize_base_url(&args.server_base_url)?;
     let client = Client::new();
 
-    let snapshot =
-        load_snapshot_from_server(&client, &base_url, args.prefix.as_deref(), args.depth)?;
+    let snapshot = load_snapshot_from_server(&base_url, args.prefix.as_deref(), args.depth)?;
     let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
     let action_plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
 
