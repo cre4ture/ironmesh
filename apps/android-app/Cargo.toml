@@ -10,6 +10,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 bytes.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
 jni = "0.21"

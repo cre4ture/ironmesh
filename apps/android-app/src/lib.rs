@@ -5,7 +5,8 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jbyte, jbyteArray, jint, jstring};
 use std::io::{Read, Write};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use tokio::task::JoinHandle;
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -22,6 +23,57 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     RUNTIME
         .get()
         .ok_or_else(|| anyhow::anyhow!("runtime initialization race"))
+}
+
+struct WebUiServer {
+    base_url: String,
+    local_url: String,
+    task: JoinHandle<()>,
+}
+
+fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
+    static STATE: OnceLock<Mutex<Option<WebUiServer>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn start_embedded_web_ui(base_url: String) -> Result<String> {
+    let rt = runtime()?;
+    let mut state = web_ui_server_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("web ui state lock poisoned"))?;
+
+    if let Some(existing) = state.as_ref() {
+        if existing.base_url == base_url && !existing.task.is_finished() {
+            return Ok(existing.local_url.clone());
+        }
+    }
+
+    if let Some(previous) = state.take() {
+        previous.task.abort();
+    }
+
+    let listener = rt
+        .block_on(async { tokio::net::TcpListener::bind(("127.0.0.1", 0)).await })
+        .context("failed to bind embedded web ui listener")?;
+    let address = listener
+        .local_addr()
+        .context("failed to read embedded web ui listener address")?;
+    let local_url = format!("http://127.0.0.1:{}/", address.port());
+    let app = web_ui_backend::router(
+        web_ui_backend::WebUiConfig::new(base_url.clone()).with_service_name("ironmesh-android"),
+    );
+
+    let task = rt.spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    *state = Some(WebUiServer {
+        base_url,
+        local_url: local_url.clone(),
+        task,
+    });
+
+    Ok(local_url)
 }
 
 fn throw_java_error(env: &mut JNIEnv, message: impl AsRef<str>) {
@@ -177,6 +229,37 @@ impl AndroidStorageApp {
 
     pub fn web_gui_html(&self) -> String {
         web_ui_backend::assets::app_html()
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_startWebUi(
+    mut env: JNIEnv,
+    _class: JClass,
+    base_url: JString,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let base_url: String = env.get_string(&base_url)?.into();
+        start_embedded_web_ui(base_url)
+    })();
+
+    match result {
+        Ok(url) => match env.new_string(url) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!("rust startWebUi failed to create java string: {err:#}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(&mut env, format!("rust startWebUi failed: {err:#}"));
+            std::ptr::null_mut()
+        }
     }
 }
 

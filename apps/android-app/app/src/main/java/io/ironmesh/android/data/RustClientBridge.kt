@@ -44,5 +44,8 @@ object RustClientBridge {
         version: String?,
     )
 
+    @JvmStatic
+    external fun startWebUi(baseUrl: String): String
+
     fun isAvailable(): Boolean = libraryLoaded
 }

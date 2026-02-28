@@ -179,4 +179,12 @@ class IronmeshRepository {
         )
         return
     }
+
+    fun startWebUi(baseUrl: String): String {
+        if (!RustClientBridge.isAvailable()) {
+            throw IllegalStateException("Rust client bridge is not available")
+        }
+
+        return RustClientBridge.startWebUi(sanitizeBaseUrl(baseUrl))
+    }
 }

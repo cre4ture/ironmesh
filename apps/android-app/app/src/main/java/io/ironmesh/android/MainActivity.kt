@@ -85,6 +85,10 @@ class MainActivity : ComponentActivity() {
                             Text("Open Files")
                         }
 
+                        Button(onClick = { vm.openWebUi(::openWebUi) }) {
+                            Text("Open Web UI")
+                        }
+
                         if (state.loading) {
                             CircularProgressIndicator()
                         }
@@ -138,5 +142,9 @@ class MainActivity : ComponentActivity() {
         } catch (_: ActivityNotFoundException) {
             vm.setStatus("No compatible Files app found on this device")
         }
+    }
+
+    private fun openWebUi(url: String) {
+        startActivity(WebUiActivity.intent(this, url))
     }
 }

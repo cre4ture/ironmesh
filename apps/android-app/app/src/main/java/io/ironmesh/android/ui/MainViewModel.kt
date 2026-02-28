@@ -5,7 +5,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class MainUiState(
     val baseUrl: String = IronmeshPreferences.DEFAULT_BASE_URL,
@@ -83,6 +85,31 @@ class MainViewModel(
 
     fun setStatus(message: String) {
         uiState.value = uiState.value.copy(status = message)
+    }
+
+    fun openWebUi(onReady: (String) -> Unit) {
+        val baseUrl = uiState.value.baseUrl
+        uiState.value = uiState.value.copy(loading = true, status = "Starting embedded Web UI...")
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    repository.startWebUi(baseUrl)
+                }
+            }
+                .onSuccess { url ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = "Web UI ready at $url",
+                    )
+                    onReady(url)
+                }
+                .onFailure { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = "Error: ${error.message}",
+                    )
+                }
+        }
     }
 
     private fun execute(loadingMessage: String, action: suspend () -> String) {

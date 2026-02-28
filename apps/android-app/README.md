@@ -9,6 +9,7 @@ This is a standalone Kotlin Android app scaffold for local testing of `server-no
 - Replication plan summary (`GET /cluster/replication/plan`)
 - Upload/download via Rust `client-sdk` bridge when native library is available
 - Fallback HTTP/Retrofit path remains enabled if native bridge is not loaded
+- Open embedded Web UI in an in-app `WebView` from the native screen
 
 ## Open in Android Studio
 
@@ -49,3 +50,4 @@ The app currently allows cleartext traffic (`usesCleartextTraffic=true`) for loc
 - Current Rust-backed operations in repository:
   - `putObject`, `putObjectBytes`
   - `getObject`, `getObjectBytes` (latest-only path; snapshot/version still uses HTTP fallback)
+  - `startWebUi` (starts embedded local web UI server and returns localhost URL)
