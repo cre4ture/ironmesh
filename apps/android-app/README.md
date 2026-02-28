@@ -14,7 +14,7 @@ This is a standalone Kotlin Android app scaffold for local testing of `server-no
 
 Open this folder as a project:
 
-- `apps/android-app/native`
+- `apps/android-app`
 
 Android Studio will sync Gradle and let you run the `app` module.
 

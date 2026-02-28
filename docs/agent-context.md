@@ -6,7 +6,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 
 - Project: `ironmesh` (Rust workspace)
 - Primary backend: `apps/server-node`
-- Mobile: Android native shell + SAF provider under `apps/android-app/native`
+- Mobile: Android native shell + SAF provider under `apps/android-app`
 - Cross-platform filesystem work:
   - Shared planner: `crates/sync-core`
   - Linux adapter: `crates/adapter-linux-fuse`
@@ -49,9 +49,9 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - `crates/sync-core/src/lib.rs`
 - `crates/adapter-linux-fuse/src/lib.rs`
 - `crates/adapter-linux-fuse/src/bin/mount.rs`
-- `apps/android-app/native/app/src/main/java/io/ironmesh/android/ui/MainViewModel.kt`
-- `apps/android-app/native/app/src/main/java/io/ironmesh/android/data/IronmeshPreferences.kt`
-- `apps/android-app/native/app/src/main/java/io/ironmesh/android/saf/IronmeshDocumentsProvider.kt`
+- `apps/android-app/app/src/main/java/io/ironmesh/android/ui/MainViewModel.kt`
+- `apps/android-app/app/src/main/java/io/ironmesh/android/data/IronmeshPreferences.kt`
+- `apps/android-app/app/src/main/java/io/ironmesh/android/saf/IronmeshDocumentsProvider.kt`
 - `.github/workflows/check.yml`
 - `.github/workflows/coverage.yml`
 - `docs/cross-platform-filesystem-integration-strategy.md`
