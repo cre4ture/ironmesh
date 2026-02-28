@@ -706,8 +706,8 @@ mod tests {
 
     #[tokio::test]
     async fn autonomous_peer_heartbeat_keeps_peers_online() -> Result<()> {
-        let bind_a = "127.0.0.1:19123";
-        let bind_b = "127.0.0.1:19124";
+        let bind_a = "127.0.0.1:19144";
+        let bind_b = "127.0.0.1:19145";
         let node_id_a = "00000000-0000-0000-0000-0000000007c1";
         let node_id_b = "00000000-0000-0000-0000-0000000007d2";
 
