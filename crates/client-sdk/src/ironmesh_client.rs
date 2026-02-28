@@ -3,7 +3,7 @@ use bytes::Bytes;
 use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::io::{Read, Write};
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
@@ -262,6 +262,137 @@ impl IronMeshClient {
             chunk_size_bytes: Some(CHUNK_UPLOAD_SIZE_BYTES),
             chunk_count: Some(complete_payload.chunks.len()),
         })
+    }
+
+    pub fn put_chunked_reader(
+        &self,
+        key: impl Into<String>,
+        reader: &mut dyn std::io::Read,
+    ) -> Result<UploadResult> {
+        let key = key.into();
+        let chunk_upload_url = self.store_chunk_upload_url()?;
+        let complete_url = self.store_complete_url(&key)?;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for upload")?;
+
+        let mut uploaded_total: usize = 0;
+        let mut chunk_refs = Vec::new();
+        let mut chunk = vec![0u8; CHUNK_UPLOAD_SIZE_BYTES];
+
+        loop {
+            let read_bytes = reader
+                .read(&mut chunk)
+                .with_context(|| format!("failed reading chunk for key={key}"))?;
+            if read_bytes == 0 {
+                break;
+            }
+
+            uploaded_total = uploaded_total
+                .checked_add(read_bytes)
+                .context("uploaded byte count overflow")?;
+
+            let response = runtime
+                .block_on(
+                    self.http
+                        .post(&chunk_upload_url)
+                        .body(chunk[..read_bytes].to_vec())
+                        .send(),
+                )
+                .with_context(|| format!("failed to upload chunk for key={key}"))?
+                .error_for_status()
+                .with_context(|| format!("chunk upload rejected for key={key}"))?;
+
+            let uploaded = runtime
+                .block_on(response.json::<StoreChunkUploadResponse>())
+                .with_context(|| format!("failed to parse chunk upload response for {key}"))?;
+
+            chunk_refs.push(CompleteStoreUploadChunkRef {
+                hash: uploaded.hash,
+                size_bytes: uploaded.size_bytes,
+            });
+        }
+
+        if chunk_refs.is_empty() {
+            let meta = runtime.block_on(self.put(key, Bytes::new()))?;
+            return Ok(UploadResult {
+                meta,
+                upload_mode: UploadMode::Direct,
+                chunk_size_bytes: None,
+                chunk_count: None,
+            });
+        }
+
+        let complete_payload = CompleteStoreUploadRequest {
+            total_size_bytes: uploaded_total,
+            chunks: chunk_refs,
+        };
+
+        runtime
+            .block_on(self.http.post(complete_url).json(&complete_payload).send())
+            .with_context(|| format!("failed to finalize chunked upload for key={key}"))?
+            .error_for_status()
+            .with_context(|| format!("chunked finalize rejected for key={key}"))?;
+
+        Ok(UploadResult {
+            meta: StorageObjectMeta {
+                key,
+                size_bytes: complete_payload.total_size_bytes,
+            },
+            upload_mode: UploadMode::Chunked,
+            chunk_size_bytes: Some(CHUNK_UPLOAD_SIZE_BYTES),
+            chunk_count: Some(complete_payload.chunks.len()),
+        })
+    }
+
+    pub fn get_with_selector_writer(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
+        let key = key.as_ref();
+        let url = self.store_key_url(key)?;
+
+        let mut request = self.http.get(url);
+        if let Some(snapshot) = snapshot {
+            request = request.query(&[("snapshot", snapshot)]);
+        }
+        if let Some(version) = version {
+            request = request.query(&[("version", version)]);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for download")?;
+
+        let mut response = runtime
+            .block_on(request.send())
+            .with_context(|| format!("failed to GET object key={key}"))?
+            .error_for_status()
+            .with_context(|| format!("object not found or inaccessible key={key}"))?;
+
+        loop {
+            let chunk = runtime
+                .block_on(response.chunk())
+                .with_context(|| format!("failed to read payload chunk for key={key}"))?;
+
+            match chunk {
+                Some(chunk) => writer
+                    .write_all(chunk.as_ref())
+                    .with_context(|| format!("failed to write payload chunk for key={key}"))?,
+                None => break,
+            }
+        }
+
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush output for key={key}"))?;
+        Ok(())
     }
 
     fn store_key_url(&self, key: &str) -> Result<String> {

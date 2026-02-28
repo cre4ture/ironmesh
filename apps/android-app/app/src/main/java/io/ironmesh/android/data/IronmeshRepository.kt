@@ -112,21 +112,11 @@ class IronmeshRepository {
         key: String,
         input: java.io.InputStream,
     ): Int {
-        val body = object : RequestBody() {
-            override fun contentType() = "application/octet-stream".toMediaTypeOrNull()
-
-            override fun writeTo(sink: okio.BufferedSink) {
-                input.source().use { source ->
-                    sink.writeAll(source)
-                }
-            }
+        if (!RustClientBridge.isAvailable()) {
+            throw IllegalStateException("Rust client bridge is not available")            
         }
 
-        val response = createApi(baseUrl).putObject(key, body)
-        if (!response.isSuccessful) {
-            throw IllegalStateException("PUT failed with HTTP ${response.code()}")
-        }
-        return response.code()
+        return RustClientBridge.streamPutObject(sanitizeBaseUrl(baseUrl), key, input)
     }
 
     suspend fun getObjectBytes(
@@ -159,13 +149,17 @@ class IronmeshRepository {
         snapshot: String? = null,
         version: String? = null,
     ) {
-        val response = createApi(baseUrl).getObjectBinary(key, snapshot = snapshot, version = version)
-        if (!response.isSuccessful) {
-            throw IllegalStateException("GET failed with HTTP ${response.code()}")
+        if (!RustClientBridge.isAvailable()) {
+            throw IllegalStateException("Rust client bridge is not available")
         }
-        val body = response.body() ?: throw IllegalStateException("GET failed: empty response body")
-        body.byteStream().use { input ->
-            input.copyTo(output)
-        }
+        
+        RustClientBridge.streamObjectTo(
+            sanitizeBaseUrl(baseUrl),
+            key,
+            output,
+            snapshot,
+            version,
+        )
+        return
     }
 }

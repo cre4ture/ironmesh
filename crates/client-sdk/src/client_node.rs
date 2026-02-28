@@ -88,6 +88,28 @@ impl ClientNode {
         Ok(payload)
     }
 
+    pub fn put_chunked_reader(
+        &self,
+        key: impl Into<String>,
+        reader: &mut dyn std::io::Read,
+    ) -> Result<UploadResult> {
+        let key = key.into();
+        let report = self.client.put_chunked_reader(key.clone(), reader)?;
+        self.cache.blocking_write().remove(&key);
+        Ok(report)
+    }
+
+    pub fn get_with_selector_writer(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        self.client
+            .get_with_selector_writer(key, snapshot, version, writer)
+    }
+
     pub async fn cache_entries(&self) -> Vec<CacheEntry> {
         self.cache
             .read()
