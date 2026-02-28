@@ -1,6 +1,10 @@
 package io.ironmesh.android
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.provider.DocumentsContract
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -19,7 +23,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -78,6 +81,10 @@ class MainActivity : ComponentActivity() {
                             Button(onClick = vm::getObject) { Text("GET") }
                         }
 
+                        Button(onClick = { openFilesAtIronmeshRoot(vm) }) {
+                            Text("Open Files")
+                        }
+
                         if (state.loading) {
                             CircularProgressIndicator()
                         }
@@ -92,6 +99,44 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    private fun openFilesAtIronmeshRoot(vm: MainViewModel) {
+        val authority = "${packageName}.documents"
+        val rootTreeUri = DocumentsContract.buildTreeDocumentUri(authority, "dir:")
+
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+            )
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, rootTreeUri)
+            }
+        }
+
+        val preferredPackages = listOf(
+            "com.google.android.documentsui",
+            "com.android.documentsui",
+            "com.google.android.apps.nbu.files",
+        )
+
+        val launchIntent = preferredPackages
+            .asSequence()
+            .map { pkg -> Intent(intent).setPackage(pkg) }
+            .firstOrNull { candidate ->
+                candidate.resolveActivity(packageManager) != null
+            } ?: intent
+
+        try {
+            startActivity(launchIntent)
+            vm.setStatus("Opened Files picker at Ironmesh root")
+        } catch (_: ActivityNotFoundException) {
+            vm.setStatus("No compatible Files app found on this device")
         }
     }
 }

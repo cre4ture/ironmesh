@@ -81,6 +81,10 @@ class MainViewModel(
         }
     }
 
+    fun setStatus(message: String) {
+        uiState.value = uiState.value.copy(status = message)
+    }
+
     private fun execute(loadingMessage: String, action: suspend () -> String) {
         uiState.value = uiState.value.copy(loading = true, status = loadingMessage)
         viewModelScope.launch {
