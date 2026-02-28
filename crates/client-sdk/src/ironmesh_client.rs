@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 
-const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
+const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
