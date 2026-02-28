@@ -1,15 +1,12 @@
 #![cfg(windows)]
 
-use crate::framework::{ChildGuard, binary_path, start_server};
+use crate::framework::{ChildGuard, binary_path};
 use anyhow::Context;
 use anyhow::{Result, bail};
-use reqwest::StatusCode;
-use std::fs;
 use std::path::Path;
-use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, SystemTime};
-use tokio::process::{Child, Command};
+use std::time::Duration;
+use tokio::process::Command;
 use tokio::time::sleep;
 
 pub async fn start_cfapi_adapter(
