@@ -94,12 +94,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
         let key: String = env.get_string(&key)?.into();
         let rt = runtime()?;
         let client = ClientNode::new(base_url);
-        let mut bytes = rt.block_on(client.get(key))?.to_vec();
-        bytes.push(b'R');
-        bytes.push(b'u');
-        bytes.push(b's');
-        bytes.push(b't');
-        Ok([b"Rust".to_vec(), bytes].concat())
+        let bytes = rt.block_on(client.get(key))?.to_vec();
+        Ok(bytes)
     })();
 
     match result {
