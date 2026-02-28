@@ -100,6 +100,7 @@ pub mod runtime {
     use super::FuseActionPlan;
     use crate::FuseAction;
     use anyhow::{Result, anyhow};
+    use fuser::consts::FOPEN_DIRECT_IO;
     use fuser::{
         FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
         ReplyEntry, ReplyOpen, Request,
@@ -416,6 +417,11 @@ pub mod runtime {
         }
 
         fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+            if let Err(_error) = self.hydrate_if_needed(ino) {
+                reply.error(EIO);
+                return;
+            }
+
             let Some(node) = self.nodes.get(&ino) else {
                 reply.error(ENOENT);
                 return;
@@ -480,7 +486,12 @@ pub mod runtime {
                 return;
             }
 
-            reply.opened(0, 0);
+            if let Err(_error) = self.hydrate_if_needed(ino) {
+                reply.error(EIO);
+                return;
+            }
+
+            reply.opened(0, FOPEN_DIRECT_IO);
         }
 
         fn read(

@@ -124,16 +124,18 @@ fn normalize_base_url(input: &str) -> Result<Url> {
 }
 
 fn build_store_object_url(base_url: &Url, key: &str) -> Result<Url> {
-    let mut url = base_url
-        .join("store/")
-        .context("failed to compose object base url")?;
+    let mut url = base_url.clone();
+    let normalized_key = key.trim().trim_start_matches('/');
+    if normalized_key.is_empty() {
+        anyhow::bail!("object key is empty");
+    }
+
     {
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| anyhow::anyhow!("base url cannot be used for path segments"))?;
-        for segment in key.split('/').filter(|segment| !segment.is_empty()) {
-            segments.push(segment);
-        }
+        segments.push("store");
+        segments.push(normalized_key);
     }
     Ok(url)
 }
