@@ -162,5 +162,4 @@ mod tests {
             "http://127.0.0.1:18080/store/docs/read%20me.txt"
         );
     }
-
 }

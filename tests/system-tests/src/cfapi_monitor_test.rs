@@ -2,7 +2,8 @@
 
 #[cfg(test)]
 mod cfapi_monitor_test {
-    use crate::framework::{fresh_data_dir, start_cfapi_adapter, start_server};
+    use crate::framework::{fresh_data_dir, start_server};
+    use crate::framework_win::start_cfapi_adapter;
     use reqwest::Client;
     use std::fs::File;
     use std::io::Write;
@@ -74,18 +75,17 @@ mod cfapi_monitor_test {
 
     #[tokio::test]
     async fn test_cfapi_monitor_detects_new_and_modified_file_small() {
-        run_cfapi_monitor_case(
-            "127.0.0.1:19090",
-            "initial content",
-            "modified content",
-        )
-        .await;
+        run_cfapi_monitor_case("127.0.0.1:19090", "initial content", "modified content").await;
     }
 
     #[tokio::test]
     async fn test_cfapi_monitor_detects_new_and_modified_file_large() {
         let large_initial = format!("{}{}", "A".repeat(5 * 1024 * 1024 + 1024), "\ninitial-tail");
-        let large_modified = format!("{}{}", "B".repeat(5 * 1024 * 1024 + 1024), "\nmodified-tail");
+        let large_modified = format!(
+            "{}{}",
+            "B".repeat(5 * 1024 * 1024 + 1024),
+            "\nmodified-tail"
+        );
 
         run_cfapi_monitor_case("127.0.0.1:19091", &large_initial, &large_modified).await;
     }

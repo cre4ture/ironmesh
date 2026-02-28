@@ -50,11 +50,11 @@ Why this was chosen:
 
 Current setup:
 
-- Workspace is pinned to nightly via `rust-toolchain.toml`.
+- Workspace is pinned to stable via `rust-toolchain.toml`.
 - `bindeps` is enabled in `.cargo/config.toml`.
 - CI is split to limit nightly blast radius:
 	- Stable lanes: root workspace check/clippy/unit tests/coverage.
-	- Nightly lane: `system-tests` only (`cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml`).
+	- Nightly lane: `system-tests` only (`cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml`).
 
 The `system-tests` crate is intentionally isolated from root workspace membership so stable Cargo can run root workspace jobs without parsing nightly-only `artifact` dependency declarations.
 

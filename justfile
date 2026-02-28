@@ -19,10 +19,10 @@ test-stable:
     cargo +stable test --workspace
 
 test-system-nightly:
-    cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
+    cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
 
 test-system-nightly-one name:
-    cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml --lib -- {{name}} --exact --nocapture
+    cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml --lib -- {{name}} --exact --nocapture
 
 ci-stable:
     cargo +stable check --workspace

@@ -156,12 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_store_put_get_payload_small() -> Result<()> {
-        run_server_store_put_get_payload_case(
-            "127.0.0.1:19123",
-            "server-small-payload",
-            1024,
-        )
-        .await
+        run_server_store_put_get_payload_case("127.0.0.1:19123", "server-small-payload", 1024).await
     }
 
     #[tokio::test]

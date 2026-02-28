@@ -74,11 +74,27 @@ impl IronMeshClient {
     }
 
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Bytes> {
+        self.get_with_selector(key, None, None).await
+    }
+
+    pub async fn get_with_selector(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<Bytes> {
         let key = key.as_ref();
         let url = self.store_key_url(key)?;
 
-        self.http
-            .get(url)
+        let mut request = self.http.get(url);
+        if let Some(snapshot) = snapshot {
+            request = request.query(&[("snapshot", snapshot)]);
+        }
+        if let Some(version) = version {
+            request = request.query(&[("version", version)]);
+        }
+
+        request
             .send()
             .await
             .with_context(|| format!("failed to GET object key={key}"))?

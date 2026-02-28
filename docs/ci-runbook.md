@@ -25,13 +25,13 @@ This usually means the failure is isolated to `tests/system-tests` and/or nightl
 ### 1) Reproduce locally with the same command
 
 ```bash
-cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
+cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
 ```
 
 For a single test:
 
 ```bash
-cargo -Z bindeps test --manifest-path tests/system-tests/Cargo.toml --lib -- tests::<name> --exact --nocapture
+cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml --lib -- tests::<name> --exact --nocapture
 ```
 
 ### 2) Verify stable lanes are still healthy

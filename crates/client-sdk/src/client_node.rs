@@ -30,9 +30,16 @@ impl ClientNode {
         Ok(meta)
     }
 
-    pub async fn put_large_aware(&self, key: impl Into<String>, data: Bytes) -> Result<UploadResult> {
+    pub async fn put_large_aware(
+        &self,
+        key: impl Into<String>,
+        data: Bytes,
+    ) -> Result<UploadResult> {
         let key = key.into();
-        let report = self.client.put_large_aware(key.clone(), data.clone()).await?;
+        let report = self
+            .client
+            .put_large_aware(key.clone(), data.clone())
+            .await?;
         self.cache.write().await.insert(key, data);
         Ok(report)
     }
@@ -57,6 +64,28 @@ impl ClientNode {
         }
 
         self.get(key).await
+    }
+
+    pub async fn get_with_selector(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<Bytes> {
+        let key = key.as_ref();
+        let payload = self
+            .client
+            .get_with_selector(key, snapshot, version)
+            .await?;
+
+        if snapshot.is_none() && version.is_none() {
+            self.cache
+                .write()
+                .await
+                .insert(key.to_string(), payload.clone());
+        }
+
+        Ok(payload)
     }
 
     pub async fn cache_entries(&self) -> Vec<CacheEntry> {

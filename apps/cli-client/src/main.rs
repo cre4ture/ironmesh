@@ -416,50 +416,30 @@ async fn web_store_get(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
-    if query.snapshot.is_none() && query.version.is_none() {
-        return match state.client.get_cached_or_fetch(&query.key).await {
-            Ok(payload) => (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "key": query.key,
-                    "value": String::from_utf8_lossy(&payload)
-                })),
+    let payload_result = if query.snapshot.is_none() && query.version.is_none() {
+        state.client.get_cached_or_fetch(&query.key).await
+    } else {
+        state
+            .client
+            .get_with_selector(
+                &query.key,
+                query.snapshot.as_deref(),
+                query.version.as_deref(),
             )
-                .into_response(),
-            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-        };
-    }
-
-    let object_url = match build_server_object_url(&state.server_url, &query.key) {
-        Ok(url) => url,
-        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+            .await
     };
 
-    let mut request = state.http.get(object_url);
-    if let Some(snapshot) = query.snapshot.as_deref() {
-        request = request.query(&[("snapshot", snapshot)]);
-    }
-    if let Some(version) = query.version.as_deref() {
-        request = request.query(&[("version", version)]);
-    }
-
-    match request.send().await {
-        Ok(response) => match response.error_for_status() {
-            Ok(ok) => match ok.bytes().await {
-                Ok(payload) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "key": query.key,
-                        "snapshot": query.snapshot,
-                        "version": query.version,
-                        "value": String::from_utf8_lossy(&payload)
-                    })),
-                )
-                    .into_response(),
-                Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-            },
-            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-        },
+    match payload_result {
+        Ok(payload) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "key": query.key,
+                "snapshot": query.snapshot,
+                "version": query.version,
+                "value": String::from_utf8_lossy(&payload)
+            })),
+        )
+            .into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -468,15 +448,13 @@ async fn web_store_put(
     State(state): State<WebState>,
     Json(payload): Json<WebStorePutRequest>,
 ) -> impl IntoResponse {
-    if payload.key.trim().is_empty() {
+    let WebStorePutRequest { key, value } = payload;
+
+    if key.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
-    match state
-        .client
-        .put(payload.key.clone(), Bytes::from(payload.value))
-        .await
-    {
+    match state.client.put(key, Bytes::from(value)).await {
         Ok(meta) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
@@ -569,7 +547,11 @@ async fn web_store_put_binary(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
-    match state.client.put_large_aware(query.key.clone(), payload).await {
+    match state
+        .client
+        .put_large_aware(query.key.clone(), payload)
+        .await
+    {
         Ok(report) => {
             let upload_mode = match report.upload_mode {
                 UploadMode::Direct => "direct",

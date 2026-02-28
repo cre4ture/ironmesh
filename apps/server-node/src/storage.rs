@@ -484,7 +484,10 @@ impl PersistentStore {
         for chunk in chunk_refs {
             let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
             if !fs::try_exists(&chunk_path).await? {
-                bail!("upload manifest references missing chunk hash={}", chunk.hash);
+                bail!(
+                    "upload manifest references missing chunk hash={}",
+                    chunk.hash
+                );
             }
 
             let metadata = fs::metadata(&chunk_path).await?;
@@ -598,13 +601,12 @@ impl PersistentStore {
             && let Some(preferred_head_id) = index.preferred_head_version_id.clone()
             && let Some(preferred_head) = index.versions.get(&preferred_head_id)
         {
-            let parent_context_matches = if requested_parent_version_ids.is_empty()
-                && inherit_preferred_parent
-            {
-                true
-            } else {
-                preferred_head.parent_version_ids == parent_version_ids
-            };
+            let parent_context_matches =
+                if requested_parent_version_ids.is_empty() && inherit_preferred_parent {
+                    true
+                } else {
+                    preferred_head.parent_version_ids == parent_version_ids
+                };
 
             if preferred_head.manifest_hash == manifest_hash
                 && preferred_head.state == requested_state
