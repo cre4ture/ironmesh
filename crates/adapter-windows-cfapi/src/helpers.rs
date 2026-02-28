@@ -61,15 +61,19 @@ pub fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
     }
 
     // Fallback string-prefix path for CFAPI variants and case differences.
-    if let Some(stripped) = strip_prefix_case_insensitive(&candidate_string, &candidate_lower, &root_lower) {
+    if let Some(stripped) =
+        strip_prefix_case_insensitive(&candidate_string, &candidate_lower, &root_lower)
+    {
         return normalize_path(stripped.trim_start_matches(['\\', '/']));
     }
 
     // CFAPI sometimes provides a NormalizedPath like "\sync-root-name\file.txt".
     let trimmed_leading = candidate_string.trim_start_matches(['\\', '/']);
     if let Some(root_name_os) = root.file_name()
-        && let Some(stripped) =
-            strip_to_after_root_name_case_insensitive(trimmed_leading, &root_name_os.to_string_lossy())
+        && let Some(stripped) = strip_to_after_root_name_case_insensitive(
+            trimmed_leading,
+            &root_name_os.to_string_lossy(),
+        )
     {
         return normalize_path(stripped.trim_start_matches(['\\', '/']));
     }
