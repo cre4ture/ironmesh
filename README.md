@@ -50,7 +50,7 @@ Why this was chosen:
 
 Current setup:
 
-- Workspace is pinned to stable via `rust-toolchain.toml`.
+- Workspace is pinned to nightly via `rust-toolchain.toml`.
 - `bindeps` is enabled in `.cargo/config.toml`.
 - CI is split to limit nightly blast radius:
 	- Stable lanes: root workspace check/clippy/unit tests/coverage.
