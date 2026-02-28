@@ -102,7 +102,7 @@ jobs:
         run: sdkmanager --install "ndk;27.1.12297006"
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@cargo-ndk
+        run: cargo install cargo-ndk
 
       - name: Verify Android native toolchain
         run: |
