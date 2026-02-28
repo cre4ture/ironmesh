@@ -24,6 +24,6 @@ impl IosStorageApp {
     }
 
     pub fn web_gui_html(&self) -> String {
-        web_ui::app_html()
+        web_ui_backend::assets::app_html()
     }
 }

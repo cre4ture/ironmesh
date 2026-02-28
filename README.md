@@ -8,7 +8,6 @@ Rust workspace for a distributed file storage platform with server, client SDK, 
 - `crates/client-sdk` — client library with server access + local cache.
 - `apps/server-node` — storage server node.
 - `apps/cli-client` — CLI client and built-in web interface endpoint.
-- `apps/web-ui` — shared HTML UI fragments used by CLI + mobile wrappers.
 - `apps/android-app` — Android-facing Rust app layer.
 - `apps/ios-app` — iOS-facing Rust app layer.
 
@@ -194,7 +193,7 @@ Those bridges can be added incrementally without changing the workspace topology
 - `ironmesh nodes`
 - `ironmesh replication-plan`
 - `ironmesh serve-web` provides an interactive web UI for upload/download, key browsing, health checks, and replication-plan inspection.
-	- `serve-web` serves static files directly from `apps/web-ui/static/`.
+	- Web backend routes and static assets are provided by `crates/web-ui-backend`.
 
 ### Reconciliation and maintenance
 

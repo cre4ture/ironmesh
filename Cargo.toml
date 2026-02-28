@@ -2,12 +2,12 @@
 members = [
     "crates/common",
     "crates/client-sdk",
+    "crates/web-ui-backend",
     "crates/sync-core",
     "crates/adapter-linux-fuse",
     "crates/adapter-windows-cfapi",
     "apps/server-node",
     "apps/cli-client",
-    "apps/web-ui",
     "apps/android-app",
     "apps/ios-app",
     "apps/os-integration",
