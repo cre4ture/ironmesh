@@ -14,7 +14,6 @@ mod tests {
     use reqwest::StatusCode;
     use tokio::time::sleep;
 
-    
     #[tokio::test]
     async fn cli_put_then_get_against_live_server() -> Result<()> {
         let bind = "127.0.0.1:19081";

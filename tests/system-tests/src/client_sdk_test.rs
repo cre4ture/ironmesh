@@ -1,17 +1,18 @@
-
 #[cfg(test)]
 mod tests {
+    const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
+
+    use std::io::Cursor;
+
+    use anyhow::{Context, Result};
     use bytes::Bytes;
-    use client_sdk::ClientNode;
+    use client_sdk::{ClientNode, IronMeshClient, UploadMode};
 
-    use crate::framework::{start_server, stop_server};
-
-    use anyhow::Result;
-
+    use crate::framework::{latest_snapshot_id, start_server, stop_server};
 
     #[tokio::test]
     async fn sdk_roundtrip_against_live_server() -> Result<()> {
-        let bind = "127.0.0.1:19080";
+        let bind = "127.0.0.1:19230";
         let base_url = format!("http://{bind}");
         let mut server = start_server(bind).await?;
 
@@ -27,4 +28,320 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn client_node_cache_entries_and_remove_cached_work() -> Result<()> {
+        let bind = "127.0.0.1:19231";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind).await?;
+
+        let client = ClientNode::new(&base_url);
+        let key = "cache-key";
+        let payload = Bytes::from_static(b"cached-value");
+
+        let result = async {
+            client.put(key, payload.clone()).await?;
+
+            let fetched = client.get(key).await?;
+            assert_eq!(fetched, payload);
+
+            let entries = client.cache_entries().await;
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| { entry.key == key && entry.size_bytes == payload.len() })
+            );
+
+            client.remove_cached(key).await?;
+            assert!(client.remove_cached(key).await.is_err());
+
+            let refetched = client.get_cached_or_fetch(key).await?;
+            assert_eq!(refetched, payload);
+            let entries = client.cache_entries().await;
+            assert!(entries.iter().any(|entry| entry.key == key));
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn client_node_snapshot_and_reader_writer_paths_work() -> Result<()> {
+        let bind = "127.0.0.1:19232";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind).await?;
+
+        let client = ClientNode::new(&base_url);
+        let http = reqwest::Client::new();
+
+        let result = async {
+            let versioned_key = "history/client-node";
+            let first = Bytes::from_static(b"v1-from-client-node");
+            let second = Bytes::from_static(b"v2-from-client-node");
+
+            client.put(versioned_key, first.clone()).await?;
+            let snapshot_id = latest_snapshot_id(&http, &base_url).await?;
+            client
+                .put_large_aware(versioned_key, second.clone())
+                .await?;
+
+            let historical = client
+                .get_with_selector(versioned_key, Some(&snapshot_id), None)
+                .await?;
+            assert_eq!(historical, first);
+
+            let latest = client.get(versioned_key).await?;
+            assert_eq!(latest, second);
+
+            let snapshot_for_writer = snapshot_id.clone();
+            let writer_client = client.clone();
+            let historical_writer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                let mut historical_writer = Vec::new();
+                writer_client.get_with_selector_writer(
+                    versioned_key,
+                    Some(&snapshot_for_writer),
+                    None,
+                    &mut historical_writer,
+                )?;
+                Ok(historical_writer)
+            })
+            .await
+            .context("client_node get_with_selector_writer task join failed")??;
+            assert_eq!(historical_writer, first);
+
+            let chunked_key = "reader/client-node";
+            client
+                .put(chunked_key, Bytes::from_static(b"old-value"))
+                .await?;
+
+            let chunked_payload =
+                vec![b'R'; CHUNK_UPLOAD_THRESHOLD_BYTES + (CHUNK_UPLOAD_THRESHOLD_BYTES / 4)];
+            let expected_chunked_payload = chunked_payload.clone();
+            let blocking_client = client.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut reader = Cursor::new(chunked_payload);
+                let report = blocking_client.put_chunked_reader(chunked_key, &mut reader)?;
+                assert!(matches!(report.upload_mode, UploadMode::Chunked));
+                Ok(())
+            })
+            .await
+            .context("put_chunked_reader task join failed")??;
+
+            let entries = client.cache_entries().await;
+            assert!(
+                !entries.iter().any(|entry| entry.key == chunked_key),
+                "put_chunked_reader should invalidate cached entry for the key"
+            );
+
+            let refreshed = client.get_cached_or_fetch(chunked_key).await?;
+            assert_eq!(refreshed, Bytes::from(expected_chunked_payload));
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn ironmesh_client_upload_modes_and_reader_writer_paths_work() -> Result<()> {
+        let bind = "127.0.0.1:19233";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind).await?;
+
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            let direct_report = sdk
+                .put_large_aware("large-aware/direct", Bytes::from_static(b"small"))
+                .await?;
+            assert!(matches!(direct_report.upload_mode, UploadMode::Direct));
+            assert_eq!(direct_report.chunk_size_bytes, None);
+            assert_eq!(direct_report.chunk_count, None);
+
+            let large_payload = vec![b'L'; CHUNK_UPLOAD_THRESHOLD_BYTES + 128];
+            let large_report = sdk
+                .put_large_aware("large-aware/chunked", Bytes::from(large_payload.clone()))
+                .await?;
+            assert!(matches!(large_report.upload_mode, UploadMode::Chunked));
+            assert_eq!(
+                large_report.chunk_size_bytes,
+                Some(CHUNK_UPLOAD_THRESHOLD_BYTES)
+            );
+            assert!(large_report.chunk_count.unwrap_or(0) >= 2);
+            let fetched_large = sdk.get("large-aware/chunked").await?;
+            assert_eq!(fetched_large, Bytes::from(large_payload));
+
+            let small_reader_sdk = sdk.clone();
+            let small_reader_report = tokio::task::spawn_blocking(move || -> Result<_> {
+                let payload = b"reader-direct";
+                let mut reader = Cursor::new(payload.to_vec());
+                small_reader_sdk.put_large_aware_reader(
+                    "reader/direct",
+                    &mut reader,
+                    payload.len() as u64,
+                )
+            })
+            .await
+            .context("put_large_aware_reader task join failed")??;
+            assert!(matches!(
+                small_reader_report.upload_mode,
+                UploadMode::Direct
+            ));
+            assert_eq!(
+                sdk.get("reader/direct").await?,
+                Bytes::from_static(b"reader-direct")
+            );
+
+            let chunked_reader_sdk = sdk.clone();
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let payload =
+                    vec![b'C'; CHUNK_UPLOAD_THRESHOLD_BYTES + (CHUNK_UPLOAD_THRESHOLD_BYTES / 2)];
+                let mut reader = Cursor::new(payload);
+                chunked_reader_sdk.put_chunked_reader("reader/chunked", &mut reader)
+            })
+            .await
+            .context("put_chunked_reader task join failed")??;
+
+            let writer_sdk = sdk.clone();
+            let writer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                let mut writer = Vec::new();
+                writer_sdk.get_with_selector_writer("reader/chunked", None, None, &mut writer)?;
+                Ok(writer)
+            })
+            .await
+            .context("get_with_selector_writer task join failed")??;
+            assert_eq!(
+                writer,
+                vec![b'C'; CHUNK_UPLOAD_THRESHOLD_BYTES + (CHUNK_UPLOAD_THRESHOLD_BYTES / 2)]
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn ironmesh_client_snapshot_store_index_and_snapshot_loading_work() -> Result<()> {
+        let bind = "127.0.0.1:19234";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind).await?;
+
+        let sdk = IronMeshClient::new(&base_url);
+        let http = reqwest::Client::new();
+
+        let result = async {
+            let versioned_key = "history/sdk";
+            sdk.put(versioned_key, Bytes::from_static(b"sdk-v1"))
+                .await?;
+            let snapshot_id = latest_snapshot_id(&http, &base_url).await?;
+            sdk.put(versioned_key, Bytes::from_static(b"sdk-v2"))
+                .await?;
+
+            let latest = sdk.get_with_selector(versioned_key, None, None).await?;
+            assert_eq!(latest, Bytes::from_static(b"sdk-v2"));
+
+            let historical = sdk
+                .get_with_selector(versioned_key, Some(&snapshot_id), None)
+                .await?;
+            assert_eq!(historical, Bytes::from_static(b"sdk-v1"));
+
+            for key in ["docs/readme.txt", "docs/guide/intro.md", "docs/api/v1.json"] {
+                sdk.put(key, Bytes::from_static(b"x")).await?;
+            }
+
+            let index = sdk.store_index(Some("docs"), 1, None).await?;
+            assert!(index.entry_count >= 3);
+            assert!(
+                index
+                    .entries
+                    .iter()
+                    .any(|entry| { entry.path == "docs/readme.txt" && entry.entry_type == "key" })
+            );
+            assert!(
+                index
+                    .entries
+                    .iter()
+                    .any(|entry| { entry.path == "docs/api/" && entry.entry_type == "prefix" })
+            );
+            assert!(
+                index
+                    .entries
+                    .iter()
+                    .any(|entry| { entry.path == "docs/guide/" && entry.entry_type == "prefix" })
+            );
+
+            let blocking_sdk = sdk.clone();
+            let blocking_index = tokio::task::spawn_blocking(move || {
+                blocking_sdk.store_index_blocking(Some("docs"), 1, None)
+            })
+            .await
+            .context("store_index_blocking task join failed")??;
+            assert_eq!(blocking_index.entries.len(), index.entries.len());
+
+            let loaded_snapshot = sdk.load_snapshot_from_server(Some("docs"), 1, None).await?;
+            assert!(loaded_snapshot.local.is_empty());
+            assert!(loaded_snapshot.remote.iter().any(|entry| {
+                entry.path == "docs/readme.txt"
+                    && entry.version.as_deref() == Some("server-head")
+                    && entry.content_hash.as_deref() == Some("server-head:docs/readme.txt")
+            }));
+            assert!(loaded_snapshot.remote.iter().any(|entry| {
+                entry.path == "docs/api" && entry.version.is_none() && entry.content_hash.is_none()
+            }));
+
+            let blocking_sdk = sdk.clone();
+            let blocking_snapshot = tokio::task::spawn_blocking(move || {
+                blocking_sdk.load_snapshot_from_server_blocking(Some("docs"), 1, None)
+            })
+            .await
+            .context("load_snapshot_from_server_blocking task join failed")??;
+            assert_eq!(blocking_snapshot.remote.len(), loaded_snapshot.remote.len());
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn ironmesh_client_missing_object_returns_errors() -> Result<()> {
+        let bind = "127.0.0.1:19235";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind).await?;
+
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            assert!(sdk.get("missing-key").await.is_err());
+            assert!(
+                sdk.get_with_selector("missing-key", None, None)
+                    .await
+                    .is_err()
+            );
+
+            let missing_writer_sdk = sdk.clone();
+            let writer_result = tokio::task::spawn_blocking(move || {
+                let mut writer = Vec::new();
+                missing_writer_sdk.get_with_selector_writer("missing-key", None, None, &mut writer)
+            })
+            .await
+            .context("missing-key writer task join failed")?;
+            assert!(writer_result.is_err());
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
+    }
 }
