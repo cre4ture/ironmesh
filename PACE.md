@@ -48,9 +48,12 @@ Use this pattern for future commits:
 - [ ] Docs updated for behavior/interface changes
 - [ ] Next step is explicitly stated
 
-## Clean code and commit review
+# General Guidelines to Follow
 
-- Follow clean code principles for all changes. Keep functions small, focused, and readable.
+- SOLID Principles
+- DRY (Don’t Repeat Yourself)
+- Clean code principles
+- Keep functions small, focused, and readable.
 - If a function grows too large or takes on multiple responsibilities, split it into smaller helper functions or modules.
 - Prefer explicit, descriptive names and minimize nested/complex branching — refactor into smaller units where helpful.
 - Before each commit perform a quick clean-code review: check for long functions, duplicated logic, unclear names, and missing error handling.
