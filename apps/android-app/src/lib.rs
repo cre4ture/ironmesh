@@ -43,9 +43,11 @@ fn start_embedded_web_ui(base_url: String) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("web ui state lock poisoned"))?;
 
     if let Some(existing) = state.as_ref()
-        && existing.base_url == base_url && !existing.task.is_finished() {
-            return Ok(existing.local_url.clone());
-        }
+        && existing.base_url == base_url
+        && !existing.task.is_finished()
+    {
+        return Ok(existing.local_url.clone());
+    }
 
     if let Some(previous) = state.take() {
         previous.task.abort();
