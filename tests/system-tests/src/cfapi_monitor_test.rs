@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 #[cfg(test)]
-mod cfapi_monitor_test {
+mod tests {
     use crate::framework::{fresh_data_dir, start_server};
     use crate::framework_win::start_cfapi_adapter;
     use reqwest::Client;
