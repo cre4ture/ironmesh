@@ -10,7 +10,12 @@ object RustClientBridge {
     external fun putObject(baseUrl: String, key: String, payload: ByteArray): Int
 
     @JvmStatic
-    external fun getObject(baseUrl: String, key: String): ByteArray
+    external fun getObject(
+        baseUrl: String,
+        key: String,
+        snapshot: String?,
+        version: String?,
+    ): ByteArray
 
     fun isAvailable(): Boolean = libraryLoaded
 }

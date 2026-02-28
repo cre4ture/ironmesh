@@ -58,28 +58,34 @@ class IronmeshRepository {
     }
 
     suspend fun putObject(baseUrl: String, key: String, payload: String): Int {
-        if (RustClientBridge.isAvailable()) {
-            return RustClientBridge.putObject(
-                sanitizeBaseUrl(baseUrl),
-                key,
-                payload.toByteArray(Charsets.UTF_8),
-            )
+        if (!RustClientBridge.isAvailable()) {
+            throw IllegalStateException("Rust client bridge is not available")
         }
 
-        val body = payload.toRequestBody("application/octet-stream".toMediaType())
-        val response = createApi(baseUrl).putObject(key, body)
-        if (!response.isSuccessful) {
-            throw IllegalStateException("PUT failed with HTTP ${response.code()}")
-        }
-        return response.code()
+        return RustClientBridge.putObject(
+            sanitizeBaseUrl(baseUrl),
+            key,
+            payload.toByteArray(Charsets.UTF_8),
+        )
     }
 
-    suspend fun getObject(baseUrl: String, key: String): String {
-        if (RustClientBridge.isAvailable()) {
-            return RustClientBridge.getObject(sanitizeBaseUrl(baseUrl), key)
-                .toString(Charsets.UTF_8)
+    suspend fun getObject(
+        baseUrl: String,
+        key: String,
+        snapshot: String? = null,
+        version: String? = null,
+    ): String {
+        if (!RustClientBridge.isAvailable()) {
+            throw IllegalStateException("Rust client bridge is not available")
         }
-        return createApi(baseUrl).getObject(key).string()
+
+        return RustClientBridge.getObject(
+            sanitizeBaseUrl(baseUrl),
+            key,
+            snapshot,
+            version,
+        )
+            .toString(Charsets.UTF_8)
     }
 
     suspend fun storeIndex(
@@ -94,16 +100,11 @@ class IronmeshRepository {
     }
 
     suspend fun putObjectBytes(baseUrl: String, key: String, payload: ByteArray): Int {
-        if (RustClientBridge.isAvailable()) {
-            return RustClientBridge.putObject(sanitizeBaseUrl(baseUrl), key, payload)
+        if (!RustClientBridge.isAvailable()) {
+            throw IllegalStateException("Rust client bridge is not available")
         }
 
-        val body = payload.toRequestBody("application/octet-stream".toMediaType())
-        val response = createApi(baseUrl).putObject(key, body)
-        if (!response.isSuccessful) {
-            throw IllegalStateException("PUT failed with HTTP ${response.code()}")
-        }
-        return response.code()
+        return RustClientBridge.putObject(sanitizeBaseUrl(baseUrl), key, payload)
     }
 
     suspend fun streamPutObject(
@@ -134,8 +135,13 @@ class IronmeshRepository {
         snapshot: String? = null,
         version: String? = null,
     ): ByteArray {
-        if (snapshot == null && version == null && RustClientBridge.isAvailable()) {
-            return RustClientBridge.getObject(sanitizeBaseUrl(baseUrl), key)
+        if (RustClientBridge.isAvailable()) {
+            return RustClientBridge.getObject(
+                sanitizeBaseUrl(baseUrl),
+                key,
+                snapshot,
+                version,
+            )
         }
 
         val response = createApi(baseUrl).getObjectBinary(key, snapshot = snapshot, version = version)

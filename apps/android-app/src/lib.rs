@@ -3,7 +3,7 @@ use bytes::Bytes;
 use client_sdk::ClientNode;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jbyteArray, jint};
+use jni::sys::{jbyteArray, jint, jstring};
 use std::sync::OnceLock;
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -25,6 +25,16 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
 
 fn throw_java_error(env: &mut JNIEnv, message: impl AsRef<str>) {
     let _ = env.throw_new("java/lang/RuntimeException", message.as_ref());
+}
+
+fn optional_jstring(env: &mut JNIEnv, value: jstring) -> Result<Option<String>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let value = unsafe { JString::from_raw(value) };
+    let value: String = env.get_string(&value)?.into();
+    Ok(Some(value))
 }
 
 pub struct AndroidStorageApp {
@@ -88,13 +98,22 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
     _class: JClass,
     base_url: JString,
     key: JString,
+    snapshot: jstring,
+    version: jstring,
 ) -> jbyteArray {
     let result = (|| -> Result<Vec<u8>> {
         let base_url: String = env.get_string(&base_url)?.into();
         let key: String = env.get_string(&key)?.into();
+        let snapshot = optional_jstring(&mut env, snapshot)?;
+        let version = optional_jstring(&mut env, version)?;
         let rt = runtime()?;
         let client = ClientNode::new(base_url);
-        let bytes = rt.block_on(client.get(key))?.to_vec();
+        let bytes = rt.block_on(client.get_with_selector(
+            key,
+            snapshot.as_deref(),
+            version.as_deref(),
+        ))?
+        .to_vec();
         Ok(bytes)
     })();
 
