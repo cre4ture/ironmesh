@@ -53,8 +53,8 @@ impl AndroidStorageApp {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_putObject(
+#[no_mangle]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_putObject(
     mut env: JNIEnv,
     _class: JClass,
     base_url: JString,
@@ -82,8 +82,8 @@ pub extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_putObject(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getObject(
+#[no_mangle]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getObject(
     mut env: JNIEnv,
     _class: JClass,
     base_url: JString,
