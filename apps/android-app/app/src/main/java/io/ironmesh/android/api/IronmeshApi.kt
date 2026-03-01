@@ -4,6 +4,7 @@ import okhttp3.RequestBody
 import okhttp3.ResponseBody
 import retrofit2.Response
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.PUT
 import retrofit2.http.Path
@@ -31,6 +32,9 @@ interface IronmeshApi {
         @Query("snapshot") snapshot: String? = null,
         @Query("version") version: String? = null,
     ): Response<ResponseBody>
+
+    @DELETE("store/{key}")
+    suspend fun deleteObject(@Path("key") key: String): Response<Unit>
 
     @GET("store/index")
     suspend fun storeIndex(

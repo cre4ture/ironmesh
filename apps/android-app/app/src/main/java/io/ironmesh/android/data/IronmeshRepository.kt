@@ -8,11 +8,7 @@ import io.ironmesh.android.api.StoreIndexResponse
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody
-import okio.source
 import okhttp3.OkHttpClient
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
@@ -134,6 +130,18 @@ class IronmeshRepository {
         }
 
         return RustClientBridge.streamPutObject(sanitizeBaseUrl(baseUrl), key, input)
+    }
+
+    suspend fun deleteObject(baseUrl: String, key: String): Int {
+        if (RustClientBridge.isAvailable()) {
+            return RustClientBridge.deleteObject(sanitizeBaseUrl(baseUrl), key)
+        }
+
+        val response = createApi(baseUrl).deleteObject(key)
+        if (!response.isSuccessful) {
+            throw IllegalStateException("DELETE failed with HTTP ${response.code()}")
+        }
+        return response.code()
     }
 
     suspend fun getObjectBytes(

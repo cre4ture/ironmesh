@@ -158,6 +158,10 @@ Out of scope for MVP:
     - remote polling reuse via `client-sdk::RemoteSnapshotPoller`,
     - local file + directory-marker uploads to server,
     - local file deletion propagation to server (`/store/delete` via `client-sdk`).
+  - `apps/android-app`:
+    - configurable multi-profile folder sync settings (prefix + local folder),
+    - periodic background sync execution via WorkManager,
+    - manual "Sync Now" trigger from UI.
 - Next step:
   - Add server-driven remote-change notifications to replace polling when backend support is available.
   - Extend deletion propagation to fully recursive directory semantics.

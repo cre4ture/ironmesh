@@ -19,8 +19,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -87,6 +89,88 @@ class MainActivity : ComponentActivity() {
 
                         Button(onClick = { vm.openWebUi(::openWebUi) }) {
                             Text("Open Web UI")
+                        }
+
+                        Text(
+                            "Folder Sync Profiles",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+
+                        OutlinedTextField(
+                            modifier = Modifier.fillMaxWidth(),
+                            value = state.newSyncLabel,
+                            onValueChange = vm::updateNewSyncLabel,
+                            label = { Text("Profile Label") },
+                            singleLine = true,
+                        )
+
+                        OutlinedTextField(
+                            modifier = Modifier.fillMaxWidth(),
+                            value = state.newSyncPrefix,
+                            onValueChange = vm::updateNewSyncPrefix,
+                            label = { Text("Remote Prefix (optional)") },
+                            singleLine = true,
+                        )
+
+                        OutlinedTextField(
+                            modifier = Modifier.fillMaxWidth(),
+                            value = state.newSyncLocalFolder,
+                            onValueChange = vm::updateNewSyncLocalFolder,
+                            label = { Text("Local Folder Path") },
+                            singleLine = true,
+                        )
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = vm::addFolderSyncProfile) {
+                                Text("Add Sync Profile")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    vm.updateNewSyncLocalFolder("/storage/emulated/0/DCIM/Camera")
+                                },
+                            ) {
+                                Text("Use Camera Folder")
+                            }
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = vm::runFolderSyncNow) { Text("Sync Now") }
+                        }
+
+                        if (state.syncProfiles.isEmpty()) {
+                            Text("No sync profiles configured.")
+                        }
+
+                        state.syncProfiles.forEach { profile ->
+                            Surface(modifier = Modifier.fillMaxWidth(), tonalElevation = 2.dp) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(profile.label, style = MaterialTheme.typography.titleSmall)
+                                    Text(
+                                        "Prefix: ${
+                                            if (profile.prefix.isBlank()) "<root>" else profile.prefix
+                                        }",
+                                    )
+                                    Text("Local: ${profile.localFolder}")
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Switch(
+                                            checked = profile.enabled,
+                                            onCheckedChange = { enabled ->
+                                                vm.setFolderSyncProfileEnabled(profile.id, enabled)
+                                            },
+                                        )
+                                        OutlinedButton(
+                                            onClick = { vm.removeFolderSyncProfile(profile.id) },
+                                        ) {
+                                            Text("Remove")
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         if (state.loading) {

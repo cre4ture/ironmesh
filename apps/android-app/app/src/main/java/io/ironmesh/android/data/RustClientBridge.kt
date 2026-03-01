@@ -36,6 +36,9 @@ object RustClientBridge {
     ): Int
 
     @JvmStatic
+    external fun deleteObject(baseUrl: String, key: String): Int
+
+    @JvmStatic
     external fun streamObjectTo(
         baseUrl: String,
         key: String,

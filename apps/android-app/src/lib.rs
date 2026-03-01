@@ -413,6 +413,33 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 /// # Safety
 /// This function is intended to be called from Java via JNI.
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_deleteObject(
+    mut env: JNIEnv,
+    _class: JClass,
+    base_url: JString,
+    key: JString,
+) -> jint {
+    let result = (|| -> Result<jint> {
+        let base_url: String = env.get_string(&base_url)?.into();
+        let key: String = env.get_string(&key)?.into();
+        let rt = runtime()?;
+        let client = ClientNode::new(base_url);
+        rt.block_on(client.delete_path(key))?;
+        Ok(204)
+    })();
+
+    match result {
+        Ok(code) => code,
+        Err(err) => {
+            throw_java_error(&mut env, format!("rust deleteObject failed: {err:#}"));
+            0
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamObjectTo<
     'local,
 >(

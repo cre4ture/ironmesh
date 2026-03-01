@@ -3,11 +3,14 @@ package io.ironmesh.android.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import io.ironmesh.android.work.FolderSyncScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.UUID
 
 data class MainUiState(
     val baseUrl: String = IronmeshPreferences.DEFAULT_BASE_URL,
@@ -16,6 +19,10 @@ data class MainUiState(
     val status: String = "Ready",
     val replicationSummary: String = "",
     val objectBody: String = "",
+    val syncProfiles: List<FolderSyncConfig> = emptyList(),
+    val newSyncLabel: String = "",
+    val newSyncPrefix: String = "",
+    val newSyncLocalFolder: String = "",
     val loading: Boolean = false,
 )
 
@@ -30,7 +37,10 @@ class MainViewModel(
 
     init {
         val persistedBaseUrl = IronmeshPreferences.getBaseUrl(getApplication())
+        val persistedProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication())
         uiState.value = uiState.value.copy(baseUrl = persistedBaseUrl)
+        uiState.value = uiState.value.copy(syncProfiles = persistedProfiles)
+        FolderSyncScheduler.reschedule(getApplication())
     }
 
     fun updateBaseUrl(value: String) {
@@ -85,6 +95,78 @@ class MainViewModel(
 
     fun setStatus(message: String) {
         uiState.value = uiState.value.copy(status = message)
+    }
+
+    fun updateNewSyncLabel(value: String) {
+        uiState.value = uiState.value.copy(newSyncLabel = value)
+    }
+
+    fun updateNewSyncPrefix(value: String) {
+        uiState.value = uiState.value.copy(newSyncPrefix = value)
+    }
+
+    fun updateNewSyncLocalFolder(value: String) {
+        uiState.value = uiState.value.copy(newSyncLocalFolder = value)
+    }
+
+    fun addFolderSyncProfile() {
+        val localFolder = uiState.value.newSyncLocalFolder.trim()
+        if (localFolder.isBlank()) {
+            setStatus("Error: Local folder path is required")
+            return
+        }
+
+        val prefix = uiState.value.newSyncPrefix.trim().trim('/').replace('\\', '/')
+        val label = uiState.value.newSyncLabel.trim().ifBlank {
+            localFolder.substringAfterLast('/').ifBlank { "Sync Profile" }
+        }
+
+        val profile = FolderSyncConfig(
+            id = UUID.randomUUID().toString(),
+            label = label,
+            prefix = prefix,
+            localFolder = localFolder,
+            depth = 64,
+            enabled = true,
+        )
+
+        val updated = uiState.value.syncProfiles + profile
+        IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
+        uiState.value = uiState.value.copy(
+            syncProfiles = updated,
+            newSyncLabel = "",
+            newSyncPrefix = "",
+            newSyncLocalFolder = "",
+            status = "Added sync profile '${profile.label}'",
+        )
+
+        FolderSyncScheduler.reschedule(getApplication())
+        FolderSyncScheduler.runNow(getApplication())
+    }
+
+    fun setFolderSyncProfileEnabled(profileId: String, enabled: Boolean) {
+        val updated = uiState.value.syncProfiles.map { profile ->
+            if (profile.id == profileId) profile.copy(enabled = enabled) else profile
+        }
+        IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
+        uiState.value = uiState.value.copy(syncProfiles = updated)
+        FolderSyncScheduler.reschedule(getApplication())
+    }
+
+    fun removeFolderSyncProfile(profileId: String) {
+        val updated = uiState.value.syncProfiles.filterNot { it.id == profileId }
+        IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
+        IronmeshPreferences.clearFolderSyncRuntimeState(getApplication(), profileId)
+        uiState.value = uiState.value.copy(
+            syncProfiles = updated,
+            status = "Removed sync profile",
+        )
+        FolderSyncScheduler.reschedule(getApplication())
+    }
+
+    fun runFolderSyncNow() {
+        FolderSyncScheduler.runNow(getApplication())
+        setStatus("Folder sync scheduled")
     }
 
     fun openWebUi(onReady: (String) -> Unit) {

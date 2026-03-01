@@ -10,6 +10,8 @@ This is a standalone Kotlin Android app scaffold for local testing of `server-no
 - Upload/download via Rust `client-sdk` bridge when native library is available
 - Fallback HTTP/Retrofit path remains enabled if native bridge is not loaded
 - Open embedded Web UI in an in-app `WebView` from the native screen
+- Configure multiple folder-sync profiles (remote prefix <-> local folder)
+- Automatic periodic background folder sync (WorkManager) + manual "Sync Now"
 
 ## Open in Android Studio
 
