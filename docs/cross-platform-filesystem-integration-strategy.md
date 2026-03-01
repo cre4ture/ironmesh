@@ -175,6 +175,7 @@ Key options:
 
 - `--local-scan-interval-ms`: periodic scan cadence for upload detection.
 - `--remote-refresh-interval-ms`: server polling cadence for remote updates.
+- `--prefix`: scope synchronization to a remote subtree; local root maps directly to that subtree.
 - `--no-watch-local`: disable native local watcher and rely on scans only.
 - `--run-once`: perform one bootstrap + local scan cycle and exit.
 

@@ -5,7 +5,7 @@ use client_sdk::{
     normalize_server_base_url,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
 use std::io::Cursor;
@@ -16,8 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_agent_core::{
     LocalEntryKind, LocalEntryState, LocalTreeState, RemoteTreeIndex, absolute_path,
-    build_remote_index, diff_local_trees, local_entry_state_for_path, normalize_relative_path,
-    remote_entry_kinds, scan_local_tree,
+    diff_local_trees, local_entry_state_for_path, normalize_relative_path, scan_local_tree,
 };
 use sync_core::{EntryKind, SyncSnapshot};
 
@@ -45,6 +44,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let scope = PathScope::new(args.prefix.clone());
     fs::create_dir_all(&args.root_dir).with_context(|| {
         format!(
             "failed to create root directory {}",
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
 
     let initial_fetcher = RemoteSnapshotFetcher::from_base_url(
         base_url.as_str(),
-        args.prefix.clone(),
+        scope.remote_prefix().map(ToString::to_string),
         args.depth,
         None,
     );
@@ -65,13 +65,14 @@ fn main() -> Result<()> {
         .fetch_snapshot_blocking()
         .context("failed to fetch initial remote snapshot")?;
 
-    let mut remote_index = build_remote_index(&initial_snapshot);
+    let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
     apply_remote_snapshot(
         &args.root_dir,
         &client,
         &initial_snapshot,
         None,
+        &scope,
         &mut suppressed_uploads,
         &mut remote_index,
     )?;
@@ -84,6 +85,7 @@ fn main() -> Result<()> {
             &args.root_dir,
             &client,
             &mut local_state,
+            &scope,
             &mut remote_index,
             &mut suppressed_uploads,
         )?;
@@ -99,7 +101,7 @@ fn main() -> Result<()> {
     let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::from_base_url(
         base_url.as_str(),
-        args.prefix.clone(),
+        scope.remote_prefix().map(ToString::to_string),
         args.depth,
         None,
     );
@@ -135,6 +137,7 @@ fn main() -> Result<()> {
                 &client,
                 &update.snapshot,
                 Some(&update.changed_paths),
+                &scope,
                 &mut suppressed_uploads,
                 &mut remote_index,
             )?;
@@ -156,6 +159,7 @@ fn main() -> Result<()> {
                 &args.root_dir,
                 &client,
                 &mut local_state,
+                &scope,
                 &mut remote_index,
                 &mut suppressed_uploads,
             )?;
@@ -206,6 +210,7 @@ fn sync_local_changes(
     root_dir: &Path,
     client: &IronMeshClient,
     local_state: &mut LocalTreeState,
+    scope: &PathScope,
     remote_index: &mut RemoteTreeIndex,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
 ) -> Result<()> {
@@ -217,7 +222,7 @@ fn sync_local_changes(
             continue;
         }
 
-        ensure_remote_directory_marker(client, path)?;
+        ensure_remote_directory_marker(client, scope, path)?;
         remote_index.directories.insert(path.clone());
         eprintln!("local-sync: uploaded directory marker {path}/");
     }
@@ -234,7 +239,7 @@ fn sync_local_changes(
             continue;
         }
 
-        upload_local_file(root_dir, client, path, entry_state.size_bytes)?;
+        upload_local_file(root_dir, client, scope, path, entry_state.size_bytes)?;
         remote_index.files.insert(path.clone());
         for parent in parent_directories(path) {
             remote_index.directories.insert(parent);
@@ -261,12 +266,14 @@ fn sync_local_changes(
                 suppressed_uploads.remove(&path);
                 continue;
             }
-            if !remote_index.files.contains(&path) {
+            let known_remote_file =
+                remote_index.files.contains(&path) || suppressed_uploads.contains_key(&path);
+            if !known_remote_file {
                 suppressed_uploads.remove(&path);
                 continue;
             }
 
-            delete_remote_file(client, &path)?;
+            delete_remote_file(client, scope, &path)?;
             suppressed_uploads.remove(&path);
             remote_index.files.remove(&path);
             eprintln!("local-sync: deleted remote file {path}");
@@ -282,23 +289,52 @@ fn apply_remote_snapshot(
     client: &IronMeshClient,
     snapshot: &SyncSnapshot,
     changed_paths: Option<&[String]>,
+    scope: &PathScope,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
     remote_index: &mut RemoteTreeIndex,
 ) -> Result<()> {
-    let next_index = build_remote_index(snapshot);
-    let entry_kinds = remote_entry_kinds(snapshot);
+    let mut next_index = RemoteTreeIndex::default();
+    let mut entry_kinds: BTreeMap<String, (EntryKind, String)> = BTreeMap::new();
+
+    for entry in &snapshot.remote {
+        let remote_path = normalize_relative_path(&entry.path);
+        let Some(local_path) = scope.remote_to_local(&remote_path) else {
+            continue;
+        };
+        if local_path.is_empty() {
+            continue;
+        }
+
+        match entry.kind {
+            EntryKind::Directory => {
+                next_index.directories.insert(local_path.clone());
+            }
+            EntryKind::File => {
+                next_index.files.insert(local_path.clone());
+            }
+        }
+        entry_kinds.insert(local_path, (entry.kind, remote_path));
+    }
 
     match changed_paths {
         Some(changed_paths) => {
+            let mut changed_local_paths = BTreeSet::new();
             for changed in changed_paths {
-                let path = normalize_relative_path(changed);
+                let Some(path) = scope.remote_to_local(changed) else {
+                    continue;
+                };
                 if path.is_empty() {
                     continue;
                 }
+                changed_local_paths.insert(path);
+            }
 
-                match entry_kinds.get(&path) {
-                    Some(EntryKind::Directory) => {
-                        let directory = absolute_path(root_dir, &path);
+            for path in changed_local_paths {
+                let path = path.as_str();
+
+                match entry_kinds.get(path) {
+                    Some((EntryKind::Directory, _)) => {
+                        let directory = absolute_path(root_dir, path);
                         fs::create_dir_all(&directory).with_context(|| {
                             format!(
                                 "failed to materialize remote directory {}",
@@ -306,15 +342,15 @@ fn apply_remote_snapshot(
                             )
                         })?;
                     }
-                    Some(EntryKind::File) => {
-                        download_remote_file(root_dir, client, &path)?;
-                        if let Some(entry_state) = local_entry_state_for_path(root_dir, &path)? {
-                            suppressed_uploads.insert(path.clone(), entry_state);
+                    Some((EntryKind::File, remote_key)) => {
+                        download_remote_file(root_dir, client, path, remote_key)?;
+                        if let Some(entry_state) = local_entry_state_for_path(root_dir, path)? {
+                            suppressed_uploads.insert(path.to_string(), entry_state);
                         }
                     }
                     None => {
-                        remove_local_path(root_dir, &path)?;
-                        suppressed_uploads.remove(&path);
+                        remove_local_path(root_dir, path)?;
+                        suppressed_uploads.remove(path);
                     }
                 }
             }
@@ -332,7 +368,10 @@ fn apply_remote_snapshot(
             }
 
             for file in &next_index.files {
-                download_remote_file(root_dir, client, file)?;
+                let Some((EntryKind::File, remote_key)) = entry_kinds.get(file) else {
+                    continue;
+                };
+                download_remote_file(root_dir, client, file, remote_key)?;
                 if let Some(entry_state) = local_entry_state_for_path(root_dir, file)? {
                     suppressed_uploads.insert(file.clone(), entry_state);
                 }
@@ -348,9 +387,10 @@ fn apply_remote_snapshot(
 fn download_remote_file(
     root_dir: &Path,
     client: &IronMeshClient,
-    relative_path: &str,
+    local_relative_path: &str,
+    remote_key: &str,
 ) -> Result<()> {
-    let target = absolute_path(root_dir, relative_path);
+    let target = absolute_path(root_dir, local_relative_path);
 
     if target.is_dir() {
         fs::remove_dir_all(&target)
@@ -378,8 +418,8 @@ fn download_remote_file(
     let mut file = File::create(&temp_path)
         .with_context(|| format!("failed to create temp file {}", temp_path.display()))?;
     client
-        .get_with_selector_writer(relative_path, None, None, &mut file)
-        .with_context(|| format!("failed to download remote file {relative_path}"))?;
+        .get_with_selector_writer(remote_key, None, None, &mut file)
+        .with_context(|| format!("failed to download remote file {remote_key}"))?;
 
     file.sync_all()
         .with_context(|| format!("failed to flush temp file {}", temp_path.display()))?;
@@ -398,6 +438,7 @@ fn download_remote_file(
 fn upload_local_file(
     root_dir: &Path,
     client: &IronMeshClient,
+    scope: &PathScope,
     relative_path: &str,
     size_bytes: u64,
 ) -> Result<()> {
@@ -405,37 +446,43 @@ fn upload_local_file(
     let mut file = File::open(&absolute)
         .with_context(|| format!("failed to open local file {}", absolute.display()))?;
 
+    let remote_key = scope.local_to_remote(relative_path).ok_or_else(|| {
+        anyhow::anyhow!("refusing to upload local root without concrete scoped path")
+    })?;
+
     client
-        .put_large_aware_reader(relative_path.to_string(), &mut file, size_bytes)
-        .with_context(|| format!("failed to upload local file {relative_path}"))?;
+        .put_large_aware_reader(remote_key.clone(), &mut file, size_bytes)
+        .with_context(|| format!("failed to upload local file {relative_path} to {remote_key}"))?;
 
     Ok(())
 }
 
-fn ensure_remote_directory_marker(client: &IronMeshClient, directory_path: &str) -> Result<()> {
-    let normalized = normalize_relative_path(directory_path);
-    if normalized.is_empty() {
+fn ensure_remote_directory_marker(
+    client: &IronMeshClient,
+    scope: &PathScope,
+    directory_path: &str,
+) -> Result<()> {
+    let Some(remote_directory) = scope.local_to_remote(directory_path) else {
         return Ok(());
-    }
+    };
 
-    let marker_key = format!("{}/", normalized);
+    let marker_key = format!("{}/", remote_directory);
     let mut empty = Cursor::new(Vec::<u8>::new());
     client
         .put_large_aware_reader(marker_key, &mut empty, 0)
-        .with_context(|| format!("failed to upload directory marker for {normalized}"))?;
+        .with_context(|| format!("failed to upload directory marker for {remote_directory}"))?;
 
     Ok(())
 }
 
-fn delete_remote_file(client: &IronMeshClient, file_path: &str) -> Result<()> {
-    let normalized = normalize_relative_path(file_path);
-    if normalized.is_empty() {
+fn delete_remote_file(client: &IronMeshClient, scope: &PathScope, file_path: &str) -> Result<()> {
+    let Some(remote_key) = scope.local_to_remote(file_path) else {
         return Ok(());
-    }
+    };
 
     client
-        .delete_path_blocking(&normalized)
-        .with_context(|| format!("failed to delete remote file {normalized}"))?;
+        .delete_path_blocking(&remote_key)
+        .with_context(|| format!("failed to delete remote file {remote_key}"))?;
 
     Ok(())
 }
@@ -481,4 +528,89 @@ fn parent_directories(path: &str) -> Vec<String> {
         directories.push(segments[..index].join("/"));
     }
     directories
+}
+
+#[derive(Debug, Clone)]
+struct PathScope {
+    prefix: Option<String>,
+}
+
+impl PathScope {
+    fn new(prefix: Option<String>) -> Self {
+        Self {
+            prefix: prefix
+                .map(|value| normalize_relative_path(&value))
+                .filter(|value| !value.is_empty()),
+        }
+    }
+
+    fn remote_prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+
+    fn remote_to_local(&self, remote_path: &str) -> Option<String> {
+        let normalized = normalize_relative_path(remote_path);
+        if normalized.is_empty() {
+            return None;
+        }
+
+        match &self.prefix {
+            None => Some(normalized),
+            Some(prefix) => {
+                if normalized == *prefix {
+                    return Some(String::new());
+                }
+
+                let scoped_prefix = format!("{prefix}/");
+                normalized
+                    .strip_prefix(&scoped_prefix)
+                    .map(ToString::to_string)
+            }
+        }
+    }
+
+    fn local_to_remote(&self, local_path: &str) -> Option<String> {
+        let normalized = normalize_relative_path(local_path);
+        if normalized.is_empty() {
+            return None;
+        }
+
+        Some(match &self.prefix {
+            None => normalized,
+            Some(prefix) => format!("{prefix}/{normalized}"),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PathScope;
+
+    #[test]
+    fn path_scope_without_prefix_keeps_paths() {
+        let scope = PathScope::new(None);
+        assert_eq!(
+            scope.remote_to_local("docs/readme.txt"),
+            Some("docs/readme.txt".to_string())
+        );
+        assert_eq!(
+            scope.local_to_remote("docs/readme.txt"),
+            Some("docs/readme.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn path_scope_with_prefix_maps_both_directions() {
+        let scope = PathScope::new(Some("team/a".to_string()));
+        assert_eq!(scope.remote_prefix(), Some("team/a"));
+        assert_eq!(
+            scope.remote_to_local("team/a/docs/readme.txt"),
+            Some("docs/readme.txt".to_string())
+        );
+        assert_eq!(scope.remote_to_local("other/docs/readme.txt"), None);
+        assert_eq!(
+            scope.local_to_remote("docs/readme.txt"),
+            Some("team/a/docs/readme.txt".to_string())
+        );
+    }
 }
