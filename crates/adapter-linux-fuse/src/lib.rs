@@ -780,6 +780,21 @@ pub mod runtime {
                 parent_node.children.insert(name.to_string(), inode);
             }
 
+            let directory_marker_path = format!("{}/", self.resolve_full_path(inode));
+            let mut marker_reader = Cursor::new(Vec::new());
+            if self
+                .uploader
+                .upload_reader(&directory_marker_path, &mut marker_reader, 0)
+                .is_err()
+            {
+                if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                    parent_node.children.remove(name);
+                }
+                self.nodes.remove(&inode);
+                reply.error(EIO);
+                return;
+            }
+
             let Some(created) = self.nodes.get(&inode) else {
                 reply.error(EIO);
                 return;

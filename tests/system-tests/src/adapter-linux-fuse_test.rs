@@ -138,6 +138,35 @@ mod tests {
         bail!("server did not expose expected payload for key {key}");
     }
 
+    async fn wait_for_remote_directory_existence(
+        sdk: &IronMeshClient,
+        dir_name: &str,
+        retries: usize,
+    ) -> Result<()> {
+        let expected_with_trailing_slash = format!("{dir_name}/");
+
+        for _ in 0..retries {
+            if let Ok(index) = sdk.store_index(None, 1, None).await {
+                let found = index.entries.iter().any(|entry| {
+                    let path_match =
+                        entry.path == dir_name || entry.path == expected_with_trailing_slash;
+                    let type_match = entry.entry_type == "prefix"
+                        || entry.entry_type == "key"
+                        || entry.path.ends_with('/');
+                    path_match && type_match
+                });
+
+                if found {
+                    return Ok(());
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("store index did not report remote directory for {expected_with_trailing_slash}");
+    }
+
     async fn run_server_mode_upload_case(
         bind: &str,
         seed_key: &str,
@@ -318,6 +347,60 @@ mod tests {
         result
     }
 
+    async fn run_empty_folder_create_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-empty-folder");
+        let mut server = start_server(bind).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            // Seed one remote file so we have a deterministic mount-readiness probe.
+            sdk.put_large_aware(
+                "seed-empty-folder.txt",
+                Bytes::from_static(b"seed-empty-folder"),
+            )
+            .await?;
+
+            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-empty-folder.txt");
+                wait_for_file(&seed_path, 120).await?;
+
+                let empty_dir_name = "created-empty-dir";
+                let empty_dir_path = mountpoint.join(empty_dir_name);
+                fs::create_dir(&empty_dir_path).with_context(|| {
+                    format!(
+                        "failed to create mounted directory {}",
+                        empty_dir_path.display()
+                    )
+                })?;
+                assert!(
+                    empty_dir_path.is_dir(),
+                    "expected mounted directory to exist: {}",
+                    empty_dir_path.display()
+                );
+
+                wait_for_remote_directory_existence(&sdk, empty_dir_name, 150).await?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
     async fn run_remote_additions_refresh_case(bind: &str) -> Result<()> {
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
@@ -447,6 +530,11 @@ mod tests {
     async fn linux_fuse_server_mode_nested_folders_create_delete_and_file_roundtrip() -> Result<()>
     {
         run_nested_folder_roundtrip_case("127.0.0.1:19362").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_creates_empty_folder_and_persists_remote_prefix() -> Result<()> {
+        run_empty_folder_create_case("127.0.0.1:19365").await
     }
 
     #[tokio::test]
