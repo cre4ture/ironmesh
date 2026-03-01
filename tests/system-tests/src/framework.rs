@@ -346,6 +346,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
         "server-node" => "IRONMESH_SERVER_BIN",
         "cli-client" => "IRONMESH_CLI_BIN",
         "os-integration" => "IRONMESH_OS_INTEGRATION_BIN",
+        "ironmesh-folder-agent" => "IRONMESH_FOLDER_AGENT_BIN",
         _ => "",
     };
 
@@ -366,6 +367,9 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
         "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_server-node"),
         "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_cli-client"),
         "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_os-integration"),
+        "ironmesh-folder-agent" => {
+            option_env!("CARGO_BIN_FILE_IRONMESH_FOLDER_AGENT_ironmesh-folder-agent")
+        }
         _ => None,
     };
 
@@ -378,11 +382,12 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
 
     if !path.exists() {
         bail!(
-            "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{}/{} overrides)",
+            "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{}/{}/{} overrides)",
             path.display(),
             "IRONMESH_SERVER_BIN",
             "IRONMESH_CLI_BIN",
-            "IRONMESH_OS_INTEGRATION_BIN"
+            "IRONMESH_OS_INTEGRATION_BIN",
+            "IRONMESH_FOLDER_AGENT_BIN"
         );
     }
 

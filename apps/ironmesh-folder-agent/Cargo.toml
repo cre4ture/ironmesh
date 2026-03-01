@@ -1,0 +1,15 @@
+[package]
+name = "ironmesh-folder-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+client-sdk = { path = "../../crates/client-sdk" }
+notify.workspace = true
+sync-agent-core = { path = "../../crates/sync-agent-core" }
+sync-core = { path = "../../crates/sync-core" }
+ctrlc = "3"

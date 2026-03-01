@@ -15,3 +15,6 @@ mod cfapi_monitor_test;
 #[cfg(target_os = "linux")]
 #[path = "adapter-linux-fuse_test.rs"]
 mod adapter_linux_fuse_test;
+
+#[path = "folder_agent_test.rs"]
+mod folder_agent_test;

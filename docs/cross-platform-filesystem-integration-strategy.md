@@ -150,8 +150,32 @@ Out of scope for MVP:
     - callback contract on `changed_paths` + latest snapshot,
     - adapter-side callback applies platform action plans.
   - `crates/adapter-linux-fuse` live mount now consumes the same polling abstraction to materialize remote additions without remounting.
+  - `crates/sync-agent-core` with reusable local tree scanning, diffing, and remote index utilities.
+  - `apps/ironmesh-folder-agent`:
+    - OS-independent local-folder synchronization runtime,
+    - initial remote materialization into a configured local root folder,
+    - hybrid change detection: periodic local scans + native filesystem watcher events,
+    - remote polling reuse via `client-sdk::RemoteSnapshotPoller`,
+    - local file + directory-marker uploads to server.
 - Next step:
   - Add server-driven remote-change notifications to replace polling when backend support is available.
+  - Add remote delete propagation into `client-sdk` and wire folder-agent local deletions to it.
+
+## Folder agent usage (MVP)
+
+```bash
+mkdir -p /tmp/ironmesh-root
+cargo run -p ironmesh-folder-agent -- \
+  --root-dir /tmp/ironmesh-root \
+  --server-base-url http://127.0.0.1:18080
+```
+
+Key options:
+
+- `--local-scan-interval-ms`: periodic scan cadence for upload detection.
+- `--remote-refresh-interval-ms`: server polling cadence for remote updates.
+- `--no-watch-local`: disable native local watcher and rely on scans only.
+- `--run-once`: perform one bootstrap + local scan cycle and exit.
 
 ## Linux FUSE MVP test (current)
 
