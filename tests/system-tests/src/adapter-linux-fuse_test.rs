@@ -146,6 +146,104 @@ mod tests {
         result
     }
 
+    async fn run_nested_folder_roundtrip_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-nested-folders");
+        let mut server = start_server(bind).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let nested_dirs = vec!["l1", "l1/l2", "l1/l2/l3"];
+        let uploaded_files = vec![
+            ("l1/small-l1.txt", b"upload-l1".to_vec()),
+            ("l1/l2/small-l2.txt", b"upload-l2".to_vec()),
+            ("l1/l2/l3/small-l3.txt", b"upload-l3".to_vec()),
+        ];
+
+        let result = async {
+            // Provide a stable remote seed so we can reliably detect mount readiness.
+            sdk.put_large_aware("seed-nested.txt", Bytes::from_static(b"seed-nested"))
+                .await?;
+
+            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let phase_one = async {
+                let seed_path = mountpoint.join("seed-nested.txt");
+                wait_for_file(&seed_path, 100).await?;
+
+                for dir in &nested_dirs {
+                    let dir_path = mountpoint.join(dir);
+                    fs::create_dir(&dir_path).with_context(|| {
+                        format!("failed to create mounted directory {}", dir_path.display())
+                    })?;
+                    assert!(
+                        dir_path.is_dir(),
+                        "expected mounted directory to exist: {}",
+                        dir_path.display()
+                    );
+                }
+
+                for (key, payload) in &uploaded_files {
+                    let mounted_path = mountpoint.join(key);
+                    fs::write(&mounted_path, payload).with_context(|| {
+                        format!("failed to write mounted file {}", mounted_path.display())
+                    })?;
+                    wait_for_object_bytes(&sdk, key, payload, 150).await?;
+                }
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            phase_one?;
+
+            // Remount to validate download/hydration from server for each uploaded file.
+            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let phase_two = async {
+                for (key, payload) in &uploaded_files {
+                    let mounted_path = mountpoint.join(key);
+                    wait_for_file(&mounted_path, 100).await?;
+                    let downloaded = fs::read(&mounted_path).with_context(|| {
+                        format!("failed to read mounted file {}", mounted_path.display())
+                    })?;
+                    assert_eq!(downloaded, *payload);
+                }
+
+                for (key, _) in uploaded_files.iter().rev() {
+                    let mounted_path = mountpoint.join(key);
+                    fs::remove_file(&mounted_path).with_context(|| {
+                        format!("failed to remove mounted file {}", mounted_path.display())
+                    })?;
+                }
+
+                for dir in nested_dirs.iter().rev() {
+                    let dir_path = mountpoint.join(dir);
+                    fs::remove_dir(&dir_path).with_context(|| {
+                        format!("failed to remove mounted directory {}", dir_path.display())
+                    })?;
+                    assert!(
+                        !dir_path.exists(),
+                        "expected mounted directory to be deleted: {}",
+                        dir_path.display()
+                    );
+                }
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            phase_two
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
     #[tokio::test]
     async fn linux_fuse_server_mode_uploads_small_payload() -> Result<()> {
         run_server_mode_upload_case(
@@ -173,5 +271,11 @@ mod tests {
             upload_payload,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_server_mode_nested_folders_create_delete_and_file_roundtrip() -> Result<()>
+    {
+        run_nested_folder_roundtrip_case("127.0.0.1:19362").await
     }
 }

@@ -105,7 +105,7 @@ pub mod runtime {
         FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
         ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
     };
-    use libc::{EACCES, EBADF, EEXIST, EINVAL, EIO, ENOENT};
+    use libc::{EACCES, EBADF, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
     use std::collections::{BTreeMap, HashMap};
     use std::ffi::OsStr;
     use std::io::Cursor;
@@ -624,6 +624,134 @@ pub mod runtime {
                 }
             }
 
+            reply.ok();
+        }
+
+        fn mkdir(
+            &mut self,
+            _req: &Request<'_>,
+            parent: u64,
+            name: &OsStr,
+            _mode: u32,
+            _umask: u32,
+            reply: ReplyEntry,
+        ) {
+            let Some(parent_node) = self.nodes.get(&parent) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if parent_node.kind != FileType::Directory {
+                reply.error(ENOTDIR);
+                return;
+            }
+
+            let Some(name) = name.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+            if name.is_empty() || name.contains('/') {
+                reply.error(EINVAL);
+                return;
+            }
+            if parent_node.children.contains_key(name) {
+                reply.error(EEXIST);
+                return;
+            }
+
+            let inode = self.next_inode();
+            self.nodes
+                .insert(inode, FsNode::directory(inode, name.to_string(), parent));
+
+            if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                parent_node.children.insert(name.to_string(), inode);
+            }
+
+            let Some(created) = self.nodes.get(&inode) else {
+                reply.error(EIO);
+                return;
+            };
+            reply.entry(&TTL, &created.attr(self.uid, self.gid), 0);
+        }
+
+        fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+            let Some(name) = name.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+
+            let Some(parent_node) = self.nodes.get(&parent) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if parent_node.kind != FileType::Directory {
+                reply.error(ENOTDIR);
+                return;
+            }
+
+            let Some(child_inode) = parent_node.children.get(name).copied() else {
+                reply.error(ENOENT);
+                return;
+            };
+
+            let Some(child_node) = self.nodes.get(&child_inode) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if child_node.kind == FileType::Directory {
+                reply.error(EISDIR);
+                return;
+            }
+
+            if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                parent_node.children.remove(name);
+            }
+            self.nodes.remove(&child_inode);
+            self.open_handles
+                .retain(|_, handle| handle.inode != child_inode);
+            reply.ok();
+        }
+
+        fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+            let Some(name) = name.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+            if name == "." || name == ".." {
+                reply.error(EINVAL);
+                return;
+            }
+
+            let Some(parent_node) = self.nodes.get(&parent) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if parent_node.kind != FileType::Directory {
+                reply.error(ENOTDIR);
+                return;
+            }
+
+            let Some(child_inode) = parent_node.children.get(name).copied() else {
+                reply.error(ENOENT);
+                return;
+            };
+
+            let Some(child_node) = self.nodes.get(&child_inode) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if child_node.kind != FileType::Directory {
+                reply.error(ENOTDIR);
+                return;
+            }
+            if !child_node.children.is_empty() {
+                reply.error(ENOTEMPTY);
+                return;
+            }
+
+            if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                parent_node.children.remove(name);
+            }
+            self.nodes.remove(&child_inode);
             reply.ok();
         }
 
