@@ -20,6 +20,17 @@
 
 The node uses an on-disk **content-addressed object store** with immutable snapshot manifests.
 
+### Identity and namespace model
+
+- `object_id` is immutable identity of a logical file.
+- `path` is a mutable namespace binding to an `object_id`.
+- Version history is attached to `object_id`, not to path text.
+- Rename updates only namespace bindings and keeps `object_id`.
+- Copy creates a new `object_id` and records provenance on the first copied version:
+  - `copied_from_object_id`
+  - `copied_from_version_id`
+  - optional `copied_from_path`
+
 ### 1) Content-addressed chunk storage
 
 - Incoming object data is split into fixed-size chunks (currently 1 MiB).
@@ -49,10 +60,19 @@ On every read:
 
 ### 4) Snapshot model
 
-- The node maintains a mutable `current` key -> manifest map in `state/current.json`.
+- The node maintains mutable namespace state in `state/current.json`:
+  - `path -> object_id` bindings,
+  - `path -> head_manifest_hash` materialization for read/index compatibility.
 - After each successful write, the node creates an immutable snapshot in `snapshots/`.
-- A snapshot captures the full key -> manifest map at that point in time.
+- A snapshot captures full namespace/materialized state at that point in time.
 - Older versions are accessible by reading with a snapshot ID.
+
+### 5) Branching / conflict model
+
+- Concurrent writes to one logical document create multiple heads in the same `object_id` DAG.
+- Preferred-head policy resolves default reads.
+- Rename does not break branching continuity because identity remains `object_id`.
+- Copy starts a new DAG rooted with provenance metadata to source history.
 
 ## API behavior
 
