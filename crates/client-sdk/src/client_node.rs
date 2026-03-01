@@ -125,6 +125,13 @@ impl ClientNode {
         Ok(())
     }
 
+    pub async fn delete_path(&self, key: impl Into<String>) -> Result<()> {
+        let key = key.into();
+        self.client.delete_path(&key).await?;
+        self.cache.write().await.remove(&key);
+        Ok(())
+    }
+
     pub fn put_chunked_reader(
         &self,
         key: impl Into<String>,

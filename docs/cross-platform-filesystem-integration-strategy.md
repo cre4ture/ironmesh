@@ -156,10 +156,11 @@ Out of scope for MVP:
     - initial remote materialization into a configured local root folder,
     - hybrid change detection: periodic local scans + native filesystem watcher events,
     - remote polling reuse via `client-sdk::RemoteSnapshotPoller`,
-    - local file + directory-marker uploads to server.
+    - local file + directory-marker uploads to server,
+    - local file deletion propagation to server (`/store/delete` via `client-sdk`).
 - Next step:
   - Add server-driven remote-change notifications to replace polling when backend support is available.
-  - Add remote delete propagation into `client-sdk` and wire folder-agent local deletions to it.
+  - Extend deletion propagation to fully recursive directory semantics.
 
 ## Folder agent usage (MVP)
 

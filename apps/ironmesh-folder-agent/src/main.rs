@@ -15,9 +15,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_agent_core::{
-    LocalEntryState, LocalTreeState, RemoteTreeIndex, absolute_path, build_remote_index,
-    diff_local_trees, local_entry_state_for_path, normalize_relative_path, remote_entry_kinds,
-    scan_local_tree,
+    LocalEntryKind, LocalEntryState, LocalTreeState, RemoteTreeIndex, absolute_path,
+    build_remote_index, diff_local_trees, local_entry_state_for_path, normalize_relative_path,
+    remote_entry_kinds, scan_local_tree,
 };
 use sync_core::{EntryKind, SyncSnapshot};
 
@@ -243,10 +243,34 @@ fn sync_local_changes(
     }
 
     if !diff.deleted_paths.is_empty() {
-        eprintln!(
-            "local-sync: {} local deletions detected; remote delete is not implemented in client-sdk",
-            diff.deleted_paths.len()
-        );
+        let mut deleted_paths = diff.deleted_paths.clone();
+        deleted_paths.sort_by(|left, right| {
+            right
+                .matches('/')
+                .count()
+                .cmp(&left.matches('/').count())
+                .then_with(|| right.cmp(left))
+        });
+
+        for path in deleted_paths {
+            let Some(previous) = local_state.get(&path) else {
+                continue;
+            };
+
+            if previous.kind != LocalEntryKind::File {
+                suppressed_uploads.remove(&path);
+                continue;
+            }
+            if !remote_index.files.contains(&path) {
+                suppressed_uploads.remove(&path);
+                continue;
+            }
+
+            delete_remote_file(client, &path)?;
+            suppressed_uploads.remove(&path);
+            remote_index.files.remove(&path);
+            eprintln!("local-sync: deleted remote file {path}");
+        }
     }
 
     *local_state = current;
@@ -399,6 +423,19 @@ fn ensure_remote_directory_marker(client: &IronMeshClient, directory_path: &str)
     client
         .put_large_aware_reader(marker_key, &mut empty, 0)
         .with_context(|| format!("failed to upload directory marker for {normalized}"))?;
+
+    Ok(())
+}
+
+fn delete_remote_file(client: &IronMeshClient, file_path: &str) -> Result<()> {
+    let normalized = normalize_relative_path(file_path);
+    if normalized.is_empty() {
+        return Ok(());
+    }
+
+    client
+        .delete_path_blocking(&normalized)
+        .with_context(|| format!("failed to delete remote file {normalized}"))?;
 
     Ok(())
 }

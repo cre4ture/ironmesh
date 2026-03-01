@@ -173,6 +173,26 @@ async fn wait_for_remote_directory(
     bail!("remote directory marker not observed for {normalized}")
 }
 
+async fn wait_for_remote_file_absence(
+    sdk: &IronMeshClient,
+    key: &str,
+    retries: usize,
+) -> Result<()> {
+    for _ in 0..retries {
+        let get_missing = sdk.get(key).await.is_err();
+        if let Ok(index) = sdk.store_index(None, 64, None).await {
+            let index_missing = !index.entries.iter().any(|entry| entry.path == key);
+            if get_missing && index_missing {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("remote file {key} was expected to be deleted")
+}
+
 async fn delete_remote_key_by_query(base_url: &str, key: &str) -> Result<()> {
     let http = reqwest::Client::new();
     let response = http
@@ -351,6 +371,42 @@ async fn folder_agent_run_once_bootstraps_and_exits() -> Result<()> {
             .await?;
 
         Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_propagates_local_file_deletions_to_remote() -> Result<()> {
+    let bind = "127.0.0.1:19414";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-delete-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware("delete-me/target.txt", Bytes::from_static(b"to-delete"))
+            .await?;
+
+        let mut agent = start_folder_agent(&base_url, &local_root, 250, 250, true).await?;
+        let scenario = async {
+            let local_file = local_root.join("delete-me/target.txt");
+            wait_for_local_file_bytes(&local_file, b"to-delete", 220).await?;
+
+            fs::remove_file(&local_file)
+                .with_context(|| format!("failed to remove local file {}", local_file.display()))?;
+
+            wait_for_remote_file_absence(&sdk, "delete-me/target.txt", 220).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut agent).await;
+        scenario
     }
     .await;
 

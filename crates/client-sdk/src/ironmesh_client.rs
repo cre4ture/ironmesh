@@ -198,6 +198,24 @@ impl IronMeshClient {
         }
     }
 
+    pub async fn delete_path(&self, key: impl AsRef<str>) -> Result<()> {
+        let key = key.as_ref();
+        let url = self.store_delete_url()?;
+
+        let response = self
+            .http
+            .post(url)
+            .query(&[("key", key)])
+            .send()
+            .await
+            .with_context(|| format!("failed to delete path {key}"))?;
+
+        match response.status() {
+            StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(()),
+            status => Err(anyhow!("delete failed for {key}: {status}")),
+        }
+    }
+
     pub async fn store_index(
         &self,
         prefix: Option<&str>,
@@ -269,6 +287,16 @@ impl IronMeshClient {
             .build()
             .context("failed to create runtime for snapshot load")?;
         runtime.block_on(self.load_snapshot_from_server(prefix, depth, snapshot))
+    }
+
+    pub fn delete_path_blocking(&self, key: impl AsRef<str>) -> Result<()> {
+        let key = key.as_ref().to_string();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for delete request")?;
+        runtime.block_on(self.delete_path(key))
     }
 
     pub async fn put_large_aware(
@@ -626,6 +654,21 @@ impl IronMeshClient {
         Ok(url.to_string())
     }
 
+    fn store_delete_url(&self) -> Result<String> {
+        let mut url = reqwest::Url::parse(&self.server_base_url)
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("delete");
+        }
+
+        Ok(url.to_string())
+    }
+
     fn store_complete_url(&self, key: &str) -> Result<String> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
@@ -815,5 +858,12 @@ mod tests {
             paths,
             vec!["docs/", "docs/guides/", "docs/guides/readme.md"]
         );
+    }
+
+    #[test]
+    fn delete_url_builder_builds_expected_path() {
+        let client = IronMeshClient::new("http://127.0.0.1:18080/");
+        let url = client.store_delete_url().expect("delete url should build");
+        assert_eq!(url, "http://127.0.0.1:18080/store/delete");
     }
 }
