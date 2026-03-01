@@ -5,6 +5,7 @@ use reqwest::Client as HttpClient;
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 
@@ -145,7 +146,7 @@ impl IronMeshClient {
             request = request.query(&[("snapshot", snapshot)]);
         }
 
-        request
+        let mut result = request
             .send()
             .await
             .context("failed to request /store/index")?
@@ -153,7 +154,14 @@ impl IronMeshClient {
             .context("/store/index returned non-success status")?
             .json::<StoreIndexResponse>()
             .await
-            .context("failed to parse /store/index response")
+            .context("failed to parse /store/index response");
+
+        if let Ok(ref mut response) = result {
+            ensure_missing_folder_markers(&mut response.entries);
+            response.entry_count = response.entries.len();
+        }
+
+        result
     }
 
     pub fn store_index_blocking(
@@ -556,6 +564,47 @@ pub fn normalize_server_base_url(input: &str) -> Result<Url> {
     Ok(normalized)
 }
 
+fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
+    let mut existing = BTreeSet::new();
+    for entry in entries.iter() {
+        existing.insert(entry.path.clone());
+    }
+
+    let mut to_add = BTreeSet::new();
+    for entry in entries.iter() {
+        let path = entry.path.trim_end_matches('/');
+        if path.is_empty() {
+            continue;
+        }
+
+        let segments: Vec<&str> = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if segments.len() < 2 {
+            continue;
+        }
+
+        for index in 1..segments.len() {
+            let marker = format!("{}/", segments[..index].join("/"));
+            if !existing.contains(&marker) {
+                to_add.insert(marker);
+            }
+        }
+    }
+
+    for marker in to_add {
+        if existing.insert(marker.clone()) {
+            entries.push(StoreIndexEntry {
+                path: marker,
+                entry_type: "prefix".to_string(),
+            });
+        }
+    }
+
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+}
+
 pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncSnapshot {
     let mut remote = Vec::with_capacity(entries.len());
 
@@ -623,6 +672,47 @@ mod tests {
                 "server-head",
                 "server-head:docs/readme.txt"
             )
+        );
+    }
+
+    #[test]
+    fn ensure_missing_folder_markers_adds_nested_parents() {
+        let mut entries = vec![StoreIndexEntry {
+            path: "a/b/c.txt".to_string(),
+            entry_type: "key".to_string(),
+        }];
+
+        ensure_missing_folder_markers(&mut entries);
+
+        let paths = entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["a/", "a/b/", "a/b/c.txt"]);
+    }
+
+    #[test]
+    fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
+        let mut entries = vec![
+            StoreIndexEntry {
+                path: "docs/".to_string(),
+                entry_type: "prefix".to_string(),
+            },
+            StoreIndexEntry {
+                path: "docs/guides/readme.md".to_string(),
+                entry_type: "key".to_string(),
+            },
+        ];
+
+        ensure_missing_folder_markers(&mut entries);
+
+        let paths = entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["docs/", "docs/guides/", "docs/guides/readme.md"]
         );
     }
 }
