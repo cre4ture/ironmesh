@@ -88,6 +88,43 @@ impl ClientNode {
         Ok(payload)
     }
 
+    pub async fn rename_path(
+        &self,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<()> {
+        let from_path = from_path.into();
+        let to_path = to_path.into();
+        self.client
+            .rename_path(from_path.clone(), to_path.clone(), overwrite)
+            .await?;
+
+        let mut cache = self.cache.write().await;
+        if let Some(payload) = cache.remove(&from_path) {
+            cache.insert(to_path, payload);
+        }
+        Ok(())
+    }
+
+    pub async fn copy_path(
+        &self,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<()> {
+        let from_path = from_path.into();
+        let to_path = to_path.into();
+        self.client
+            .copy_path(from_path.clone(), to_path.clone(), overwrite)
+            .await?;
+
+        if let Some(payload) = self.cache.read().await.get(&from_path).cloned() {
+            self.cache.write().await.insert(to_path, payload);
+        }
+        Ok(())
+    }
+
     pub fn put_chunked_reader(
         &self,
         key: impl Into<String>,

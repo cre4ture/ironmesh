@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use uuid::Uuid;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
@@ -30,11 +31,15 @@ struct SnapshotManifest {
     id: String,
     created_at_unix: u64,
     objects: HashMap<String, String>,
+    #[serde(default)]
+    object_ids: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CurrentState {
     objects: HashMap<String, String>,
+    #[serde(default)]
+    object_ids: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,16 +52,19 @@ pub enum VersionConsistencyState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileVersionRecord {
     version_id: String,
-    key: String,
+    object_id: String,
     manifest_hash: String,
     parent_version_ids: Vec<String>,
     state: VersionConsistencyState,
     created_at_unix: u64,
+    copied_from_object_id: Option<String>,
+    copied_from_version_id: Option<String>,
+    copied_from_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileVersionIndex {
-    key: String,
+    object_id: String,
     versions: HashMap<String, FileVersionRecord>,
     head_version_ids: Vec<String>,
     preferred_head_version_id: Option<String>,
@@ -68,15 +76,26 @@ pub struct VersionRecordSummary {
     pub parent_version_ids: Vec<String>,
     pub state: VersionConsistencyState,
     pub created_at_unix: u64,
+    pub copied_from_object_id: Option<String>,
+    pub copied_from_version_id: Option<String>,
+    pub copied_from_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionGraphSummary {
     pub key: String,
+    pub object_id: String,
     pub preferred_head_version_id: Option<String>,
     pub preferred_head_reason: Option<PreferredHeadReason>,
     pub head_version_ids: Vec<String>,
     pub versions: Vec<VersionRecordSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathMutationResult {
+    Applied,
+    SourceMissing,
+    TargetExists,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -382,20 +401,11 @@ impl PersistentStore {
 
     pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
         let mut subjects: HashSet<String> = self.current_state.objects.keys().cloned().collect();
-
-        let mut entries = fs::read_dir(&self.versions_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-
-            let payload = fs::read(&path).await?;
-            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
-                .with_context(|| format!("invalid version index {}", path.display()))?;
-
-            for head_version_id in &index.head_version_ids {
-                subjects.insert(format!("{}@{}", index.key, head_version_id));
+        for (path, object_id) in &self.current_state.object_ids {
+            if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
+                for head_version_id in &index.head_version_ids {
+                    subjects.insert(format!("{path}@{head_version_id}"));
+                }
             }
         }
 
@@ -542,10 +552,13 @@ impl PersistentStore {
             explicit_version_id,
         } = options;
 
+        let object_id = self
+            .object_id_for_key(key)
+            .unwrap_or_else(generate_object_id);
         let mut index = self
-            .load_version_index(key)
+            .load_version_index_by_object_id(&object_id)
             .await?
-            .unwrap_or_else(|| empty_version_index(key));
+            .unwrap_or_else(|| empty_version_index(&object_id));
 
         let parent_version_ids = if requested_parent_version_ids.is_empty() {
             if inherit_preferred_parent {
@@ -625,11 +638,14 @@ impl PersistentStore {
 
         let record = FileVersionRecord {
             version_id: version_id.clone(),
-            key: key.to_string(),
+            object_id: object_id.clone(),
             manifest_hash: manifest_hash.to_string(),
             parent_version_ids: parent_version_ids.clone(),
             state: requested_state.clone(),
             created_at_unix: unix_ts(),
+            copied_from_object_id: None,
+            copied_from_version_id: None,
+            copied_from_path: None,
         };
 
         index.versions.insert(version_id.clone(), record);
@@ -644,7 +660,8 @@ impl PersistentStore {
         index.head_version_ids.sort();
         index.preferred_head_version_id = choose_preferred_head(&index);
 
-        self.persist_version_index(key, &index).await?;
+        self.persist_version_index_by_object_id(&object_id, &index)
+            .await?;
         self.sync_current_state_for_key_from_index(key, &index)?;
         self.persist_current_state().await?;
 
@@ -665,7 +682,11 @@ impl PersistentStore {
     }
 
     pub async fn commit_version(&mut self, key: &str, version_id: &str) -> Result<bool> {
-        let mut index = match self.load_version_index(key).await? {
+        let Some(object_id) = self.object_id_for_key(key) else {
+            return Ok(false);
+        };
+
+        let mut index = match self.load_version_index_by_object_id(&object_id).await? {
             Some(index) => index,
             None => return Ok(false),
         };
@@ -681,7 +702,8 @@ impl PersistentStore {
         version.state = VersionConsistencyState::Confirmed;
         index.preferred_head_version_id = choose_preferred_head(&index);
 
-        self.persist_version_index(key, &index).await?;
+        self.persist_version_index_by_object_id(&object_id, &index)
+            .await?;
         self.sync_current_state_for_key_from_index(key, &index)?;
         self.persist_current_state().await?;
         self.create_snapshot().await?;
@@ -690,7 +712,11 @@ impl PersistentStore {
     }
 
     pub async fn list_versions(&self, key: &str) -> Result<Option<VersionGraphSummary>> {
-        let Some(index) = self.load_version_index(key).await? else {
+        let Some(object_id) = self.object_id_for_key(key) else {
+            return Ok(None);
+        };
+
+        let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
             return Ok(None);
         };
 
@@ -702,6 +728,9 @@ impl PersistentStore {
                 parent_version_ids: record.parent_version_ids.clone(),
                 state: record.state.clone(),
                 created_at_unix: record.created_at_unix,
+                copied_from_object_id: record.copied_from_object_id.clone(),
+                copied_from_version_id: record.copied_from_version_id.clone(),
+                copied_from_path: record.copied_from_path.clone(),
             })
             .collect();
 
@@ -714,7 +743,8 @@ impl PersistentStore {
         let preferred = choose_preferred_head_with_reason(&index);
 
         Ok(Some(VersionGraphSummary {
-            key: index.key,
+            key: key.to_string(),
+            object_id: index.object_id.clone(),
             preferred_head_version_id: preferred.as_ref().map(|(id, _)| id.clone()),
             preferred_head_reason: preferred.map(|(_, reason)| reason),
             head_version_ids: index.head_version_ids,
@@ -723,7 +753,11 @@ impl PersistentStore {
     }
 
     pub async fn has_manifest_for_key(&self, key: &str, manifest_hash: &str) -> Result<bool> {
-        let Some(index) = self.load_version_index(key).await? else {
+        let Some(object_id) = self.object_id_for_key(key) else {
+            return Ok(false);
+        };
+
+        let Some(index) = self.load_version_index_by_object_id(&object_id).await? else {
             return Ok(false);
         };
 
@@ -739,8 +773,13 @@ impl PersistentStore {
         version_id: Option<&str>,
         read_mode: ObjectReadMode,
     ) -> Result<Option<ReplicationExportBundle>> {
+        let object_id = self.object_id_for_key(key);
         let (selected_version_id, state, manifest_hash) = if let Some(version_id) = version_id {
-            let Some(index) = self.load_version_index(key).await? else {
+            let Some(object_id) = object_id.as_ref() else {
+                return Ok(None);
+            };
+
+            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
                 return Ok(None);
             };
 
@@ -754,18 +793,27 @@ impl PersistentStore {
                 record.manifest_hash.clone(),
             )
         } else {
-            match self.load_version_index(key).await? {
-                Some(index) => {
-                    let Some(record) = version_record_for_read_mode(&index, read_mode) else {
-                        return Ok(None);
-                    };
+            match object_id {
+                Some(object_id) => match self.load_version_index_by_object_id(&object_id).await? {
+                    Some(index) => {
+                        let Some(record) = version_record_for_read_mode(&index, read_mode) else {
+                            return Ok(None);
+                        };
 
-                    (
-                        Some(record.version_id.clone()),
-                        record.state.clone(),
-                        record.manifest_hash.clone(),
-                    )
-                }
+                        (
+                            Some(record.version_id.clone()),
+                            record.state.clone(),
+                            record.manifest_hash.clone(),
+                        )
+                    }
+                    None => {
+                        let Some(manifest_hash) = self.current_state.objects.get(key).cloned()
+                        else {
+                            return Ok(None);
+                        };
+                        (None, VersionConsistencyState::Confirmed, manifest_hash)
+                    }
+                },
                 None => {
                     let Some(manifest_hash) = self.current_state.objects.get(key).cloned() else {
                         return Ok(None);
@@ -783,13 +831,6 @@ impl PersistentStore {
         let manifest_bytes = fs::read(&manifest_path).await?;
         let manifest = serde_json::from_slice::<ObjectManifest>(&manifest_bytes)
             .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
-
-        if manifest.key != key {
-            bail!(
-                "manifest key mismatch for replication export: expected={key} actual={}",
-                manifest.key
-            );
-        }
 
         Ok(Some(ReplicationExportBundle {
             key: key.to_string(),
@@ -895,10 +936,13 @@ impl PersistentStore {
             write_atomic(&manifest_path, manifest_payload).await?;
         }
 
+        let object_id = self
+            .object_id_for_key(key)
+            .unwrap_or_else(generate_object_id);
         let mut index = self
-            .load_version_index(key)
+            .load_version_index_by_object_id(&object_id)
             .await?
-            .unwrap_or_else(|| empty_version_index(key));
+            .unwrap_or_else(|| empty_version_index(&object_id));
 
         let resolved_version_id = version_id
             .map(ToString::to_string)
@@ -916,11 +960,14 @@ impl PersistentStore {
 
         let record = FileVersionRecord {
             version_id: resolved_version_id.clone(),
-            key: key.to_string(),
+            object_id: object_id.clone(),
             manifest_hash: manifest_hash.to_string(),
             parent_version_ids: Vec::new(),
             state,
             created_at_unix: unix_ts(),
+            copied_from_object_id: None,
+            copied_from_version_id: None,
+            copied_from_path: None,
         };
 
         index.versions.insert(resolved_version_id.clone(), record);
@@ -932,7 +979,8 @@ impl PersistentStore {
         index.head_version_ids.sort();
         index.preferred_head_version_id = choose_preferred_head(&index);
 
-        self.persist_version_index(key, &index).await?;
+        self.persist_version_index_by_object_id(&object_id, &index)
+            .await?;
         self.sync_current_state_for_key_from_index(key, &index)?;
         self.persist_current_state().await?;
         self.create_snapshot().await?;
@@ -949,7 +997,11 @@ impl PersistentStore {
             return Ok(false);
         };
 
-        let Some(mut index) = self.load_version_index(key).await? else {
+        let Some(object_id) = self.object_id_for_key(key) else {
+            return Ok(false);
+        };
+
+        let Some(mut index) = self.load_version_index_by_object_id(&object_id).await? else {
             return Ok(false);
         };
 
@@ -960,7 +1012,8 @@ impl PersistentStore {
         index.head_version_ids = recompute_head_version_ids(&index);
         index.preferred_head_version_id = choose_preferred_head(&index);
 
-        self.persist_version_index(key, &index).await?;
+        self.persist_version_index_by_object_id(&object_id, &index)
+            .await?;
         self.sync_current_state_for_key_from_index(key, &index)?;
         self.persist_current_state().await?;
         self.create_snapshot().await?;
@@ -1001,6 +1054,13 @@ impl PersistentStore {
     pub async fn list_provisional_versions(&self) -> Result<Vec<ReconcileVersionEntry>> {
         let mut entries = fs::read_dir(&self.versions_dir).await?;
         let mut output = Vec::new();
+        let mut paths_by_object_id: HashMap<String, Vec<String>> = HashMap::new();
+        for (path, object_id) in &self.current_state.object_ids {
+            paths_by_object_id
+                .entry(object_id.clone())
+                .or_default()
+                .push(path.clone());
+        }
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -1017,14 +1077,18 @@ impl PersistentStore {
                     continue;
                 }
 
-                output.push(ReconcileVersionEntry {
-                    key: record.key.clone(),
-                    version_id: record.version_id.clone(),
-                    manifest_hash: record.manifest_hash.clone(),
-                    parent_version_ids: record.parent_version_ids.clone(),
-                    state: record.state.clone(),
-                    created_at_unix: record.created_at_unix,
-                });
+                if let Some(paths) = paths_by_object_id.get(&record.object_id) {
+                    for key in paths {
+                        output.push(ReconcileVersionEntry {
+                            key: key.clone(),
+                            version_id: record.version_id.clone(),
+                            manifest_hash: record.manifest_hash.clone(),
+                            parent_version_ids: record.parent_version_ids.clone(),
+                            state: record.state.clone(),
+                            created_at_unix: record.created_at_unix,
+                        });
+                    }
+                }
             }
         }
 
@@ -1046,8 +1110,11 @@ impl PersistentStore {
         read_mode: ObjectReadMode,
     ) -> std::result::Result<Bytes, StoreReadError> {
         let manifest_hash = if let Some(version_id) = version_id {
+            let Some(object_id) = self.object_id_for_key(key) else {
+                return Err(StoreReadError::NotFound);
+            };
             let index = self
-                .load_version_index(key)
+                .load_version_index_by_object_id(&object_id)
                 .await
                 .map_err(StoreReadError::Internal)?;
             let Some(index) = index else {
@@ -1069,13 +1136,17 @@ impl PersistentStore {
                 None => None,
             }
         } else {
-            let index = self
-                .load_version_index(key)
-                .await
-                .map_err(StoreReadError::Internal)?;
-
-            match index {
-                Some(index) => manifest_hash_for_read_mode(&index, read_mode),
+            match self.object_id_for_key(key) {
+                Some(object_id) => {
+                    let index = self
+                        .load_version_index_by_object_id(&object_id)
+                        .await
+                        .map_err(StoreReadError::Internal)?;
+                    match index {
+                        Some(index) => manifest_hash_for_read_mode(&index, read_mode),
+                        None => self.current_state.objects.get(key).cloned(),
+                    }
+                }
                 None => self.current_state.objects.get(key).cloned(),
             }
         }
@@ -1155,10 +1226,13 @@ impl PersistentStore {
     }
 
     pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
+        let object_id = self
+            .object_id_for_key(key)
+            .unwrap_or_else(generate_object_id);
         let mut index = self
-            .load_version_index(key)
+            .load_version_index_by_object_id(&object_id)
             .await?
-            .unwrap_or_else(|| empty_version_index(key));
+            .unwrap_or_else(|| empty_version_index(&object_id));
 
         let parent_version_ids = if options.parent_version_ids.is_empty() {
             if options.inherit_preferred_parent {
@@ -1206,11 +1280,14 @@ impl PersistentStore {
 
         let record = FileVersionRecord {
             version_id: version_id.clone(),
-            key: key.to_string(),
+            object_id: object_id.clone(),
             manifest_hash: TOMBSTONE_MANIFEST_HASH.to_string(),
             parent_version_ids: parent_version_ids.clone(),
             state: options.state.clone(),
             created_at_unix: unix_ts(),
+            copied_from_object_id: None,
+            copied_from_version_id: None,
+            copied_from_path: None,
         };
 
         index.versions.insert(version_id.clone(), record);
@@ -1225,7 +1302,8 @@ impl PersistentStore {
         index.head_version_ids.sort();
         index.preferred_head_version_id = choose_preferred_head(&index);
 
-        self.persist_version_index(key, &index).await?;
+        self.persist_version_index_by_object_id(&object_id, &index)
+            .await?;
         self.sync_current_state_for_key_from_index(key, &index)?;
         self.persist_current_state().await?;
 
@@ -1234,6 +1312,122 @@ impl PersistentStore {
         }
 
         Ok(version_id)
+    }
+
+    pub async fn rename_object_path(
+        &mut self,
+        from_path: &str,
+        to_path: &str,
+        overwrite: bool,
+    ) -> Result<PathMutationResult> {
+        if from_path == to_path {
+            return Ok(PathMutationResult::Applied);
+        }
+
+        let Some(object_id) = self.current_state.object_ids.get(from_path).cloned() else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+        let Some(manifest_hash) = self.current_state.objects.get(from_path).cloned() else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+
+        if self.current_state.object_ids.contains_key(to_path) {
+            if !overwrite {
+                return Ok(PathMutationResult::TargetExists);
+            }
+            return Ok(PathMutationResult::TargetExists);
+        }
+
+        self.current_state.object_ids.remove(from_path);
+        self.current_state.objects.remove(from_path);
+        self.current_state
+            .object_ids
+            .insert(to_path.to_string(), object_id);
+        self.current_state
+            .objects
+            .insert(to_path.to_string(), manifest_hash);
+
+        self.persist_current_state().await?;
+        self.create_snapshot().await?;
+
+        Ok(PathMutationResult::Applied)
+    }
+
+    pub async fn copy_object_path(
+        &mut self,
+        from_path: &str,
+        to_path: &str,
+        overwrite: bool,
+    ) -> Result<PathMutationResult> {
+        if from_path == to_path {
+            return Ok(PathMutationResult::Applied);
+        }
+
+        let Some(source_object_id) = self.current_state.object_ids.get(from_path).cloned() else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+
+        if self.current_state.object_ids.contains_key(to_path) {
+            if !overwrite {
+                return Ok(PathMutationResult::TargetExists);
+            }
+            return Ok(PathMutationResult::TargetExists);
+        }
+
+        let Some(source_index) = self
+            .load_version_index_by_object_id(&source_object_id)
+            .await?
+        else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+        let Some(source_head_version_id) = source_index.preferred_head_version_id.clone() else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+        let Some(source_head) = source_index.versions.get(&source_head_version_id) else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+
+        if source_head.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(PathMutationResult::SourceMissing);
+        }
+
+        let copied_object_id = generate_object_id();
+        let copied_version_id = format!(
+            "copy-{}-{}",
+            unix_ts_nanos(),
+            &source_head.manifest_hash[..12]
+        );
+        let copied_record = FileVersionRecord {
+            version_id: copied_version_id.clone(),
+            object_id: copied_object_id.clone(),
+            manifest_hash: source_head.manifest_hash.clone(),
+            parent_version_ids: Vec::new(),
+            state: source_head.state.clone(),
+            created_at_unix: unix_ts(),
+            copied_from_object_id: Some(source_object_id),
+            copied_from_version_id: Some(source_head.version_id.clone()),
+            copied_from_path: Some(from_path.to_string()),
+        };
+
+        let mut copied_index = empty_version_index(&copied_object_id);
+        copied_index
+            .versions
+            .insert(copied_version_id.clone(), copied_record);
+        copied_index.head_version_ids = vec![copied_version_id];
+        copied_index.preferred_head_version_id = choose_preferred_head(&copied_index);
+        self.persist_version_index_by_object_id(&copied_object_id, &copied_index)
+            .await?;
+
+        self.current_state
+            .object_ids
+            .insert(to_path.to_string(), copied_object_id);
+        self.current_state
+            .objects
+            .insert(to_path.to_string(), source_head.manifest_hash.clone());
+        self.persist_current_state().await?;
+        self.create_snapshot().await?;
+
+        Ok(PathMutationResult::Applied)
     }
 
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
@@ -1352,8 +1546,15 @@ impl PersistentStore {
         })
     }
 
-    async fn load_version_index(&self, key: &str) -> Result<Option<FileVersionIndex>> {
-        let path = self.version_index_path(key);
+    fn object_id_for_key(&self, key: &str) -> Option<String> {
+        self.current_state.object_ids.get(key).cloned()
+    }
+
+    async fn load_version_index_by_object_id(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<FileVersionIndex>> {
+        let path = self.version_index_path(object_id);
 
         if !fs::try_exists(&path).await? {
             return Ok(None);
@@ -1366,8 +1567,12 @@ impl PersistentStore {
         Ok(Some(index))
     }
 
-    async fn persist_version_index(&self, key: &str, index: &FileVersionIndex) -> Result<()> {
-        let path = self.version_index_path(key);
+    async fn persist_version_index_by_object_id(
+        &self,
+        object_id: &str,
+        index: &FileVersionIndex,
+    ) -> Result<()> {
+        let path = self.version_index_path(object_id);
         let payload = serde_json::to_vec_pretty(index)?;
         write_atomic(&path, &payload).await
     }
@@ -1379,6 +1584,7 @@ impl PersistentStore {
     ) -> Result<()> {
         let Some(preferred_head) = &index.preferred_head_version_id else {
             self.current_state.objects.remove(key);
+            self.current_state.object_ids.remove(key);
             return Ok(());
         };
 
@@ -1392,12 +1598,16 @@ impl PersistentStore {
 
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
             self.current_state.objects.remove(key);
+            self.current_state.object_ids.remove(key);
             return Ok(());
         }
 
         self.current_state
             .objects
             .insert(key.to_string(), manifest_hash);
+        self.current_state
+            .object_ids
+            .insert(key.to_string(), index.object_id.clone());
         Ok(())
     }
 
@@ -1408,7 +1618,10 @@ impl PersistentStore {
 
     async fn create_snapshot(&self) -> Result<String> {
         let created_at_unix = unix_ts();
-        let object_map_payload = serde_json::to_vec(&self.current_state.objects)?;
+        let object_map_payload = serde_json::to_vec(&(
+            self.current_state.objects.clone(),
+            self.current_state.object_ids.clone(),
+        ))?;
         let state_hash = hash_hex(&object_map_payload);
         let snapshot_id = format!("snap-{}-{}", unix_ts_nanos(), &state_hash[..12]);
 
@@ -1416,6 +1629,7 @@ impl PersistentStore {
             id: snapshot_id.clone(),
             created_at_unix,
             objects: self.current_state.objects.clone(),
+            object_ids: self.current_state.object_ids.clone(),
         };
 
         let payload = serde_json::to_vec_pretty(&manifest)?;
@@ -1531,9 +1745,9 @@ impl PersistentStore {
         Ok(files)
     }
 
-    fn version_index_path(&self, key: &str) -> PathBuf {
-        let key_hash = hash_hex(key.as_bytes());
-        self.versions_dir.join(format!("{key_hash}.json"))
+    fn version_index_path(&self, object_id: &str) -> PathBuf {
+        let object_id_hash = hash_hex(object_id.as_bytes());
+        self.versions_dir.join(format!("{object_id_hash}.json"))
     }
 
     fn reconcile_marker_path(
@@ -1548,13 +1762,17 @@ impl PersistentStore {
     }
 }
 
-fn empty_version_index(key: &str) -> FileVersionIndex {
+fn empty_version_index(object_id: &str) -> FileVersionIndex {
     FileVersionIndex {
-        key: key.to_string(),
+        object_id: object_id.to_string(),
         versions: HashMap::new(),
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
     }
+}
+
+fn generate_object_id() -> String {
+    format!("obj-{}", Uuid::now_v7())
 }
 
 fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {

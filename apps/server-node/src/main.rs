@@ -33,8 +33,8 @@ mod ui;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
-    ObjectReadMode, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    StoreReadError, UploadChunkRef, VersionConsistencyState,
+    ObjectReadMode, PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry,
+    RepairAttemptRecord, StoreReadError, UploadChunkRef, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -505,6 +505,8 @@ async fn main() -> Result<()> {
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/store/delete", post(delete_object_by_query))
+        .route("/store/rename", post(rename_object_path))
+        .route("/store/copy", post(copy_object_path))
         .route("/store-chunks/upload", post(upload_store_chunk))
         .route(
             "/store/{key}",
@@ -957,6 +959,14 @@ struct DeleteObjectByQuery {
     internal_replication: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct PathMutationRequest {
+    from_path: String,
+    to_path: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct StoreChunkUploadResponse {
     hash: String,
@@ -1008,6 +1018,62 @@ async fn delete_object_by_query(
     )
     .await
     .into_response()
+}
+
+async fn rename_object_path(
+    State(state): State<ServerState>,
+    Json(request): Json<PathMutationRequest>,
+) -> Response {
+    if request.from_path.trim().is_empty() || request.to_path.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut store = state.store.lock().await;
+    match store
+        .rename_object_path(&request.from_path, &request.to_path, request.overwrite)
+        .await
+    {
+        Ok(PathMutationResult::Applied) => StatusCode::NO_CONTENT.into_response(),
+        Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),
+        Ok(PathMutationResult::TargetExists) => StatusCode::CONFLICT.into_response(),
+        Err(err) => {
+            tracing::error!(
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                error = %err,
+                "failed to rename object path"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn copy_object_path(
+    State(state): State<ServerState>,
+    Json(request): Json<PathMutationRequest>,
+) -> Response {
+    if request.from_path.trim().is_empty() || request.to_path.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut store = state.store.lock().await;
+    match store
+        .copy_object_path(&request.from_path, &request.to_path, request.overwrite)
+        .await
+    {
+        Ok(PathMutationResult::Applied) => StatusCode::NO_CONTENT.into_response(),
+        Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),
+        Ok(PathMutationResult::TargetExists) => StatusCode::CONFLICT.into_response(),
+        Err(err) => {
+            tracing::error!(
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                error = %err,
+                "failed to copy object path"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn put_object(

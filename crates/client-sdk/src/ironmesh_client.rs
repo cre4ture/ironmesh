@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
@@ -68,6 +68,13 @@ struct CompleteStoreUploadChunkRef {
     size_bytes: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct PathMutationRequest {
+    from_path: String,
+    to_path: String,
+    overwrite: bool,
+}
+
 impl IronMeshClient {
     pub fn new(server_base_url: impl Into<String>) -> Self {
         Self {
@@ -125,6 +132,70 @@ impl IronMeshClient {
             .bytes()
             .await
             .with_context(|| format!("failed to read payload for key={key}"))
+    }
+
+    pub async fn rename_path(
+        &self,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<()> {
+        let from_path = from_path.into();
+        let to_path = to_path.into();
+        let url = self.store_rename_url()?;
+
+        let response = self
+            .http
+            .post(url)
+            .json(&PathMutationRequest {
+                from_path: from_path.clone(),
+                to_path: to_path.clone(),
+                overwrite,
+            })
+            .send()
+            .await
+            .with_context(|| format!("failed to rename {from_path} -> {to_path}"))?;
+
+        match response.status() {
+            StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => bail!("rename source path not found: {from_path}"),
+            StatusCode::CONFLICT => bail!("rename target path already exists: {to_path}"),
+            status => Err(anyhow!(
+                "rename failed for {from_path} -> {to_path}: {status}"
+            )),
+        }
+    }
+
+    pub async fn copy_path(
+        &self,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<()> {
+        let from_path = from_path.into();
+        let to_path = to_path.into();
+        let url = self.store_copy_url()?;
+
+        let response = self
+            .http
+            .post(url)
+            .json(&PathMutationRequest {
+                from_path: from_path.clone(),
+                to_path: to_path.clone(),
+                overwrite,
+            })
+            .send()
+            .await
+            .with_context(|| format!("failed to copy {from_path} -> {to_path}"))?;
+
+        match response.status() {
+            StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => bail!("copy source path not found: {from_path}"),
+            StatusCode::CONFLICT => bail!("copy target path already exists: {to_path}"),
+            status => Err(anyhow!(
+                "copy failed for {from_path} -> {to_path}: {status}"
+            )),
+        }
     }
 
     pub async fn store_index(
@@ -520,6 +591,36 @@ impl IronMeshClient {
                 .map_err(|_| anyhow!("server URL cannot be a base"))?;
             segments.push("store-chunks");
             segments.push("upload");
+        }
+
+        Ok(url.to_string())
+    }
+
+    fn store_rename_url(&self) -> Result<String> {
+        let mut url = reqwest::Url::parse(&self.server_base_url)
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("rename");
+        }
+
+        Ok(url.to_string())
+    }
+
+    fn store_copy_url(&self) -> Result<String> {
+        let mut url = reqwest::Url::parse(&self.server_base_url)
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("copy");
         }
 
         Ok(url.to_string())

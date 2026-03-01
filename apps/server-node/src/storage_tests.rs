@@ -15,11 +15,14 @@ fn mk_record(
 ) -> FileVersionRecord {
     FileVersionRecord {
         version_id: version_id.to_string(),
-        key: "k".to_string(),
+        object_id: "obj-k".to_string(),
         manifest_hash: format!("m-{version_id}"),
         parent_version_ids: Vec::new(),
         state,
         created_at_unix,
+        copied_from_object_id: None,
+        copied_from_version_id: None,
+        copied_from_path: None,
     }
 }
 
@@ -442,13 +445,8 @@ async fn drop_replica_subject_removes_version() {
         .unwrap();
     assert!(dropped);
 
-    let versions = store.list_versions("drop-key").await.unwrap().unwrap();
-    assert!(
-        versions
-            .versions
-            .iter()
-            .all(|entry| entry.version_id != put.version_id)
-    );
+    let versions = store.list_versions("drop-key").await.unwrap();
+    assert!(versions.is_none());
 
     let _ = fs::remove_dir_all(root).await;
 }
@@ -525,14 +523,13 @@ async fn tombstone_creates_tombstone_version_and_removes_current_key() {
     assert_eq!(read.as_ref(), b"to-be-deleted");
 
     // tombstone
-    let tomb_id = store
+    let _tomb_id = store
         .tombstone_object("will-delete", PutOptions::default())
         .await
         .unwrap();
 
-    // version index should contain tombstone entry
-    let versions = store.list_versions("will-delete").await.unwrap().unwrap();
-    assert!(versions.versions.iter().any(|v| v.version_id == tomb_id));
+    // path is unbound after tombstone under stable-object-id semantics
+    assert!(store.list_versions("will-delete").await.unwrap().is_none());
 
     // current keys should not include the key after tombstone
     let keys = store.current_keys();
@@ -546,6 +543,134 @@ async fn tombstone_creates_tombstone_version_and_removes_current_key() {
         Err(super::StoreReadError::NotFound) => {}
         other => panic!("expected NotFound after tombstone, got: {:?}", other),
     }
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn rename_preserves_object_id_and_history() {
+    let root = test_store_dir("rename-preserves-object-id");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    let put = store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"hello"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let before = store.list_versions("docs/a.txt").await.unwrap().unwrap();
+    let before_object_id = before.object_id.clone();
+    assert_eq!(before.versions.len(), 1);
+    assert_eq!(before.versions[0].version_id, put.version_id);
+
+    let mutation = store
+        .rename_object_path("docs/a.txt", "docs/b.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    assert!(
+        store
+            .get_object("docs/a.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .is_err()
+    );
+
+    let after = store.list_versions("docs/b.txt").await.unwrap().unwrap();
+    assert_eq!(after.object_id, before_object_id);
+    assert!(
+        after
+            .versions
+            .iter()
+            .any(|v| v.version_id == put.version_id)
+    );
+
+    let read = store
+        .get_object("docs/b.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(read.as_ref(), b"hello");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn copy_creates_new_object_id_with_provenance() {
+    let root = test_store_dir("copy-provenance-object-id");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    let _ = store
+        .put_object_versioned(
+            "docs/source.txt",
+            Bytes::from_static(b"source-v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let source_before = store
+        .list_versions("docs/source.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let source_object_id = source_before.object_id.clone();
+    let source_head_version_id = source_before
+        .preferred_head_version_id
+        .clone()
+        .expect("source should have a preferred head");
+
+    let mutation = store
+        .copy_object_path("docs/source.txt", "docs/copy.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    let copy_versions = store.list_versions("docs/copy.txt").await.unwrap().unwrap();
+    assert_ne!(copy_versions.object_id, source_object_id);
+    assert_eq!(copy_versions.versions.len(), 1);
+    let copy_root = &copy_versions.versions[0];
+    assert_eq!(
+        copy_root.copied_from_object_id.as_deref(),
+        Some(source_object_id.as_str())
+    );
+    assert_eq!(
+        copy_root.copied_from_version_id.as_deref(),
+        Some(source_head_version_id.as_str())
+    );
+    assert_eq!(
+        copy_root.copied_from_path.as_deref(),
+        Some("docs/source.txt")
+    );
+
+    let copied_payload = store
+        .get_object("docs/copy.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(copied_payload.as_ref(), b"source-v1");
+
+    let _ = store
+        .put_object_versioned(
+            "docs/copy.txt",
+            Bytes::from_static(b"copy-v2"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let source_after = store
+        .get_object("docs/source.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(source_after.as_ref(), b"source-v1");
+
+    let copy_after = store
+        .get_object("docs/copy.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(copy_after.as_ref(), b"copy-v2");
 
     let _ = fs::remove_dir_all(root).await;
 }
