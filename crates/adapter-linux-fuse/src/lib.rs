@@ -110,6 +110,7 @@ pub mod runtime {
     use std::ffi::OsStr;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, TryRecvError};
     use std::time::{Duration, SystemTime};
 
     const ROOT_INODE: u64 = 1;
@@ -289,6 +290,7 @@ pub mod runtime {
         nodes: HashMap<u64, FsNode>,
         hydrator: Box<dyn Hydrator>,
         uploader: Box<dyn Uploader>,
+        refresh_rx: Option<Receiver<FuseActionPlan>>,
         open_handles: HashMap<u64, OpenHandle>,
         next_handle: u64,
         uid: u32,
@@ -300,6 +302,7 @@ pub mod runtime {
             action_plan: &FuseActionPlan,
             hydrator: Box<dyn Hydrator>,
             uploader: Box<dyn Uploader>,
+            refresh_rx: Option<Receiver<FuseActionPlan>>,
         ) -> Self {
             // Safe: libc getters have no preconditions.
             let uid = unsafe { libc::geteuid() };
@@ -310,6 +313,7 @@ pub mod runtime {
                 nodes: HashMap::new(),
                 hydrator,
                 uploader,
+                refresh_rx,
                 open_handles: HashMap::new(),
                 next_handle: 1,
                 uid,
@@ -409,6 +413,79 @@ pub mod runtime {
             self.nodes.insert(inode, file);
             if let Some(parent) = self.nodes.get_mut(&parent_inode) {
                 parent.children.insert(file_name.to_string(), inode);
+            }
+        }
+
+        fn ensure_placeholder_file_if_missing(
+            &mut self,
+            relative_path: &str,
+            remote_version: &str,
+        ) {
+            let mut segments: Vec<&str> = relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            if segments.is_empty() {
+                return;
+            }
+
+            let file_name = segments.pop().unwrap_or_default();
+            let parent_path = segments.join("/");
+            let parent_inode = self.ensure_directory(&parent_path);
+
+            if self
+                .nodes
+                .get(&parent_inode)
+                .and_then(|node| node.children.get(file_name).copied())
+                .is_some()
+            {
+                return;
+            }
+
+            let inode = self.next_inode();
+            let file = FsNode::placeholder_file(
+                inode,
+                file_name.to_string(),
+                parent_inode,
+                remote_version.to_string(),
+            );
+            self.nodes.insert(inode, file);
+            if let Some(parent) = self.nodes.get_mut(&parent_inode) {
+                parent.children.insert(file_name.to_string(), inode);
+            }
+        }
+
+        fn apply_remote_action_plan_additive(&mut self, action_plan: &FuseActionPlan) {
+            for action in &action_plan.actions {
+                match action {
+                    FuseAction::EnsureDirectory { path } => {
+                        self.ensure_directory(path);
+                    }
+                    FuseAction::EnsurePlaceholder {
+                        path,
+                        remote_version,
+                    }
+                    | FuseAction::HydrateOnRead {
+                        path,
+                        remote_version,
+                    } => {
+                        self.ensure_placeholder_file_if_missing(path, remote_version);
+                    }
+                    FuseAction::UploadOnFlush { .. } | FuseAction::MarkConflict { .. } => {}
+                }
+            }
+        }
+
+        fn drain_remote_updates(&mut self) {
+            let Some(refresh_rx) = self.refresh_rx.as_ref() else {
+                return;
+            };
+
+            loop {
+                match refresh_rx.try_recv() {
+                    Ok(action_plan) => self.apply_remote_action_plan_additive(&action_plan),
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                }
             }
         }
 
@@ -555,6 +632,8 @@ pub mod runtime {
 
     impl Filesystem for IronmeshFuseFs {
         fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+            self.drain_remote_updates();
+
             let Some(parent_node) = self.nodes.get(&parent) else {
                 reply.error(ENOENT);
                 return;
@@ -575,6 +654,8 @@ pub mod runtime {
         }
 
         fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+            self.drain_remote_updates();
+
             if let Err(_error) = self.hydrate_if_needed(ino) {
                 reply.error(EIO);
                 return;
@@ -595,6 +676,8 @@ pub mod runtime {
             offset: i64,
             mut reply: ReplyDirectory,
         ) {
+            self.drain_remote_updates();
+
             let Some(node) = self.nodes.get(&ino) else {
                 reply.error(ENOENT);
                 return;
@@ -636,6 +719,8 @@ pub mod runtime {
             _umask: u32,
             reply: ReplyEntry,
         ) {
+            self.drain_remote_updates();
+
             let Some(parent_node) = self.nodes.get(&parent) else {
                 reply.error(ENOENT);
                 return;
@@ -674,6 +759,8 @@ pub mod runtime {
         }
 
         fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+            self.drain_remote_updates();
+
             let Some(name) = name.to_str() else {
                 reply.error(EINVAL);
                 return;
@@ -712,6 +799,8 @@ pub mod runtime {
         }
 
         fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+            self.drain_remote_updates();
+
             let Some(name) = name.to_str() else {
                 reply.error(EINVAL);
                 return;
@@ -756,6 +845,8 @@ pub mod runtime {
         }
 
         fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+            self.drain_remote_updates();
+
             let Some(node) = self.nodes.get(&ino) else {
                 reply.error(ENOENT);
                 return;
@@ -791,6 +882,8 @@ pub mod runtime {
             flags: i32,
             reply: ReplyCreate,
         ) {
+            self.drain_remote_updates();
+
             let Some(parent_node) = self.nodes.get(&parent) else {
                 reply.error(ENOENT);
                 return;
@@ -846,6 +939,8 @@ pub mod runtime {
             _lock_owner: Option<u64>,
             reply: ReplyData,
         ) {
+            self.drain_remote_updates();
+
             if let Err(_error) = self.hydrate_if_needed(ino) {
                 reply.error(EIO);
                 return;
@@ -883,6 +978,8 @@ pub mod runtime {
             _lock_owner: Option<u64>,
             reply: ReplyWrite,
         ) {
+            self.drain_remote_updates();
+
             let Some(handle) = self.open_handles.get(&fh).copied() else {
                 reply.error(EBADF);
                 return;
@@ -954,6 +1051,8 @@ pub mod runtime {
             _flags: Option<u32>,
             reply: ReplyAttr,
         ) {
+            self.drain_remote_updates();
+
             if let Some(size) = size {
                 if let Err(_error) = self.hydrate_if_needed(ino) {
                     reply.error(EIO);
@@ -992,6 +1091,8 @@ pub mod runtime {
             _lock_owner: u64,
             reply: ReplyEmpty,
         ) {
+            self.drain_remote_updates();
+
             match self.flush_handle(ino, fh) {
                 Ok(()) => reply.ok(),
                 Err(_error) => reply.error(EIO),
@@ -1008,6 +1109,8 @@ pub mod runtime {
             _flush: bool,
             reply: ReplyEmpty,
         ) {
+            self.drain_remote_updates();
+
             match self.release_handle(ino, fh) {
                 Ok(()) => reply.ok(),
                 Err(_error) => reply.error(EIO),
@@ -1028,7 +1131,7 @@ pub mod runtime {
             ));
         }
 
-        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader);
+        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader, None);
         fuser::mount2(fs, &config.mountpoint, &config.mount_options())?;
         Ok(())
     }
@@ -1039,6 +1142,16 @@ pub mod runtime {
         hydrator: Box<dyn Hydrator>,
         uploader: Box<dyn Uploader>,
     ) -> Result<()> {
+        mount_action_plan_until_shutdown_with_updates(config, action_plan, hydrator, uploader, None)
+    }
+
+    pub fn mount_action_plan_until_shutdown_with_updates(
+        config: &FuseMountConfig,
+        action_plan: FuseActionPlan,
+        hydrator: Box<dyn Hydrator>,
+        uploader: Box<dyn Uploader>,
+        refresh_rx: Option<Receiver<FuseActionPlan>>,
+    ) -> Result<()> {
         if !Path::new(&config.mountpoint).exists() {
             return Err(anyhow!(
                 "mountpoint does not exist: {}",
@@ -1046,7 +1159,7 @@ pub mod runtime {
             ));
         }
 
-        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader);
+        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader, refresh_rx);
         let session = fuser::spawn_mount2(fs, &config.mountpoint, &config.mount_options())
             .with_context(|| {
                 format!(

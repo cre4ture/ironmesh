@@ -103,7 +103,7 @@ Out of scope for MVP:
 
 1. MVP (this change): shared planner + tests.
 2. Linux pilot: `adapter-linux-fuse` read-only mount using planner metadata decisions. ✅
-3. Windows pilot: sync root registration + read/hydrate callback path. (next)
+3. Windows pilot: sync root registration + read/hydrate callback path. ✅
 4. Android alignment: map `DocumentsProvider` operations to the same planner contracts.
 5. Shared writeback queue + conflict resolution UX.
 
@@ -141,8 +141,17 @@ Out of scope for MVP:
     - `--snapshot-file` static snapshot mode.
     - `--server-base-url` live namespace/hydration mode via `server-node` APIs.
   - CI artifact publication for Ubuntu mount binary (`linux-fuse-mount-binary-ubuntu`).
+  - `crates/adapter-windows-cfapi` runtime with:
+    - sync-root registration + placeholder creation,
+    - fetch-data hydration callbacks backed by `server-node`,
+    - periodic remote namespace refresh via `/store/index` polling.
+  - Shared polling abstraction in `crates/client-sdk/src/remote_sync.rs`:
+    - SDK-owned polling thread (`RemoteSnapshotPoller`),
+    - callback contract on `changed_paths` + latest snapshot,
+    - adapter-side callback applies platform action plans.
+  - `crates/adapter-linux-fuse` live mount now consumes the same polling abstraction to materialize remote additions without remounting.
 - Next step:
-  - Start Windows CFAPI adapter implementation against `sync-core` contracts.
+  - Add server-driven remote-change notifications to replace polling when backend support is available.
 
 ## Linux FUSE MVP test (current)
 

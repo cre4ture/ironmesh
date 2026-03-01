@@ -26,6 +26,14 @@ mod tests {
         server_base_url: &str,
         mountpoint: &Path,
     ) -> Result<ChildGuard> {
+        start_linux_fuse_adapter_with_refresh(server_base_url, mountpoint, 500).await
+    }
+
+    async fn start_linux_fuse_adapter_with_refresh(
+        server_base_url: &str,
+        mountpoint: &Path,
+        remote_refresh_interval_ms: u64,
+    ) -> Result<ChildGuard> {
         let os_integration_bin = binary_path("os-integration")?;
         let mountpoint_arg = mountpoint.to_string_lossy().to_string();
 
@@ -34,6 +42,8 @@ mod tests {
             .arg(server_base_url)
             .arg("--mountpoint")
             .arg(&mountpoint_arg)
+            .arg("--remote-refresh-interval-ms")
+            .arg(remote_refresh_interval_ms.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -51,6 +61,20 @@ mod tests {
         }
 
         bail!("expected mounted file does not exist: {}", path.display());
+    }
+
+    async fn wait_for_dir(path: &Path, retries: usize) -> Result<()> {
+        for _ in 0..retries {
+            if path.is_dir() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "expected mounted directory does not exist: {}",
+            path.display()
+        );
     }
 
     async fn try_unmount(mountpoint: &Path) -> Result<()> {
@@ -278,6 +302,61 @@ mod tests {
         result
     }
 
+    async fn run_remote_additions_refresh_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-remote-refresh");
+        let mut server = start_server(bind).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            sdk.put_large_aware("seed-refresh.txt", Bytes::from_static(b"seed-refresh"))
+                .await?;
+
+            let mut adapter =
+                start_linux_fuse_adapter_with_refresh(&base_url, &mountpoint, 500).await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-refresh.txt");
+                wait_for_file(&seed_path, 120).await?;
+
+                sdk.put_large_aware(
+                    "live-refresh/added.txt",
+                    Bytes::from_static(b"remote-refresh-content"),
+                )
+                .await?;
+                sdk.put("live-refresh/subdir/", Bytes::new()).await?;
+
+                let folder_path = mountpoint.join("live-refresh");
+                let nested_folder_path = mountpoint.join("live-refresh").join("subdir");
+                let file_path = mountpoint.join("live-refresh").join("added.txt");
+
+                wait_for_dir(&folder_path, 180).await?;
+                wait_for_dir(&nested_folder_path, 180).await?;
+                wait_for_file(&file_path, 180).await?;
+
+                let hydrated = fs::read(&file_path).with_context(|| {
+                    format!("failed to read mounted file {}", file_path.display())
+                })?;
+                assert_eq!(hydrated, b"remote-refresh-content");
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
     #[tokio::test]
     async fn linux_fuse_server_mode_uploads_small_payload() -> Result<()> {
         run_server_mode_upload_case(
@@ -311,5 +390,10 @@ mod tests {
     async fn linux_fuse_server_mode_nested_folders_create_delete_and_file_roundtrip() -> Result<()>
     {
         run_nested_folder_roundtrip_case("127.0.0.1:19362").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_remote_additions_materialize_without_remount() -> Result<()> {
+        run_remote_additions_refresh_case("127.0.0.1:19363").await
     }
 }

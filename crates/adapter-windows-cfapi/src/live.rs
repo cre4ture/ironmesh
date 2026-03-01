@@ -2,7 +2,6 @@ use crate::runtime::{Hydrator, Uploader};
 use anyhow::{Context, Result};
 use client_sdk::{IronMeshClient, normalize_server_base_url};
 use reqwest::Url;
-use sync_core::{EntryKind, SyncSnapshot};
 
 #[derive(Clone)]
 pub struct ServerNodeHydrator {
@@ -45,30 +44,6 @@ impl Uploader for ServerNodeHydrator {
 
 pub fn normalize_base_url(input: &str) -> Result<Url> {
     normalize_server_base_url(input)
-}
-
-pub fn load_snapshot_from_server(
-    base_url: &Url,
-    prefix: Option<&str>,
-    depth: usize,
-) -> Result<SyncSnapshot> {
-    let sdk = IronMeshClient::new(base_url.as_str());
-    let mut snapshot = sdk.load_snapshot_from_server_blocking(prefix, depth, None)?;
-
-    for entry in &mut snapshot.remote {
-        if entry.kind != EntryKind::File {
-            continue;
-        }
-
-        let size = sdk
-            .get_object_size_blocking(&entry.path, None, None)
-            .with_context(|| format!("failed to fetch remote size for {}", entry.path))?;
-
-        let base_version = entry.version.as_deref().unwrap_or("server-head");
-        entry.version = Some(format!("{base_version}:size={size}"));
-    }
-
-    Ok(snapshot)
 }
 
 #[cfg(test)]

@@ -15,6 +15,17 @@ pub async fn start_cfapi_adapter(
     root_path: &Path,
     server_base_url: &str,
 ) -> Result<ChildGuard> {
+    start_cfapi_adapter_with_refresh(sync_root_id, display_name, root_path, server_base_url, 500)
+        .await
+}
+
+pub async fn start_cfapi_adapter_with_refresh(
+    sync_root_id: &str,
+    display_name: &str,
+    root_path: &Path,
+    server_base_url: &str,
+    remote_refresh_interval_ms: u64,
+) -> Result<ChildGuard> {
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
 
@@ -47,6 +58,8 @@ pub async fn start_cfapi_adapter(
         .arg(&root_path_arg)
         .arg("--server-base-url")
         .arg(server_base_url)
+        .arg("--remote-refresh-interval-ms")
+        .arg(remote_refresh_interval_ms.to_string())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()

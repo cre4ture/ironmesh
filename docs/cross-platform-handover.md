@@ -30,11 +30,16 @@ This document is the handover package for continuing cross-platform filesystem i
   - Operation mapping tests equivalent to Linux adapter.
   - Runtime uses CFAPI registration (`CfRegisterSyncRoot`), placeholder creation (`CfCreatePlaceholders`), and fetch-data callback transfer (`CfExecute`).
   - Registration utility binary: `adapter-windows-cfapi-register`.
+  - Live server hydration integration via `os-integration serve`:
+    - Placeholder materialization from `/store/index`.
+    - On-demand hydration from `GET /store/{key}`.
+    - Remote namespace refresh loop via periodic `/store/index` polling (`--remote-refresh-interval-ms`), implemented through `client-sdk` `RemoteSnapshotPoller` (`changed_paths` callback contract).
+- Linux FUSE live mount now also uses the same `client-sdk` polling abstraction to apply remote additions while mounted.
   - Windows compile check lane added to CI.
 
 ### Not implemented yet
 
-- Windows CFAPI full live-server integration (namespace/object hydration from `server-node` in callback path).
+- Real-time remote-change notifications (current implementation uses polling, not push notifications).
 - Linux write path (current runtime is read-only).
 - Android Rust-bridge alignment to consume `sync-core` directly.
 
@@ -151,8 +156,4 @@ Status: complete.
 
 ## Suggested next task on Windows
 
-Integrate live namespace/object fetch from `server-node` into the CFAPI runtime flow:
-
-1. fetch remote namespace and materialize placeholders under sync root,
-2. resolve file identity -> object key mapping in callback context,
-3. hydrate callback bytes from `GET /store/{key}` for requested ranges.
+Add a server-driven remote-change mechanism (SSE/WebSocket/long-poll) to reduce polling latency and index refresh load.

@@ -146,6 +146,9 @@ Those bridges can be added incrementally without changing the workspace topology
 ## Cross-platform filesystem integration strategy
 
 - Cross-platform filesystem integration strategy, requirements, and phased plan are documented in [docs/cross-platform-filesystem-integration-strategy.md](docs/cross-platform-filesystem-integration-strategy.md).
+- Windows CFAPI and Linux FUSE adapters currently refresh remote namespace changes via periodic `/store/index` polling.
+  - Configure with `--remote-refresh-interval-ms` (default `3000`).
+  - Polling is implemented via `client-sdk` `RemoteSnapshotPoller`, which keeps the last snapshot in an SDK-owned thread and triggers adapter callbacks with `changed_paths`.
 
 ## Cross-environment handover
 

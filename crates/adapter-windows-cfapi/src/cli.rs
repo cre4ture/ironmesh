@@ -1,13 +1,14 @@
 #![cfg(windows)]
 
 use clap::{Parser, Subcommand};
+use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use crate::adapter::WindowsCfapiAdapter;
-use crate::live::{ServerNodeHydrator, load_snapshot_from_server, normalize_base_url};
+use crate::live::{ServerNodeHydrator, normalize_base_url};
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root, register_sync_root,
 };
@@ -41,6 +42,8 @@ struct ServeArgs {
     prefix: Option<String>,
     #[arg(long, default_value_t = 64)]
     depth: usize,
+    #[arg(long, default_value_t = 3000)]
+    remote_refresh_interval_ms: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -68,18 +71,27 @@ pub fn cli_main() -> anyhow::Result<()> {
                 SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
 
             let base_url = normalize_base_url(&args.server_base_url)?;
+            let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
+            let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
 
-            let snapshot =
-                load_snapshot_from_server(&base_url, args.prefix.as_deref(), args.depth)?;
             let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
-            let action_plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
+            let fetcher = RemoteSnapshotFetcher::from_base_url(
+                base_url.as_str(),
+                args.prefix.clone(),
+                args.depth,
+                None,
+            );
+            let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
+            let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
 
-            let runtime = CfapiRuntime::from_action_plan(&action_plan);
+            let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
             let hydrator = Box::new(ServerNodeHydrator::new(base_url.clone()));
             let uploader = Arc::new(ServerNodeHydrator::new(base_url));
-            let _connection = connect_sync_root(&registration, runtime, hydrator, uploader)?;
+            let _connection =
+                connect_sync_root(&registration, runtime.clone(), hydrator, uploader)?;
 
             apply_action_plan(&registration.root_path, &action_plan)?;
+            let _ = runtime.sync_from_action_plan(&action_plan);
             eprintln!(
                 "materialized {} planned entries under sync root",
                 action_plan.actions.len()
@@ -94,6 +106,36 @@ pub fn cli_main() -> anyhow::Result<()> {
                     r.store(false, Ordering::SeqCst);
                 })?;
             }
+
+            let refresh_registration = registration.clone();
+            let refresh_adapter = adapter.clone();
+            let refresh_runtime = runtime.clone();
+            let refresh_running = running.clone();
+            refresh_poller.spawn_fetcher_loop(
+                refresh_running,
+                Some(initial_snapshot),
+                fetcher,
+                move |update| {
+                    let plan =
+                        refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
+                    if let Err(err) = apply_action_plan(&refresh_registration.root_path, &plan) {
+                        eprintln!("remote-refresh: apply_action_plan error: {err}");
+                        return;
+                    }
+                    let reconciled_paths = refresh_runtime.sync_from_action_plan(&plan);
+                    if reconciled_paths > 0 {
+                        eprintln!(
+                            "remote-refresh: reconciled {} changed paths",
+                            reconciled_paths
+                        );
+                    } else {
+                        eprintln!(
+                            "remote-refresh: detected {} changed remote paths; no local plan delta",
+                            update.changed_paths.len()
+                        );
+                    }
+                },
+            );
 
             while running.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(1));

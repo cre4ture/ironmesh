@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRootRegistration {
@@ -146,6 +146,40 @@ impl CfapiRuntime {
             .expect("remote version map lock poisoned")
             .insert(normalize_path(relative_path), remote_version.into());
     }
+
+    pub fn sync_from_action_plan(&self, plan: &CfapiActionPlan) -> usize {
+        let mut changed = 0usize;
+        let mut remote_versions = self
+            .remote_versions_by_path
+            .lock()
+            .expect("remote version map lock poisoned");
+        for action in &plan.actions {
+            match action {
+                CfapiAction::EnsurePlaceholder {
+                    path,
+                    remote_version,
+                }
+                | CfapiAction::HydrateOnDemand {
+                    path,
+                    remote_version,
+                } => {
+                    let normalized = normalize_path(path);
+                    let update = match remote_versions.get(&normalized) {
+                        Some(existing) => existing != remote_version,
+                        None => true,
+                    };
+                    if update {
+                        remote_versions.insert(normalized, remote_version.clone());
+                        changed += 1;
+                    }
+                }
+                CfapiAction::EnsureDirectory { .. }
+                | CfapiAction::QueueUploadOnClose { .. }
+                | CfapiAction::MarkConflict { .. } => {}
+            }
+        }
+        changed
+    }
 }
 
 // `normalize_path` now lives in `helpers.rs`.
@@ -223,7 +257,7 @@ impl Drop for SyncRootConnection {
 
 struct CallbackContext {
     sync_root: PathBuf,
-    runtime: CfapiRuntime,
+    runtime: Arc<CfapiRuntime>,
     hydrator: Box<dyn Hydrator>,
     uploader: std::sync::Arc<dyn Uploader>,
     hydrated_once_paths: Mutex<HashSet<String>>,
@@ -449,7 +483,7 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
 
 pub fn connect_sync_root(
     registration: &SyncRootRegistration,
-    runtime: CfapiRuntime,
+    runtime: Arc<CfapiRuntime>,
     hydrator: Box<dyn Hydrator>,
     uploader: std::sync::Arc<dyn Uploader>,
 ) -> Result<SyncRootConnection> {

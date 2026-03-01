@@ -151,6 +151,48 @@ mod tests {
         wait_for_hydrated_payload(&local_file, payload, 150).await;
     }
 
+    async fn run_cfapi_remote_additions_case(
+        bind: &str,
+        folder_key: &str,
+        file_key: &str,
+        payload: &[u8],
+    ) {
+        let _server = start_server(bind)
+            .await
+            .expect("failed to start local server-node");
+
+        let base_url = format!("http://{bind}");
+        let sync_root = fresh_data_dir("cfapi-remote-additions-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.remote.additions.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let _adapter = start_cfapi_adapter(
+            &sync_root_id,
+            "ironmesh System Test Remote Additions Root",
+            &sync_root,
+            &base_url,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let sdk = IronMeshClient::new(&base_url);
+        sdk.put(folder_key, Bytes::new())
+            .await
+            .expect("failed to seed remote folder marker");
+        sdk.put_large_aware(file_key, Bytes::from(payload.to_vec()))
+            .await
+            .expect("failed to seed remote file");
+
+        let folder_path = sync_root.join(folder_key.trim_end_matches('/').replace('/', "\\"));
+        let local_file = sync_root.join(file_key.replace('/', "\\"));
+        wait_for_path(&folder_path, 250).await;
+        wait_for_path(&local_file, 250).await;
+        wait_for_hydrated_payload(&local_file, payload, 200).await;
+    }
+
     #[tokio::test]
     async fn test_cfapi_monitor_detects_new_and_modified_file_small() {
         run_cfapi_monitor_case("127.0.0.1:19090", "initial content", "modified content").await;
@@ -186,5 +228,16 @@ mod tests {
             "\nlarge-hydration-tail"
         );
         run_cfapi_hydration_case("127.0.0.1:19093", "hydrate/large.bin", payload.as_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_remote_additions_materialize_placeholders() {
+        run_cfapi_remote_additions_case(
+            "127.0.0.1:19094",
+            "remote-added/folder/",
+            "remote-added/folder/new-file.txt",
+            b"remote addition hydrated",
+        )
+        .await;
     }
 }
