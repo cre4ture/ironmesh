@@ -38,17 +38,17 @@ pub fn serve_main() -> anyhow::Result<()> {
     let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
     let action_plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
 
-    apply_action_plan(&registration.root_path, &action_plan)?;
-    eprintln!(
-        "materialized {} planned entries under sync root",
-        action_plan.actions.len()
-    );
-
     let runtime = CfapiRuntime::from_action_plan(&action_plan);
     let hydrator = Box::new(ServerNodeHydrator::new(base_url.clone()));
     use std::sync::Arc;
     let uploader = Arc::new(ServerNodeHydrator::new(base_url));
     let _connection = connect_sync_root(&registration, runtime, hydrator, uploader)?;
+
+    apply_action_plan(&registration.root_path, &action_plan)?;
+    eprintln!(
+        "materialized {} planned entries under sync root",
+        action_plan.actions.len()
+    );
 
     eprintln!("connected to CFAPI callbacks; serving hydration requests");
     let running = std::sync::Arc::new(AtomicBool::new(true));

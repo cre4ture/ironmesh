@@ -501,7 +501,7 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
     let mut remote = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        if entry.entry_type == "prefix" {
+        if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
             let directory_path = entry.path.trim_end_matches('/').to_string();
             if !directory_path.is_empty() {
                 remote.push(NamespaceEntry::directory(directory_path));

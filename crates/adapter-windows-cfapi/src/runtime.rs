@@ -326,6 +326,8 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
     }
 
     struct PlaceholderInput {
+        base_dir: PathBuf,
+        child_name: String,
         relative_name_utf16: Vec<u16>,
         identity: Vec<u8>,
         metadata: CF_FS_METADATA,
@@ -333,6 +335,21 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
 
     let mut inputs = Vec::with_capacity(placeholders.len());
     for (relative_path, remote_version) in placeholders {
+        let (parent_rel, child_name) = match relative_path.rsplit_once('/') {
+            Some((parent, child)) => (parent, child),
+            None => ("", relative_path.as_str()),
+        };
+        if child_name.is_empty() || child_name.contains('\\') || child_name.contains('/') {
+            return Err(anyhow!(
+                "invalid placeholder child name derived from path '{}'",
+                relative_path
+            ));
+        }
+        let base_dir = if parent_rel.is_empty() {
+            root_path.to_path_buf()
+        } else {
+            root_path.join(parent_rel.replace('/', "\\"))
+        };
         let basic_info = FILE_BASIC_INFO {
             FileAttributes: FILE_ATTRIBUTE_NORMAL,
             ..Default::default()
@@ -343,38 +360,65 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
         };
 
         inputs.push(PlaceholderInput {
-            relative_name_utf16: utf16_string(&relative_path),
+            base_dir,
+            child_name: child_name.to_string(),
+            relative_name_utf16: utf16_string(child_name),
             identity: remote_version.into_bytes(),
             metadata,
         });
     }
 
-    let mut create_infos = Vec::with_capacity(inputs.len());
-    for input in &mut inputs {
-        create_infos.push(CF_PLACEHOLDER_CREATE_INFO {
-            RelativeFileName: input.relative_name_utf16.as_ptr(),
-            FsMetadata: input.metadata,
-            FileIdentity: input.identity.as_ptr().cast::<c_void>(),
-            FileIdentityLength: input.identity.len() as u32,
-            Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
-            Result: 0,
-            CreateUsn: 0,
-        });
+    let mut by_base_dir: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    for (idx, input) in inputs.iter().enumerate() {
+        by_base_dir.entry(input.base_dir.clone()).or_default().push(idx);
     }
 
-    let base_path = utf16_path(root_path);
-    let mut entries_processed = 0u32;
-    let hr = unsafe {
-        CfCreatePlaceholders(
-            base_path.as_ptr(),
-            create_infos.as_mut_ptr(),
-            create_infos.len() as u32,
-            CF_CREATE_FLAG_STOP_ON_ERROR,
-            &mut entries_processed,
-        )
-    };
+    for (base_dir, indices) in by_base_dir {
+        let mut create_infos = Vec::with_capacity(indices.len());
+        for &idx in &indices {
+            let input = &inputs[idx];
+            create_infos.push(CF_PLACEHOLDER_CREATE_INFO {
+                RelativeFileName: input.relative_name_utf16.as_ptr(),
+                FsMetadata: input.metadata,
+                FileIdentity: input.identity.as_ptr().cast::<c_void>(),
+                FileIdentityLength: input.identity.len() as u32,
+                Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+                Result: 0,
+                CreateUsn: 0,
+            });
+        }
 
-    hresult_to_result(hr, "CfCreatePlaceholders")
+        let base_path = utf16_path(&base_dir);
+        let mut entries_processed = 0u32;
+        let hr = unsafe {
+            CfCreatePlaceholders(
+                base_path.as_ptr(),
+                create_infos.as_mut_ptr(),
+                create_infos.len() as u32,
+                CF_CREATE_FLAG_STOP_ON_ERROR,
+                &mut entries_processed,
+            )
+        };
+
+        let result = hresult_to_result(hr, "CfCreatePlaceholders (apply_action_plan)");
+        if let Err(err) = &result {
+            eprintln!("apply_action_plan: error creating placeholders: {err}");
+            eprintln!("base_dir={}", base_dir.display());
+            for idx in indices {
+                let input = &inputs[idx];
+                eprintln!(
+                    "placeholder: relative_name={} identity={:?} metadata={{attributes={:x} filesize={}}}",
+                    input.child_name,
+                    input.identity,
+                    input.metadata.BasicInfo.FileAttributes,
+                    input.metadata.FileSize
+                );
+            }
+            return result;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn connect_sync_root(
