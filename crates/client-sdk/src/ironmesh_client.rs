@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use sync_core::{NamespaceEntry, SyncSnapshot};
@@ -474,6 +475,28 @@ impl IronMeshClient {
     }
 }
 
+pub fn normalize_server_base_url(input: &str) -> Result<Url> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("server base URL is empty"));
+    }
+
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+
+    let mut normalized =
+        Url::parse(&with_scheme).with_context(|| format!("invalid server base URL: {input}"))?;
+    if !normalized.path().ends_with('/') {
+        let path = format!("{}/", normalized.path());
+        normalized.set_path(&path);
+    }
+
+    Ok(normalized)
+}
+
 pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncSnapshot {
     let mut remote = Vec::with_capacity(entries.len());
 
@@ -510,6 +533,12 @@ mod tests {
             .store_key_url("read me.txt")
             .expect("object url should build");
         assert_eq!(url, "http://127.0.0.1:18080/store/read%20me.txt");
+    }
+
+    #[test]
+    fn normalize_server_base_url_adds_scheme_and_trailing_slash() {
+        let normalized = normalize_server_base_url("127.0.0.1:18080").expect("url should be valid");
+        assert_eq!(normalized.as_str(), "http://127.0.0.1:18080/");
     }
 
     #[test]

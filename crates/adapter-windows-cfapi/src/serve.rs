@@ -4,7 +4,6 @@ use crate::adapter::WindowsCfapiAdapter;
 use crate::live::{ServerNodeHydrator, load_snapshot_from_server, normalize_base_url};
 use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root};
 use clap::Parser;
-use reqwest::blocking::Client;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -34,7 +33,6 @@ pub fn serve_main() -> anyhow::Result<()> {
         SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
 
     let base_url = normalize_base_url(&args.server_base_url)?;
-    let client = Client::new();
 
     let snapshot = load_snapshot_from_server(&base_url, args.prefix.as_deref(), args.depth)?;
     let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
@@ -47,9 +45,9 @@ pub fn serve_main() -> anyhow::Result<()> {
     );
 
     let runtime = CfapiRuntime::from_action_plan(&action_plan);
-    let hydrator = Box::new(ServerNodeHydrator::new(client.clone(), base_url.clone()));
+    let hydrator = Box::new(ServerNodeHydrator::new(base_url.clone()));
     use std::sync::Arc;
-    let uploader = Arc::new(ServerNodeHydrator::new(client, base_url));
+    let uploader = Arc::new(ServerNodeHydrator::new(base_url));
     let _connection = connect_sync_root(&registration, runtime, hydrator, uploader)?;
 
     eprintln!("connected to CFAPI callbacks; serving hydration requests");

@@ -13,7 +13,7 @@ mod tests {
     use tokio::process::Command;
     use tokio::time::sleep;
 
-    const LARGE_PAYLOAD_BYTES: usize = 5 * 1024 * 1024 + 1024;
+    const LARGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
     fn fuse_runtime_available() -> bool {
         Path::new("/dev/fuse").exists()
@@ -76,7 +76,32 @@ mod tests {
         let _ = try_unmount(mountpoint).await;
     }
 
-    async fn run_server_mode_hydration_case(bind: &str, key: &str, payload: Vec<u8>) -> Result<()> {
+    async fn wait_for_object_bytes(
+        sdk: &IronMeshClient,
+        key: &str,
+        expected: &[u8],
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(bytes) = sdk.get(key).await
+                && bytes.as_ref() == expected
+            {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("server did not expose expected payload for key {key}");
+    }
+
+    async fn run_server_mode_upload_case(
+        bind: &str,
+        seed_key: &str,
+        seed_payload: Vec<u8>,
+        upload_key: &str,
+        upload_payload: Vec<u8>,
+    ) -> Result<()> {
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -88,21 +113,24 @@ mod tests {
         let sdk = IronMeshClient::new(&base_url);
 
         let result = async {
-            sdk.put_large_aware(key, Bytes::from(payload.clone()))
+            sdk.put_large_aware(seed_key, Bytes::from(seed_payload.clone()))
                 .await?;
 
             let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
             let mount_result = async {
-                let mounted_file = mountpoint.join(key);
+                let mounted_file = mountpoint.join(seed_key);
                 wait_for_file(&mounted_file, 100).await?;
 
                 let hydrated = fs::read(&mounted_file).with_context(|| {
                     format!("failed to read mounted file {}", mounted_file.display())
                 })?;
-                assert_eq!(hydrated, payload);
+                assert_eq!(hydrated, seed_payload);
 
-                let write_result = fs::write(&mounted_file, b"must-fail");
-                assert!(write_result.is_err(), "linux fuse mount must be read-only");
+                let upload_path = mountpoint.join(upload_key);
+                fs::write(&upload_path, &upload_payload).with_context(|| {
+                    format!("failed to write mounted file {}", upload_path.display())
+                })?;
+                wait_for_object_bytes(&sdk, upload_key, &upload_payload, 150).await?;
 
                 Ok::<(), anyhow::Error>(())
             }
@@ -119,21 +147,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn linux_fuse_server_mode_hydrates_small_payload() -> Result<()> {
-        run_server_mode_hydration_case(
+    async fn linux_fuse_server_mode_uploads_small_payload() -> Result<()> {
+        run_server_mode_upload_case(
             "127.0.0.1:19360",
-            "live-small.txt",
+            "seed-small.txt",
             b"hello-from-live-server".to_vec(),
+            "upload-small.txt",
+            b"uploaded-via-fuse-small".to_vec(),
         )
         .await
     }
 
     #[tokio::test]
-    async fn linux_fuse_server_mode_hydrates_large_payload() -> Result<()> {
-        let mut payload = vec![b'Z'; LARGE_PAYLOAD_BYTES];
-        payload[0..6].copy_from_slice(b"BEGIN:");
-        payload[LARGE_PAYLOAD_BYTES - 4..LARGE_PAYLOAD_BYTES].copy_from_slice(b":END");
+    async fn linux_fuse_server_mode_uploads_large_10mb_payload() -> Result<()> {
+        let seed_payload = b"seed-large".to_vec();
+        let mut upload_payload = vec![b'Z'; LARGE_UPLOAD_BYTES];
+        upload_payload[0..9].copy_from_slice(b"10MBHEAD:");
+        upload_payload[LARGE_UPLOAD_BYTES - 8..LARGE_UPLOAD_BYTES].copy_from_slice(b":10MBEND");
 
-        run_server_mode_hydration_case("127.0.0.1:19361", "live-large.bin", payload).await
+        run_server_mode_upload_case(
+            "127.0.0.1:19361",
+            "seed-large.txt",
+            seed_payload,
+            "upload-large-10mb.bin",
+            upload_payload,
+        )
+        .await
     }
 }

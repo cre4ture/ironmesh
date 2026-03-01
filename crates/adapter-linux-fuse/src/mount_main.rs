@@ -1,21 +1,19 @@
 #![cfg(not(windows))]
 
 use crate::LinuxFuseAdapter;
-use crate::runtime::{FuseMountConfig, Hydrator, mount_action_plan};
+use crate::runtime::{
+    DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, Uploader, mount_action_plan,
+};
 use anyhow::{Context, Result};
 use clap::Parser;
-use client_sdk::IronMeshClient;
-use reqwest::Url;
-use reqwest::blocking::Client;
+use client_sdk::{IronMeshClient, normalize_server_base_url};
 use std::fs;
 use std::path::PathBuf;
 use sync_core::{SyncPolicy, SyncSnapshot};
 
 #[derive(Debug, Parser)]
 #[command(name = "adapter-linux-fuse-mount")]
-#[command(
-    about = "Mount a read-only Ironmesh FUSE view from a SyncSnapshot JSON or a live server-node"
-)]
+#[command(about = "Mount an Ironmesh FUSE view from a SyncSnapshot JSON or a live server-node")]
 struct Args {
     #[arg(long)]
     snapshot_file: Option<PathBuf>,
@@ -42,27 +40,22 @@ pub fn mount_main() -> Result<()> {
         anyhow::bail!("exactly one of --snapshot-file or --server-base-url must be set");
     }
 
-    let client = Client::new();
-
-    let (snapshot, hydrator): (SyncSnapshot, Box<dyn Hydrator>) =
+    let (snapshot, hydrator, uploader): (SyncSnapshot, Box<dyn Hydrator>, Box<dyn Uploader>) =
         if let Some(snapshot_file) = &args.snapshot_file {
             let json = fs::read_to_string(snapshot_file)
                 .with_context(|| format!("failed to read {}", snapshot_file.display()))?;
             let snapshot: SyncSnapshot = serde_json::from_str(&json)
                 .with_context(|| format!("failed to parse {}", snapshot_file.display()))?;
-            (snapshot, Box::new(DemoHydrator))
+            (snapshot, Box::new(DemoHydrator), Box::new(DemoUploader))
         } else {
-            let base_url = normalize_base_url(args.server_base_url.as_deref().unwrap_or_default())?;
+            let base_url =
+                normalize_server_base_url(args.server_base_url.as_deref().unwrap_or_default())?;
             let sdk = IronMeshClient::new(base_url.as_str());
             let snapshot =
                 sdk.load_snapshot_from_server_blocking(args.prefix.as_deref(), args.depth, None)?;
-            (
-                snapshot,
-                Box::new(ServerNodeHydrator {
-                    client: client.clone(),
-                    base_url,
-                }),
-            )
+
+            let io = ServerNodeIo::new(base_url.as_str());
+            (snapshot, Box::new(io.clone()), Box::new(io))
         };
 
     let adapter = LinuxFuseAdapter::new(args.fs_name.clone());
@@ -71,71 +64,42 @@ pub fn mount_main() -> Result<()> {
     let mut config = FuseMountConfig::new(args.mountpoint, args.fs_name);
     config.allow_other = args.allow_other;
 
-    mount_action_plan(&config, actions, hydrator)
+    mount_action_plan(&config, actions, hydrator, uploader)
 }
 
-#[derive(Debug, Default, Clone)]
-struct DemoHydrator;
+#[derive(Clone)]
+struct ServerNodeIo {
+    sdk: IronMeshClient,
+}
 
-impl Hydrator for DemoHydrator {
-    fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>> {
-        Ok(
-            format!("ironmesh placeholder hydrated: path={path} version={remote_version}\n")
-                .into_bytes(),
-        )
+impl ServerNodeIo {
+    fn new(server_base_url: impl Into<String>) -> Self {
+        Self {
+            sdk: IronMeshClient::new(server_base_url),
+        }
     }
 }
 
-#[derive(Debug, Clone)]
-struct ServerNodeHydrator {
-    client: Client,
-    base_url: Url,
-}
-
-impl Hydrator for ServerNodeHydrator {
+impl Hydrator for ServerNodeIo {
     fn hydrate(&self, path: &str, _remote_version: &str) -> Result<Vec<u8>> {
-        let object_url = build_store_object_url(&self.base_url, path)?;
-        let response = self
-            .client
-            .get(object_url)
-            .send()
-            .with_context(|| format!("failed to fetch object for path {path}"))?
-            .error_for_status()
-            .with_context(|| format!("server returned error for path {path}"))?;
-
-        let bytes = response.bytes().context("failed reading object bytes")?;
-        Ok(bytes.to_vec())
+        let mut payload = Vec::new();
+        self.sdk
+            .get_with_selector_writer(path, None, None, &mut payload)
+            .with_context(|| format!("failed to fetch object for path {path}"))?;
+        Ok(payload)
     }
 }
 
-fn normalize_base_url(input: &str) -> Result<Url> {
-    let trimmed = input.trim();
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{trimmed}")
-    };
-    let url = if with_scheme.ends_with('/') {
-        with_scheme
-    } else {
-        format!("{with_scheme}/")
-    };
-    Url::parse(&url).with_context(|| format!("invalid server base url: {input}"))
-}
-
-fn build_store_object_url(base_url: &Url, key: &str) -> Result<Url> {
-    let mut url = base_url.clone();
-    let normalized_key = key.trim().trim_start_matches('/');
-    if normalized_key.is_empty() {
-        anyhow::bail!("object key is empty");
+impl Uploader for ServerNodeIo {
+    fn upload_reader(
+        &self,
+        path: &str,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<Option<String>> {
+        self.sdk
+            .put_large_aware_reader(path.to_string(), reader, length)
+            .with_context(|| format!("failed to upload object for path {path}"))?;
+        Ok(Some("server-head".to_string()))
     }
-
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("base url cannot be used for path segments"))?;
-        segments.push("store");
-        segments.push(normalized_key);
-    }
-    Ok(url)
 }

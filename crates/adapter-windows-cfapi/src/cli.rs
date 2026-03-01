@@ -1,7 +1,6 @@
 #![cfg(windows)]
 
 use clap::{Parser, Subcommand};
-use reqwest::blocking::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -69,7 +68,6 @@ pub fn cli_main() -> anyhow::Result<()> {
                 SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
 
             let base_url = normalize_base_url(&args.server_base_url)?;
-            let client = Client::new();
 
             let snapshot =
                 load_snapshot_from_server(&base_url, args.prefix.as_deref(), args.depth)?;
@@ -83,8 +81,8 @@ pub fn cli_main() -> anyhow::Result<()> {
             );
 
             let runtime = CfapiRuntime::from_action_plan(&action_plan);
-            let hydrator = Box::new(ServerNodeHydrator::new(client.clone(), base_url.clone()));
-            let uploader = Arc::new(ServerNodeHydrator::new(client, base_url));
+            let hydrator = Box::new(ServerNodeHydrator::new(base_url.clone()));
+            let uploader = Arc::new(ServerNodeHydrator::new(base_url));
             let _connection = connect_sync_root(&registration, runtime, hydrator, uploader)?;
 
             eprintln!("connected to CFAPI callbacks; serving hydration requests");

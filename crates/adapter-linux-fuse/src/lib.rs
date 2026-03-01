@@ -99,15 +99,16 @@ pub fn map_sync_plan_to_fuse_actions(sync_plan: &SyncPlan) -> FuseActionPlan {
 pub mod runtime {
     use super::FuseActionPlan;
     use crate::FuseAction;
-    use anyhow::{Result, anyhow};
+    use anyhow::{Context, Result, anyhow};
     use fuser::consts::FOPEN_DIRECT_IO;
     use fuser::{
-        FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
-        ReplyEntry, ReplyOpen, Request,
+        FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
+        ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
     };
-    use libc::{EIO, ENOENT, ENOSYS};
+    use libc::{EACCES, EBADF, EEXIST, EINVAL, EIO, ENOENT};
     use std::collections::{BTreeMap, HashMap};
     use std::ffi::OsStr;
+    use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
@@ -133,7 +134,6 @@ pub mod runtime {
         fn mount_options(&self) -> Vec<MountOption> {
             let mut options = vec![
                 MountOption::FSName(self.fs_name.clone()),
-                MountOption::RO,
                 MountOption::NoExec,
                 MountOption::DefaultPermissions,
             ];
@@ -150,6 +150,15 @@ pub mod runtime {
         fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>>;
     }
 
+    pub trait Uploader: Send + Sync + 'static {
+        fn upload_reader(
+            &self,
+            path: &str,
+            reader: &mut dyn std::io::Read,
+            length: u64,
+        ) -> Result<Option<String>>;
+    }
+
     #[derive(Debug, Default, Clone)]
     pub struct DemoHydrator;
 
@@ -159,6 +168,20 @@ pub mod runtime {
                 format!("ironmesh placeholder hydrated: path={path} version={remote_version}\n")
                     .into_bytes(),
             )
+        }
+    }
+
+    #[derive(Debug, Default, Clone)]
+    pub struct DemoUploader;
+
+    impl Uploader for DemoUploader {
+        fn upload_reader(
+            &self,
+            _path: &str,
+            _reader: &mut dyn std::io::Read,
+            _length: u64,
+        ) -> Result<Option<String>> {
+            Ok(Some("demo-upload".to_string()))
         }
     }
 
@@ -209,16 +232,36 @@ pub mod runtime {
             }
         }
 
-        fn attr(&self) -> FileAttr {
+        fn regular_file(inode: u64, name: String, parent_inode: u64) -> Self {
+            Self {
+                inode,
+                name,
+                parent_inode,
+                kind: FileType::RegularFile,
+                size: 0,
+                modified_at: SystemTime::now(),
+                children: BTreeMap::new(),
+                data: Vec::new(),
+                placeholder_version: None,
+            }
+        }
+
+        fn attr(&self, uid: u32, gid: u32) -> FileAttr {
             let (perm, nlink) = match self.kind {
                 FileType::Directory => (0o755, 2),
-                _ => (0o444, 1),
+                _ => (0o644, 1),
+            };
+
+            let blocks = if self.kind == FileType::Directory {
+                1
+            } else {
+                self.size.div_ceil(512).max(1)
             };
 
             FileAttr {
                 ino: self.inode,
                 size: self.size,
-                blocks: 1,
+                blocks,
                 atime: self.modified_at,
                 mtime: self.modified_at,
                 ctime: self.modified_at,
@@ -226,8 +269,8 @@ pub mod runtime {
                 kind: self.kind,
                 perm,
                 nlink,
-                uid: 0,
-                gid: 0,
+                uid,
+                gid,
                 rdev: 0,
                 blksize: 4096,
                 flags: 0,
@@ -235,16 +278,42 @@ pub mod runtime {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct OpenHandle {
+        inode: u64,
+        write_access: bool,
+        dirty: bool,
+    }
+
     pub struct IronmeshFuseFs {
         nodes: HashMap<u64, FsNode>,
         hydrator: Box<dyn Hydrator>,
+        uploader: Box<dyn Uploader>,
+        open_handles: HashMap<u64, OpenHandle>,
+        next_handle: u64,
+        uid: u32,
+        gid: u32,
     }
 
     impl IronmeshFuseFs {
-        pub fn from_action_plan(action_plan: &FuseActionPlan, hydrator: Box<dyn Hydrator>) -> Self {
+        pub fn from_action_plan(
+            action_plan: &FuseActionPlan,
+            hydrator: Box<dyn Hydrator>,
+            uploader: Box<dyn Uploader>,
+        ) -> Self {
+            // Safe: libc getters have no preconditions.
+            let uid = unsafe { libc::geteuid() };
+            // Safe: libc getters have no preconditions.
+            let gid = unsafe { libc::getegid() };
+
             let mut fs = Self {
                 nodes: HashMap::new(),
                 hydrator,
+                uploader,
+                open_handles: HashMap::new(),
+                next_handle: 1,
+                uid,
+                gid,
             };
             fs.nodes.insert(
                 ROOT_INODE,
@@ -375,6 +444,95 @@ pub mod runtime {
             Ok(())
         }
 
+        fn truncate_if_needed(&mut self, inode: u64, size: u64) -> Result<bool> {
+            let node = self
+                .nodes
+                .get_mut(&inode)
+                .ok_or_else(|| anyhow!("inode not found"))?;
+            if node.kind != FileType::RegularFile {
+                return Err(anyhow!("inode {inode} is not a regular file"));
+            }
+
+            let target_size = usize::try_from(size).context("file size overflow")?;
+            let changed = node.data.len() != target_size;
+            if changed {
+                node.data.resize(target_size, 0);
+                node.size = size;
+                node.modified_at = SystemTime::now();
+                node.placeholder_version = None;
+            }
+            Ok(changed)
+        }
+
+        fn alloc_open_handle(&mut self, inode: u64, write_access: bool) -> u64 {
+            let fh = self.next_handle;
+            self.next_handle = self.next_handle.saturating_add(1);
+            self.open_handles.insert(
+                fh,
+                OpenHandle {
+                    inode,
+                    write_access,
+                    dirty: false,
+                },
+            );
+            fh
+        }
+
+        fn write_requested(flags: i32) -> bool {
+            let write_flags =
+                libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND | libc::O_TRUNC | libc::O_CREAT;
+            (flags & write_flags) != 0
+        }
+
+        fn upload_inode(&self, inode: u64) -> Result<()> {
+            let node = self
+                .nodes
+                .get(&inode)
+                .ok_or_else(|| anyhow!("inode not found"))?;
+            if node.kind != FileType::RegularFile {
+                return Err(anyhow!("inode {inode} is not a regular file"));
+            }
+
+            let path = self.resolve_full_path(inode);
+            let mut reader = Cursor::new(node.data.clone());
+            self.uploader
+                .upload_reader(&path, &mut reader, node.size)
+                .with_context(|| format!("failed to upload path {path}"))?;
+            Ok(())
+        }
+
+        fn flush_handle(&mut self, ino: u64, fh: u64) -> Result<()> {
+            let Some(handle) = self.open_handles.get(&fh).copied() else {
+                return Err(anyhow!("unknown file handle"));
+            };
+            if handle.inode != ino {
+                return Err(anyhow!("inode/file-handle mismatch"));
+            }
+
+            if handle.write_access && handle.dirty {
+                self.upload_inode(ino)?;
+                if let Some(handle) = self.open_handles.get_mut(&fh) {
+                    handle.dirty = false;
+                }
+            }
+
+            Ok(())
+        }
+
+        fn release_handle(&mut self, ino: u64, fh: u64) -> Result<()> {
+            let Some(handle) = self.open_handles.remove(&fh) else {
+                return Err(anyhow!("unknown file handle"));
+            };
+            if handle.inode != ino {
+                return Err(anyhow!("inode/file-handle mismatch"));
+            }
+
+            if handle.write_access && handle.dirty {
+                self.upload_inode(ino)?;
+            }
+            Ok(())
+        }
+
         fn resolve_full_path(&self, inode: u64) -> String {
             if inode == ROOT_INODE {
                 return String::new();
@@ -413,7 +571,7 @@ pub mod runtime {
                 reply.error(ENOENT);
                 return;
             };
-            reply.entry(&TTL, &child.attr(), 0);
+            reply.entry(&TTL, &child.attr(self.uid, self.gid), 0);
         }
 
         fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
@@ -426,7 +584,7 @@ pub mod runtime {
                 reply.error(ENOENT);
                 return;
             };
-            reply.attr(&TTL, &node.attr());
+            reply.attr(&TTL, &node.attr(self.uid, self.gid));
         }
 
         fn readdir(
@@ -480,18 +638,73 @@ pub mod runtime {
                 return;
             }
 
-            let write_flags = libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND | libc::O_TRUNC;
-            if (flags & write_flags) != 0 {
-                reply.error(ENOSYS);
-                return;
-            }
-
-            if let Err(_error) = self.hydrate_if_needed(ino) {
+            let write_access = Self::write_requested(flags);
+            if write_access && (flags & libc::O_TRUNC) != 0 {
+                if let Err(_error) = self.truncate_if_needed(ino, 0) {
+                    reply.error(EIO);
+                    return;
+                }
+            } else if let Err(_error) = self.hydrate_if_needed(ino) {
                 reply.error(EIO);
                 return;
             }
 
-            reply.opened(0, FOPEN_DIRECT_IO);
+            let fh = self.alloc_open_handle(ino, write_access);
+            reply.opened(fh, FOPEN_DIRECT_IO);
+        }
+
+        fn create(
+            &mut self,
+            _req: &Request<'_>,
+            parent: u64,
+            name: &OsStr,
+            _mode: u32,
+            _umask: u32,
+            flags: i32,
+            reply: ReplyCreate,
+        ) {
+            let Some(parent_node) = self.nodes.get(&parent) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if parent_node.kind != FileType::Directory {
+                reply.error(ENOENT);
+                return;
+            }
+
+            let Some(name) = name.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+            if name.is_empty() || name.contains('/') {
+                reply.error(EINVAL);
+                return;
+            }
+            if parent_node.children.contains_key(name) {
+                reply.error(EEXIST);
+                return;
+            }
+
+            let inode = self.next_inode();
+            self.nodes
+                .insert(inode, FsNode::regular_file(inode, name.to_string(), parent));
+
+            if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                parent_node.children.insert(name.to_string(), inode);
+            }
+
+            let fh = self.alloc_open_handle(inode, Self::write_requested(flags));
+            let Some(created) = self.nodes.get(&inode) else {
+                reply.error(EIO);
+                return;
+            };
+            reply.created(
+                &TTL,
+                &created.attr(self.uid, self.gid),
+                0,
+                fh,
+                FOPEN_DIRECT_IO,
+            );
         }
 
         fn read(
@@ -529,12 +742,156 @@ pub mod runtime {
             let end = (start + size as usize).min(data.len());
             reply.data(&data[start..end]);
         }
+
+        fn write(
+            &mut self,
+            _req: &Request<'_>,
+            ino: u64,
+            fh: u64,
+            offset: i64,
+            data: &[u8],
+            _write_flags: u32,
+            _flags: i32,
+            _lock_owner: Option<u64>,
+            reply: ReplyWrite,
+        ) {
+            let Some(handle) = self.open_handles.get(&fh).copied() else {
+                reply.error(EBADF);
+                return;
+            };
+            if handle.inode != ino {
+                reply.error(EBADF);
+                return;
+            }
+            if !handle.write_access {
+                reply.error(EACCES);
+                return;
+            }
+
+            let Ok(start) = usize::try_from(offset) else {
+                reply.error(EIO);
+                return;
+            };
+            let Some(end) = start.checked_add(data.len()) else {
+                reply.error(EIO);
+                return;
+            };
+
+            let Some(file) = self.nodes.get_mut(&ino) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if file.kind != FileType::RegularFile {
+                reply.error(ENOENT);
+                return;
+            }
+
+            if file.data.len() < start {
+                file.data.resize(start, 0);
+            }
+            if file.data.len() < end {
+                file.data.resize(end, 0);
+            }
+            file.data[start..end].copy_from_slice(data);
+            file.size = file.data.len() as u64;
+            file.modified_at = SystemTime::now();
+            file.placeholder_version = None;
+
+            if let Some(handle) = self.open_handles.get_mut(&fh) {
+                handle.dirty = true;
+            }
+
+            let Ok(written) = u32::try_from(data.len()) else {
+                reply.error(EIO);
+                return;
+            };
+            reply.written(written);
+        }
+
+        fn setattr(
+            &mut self,
+            _req: &Request<'_>,
+            ino: u64,
+            _mode: Option<u32>,
+            _uid: Option<u32>,
+            _gid: Option<u32>,
+            size: Option<u64>,
+            _atime: Option<TimeOrNow>,
+            _mtime: Option<TimeOrNow>,
+            _ctime: Option<SystemTime>,
+            fh: Option<u64>,
+            _crtime: Option<SystemTime>,
+            _chgtime: Option<SystemTime>,
+            _bkuptime: Option<SystemTime>,
+            _flags: Option<u32>,
+            reply: ReplyAttr,
+        ) {
+            if let Some(size) = size {
+                if let Err(_error) = self.hydrate_if_needed(ino) {
+                    reply.error(EIO);
+                    return;
+                }
+
+                let changed = match self.truncate_if_needed(ino, size) {
+                    Ok(changed) => changed,
+                    Err(_error) => {
+                        reply.error(EIO);
+                        return;
+                    }
+                };
+
+                if changed
+                    && let Some(fh) = fh
+                    && let Some(handle) = self.open_handles.get_mut(&fh)
+                    && handle.write_access
+                {
+                    handle.dirty = true;
+                }
+            }
+
+            let Some(node) = self.nodes.get(&ino) else {
+                reply.error(ENOENT);
+                return;
+            };
+            reply.attr(&TTL, &node.attr(self.uid, self.gid));
+        }
+
+        fn flush(
+            &mut self,
+            _req: &Request<'_>,
+            ino: u64,
+            fh: u64,
+            _lock_owner: u64,
+            reply: ReplyEmpty,
+        ) {
+            match self.flush_handle(ino, fh) {
+                Ok(()) => reply.ok(),
+                Err(_error) => reply.error(EIO),
+            }
+        }
+
+        fn release(
+            &mut self,
+            _req: &Request<'_>,
+            ino: u64,
+            fh: u64,
+            _flags: i32,
+            _lock_owner: Option<u64>,
+            _flush: bool,
+            reply: ReplyEmpty,
+        ) {
+            match self.release_handle(ino, fh) {
+                Ok(()) => reply.ok(),
+                Err(_error) => reply.error(EIO),
+            }
+        }
     }
 
     pub fn mount_action_plan(
         config: &FuseMountConfig,
         action_plan: FuseActionPlan,
         hydrator: Box<dyn Hydrator>,
+        uploader: Box<dyn Uploader>,
     ) -> Result<()> {
         if !Path::new(&config.mountpoint).exists() {
             return Err(anyhow!(
@@ -543,7 +900,7 @@ pub mod runtime {
             ));
         }
 
-        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator);
+        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader);
         fuser::mount2(fs, &config.mountpoint, &config.mount_options())?;
         Ok(())
     }
