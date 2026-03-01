@@ -1,5 +1,6 @@
 use anyhow::Context;
 use anyhow::{Result, bail};
+use client_sdk::IronMeshClient;
 use reqwest::StatusCode;
 use std::fs;
 use std::path::Path;
@@ -304,6 +305,35 @@ pub async fn wait_for_object_payload(
     }
 
     bail!("object {key} did not replicate to expected payload at {base_url}/store/{key}");
+}
+
+pub async fn wait_for_store_index_entry(
+    sdk: &IronMeshClient,
+    prefix: Option<&str>,
+    depth: usize,
+    expected_path: &str,
+    expected_entry_type: &str,
+    present: bool,
+    retries: usize,
+) -> Result<()> {
+    for _ in 0..retries {
+        if let Ok(index) = sdk.store_index(prefix, depth, None).await {
+            let found = index.entries.iter().any(|entry| {
+                entry.path == expected_path && entry.entry_type == expected_entry_type
+            });
+            if found == present {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let expected_state = if present { "present" } else { "absent" };
+    let prefix_label = prefix.unwrap_or("<root>");
+    bail!(
+        "store index did not report {expected_entry_type} path={expected_path} as {expected_state} for prefix={prefix_label} depth={depth}"
+    );
 }
 
 pub async fn stop_server(child: &mut ChildGuard) {

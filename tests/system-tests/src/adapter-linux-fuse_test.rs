@@ -2,7 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::framework::{ChildGuard, binary_path, fresh_data_dir, start_server, stop_server};
+    use crate::framework::{
+        ChildGuard, binary_path, fresh_data_dir, start_server, stop_server,
+        wait_for_store_index_entry,
+    };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
@@ -157,11 +160,10 @@ mod tests {
         let mut server = start_server(bind).await?;
         let sdk = IronMeshClient::new(&base_url);
 
-        let nested_dirs = vec!["l1", "l1/l2", "l1/l2/l3"];
-        let uploaded_files = vec![
-            ("l1/small-l1.txt", b"upload-l1".to_vec()),
-            ("l1/l2/small-l2.txt", b"upload-l2".to_vec()),
-            ("l1/l2/l3/small-l3.txt", b"upload-l3".to_vec()),
+        let nested_steps = vec![
+            ("l1", "l1/small-l1.txt", b"upload-l1".to_vec()),
+            ("l1/l2", "l1/l2/small-l2.txt", b"upload-l2".to_vec()),
+            ("l1/l2/l3", "l1/l2/l3/small-l3.txt", b"upload-l3".to_vec()),
         ];
 
         let result = async {
@@ -174,7 +176,8 @@ mod tests {
                 let seed_path = mountpoint.join("seed-nested.txt");
                 wait_for_file(&seed_path, 100).await?;
 
-                for dir in &nested_dirs {
+                for step_index in 0..nested_steps.len() {
+                    let (dir, key, payload) = &nested_steps[step_index];
                     let dir_path = mountpoint.join(dir);
                     fs::create_dir(&dir_path).with_context(|| {
                         format!("failed to create mounted directory {}", dir_path.display())
@@ -184,14 +187,37 @@ mod tests {
                         "expected mounted directory to exist: {}",
                         dir_path.display()
                     );
-                }
-
-                for (key, payload) in &uploaded_files {
                     let mounted_path = mountpoint.join(key);
                     fs::write(&mounted_path, payload).with_context(|| {
                         format!("failed to write mounted file {}", mounted_path.display())
                     })?;
                     wait_for_object_bytes(&sdk, key, payload, 150).await?;
+
+                    for step in nested_steps.iter().take(step_index + 1) {
+                        let (verify_dir, verify_key, _) = &step;
+                        let verify_dir_prefix = format!("{verify_dir}/");
+                        let parent = verify_dir.rsplit_once('/').map(|(parent, _)| parent);
+                        wait_for_store_index_entry(
+                            &sdk,
+                            parent,
+                            1,
+                            &verify_dir_prefix,
+                            "prefix",
+                            true,
+                            150,
+                        )
+                        .await?;
+                        wait_for_store_index_entry(
+                            &sdk,
+                            Some(verify_dir),
+                            1,
+                            verify_key,
+                            "key",
+                            true,
+                            150,
+                        )
+                        .await?;
+                    }
                 }
 
                 Ok::<(), anyhow::Error>(())
@@ -203,23 +229,31 @@ mod tests {
             // Remount to validate download/hydration from server for each uploaded file.
             let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
             let phase_two = async {
-                for (key, payload) in &uploaded_files {
+                for (dir, key, payload) in &nested_steps {
                     let mounted_path = mountpoint.join(key);
                     wait_for_file(&mounted_path, 100).await?;
                     let downloaded = fs::read(&mounted_path).with_context(|| {
                         format!("failed to read mounted file {}", mounted_path.display())
                     })?;
                     assert_eq!(downloaded, *payload);
+
+                    let dir_prefix = format!("{dir}/");
+                    let parent = dir.rsplit_once('/').map(|(parent, _)| parent);
+                    wait_for_store_index_entry(&sdk, parent, 1, &dir_prefix, "prefix", true, 150)
+                        .await?;
+                    wait_for_store_index_entry(&sdk, Some(dir), 1, key, "key", true, 150).await?;
                 }
 
-                for (key, _) in uploaded_files.iter().rev() {
+                for step_index in (0..nested_steps.len()).rev() {
+                    let (_, key, _) = nested_steps[step_index];
                     let mounted_path = mountpoint.join(key);
                     fs::remove_file(&mounted_path).with_context(|| {
                         format!("failed to remove mounted file {}", mounted_path.display())
                     })?;
                 }
 
-                for dir in nested_dirs.iter().rev() {
+                for step_index in (0..nested_steps.len()).rev() {
+                    let (dir, _, _) = nested_steps[step_index];
                     let dir_path = mountpoint.join(dir);
                     fs::remove_dir(&dir_path).with_context(|| {
                         format!("failed to remove mounted directory {}", dir_path.display())
