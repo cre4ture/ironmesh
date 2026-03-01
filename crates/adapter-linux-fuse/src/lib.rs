@@ -1032,6 +1032,41 @@ pub mod runtime {
         fuser::mount2(fs, &config.mountpoint, &config.mount_options())?;
         Ok(())
     }
+
+    pub fn mount_action_plan_until_shutdown(
+        config: &FuseMountConfig,
+        action_plan: FuseActionPlan,
+        hydrator: Box<dyn Hydrator>,
+        uploader: Box<dyn Uploader>,
+    ) -> Result<()> {
+        if !Path::new(&config.mountpoint).exists() {
+            return Err(anyhow!(
+                "mountpoint does not exist: {}",
+                config.mountpoint.display()
+            ));
+        }
+
+        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader);
+        let session = fuser::spawn_mount2(fs, &config.mountpoint, &config.mount_options())
+            .with_context(|| {
+                format!(
+                    "failed to mount FUSE filesystem at {}",
+                    config.mountpoint.display()
+                )
+            })?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        ctrlc::set_handler(move || {
+            let _ = tx.send(());
+        })
+        .context("failed to install Ctrl+C handler")?;
+
+        rx.recv()
+            .context("failed waiting for Ctrl+C shutdown signal")?;
+
+        drop(session);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

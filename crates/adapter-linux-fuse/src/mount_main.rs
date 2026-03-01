@@ -2,7 +2,8 @@
 
 use crate::LinuxFuseAdapter;
 use crate::runtime::{
-    DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, Uploader, mount_action_plan,
+    DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, Uploader,
+    mount_action_plan_until_shutdown,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -64,7 +65,7 @@ pub fn mount_main() -> Result<()> {
     let mut config = FuseMountConfig::new(args.mountpoint, args.fs_name);
     config.allow_other = args.allow_other;
 
-    mount_action_plan(&config, actions, hydrator, uploader)
+    mount_action_plan_until_shutdown(&config, actions, hydrator, uploader)
 }
 
 #[derive(Clone)]
