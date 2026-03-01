@@ -307,6 +307,7 @@ pub async fn wait_for_object_payload(
     bail!("object {key} did not replicate to expected payload at {base_url}/store/{key}");
 }
 
+#[allow(dead_code)]
 pub async fn wait_for_store_index_entry(
     sdk: &IronMeshClient,
     prefix: Option<&str>,
