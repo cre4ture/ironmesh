@@ -1,13 +1,15 @@
 #![cfg(not(windows))]
 
-use crate::LinuxFuseAdapter;
 use crate::runtime::{
     DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, Uploader,
     mount_action_plan_until_shutdown, mount_action_plan_until_shutdown_with_updates,
 };
+use crate::{FuseAction, FuseActionPlan, LinuxFuseAdapter};
 use anyhow::{Context, Result};
 use clap::Parser;
-use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, normalize_server_base_url};
+use client_sdk::{
+    IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, normalize_server_base_url,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,7 +93,16 @@ pub fn mount_main() -> Result<()> {
         Some(snapshot),
         refresh_fetcher,
         move |update| {
-            let plan = refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
+            let full_plan = refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
+            let plan = filter_refresh_action_plan(full_plan, &update.changed_paths);
+            if plan.actions.is_empty() {
+                eprintln!(
+                    "remote-refresh: detected {} changed remote paths; no local plan delta",
+                    update.changed_paths.len()
+                );
+                return;
+            }
+
             if refresh_tx.send(plan).is_err() {
                 refresh_stop_signal.store(false, Ordering::SeqCst);
                 return;
@@ -116,6 +127,34 @@ pub fn mount_main() -> Result<()> {
     let _ = refresh_thread.join();
 
     result
+}
+
+fn filter_refresh_action_plan(plan: FuseActionPlan, changed_paths: &[String]) -> FuseActionPlan {
+    if changed_paths.is_empty() {
+        return FuseActionPlan::default();
+    }
+
+    let mut changed = std::collections::HashSet::new();
+    for path in changed_paths {
+        changed.insert(path.as_str());
+    }
+
+    let actions = plan
+        .actions
+        .into_iter()
+        .filter(|action| {
+            let path = match action {
+                FuseAction::EnsureDirectory { path }
+                | FuseAction::EnsurePlaceholder { path, .. }
+                | FuseAction::HydrateOnRead { path, .. }
+                | FuseAction::UploadOnFlush { path, .. }
+                | FuseAction::MarkConflict { path, .. } => path,
+            };
+            changed.contains(path.as_str())
+        })
+        .collect();
+
+    FuseActionPlan { actions }
 }
 
 #[derive(Clone)]
@@ -152,5 +191,39 @@ impl Uploader for ServerNodeIo {
             .put_large_aware_reader(path.to_string(), reader, length)
             .with_context(|| format!("failed to upload object for path {path}"))?;
         Ok(Some("server-head".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_refresh_action_plan_keeps_only_changed_paths() {
+        let plan = FuseActionPlan {
+            actions: vec![
+                FuseAction::EnsureDirectory {
+                    path: "docs".to_string(),
+                },
+                FuseAction::EnsurePlaceholder {
+                    path: "docs/new.txt".to_string(),
+                    remote_version: "v1".to_string(),
+                },
+                FuseAction::EnsurePlaceholder {
+                    path: "notes/todo.txt".to_string(),
+                    remote_version: "v3".to_string(),
+                },
+            ],
+        };
+
+        let filtered = filter_refresh_action_plan(plan, &["docs/new.txt".to_string()]);
+
+        assert_eq!(
+            filtered.actions,
+            vec![FuseAction::EnsurePlaceholder {
+                path: "docs/new.txt".to_string(),
+                remote_version: "v1".to_string(),
+            }],
+        );
     }
 }

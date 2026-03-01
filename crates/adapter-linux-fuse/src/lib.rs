@@ -110,7 +110,7 @@ pub mod runtime {
     use std::ffi::OsStr;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc::{Receiver, TryRecvError};
+    use std::sync::mpsc::Receiver;
     use std::time::{Duration, SystemTime};
 
     const ROOT_INODE: u64 = 1;
@@ -416,7 +416,13 @@ pub mod runtime {
             }
         }
 
-        fn ensure_placeholder_file_if_missing(
+        fn inode_has_active_writer(&self, inode: u64) -> bool {
+            self.open_handles
+                .values()
+                .any(|handle| handle.inode == inode && handle.write_access)
+        }
+
+        fn ensure_placeholder_file_for_refresh(
             &mut self,
             relative_path: &str,
             remote_version: &str,
@@ -433,12 +439,35 @@ pub mod runtime {
             let parent_path = segments.join("/");
             let parent_inode = self.ensure_directory(&parent_path);
 
-            if self
+            let existing = self
                 .nodes
                 .get(&parent_inode)
-                .and_then(|node| node.children.get(file_name).copied())
-                .is_some()
-            {
+                .and_then(|node| node.children.get(file_name).copied());
+
+            if let Some(inode) = existing {
+                if self.inode_has_active_writer(inode) {
+                    return;
+                }
+
+                let Some(file) = self.nodes.get_mut(&inode) else {
+                    return;
+                };
+                if file.kind != FileType::RegularFile {
+                    return;
+                }
+
+                let already_placeholder = file.placeholder_version.as_deref()
+                    == Some(remote_version)
+                    && file.data.is_empty()
+                    && file.size == 0;
+                if already_placeholder {
+                    return;
+                }
+
+                file.placeholder_version = Some(remote_version.to_string());
+                file.data.clear();
+                file.size = 0;
+                file.modified_at = SystemTime::now();
                 return;
             }
 
@@ -469,7 +498,7 @@ pub mod runtime {
                         path,
                         remote_version,
                     } => {
-                        self.ensure_placeholder_file_if_missing(path, remote_version);
+                        self.ensure_placeholder_file_for_refresh(path, remote_version);
                     }
                     FuseAction::UploadOnFlush { .. } | FuseAction::MarkConflict { .. } => {}
                 }
@@ -477,15 +506,15 @@ pub mod runtime {
         }
 
         fn drain_remote_updates(&mut self) {
-            let Some(refresh_rx) = self.refresh_rx.as_ref() else {
-                return;
-            };
-
-            loop {
-                match refresh_rx.try_recv() {
-                    Ok(action_plan) => self.apply_remote_action_plan_additive(&action_plan),
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            let mut pending = Vec::new();
+            if let Some(refresh_rx) = self.refresh_rx.as_ref() {
+                while let Ok(action_plan) = refresh_rx.try_recv() {
+                    pending.push(action_plan);
                 }
+            }
+
+            for action_plan in pending {
+                self.apply_remote_action_plan_additive(&action_plan);
             }
         }
 

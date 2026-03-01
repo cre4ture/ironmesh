@@ -63,6 +63,22 @@ mod tests {
         bail!("expected mounted file does not exist: {}", path.display());
     }
 
+    async fn wait_for_file_bytes(path: &Path, expected: &[u8], retries: usize) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(bytes) = fs::read(path)
+                && bytes.as_slice() == expected
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "expected mounted file {} to match provided bytes",
+            path.display()
+        );
+    }
+
     async fn wait_for_dir(path: &Path, retries: usize) -> Result<()> {
         for _ in 0..retries {
             if path.is_dir() {
@@ -357,6 +373,47 @@ mod tests {
         result
     }
 
+    async fn run_remote_update_refresh_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-remote-update-refresh");
+        let mut server = start_server(bind).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            let remote_key = "live-refresh/updated.txt";
+            sdk.put_large_aware(remote_key, Bytes::from_static(b"version-one"))
+                .await?;
+
+            let mut adapter =
+                start_linux_fuse_adapter_with_refresh(&base_url, &mountpoint, 250).await?;
+            let scenario = async {
+                let mounted_file = mountpoint.join(remote_key);
+                wait_for_file(&mounted_file, 180).await?;
+                wait_for_file_bytes(&mounted_file, b"version-one", 180).await?;
+
+                sdk.put_large_aware(remote_key, Bytes::from_static(b"version-two-extended"))
+                    .await?;
+
+                wait_for_file_bytes(&mounted_file, b"version-two-extended", 220).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
     #[tokio::test]
     async fn linux_fuse_server_mode_uploads_small_payload() -> Result<()> {
         run_server_mode_upload_case(
@@ -395,5 +452,10 @@ mod tests {
     #[tokio::test]
     async fn linux_fuse_remote_additions_materialize_without_remount() -> Result<()> {
         run_remote_additions_refresh_case("127.0.0.1:19363").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_remote_file_update_refreshes_without_remount() -> Result<()> {
+        run_remote_update_refresh_case("127.0.0.1:19364").await
     }
 }
