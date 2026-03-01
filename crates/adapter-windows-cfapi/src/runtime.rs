@@ -1,4 +1,5 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
+use crate::cfapi::path_is_placeholder;
 use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
 use crate::monitor::SyncRootMonitor;
 use anyhow::{Result, anyhow};
@@ -126,6 +127,7 @@ impl CfapiRuntime {
         relative_path: &str,
         hydrator: &dyn Hydrator,
     ) -> Result<Vec<u8>> {
+        eprintln!("handle_fetch_data: requested path={relative_path}");
         let normalized = normalize_path(relative_path);
         let remote_versions = self
             .remote_versions_by_path
@@ -225,6 +227,7 @@ struct CallbackContext {
     hydrator: Box<dyn Hydrator>,
     uploader: std::sync::Arc<dyn Uploader>,
     hydrated_once_paths: Mutex<HashSet<String>>,
+    paths_by_file_id: Mutex<std::collections::HashMap<i64, String>>,
     /// Map of request key -> recorded open info (flags + initial metadata)
     opens: Mutex<std::collections::HashMap<u64, OpenInfo>>,
 }
@@ -286,6 +289,25 @@ pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
     let root_path_utf16 = utf16_path(root_path);
     let hr = unsafe { CfUnregisterSyncRoot(root_path_utf16.as_ptr()) };
     hresult_to_result(hr, "CfUnregisterSyncRoot")
+}
+
+fn parse_size_from_remote_version(remote_version: &str) -> Option<i64> {
+    let (_, size_str) = remote_version.rsplit_once(":size=")?;
+    size_str.parse::<i64>().ok().filter(|size| *size >= 0)
+}
+
+fn encode_file_identity(relative_path: &str, remote_version: &str) -> Vec<u8> {
+    format!("path={relative_path}\nversion={remote_version}").into_bytes()
+}
+
+fn decode_path_from_file_identity(file_identity: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(file_identity).ok()?;
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("path=") {
+            return Some(normalize_path(path));
+        }
+    }
+    None
 }
 
 pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()> {
@@ -354,23 +376,27 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
             FileAttributes: FILE_ATTRIBUTE_NORMAL,
             ..Default::default()
         };
+        let file_size = parse_size_from_remote_version(&remote_version).unwrap_or(0);
         let metadata = CF_FS_METADATA {
             BasicInfo: basic_info,
-            FileSize: 0,
+            FileSize: file_size,
         };
 
         inputs.push(PlaceholderInput {
             base_dir,
             child_name: child_name.to_string(),
             relative_name_utf16: utf16_string(child_name),
-            identity: remote_version.into_bytes(),
+            identity: encode_file_identity(&relative_path, &remote_version),
             metadata,
         });
     }
 
     let mut by_base_dir: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
     for (idx, input) in inputs.iter().enumerate() {
-        by_base_dir.entry(input.base_dir.clone()).or_default().push(idx);
+        by_base_dir
+            .entry(input.base_dir.clone())
+            .or_default()
+            .push(idx);
     }
 
     for (base_dir, indices) in by_base_dir {
@@ -452,6 +478,7 @@ pub fn connect_sync_root(
         hydrator,
         uploader: uploader.clone(),
         hydrated_once_paths: Mutex::new(HashSet::new()),
+        paths_by_file_id: Mutex::new(std::collections::HashMap::new()),
         opens: Mutex::new(std::collections::HashMap::new()),
     });
 
@@ -530,7 +557,38 @@ unsafe extern "system" fn callback_fetch_data(
     let context = unsafe { &*context_ptr };
 
     let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
-    let relative_path = path_to_relative(&context.sync_root, &normalized_path);
+    let mut relative_path = if normalized_path.is_empty() {
+        String::new()
+    } else {
+        path_to_relative(&context.sync_root, &normalized_path)
+    };
+    if relative_path.is_empty()
+        && let Ok(paths_by_file_id) = context.paths_by_file_id.lock()
+        && let Some(mapped) = paths_by_file_id.get(&callback_info_ref.FileId)
+    {
+        relative_path = mapped.clone();
+    }
+    if relative_path.is_empty()
+        && !callback_info_ref.FileIdentity.is_null()
+        && callback_info_ref.FileIdentityLength > 0
+    {
+        let file_identity = unsafe {
+            std::slice::from_raw_parts(
+                callback_info_ref.FileIdentity.cast::<u8>(),
+                callback_info_ref.FileIdentityLength as usize,
+            )
+        };
+        if let Some(decoded_path) = decode_path_from_file_identity(file_identity) {
+            relative_path = decoded_path;
+        }
+    }
+    if relative_path.is_empty() {
+        eprintln!(
+            "cfapi fetch-data could not resolve relative path: normalized_path='{}' file_id={}",
+            normalized_path, callback_info_ref.FileId
+        );
+        return;
+    }
 
     let payload = match context
         .runtime
@@ -576,6 +634,11 @@ unsafe extern "system" fn callback_file_open(
     // Capture initial metadata (size + mtime) if available so we can detect writes.
     let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
     let relative = path_to_relative(&context.sync_root, &normalized_path);
+    if !relative.is_empty()
+        && let Ok(mut paths_by_file_id) = context.paths_by_file_id.lock()
+    {
+        paths_by_file_id.insert(callback_info_ref.FileId, relative.clone());
+    }
     let full_path = context.sync_root.join(&relative);
     let (size, mtime_secs) = match std::fs::metadata(&full_path) {
         Ok(m) => {
@@ -637,6 +700,11 @@ unsafe extern "system" fn callback_file_close_completion(
     }
 
     let relative_path = path_to_relative(&context.sync_root, &normalized_path);
+    if !relative_path.is_empty()
+        && let Ok(mut paths_by_file_id) = context.paths_by_file_id.lock()
+    {
+        paths_by_file_id.insert(callback_info_ref.FileId, relative_path.clone());
+    }
     eprintln!(
         "close-completion: relative_path={}, normalized_path={}, sync_root={:?}",
         relative_path, normalized_path, context.sync_root
@@ -650,33 +718,21 @@ unsafe extern "system" fn callback_file_close_completion(
     let request_key = callback_info_ref.RequestKey as u64;
     if let Ok(mut opens) = context.opens.lock()
         && let Some(open_info) = opens.remove(&request_key)
+        && let Ok(metadata) = std::fs::metadata(&full_path)
     {
-        // CF provides open completion flags; check for write access flag.
-        if (open_info.flags & CF_OPEN_FILE_FLAG_WRITE_ACCESS as u32) == 0 {
+        let size = metadata.len();
+        let mtime_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if size == open_info.size && mtime_secs == open_info.mtime_secs {
             eprintln!(
-                "close-completion: open flags indicate no write access (flags=0x{:08x}); doing upload anyway",
-                open_info.flags
+                "close-completion: unchanged file close (flags=0x{:08x}); skipping upload for {}",
+                open_info.flags, relative_path
             );
-            // return;
-        }
-
-        // We saw a write-capable open; check if file changed since open.
-        if let Ok(metadata) = std::fs::metadata(&full_path) {
-            let size = metadata.len();
-            let mtime_secs = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if size == open_info.size && mtime_secs == open_info.mtime_secs {
-                eprintln!(
-                    "close-completion: file opened write-capable but unchanged; doing upload anyway"
-                );
-                // return;
-            }
-        } else {
-            // If metadata now unavailable but open existed, proceed to upload as a fallback.
+            return;
         }
     }
 
@@ -699,6 +755,13 @@ unsafe extern "system" fn callback_file_close_completion(
             return;
         }
     };
+    if path_is_placeholder(&full_path) {
+        eprintln!(
+            "close-completion: {} is still a placeholder; skipping upload",
+            relative_path
+        );
+        return;
+    }
     if metadata.is_dir() {
         eprintln!(
             "close-completion: {} is a directory, uploading directory metadata",

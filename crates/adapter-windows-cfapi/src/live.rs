@@ -2,7 +2,7 @@ use crate::runtime::{Hydrator, Uploader};
 use anyhow::{Context, Result};
 use client_sdk::{IronMeshClient, normalize_server_base_url};
 use reqwest::Url;
-use sync_core::SyncSnapshot;
+use sync_core::{EntryKind, SyncSnapshot};
 
 #[derive(Clone)]
 pub struct ServerNodeHydrator {
@@ -19,6 +19,7 @@ impl ServerNodeHydrator {
 
 impl Hydrator for ServerNodeHydrator {
     fn hydrate(&self, path: &str, _remote_version: &str) -> Result<Vec<u8>> {
+        eprintln!("hydrating path {path} from server");
         let mut bytes = Vec::new();
         self.sdk
             .get_with_selector_writer(path, None, None, &mut bytes)
@@ -38,7 +39,7 @@ impl Uploader for ServerNodeHydrator {
             .put_large_aware_reader(path.to_string(), reader, length)
             .with_context(|| format!("failed to upload object for path {path}"))?;
 
-        Ok(Some("server-head".to_string()))
+        Ok(Some(format!("server-head:size={length}")))
     }
 }
 
@@ -52,7 +53,22 @@ pub fn load_snapshot_from_server(
     depth: usize,
 ) -> Result<SyncSnapshot> {
     let sdk = IronMeshClient::new(base_url.as_str());
-    sdk.load_snapshot_from_server_blocking(prefix, depth, None)
+    let mut snapshot = sdk.load_snapshot_from_server_blocking(prefix, depth, None)?;
+
+    for entry in &mut snapshot.remote {
+        if entry.kind != EntryKind::File {
+            continue;
+        }
+
+        let size = sdk
+            .get_object_size_blocking(&entry.path, None, None)
+            .with_context(|| format!("failed to fetch remote size for {}", entry.path))?;
+
+        let base_version = entry.version.as_deref().unwrap_or("server-head");
+        entry.version = Some(format!("{base_version}:size={size}"));
+    }
+
+    Ok(snapshot)
 }
 
 #[cfg(test)]

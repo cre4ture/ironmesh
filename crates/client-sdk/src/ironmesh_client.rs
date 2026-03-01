@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
+use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -412,6 +413,64 @@ impl IronMeshClient {
             .flush()
             .with_context(|| format!("failed to flush output for key={key}"))?;
         Ok(())
+    }
+
+    pub async fn get_object_size(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<u64> {
+        let key = key.as_ref();
+        let url = self.store_key_url(key)?;
+
+        let mut request = self.http.head(url);
+        if let Some(snapshot) = snapshot {
+            request = request.query(&[("snapshot", snapshot)]);
+        }
+        if let Some(version) = version {
+            request = request.query(&[("version", version)]);
+        }
+
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("failed to HEAD object key={key}"))?;
+
+        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            let bytes = self.get_with_selector(key, snapshot, version).await?;
+            return Ok(bytes.len() as u64);
+        }
+
+        let response = response
+            .error_for_status()
+            .with_context(|| format!("object not found or inaccessible key={key}"))?;
+
+        if let Some(content_length) = response.content_length()
+            && content_length > 0
+        {
+            return Ok(content_length);
+        }
+
+        let bytes = self.get_with_selector(key, snapshot, version).await?;
+        Ok(bytes.len() as u64)
+    }
+
+    pub fn get_object_size_blocking(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<u64> {
+        let key = key.as_ref().to_string();
+        let snapshot = snapshot.map(|value| value.to_string());
+        let version = version.map(|value| value.to_string());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for object size request")?;
+        runtime.block_on(self.get_object_size(&key, snapshot.as_deref(), version.as_deref()))
     }
 
     fn store_key_url(&self, key: &str) -> Result<String> {
