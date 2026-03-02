@@ -79,16 +79,18 @@ fn main() -> Result<()> {
 
     let mut local_state = scan_local_tree(&args.root_dir)
         .context("failed to scan local state after initial remote sync")?;
+    local_state = startup_baseline_state_from_remote_index(&local_state, &remote_index);
+
+    sync_local_changes(
+        &args.root_dir,
+        &client,
+        &mut local_state,
+        &scope,
+        &mut remote_index,
+        &mut suppressed_uploads,
+    )?;
 
     if args.run_once {
-        sync_local_changes(
-            &args.root_dir,
-            &client,
-            &mut local_state,
-            &scope,
-            &mut remote_index,
-            &mut suppressed_uploads,
-        )?;
         return Ok(());
     }
 
@@ -179,6 +181,31 @@ fn install_ctrlc_handler(running: Arc<AtomicBool>) -> Result<()> {
         running.store(false, Ordering::SeqCst);
     })
     .context("failed to install Ctrl+C handler")
+}
+
+fn startup_baseline_state_from_remote_index(
+    local_state: &LocalTreeState,
+    remote_index: &RemoteTreeIndex,
+) -> LocalTreeState {
+    let mut baseline = LocalTreeState::new();
+
+    for path in &remote_index.directories {
+        if let Some(entry_state) = local_state.get(path)
+            && entry_state.kind == LocalEntryKind::Directory
+        {
+            baseline.insert(path.clone(), entry_state.clone());
+        }
+    }
+
+    for path in &remote_index.files {
+        if let Some(entry_state) = local_state.get(path)
+            && entry_state.kind == LocalEntryKind::File
+        {
+            baseline.insert(path.clone(), entry_state.clone());
+        }
+    }
+
+    baseline
 }
 
 fn start_local_watcher(

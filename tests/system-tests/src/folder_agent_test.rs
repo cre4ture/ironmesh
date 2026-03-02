@@ -428,8 +428,132 @@ async fn folder_agent_propagates_local_file_deletions_to_remote() -> Result<()> 
 }
 
 #[tokio::test]
-async fn folder_agent_prefix_scope_maps_local_root_to_selected_remote_subtree() -> Result<()> {
+async fn folder_agent_detects_remote_add_and_modify_done_while_stopped_after_restart() -> Result<()>
+{
     let bind = "127.0.0.1:19415";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-restart-remote-change-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware(
+            "restart-detect/existing.txt",
+            Bytes::from_static(b"before-stop-version"),
+        )
+        .await?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        wait_for_local_file_bytes(
+            &local_root.join("restart-detect/existing.txt"),
+            b"before-stop-version",
+            220,
+        )
+        .await?;
+        stop_folder_agent(&mut first_run).await;
+
+        sdk.put_large_aware(
+            "restart-detect/existing.txt",
+            Bytes::from_static(b"after-restart-modified"),
+        )
+        .await?;
+        sdk.put_large_aware(
+            "restart-detect/offline/new.txt",
+            Bytes::from_static(b"after-restart-added"),
+        )
+        .await?;
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            wait_for_local_file_bytes(
+                &local_root.join("restart-detect/existing.txt"),
+                b"after-restart-modified",
+                220,
+            )
+            .await?;
+            wait_for_local_file_bytes(
+                &local_root.join("restart-detect/offline/new.txt"),
+                b"after-restart-added",
+                220,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_detects_local_add_and_modify_done_while_stopped_after_restart() -> Result<()>
+{
+    let bind = "127.0.0.1:19416";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-restart-local-change-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        stop_folder_agent(&mut first_run).await;
+
+        fs::create_dir_all(local_root.join("local-offline")).with_context(|| {
+            format!(
+                "failed to create local directory {}",
+                local_root.join("local-offline").display()
+            )
+        })?;
+        fs::write(local_root.join("local-offline/new.txt"), b"offline-v1").with_context(|| {
+            format!(
+                "failed to write local file {}",
+                local_root.join("local-offline/new.txt").display()
+            )
+        })?;
+        fs::write(
+            local_root.join("local-offline/new.txt"),
+            b"offline-v2-modified",
+        )
+        .with_context(|| {
+            format!(
+                "failed to modify local file {}",
+                local_root.join("local-offline/new.txt").display()
+            )
+        })?;
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            wait_for_remote_file_bytes(&sdk, "local-offline/new.txt", b"offline-v2-modified", 220)
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_prefix_scope_maps_local_root_to_selected_remote_subtree() -> Result<()> {
+    let bind = "127.0.0.1:19417";
     let base_url = format!("http://{bind}");
     let local_root = fresh_data_dir("folder-agent-prefix-scope-root");
     let scope_prefix = "scoped/team-a";
