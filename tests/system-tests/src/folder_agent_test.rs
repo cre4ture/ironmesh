@@ -505,38 +505,61 @@ async fn folder_agent_detects_local_add_and_modify_done_while_stopped_after_rest
     let sdk = IronMeshClient::new(&base_url);
 
     let result = async {
-        let mut first_run =
-            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
-        stop_folder_agent(&mut first_run).await;
-
         fs::create_dir_all(local_root.join("local-offline")).with_context(|| {
             format!(
                 "failed to create local directory {}",
                 local_root.join("local-offline").display()
             )
         })?;
-        fs::write(local_root.join("local-offline/new.txt"), b"offline-v1").with_context(|| {
+        fs::write(local_root.join("local-offline/new1.txt"), b"offline-v1").with_context(|| {
             format!(
                 "failed to write local file {}",
-                local_root.join("local-offline/new.txt").display()
+                local_root.join("local-offline/new1.txt").display()
+            )
+        })?;
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        stop_folder_agent(&mut first_run).await;
+
+        fs::create_dir_all(local_root.join("local-offline2")).with_context(|| {
+            format!(
+                "failed to create local directory {}",
+                local_root.join("local-offline2").display()
+            )
+        })?;
+        fs::write(local_root.join("local-offline2/new1.txt"), b"offline-v1").with_context(|| {
+            format!(
+                "failed to write local file {}",
+                local_root.join("local-offline2/new1.txt").display()
+            )
+        })?;
+
+        fs::write(local_root.join("local-offline/new2.txt"), b"offline-v1").with_context(|| {
+            format!(
+                "failed to write local file {}",
+                local_root.join("local-offline/new2.txt").display()
             )
         })?;
         fs::write(
-            local_root.join("local-offline/new.txt"),
+            local_root.join("local-offline/new1.txt"),
             b"offline-v2-modified",
         )
         .with_context(|| {
             format!(
                 "failed to modify local file {}",
-                local_root.join("local-offline/new.txt").display()
+                local_root.join("local-offline/new1.txt").display()
             )
         })?;
 
         let mut second_run =
             start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
         let scenario = async {
-            wait_for_remote_file_bytes(&sdk, "local-offline/new.txt", b"offline-v2-modified", 220)
+            wait_for_remote_file_bytes(&sdk, "local-offline2/new1.txt", b"offline-v1", 220)
                 .await?;
+            wait_for_remote_file_bytes(&sdk, "local-offline/new1.txt", b"offline-v2-modified", 220)
+                .await?;
+            wait_for_remote_file_bytes(&sdk, "local-offline/new2.txt", b"offline-v1", 220)
+                .await?; 
             Ok::<(), anyhow::Error>(())
         }
         .await;
