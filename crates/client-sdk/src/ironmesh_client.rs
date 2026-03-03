@@ -42,6 +42,10 @@ struct StoreChunkUploadResponse {
 pub struct StoreIndexEntry {
     pub path: String,
     pub entry_type: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -742,6 +746,8 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
             entries.push(StoreIndexEntry {
                 path: marker,
                 entry_type: "prefix".to_string(),
+                version: None,
+                content_hash: None,
             });
         }
     }
@@ -761,10 +767,14 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
             continue;
         }
 
+        let version = entry.version.unwrap_or_else(|| "server-head".to_string());
+        let content_hash = entry
+            .content_hash
+            .unwrap_or_else(|| format!("server-head:{}", entry.path));
         remote.push(NamespaceEntry::file(
             entry.path.clone(),
-            "server-head",
-            format!("server-head:{}", entry.path),
+            version,
+            content_hash,
         ));
     }
 
@@ -799,10 +809,14 @@ mod tests {
             StoreIndexEntry {
                 path: "docs/".to_string(),
                 entry_type: "prefix".to_string(),
+                version: None,
+                content_hash: None,
             },
             StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                version: None,
+                content_hash: None,
             },
         ]);
 
@@ -824,6 +838,8 @@ mod tests {
         let mut entries = vec![StoreIndexEntry {
             path: "a/b/c.txt".to_string(),
             entry_type: "key".to_string(),
+            version: None,
+            content_hash: None,
         }];
 
         ensure_missing_folder_markers(&mut entries);
@@ -841,10 +857,14 @@ mod tests {
             StoreIndexEntry {
                 path: "docs/".to_string(),
                 entry_type: "prefix".to_string(),
+                version: None,
+                content_hash: None,
             },
             StoreIndexEntry {
                 path: "docs/guides/readme.md".to_string(),
                 entry_type: "key".to_string(),
+                version: None,
+                content_hash: None,
             },
         ];
 
