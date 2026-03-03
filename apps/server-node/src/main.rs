@@ -577,6 +577,18 @@ async fn main() -> Result<()> {
             "/maintenance/tombstones/compact",
             post(run_tombstone_compaction),
         )
+        .route(
+            "/maintenance/tombstones/archive",
+            get(list_tombstone_archives),
+        )
+        .route(
+            "/maintenance/tombstones/archive/restore",
+            post(run_tombstone_archive_restore),
+        )
+        .route(
+            "/maintenance/tombstones/archive/purge",
+            post(run_tombstone_archive_purge),
+        )
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1611,6 +1623,14 @@ struct CleanupQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct TombstoneRestoreQuery {
+    object_id: String,
+    archive_file: Option<String>,
+    overwrite: Option<bool>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct InternalNodeTokenRotateRequest {
     node_id: NodeId,
     token: String,
@@ -2530,6 +2550,66 @@ async fn run_tombstone_compaction(
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
         Err(err) => {
             tracing::error!(error = %err, "maintenance tombstone compaction failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn list_tombstone_archives(State(state): State<ServerState>) -> impl IntoResponse {
+    let store = state.store.lock().await;
+    match store.list_tombstone_archives().await {
+        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to list tombstone archives");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn run_tombstone_archive_restore(
+    State(state): State<ServerState>,
+    Query(query): Query<TombstoneRestoreQuery>,
+) -> impl IntoResponse {
+    let object_id = query.object_id.trim();
+    if object_id.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let dry_run = query.dry_run.unwrap_or(true);
+    let overwrite = query.overwrite.unwrap_or(false);
+    let store = state.store.lock().await;
+    match store
+        .restore_tombstone_index_from_archive(
+            object_id,
+            query.archive_file.as_deref(),
+            overwrite,
+            dry_run,
+        )
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, object_id = %object_id, "failed to restore tombstone archive");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn run_tombstone_archive_purge(
+    State(state): State<ServerState>,
+    Query(query): Query<CleanupQuery>,
+) -> impl IntoResponse {
+    let retention_secs = query.retention_secs.unwrap_or(60 * 60 * 24 * 180);
+    let dry_run = query.dry_run.unwrap_or(true);
+
+    let store = state.store.lock().await;
+    match store
+        .purge_tombstone_archives(retention_secs, dry_run)
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to purge tombstone archives");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

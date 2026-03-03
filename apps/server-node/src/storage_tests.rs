@@ -461,6 +461,116 @@ async fn compact_tombstone_indexes_archives_and_removes_old_tombstoned_index() {
 }
 
 #[tokio::test]
+async fn list_tombstone_archives_returns_metadata_for_compaction_artifacts() {
+    let root = test_store_dir("tombstone-archive-list");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    store
+        .put_object_versioned(
+            "gone",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("gone", PutOptions::default())
+        .await
+        .unwrap();
+    let compact = store.compact_tombstone_indexes(0, false).await.unwrap();
+    assert_eq!(compact.archived_indexes, 1);
+
+    let archives = store.list_tombstone_archives().await.unwrap();
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].entries >= 1);
+    assert!(archives[0].size_bytes > 0);
+    assert!(archives[0].file_name.ends_with(".jsonl"));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn restore_tombstone_index_from_archive_recreates_deleted_index() {
+    let root = test_store_dir("tombstone-archive-restore");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    store
+        .put_object_versioned(
+            "gone",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let before_delete = store.list_versions("gone").await.unwrap().unwrap();
+    let object_id = before_delete.object_id.clone();
+    let index_path = store.version_index_path(&object_id);
+    store
+        .tombstone_object("gone", PutOptions::default())
+        .await
+        .unwrap();
+    store.compact_tombstone_indexes(0, false).await.unwrap();
+    assert!(!fs::try_exists(&index_path).await.unwrap());
+
+    let dry_run = store
+        .restore_tombstone_index_from_archive(&object_id, None, false, true)
+        .await
+        .unwrap();
+    assert!(dry_run.found);
+    assert!(dry_run.would_restore);
+    assert!(!dry_run.restored);
+    assert!(!fs::try_exists(&index_path).await.unwrap());
+
+    let restored = store
+        .restore_tombstone_index_from_archive(&object_id, None, false, false)
+        .await
+        .unwrap();
+    assert!(restored.found);
+    assert!(restored.restored);
+    assert!(fs::try_exists(&index_path).await.unwrap());
+
+    let skipped = store
+        .restore_tombstone_index_from_archive(&object_id, None, false, false)
+        .await
+        .unwrap();
+    assert!(skipped.skipped_existing);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn purge_tombstone_archives_dry_run_then_delete() {
+    let root = test_store_dir("tombstone-archive-purge");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    store
+        .put_object_versioned(
+            "gone",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("gone", PutOptions::default())
+        .await
+        .unwrap();
+    store.compact_tombstone_indexes(0, false).await.unwrap();
+    assert_eq!(store.list_tombstone_archives().await.unwrap().len(), 1);
+
+    let dry_run = store.purge_tombstone_archives(0, true).await.unwrap();
+    assert!(dry_run.eligible_files >= 1);
+    assert_eq!(dry_run.deleted_files, 0);
+    assert_eq!(store.list_tombstone_archives().await.unwrap().len(), 1);
+
+    let deleted = store.purge_tombstone_archives(0, false).await.unwrap();
+    assert!(deleted.deleted_files >= 1);
+    assert!(store.list_tombstone_archives().await.unwrap().is_empty());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn load_repair_attempts_returns_empty_when_file_missing() {
     let root = test_store_dir("repair-attempts-empty");
     let store = PersistentStore::init(root.clone()).await.unwrap();

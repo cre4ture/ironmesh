@@ -146,6 +146,37 @@ pub struct TombstoneCompactionReport {
     pub archive_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TombstoneArchiveFileInfo {
+    pub file_name: String,
+    pub path: String,
+    pub modified_at_unix: u64,
+    pub size_bytes: u64,
+    pub entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TombstoneRestoreReport {
+    pub object_id: String,
+    pub source_archive_file: Option<String>,
+    pub dry_run: bool,
+    pub found: bool,
+    pub restored: bool,
+    pub skipped_existing: bool,
+    pub would_restore: bool,
+    pub index_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TombstoneArchivePurgeReport {
+    pub retention_secs: u64,
+    pub dry_run: bool,
+    pub scanned_files: usize,
+    pub eligible_files: usize,
+    pub deleted_files: usize,
+    pub kept_recent_files: usize,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -1696,6 +1727,213 @@ impl PersistentStore {
         })
     }
 
+    pub async fn list_tombstone_archives(&self) -> Result<Vec<TombstoneArchiveFileInfo>> {
+        let archive_dir = self.tombstone_archive_dir();
+        if !fs::try_exists(&archive_dir).await? {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = fs::read_dir(&archive_dir).await?;
+        let mut files = Vec::<TombstoneArchiveFileInfo>::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let metadata = fs::metadata(&path).await?;
+            let modified_at_unix = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_secs())
+                .unwrap_or(0);
+
+            let payload = fs::read(&path).await?;
+            let entries = payload
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .count();
+
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            files.push(TombstoneArchiveFileInfo {
+                file_name: file_name.to_string(),
+                path: path.to_string_lossy().to_string(),
+                modified_at_unix,
+                size_bytes: metadata.len(),
+                entries,
+            });
+        }
+
+        files.sort_by(|left, right| {
+            right
+                .modified_at_unix
+                .cmp(&left.modified_at_unix)
+                .then_with(|| left.file_name.cmp(&right.file_name))
+        });
+        Ok(files)
+    }
+
+    pub async fn restore_tombstone_index_from_archive(
+        &self,
+        object_id: &str,
+        archive_file: Option<&str>,
+        overwrite: bool,
+        dry_run: bool,
+    ) -> Result<TombstoneRestoreReport> {
+        let archive_candidates = if let Some(file_name) = archive_file {
+            vec![self.validate_archive_file(file_name).await?]
+        } else {
+            self.list_archive_paths().await?
+        };
+
+        let mut selected: Option<(String, ArchivedTombstoneIndexRecord)> = None;
+        for path in archive_candidates {
+            let file_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let payload = fs::read(&path).await?;
+            for line in payload
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                let record = serde_json::from_slice::<ArchivedTombstoneIndexRecord>(line)
+                    .with_context(|| {
+                        format!("invalid tombstone archive record in {}", path.display())
+                    })?;
+                if record.object_id != object_id {
+                    continue;
+                }
+
+                let replace = selected
+                    .as_ref()
+                    .map(|(_, current)| {
+                        (
+                            record.archived_at_unix,
+                            record.preferred_tombstone_created_at_unix,
+                        ) > (
+                            current.archived_at_unix,
+                            current.preferred_tombstone_created_at_unix,
+                        )
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    selected = Some((file_name.clone(), record));
+                }
+            }
+        }
+
+        let index_path = self.version_index_path(object_id);
+        let index_path_string = index_path.to_string_lossy().to_string();
+        let index_exists = fs::try_exists(&index_path).await?;
+        if selected.is_none() {
+            return Ok(TombstoneRestoreReport {
+                object_id: object_id.to_string(),
+                source_archive_file: archive_file.map(ToString::to_string),
+                dry_run,
+                found: false,
+                restored: false,
+                skipped_existing: index_exists,
+                would_restore: false,
+                index_path: index_path_string,
+            });
+        }
+
+        let (source_archive_file, record) = selected.expect("checked above");
+        if index_exists && !overwrite {
+            return Ok(TombstoneRestoreReport {
+                object_id: object_id.to_string(),
+                source_archive_file: Some(source_archive_file),
+                dry_run,
+                found: true,
+                restored: false,
+                skipped_existing: true,
+                would_restore: false,
+                index_path: index_path_string,
+            });
+        }
+
+        if dry_run {
+            return Ok(TombstoneRestoreReport {
+                object_id: object_id.to_string(),
+                source_archive_file: Some(source_archive_file),
+                dry_run,
+                found: true,
+                restored: false,
+                skipped_existing: false,
+                would_restore: true,
+                index_path: index_path_string,
+            });
+        }
+
+        let payload = serde_json::to_vec_pretty(&record.index)?;
+        write_atomic(&index_path, &payload).await?;
+        Ok(TombstoneRestoreReport {
+            object_id: object_id.to_string(),
+            source_archive_file: Some(source_archive_file),
+            dry_run,
+            found: true,
+            restored: true,
+            skipped_existing: false,
+            would_restore: false,
+            index_path: index_path_string,
+        })
+    }
+
+    pub async fn purge_tombstone_archives(
+        &self,
+        retention_secs: u64,
+        dry_run: bool,
+    ) -> Result<TombstoneArchivePurgeReport> {
+        let now = unix_ts();
+        let paths = self.list_archive_paths().await?;
+
+        let mut scanned_files = 0usize;
+        let mut eligible_files = 0usize;
+        let mut deleted_files = 0usize;
+        let mut kept_recent_files = 0usize;
+
+        for path in paths {
+            scanned_files += 1;
+            let metadata = fs::metadata(&path).await?;
+            let modified_at = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_secs())
+                .unwrap_or(0);
+            let age_secs = now.saturating_sub(modified_at);
+
+            if age_secs < retention_secs {
+                kept_recent_files += 1;
+                continue;
+            }
+
+            eligible_files += 1;
+            if dry_run {
+                continue;
+            }
+
+            fs::remove_file(&path).await?;
+            deleted_files += 1;
+        }
+
+        Ok(TombstoneArchivePurgeReport {
+            retention_secs,
+            dry_run,
+            scanned_files,
+            eligible_files,
+            deleted_files,
+            kept_recent_files,
+        })
+    }
+
     fn object_id_for_key(&self, key: &str) -> Option<String> {
         self.current_state.object_ids.get(key).cloned()
     }
@@ -1909,6 +2147,46 @@ impl PersistentStore {
         let seed = format!("{source_node_id}:{key}:{source_version_id}");
         let marker_id = hash_hex(seed.as_bytes());
         self.reconcile_markers_dir.join(format!("{marker_id}.json"))
+    }
+
+    fn tombstone_archive_dir(&self) -> PathBuf {
+        self.root_dir.join("state").join("tombstone_archive")
+    }
+
+    async fn list_archive_paths(&self) -> Result<Vec<PathBuf>> {
+        let archive_dir = self.tombstone_archive_dir();
+        if !fs::try_exists(&archive_dir).await? {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = fs::read_dir(&archive_dir).await?;
+        let mut paths = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
+    }
+
+    async fn validate_archive_file(&self, file_name: &str) -> Result<PathBuf> {
+        if file_name.contains('/') || file_name.contains('\\') {
+            bail!("archive file name must not include path separators");
+        }
+        if Path::new(file_name)
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("jsonl")
+        {
+            bail!("archive file must end with .jsonl");
+        }
+
+        let path = self.tombstone_archive_dir().join(file_name);
+        if !fs::try_exists(&path).await? {
+            bail!("archive file not found: {}", path.display());
+        }
+        Ok(path)
     }
 }
 
