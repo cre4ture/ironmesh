@@ -280,6 +280,15 @@ fn startup_conflicts(root_dir: &Path, server_base_url: &str) -> Result<Vec<(Stri
     Ok(values)
 }
 
+fn baseline_integrity_check(root_dir: &Path, server_base_url: &str) -> Result<String> {
+    let baseline_path = baseline_db_path(root_dir, server_base_url, None)?;
+    let connection = Connection::open(&baseline_path)
+        .with_context(|| format!("failed to open sqlite baseline {}", baseline_path.display()))?;
+    connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .context("failed to execute sqlite integrity_check")
+}
+
 async fn wait_for_startup_conflict_reason(
     root_dir: &Path,
     server_base_url: &str,
@@ -299,6 +308,33 @@ async fn wait_for_startup_conflict_reason(
     }
 
     bail!("startup conflict not found for path={path} reason={reason}")
+}
+
+async fn wait_for_remote_prefix_entry_count(
+    sdk: &IronMeshClient,
+    prefix: &str,
+    expected_min: usize,
+    retries: usize,
+) -> Result<()> {
+    let normalized_prefix = prefix.trim_matches('/');
+    for _ in 0..retries {
+        if let Ok(index) = sdk.store_index(None, 64, None).await {
+            let observed = index
+                .entries
+                .iter()
+                .filter(|entry| {
+                    let path = entry.path.trim_matches('/');
+                    path.starts_with(normalized_prefix)
+                })
+                .count();
+            if observed >= expected_min {
+                return Ok(());
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("remote prefix {normalized_prefix} did not reach at least {expected_min} entries")
 }
 
 #[tokio::test]
@@ -935,6 +971,147 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_is_missing(
                 "conflict/x.txt",
                 "dual_modify_missing_baseline",
                 120,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result<()> {
+    let bind = "127.0.0.1:19422";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-crash-active-write-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        let large_payload = vec![b'x'; 2 * 1024 * 1024];
+        fs::create_dir_all(local_root.join("crash-active")).with_context(|| {
+            format!(
+                "failed to create local directory {}",
+                local_root.join("crash-active").display()
+            )
+        })?;
+        fs::write(local_root.join("crash-active/local-a.bin"), &large_payload).with_context(
+            || {
+                format!(
+                    "failed to write local file {}",
+                    local_root.join("crash-active/local-a.bin").display()
+                )
+            },
+        )?;
+        fs::write(local_root.join("crash-active/local-b.bin"), &large_payload).with_context(
+            || {
+                format!(
+                    "failed to write local file {}",
+                    local_root.join("crash-active/local-b.bin").display()
+                )
+            },
+        )?;
+        fs::write(local_root.join("crash-active/local-c.bin"), &large_payload).with_context(
+            || {
+                format!(
+                    "failed to write local file {}",
+                    local_root.join("crash-active/local-c.bin").display()
+                )
+            },
+        )?;
+
+        sdk.put_large_aware(
+            "crash-active/remote-base.txt",
+            Bytes::from_static(b"remote-v1"),
+        )
+        .await?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 1_500, 100, true).await?;
+
+        // Wait until active sync starts and at least one local upload hits remote.
+        wait_for_remote_prefix_entry_count(&sdk, "crash-active/local-", 1, 320).await?;
+
+        // Abrupt process termination during active syncing.
+        stop_folder_agent(&mut first_run).await;
+
+        let integrity = baseline_integrity_check(&local_root, &base_url)?;
+        assert_eq!(integrity.to_lowercase(), "ok");
+
+        fs::write(
+            local_root.join("crash-active/local-a.bin"),
+            b"local-a-after-crash",
+        )
+        .with_context(|| {
+            format!(
+                "failed to modify local file {}",
+                local_root.join("crash-active/local-a.bin").display()
+            )
+        })?;
+        fs::write(
+            local_root.join("crash-active/local-new.txt"),
+            b"local-new-after-crash",
+        )
+        .with_context(|| {
+            format!(
+                "failed to create local file {}",
+                local_root.join("crash-active/local-new.txt").display()
+            )
+        })?;
+
+        sdk.put_large_aware(
+            "crash-active/remote-base.txt",
+            Bytes::from_static(b"remote-v2-after-crash"),
+        )
+        .await?;
+        sdk.put_large_aware(
+            "crash-active/remote-new.txt",
+            Bytes::from_static(b"remote-new-after-crash"),
+        )
+        .await?;
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 1_500, 100, true).await?;
+        let scenario = async {
+            wait_for_remote_file_bytes(
+                &sdk,
+                "crash-active/local-a.bin",
+                b"local-a-after-crash",
+                360,
+            )
+            .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "crash-active/local-new.txt",
+                b"local-new-after-crash",
+                360,
+            )
+            .await?;
+
+            wait_for_remote_file_bytes(&sdk, "crash-active/local-b.bin", &large_payload, 360)
+                .await?;
+            wait_for_remote_file_bytes(&sdk, "crash-active/local-c.bin", &large_payload, 360)
+                .await?;
+
+            wait_for_local_file_bytes(
+                &local_root.join("crash-active/remote-base.txt"),
+                b"remote-v2-after-crash",
+                360,
+            )
+            .await?;
+            wait_for_local_file_bytes(
+                &local_root.join("crash-active/remote-new.txt"),
+                b"remote-new-after-crash",
+                360,
             )
             .await?;
             Ok::<(), anyhow::Error>(())

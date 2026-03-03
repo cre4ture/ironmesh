@@ -5,7 +5,7 @@ use client_sdk::{
     normalize_server_base_url,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1078,6 +1078,9 @@ struct StartupStateStore {
     scope_fingerprint: String,
 }
 
+const BASELINE_SCHEMA_VERSION_INITIAL: i64 = 1;
+const BASELINE_SCHEMA_VERSION_CURRENT: i64 = 2;
+
 impl StartupStateStore {
     fn new(root_dir: &Path, scope: &PathScope, server_base_url: &str) -> Self {
         let mut hasher = DefaultHasher::new();
@@ -1290,7 +1293,7 @@ impl StartupStateStore {
             })?;
         }
 
-        let connection = Connection::open(&self.path)
+        let mut connection = Connection::open(&self.path)
             .with_context(|| format!("failed to open sqlite baseline {}", self.path.display()))?;
 
         connection
@@ -1300,6 +1303,13 @@ impl StartupStateStore {
             .pragma_update(None, "synchronous", "FULL")
             .context("failed to set sqlite synchronous mode")?;
 
+        self.ensure_schema(&mut connection)?;
+        self.ensure_scope_fingerprint(&connection)?;
+
+        Ok(connection)
+    }
+
+    fn ensure_schema(&self, connection: &mut Connection) -> Result<()> {
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS baseline_meta (
@@ -1310,7 +1320,8 @@ impl StartupStateStore {
                      path TEXT PRIMARY KEY,
                      kind INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL,
-                     modified_unix_ms INTEGER NOT NULL
+                     modified_unix_ms INTEGER NOT NULL,
+                     content_hash TEXT
                  );
                  CREATE TABLE IF NOT EXISTS conflicts (
                      path TEXT PRIMARY KEY,
@@ -1321,29 +1332,96 @@ impl StartupStateStore {
             )
             .context("failed to initialize sqlite baseline schema")?;
 
+        let stored_version = connection
+            .query_row(
+                "SELECT value FROM baseline_meta WHERE key = ?1",
+                ["schema_version"],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("failed to read sqlite baseline schema version")?;
+
+        let mut schema_version = match stored_version {
+            Some(raw) => raw
+                .parse::<i64>()
+                .with_context(|| format!("invalid sqlite baseline schema version: {raw}"))?,
+            None => BASELINE_SCHEMA_VERSION_INITIAL,
+        };
+
+        if schema_version < BASELINE_SCHEMA_VERSION_INITIAL {
+            bail!(
+                "unsupported sqlite baseline schema version: {schema_version} (minimum={})",
+                BASELINE_SCHEMA_VERSION_INITIAL
+            );
+        }
+
+        while schema_version < BASELINE_SCHEMA_VERSION_CURRENT {
+            match schema_version {
+                1 => {
+                    self.migrate_schema_v1_to_v2(connection)?;
+                    schema_version = 2;
+                }
+                _ => {
+                    bail!("unsupported sqlite baseline schema version: {schema_version}");
+                }
+            }
+        }
+
+        if schema_version > BASELINE_SCHEMA_VERSION_CURRENT {
+            bail!(
+                "unsupported sqlite baseline schema version: {} (current={})",
+                schema_version,
+                BASELINE_SCHEMA_VERSION_CURRENT
+            );
+        }
+
         connection
             .execute(
-                "INSERT OR IGNORE INTO baseline_meta(key, value) VALUES(?1, ?2)",
-                params!["schema_version", "1"],
+                "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params!["schema_version", schema_version.to_string()],
             )
-            .context("failed to initialize sqlite baseline metadata")?;
+            .context("failed to persist sqlite baseline schema version")?;
+
+        Ok(())
+    }
+
+    fn migrate_schema_v1_to_v2(&self, connection: &Connection) -> Result<()> {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(baseline_entries)")
+            .context("failed to inspect sqlite baseline_entries schema")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("failed to read sqlite baseline_entries columns")?;
+
+        let mut has_content_hash = false;
+        for column in columns {
+            if column.context("failed to decode sqlite baseline_entries column")? == "content_hash"
+            {
+                has_content_hash = true;
+                break;
+            }
+        }
+
+        if !has_content_hash {
+            connection
+                .execute(
+                    "ALTER TABLE baseline_entries ADD COLUMN content_hash TEXT",
+                    [],
+                )
+                .context("failed to migrate sqlite baseline schema v1->v2")?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_scope_fingerprint(&self, connection: &Connection) -> Result<()> {
         connection
             .execute(
                 "INSERT OR IGNORE INTO baseline_meta(key, value) VALUES(?1, ?2)",
                 params!["scope_fingerprint", self.scope_fingerprint.as_str()],
             )
             .context("failed to initialize sqlite baseline scope metadata")?;
-
-        let schema_version: String = connection
-            .query_row(
-                "SELECT value FROM baseline_meta WHERE key = ?1",
-                ["schema_version"],
-                |row| row.get(0),
-            )
-            .context("failed to read sqlite baseline schema version")?;
-        if schema_version != "1" {
-            bail!("unsupported sqlite baseline schema version: {schema_version}");
-        }
 
         let stored_fingerprint: String = connection
             .query_row(
@@ -1360,7 +1438,7 @@ impl StartupStateStore {
             );
         }
 
-        Ok(connection)
+        Ok(())
     }
 }
 
@@ -1374,10 +1452,11 @@ fn current_unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        PathScope, local_entry_state_for_path, local_file_content_hash,
-        local_paths_to_preserve_on_startup, startup_dual_modify_missing_baseline_paths,
-        startup_remote_delete_wins_paths,
+        BASELINE_SCHEMA_VERSION_CURRENT, PathScope, StartupStateStore, local_entry_state_for_path,
+        local_file_content_hash, local_paths_to_preserve_on_startup,
+        startup_dual_modify_missing_baseline_paths, startup_remote_delete_wins_paths,
     };
+    use rusqlite::{Connection, params};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1542,6 +1621,137 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn startup_state_store_migrates_schema_v1_to_current() {
+        let root = test_root();
+        let scope = PathScope::new(None);
+        let store = StartupStateStore::new(&root, &scope, "http://127.0.0.1:8080");
+        remove_sqlite_sidecars(&store.path);
+
+        {
+            let connection = Connection::open(&store.path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE baseline_meta (
+                         key TEXT PRIMARY KEY,
+                         value TEXT NOT NULL
+                     );
+                     CREATE TABLE baseline_entries (
+                         path TEXT PRIMARY KEY,
+                         kind INTEGER NOT NULL,
+                         size_bytes INTEGER NOT NULL,
+                         modified_unix_ms INTEGER NOT NULL
+                     );
+                     CREATE TABLE conflicts (
+                         path TEXT PRIMARY KEY,
+                         reason TEXT NOT NULL,
+                         details_json TEXT NOT NULL,
+                         created_unix_ms INTEGER NOT NULL
+                     );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
+                    params!["schema_version", "1"],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
+                    params!["scope_fingerprint", store.scope_fingerprint.as_str()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO baseline_entries(path, kind, size_bytes, modified_unix_ms)
+                     VALUES(?1, ?2, ?3, ?4)",
+                    params!["docs/readme.txt", 0_i64, 5_i64, 11_i64],
+                )
+                .unwrap();
+        }
+
+        let loaded = store.load_local_baseline().unwrap();
+        let state = loaded.get("docs/readme.txt").unwrap();
+        assert_eq!(state.kind, LocalEntryKind::File);
+        assert_eq!(state.size_bytes, 5);
+        assert_eq!(state.modified_unix_ms, 11);
+
+        let connection = Connection::open(&store.path).unwrap();
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM baseline_meta WHERE key = ?1",
+                ["schema_version"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, BASELINE_SCHEMA_VERSION_CURRENT.to_string());
+
+        let mut pragma = connection
+            .prepare("PRAGMA table_info(baseline_entries)")
+            .unwrap();
+        let has_content_hash = pragma
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|column| column == "content_hash");
+        assert!(has_content_hash);
+
+        remove_sqlite_sidecars(&store.path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_state_store_rejects_future_schema_version() {
+        let root = test_root();
+        let scope = PathScope::new(None);
+        let store = StartupStateStore::new(&root, &scope, "http://127.0.0.1:8080");
+        remove_sqlite_sidecars(&store.path);
+
+        {
+            let connection = Connection::open(&store.path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE baseline_meta (
+                         key TEXT PRIMARY KEY,
+                         value TEXT NOT NULL
+                     );
+                     CREATE TABLE baseline_entries (
+                         path TEXT PRIMARY KEY,
+                         kind INTEGER NOT NULL,
+                         size_bytes INTEGER NOT NULL,
+                         modified_unix_ms INTEGER NOT NULL,
+                         content_hash TEXT
+                     );
+                     CREATE TABLE conflicts (
+                         path TEXT PRIMARY KEY,
+                         reason TEXT NOT NULL,
+                         details_json TEXT NOT NULL,
+                         created_unix_ms INTEGER NOT NULL
+                     );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
+                    params!["schema_version", "99"],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
+                    params!["scope_fingerprint", store.scope_fingerprint.as_str()],
+                )
+                .unwrap();
+        }
+
+        let error = store.load_local_baseline().unwrap_err().to_string();
+        assert!(error.contains("unsupported sqlite baseline schema version"));
+
+        remove_sqlite_sidecars(&store.path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn write_file(root: &Path, relative_path: &str, bytes: &[u8]) {
         let absolute = root.join(relative_path);
         if let Some(parent) = absolute.parent() {
@@ -1563,5 +1773,13 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn remove_sqlite_sidecars(path: &Path) {
+        let _ = fs::remove_file(path);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        let _ = fs::remove_file(wal);
+        let _ = fs::remove_file(shm);
     }
 }

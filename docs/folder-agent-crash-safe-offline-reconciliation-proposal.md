@@ -14,7 +14,7 @@ Goal: preserve offline local edits/additions across normal stop, crash, or power
 
 ### 1.1 Current implementation status
 Implemented so far:
-- SQLite baseline store (schema v1) with scope fingerprint validation.
+- SQLite baseline store with schema versioning and startup migration (v1 -> v2), plus scope fingerprint validation.
 - Runtime baseline persistence (not only on clean shutdown) for crash-safe restart behavior.
 - Per-path recovery behavior when individual baseline rows are missing.
 - Server `/store/index` now includes per-file `content_hash`.
@@ -27,6 +27,7 @@ Implemented so far:
   - `modify_delete_conflict`
   - `dual_modify_missing_baseline`
 - Incremental per-path baseline upserts/removals during startup/runtime apply/upload/delete flows to reduce crash windows.
+- Crash-window system test coverage for abrupt kill during active sync writes, with restart reconciliation checks (local + remote changes).
 - Server-side tombstone tooling scaffold:
   - `POST /maintenance/tombstones/compact`
   - `GET /maintenance/tombstones/archive`
@@ -42,6 +43,7 @@ Not implemented yet:
 - Conflict lifecycle tooling (resolve/ack/clear workflows and user-facing surfacing).
 - Full tombstone retention policy controls and richer restore/purge guardrails (RBAC role tiers, audit viewer APIs, tamper-evident archival).
 - Telemetry counters for path/global recovery and conflict classes.
+- Full transport/authn/authz security architecture implementation (documented in `docs/security-architecture.md`).
 
 ## 2. Decision Update
 Chosen direction:
@@ -66,7 +68,7 @@ Chosen direction:
 ### 5.1 Scope identity
 Use one SQLite database per `(root_dir, server_base_url, prefix)` scope.
 
-### 5.2 Suggested schema (v1)
+### 5.2 Current schema target (v2, with v1 migration support)
 - `meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)`
   - `schema_version`
   - `scope_fingerprint`
@@ -182,22 +184,11 @@ Update DB during normal operation:
 - crash simulation: kill agent ungracefully, mutate local, restart, verify no data loss,
 - verify no full-tree recovery when only a few rows are missing.
 
-## 14. Rollout Plan
-Phase 1:
-- server exposes stable content hashes,
-- introduce SQLite state store and schema v1,
-- dual-write diagnostics (optional).
-
-Phase 2:
-- switch startup reconciliation to SQLite-backed per-path mode,
-- enable selective hashing for ambiguous paths.
-
-Phase 3:
-- enable full conflict tracking + tombstone retention behavior,
-- add crash and partial-DB-loss system tests.
-
-Phase 4:
-- telemetry: counts for path recovery/global recovery/conflicts.
+## 14. Experimental-Phase Implementation Strategy
+- No staged rollout and no feature-flag gating are required at this phase.
+- Land changes directly in mainline with test coverage.
+- Keep migration/backward compatibility for developer environments (schema versioning and startup migration).
+- Revisit staged rollout strategy only when a production-like environment exists.
 
 ## 15. Open Decisions
 - SQLite pragmas default (`WAL`, `synchronous` level).
