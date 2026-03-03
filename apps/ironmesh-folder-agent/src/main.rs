@@ -6,6 +6,7 @@ use client_sdk::{
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, params};
+use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -61,14 +62,15 @@ fn main() -> Result<()> {
     let local_state_before_remote_sync = scan_local_tree(&args.root_dir)
         .context("failed to scan local state before initial remote sync")?;
 
-    let baseline_before_remote_sync = match state_store.load_local_baseline() {
-        Ok(state) => Some(state),
-        Err(error) => {
-            eprintln!("startup-state: failed to load sqlite baseline: {error}");
-            state_store.quarantine_corrupt().ok();
-            None
-        }
-    };
+    let baseline_before_remote_sync =
+        match load_local_baseline_with_retries(&state_store, 6, Duration::from_millis(100)) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                eprintln!("startup-state: failed to load sqlite baseline: {error}");
+                state_store.quarantine_corrupt().ok();
+                None
+            }
+        };
 
     let client = IronMeshClient::new(base_url.as_str());
 
@@ -97,6 +99,33 @@ fn main() -> Result<()> {
         &remote_files_before_remote_sync,
         &preserve_local_files,
     );
+    let mut startup_conflicts = startup_add_delete_conflicts(
+        &local_state_before_remote_sync,
+        baseline_before_remote_sync.as_ref(),
+        &remote_files_before_remote_sync,
+        &preserve_local_files,
+        &remote_delete_wins_paths,
+    );
+    let dual_modify_conflict_paths = startup_dual_modify_missing_baseline_paths(
+        &args.root_dir,
+        &local_state_before_remote_sync,
+        baseline_before_remote_sync.as_ref(),
+        &remote_hashes_before_remote_sync,
+        &preserve_local_files,
+    );
+    for path in dual_modify_conflict_paths {
+        startup_conflicts.push(StartupConflict {
+            path: path.clone(),
+            reason: "dual_modify_missing_baseline".to_string(),
+            details_json: json!({
+                "policy": "keep_local_bytes",
+                "local_action": "upload_local",
+                "remote_action": "overwrite_possible",
+            })
+            .to_string(),
+            created_unix_ms: current_unix_ms(),
+        });
+    }
 
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
@@ -106,6 +135,7 @@ fn main() -> Result<()> {
         &initial_snapshot,
         None,
         Some(&preserve_local_files),
+        Some(&state_store),
         &scope,
         &mut suppressed_uploads,
         &mut remote_index,
@@ -122,11 +152,15 @@ fn main() -> Result<()> {
         &remote_index,
         &preserve_local_files,
     );
+    state_store
+        .persist_local_baseline(&local_state)
+        .context("failed to persist sqlite baseline after remote apply during startup")?;
 
     sync_local_changes(
         &args.root_dir,
         &client,
         &mut local_state,
+        Some(&state_store),
         &scope,
         &mut remote_index,
         &mut suppressed_uploads,
@@ -135,6 +169,9 @@ fn main() -> Result<()> {
     state_store
         .persist_local_baseline(&local_state)
         .context("failed to persist sqlite baseline after startup reconciliation")?;
+    state_store
+        .persist_startup_conflicts(&startup_conflicts)
+        .context("failed to persist startup conflicts")?;
 
     if args.run_once {
         return Ok(());
@@ -187,6 +224,7 @@ fn main() -> Result<()> {
                 &update.snapshot,
                 Some(&update.changed_paths),
                 None,
+                Some(&state_store),
                 &scope,
                 &mut suppressed_uploads,
                 &mut remote_index,
@@ -211,6 +249,7 @@ fn main() -> Result<()> {
                 &args.root_dir,
                 &client,
                 &mut local_state,
+                Some(&state_store),
                 &scope,
                 &mut remote_index,
                 &mut suppressed_uploads,
@@ -240,6 +279,32 @@ fn install_ctrlc_handler(running: Arc<AtomicBool>) -> Result<()> {
         running.store(false, Ordering::SeqCst);
     })
     .context("failed to install Ctrl+C handler")
+}
+
+fn load_local_baseline_with_retries(
+    state_store: &StartupStateStore,
+    max_attempts: usize,
+    retry_delay: Duration,
+) -> Result<LocalTreeState> {
+    let attempts = max_attempts.max(1);
+    let mut last_error = None;
+
+    for attempt in 1..=attempts {
+        match state_store.load_local_baseline() {
+            Ok(state) => return Ok(state),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < attempts {
+                    thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+
+    match last_error {
+        Some(error) => Err(error),
+        None => bail!("failed to load sqlite baseline: no attempts executed"),
+    }
 }
 
 fn local_paths_to_preserve_on_startup(
@@ -359,6 +424,109 @@ fn startup_remote_delete_wins_paths(
     delete_wins
 }
 
+#[derive(Debug, Clone)]
+struct StartupConflict {
+    path: String,
+    reason: String,
+    details_json: String,
+    created_unix_ms: u128,
+}
+
+fn startup_add_delete_conflicts(
+    local_state: &LocalTreeState,
+    baseline: Option<&LocalTreeState>,
+    remote_files: &BTreeSet<String>,
+    preserve_local_files: &BTreeSet<String>,
+    remote_delete_wins_paths: &BTreeSet<String>,
+) -> Vec<StartupConflict> {
+    let mut conflicts = Vec::new();
+
+    for path in preserve_local_files {
+        if remote_files.contains(path) || remote_delete_wins_paths.contains(path) {
+            continue;
+        }
+        let Some(entry_state) = local_state.get(path) else {
+            continue;
+        };
+        if entry_state.kind != LocalEntryKind::File {
+            continue;
+        }
+
+        let (reason, details_json) = match baseline.and_then(|state| state.get(path)) {
+            Some(previous) if previous != entry_state => (
+                "modify_delete_conflict",
+                json!({
+                    "policy": "keep_local_bytes",
+                    "local_action": "upload_local",
+                    "remote_action": "delete_seen",
+                })
+                .to_string(),
+            ),
+            None => (
+                "add_delete_ambiguous_missing_baseline",
+                json!({
+                    "policy": "keep_local_bytes",
+                    "local_action": "upload_local",
+                    "remote_action": "missing",
+                })
+                .to_string(),
+            ),
+            _ => continue,
+        };
+        conflicts.push(StartupConflict {
+            path: path.clone(),
+            reason: reason.to_string(),
+            details_json,
+            created_unix_ms: current_unix_ms(),
+        });
+    }
+
+    conflicts
+}
+
+fn startup_dual_modify_missing_baseline_paths(
+    root_dir: &Path,
+    local_state: &LocalTreeState,
+    baseline: Option<&LocalTreeState>,
+    remote_hashes: &BTreeMap<String, String>,
+    preserve_local_files: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut dual_modify = BTreeSet::new();
+
+    for path in preserve_local_files {
+        if baseline.and_then(|state| state.get(path)).is_some() {
+            continue;
+        }
+        let Some(entry_state) = local_state.get(path) else {
+            continue;
+        };
+        if entry_state.kind != LocalEntryKind::File {
+            continue;
+        }
+
+        let Some(remote_hash) = remote_hashes.get(path) else {
+            continue;
+        };
+
+        let local_hash = match local_file_content_hash(root_dir, path) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "startup-state: failed to hash local file {path} for dual-modify check: {error}; treating as conflict"
+                );
+                dual_modify.insert(path.clone());
+                continue;
+            }
+        };
+
+        if local_hash != *remote_hash {
+            dual_modify.insert(path.clone());
+        }
+    }
+
+    dual_modify
+}
+
 fn local_file_content_hash(root_dir: &Path, relative_path: &str) -> Result<String> {
     let absolute = absolute_path(root_dir, relative_path);
     let mut file = File::open(&absolute).with_context(|| {
@@ -447,6 +615,7 @@ fn sync_local_changes(
     root_dir: &Path,
     client: &IronMeshClient,
     local_state: &mut LocalTreeState,
+    state_store: Option<&StartupStateStore>,
     scope: &PathScope,
     remote_index: &mut RemoteTreeIndex,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
@@ -461,6 +630,15 @@ fn sync_local_changes(
 
         ensure_remote_directory_marker(client, scope, path)?;
         remote_index.directories.insert(path.clone());
+        if let Some(store) = state_store
+            && let Some(entry_state) = current.get(path)
+        {
+            store
+                .upsert_baseline_entry(path, entry_state)
+                .with_context(|| {
+                    format!("failed to persist baseline directory entry for {path}")
+                })?;
+        }
         eprintln!("local-sync: uploaded directory marker {path}/");
     }
 
@@ -480,6 +658,11 @@ fn sync_local_changes(
         remote_index.files.insert(path.clone());
         for parent in parent_directories(path) {
             remote_index.directories.insert(parent);
+        }
+        if let Some(store) = state_store {
+            store
+                .upsert_baseline_entry(path, entry_state)
+                .with_context(|| format!("failed to persist baseline file entry for {path}"))?;
         }
         eprintln!("local-sync: uploaded file {path}");
     }
@@ -513,6 +696,11 @@ fn sync_local_changes(
             delete_remote_file(client, scope, &path)?;
             suppressed_uploads.remove(&path);
             remote_index.files.remove(&path);
+            if let Some(store) = state_store {
+                store
+                    .remove_baseline_entry(&path)
+                    .with_context(|| format!("failed to remove baseline entry for {path}"))?;
+            }
             eprintln!("local-sync: deleted remote file {path}");
         }
     }
@@ -527,6 +715,7 @@ fn apply_remote_snapshot(
     snapshot: &SyncSnapshot,
     changed_paths: Option<&[String]>,
     preserve_local_files: Option<&BTreeSet<String>>,
+    state_store: Option<&StartupStateStore>,
     scope: &PathScope,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
     remote_index: &mut RemoteTreeIndex,
@@ -579,9 +768,18 @@ fn apply_remote_snapshot(
                                 directory.display()
                             )
                         })?;
+                        if let Some(store) = state_store
+                            && let Some(entry_state) = local_entry_state_for_path(root_dir, path)?
+                        {
+                            store
+                                .upsert_baseline_entry(path, &entry_state)
+                                .with_context(|| {
+                                    format!("failed to persist baseline directory entry for {path}")
+                                })?;
+                        }
                     }
                     Some((EntryKind::File, remote_key)) => {
-                        download_remote_file(root_dir, client, path, remote_key)?;
+                        download_remote_file(root_dir, client, path, remote_key, state_store)?;
                         if let Some(entry_state) = local_entry_state_for_path(root_dir, path)? {
                             suppressed_uploads.insert(path.to_string(), entry_state);
                         }
@@ -589,6 +787,11 @@ fn apply_remote_snapshot(
                     None => {
                         remove_local_path(root_dir, path)?;
                         suppressed_uploads.remove(path);
+                        if let Some(store) = state_store {
+                            store.remove_baseline_entry(path).with_context(|| {
+                                format!("failed to remove baseline entry for {path}")
+                            })?;
+                        }
                     }
                 }
             }
@@ -603,6 +806,18 @@ fn apply_remote_snapshot(
                         absolute.display()
                     )
                 })?;
+                if let Some(store) = state_store
+                    && let Some(entry_state) = local_entry_state_for_path(root_dir, directory)?
+                {
+                    store
+                        .upsert_baseline_entry(directory, &entry_state)
+                        .with_context(|| {
+                            format!(
+                                "failed to persist baseline directory entry for {}",
+                                directory
+                            )
+                        })?;
+                }
             }
 
             for file in &next_index.files {
@@ -615,7 +830,7 @@ fn apply_remote_snapshot(
                 {
                     continue;
                 }
-                download_remote_file(root_dir, client, file, remote_key)?;
+                download_remote_file(root_dir, client, file, remote_key, state_store)?;
                 if let Some(entry_state) = local_entry_state_for_path(root_dir, file)? {
                     suppressed_uploads.insert(file.clone(), entry_state);
                 }
@@ -633,6 +848,7 @@ fn download_remote_file(
     client: &IronMeshClient,
     local_relative_path: &str,
     remote_key: &str,
+    state_store: Option<&StartupStateStore>,
 ) -> Result<()> {
     let target = absolute_path(root_dir, local_relative_path);
 
@@ -667,6 +883,17 @@ fn download_remote_file(
 
     file.sync_all()
         .with_context(|| format!("failed to flush temp file {}", temp_path.display()))?;
+
+    if let Some(store) = state_store {
+        let metadata = fs::metadata(&temp_path)
+            .with_context(|| format!("failed to inspect temp file {}", temp_path.display()))?;
+        let entry_state = local_entry_state_from_metadata(&metadata);
+        store
+            .upsert_baseline_entry(local_relative_path, &entry_state)
+            .with_context(|| {
+                format!("failed to persist baseline file entry for {local_relative_path}")
+            })?;
+    }
 
     fs::rename(&temp_path, &target).with_context(|| {
         format!(
@@ -754,6 +981,26 @@ fn remove_local_path(root_dir: &Path, relative_path: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn local_entry_state_from_metadata(metadata: &fs::Metadata) -> LocalEntryState {
+    let kind = if metadata.is_dir() {
+        LocalEntryKind::Directory
+    } else {
+        LocalEntryKind::File
+    };
+    let modified_unix_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+
+    LocalEntryState {
+        kind,
+        size_bytes: metadata.len(),
+        modified_unix_ms,
+    }
 }
 
 fn parent_directories(path: &str) -> Vec<String> {
@@ -936,6 +1183,76 @@ impl StartupStateStore {
         Ok(())
     }
 
+    fn upsert_baseline_entry(&self, path: &str, entry_state: &LocalEntryState) -> Result<()> {
+        let connection = self.sqlite_connection()?;
+        let kind_code: i64 = match entry_state.kind {
+            LocalEntryKind::File => 0,
+            LocalEntryKind::Directory => 1,
+        };
+        let size_bytes = i64::try_from(entry_state.size_bytes)
+            .with_context(|| format!("size overflow while persisting baseline: {path}"))?;
+        let modified_unix_ms = i64::try_from(entry_state.modified_unix_ms)
+            .with_context(|| format!("mtime overflow while persisting baseline: {path}"))?;
+
+        connection
+            .execute(
+                "INSERT INTO baseline_entries(path, kind, size_bytes, modified_unix_ms)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET
+                     kind = excluded.kind,
+                     size_bytes = excluded.size_bytes,
+                     modified_unix_ms = excluded.modified_unix_ms",
+                params![path, kind_code, size_bytes, modified_unix_ms],
+            )
+            .with_context(|| format!("failed to upsert sqlite baseline row for {path}"))?;
+
+        Ok(())
+    }
+
+    fn remove_baseline_entry(&self, path: &str) -> Result<()> {
+        let connection = self.sqlite_connection()?;
+        connection
+            .execute("DELETE FROM baseline_entries WHERE path = ?1", [path])
+            .with_context(|| format!("failed to delete sqlite baseline row for {path}"))?;
+        Ok(())
+    }
+
+    fn persist_startup_conflicts(&self, conflicts: &[StartupConflict]) -> Result<()> {
+        let mut connection = self.sqlite_connection()?;
+        let tx = connection
+            .transaction()
+            .context("failed to start sqlite conflicts transaction")?;
+        tx.execute("DELETE FROM conflicts", [])
+            .context("failed to clear sqlite conflicts table")?;
+
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO conflicts(path, reason, details_json, created_unix_ms)
+                     VALUES(?1, ?2, ?3, ?4)",
+                )
+                .context("failed to prepare sqlite conflict insert")?;
+            for conflict in conflicts {
+                let created_unix_ms = i64::try_from(conflict.created_unix_ms)
+                    .with_context(|| format!("invalid conflict timestamp for {}", conflict.path))?;
+                insert
+                    .execute(params![
+                        conflict.path,
+                        conflict.reason,
+                        conflict.details_json,
+                        created_unix_ms
+                    ])
+                    .with_context(|| {
+                        format!("failed to insert sqlite conflict row for {}", conflict.path)
+                    })?;
+            }
+        }
+
+        tx.commit()
+            .context("failed to commit sqlite conflicts transaction")?;
+        Ok(())
+    }
+
     fn quarantine_corrupt(&self) -> Result<()> {
         if !self.path.exists() {
             return Ok(());
@@ -994,6 +1311,12 @@ impl StartupStateStore {
                      kind INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL,
                      modified_unix_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS conflicts (
+                     path TEXT PRIMARY KEY,
+                     reason TEXT NOT NULL,
+                     details_json TEXT NOT NULL,
+                     created_unix_ms INTEGER NOT NULL
                  );",
             )
             .context("failed to initialize sqlite baseline schema")?;
@@ -1052,7 +1375,8 @@ fn current_unix_ms() -> u128 {
 mod tests {
     use super::{
         PathScope, local_entry_state_for_path, local_file_content_hash,
-        local_paths_to_preserve_on_startup, startup_remote_delete_wins_paths,
+        local_paths_to_preserve_on_startup, startup_dual_modify_missing_baseline_paths,
+        startup_remote_delete_wins_paths,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1186,6 +1510,36 @@ mod tests {
 
         assert!(delete_wins.contains("unchanged.txt"));
         assert!(!delete_wins.contains("changed.txt"));
+    }
+
+    #[test]
+    fn startup_dual_modify_detects_missing_baseline_hash_mismatch() {
+        let root = test_root();
+        write_file(&root, "docs/readme.txt", b"local-version");
+
+        let mut local = LocalTreeState::new();
+        local.insert(
+            "docs/readme.txt".to_string(),
+            local_entry_state_for_path(&root, "docs/readme.txt")
+                .unwrap()
+                .unwrap(),
+        );
+
+        let mut remote_hashes = BTreeMap::new();
+        remote_hashes.insert("docs/readme.txt".to_string(), "remote-hash".to_string());
+
+        let preserve = std::iter::once("docs/readme.txt".to_string()).collect();
+        let dual_modify = startup_dual_modify_missing_baseline_paths(
+            &root,
+            &local,
+            None,
+            &remote_hashes,
+            &preserve,
+        );
+
+        assert!(dual_modify.contains("docs/readme.txt"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn write_file(root: &Path, relative_path: &str, bytes: &[u8]) {

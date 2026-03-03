@@ -22,9 +22,14 @@ Implemented so far:
   - if local hash matches remote hash, do not preserve/upload.
   - if hash differs or hash is unavailable, preserve local bytes (non-destructive default).
 - Remote delete intent now wins for unchanged local files with valid baseline on restart.
+- Startup conflict persistence in SQLite (`conflicts` table) for:
+  - `add_delete_ambiguous_missing_baseline`
+  - `modify_delete_conflict`
+  - `dual_modify_missing_baseline`
+- Incremental per-path baseline upserts/removals during startup/runtime apply/upload/delete flows to reduce crash windows.
 
 Not implemented yet:
-- Persistent conflict tracking table/flows (`conflicts` lifecycle and resolution tooling).
+- Conflict lifecycle tooling (resolve/ack/clear workflows and user-facing surfacing).
 - Full tombstone retention/compaction/archival/admin tooling stack.
 - Telemetry counters for path/global recovery and conflict classes.
 

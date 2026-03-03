@@ -260,6 +260,47 @@ fn delete_baseline_entry(root_dir: &Path, server_base_url: &str, path: &str) -> 
     Ok(())
 }
 
+fn startup_conflicts(root_dir: &Path, server_base_url: &str) -> Result<Vec<(String, String)>> {
+    let baseline_path = baseline_db_path(root_dir, server_base_url, None)?;
+    let connection = Connection::open(&baseline_path)
+        .with_context(|| format!("failed to open sqlite baseline {}", baseline_path.display()))?;
+    let mut statement = connection
+        .prepare("SELECT path, reason FROM conflicts")
+        .context("failed to query sqlite conflicts rows")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to decode sqlite conflicts rows")?;
+
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row.context("failed to decode sqlite conflict row")?);
+    }
+    Ok(values)
+}
+
+async fn wait_for_startup_conflict_reason(
+    root_dir: &Path,
+    server_base_url: &str,
+    path: &str,
+    reason: &str,
+    retries: usize,
+) -> Result<()> {
+    for _ in 0..retries {
+        if let Ok(conflicts) = startup_conflicts(root_dir, server_base_url)
+            && conflicts.iter().any(|(conflict_path, conflict_reason)| {
+                conflict_path == path && conflict_reason == reason
+            })
+        {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("startup conflict not found for path={path} reason={reason}")
+}
+
 #[tokio::test]
 async fn folder_agent_bootstrap_materializes_remote_tree() -> Result<()> {
     let bind = "127.0.0.1:19410";
@@ -840,6 +881,62 @@ async fn folder_agent_respects_remote_delete_intent_for_unchanged_local_after_re
         let scenario = async {
             wait_for_remote_file_absence(&sdk, "delete-intent/target.txt", 220).await?;
             wait_for_local_absence(&local_root.join("delete-intent/target.txt"), 220).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_records_dual_modify_conflict_when_baseline_row_is_missing() -> Result<()> {
+    let bind = "127.0.0.1:19421";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-dual-modify-conflict-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware("conflict/x.txt", Bytes::from_static(b"remote-v1"))
+            .await?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        wait_for_local_file_bytes(&local_root.join("conflict/x.txt"), b"remote-v1", 220).await?;
+        stop_folder_agent(&mut first_run).await;
+
+        fs::write(local_root.join("conflict/x.txt"), b"local-v2").with_context(|| {
+            format!(
+                "failed to modify local file {}",
+                local_root.join("conflict/x.txt").display()
+            )
+        })?;
+        sdk.put_large_aware("conflict/x.txt", Bytes::from_static(b"remote-v2"))
+            .await?;
+        delete_baseline_entry(&local_root, &base_url, "conflict/x.txt")?;
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            // Safety policy for this ambiguous case: keep local bytes.
+            wait_for_remote_file_bytes(&sdk, "conflict/x.txt", b"local-v2", 220).await?;
+
+            wait_for_startup_conflict_reason(
+                &local_root,
+                &base_url,
+                "conflict/x.txt",
+                "dual_modify_missing_baseline",
+                120,
+            )
+            .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
