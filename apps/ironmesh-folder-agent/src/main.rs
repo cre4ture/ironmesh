@@ -692,6 +692,7 @@ impl PathScope {
 
 struct StartupStateStore {
     path: PathBuf,
+    scope_fingerprint: String,
 }
 
 impl StartupStateStore {
@@ -705,7 +706,10 @@ impl StartupStateStore {
         let mut path = std::env::temp_dir();
         path.push("ironmesh-folder-agent");
         path.push(format!("baseline-{fingerprint:016x}.sqlite"));
-        Self { path }
+        Self {
+            path,
+            scope_fingerprint: format!("{fingerprint:016x}"),
+        }
     }
 
     fn load_local_baseline(&self) -> Result<LocalTreeState> {
@@ -864,6 +868,38 @@ impl StartupStateStore {
                 params!["schema_version", "1"],
             )
             .context("failed to initialize sqlite baseline metadata")?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO baseline_meta(key, value) VALUES(?1, ?2)",
+                params!["scope_fingerprint", self.scope_fingerprint.as_str()],
+            )
+            .context("failed to initialize sqlite baseline scope metadata")?;
+
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM baseline_meta WHERE key = ?1",
+                ["schema_version"],
+                |row| row.get(0),
+            )
+            .context("failed to read sqlite baseline schema version")?;
+        if schema_version != "1" {
+            bail!("unsupported sqlite baseline schema version: {schema_version}");
+        }
+
+        let stored_fingerprint: String = connection
+            .query_row(
+                "SELECT value FROM baseline_meta WHERE key = ?1",
+                ["scope_fingerprint"],
+                |row| row.get(0),
+            )
+            .context("failed to read sqlite baseline scope fingerprint")?;
+        if stored_fingerprint != self.scope_fingerprint {
+            bail!(
+                "sqlite baseline scope fingerprint mismatch (stored={}, expected={})",
+                stored_fingerprint,
+                self.scope_fingerprint
+            );
+        }
 
         Ok(connection)
     }
