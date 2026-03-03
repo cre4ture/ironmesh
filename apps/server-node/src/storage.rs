@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
@@ -133,6 +134,18 @@ pub struct CleanupReport {
     pub deleted_chunks: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TombstoneCompactionReport {
+    pub retention_secs: u64,
+    pub dry_run: bool,
+    pub scanned_indexes: usize,
+    pub tombstone_head_indexes: usize,
+    pub eligible_indexes: usize,
+    pub archived_indexes: usize,
+    pub removed_indexes: usize,
+    pub archive_path: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -250,6 +263,15 @@ struct ReconcileMarker {
     source_version_id: String,
     local_version_id: Option<String>,
     imported_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchivedTombstoneIndexRecord {
+    object_id: String,
+    preferred_tombstone_version_id: String,
+    preferred_tombstone_created_at_unix: u64,
+    archived_at_unix: u64,
+    index: FileVersionIndex,
 }
 
 impl PersistentStore {
@@ -1554,6 +1576,123 @@ impl PersistentStore {
             skipped_recent_chunks,
             deleted_manifests,
             deleted_chunks,
+        })
+    }
+
+    pub async fn compact_tombstone_indexes(
+        &self,
+        retention_secs: u64,
+        dry_run: bool,
+    ) -> Result<TombstoneCompactionReport> {
+        let now = unix_ts();
+        let bound_object_ids: HashSet<String> =
+            self.current_state.object_ids.values().cloned().collect();
+
+        let mut scanned_indexes = 0usize;
+        let mut tombstone_head_indexes = 0usize;
+        let mut eligible = Vec::<(PathBuf, String, String, u64, FileVersionIndex)>::new();
+
+        let mut version_entries = fs::read_dir(&self.versions_dir).await?;
+        while let Some(entry) = version_entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            scanned_indexes += 1;
+            let payload = fs::read(&path).await?;
+            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
+                .with_context(|| format!("invalid version index {}", path.display()))?;
+
+            let Some(preferred_head_id) = index
+                .preferred_head_version_id
+                .clone()
+                .or_else(|| choose_preferred_head(&index))
+            else {
+                continue;
+            };
+            let Some(preferred_head) = index.versions.get(&preferred_head_id) else {
+                continue;
+            };
+            if preferred_head.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+            tombstone_head_indexes += 1;
+            if bound_object_ids.contains(&index.object_id) {
+                continue;
+            }
+
+            let age_secs = now.saturating_sub(preferred_head.created_at_unix);
+            if age_secs < retention_secs {
+                continue;
+            }
+
+            eligible.push((
+                path,
+                index.object_id.clone(),
+                preferred_head.version_id.clone(),
+                preferred_head.created_at_unix,
+                index,
+            ));
+        }
+
+        let eligible_indexes = eligible.len();
+        if dry_run || eligible.is_empty() {
+            return Ok(TombstoneCompactionReport {
+                retention_secs,
+                dry_run,
+                scanned_indexes,
+                tombstone_head_indexes,
+                eligible_indexes,
+                archived_indexes: 0,
+                removed_indexes: 0,
+                archive_path: None,
+            });
+        }
+
+        let archive_dir = self.root_dir.join("state").join("tombstone_archive");
+        fs::create_dir_all(&archive_dir).await?;
+        let archive_file = archive_dir.join(format!("archive-{}.jsonl", unix_ts_nanos()));
+        let mut archive_writer = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&archive_file)
+            .await
+            .with_context(|| format!("failed to create {}", archive_file.display()))?;
+
+        let mut archived_indexes = 0usize;
+        let mut removed_indexes = 0usize;
+        for (path, object_id, preferred_tombstone_version_id, tombstone_created_at_unix, index) in
+            eligible
+        {
+            let record = ArchivedTombstoneIndexRecord {
+                object_id,
+                preferred_tombstone_version_id,
+                preferred_tombstone_created_at_unix: tombstone_created_at_unix,
+                archived_at_unix: now,
+                index,
+            };
+            let mut line = serde_json::to_vec(&record)?;
+            line.push(b'\n');
+            archive_writer.write_all(&line).await?;
+            archived_indexes += 1;
+
+            if fs::try_exists(&path).await? {
+                fs::remove_file(&path).await?;
+                removed_indexes += 1;
+            }
+        }
+        archive_writer.flush().await?;
+
+        Ok(TombstoneCompactionReport {
+            retention_secs,
+            dry_run,
+            scanned_indexes,
+            tombstone_head_indexes,
+            eligible_indexes,
+            archived_indexes,
+            removed_indexes,
+            archive_path: Some(archive_file.to_string_lossy().to_string()),
         })
     }
 

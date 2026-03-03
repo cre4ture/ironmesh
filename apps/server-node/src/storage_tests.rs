@@ -391,6 +391,76 @@ async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk() {
 }
 
 #[tokio::test]
+async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index() {
+    let root = test_store_dir("tombstone-compact-dry-run");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    store
+        .put_object_versioned(
+            "gone",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let before_delete = store.list_versions("gone").await.unwrap().unwrap();
+    let object_id = before_delete.object_id.clone();
+    let index_path = store.version_index_path(&object_id);
+
+    store
+        .tombstone_object("gone", PutOptions::default())
+        .await
+        .unwrap();
+
+    let report = store.compact_tombstone_indexes(0, true).await.unwrap();
+    assert!(report.scanned_indexes >= 1);
+    assert!(report.tombstone_head_indexes >= 1);
+    assert!(report.eligible_indexes >= 1);
+    assert_eq!(report.archived_indexes, 0);
+    assert_eq!(report.removed_indexes, 0);
+    assert!(report.archive_path.is_none());
+    assert!(fs::try_exists(&index_path).await.unwrap());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn compact_tombstone_indexes_archives_and_removes_old_tombstoned_index() {
+    let root = test_store_dir("tombstone-compact-delete");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    store
+        .put_object_versioned(
+            "gone",
+            Bytes::from_static(b"payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let before_delete = store.list_versions("gone").await.unwrap().unwrap();
+    let object_id = before_delete.object_id.clone();
+    let index_path = store.version_index_path(&object_id);
+
+    store
+        .tombstone_object("gone", PutOptions::default())
+        .await
+        .unwrap();
+
+    let report = store.compact_tombstone_indexes(0, false).await.unwrap();
+    assert!(report.eligible_indexes >= 1);
+    assert_eq!(report.archived_indexes, 1);
+    assert_eq!(report.removed_indexes, 1);
+    let archive_path = report.archive_path.expect("archive path should exist");
+    assert!(fs::try_exists(&archive_path).await.unwrap());
+    assert!(!fs::try_exists(&index_path).await.unwrap());
+
+    let archive_bytes = fs::read(&archive_path).await.unwrap();
+    assert!(!archive_bytes.is_empty());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn load_repair_attempts_returns_empty_when_file_missing() {
     let root = test_store_dir("repair-attempts-empty");
     let store = PersistentStore::init(root.clone()).await.unwrap();

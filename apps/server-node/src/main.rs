@@ -573,6 +573,10 @@ async fn main() -> Result<()> {
         )
         .route("/cluster/reconcile/{node_id}", post(reconcile_from_node))
         .route("/maintenance/cleanup", post(run_cleanup))
+        .route(
+            "/maintenance/tombstones/compact",
+            post(run_tombstone_compaction),
+        )
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2506,6 +2510,26 @@ async fn run_cleanup(
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
         Err(err) => {
             tracing::error!(error = %err, "maintenance cleanup failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn run_tombstone_compaction(
+    State(state): State<ServerState>,
+    Query(query): Query<CleanupQuery>,
+) -> impl IntoResponse {
+    let retention_secs = query.retention_secs.unwrap_or(60 * 60 * 24 * 30);
+    let dry_run = query.dry_run.unwrap_or(true);
+
+    let store = state.store.lock().await;
+    match store
+        .compact_tombstone_indexes(retention_secs, dry_run)
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "maintenance tombstone compaction failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

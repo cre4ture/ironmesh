@@ -27,10 +27,14 @@ Implemented so far:
   - `modify_delete_conflict`
   - `dual_modify_missing_baseline`
 - Incremental per-path baseline upserts/removals during startup/runtime apply/upload/delete flows to reduce crash windows.
+- Server-side tombstone tooling scaffold:
+  - `POST /maintenance/tombstones/compact`
+  - dry-run support
+  - archival of compacted tombstoned version indexes into `state/tombstone_archive/*.jsonl`
 
 Not implemented yet:
 - Conflict lifecycle tooling (resolve/ack/clear workflows and user-facing surfacing).
-- Full tombstone retention/compaction/archival/admin tooling stack.
+- Full tombstone retention policy controls and restore workflows from archive.
 - Telemetry counters for path/global recovery and conflict classes.
 
 ## 2. Decision Update
