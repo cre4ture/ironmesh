@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -70,11 +70,6 @@ fn main() -> Result<()> {
         }
     };
 
-    let preserve_local_files = local_paths_to_preserve_on_startup(
-        &local_state_before_remote_sync,
-        baseline_before_remote_sync.as_ref(),
-    );
-
     let client = IronMeshClient::new(base_url.as_str());
 
     let initial_fetcher = RemoteSnapshotFetcher::from_base_url(
@@ -86,6 +81,14 @@ fn main() -> Result<()> {
     let initial_snapshot = initial_fetcher
         .fetch_snapshot_blocking()
         .context("failed to fetch initial remote snapshot")?;
+    let remote_hashes_before_remote_sync =
+        remote_file_hashes_by_local_path(&initial_snapshot, &scope);
+    let preserve_local_files = local_paths_to_preserve_on_startup(
+        &args.root_dir,
+        &local_state_before_remote_sync,
+        baseline_before_remote_sync.as_ref(),
+        &remote_hashes_before_remote_sync,
+    );
 
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
@@ -228,8 +231,10 @@ fn install_ctrlc_handler(running: Arc<AtomicBool>) -> Result<()> {
 }
 
 fn local_paths_to_preserve_on_startup(
+    root_dir: &Path,
     local_state: &LocalTreeState,
     baseline: Option<&LocalTreeState>,
+    remote_hashes: &BTreeMap<String, String>,
 ) -> BTreeSet<String> {
     let mut preserve = BTreeSet::new();
 
@@ -238,16 +243,85 @@ fn local_paths_to_preserve_on_startup(
             continue;
         }
 
-        let unchanged = baseline
-            .and_then(|state| state.get(path))
-            .is_some_and(|previous| previous == entry_state);
+        let Some(previous) = baseline.and_then(|state| state.get(path)) else {
+            if let Some(remote_hash) = remote_hashes.get(path) {
+                match local_file_content_hash(root_dir, path) {
+                    Ok(local_hash) if local_hash == *remote_hash => continue,
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "startup-state: failed to hash local file {path}: {error}; preserving local bytes"
+                        );
+                    }
+                }
+            }
+            preserve.insert(path.clone());
+            continue;
+        };
 
-        if !unchanged {
+        if previous != entry_state {
             preserve.insert(path.clone());
         }
     }
 
     preserve
+}
+
+fn remote_file_hashes_by_local_path(
+    snapshot: &SyncSnapshot,
+    scope: &PathScope,
+) -> BTreeMap<String, String> {
+    let mut by_local_path = BTreeMap::new();
+
+    for entry in &snapshot.remote {
+        if entry.kind != EntryKind::File {
+            continue;
+        }
+        let Some(content_hash) = entry.content_hash.as_deref() else {
+            continue;
+        };
+        if content_hash.is_empty() {
+            continue;
+        }
+
+        let remote_path = normalize_relative_path(&entry.path);
+        let Some(local_path) = scope.remote_to_local(&remote_path) else {
+            continue;
+        };
+        if local_path.is_empty() {
+            continue;
+        }
+        by_local_path.insert(local_path, content_hash.to_string());
+    }
+
+    by_local_path
+}
+
+fn local_file_content_hash(root_dir: &Path, relative_path: &str) -> Result<String> {
+    let absolute = absolute_path(root_dir, relative_path);
+    let mut file = File::open(&absolute).with_context(|| {
+        format!(
+            "failed to open local file for hashing {}",
+            absolute.display()
+        )
+    })?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).with_context(|| {
+            format!(
+                "failed to read local file for hashing {}",
+                absolute.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn startup_baseline_state_from_remote_index(
@@ -914,7 +988,15 @@ fn current_unix_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::PathScope;
+    use super::{
+        PathScope, local_entry_state_for_path, local_file_content_hash,
+        local_paths_to_preserve_on_startup,
+    };
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use sync_agent_core::LocalTreeState;
 
     #[test]
     fn path_scope_without_prefix_keeps_paths() {
@@ -942,5 +1024,81 @@ mod tests {
             scope.local_to_remote("docs/readme.txt"),
             Some("team/a/docs/readme.txt".to_string())
         );
+    }
+
+    #[test]
+    fn startup_preserve_skips_missing_baseline_file_when_hash_matches_remote() {
+        let root = test_root();
+        write_file(&root, "docs/readme.txt", b"hello");
+
+        let mut local = LocalTreeState::new();
+        local.insert(
+            "docs/readme.txt".to_string(),
+            local_entry_state_for_path(&root, "docs/readme.txt")
+                .unwrap()
+                .unwrap(),
+        );
+
+        let mut remote_hashes = BTreeMap::new();
+        remote_hashes.insert(
+            "docs/readme.txt".to_string(),
+            local_file_content_hash(&root, "docs/readme.txt").unwrap(),
+        );
+
+        let preserve = local_paths_to_preserve_on_startup(&root, &local, None, &remote_hashes);
+
+        assert!(preserve.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_preserve_keeps_missing_baseline_file_when_hash_differs() {
+        let root = test_root();
+        write_file(&root, "docs/readme.txt", b"hello");
+
+        let mut local = LocalTreeState::new();
+        local.insert(
+            "docs/readme.txt".to_string(),
+            local_entry_state_for_path(&root, "docs/readme.txt")
+                .unwrap()
+                .unwrap(),
+        );
+
+        let mut remote_hashes = BTreeMap::new();
+        remote_hashes.insert(
+            "docs/readme.txt".to_string(),
+            "not-the-local-hash".to_string(),
+        );
+
+        let preserve = local_paths_to_preserve_on_startup(&root, &local, None, &remote_hashes);
+
+        assert_eq!(preserve.len(), 1);
+        assert!(preserve.contains("docs/readme.txt"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_file(root: &Path, relative_path: &str, bytes: &[u8]) {
+        let absolute = root.join(relative_path);
+        if let Some(parent) = absolute.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(absolute, bytes).unwrap();
+    }
+
+    fn test_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "ironmesh-folder-agent-test-{}-{}",
+            std::process::id(),
+            nonce
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }
