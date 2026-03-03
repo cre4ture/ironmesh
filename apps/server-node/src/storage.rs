@@ -177,6 +177,20 @@ pub struct TombstoneArchivePurgeReport {
     pub kept_recent_files: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAuditEvent {
+    pub event_id: String,
+    pub action: String,
+    pub actor: Option<String>,
+    pub source_node: Option<String>,
+    pub authorized: bool,
+    pub dry_run: bool,
+    pub approved: bool,
+    pub outcome: String,
+    pub details_json: String,
+    pub created_at_unix: u64,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -284,6 +298,7 @@ pub struct PersistentStore {
     repair_attempts_path: PathBuf,
     cluster_replicas_path: PathBuf,
     internal_node_tokens_path: PathBuf,
+    admin_audit_log_path: PathBuf,
     current_state: CurrentState,
 }
 
@@ -318,6 +333,7 @@ impl PersistentStore {
         let repair_attempts_path = state_dir.join("repair_attempts.json");
         let cluster_replicas_path = state_dir.join("cluster_replicas.json");
         let internal_node_tokens_path = state_dir.join("internal_node_tokens.json");
+        let admin_audit_log_path = state_dir.join("admin_audit.jsonl");
 
         fs::create_dir_all(&chunks_dir).await?;
         fs::create_dir_all(&manifests_dir).await?;
@@ -346,6 +362,7 @@ impl PersistentStore {
             repair_attempts_path,
             cluster_replicas_path,
             internal_node_tokens_path,
+            admin_audit_log_path,
             current_state,
         })
     }
@@ -1932,6 +1949,20 @@ impl PersistentStore {
             deleted_files,
             kept_recent_files,
         })
+    }
+
+    pub async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.admin_audit_log_path)
+            .await
+            .with_context(|| format!("failed to open {}", self.admin_audit_log_path.display()))?;
+        let mut line = serde_json::to_vec(event)?;
+        line.push(b'\n');
+        file.write_all(&line).await?;
+        file.flush().await?;
+        Ok(())
     }
 
     fn object_id_for_key(&self, key: &str) -> Option<String> {

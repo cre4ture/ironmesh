@@ -571,6 +571,41 @@ async fn purge_tombstone_archives_dry_run_then_delete() {
 }
 
 #[tokio::test]
+async fn append_admin_audit_event_writes_jsonl_log() {
+    let root = test_store_dir("admin-audit-log");
+    let store = PersistentStore::init(root.clone()).await.unwrap();
+
+    let event = AdminAuditEvent {
+        event_id: "evt-1".to_string(),
+        action: "maintenance/tombstones/compact".to_string(),
+        actor: Some("ci".to_string()),
+        source_node: None,
+        authorized: true,
+        dry_run: true,
+        approved: false,
+        outcome: "success".to_string(),
+        details_json: "{\"x\":1}".to_string(),
+        created_at_unix: unix_ts(),
+    };
+    store.append_admin_audit_event(&event).await.unwrap();
+
+    let payload = fs::read(root.join("state").join("admin_audit.jsonl"))
+        .await
+        .unwrap();
+    let lines = payload
+        .split(|value| *value == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1);
+    let parsed: AdminAuditEvent = serde_json::from_slice(lines[0]).unwrap();
+    assert_eq!(parsed.event_id, "evt-1");
+    assert_eq!(parsed.action, "maintenance/tombstones/compact");
+    assert_eq!(parsed.actor.as_deref(), Some("ci"));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn load_repair_attempts_returns_empty_when_file_missing() {
     let root = test_store_dir("repair-attempts-empty");
     let store = PersistentStore::init(root.clone()).await.unwrap();

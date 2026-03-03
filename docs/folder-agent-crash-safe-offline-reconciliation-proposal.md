@@ -32,12 +32,15 @@ Implemented so far:
   - `GET /maintenance/tombstones/archive`
   - `POST /maintenance/tombstones/archive/restore`
   - `POST /maintenance/tombstones/archive/purge`
+  - token-based admin access control via `IRONMESH_ADMIN_TOKEN` + `x-ironmesh-admin-token`
+  - explicit approval gate for destructive runs (`dry_run=false` requires `approve=true`)
+  - persistent admin audit trail in `state/admin_audit.jsonl`
   - dry-run support
   - archival of compacted tombstoned version indexes into `state/tombstone_archive/*.jsonl`
 
 Not implemented yet:
 - Conflict lifecycle tooling (resolve/ack/clear workflows and user-facing surfacing).
-- Full tombstone retention policy controls and richer restore/purge guardrails (RBAC, approvals, audit trails).
+- Full tombstone retention policy controls and richer restore/purge guardrails (RBAC role tiers, audit viewer APIs, tamper-evident archival).
 - Telemetry counters for path/global recovery and conflict classes.
 
 ## 2. Decision Update

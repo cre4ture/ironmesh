@@ -1,7 +1,7 @@
 use super::{
-    MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState, ServerState,
-    StartupRepairStatus, await_repair_busy_threshold, build_store_index_entries, cluster,
-    constant_time_eq, expected_internal_token_for_node, internal_node_header_valid,
+    AdminControl, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState,
+    ServerState, StartupRepairStatus, await_repair_busy_threshold, build_store_index_entries,
+    cluster, constant_time_eq, expected_internal_token_for_node, internal_node_header_valid,
     internal_token_matches, jittered_backoff_secs, parse_internal_node_tokens,
     replication::build_internal_replication_put_url, run_startup_replication_repair_once,
     should_trigger_autonomous_post_write_replication,
@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
+use axum::http::HeaderMap;
 use std::collections::HashMap;
 use tokio::time::{Duration, Instant};
 
@@ -42,6 +43,50 @@ fn internal_token_auth_requires_exact_match_when_configured() {
     assert!(!internal_token_matches("secret", None));
     assert!(!internal_token_matches("secret", Some("wrong")));
     assert!(internal_token_matches("secret", Some("secret")));
+}
+
+#[tokio::test]
+async fn admin_authorization_requires_token_when_configured() {
+    let mut state = build_test_state(1, false).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let headers = HeaderMap::new();
+
+    let result = super::authorize_admin_request(
+        &state,
+        &headers,
+        "maintenance/tombstones/compact",
+        true,
+        true,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(result.err(), Some(axum::http::StatusCode::UNAUTHORIZED));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn admin_authorization_requires_explicit_approval_for_destructive_action() {
+    let mut state = build_test_state(1, false).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let result = super::authorize_admin_request(
+        &state,
+        &headers,
+        "maintenance/tombstones/archive/purge",
+        false,
+        false,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        result.err(),
+        Some(axum::http::StatusCode::PRECONDITION_FAILED)
+    );
+
+    cleanup_test_state(&state).await;
 }
 
 #[test]
@@ -326,6 +371,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        admin_control: AdminControl::default(),
     };
 
     if seed_gap {

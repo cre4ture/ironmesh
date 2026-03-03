@@ -18,6 +18,7 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use common::{HealthStatus, NodeId};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
@@ -25,6 +26,7 @@ use tracing::{info, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use uuid::Uuid;
 
 mod cluster;
 mod replication;
@@ -33,8 +35,9 @@ mod ui;
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
-    ObjectReadMode, PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry,
-    RepairAttemptRecord, StoreReadError, UploadChunkRef, VersionConsistencyState,
+    AdminAuditEvent, ObjectReadMode, PathMutationResult, PersistentStore, PutOptions,
+    ReconcileVersionEntry, RepairAttemptRecord, StoreReadError, UploadChunkRef,
+    VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -52,6 +55,7 @@ struct ServerState {
     log_buffer: Arc<LogBuffer>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
+    admin_control: AdminControl,
 }
 
 struct LogBuffer {
@@ -171,6 +175,11 @@ struct PeerHeartbeatConfig {
     interval_secs: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AdminControl {
+    admin_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum StartupRepairStatus {
     Disabled,
@@ -269,6 +278,16 @@ impl PeerHeartbeatConfig {
             enabled,
             interval_secs,
         }
+    }
+}
+
+impl AdminControl {
+    fn from_env() -> Self {
+        let admin_token = std::env::var("IRONMESH_ADMIN_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Self { admin_token }
     }
 }
 
@@ -380,6 +399,7 @@ async fn main() -> Result<()> {
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
             .unwrap_or(true);
     let peer_heartbeat_config = PeerHeartbeatConfig::from_env();
+    let admin_control = AdminControl::from_env();
     let startup_repair_status = if repair_config.startup_repair_enabled {
         StartupRepairStatus::Scheduled
     } else {
@@ -448,6 +468,7 @@ async fn main() -> Result<()> {
         log_buffer,
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        admin_control,
     };
 
     if let Err(err) = persist_internal_node_tokens_state(&state).await {
@@ -1620,6 +1641,7 @@ struct OutboundNodeHeartbeatRequest {
 struct CleanupQuery {
     retention_secs: Option<u64>,
     dry_run: Option<bool>,
+    approve: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1628,6 +1650,7 @@ struct TombstoneRestoreQuery {
     archive_file: Option<String>,
     overwrite: Option<bool>,
     dry_run: Option<bool>,
+    approve: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2424,6 +2447,108 @@ async fn internal_outbound_token(state: &ServerState) -> Option<String> {
     expected_internal_token_for_node(&tokens, state.node_id).map(ToString::to_string)
 }
 
+const ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
+const ADMIN_ACTOR_HEADER: &str = "x-ironmesh-admin-actor";
+const ADMIN_SOURCE_NODE_HEADER: &str = "x-ironmesh-node-id";
+
+#[derive(Debug, Clone)]
+struct AdminRequestMetadata {
+    actor: Option<String>,
+    source_node: Option<String>,
+}
+
+fn admin_request_metadata(headers: &HeaderMap) -> AdminRequestMetadata {
+    let actor = headers
+        .get(ADMIN_ACTOR_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let source_node = headers
+        .get(ADMIN_SOURCE_NODE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    AdminRequestMetadata { actor, source_node }
+}
+
+async fn append_admin_audit(
+    state: &ServerState,
+    action: &str,
+    request: &AdminRequestMetadata,
+    authorized: bool,
+    dry_run: bool,
+    approved: bool,
+    outcome: &str,
+    details: serde_json::Value,
+) {
+    let event = AdminAuditEvent {
+        event_id: Uuid::now_v7().to_string(),
+        action: action.to_string(),
+        actor: request.actor.clone(),
+        source_node: request.source_node.clone(),
+        authorized,
+        dry_run,
+        approved,
+        outcome: outcome.to_string(),
+        details_json: serde_json::to_string(&details).unwrap_or_else(|_| "{}".to_string()),
+        created_at_unix: unix_ts(),
+    };
+    let store = state.store.lock().await;
+    if let Err(err) = store.append_admin_audit_event(&event).await {
+        warn!(error = %err, action = %action, "failed to append admin audit event");
+    }
+}
+
+async fn authorize_admin_request(
+    state: &ServerState,
+    headers: &HeaderMap,
+    action: &str,
+    dry_run: bool,
+    approve: bool,
+    details: serde_json::Value,
+) -> std::result::Result<AdminRequestMetadata, StatusCode> {
+    let request = admin_request_metadata(headers);
+
+    if let Some(expected) = state.admin_control.admin_token.as_deref() {
+        let provided = headers
+            .get(ADMIN_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok());
+        if !internal_token_matches(expected, provided) {
+            append_admin_audit(
+                state,
+                action,
+                &request,
+                false,
+                dry_run,
+                approve,
+                "denied_auth",
+                details,
+            )
+            .await;
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    if !dry_run && !approve {
+        append_admin_audit(
+            state,
+            action,
+            &request,
+            true,
+            dry_run,
+            approve,
+            "denied_missing_approval",
+            details,
+        )
+        .await;
+        return Err(StatusCode::PRECONDITION_FAILED);
+    }
+
+    Ok(request)
+}
+
 fn expected_internal_token_for_node(
     node_tokens: &HashMap<NodeId, String>,
     node_id: NodeId,
@@ -2520,15 +2645,72 @@ fn unix_ts() -> u64 {
 
 async fn run_cleanup(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<CleanupQuery>,
 ) -> impl IntoResponse {
     let retention_secs = query.retention_secs.unwrap_or(60 * 60 * 24);
     let dry_run = query.dry_run.unwrap_or(true);
+    let approve = query.approve.unwrap_or(false);
+    let action = "maintenance/cleanup";
+    let request_details = json!({
+        "retention_secs": retention_secs,
+        "dry_run": dry_run,
+        "approve": approve,
+    });
+    let request = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        dry_run,
+        approve,
+        request_details.clone(),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
 
-    let store = state.store.lock().await;
-    match store.cleanup_unreferenced(retention_secs, dry_run).await {
-        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+    let result = {
+        let store = state.store.lock().await;
+        store.cleanup_unreferenced(retention_secs, dry_run).await
+    };
+    match result {
+        Ok(report) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "success",
+                json!({
+                    "retention_secs": retention_secs,
+                    "dry_run": dry_run,
+                    "deleted_manifests": report.deleted_manifests,
+                    "deleted_chunks": report.deleted_chunks,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(report)).into_response()
+        }
         Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "error",
+                json!({
+                    "retention_secs": retention_secs,
+                    "dry_run": dry_run,
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
             tracing::error!(error = %err, "maintenance cleanup failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -2537,29 +2719,132 @@ async fn run_cleanup(
 
 async fn run_tombstone_compaction(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<CleanupQuery>,
 ) -> impl IntoResponse {
     let retention_secs = query.retention_secs.unwrap_or(60 * 60 * 24 * 30);
     let dry_run = query.dry_run.unwrap_or(true);
-
-    let store = state.store.lock().await;
-    match store
-        .compact_tombstone_indexes(retention_secs, dry_run)
-        .await
+    let approve = query.approve.unwrap_or(false);
+    let action = "maintenance/tombstones/compact";
+    let request_details = json!({
+        "retention_secs": retention_secs,
+        "dry_run": dry_run,
+        "approve": approve,
+    });
+    let request = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        dry_run,
+        approve,
+        request_details.clone(),
+    )
+    .await
     {
-        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let result = {
+        let store = state.store.lock().await;
+        store
+            .compact_tombstone_indexes(retention_secs, dry_run)
+            .await
+    };
+    match result {
+        Ok(report) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "success",
+                json!({
+                    "retention_secs": retention_secs,
+                    "dry_run": dry_run,
+                    "eligible_indexes": report.eligible_indexes,
+                    "removed_indexes": report.removed_indexes,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(report)).into_response()
+        }
         Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "error",
+                json!({
+                    "retention_secs": retention_secs,
+                    "dry_run": dry_run,
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
             tracing::error!(error = %err, "maintenance tombstone compaction failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
 
-async fn list_tombstone_archives(State(state): State<ServerState>) -> impl IntoResponse {
-    let store = state.store.lock().await;
-    match store.list_tombstone_archives().await {
-        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
+async fn list_tombstone_archives(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let dry_run = true;
+    let approve = true;
+    let action = "maintenance/tombstones/archive/list";
+    let request = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        dry_run,
+        approve,
+        json!({}),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let result = {
+        let store = state.store.lock().await;
+        store.list_tombstone_archives().await
+    };
+    match result {
+        Ok(entries) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "success",
+                json!({ "entries": entries.len() }),
+            )
+            .await;
+            (StatusCode::OK, Json(entries)).into_response()
+        }
         Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
             tracing::error!(error = %err, "failed to list tombstone archives");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -2568,6 +2853,7 @@ async fn list_tombstone_archives(State(state): State<ServerState>) -> impl IntoR
 
 async fn run_tombstone_archive_restore(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<TombstoneRestoreQuery>,
 ) -> impl IntoResponse {
     let object_id = query.object_id.trim();
@@ -2576,19 +2862,80 @@ async fn run_tombstone_archive_restore(
     }
 
     let dry_run = query.dry_run.unwrap_or(true);
+    let approve = query.approve.unwrap_or(false);
     let overwrite = query.overwrite.unwrap_or(false);
-    let store = state.store.lock().await;
-    match store
-        .restore_tombstone_index_from_archive(
-            object_id,
-            query.archive_file.as_deref(),
-            overwrite,
-            dry_run,
-        )
-        .await
+    let action = "maintenance/tombstones/archive/restore";
+    let request_details = json!({
+        "object_id": object_id,
+        "archive_file": query.archive_file.clone(),
+        "overwrite": overwrite,
+        "dry_run": dry_run,
+        "approve": approve,
+    });
+    let request = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        dry_run,
+        approve,
+        request_details.clone(),
+    )
+    .await
     {
-        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let result = {
+        let store = state.store.lock().await;
+        store
+            .restore_tombstone_index_from_archive(
+                object_id,
+                query.archive_file.as_deref(),
+                overwrite,
+                dry_run,
+            )
+            .await
+    };
+    match result {
+        Ok(report) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "success",
+                json!({
+                    "object_id": object_id,
+                    "dry_run": dry_run,
+                    "overwrite": overwrite,
+                    "found": report.found,
+                    "restored": report.restored,
+                    "skipped_existing": report.skipped_existing,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(report)).into_response()
+        }
         Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "error",
+                json!({
+                    "object_id": object_id,
+                    "dry_run": dry_run,
+                    "overwrite": overwrite,
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
             tracing::error!(error = %err, object_id = %object_id, "failed to restore tombstone archive");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -2597,18 +2944,74 @@ async fn run_tombstone_archive_restore(
 
 async fn run_tombstone_archive_purge(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Query(query): Query<CleanupQuery>,
 ) -> impl IntoResponse {
     let retention_secs = query.retention_secs.unwrap_or(60 * 60 * 24 * 180);
     let dry_run = query.dry_run.unwrap_or(true);
-
-    let store = state.store.lock().await;
-    match store
-        .purge_tombstone_archives(retention_secs, dry_run)
-        .await
+    let approve = query.approve.unwrap_or(false);
+    let action = "maintenance/tombstones/archive/purge";
+    let request_details = json!({
+        "retention_secs": retention_secs,
+        "dry_run": dry_run,
+        "approve": approve,
+    });
+    let request = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        dry_run,
+        approve,
+        request_details.clone(),
+    )
+    .await
     {
-        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let result = {
+        let store = state.store.lock().await;
+        store
+            .purge_tombstone_archives(retention_secs, dry_run)
+            .await
+    };
+    match result {
+        Ok(report) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "success",
+                json!({
+                    "retention_secs": retention_secs,
+                    "dry_run": dry_run,
+                    "eligible_files": report.eligible_files,
+                    "deleted_files": report.deleted_files,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(report)).into_response()
+        }
         Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                dry_run,
+                approve,
+                "error",
+                json!({
+                    "retention_secs": retention_secs,
+                    "dry_run": dry_run,
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
             tracing::error!(error = %err, "failed to purge tombstone archives");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }

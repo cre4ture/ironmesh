@@ -2277,7 +2277,7 @@ mod tests {
 
             let cleanup_response = client
                 .post(format!(
-                    "{base_url}/maintenance/cleanup?retention_secs=0&dry_run=false"
+                    "{base_url}/maintenance/cleanup?retention_secs=0&dry_run=false&approve=true"
                 ))
                 .send()
                 .await?
