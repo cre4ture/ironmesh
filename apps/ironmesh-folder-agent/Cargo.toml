@@ -13,3 +13,4 @@ notify.workspace = true
 sync-agent-core = { path = "../../crates/sync-agent-core" }
 sync-core = { path = "../../crates/sync-core" }
 ctrlc = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,13 +1,16 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotUpdate,
     normalize_server_base_url,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rusqlite::{Connection, params};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +48,9 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     let scope = PathScope::new(args.prefix.clone());
+    let base_url = normalize_server_base_url(&args.server_base_url)?;
+    let state_store = StartupStateStore::new(&args.root_dir, &scope, base_url.as_str());
+
     fs::create_dir_all(&args.root_dir).with_context(|| {
         format!(
             "failed to create root directory {}",
@@ -52,7 +58,23 @@ fn main() -> Result<()> {
         )
     })?;
 
-    let base_url = normalize_server_base_url(&args.server_base_url)?;
+    let local_state_before_remote_sync = scan_local_tree(&args.root_dir)
+        .context("failed to scan local state before initial remote sync")?;
+
+    let baseline_before_remote_sync = match state_store.load_local_baseline() {
+        Ok(state) => Some(state),
+        Err(error) => {
+            eprintln!("startup-state: failed to load sqlite baseline: {error}");
+            state_store.quarantine_corrupt().ok();
+            None
+        }
+    };
+
+    let preserve_local_files = local_paths_to_preserve_on_startup(
+        &local_state_before_remote_sync,
+        baseline_before_remote_sync.as_ref(),
+    );
+
     let client = IronMeshClient::new(base_url.as_str());
 
     let initial_fetcher = RemoteSnapshotFetcher::from_base_url(
@@ -72,6 +94,7 @@ fn main() -> Result<()> {
         &client,
         &initial_snapshot,
         None,
+        Some(&preserve_local_files),
         &scope,
         &mut suppressed_uploads,
         &mut remote_index,
@@ -79,7 +102,11 @@ fn main() -> Result<()> {
 
     let mut local_state = scan_local_tree(&args.root_dir)
         .context("failed to scan local state after initial remote sync")?;
-    local_state = startup_baseline_state_from_remote_index(&local_state, &remote_index);
+    local_state = startup_baseline_state_from_remote_index(
+        &local_state,
+        &remote_index,
+        &preserve_local_files,
+    );
 
     sync_local_changes(
         &args.root_dir,
@@ -89,6 +116,10 @@ fn main() -> Result<()> {
         &mut remote_index,
         &mut suppressed_uploads,
     )?;
+
+    state_store
+        .persist_local_baseline(&local_state)
+        .context("failed to persist sqlite baseline after startup reconciliation")?;
 
     if args.run_once {
         return Ok(());
@@ -132,6 +163,7 @@ fn main() -> Result<()> {
     let mut next_local_scan = Instant::now() + local_scan_interval;
 
     while running.load(Ordering::SeqCst) {
+        let mut baseline_dirty = false;
         let mut remote_updates_applied = false;
         while let Ok(update) = remote_rx.try_recv() {
             apply_remote_snapshot(
@@ -139,6 +171,7 @@ fn main() -> Result<()> {
                 &client,
                 &update.snapshot,
                 Some(&update.changed_paths),
+                None,
                 &scope,
                 &mut suppressed_uploads,
                 &mut remote_index,
@@ -149,6 +182,7 @@ fn main() -> Result<()> {
         if remote_updates_applied {
             local_state = scan_local_tree(&args.root_dir)
                 .context("failed to rescan local state after remote update")?;
+            baseline_dirty = true;
         }
 
         let mut local_scan_requested = false;
@@ -157,6 +191,7 @@ fn main() -> Result<()> {
         }
 
         if local_scan_requested || Instant::now() >= next_local_scan {
+            let previous_local_state = local_state.clone();
             sync_local_changes(
                 &args.root_dir,
                 &client,
@@ -165,7 +200,16 @@ fn main() -> Result<()> {
                 &mut remote_index,
                 &mut suppressed_uploads,
             )?;
+            if local_state != previous_local_state {
+                baseline_dirty = true;
+            }
             next_local_scan = Instant::now() + local_scan_interval;
+        }
+
+        if baseline_dirty {
+            state_store
+                .persist_local_baseline(&local_state)
+                .context("failed to persist sqlite baseline during runtime")?;
         }
 
         thread::sleep(Duration::from_millis(250));
@@ -183,13 +227,40 @@ fn install_ctrlc_handler(running: Arc<AtomicBool>) -> Result<()> {
     .context("failed to install Ctrl+C handler")
 }
 
+fn local_paths_to_preserve_on_startup(
+    local_state: &LocalTreeState,
+    baseline: Option<&LocalTreeState>,
+) -> BTreeSet<String> {
+    let mut preserve = BTreeSet::new();
+
+    for (path, entry_state) in local_state {
+        if entry_state.kind != LocalEntryKind::File {
+            continue;
+        }
+
+        let unchanged = baseline
+            .and_then(|state| state.get(path))
+            .is_some_and(|previous| previous == entry_state);
+
+        if !unchanged {
+            preserve.insert(path.clone());
+        }
+    }
+
+    preserve
+}
+
 fn startup_baseline_state_from_remote_index(
     local_state: &LocalTreeState,
     remote_index: &RemoteTreeIndex,
+    excluded_paths: &BTreeSet<String>,
 ) -> LocalTreeState {
     let mut baseline = LocalTreeState::new();
 
     for path in &remote_index.directories {
+        if excluded_paths.contains(path) {
+            continue;
+        }
         if let Some(entry_state) = local_state.get(path)
             && entry_state.kind == LocalEntryKind::Directory
         {
@@ -198,6 +269,9 @@ fn startup_baseline_state_from_remote_index(
     }
 
     for path in &remote_index.files {
+        if excluded_paths.contains(path) {
+            continue;
+        }
         if let Some(entry_state) = local_state.get(path)
             && entry_state.kind == LocalEntryKind::File
         {
@@ -316,6 +390,7 @@ fn apply_remote_snapshot(
     client: &IronMeshClient,
     snapshot: &SyncSnapshot,
     changed_paths: Option<&[String]>,
+    preserve_local_files: Option<&BTreeSet<String>>,
     scope: &PathScope,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
     remote_index: &mut RemoteTreeIndex,
@@ -398,6 +473,12 @@ fn apply_remote_snapshot(
                 let Some((EntryKind::File, remote_key)) = entry_kinds.get(file) else {
                     continue;
                 };
+                if preserve_local_files.is_some_and(|set| set.contains(file))
+                    && local_entry_state_for_path(root_dir, file)?
+                        .is_some_and(|entry| entry.kind == LocalEntryKind::File)
+                {
+                    continue;
+                }
                 download_remote_file(root_dir, client, file, remote_key)?;
                 if let Some(entry_state) = local_entry_state_for_path(root_dir, file)? {
                     suppressed_uploads.insert(file.clone(), entry_state);
@@ -607,6 +688,192 @@ impl PathScope {
             Some(prefix) => format!("{prefix}/{normalized}"),
         })
     }
+}
+
+struct StartupStateStore {
+    path: PathBuf,
+}
+
+impl StartupStateStore {
+    fn new(root_dir: &Path, scope: &PathScope, server_base_url: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        root_dir.to_string_lossy().hash(&mut hasher);
+        scope.remote_prefix().unwrap_or_default().hash(&mut hasher);
+        server_base_url.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+
+        let mut path = std::env::temp_dir();
+        path.push("ironmesh-folder-agent");
+        path.push(format!("baseline-{fingerprint:016x}.sqlite"));
+        Self { path }
+    }
+
+    fn load_local_baseline(&self) -> Result<LocalTreeState> {
+        let connection = self.sqlite_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT path, kind, size_bytes, modified_unix_ms
+                 FROM baseline_entries",
+            )
+            .context("failed to prepare sqlite baseline query")?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .context("failed to read sqlite baseline rows")?;
+
+        let mut state = LocalTreeState::new();
+        for row in rows {
+            let (path, kind_code, size_bytes_i64, modified_unix_ms_i64) =
+                row.context("failed to decode sqlite baseline row")?;
+
+            let kind = match kind_code {
+                0 => LocalEntryKind::File,
+                1 => LocalEntryKind::Directory,
+                _ => bail!("invalid kind code in sqlite baseline for path={path}"),
+            };
+
+            let size_bytes = u64::try_from(size_bytes_i64)
+                .with_context(|| format!("invalid size in sqlite baseline for path={path}"))?;
+            let modified_unix_ms = u128::try_from(modified_unix_ms_i64)
+                .with_context(|| format!("invalid mtime in sqlite baseline for path={path}"))?;
+
+            state.insert(
+                path,
+                LocalEntryState {
+                    kind,
+                    size_bytes,
+                    modified_unix_ms,
+                },
+            );
+        }
+
+        Ok(state)
+    }
+
+    fn persist_local_baseline(&self, state: &LocalTreeState) -> Result<()> {
+        let mut connection = self.sqlite_connection()?;
+        let tx = connection
+            .transaction()
+            .context("failed to start sqlite baseline transaction")?;
+
+        tx.execute("DELETE FROM baseline_entries", [])
+            .context("failed to clear sqlite baseline table")?;
+
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO baseline_entries(path, kind, size_bytes, modified_unix_ms)
+                     VALUES(?1, ?2, ?3, ?4)",
+                )
+                .context("failed to prepare sqlite baseline insert")?;
+
+            for (path, entry_state) in state {
+                let kind_code: i64 = match entry_state.kind {
+                    LocalEntryKind::File => 0,
+                    LocalEntryKind::Directory => 1,
+                };
+                let size_bytes = i64::try_from(entry_state.size_bytes)
+                    .with_context(|| format!("size overflow while persisting baseline: {path}"))?;
+                let modified_unix_ms = i64::try_from(entry_state.modified_unix_ms)
+                    .with_context(|| format!("mtime overflow while persisting baseline: {path}"))?;
+
+                insert
+                    .execute(params![path, kind_code, size_bytes, modified_unix_ms])
+                    .with_context(|| format!("failed to insert sqlite baseline row for {path}"))?;
+            }
+        }
+
+        tx.commit()
+            .context("failed to commit sqlite baseline transaction")?;
+
+        Ok(())
+    }
+
+    fn quarantine_corrupt(&self) -> Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+
+        let quarantine = self
+            .path
+            .with_extension(format!("corrupt-{}", current_unix_ms()));
+        fs::rename(&self.path, &quarantine).with_context(|| {
+            format!(
+                "failed to quarantine sqlite baseline {}",
+                self.path.display()
+            )
+        })?;
+
+        let wal = PathBuf::from(format!("{}-wal", self.path.display()));
+        if wal.exists() {
+            let _ = fs::remove_file(wal);
+        }
+        let shm = PathBuf::from(format!("{}-shm", self.path.display()));
+        if shm.exists() {
+            let _ = fs::remove_file(shm);
+        }
+
+        Ok(())
+    }
+
+    fn sqlite_connection(&self) -> Result<Connection> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create sqlite baseline directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let connection = Connection::open(&self.path)
+            .with_context(|| format!("failed to open sqlite baseline {}", self.path.display()))?;
+
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .context("failed to set sqlite journal_mode")?;
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .context("failed to set sqlite synchronous mode")?;
+
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS baseline_meta (
+                     key TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS baseline_entries (
+                     path TEXT PRIMARY KEY,
+                     kind INTEGER NOT NULL,
+                     size_bytes INTEGER NOT NULL,
+                     modified_unix_ms INTEGER NOT NULL
+                 );",
+            )
+            .context("failed to initialize sqlite baseline schema")?;
+
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO baseline_meta(key, value) VALUES(?1, ?2)",
+                params!["schema_version", "1"],
+            )
+            .context("failed to initialize sqlite baseline metadata")?;
+
+        Ok(connection)
+    }
+}
+
+fn current_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 #[cfg(test)]
