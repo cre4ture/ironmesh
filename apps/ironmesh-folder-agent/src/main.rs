@@ -81,6 +81,8 @@ fn main() -> Result<()> {
     let initial_snapshot = initial_fetcher
         .fetch_snapshot_blocking()
         .context("failed to fetch initial remote snapshot")?;
+    let remote_files_before_remote_sync =
+        remote_file_paths_by_local_path(&initial_snapshot, &scope);
     let remote_hashes_before_remote_sync =
         remote_file_hashes_by_local_path(&initial_snapshot, &scope);
     let preserve_local_files = local_paths_to_preserve_on_startup(
@@ -88,6 +90,12 @@ fn main() -> Result<()> {
         &local_state_before_remote_sync,
         baseline_before_remote_sync.as_ref(),
         &remote_hashes_before_remote_sync,
+    );
+    let remote_delete_wins_paths = startup_remote_delete_wins_paths(
+        &local_state_before_remote_sync,
+        baseline_before_remote_sync.as_ref(),
+        &remote_files_before_remote_sync,
+        &preserve_local_files,
     );
 
     let mut remote_index = RemoteTreeIndex::default();
@@ -102,6 +110,10 @@ fn main() -> Result<()> {
         &mut suppressed_uploads,
         &mut remote_index,
     )?;
+    for path in &remote_delete_wins_paths {
+        remove_local_path(&args.root_dir, path)?;
+        suppressed_uploads.remove(path);
+    }
 
     let mut local_state = scan_local_tree(&args.root_dir)
         .context("failed to scan local state after initial remote sync")?;
@@ -295,6 +307,56 @@ fn remote_file_hashes_by_local_path(
     }
 
     by_local_path
+}
+
+fn remote_file_paths_by_local_path(snapshot: &SyncSnapshot, scope: &PathScope) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+
+    for entry in &snapshot.remote {
+        if entry.kind != EntryKind::File {
+            continue;
+        }
+
+        let remote_path = normalize_relative_path(&entry.path);
+        let Some(local_path) = scope.remote_to_local(&remote_path) else {
+            continue;
+        };
+        if local_path.is_empty() {
+            continue;
+        }
+        paths.insert(local_path);
+    }
+
+    paths
+}
+
+fn startup_remote_delete_wins_paths(
+    local_state: &LocalTreeState,
+    baseline: Option<&LocalTreeState>,
+    remote_files: &BTreeSet<String>,
+    preserve_local_files: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut delete_wins = BTreeSet::new();
+
+    for (path, entry_state) in local_state {
+        if entry_state.kind != LocalEntryKind::File {
+            continue;
+        }
+        if remote_files.contains(path) {
+            continue;
+        }
+        if preserve_local_files.contains(path) {
+            continue;
+        }
+        let unchanged = baseline
+            .and_then(|state| state.get(path))
+            .is_some_and(|previous| previous == entry_state);
+        if unchanged {
+            delete_wins.insert(path.clone());
+        }
+    }
+
+    delete_wins
 }
 
 fn local_file_content_hash(root_dir: &Path, relative_path: &str) -> Result<String> {
@@ -990,13 +1052,13 @@ fn current_unix_ms() -> u128 {
 mod tests {
     use super::{
         PathScope, local_entry_state_for_path, local_file_content_hash,
-        local_paths_to_preserve_on_startup,
+        local_paths_to_preserve_on_startup, startup_remote_delete_wins_paths,
     };
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use sync_agent_core::LocalTreeState;
+    use sync_agent_core::{LocalEntryKind, LocalEntryState, LocalTreeState};
 
     #[test]
     fn path_scope_without_prefix_keeps_paths() {
@@ -1077,6 +1139,53 @@ mod tests {
         assert!(preserve.contains("docs/readme.txt"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_remote_delete_wins_only_for_unchanged_paths() {
+        let mut local = LocalTreeState::new();
+        local.insert(
+            "unchanged.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 10,
+                modified_unix_ms: 100,
+            },
+        );
+        local.insert(
+            "changed.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 20,
+                modified_unix_ms: 200,
+            },
+        );
+
+        let mut baseline = LocalTreeState::new();
+        baseline.insert(
+            "unchanged.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 10,
+                modified_unix_ms: 100,
+            },
+        );
+        baseline.insert(
+            "changed.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 21,
+                modified_unix_ms: 201,
+            },
+        );
+
+        let remote_files = std::collections::BTreeSet::new();
+        let preserve = std::collections::BTreeSet::new();
+        let delete_wins =
+            startup_remote_delete_wins_paths(&local, Some(&baseline), &remote_files, &preserve);
+
+        assert!(delete_wins.contains("unchanged.txt"));
+        assert!(!delete_wins.contains("changed.txt"));
     }
 
     fn write_file(root: &Path, relative_path: &str, bytes: &[u8]) {

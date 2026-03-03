@@ -807,3 +807,49 @@ async fn folder_agent_applies_path_level_recovery_when_baseline_row_is_missing()
     let _ = fs::remove_dir_all(&local_root);
     result
 }
+
+#[tokio::test]
+async fn folder_agent_respects_remote_delete_intent_for_unchanged_local_after_restart() -> Result<()>
+{
+    let bind = "127.0.0.1:19420";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-remote-delete-intent-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware("delete-intent/target.txt", Bytes::from_static(b"remote-v1"))
+            .await?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        wait_for_local_file_bytes(
+            &local_root.join("delete-intent/target.txt"),
+            b"remote-v1",
+            220,
+        )
+        .await?;
+        stop_folder_agent(&mut first_run).await;
+
+        delete_remote_key_by_query(&base_url, "delete-intent/target.txt").await?;
+        wait_for_remote_file_absence(&sdk, "delete-intent/target.txt", 220).await?;
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            wait_for_remote_file_absence(&sdk, "delete-intent/target.txt", 220).await?;
+            wait_for_local_absence(&local_root.join("delete-intent/target.txt"), 220).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
