@@ -4,9 +4,13 @@ use crate::framework::{ChildGuard, binary_path, fresh_data_dir, start_server, st
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use client_sdk::IronMeshClient;
+use client_sdk::normalize_server_base_url;
 use reqwest::StatusCode;
+use rusqlite::Connection;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -227,6 +231,33 @@ async fn delete_remote_key_by_query(base_url: &str, key: &str) -> Result<()> {
 
 async fn stop_folder_agent(agent: &mut ChildGuard) {
     agent.stop().await.ok();
+}
+
+fn baseline_db_path(
+    root_dir: &Path,
+    server_base_url: &str,
+    prefix: Option<&str>,
+) -> Result<PathBuf> {
+    let mut hasher = DefaultHasher::new();
+    root_dir.to_string_lossy().hash(&mut hasher);
+    prefix.unwrap_or_default().hash(&mut hasher);
+    normalize_server_base_url(server_base_url)?.hash(&mut hasher);
+    let fingerprint = hasher.finish();
+
+    let mut path = std::env::temp_dir();
+    path.push("ironmesh-folder-agent");
+    path.push(format!("baseline-{fingerprint:016x}.sqlite"));
+    Ok(path)
+}
+
+fn delete_baseline_entry(root_dir: &Path, server_base_url: &str, path: &str) -> Result<()> {
+    let baseline_path = baseline_db_path(root_dir, server_base_url, None)?;
+    let connection = Connection::open(&baseline_path)
+        .with_context(|| format!("failed to open sqlite baseline {}", baseline_path.display()))?;
+    connection
+        .execute("DELETE FROM baseline_entries WHERE path = ?1", [path])
+        .with_context(|| format!("failed to delete sqlite baseline row for {path}"))?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -627,6 +658,147 @@ async fn folder_agent_prefix_scope_maps_local_root_to_selected_remote_subtree() 
         .await;
 
         stop_folder_agent(&mut agent).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_recovers_local_offline_changes_after_unfriendly_stop() -> Result<()> {
+    let bind = "127.0.0.1:19418";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-unfriendly-stop-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        fs::create_dir_all(local_root.join("crash-case")).with_context(|| {
+            format!(
+                "failed to create local directory {}",
+                local_root.join("crash-case").display()
+            )
+        })?;
+        fs::write(local_root.join("crash-case/existing.txt"), b"before-crash").with_context(
+            || {
+                format!(
+                    "failed to write local file {}",
+                    local_root.join("crash-case/existing.txt").display()
+                )
+            },
+        )?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+
+        wait_for_remote_file_bytes(&sdk, "crash-case/existing.txt", b"before-crash", 220).await?;
+
+        // Intentionally kill the process (unfriendly stop simulation).
+        stop_folder_agent(&mut first_run).await;
+
+        fs::write(
+            local_root.join("crash-case/existing.txt"),
+            b"after-crash-modified",
+        )
+        .with_context(|| {
+            format!(
+                "failed to modify local file {}",
+                local_root.join("crash-case/existing.txt").display()
+            )
+        })?;
+        fs::write(local_root.join("crash-case/new.txt"), b"after-crash-added").with_context(
+            || {
+                format!(
+                    "failed to write local file {}",
+                    local_root.join("crash-case/new.txt").display()
+                )
+            },
+        )?;
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            wait_for_remote_file_bytes(
+                &sdk,
+                "crash-case/existing.txt",
+                b"after-crash-modified",
+                220,
+            )
+            .await?;
+            wait_for_remote_file_bytes(&sdk, "crash-case/new.txt", b"after-crash-added", 220)
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_applies_path_level_recovery_when_baseline_row_is_missing() -> Result<()> {
+    let bind = "127.0.0.1:19419";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-path-recovery-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware("path-recovery/a.txt", Bytes::from_static(b"remote-a-v1"))
+            .await?;
+        sdk.put_large_aware("path-recovery/b.txt", Bytes::from_static(b"remote-b-v1"))
+            .await?;
+        sdk.put_large_aware("path-recovery/c.txt", Bytes::from_static(b"remote-c-v1"))
+            .await?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        wait_for_local_file_bytes(&local_root.join("path-recovery/a.txt"), b"remote-a-v1", 220)
+            .await?;
+        wait_for_local_file_bytes(&local_root.join("path-recovery/b.txt"), b"remote-b-v1", 220)
+            .await?;
+        wait_for_local_file_bytes(&local_root.join("path-recovery/c.txt"), b"remote-c-v1", 220)
+            .await?;
+        stop_folder_agent(&mut first_run).await;
+
+        fs::write(local_root.join("path-recovery/a.txt"), b"local-a-v2").with_context(|| {
+            format!(
+                "failed to write local file {}",
+                local_root.join("path-recovery/a.txt").display()
+            )
+        })?;
+        sdk.put_large_aware("path-recovery/c.txt", Bytes::from_static(b"remote-c-v2"))
+            .await?;
+
+        // Simulate partial state loss: one baseline row disappears.
+        delete_baseline_entry(&local_root, &base_url, "path-recovery/b.txt")?;
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            // Changed local file is preserved and uploaded.
+            wait_for_remote_file_bytes(&sdk, "path-recovery/a.txt", b"local-a-v2", 220).await?;
+            // Unchanged local file with missing baseline row does not force global recovery.
+            wait_for_remote_file_bytes(&sdk, "path-recovery/b.txt", b"remote-b-v1", 220).await?;
+            // Remote update still applies on unaffected path.
+            wait_for_local_file_bytes(&local_root.join("path-recovery/c.txt"), b"remote-c-v2", 220)
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
         scenario
     }
     .await;
