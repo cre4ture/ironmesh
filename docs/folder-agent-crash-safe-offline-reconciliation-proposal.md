@@ -1,6 +1,6 @@
 # Folder Agent Crash-Safe Offline Reconciliation Proposal (SQLite)
 
-Status: Draft for review (no implementation)
+Status: In progress (partially implemented)
 
 ## 1. Summary
 This proposal switches the local baseline store from a flat manifest file to a local SQLite database.
@@ -11,6 +11,22 @@ It combines:
 - server-side per-file content hashes in remote snapshot/index.
 
 Goal: preserve offline local edits/additions across normal stop, crash, or power loss without silent data loss.
+
+### 1.1 Current implementation status
+Implemented so far:
+- SQLite baseline store (schema v1) with scope fingerprint validation.
+- Runtime baseline persistence (not only on clean shutdown) for crash-safe restart behavior.
+- Per-path recovery behavior when individual baseline rows are missing.
+- Server `/store/index` now includes per-file `content_hash`.
+- Folder-agent startup now uses remote hashes for missing-baseline paths:
+  - if local hash matches remote hash, do not preserve/upload.
+  - if hash differs or hash is unavailable, preserve local bytes (non-destructive default).
+- Remote delete intent now wins for unchanged local files with valid baseline on restart.
+
+Not implemented yet:
+- Persistent conflict tracking table/flows (`conflicts` lifecycle and resolution tooling).
+- Full tombstone retention/compaction/archival/admin tooling stack.
+- Telemetry counters for path/global recovery and conflict classes.
 
 ## 2. Decision Update
 Chosen direction:
