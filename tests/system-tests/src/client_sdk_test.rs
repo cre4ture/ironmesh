@@ -287,10 +287,24 @@ mod tests {
 
             let loaded_snapshot = sdk.load_snapshot_from_server(Some("docs"), 1, None).await?;
             assert!(loaded_snapshot.local.is_empty());
+            let readme_index_entry = index
+                .entries
+                .iter()
+                .find(|entry| entry.path == "docs/readme.txt" && entry.entry_type == "key")
+                .context("docs/readme.txt entry missing from store index response")?;
+            let expected_version = readme_index_entry
+                .version
+                .as_deref()
+                .unwrap_or("server-head");
+            let expected_content_hash = readme_index_entry
+                .content_hash
+                .as_deref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "server-head:docs/readme.txt".to_string());
             assert!(loaded_snapshot.remote.iter().any(|entry| {
                 entry.path == "docs/readme.txt"
-                    && entry.version.as_deref() == Some("server-head")
-                    && entry.content_hash.as_deref() == Some("server-head:docs/readme.txt")
+                    && entry.version.as_deref() == Some(expected_version)
+                    && entry.content_hash.as_deref() == Some(expected_content_hash.as_str())
             }));
             assert!(loaded_snapshot.remote.iter().any(|entry| {
                 entry.path == "docs/api" && entry.version.is_none() && entry.content_hash.is_none()

@@ -188,12 +188,34 @@ pub async fn latest_snapshot_id(http: &reqwest::Client, base_url: &str) -> Resul
         .await?;
 
     let parsed: serde_json::Value = serde_json::from_str(&payload)?;
-    let first = parsed
+    let latest = parsed
         .as_array()
-        .and_then(|arr| arr.first())
+        .and_then(|arr| {
+            arr.iter().max_by(|left, right| {
+                let left_ts = left
+                    .get("created_at_unix")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                let right_ts = right
+                    .get("created_at_unix")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                left_ts.cmp(&right_ts).then_with(|| {
+                    let left_id = left
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let right_id = right
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    left_id.cmp(right_id)
+                })
+            })
+        })
         .context("snapshots endpoint returned empty list")?;
 
-    first
+    latest
         .get("id")
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
