@@ -988,6 +988,60 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_is_missing(
 }
 
 #[tokio::test]
+async fn folder_agent_records_dual_modify_conflict_when_baseline_row_exists() -> Result<()> {
+    let bind = "127.0.0.1:19423";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-dual-modify-conflict-baseline-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware("conflict2/y.txt", Bytes::from_static(b"remote-v1"))
+            .await?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        wait_for_local_file_bytes(&local_root.join("conflict2/y.txt"), b"remote-v1", 220).await?;
+        stop_folder_agent(&mut first_run).await;
+
+        fs::write(local_root.join("conflict2/y.txt"), b"local-v2").with_context(|| {
+            format!(
+                "failed to modify local file {}",
+                local_root.join("conflict2/y.txt").display()
+            )
+        })?;
+        sdk.put_large_aware("conflict2/y.txt", Bytes::from_static(b"remote-v2"))
+            .await?;
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            // Safety policy: keep local bytes, but record the dual-modify conflict.
+            wait_for_remote_file_bytes(&sdk, "conflict2/y.txt", b"local-v2", 220).await?;
+            wait_for_startup_conflict_reason(
+                &local_root,
+                &base_url,
+                "conflict2/y.txt",
+                "dual_modify_conflict",
+                120,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
 async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result<()> {
     let bind = "127.0.0.1:19422";
     let base_url = format!("http://{bind}");
