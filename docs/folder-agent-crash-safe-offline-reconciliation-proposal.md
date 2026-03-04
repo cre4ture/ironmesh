@@ -26,8 +26,17 @@ Implemented so far:
   - `add_delete_ambiguous_missing_baseline`
   - `modify_delete_conflict`
   - `dual_modify_missing_baseline`
+  - `dual_modify_conflict`
 - Incremental per-path baseline upserts/removals during startup/runtime apply/upload/delete flows to reduce crash windows.
+- Startup cleanup of leftover `.ironmesh-part-*` files (partial download artifacts) to avoid disk accumulation across crashes.
+- Remote conflict copy materialization at startup for dual-modify conflicts into `.ironmesh-conflicts/remote/...` (no-loss policy).
+- Basic conflict lifecycle CLI tooling in `ironmesh-folder-agent`:
+  - `conflicts list` (json/table)
+  - `conflicts resolve <path> --strategy keep-local|keep-remote [--delete-conflict-copies]`
+  - `conflicts clear [--delete-conflict-copies]`
+  - `cleanup` (remove `.ironmesh-part-*` artifacts)
 - Crash-window system test coverage for abrupt kill during active sync writes, with restart reconciliation checks (local + remote changes).
+- Crash-window system test coverage for conflict-copy temp artifact presence (deterministic crash injection + restart cleanup).
 - Server-side tombstone tooling scaffold:
   - `POST /maintenance/tombstones/compact`
   - `GET /maintenance/tombstones/archive`
@@ -40,7 +49,7 @@ Implemented so far:
   - archival of compacted tombstoned version indexes into `state/tombstone_archive/*.jsonl`
 
 Not implemented yet:
-- Conflict lifecycle tooling (resolve/ack/clear workflows and user-facing surfacing).
+- User-facing conflict surfacing (UI/notifications) and richer workflows beyond the basic CLI commands.
 - Full tombstone retention policy controls and richer restore/purge guardrails (RBAC role tiers, audit viewer APIs, tamper-evident archival).
 - Telemetry counters for path/global recovery and conflict classes.
 - Full transport/authn/authz security architecture implementation (documented in `docs/security-architecture.md`).
@@ -68,17 +77,14 @@ Chosen direction:
 ### 5.1 Scope identity
 Use one SQLite database per `(root_dir, server_base_url, prefix)` scope.
 
-### 5.2 Current schema target (v2, with v1 migration support)
-- `meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)`
-  - `schema_version`
+### 5.2 Current schema target (implemented, v2 with v1 migration support)
+- `baseline_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)`
+  - `schema_version` (stored as text)
   - `scope_fingerprint`
-  - optional agent metadata
-- `files(path TEXT PRIMARY KEY, kind TEXT NOT NULL, size_bytes INTEGER, modified_unix_ms INTEGER, local_hash TEXT, remote_hash TEXT, state TEXT NOT NULL, last_seen_unix_ms INTEGER NOT NULL)`
-- `conflicts(path TEXT PRIMARY KEY, reason TEXT NOT NULL, details_json TEXT, created_unix_ms INTEGER NOT NULL)`
-
-Notes:
-- `kind`: file|directory|tombstone
-- `state`: synced|pending_upload|pending_delete|conflict
+- `baseline_entries(path TEXT PRIMARY KEY, kind INTEGER NOT NULL, size_bytes INTEGER NOT NULL, modified_unix_ms INTEGER NOT NULL, content_hash TEXT)`
+  - `kind`: `0=file`, `1=directory`
+  - `content_hash`: optional BLAKE3 hex hash for files
+- `conflicts(path TEXT PRIMARY KEY, reason TEXT NOT NULL, details_json TEXT NOT NULL, created_unix_ms INTEGER NOT NULL)`
 
 ### 5.3 Durability and crash safety
 Use DB guarantees instead of hand-rolled atomic file writes:

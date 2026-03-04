@@ -6,7 +6,7 @@ use bytes::Bytes;
 use client_sdk::IronMeshClient;
 use client_sdk::normalize_server_base_url;
 use reqwest::StatusCode;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
@@ -60,6 +60,50 @@ async fn start_folder_agent(
     {
         bail!("ironmesh-folder-agent exited early with status {status}");
     }
+
+    Ok(ChildGuard::new(child))
+}
+
+async fn spawn_folder_agent_no_wait(
+    server_base_url: &str,
+    root_dir: &Path,
+    prefix: Option<&str>,
+    remote_refresh_interval_ms: u64,
+    local_scan_interval_ms: u64,
+    extra_env: &[(&str, &str)],
+    no_watch_local: bool,
+) -> Result<ChildGuard> {
+    let agent_bin = binary_path("ironmesh-folder-agent")?;
+
+    let mut command = Command::new(agent_bin);
+    command
+        .arg("--root-dir")
+        .arg(root_dir)
+        .arg("--server-base-url")
+        .arg(server_base_url)
+        .args(
+            prefix
+                .map(|value| vec!["--prefix".to_string(), value.to_string()])
+                .unwrap_or_default(),
+        )
+        .arg("--remote-refresh-interval-ms")
+        .arg(remote_refresh_interval_ms.to_string())
+        .arg("--local-scan-interval-ms")
+        .arg(local_scan_interval_ms.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    if no_watch_local {
+        command.arg("--no-watch-local");
+    }
+
+    let child = command
+        .spawn()
+        .context("failed to spawn ironmesh-folder-agent")?;
 
     Ok(ChildGuard::new(child))
 }
@@ -1368,9 +1412,33 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
             artifact.display()
         );
 
-        let mut second_run =
-            start_folder_agent(&base_url, &local_root, None, 250, 250, true).await?;
+        let mut second_run = spawn_folder_agent_no_wait(
+            &base_url,
+            &local_root,
+            None,
+            250,
+            250,
+            &[(
+                "IRONMESH_TEST_CONFLICT_COPY_SLEEP_AFTER_TEMP_CREATE_MS",
+                "2000",
+            )],
+            true,
+        )
+        .await?;
         let scenario = async {
+            // Startup cleanup should remove leftover temp artifacts from the crash.
+            for _ in 0..120 {
+                if !artifact.exists() {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                !artifact.exists(),
+                "expected temp artifact to be cleaned up on restart: {}",
+                artifact.display()
+            );
+
             wait_for_local_file_size_and_prefix(&target, expected_size, b"REMOTE-V2-", 360).await?;
             assert_remote_store_index_has_no_paths_containing(&sdk, "ironmesh-part-", 20).await?;
             Ok::<(), anyhow::Error>(())
@@ -1378,6 +1446,168 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
         .await;
 
         stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Result<()> {
+    let bind = "127.0.0.1:19425";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-conflict-copy-crash-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware("conflict-copy/target.bin", Bytes::from_static(b"remote-v1"))
+            .await?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 250, 250, true).await?;
+        wait_for_local_file_bytes(
+            &local_root.join("conflict-copy/target.bin"),
+            b"remote-v1",
+            220,
+        )
+        .await?;
+        stop_folder_agent(&mut first_run).await;
+
+        let baseline_path = baseline_db_path(&local_root, &base_url, None)?;
+        let baseline_connection = Connection::open(&baseline_path).with_context(|| {
+            format!("failed to open sqlite baseline {}", baseline_path.display())
+        })?;
+        let baseline_hash: Option<String> = baseline_connection
+            .query_row(
+                "SELECT content_hash FROM baseline_entries WHERE path = ?1",
+                ["conflict-copy/target.bin"],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .context("failed to query sqlite baseline hash for conflict-copy/target.bin")?
+            .flatten();
+        let baseline_hash = baseline_hash
+            .filter(|value| !value.trim().is_empty())
+            .context("expected baseline hash to be present after first sync")?;
+
+        let local_v2 = b"local-v2-longer-than-remote-v1";
+        fs::write(local_root.join("conflict-copy/target.bin"), local_v2).with_context(|| {
+            format!(
+                "failed to modify local file {}",
+                local_root.join("conflict-copy/target.bin").display()
+            )
+        })?;
+
+        sdk.put_large_aware("conflict-copy/target.bin", Bytes::from_static(b"remote-v2"))
+            .await?;
+        let index = sdk.store_index(None, 64, None).await?;
+        let remote_hash = index
+            .entries
+            .iter()
+            .find(|entry| entry.path == "conflict-copy/target.bin")
+            .and_then(|entry| entry.content_hash.clone())
+            .filter(|value| !value.trim().is_empty())
+            .context("expected remote content_hash for conflict-copy/target.bin")?;
+        assert_ne!(
+            baseline_hash, remote_hash,
+            "expected remote content_hash to differ from baseline after remote update"
+        );
+
+        let conflict_dir = local_root.join(".ironmesh-conflicts/remote/conflict-copy");
+
+        // Deterministic crash injection: abort right after creating the conflict temp file.
+        let agent_bin = binary_path("ironmesh-folder-agent")?;
+        let mut crash_run = Command::new(agent_bin);
+        crash_run
+            .arg("--run-once")
+            .arg("--root-dir")
+            .arg(&local_root)
+            .arg("--server-base-url")
+            .arg(&base_url)
+            .arg("--remote-refresh-interval-ms")
+            .arg("250")
+            .arg("--local-scan-interval-ms")
+            .arg("250")
+            .arg("--no-watch-local")
+            .env("IRONMESH_TEST_CRASH_AFTER_CONFLICT_COPY_TEMP_CREATE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let status = timeout(Duration::from_secs(20), crash_run.status())
+            .await
+            .context("folder-agent crash injection timed out")?
+            .context("failed to execute folder-agent crash injection")?;
+        if status.success() {
+            bail!("expected folder-agent crash injection run to fail, got status {status}");
+        }
+
+        let artifacts = local_files_in_dir_containing(&conflict_dir, "ironmesh-part-")?;
+        let artifact = artifacts
+            .into_iter()
+            .next()
+            .context("expected conflict-copy temp artifact after crash injection")?;
+
+        assert!(
+            artifact.exists(),
+            "expected conflict-copy temp artifact to exist after crash injection: {}",
+            artifact.display()
+        );
+
+        let mut third_run =
+            start_folder_agent(&base_url, &local_root, None, 250, 250, true).await?;
+        let scenario = async {
+            for _ in 0..120 {
+                if !artifact.exists() {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                !artifact.exists(),
+                "expected conflict-copy temp artifact to be cleaned up on restart: {}",
+                artifact.display()
+            );
+
+            // Safety policy: local bytes win on the canonical path.
+            wait_for_remote_file_bytes(&sdk, "conflict-copy/target.bin", local_v2, 360).await?;
+
+            // But the remote bytes must be preserved as a conflict copy.
+            let mut conflict_copy: Option<PathBuf> = None;
+            for _ in 0..200 {
+                if let Ok(entries) = fs::read_dir(&conflict_dir) {
+                    for entry in entries {
+                        let path = entry?.path();
+                        let Some(file_name) = path.file_name().and_then(|value| value.to_str())
+                        else {
+                            continue;
+                        };
+                        if file_name.starts_with("target.bin.remote-conflict-") {
+                            conflict_copy = Some(path);
+                            break;
+                        }
+                    }
+                }
+                if conflict_copy.is_some() {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+
+            let conflict_copy =
+                conflict_copy.context("did not observe remote conflict copy after restart")?;
+            wait_for_local_file_bytes(&conflict_copy, b"remote-v2", 60).await?;
+
+            assert_remote_store_index_has_no_paths_containing(&sdk, "ironmesh-part-", 20).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut third_run).await;
         scenario
     }
     .await;

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotUpdate,
     normalize_server_base_url,
@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -28,26 +28,259 @@ use sync_core::{EntryKind, SyncSnapshot};
 #[command(name = "ironmesh-folder-agent")]
 #[command(about = "OS-independent folder synchronization agent for Ironmesh")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(long)]
     root_dir: PathBuf,
-    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    #[arg(long, default_value = "http://127.0.0.1:8080", global = true)]
     server_base_url: String,
-    #[arg(long)]
+    #[arg(long, global = true)]
     prefix: Option<String>,
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 64, global = true)]
     depth: usize,
-    #[arg(long, default_value_t = 3000)]
+    #[arg(long, default_value_t = 3000, global = true)]
     remote_refresh_interval_ms: u64,
-    #[arg(long, default_value_t = 2000)]
+    #[arg(long, default_value_t = 2000, global = true)]
     local_scan_interval_ms: u64,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     no_watch_local: bool,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     run_once: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Inspect or resolve startup conflicts persisted in the local SQLite state store.
+    Conflicts {
+        #[command(subcommand)]
+        command: ConflictCommand,
+    },
+    /// Remove partial download artifacts (`.ironmesh-part-*`) left behind by crashes/power loss.
+    Cleanup {
+        /// Only print the number of files that would be removed.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConflictCommand {
+    /// Print all currently persisted startup conflicts.
+    List {
+        #[arg(long, value_enum, default_value_t = ConflictListFormat::Json)]
+        format: ConflictListFormat,
+    },
+    /// Clear a single conflict row (optionally also deleting related local conflict-copy files).
+    Resolve {
+        /// Relative path within the agent root directory.
+        path: String,
+        #[arg(long, value_enum, default_value_t = ConflictResolutionStrategy::KeepLocal)]
+        strategy: ConflictResolutionStrategy,
+        #[arg(long, default_value_t = false)]
+        delete_conflict_copies: bool,
+    },
+    /// Clear all persisted conflict rows.
+    Clear {
+        #[arg(long, default_value_t = false)]
+        delete_conflict_copies: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConflictListFormat {
+    Json,
+    Table,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConflictResolutionStrategy {
+    KeepLocal,
+    KeepRemote,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(command) = args.command.as_ref() {
+        return run_command(&args, command);
+    }
+
+    run_agent(&args)
+}
+
+fn run_command(args: &Args, command: &Command) -> Result<()> {
+    match command {
+        Command::Cleanup { dry_run } => {
+            let removed = cleanup_ironmesh_part_files(&args.root_dir, *dry_run)?;
+            if *dry_run {
+                println!("cleanup: would remove {removed} partial download artifacts");
+            } else {
+                println!("cleanup: removed {removed} partial download artifacts");
+            }
+            Ok(())
+        }
+        Command::Conflicts { command } => run_conflict_command(args, command),
+    }
+}
+
+fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
+    let scope = PathScope::new(args.prefix.clone());
+    let base_url = normalize_server_base_url(&args.server_base_url)?;
+    let state_store = StartupStateStore::new(&args.root_dir, &scope, base_url.as_str());
+
+    match command {
+        ConflictCommand::List { format } => {
+            let conflicts = state_store.load_conflicts()?;
+            match format {
+                ConflictListFormat::Json => {
+                    for conflict in conflicts {
+                        let parsed_details = serde_json::from_str::<serde_json::Value>(
+                            conflict.details_json.as_str(),
+                        )
+                        .unwrap_or_else(|_| serde_json::Value::String(conflict.details_json));
+                        let line = json!({
+                            "path": conflict.path,
+                            "reason": conflict.reason,
+                            "created_unix_ms": conflict.created_unix_ms,
+                            "details": parsed_details,
+                        });
+                        println!("{}", line.to_string());
+                    }
+                }
+                ConflictListFormat::Table => {
+                    println!("{:<48}  {:<28}  {}", "path", "reason", "created_unix_ms");
+                    for conflict in conflicts {
+                        println!(
+                            "{:<48}  {:<28}  {}",
+                            conflict.path, conflict.reason, conflict.created_unix_ms
+                        );
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        ConflictCommand::Clear {
+            delete_conflict_copies: delete_copies,
+        } => {
+            let conflicts = state_store.load_conflicts()?;
+            let removed_rows = state_store.clear_conflicts()?;
+
+            if *delete_copies {
+                for conflict in &conflicts {
+                    let _ = delete_conflict_copies(&args.root_dir, conflict.path.as_str());
+                }
+            }
+
+            println!("conflicts: cleared {removed_rows} rows");
+            Ok(())
+        }
+        ConflictCommand::Resolve {
+            path,
+            strategy,
+            delete_conflict_copies: delete_copies,
+        } => {
+            match strategy {
+                ConflictResolutionStrategy::KeepLocal => {
+                    let removed_rows = state_store.remove_conflict(path.as_str())?;
+                    if *delete_copies {
+                        let removed_files =
+                            delete_conflict_copies(&args.root_dir, path.as_str()).unwrap_or(0);
+                        println!(
+                            "conflicts: resolved {path} (keep-local), removed {removed_rows} rows, removed {removed_files} conflict copy files"
+                        );
+                    } else {
+                        println!(
+                            "conflicts: resolved {path} (keep-local), removed {removed_rows} rows"
+                        );
+                    }
+                    Ok(())
+                }
+                ConflictResolutionStrategy::KeepRemote => {
+                    let remote_copy = newest_remote_conflict_copy(&args.root_dir, path.as_str())?;
+
+                    // Preserve the current local bytes before applying the remote copy.
+                    let local_target = absolute_path(&args.root_dir, path.as_str());
+                    if local_target.is_file() {
+                        let timestamp = current_unix_ms();
+                        let local_backup_dir =
+                            conflict_copy_dir(&args.root_dir, "local", path.as_str());
+                        fs::create_dir_all(&local_backup_dir).with_context(|| {
+                            format!(
+                                "failed to create conflict backup directory {}",
+                                local_backup_dir.display()
+                            )
+                        })?;
+                        let file_name = local_target
+                            .file_name()
+                            .map(|value| value.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "object".to_string());
+                        let backup_target = local_backup_dir
+                            .join(format!("{file_name}.local-conflict-{timestamp}"));
+
+                        // Prefer atomic rename; fall back to copy if the file is locked.
+                        if fs::rename(&local_target, &backup_target).is_err() {
+                            fs::copy(&local_target, &backup_target).with_context(|| {
+                                format!(
+                                    "failed to copy local file {} to backup {}",
+                                    local_target.display(),
+                                    backup_target.display()
+                                )
+                            })?;
+                        }
+                    }
+
+                    copy_file_atomically(&remote_copy, &local_target).with_context(|| {
+                        format!(
+                            "failed to apply remote conflict copy {} into {}",
+                            remote_copy.display(),
+                            local_target.display()
+                        )
+                    })?;
+
+                    let client = IronMeshClient::new(base_url.as_str());
+                    let metadata = fs::metadata(&local_target).with_context(|| {
+                        format!(
+                            "failed to inspect resolved local file {}",
+                            local_target.display()
+                        )
+                    })?;
+                    let content_hash = upload_local_file(
+                        &args.root_dir,
+                        &client,
+                        &scope,
+                        path.as_str(),
+                        metadata.len(),
+                    )?;
+
+                    if let Some(entry_state) =
+                        local_entry_state_for_path(&args.root_dir, path.as_str())?
+                    {
+                        state_store.upsert_baseline_entry_with_hash(
+                            path.as_str(),
+                            &entry_state,
+                            Some(content_hash.as_str()),
+                        )?;
+                    }
+
+                    let removed_rows = state_store.remove_conflict(path.as_str())?;
+                    let removed_files = if *delete_copies {
+                        delete_conflict_copies(&args.root_dir, path.as_str()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    println!(
+                        "conflicts: resolved {path} (keep-remote), removed {removed_rows} rows, removed {removed_files} conflict copy files"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn run_agent(args: &Args) -> Result<()> {
     let scope = PathScope::new(args.prefix.clone());
     let base_url = normalize_server_base_url(&args.server_base_url)?;
     let state_store = StartupStateStore::new(&args.root_dir, &scope, base_url.as_str());
@@ -58,6 +291,10 @@ fn main() -> Result<()> {
             args.root_dir.display()
         )
     })?;
+
+    if let Err(error) = cleanup_ironmesh_part_files(&args.root_dir, false) {
+        eprintln!("startup-state: failed to cleanup partial download artifacts: {error}");
+    }
 
     let local_state_before_remote_sync = scan_local_tree(&args.root_dir)
         .context("failed to scan local state before initial remote sync")?;
@@ -493,6 +730,43 @@ struct StartupConflict {
     created_unix_ms: u128,
 }
 
+struct SleepAfterFirstWrite {
+    inner: File,
+    delay: Duration,
+    slept: bool,
+}
+
+impl SleepAfterFirstWrite {
+    fn new(inner: File, delay: Duration) -> Self {
+        Self {
+            inner,
+            delay,
+            slept: false,
+        }
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.inner.sync_all()
+    }
+}
+
+impl Write for SleepAfterFirstWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if !self.slept && written > 0 {
+            self.slept = true;
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn materialize_remote_conflict_copies(
     root_dir: &Path,
     client: &IronMeshClient,
@@ -545,7 +819,7 @@ fn materialize_remote_conflict_copies(
         );
         let temp_path = conflict_target.with_file_name(temp_name);
 
-        let mut file = match File::create(&temp_path) {
+        let file = match File::create(&temp_path) {
             Ok(file) => file,
             Err(error) => {
                 eprintln!(
@@ -556,7 +830,36 @@ fn materialize_remote_conflict_copies(
             }
         };
 
-        if let Err(error) = client.get_with_selector_writer(&remote_key, None, None, &mut file) {
+        if cfg!(debug_assertions) {
+            if let Ok(raw) = std::env::var("IRONMESH_TEST_CONFLICT_COPY_SLEEP_AFTER_TEMP_CREATE_MS")
+                && let Ok(delay_ms) = raw.parse::<u64>()
+                && delay_ms > 0
+            {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+
+            if std::env::var("IRONMESH_TEST_CRASH_AFTER_CONFLICT_COPY_TEMP_CREATE")
+                .ok()
+                .is_some_and(|value| value == "1")
+            {
+                // Test-only crash injection: simulates a power loss/crash with a temp file present.
+                std::process::abort();
+            }
+        }
+
+        let delay = if cfg!(debug_assertions) {
+            std::env::var("IRONMESH_TEST_CONFLICT_COPY_WRITE_DELAY_MS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::from_millis(0))
+        } else {
+            Duration::from_millis(0)
+        };
+        let mut writer = SleepAfterFirstWrite::new(file, delay);
+
+        if let Err(error) = client.get_with_selector_writer(&remote_key, None, None, &mut writer) {
             eprintln!(
                 "startup-state: failed to download remote conflict copy for {}: {error}",
                 conflict.path
@@ -565,7 +868,7 @@ fn materialize_remote_conflict_copies(
             continue;
         }
 
-        if let Err(error) = file.sync_all() {
+        if let Err(error) = writer.sync_all() {
             eprintln!(
                 "startup-state: failed to flush conflict temp file {}: {error}",
                 temp_path.display()
@@ -1328,6 +1631,14 @@ struct StartupStateStore {
     scope_fingerprint: String,
 }
 
+#[derive(Debug, Clone)]
+struct StoredConflict {
+    path: String,
+    reason: String,
+    details_json: String,
+    created_unix_ms: i64,
+}
+
 const BASELINE_SCHEMA_VERSION_INITIAL: i64 = 1;
 const BASELINE_SCHEMA_VERSION_CURRENT: i64 = 2;
 
@@ -1588,6 +1899,50 @@ impl StartupStateStore {
         Ok(())
     }
 
+    fn load_conflicts(&self) -> Result<Vec<StoredConflict>> {
+        let connection = self.sqlite_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT path, reason, details_json, created_unix_ms
+                 FROM conflicts
+                 ORDER BY created_unix_ms ASC, path ASC",
+            )
+            .context("failed to prepare sqlite conflicts query")?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok(StoredConflict {
+                    path: row.get::<_, String>(0)?,
+                    reason: row.get::<_, String>(1)?,
+                    details_json: row.get::<_, String>(2)?,
+                    created_unix_ms: row.get::<_, i64>(3)?,
+                })
+            })
+            .context("failed to read sqlite conflict rows")?;
+
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row.context("failed to decode sqlite conflict row")?);
+        }
+        Ok(values)
+    }
+
+    fn clear_conflicts(&self) -> Result<usize> {
+        let connection = self.sqlite_connection()?;
+        let removed = connection
+            .execute("DELETE FROM conflicts", [])
+            .context("failed to clear sqlite conflicts table")?;
+        Ok(removed)
+    }
+
+    fn remove_conflict(&self, path: &str) -> Result<usize> {
+        let connection = self.sqlite_connection()?;
+        let removed = connection
+            .execute("DELETE FROM conflicts WHERE path = ?1", [path])
+            .with_context(|| format!("failed to remove sqlite conflict row for {path}"))?;
+        Ok(removed)
+    }
+
     fn quarantine_corrupt(&self) -> Result<()> {
         if !self.path.exists() {
             return Ok(());
@@ -1772,6 +2127,235 @@ impl StartupStateStore {
 
         Ok(())
     }
+}
+
+fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usize> {
+    if !root_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0_usize;
+    let mut stack = vec![root_dir.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!(
+                    "cleanup: failed to read directory {}: {error}",
+                    dir.display()
+                );
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!("cleanup: failed to read directory entry: {error}");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    eprintln!("cleanup: failed to inspect {}: {error}", path.display());
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                // Skip symlinked directories to avoid loops.
+                if file_type.is_symlink() {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+
+            if !is_ironmesh_part_file_name(file_name) {
+                continue;
+            }
+
+            if dry_run {
+                removed += 1;
+                continue;
+            }
+
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    eprintln!("cleanup: failed to remove {}: {error}", path.display());
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+fn is_ironmesh_part_file_name(file_name: &str) -> bool {
+    if !file_name.starts_with('.') {
+        return false;
+    }
+
+    let Some((_, suffix)) = file_name.rsplit_once(".ironmesh-part-") else {
+        return false;
+    };
+
+    !suffix.is_empty() && suffix.chars().all(|value| value.is_ascii_digit())
+}
+
+fn conflict_copy_dir(root_dir: &Path, side: &str, relative_path: &str) -> PathBuf {
+    let rel = Path::new(relative_path);
+    let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+    root_dir.join(".ironmesh-conflicts").join(side).join(parent)
+}
+
+fn newest_remote_conflict_copy(root_dir: &Path, relative_path: &str) -> Result<PathBuf> {
+    let rel = Path::new(relative_path);
+    let Some(file_name) = rel.file_name().and_then(|value| value.to_str()) else {
+        bail!("conflicts: invalid path (expected file): {relative_path}");
+    };
+
+    let dir = conflict_copy_dir(root_dir, "remote", relative_path);
+    if !dir.is_dir() {
+        bail!(
+            "conflicts: no remote conflict copies found for {relative_path} (missing directory {})",
+            dir.display()
+        );
+    }
+
+    let prefix = format!("{file_name}.remote-conflict-");
+    let mut best: Option<(u128, PathBuf)> = None;
+
+    for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+
+        let Some(rest) = name.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        let Ok(timestamp) = rest.parse::<u128>() else {
+            continue;
+        };
+
+        match &best {
+            None => best = Some((timestamp, path)),
+            Some((best_ts, _)) if timestamp > *best_ts => best = Some((timestamp, path)),
+            _ => {}
+        }
+    }
+
+    best.map(|(_, path)| path).ok_or_else(|| {
+        anyhow::anyhow!("conflicts: no remote conflict copies found for {relative_path}")
+    })
+}
+
+fn delete_conflict_copies(root_dir: &Path, relative_path: &str) -> Result<usize> {
+    let rel = Path::new(relative_path);
+    let Some(file_name) = rel.file_name().and_then(|value| value.to_str()) else {
+        return Ok(0);
+    };
+
+    let mut removed = 0_usize;
+    for (side, prefix) in [
+        ("remote", format!("{file_name}.remote-conflict-")),
+        ("local", format!("{file_name}.local-conflict-")),
+    ] {
+        let dir = conflict_copy_dir(root_dir, side, relative_path);
+        if !dir.is_dir() {
+            continue;
+        }
+
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(prefix.as_str()) {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+fn copy_file_atomically(source: &Path, target: &Path) -> Result<()> {
+    if target.is_dir() {
+        fs::remove_dir_all(target)
+            .with_context(|| format!("failed to remove local directory {}", target.display()))?;
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+    }
+
+    let temp_name = format!(
+        ".{}.ironmesh-part-{}",
+        target
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "object".to_string()),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temp_path = target.with_file_name(temp_name);
+
+    let mut input = File::open(source)
+        .with_context(|| format!("failed to open source file {}", source.display()))?;
+    let mut output = File::create(&temp_path)
+        .with_context(|| format!("failed to create temp file {}", temp_path.display()))?;
+    std::io::copy(&mut input, &mut output).with_context(|| {
+        format!(
+            "failed to copy {} into {}",
+            source.display(),
+            temp_path.display()
+        )
+    })?;
+    output
+        .sync_all()
+        .with_context(|| format!("failed to flush temp file {}", temp_path.display()))?;
+
+    fs::rename(&temp_path, target).with_context(|| {
+        format!(
+            "failed to place resolved file {} into {}",
+            temp_path.display(),
+            target.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 fn current_unix_ms() -> u128 {
