@@ -9,6 +9,7 @@ use reqwest::StatusCode;
 use rusqlite::Connection;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -147,6 +148,59 @@ async fn wait_for_local_absence(path: &Path, retries: usize) -> Result<()> {
     bail!("local path was expected to disappear: {}", path.display())
 }
 
+async fn wait_for_local_file_size_and_prefix(
+    path: &Path,
+    expected_size: u64,
+    expected_prefix: &[u8],
+    retries: usize,
+) -> Result<()> {
+    for _ in 0..retries {
+        if let Ok(metadata) = fs::metadata(path)
+            && metadata.is_file()
+            && metadata.len() == expected_size
+        {
+            let mut file = std::fs::File::open(path)?;
+            let mut prefix = vec![0_u8; expected_prefix.len()];
+            if file.read_exact(&mut prefix).is_ok() && prefix.as_slice() == expected_prefix {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!(
+        "local file {} did not reach expected size/prefix",
+        path.display()
+    )
+}
+
+fn local_files_in_dir_containing(dir: &Path, needle: &str) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    if !dir.is_dir() {
+        return Ok(found);
+    }
+
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("failed to read dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if !file_name.contains(needle) {
+            continue;
+        }
+        if path.is_file() {
+            found.push(path);
+        }
+    }
+
+    Ok(found)
+}
+
 async fn wait_for_remote_file_bytes(
     sdk: &IronMeshClient,
     key: &str,
@@ -164,6 +218,25 @@ async fn wait_for_remote_file_bytes(
     }
 
     bail!("remote file {key} did not match expected payload")
+}
+
+async fn assert_remote_store_index_has_no_paths_containing(
+    sdk: &IronMeshClient,
+    needle: &str,
+    checks: usize,
+) -> Result<()> {
+    for _ in 0..checks {
+        let index = sdk.store_index(None, 128, None).await?;
+        let bad = index
+            .entries
+            .iter()
+            .find(|entry| entry.path.contains(needle));
+        if let Some(entry) = bad {
+            bail!("remote store index unexpectedly contains {}", entry.path);
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
 }
 
 async fn wait_for_remote_directory(
@@ -1218,6 +1291,88 @@ async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result
                 360,
             )
             .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut second_run).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result<()> {
+    let bind = "127.0.0.1:19424";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-partial-download-artifacts-root");
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware(
+            "partial-download/target.bin",
+            Bytes::from_static(b"remote-v1"),
+        )
+        .await?;
+
+        let mut first_run =
+            start_folder_agent(&base_url, &local_root, None, 250, 250, true).await?;
+        wait_for_local_file_bytes(
+            &local_root.join("partial-download/target.bin"),
+            b"remote-v1",
+            220,
+        )
+        .await?;
+
+        let mut large_payload = Vec::with_capacity(32 * 1024 * 1024);
+        large_payload.extend_from_slice(b"REMOTE-V2-");
+        large_payload.resize(32 * 1024 * 1024, b'x');
+        let expected_size = large_payload.len() as u64;
+
+        sdk.put_large_aware(
+            "partial-download/target.bin",
+            Bytes::from(large_payload.clone()),
+        )
+        .await?;
+
+        let target = local_root.join("partial-download/target.bin");
+        let dir = local_root.join("partial-download");
+        let mut artifact: Option<PathBuf> = None;
+        for _ in 0..400 {
+            if let Ok(bytes) = fs::read(&target)
+                && bytes.as_slice() == b"remote-v1"
+            {
+                let artifacts = local_files_in_dir_containing(&dir, "ironmesh-part-")?;
+                if let Some(path) = artifacts.first() {
+                    artifact = Some(path.clone());
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+
+        let artifact = artifact.context("did not observe download temp artifact before crash")?;
+
+        // Kill the agent while it is mid-download (temp file exists, target still old).
+        stop_folder_agent(&mut first_run).await;
+
+        assert!(
+            artifact.exists(),
+            "expected temp artifact to remain after crash: {}",
+            artifact.display()
+        );
+
+        let mut second_run =
+            start_folder_agent(&base_url, &local_root, None, 250, 250, true).await?;
+        let scenario = async {
+            wait_for_local_file_size_and_prefix(&target, expected_size, b"REMOTE-V2-", 360).await?;
+            assert_remote_store_index_has_no_paths_containing(&sdk, "ironmesh-part-", 20).await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
