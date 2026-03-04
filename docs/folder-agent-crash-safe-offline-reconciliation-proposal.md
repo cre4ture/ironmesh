@@ -35,6 +35,8 @@ Implemented so far:
   - `conflicts resolve <path> --strategy keep-local|keep-remote [--delete-conflict-copies]`
   - `conflicts clear [--delete-conflict-copies]`
   - `cleanup` (remove `.ironmesh-part-*` artifacts)
+- Optional local web UI for conflict surfacing + resolution buttons:
+  - start agent with `--ui-bind 127.0.0.1:3030` and open `http://127.0.0.1:3030`
 - Crash-window system test coverage for abrupt kill during active sync writes, with restart reconciliation checks (local + remote changes).
 - Crash-window system test coverage for conflict-copy temp artifact presence (deterministic crash injection + restart cleanup).
 - Server-side tombstone tooling scaffold:
@@ -49,7 +51,7 @@ Implemented so far:
   - archival of compacted tombstoned version indexes into `state/tombstone_archive/*.jsonl`
 
 Not implemented yet:
-- User-facing conflict surfacing (UI/notifications) and richer workflows beyond the basic CLI commands.
+- User-facing notifications and richer UI workflows beyond the basic conflict list/resolve actions.
 - Full tombstone retention policy controls and richer restore/purge guardrails (RBAC role tiers, audit viewer APIs, tamper-evident archival).
 - Telemetry counters for path/global recovery and conflict classes.
 - Full transport/authn/authz security architecture implementation (documented in `docs/security-architecture.md`).

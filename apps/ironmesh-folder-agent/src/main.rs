@@ -6,6 +6,7 @@ use client_sdk::{
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +24,8 @@ use sync_agent_core::{
     diff_local_trees, local_entry_state_for_path, normalize_relative_path, scan_local_tree,
 };
 use sync_core::{EntryKind, SyncSnapshot};
+
+mod ui;
 
 #[derive(Debug, Parser)]
 #[command(name = "ironmesh-folder-agent")]
@@ -46,6 +49,9 @@ struct Args {
     no_watch_local: bool,
     #[arg(long, default_value_t = false, global = true)]
     run_once: bool,
+    /// Start a local web UI (example: `--ui-bind 127.0.0.1:3030`).
+    #[arg(long, global = true)]
+    ui_bind: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,10 +98,219 @@ enum ConflictListFormat {
     Table,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum ConflictResolutionStrategy {
     KeepLocal,
     KeepRemote,
+}
+
+#[derive(Debug, Serialize)]
+struct ConflictResolutionResult {
+    path: String,
+    strategy: ConflictResolutionStrategy,
+    conflict_reason: Option<String>,
+    action: String,
+    removed_conflict_rows: usize,
+    removed_conflict_copy_files: usize,
+}
+
+fn validate_user_relative_path_input(path: &str) -> Result<String> {
+    let normalized = normalize_relative_path(path);
+    if normalized.is_empty() {
+        bail!("path must not be empty");
+    }
+
+    for segment in normalized.split('/') {
+        if segment == ".." {
+            bail!("path must not contain '..' segments");
+        }
+        if segment.contains(':') {
+            bail!("path must not contain ':' characters");
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn resolve_conflict_action(
+    root_dir: &Path,
+    server_base_url: &str,
+    scope: &PathScope,
+    state_store: &StartupStateStore,
+    path: &str,
+    strategy: ConflictResolutionStrategy,
+    delete_conflict_copies_on_finish: bool,
+) -> Result<ConflictResolutionResult> {
+    let normalized_path = validate_user_relative_path_input(path)?;
+
+    match strategy {
+        ConflictResolutionStrategy::KeepLocal => {
+            let removed_conflict_rows = state_store.remove_conflict(normalized_path.as_str())?;
+            let removed_conflict_copy_files = if delete_conflict_copies_on_finish {
+                delete_conflict_copies(root_dir, normalized_path.as_str()).unwrap_or(0)
+            } else {
+                0
+            };
+            Ok(ConflictResolutionResult {
+                path: normalized_path,
+                strategy,
+                conflict_reason: None,
+                action: "cleared_conflict_row".to_string(),
+                removed_conflict_rows,
+                removed_conflict_copy_files,
+            })
+        }
+        ConflictResolutionStrategy::KeepRemote => {
+            let conflict = state_store
+                .load_conflict(normalized_path.as_str())?
+                .with_context(|| format!("conflict not found for path={normalized_path}"))?;
+
+            match conflict.reason.as_str() {
+                "dual_modify_conflict" | "dual_modify_missing_baseline" => {
+                    let remote_copy =
+                        newest_remote_conflict_copy(root_dir, normalized_path.as_str())?;
+
+                    // Preserve the current local bytes before applying the remote copy.
+                    let local_target = absolute_path(root_dir, normalized_path.as_str());
+                    if local_target.is_file() {
+                        let timestamp = current_unix_ms();
+                        let local_backup_dir =
+                            conflict_copy_dir(root_dir, "local", normalized_path.as_str());
+                        fs::create_dir_all(&local_backup_dir).with_context(|| {
+                            format!(
+                                "failed to create conflict backup directory {}",
+                                local_backup_dir.display()
+                            )
+                        })?;
+                        let file_name = local_target
+                            .file_name()
+                            .map(|value| value.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "object".to_string());
+                        let backup_target = local_backup_dir
+                            .join(format!("{file_name}.local-conflict-{timestamp}"));
+
+                        // Prefer atomic rename; fall back to copy if the file is locked.
+                        if fs::rename(&local_target, &backup_target).is_err() {
+                            fs::copy(&local_target, &backup_target).with_context(|| {
+                                format!(
+                                    "failed to copy local file {} to backup {}",
+                                    local_target.display(),
+                                    backup_target.display()
+                                )
+                            })?;
+                        }
+                    }
+
+                    copy_file_atomically(&remote_copy, &local_target).with_context(|| {
+                        format!(
+                            "failed to apply remote conflict copy {} into {}",
+                            remote_copy.display(),
+                            local_target.display()
+                        )
+                    })?;
+
+                    let client = IronMeshClient::new(server_base_url);
+                    let metadata = fs::metadata(&local_target).with_context(|| {
+                        format!(
+                            "failed to inspect resolved local file {}",
+                            local_target.display()
+                        )
+                    })?;
+                    let content_hash = upload_local_file(
+                        root_dir,
+                        &client,
+                        scope,
+                        normalized_path.as_str(),
+                        metadata.len(),
+                    )?;
+
+                    if let Some(entry_state) =
+                        local_entry_state_for_path(root_dir, normalized_path.as_str())?
+                    {
+                        state_store.upsert_baseline_entry_with_hash(
+                            normalized_path.as_str(),
+                            &entry_state,
+                            Some(content_hash.as_str()),
+                        )?;
+                    }
+
+                    let removed_conflict_rows =
+                        state_store.remove_conflict(normalized_path.as_str())?;
+                    let removed_conflict_copy_files = if delete_conflict_copies_on_finish {
+                        delete_conflict_copies(root_dir, normalized_path.as_str()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    Ok(ConflictResolutionResult {
+                        path: normalized_path,
+                        strategy,
+                        conflict_reason: Some(conflict.reason),
+                        action: "applied_remote_copy_and_uploaded".to_string(),
+                        removed_conflict_rows,
+                        removed_conflict_copy_files,
+                    })
+                }
+                "modify_delete_conflict" | "add_delete_ambiguous_missing_baseline" => {
+                    let local_target = absolute_path(root_dir, normalized_path.as_str());
+
+                    // Preserve local bytes before applying remote delete intent.
+                    if local_target.is_file() {
+                        let timestamp = current_unix_ms();
+                        let local_backup_dir =
+                            conflict_copy_dir(root_dir, "local", normalized_path.as_str());
+                        fs::create_dir_all(&local_backup_dir).with_context(|| {
+                            format!(
+                                "failed to create conflict backup directory {}",
+                                local_backup_dir.display()
+                            )
+                        })?;
+                        let file_name = local_target
+                            .file_name()
+                            .map(|value| value.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "object".to_string());
+                        let backup_target = local_backup_dir
+                            .join(format!("{file_name}.local-conflict-{timestamp}"));
+
+                        if fs::rename(&local_target, &backup_target).is_err() {
+                            fs::copy(&local_target, &backup_target).with_context(|| {
+                                format!(
+                                    "failed to copy local file {} to backup {}",
+                                    local_target.display(),
+                                    backup_target.display()
+                                )
+                            })?;
+                        }
+                    }
+
+                    remove_local_path(root_dir, normalized_path.as_str())?;
+
+                    let client = IronMeshClient::new(server_base_url);
+                    delete_remote_file(&client, scope, normalized_path.as_str())?;
+                    state_store.remove_baseline_entry(normalized_path.as_str())?;
+
+                    let removed_conflict_rows =
+                        state_store.remove_conflict(normalized_path.as_str())?;
+                    let removed_conflict_copy_files = if delete_conflict_copies_on_finish {
+                        delete_conflict_copies(root_dir, normalized_path.as_str()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    Ok(ConflictResolutionResult {
+                        path: normalized_path,
+                        strategy,
+                        conflict_reason: Some(conflict.reason),
+                        action: "deleted_local_and_tombstoned_remote".to_string(),
+                        removed_conflict_rows,
+                        removed_conflict_copy_files,
+                    })
+                }
+                other => bail!("unsupported conflict reason for keep-remote resolution: {other}"),
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -180,12 +395,23 @@ fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
             strategy,
             delete_conflict_copies: delete_copies,
         } => {
-            match strategy {
+            let result = resolve_conflict_action(
+                &args.root_dir,
+                base_url.as_str(),
+                &scope,
+                &state_store,
+                path.as_str(),
+                *strategy,
+                *delete_copies,
+            )?;
+
+            let path = result.path.as_str();
+            let removed_rows = result.removed_conflict_rows;
+            let removed_files = result.removed_conflict_copy_files;
+
+            match result.strategy {
                 ConflictResolutionStrategy::KeepLocal => {
-                    let removed_rows = state_store.remove_conflict(path.as_str())?;
                     if *delete_copies {
-                        let removed_files =
-                            delete_conflict_copies(&args.root_dir, path.as_str()).unwrap_or(0);
                         println!(
                             "conflicts: resolved {path} (keep-local), removed {removed_rows} rows, removed {removed_files} conflict copy files"
                         );
@@ -194,88 +420,20 @@ fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
                             "conflicts: resolved {path} (keep-local), removed {removed_rows} rows"
                         );
                     }
-                    Ok(())
                 }
                 ConflictResolutionStrategy::KeepRemote => {
-                    let remote_copy = newest_remote_conflict_copy(&args.root_dir, path.as_str())?;
-
-                    // Preserve the current local bytes before applying the remote copy.
-                    let local_target = absolute_path(&args.root_dir, path.as_str());
-                    if local_target.is_file() {
-                        let timestamp = current_unix_ms();
-                        let local_backup_dir =
-                            conflict_copy_dir(&args.root_dir, "local", path.as_str());
-                        fs::create_dir_all(&local_backup_dir).with_context(|| {
-                            format!(
-                                "failed to create conflict backup directory {}",
-                                local_backup_dir.display()
-                            )
-                        })?;
-                        let file_name = local_target
-                            .file_name()
-                            .map(|value| value.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "object".to_string());
-                        let backup_target = local_backup_dir
-                            .join(format!("{file_name}.local-conflict-{timestamp}"));
-
-                        // Prefer atomic rename; fall back to copy if the file is locked.
-                        if fs::rename(&local_target, &backup_target).is_err() {
-                            fs::copy(&local_target, &backup_target).with_context(|| {
-                                format!(
-                                    "failed to copy local file {} to backup {}",
-                                    local_target.display(),
-                                    backup_target.display()
-                                )
-                            })?;
-                        }
-                    }
-
-                    copy_file_atomically(&remote_copy, &local_target).with_context(|| {
-                        format!(
-                            "failed to apply remote conflict copy {} into {}",
-                            remote_copy.display(),
-                            local_target.display()
-                        )
-                    })?;
-
-                    let client = IronMeshClient::new(base_url.as_str());
-                    let metadata = fs::metadata(&local_target).with_context(|| {
-                        format!(
-                            "failed to inspect resolved local file {}",
-                            local_target.display()
-                        )
-                    })?;
-                    let content_hash = upload_local_file(
-                        &args.root_dir,
-                        &client,
-                        &scope,
-                        path.as_str(),
-                        metadata.len(),
-                    )?;
-
-                    if let Some(entry_state) =
-                        local_entry_state_for_path(&args.root_dir, path.as_str())?
-                    {
-                        state_store.upsert_baseline_entry_with_hash(
-                            path.as_str(),
-                            &entry_state,
-                            Some(content_hash.as_str()),
-                        )?;
-                    }
-
-                    let removed_rows = state_store.remove_conflict(path.as_str())?;
-                    let removed_files = if *delete_copies {
-                        delete_conflict_copies(&args.root_dir, path.as_str()).unwrap_or(0)
+                    if *delete_copies {
+                        println!(
+                            "conflicts: resolved {path} (keep-remote), removed {removed_rows} rows, removed {removed_files} conflict copy files"
+                        );
                     } else {
-                        0
-                    };
-
-                    println!(
-                        "conflicts: resolved {path} (keep-remote), removed {removed_rows} rows, removed {removed_files} conflict copy files"
-                    );
-                    Ok(())
+                        println!(
+                            "conflicts: resolved {path} (keep-remote), removed {removed_rows} rows"
+                        );
+                    }
                 }
             }
+            Ok(())
         }
     }
 }
@@ -291,6 +449,28 @@ fn run_agent(args: &Args) -> Result<()> {
             args.root_dir.display()
         )
     })?;
+
+    let _ui_handle = if let Some(bind_addr) = args.ui_bind.as_deref() {
+        let listener = std::net::TcpListener::bind(bind_addr)
+            .with_context(|| format!("ui: failed to bind to {bind_addr}"))?;
+        listener
+            .set_nonblocking(true)
+            .context("ui: failed to set listener to nonblocking")?;
+        let addr = listener
+            .local_addr()
+            .context("ui: failed to determine bound address")?;
+        eprintln!("ui: listening on http://{addr}");
+
+        let ui_state = ui::FolderAgentUiState::new(
+            args.root_dir.clone(),
+            base_url.to_string(),
+            scope.clone(),
+            state_store.clone(),
+        );
+        Some(ui::spawn_ui_server(listener, ui_state))
+    } else {
+        None
+    };
 
     if let Err(error) = cleanup_ironmesh_part_files(&args.root_dir, false) {
         eprintln!("startup-state: failed to cleanup partial download artifacts: {error}");
@@ -1626,6 +1806,7 @@ impl PathScope {
     }
 }
 
+#[derive(Clone)]
 struct StartupStateStore {
     path: PathBuf,
     scope_fingerprint: String,
@@ -1925,6 +2106,28 @@ impl StartupStateStore {
             values.push(row.context("failed to decode sqlite conflict row")?);
         }
         Ok(values)
+    }
+
+    fn load_conflict(&self, path: &str) -> Result<Option<StoredConflict>> {
+        let connection = self.sqlite_connection()?;
+        let conflict = connection
+            .query_row(
+                "SELECT path, reason, details_json, created_unix_ms
+                 FROM conflicts
+                 WHERE path = ?1",
+                [path],
+                |row| {
+                    Ok(StoredConflict {
+                        path: row.get::<_, String>(0)?,
+                        reason: row.get::<_, String>(1)?,
+                        details_json: row.get::<_, String>(2)?,
+                        created_unix_ms: row.get::<_, i64>(3)?,
+                    })
+                },
+            )
+            .optional()
+            .with_context(|| format!("failed to load sqlite conflict row for {path}"))?;
+        Ok(conflict)
     }
 
     fn clear_conflicts(&self) -> Result<usize> {

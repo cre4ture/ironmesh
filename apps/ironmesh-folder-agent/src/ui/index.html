@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ironmesh Folder Agent</title>
+    <link rel="stylesheet" href="/ui/app.css" />
+  </head>
+  <body>
+    <div class="bg"></div>
+
+    <header class="top">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">IM</div>
+        <div class="title">
+          <div class="h1">Folder Agent</div>
+          <div class="sub">Pending user interactions</div>
+        </div>
+      </div>
+      <div class="meta">
+        <div class="pill" id="pill-status">Loading...</div>
+        <button class="btn ghost" id="btn-refresh" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title">
+            <span>Conflicts</span>
+            <span class="count" id="conflict-count">0</span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="toggle-delete-copies" />
+            <span>Delete conflict copies on resolve</span>
+          </label>
+        </div>
+
+        <div class="error" id="error" hidden></div>
+
+        <div class="empty" id="empty" hidden>
+          <div class="empty-title">No pending interactions.</div>
+          <div class="empty-sub">
+            If you expected conflicts, restart the agent once so it can detect them.
+          </div>
+        </div>
+
+        <div class="list" id="list"></div>
+      </section>
+
+      <section class="panel subtle">
+        <div class="panel-head">
+          <div class="panel-title">Agent Info</div>
+        </div>
+        <div class="kv" id="info"></div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <div>
+        Experimental UI. Local only unless you bind to a public address.
+      </div>
+    </footer>
+
+    <script src="/ui/app.js"></script>
+  </body>
+</html>
+
