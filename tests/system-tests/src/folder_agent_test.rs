@@ -973,6 +973,31 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_is_missing(
                 120,
             )
             .await?;
+
+            let conflict_dir = local_root.join(".ironmesh-conflicts/remote/conflict");
+            let mut found_remote_copy = false;
+            if let Ok(entries) = fs::read_dir(&conflict_dir) {
+                for entry in entries {
+                    let path = entry?.path();
+                    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    if !file_name.starts_with("x.txt.remote-conflict-") {
+                        continue;
+                    }
+                    let bytes = fs::read(&path)?;
+                    if bytes.as_slice() == b"remote-v2" {
+                        found_remote_copy = true;
+                        break;
+                    }
+                }
+            }
+            if !found_remote_copy {
+                bail!(
+                    "expected remote conflict copy for conflict/x.txt under {}",
+                    conflict_dir.display()
+                );
+            }
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -1027,6 +1052,31 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_exists() ->
                 120,
             )
             .await?;
+
+            let conflict_dir = local_root.join(".ironmesh-conflicts/remote/conflict2");
+            let mut found_remote_copy = false;
+            if let Ok(entries) = fs::read_dir(&conflict_dir) {
+                for entry in entries {
+                    let path = entry?.path();
+                    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    if !file_name.starts_with("y.txt.remote-conflict-") {
+                        continue;
+                    }
+                    let bytes = fs::read(&path)?;
+                    if bytes.as_slice() == b"remote-v2" {
+                        found_remote_copy = true;
+                        break;
+                    }
+                }
+            }
+            if !found_remote_copy {
+                bail!(
+                    "expected remote conflict copy for conflict2/y.txt under {}",
+                    conflict_dir.display()
+                );
+            }
             Ok::<(), anyhow::Error>(())
         }
         .await;

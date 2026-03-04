@@ -127,6 +127,11 @@ fn main() -> Result<()> {
         &remote_hashes_before_remote_sync,
         &preserve_local_files,
     ));
+    if let Err(error) =
+        materialize_remote_conflict_copies(&args.root_dir, &client, &scope, &startup_conflicts)
+    {
+        eprintln!("startup-state: failed to materialize conflict copies: {error}");
+    }
 
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
@@ -486,6 +491,100 @@ struct StartupConflict {
     reason: String,
     details_json: String,
     created_unix_ms: u128,
+}
+
+fn materialize_remote_conflict_copies(
+    root_dir: &Path,
+    client: &IronMeshClient,
+    scope: &PathScope,
+    conflicts: &[StartupConflict],
+) -> Result<()> {
+    let timestamp = current_unix_ms();
+
+    for conflict in conflicts {
+        if conflict.reason != "dual_modify_conflict"
+            && conflict.reason != "dual_modify_missing_baseline"
+        {
+            continue;
+        }
+
+        let Some(remote_key) = scope.local_to_remote(&conflict.path) else {
+            continue;
+        };
+
+        let base_relative = format!(".ironmesh-conflicts/remote/{}", conflict.path);
+        let base_target = absolute_path(root_dir, &base_relative);
+        let file_name = base_target
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "object".to_string());
+        let conflict_target =
+            base_target.with_file_name(format!("{file_name}.remote-conflict-{timestamp}"));
+
+        let Some(parent) = conflict_target.parent() else {
+            continue;
+        };
+
+        if let Err(error) = fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create conflict directory {}", parent.display()))
+        {
+            eprintln!("startup-state: {error}");
+            continue;
+        }
+
+        let temp_name = format!(
+            ".{}.ironmesh-part-{}",
+            conflict_target
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "object".to_string()),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let temp_path = conflict_target.with_file_name(temp_name);
+
+        let mut file = match File::create(&temp_path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!(
+                    "startup-state: failed to create conflict temp file {}: {error}",
+                    temp_path.display()
+                );
+                continue;
+            }
+        };
+
+        if let Err(error) = client.get_with_selector_writer(&remote_key, None, None, &mut file) {
+            eprintln!(
+                "startup-state: failed to download remote conflict copy for {}: {error}",
+                conflict.path
+            );
+            let _ = fs::remove_file(&temp_path);
+            continue;
+        }
+
+        if let Err(error) = file.sync_all() {
+            eprintln!(
+                "startup-state: failed to flush conflict temp file {}: {error}",
+                temp_path.display()
+            );
+            let _ = fs::remove_file(&temp_path);
+            continue;
+        }
+
+        if let Err(error) = fs::rename(&temp_path, &conflict_target) {
+            eprintln!(
+                "startup-state: failed to write conflict copy {}: {error}",
+                conflict_target.display()
+            );
+            let _ = fs::remove_file(&temp_path);
+            continue;
+        }
+    }
+
+    Ok(())
 }
 
 fn startup_add_delete_conflicts(

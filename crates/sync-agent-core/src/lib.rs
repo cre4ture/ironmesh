@@ -85,6 +85,10 @@ pub fn scan_local_tree(root: &Path) -> Result<LocalTreeState> {
                 .metadata()
                 .with_context(|| format!("failed to read metadata for {}", path.display()))?;
 
+            if is_ironmesh_internal_relative_path(&relative) {
+                continue;
+            }
+
             if metadata.is_dir() {
                 pending.push(path.clone());
             }
@@ -94,6 +98,14 @@ pub fn scan_local_tree(root: &Path) -> Result<LocalTreeState> {
     }
 
     Ok(state)
+}
+
+fn is_ironmesh_internal_relative_path(relative_path: &str) -> bool {
+    relative_path.split('/').any(|segment| {
+        segment == ".ironmesh"
+            || segment == ".ironmesh-conflicts"
+            || segment.contains(".ironmesh-part-")
+    })
 }
 
 pub fn local_entry_state_for_path(
@@ -294,6 +306,33 @@ mod tests {
 
         assert!(state.contains_key("nested"));
         assert!(state.contains_key("nested/file.txt"));
+
+        fs::remove_dir_all(root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn scan_local_tree_ignores_ironmesh_internal_artifacts() {
+        let root = test_root();
+        fs::create_dir_all(root.join(".ironmesh-conflicts/remote/nested"))
+            .expect("internal directory should be created");
+        fs::write(
+            root.join(".ironmesh-conflicts/remote/nested/conflict.txt"),
+            b"do-not-sync",
+        )
+        .expect("internal file should be written");
+        fs::write(root.join(".file.ironmesh-part-123"), b"partial")
+            .expect("partial file should be written");
+        fs::write(root.join("keep.txt"), b"keep").expect("regular file should be written");
+
+        let state = scan_local_tree(&root).expect("scan should succeed");
+
+        assert!(state.contains_key("keep.txt"));
+        assert!(!state.contains_key(".file.ironmesh-part-123"));
+        assert!(
+            !state
+                .keys()
+                .any(|path| path.starts_with(".ironmesh-conflicts"))
+        );
 
         fs::remove_dir_all(root).expect("temp root should be removed");
     }
