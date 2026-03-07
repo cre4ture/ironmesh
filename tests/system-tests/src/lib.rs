@@ -2,7 +2,7 @@
 
 mod client_sdk_test;
 mod framework;
-mod generic_test;
+mod cluster_test;
 #[path = "web-ui-backend_test.rs"]
 mod web_ui_backend_test;
 
