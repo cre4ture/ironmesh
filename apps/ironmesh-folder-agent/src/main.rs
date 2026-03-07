@@ -352,18 +352,18 @@ fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
                         let parsed_details = serde_json::from_str::<serde_json::Value>(
                             conflict.details_json.as_str(),
                         )
-                        .unwrap_or_else(|_| serde_json::Value::String(conflict.details_json));
+                        .unwrap_or(serde_json::Value::String(conflict.details_json));
                         let line = json!({
                             "path": conflict.path,
                             "reason": conflict.reason,
                             "created_unix_ms": conflict.created_unix_ms,
                             "details": parsed_details,
                         });
-                        println!("{}", line.to_string());
+                        println!("{}", line);
                     }
                 }
                 ConflictListFormat::Table => {
-                    println!("{:<48}  {:<28}  {}", "path", "reason", "created_unix_ms");
+                    println!("{:<48}  {:<28}  created_unix_ms", "path", "reason");
                     for conflict in conflicts {
                         println!(
                             "{:<48}  {:<28}  {}",
@@ -1187,20 +1187,20 @@ fn startup_dual_modify_conflicts(
             },
         };
 
-        if local_hash != *remote_hash {
-            if let Some(reason) = reason {
-                conflicts.push(StartupConflict {
-                    path: path.clone(),
-                    reason: reason.to_string(),
-                    details_json: json!({
-                        "policy": "keep_local_bytes",
-                        "local_action": "upload_local",
-                        "remote_action": "overwrite_possible",
-                    })
-                    .to_string(),
-                    created_unix_ms: current_unix_ms(),
-                });
-            }
+        if local_hash != *remote_hash
+            && let Some(reason) = reason
+        {
+            conflicts.push(StartupConflict {
+                path: path.clone(),
+                reason: reason.to_string(),
+                details_json: json!({
+                    "policy": "keep_local_bytes",
+                    "local_action": "upload_local",
+                    "remote_action": "overwrite_possible",
+                })
+                .to_string(),
+                created_unix_ms: current_unix_ms(),
+            });
         }
     }
 
@@ -1418,6 +1418,7 @@ fn sync_local_changes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_remote_snapshot(
     root_dir: &Path,
     client: &IronMeshClient,

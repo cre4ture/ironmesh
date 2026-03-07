@@ -93,6 +93,17 @@ mod tests {
         );
     }
 
+    async fn wait_for_absence(path: &Path, retries: usize) -> Result<()> {
+        for _ in 0..retries {
+            if !path.exists() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("expected mounted path to disappear: {}", path.display());
+    }
+
     async fn try_unmount(mountpoint: &Path) -> Result<()> {
         let mountpoint_arg = mountpoint.to_string_lossy().to_string();
 
@@ -165,6 +176,32 @@ mod tests {
         }
 
         bail!("store index did not report remote directory for {expected_with_trailing_slash}");
+    }
+
+    async fn wait_for_remote_directory_absence(
+        sdk: &IronMeshClient,
+        dir_name: &str,
+        retries: usize,
+    ) -> Result<()> {
+        let expected_prefix = format!("{}/", dir_name.trim_end_matches('/'));
+
+        for _ in 0..retries {
+            if let Ok(index) = sdk.store_index(None, 64, None).await {
+                let found = index.entries.iter().any(|entry| {
+                    entry.path == dir_name
+                        || entry.path == expected_prefix
+                        || entry.path.starts_with(&expected_prefix)
+                });
+
+                if !found {
+                    return Ok(());
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("store index still reports remote directory subtree for {expected_prefix}");
     }
 
     async fn run_server_mode_upload_case(
@@ -497,6 +534,257 @@ mod tests {
         result
     }
 
+    async fn run_local_rename_move_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-local-rename-move");
+        let mut server = start_server(bind).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            sdk.put_large_aware(
+                "seed-local-rename.txt",
+                Bytes::from_static(b"seed-local-rename"),
+            )
+            .await?;
+
+            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-local-rename.txt");
+                wait_for_file(&seed_path, 120).await?;
+
+                let local_file_payload = b"local-file-move-payload".to_vec();
+                let file_from_dir = mountpoint.join("local-file-move").join("from");
+                let file_to_dir = mountpoint.join("local-file-move").join("to");
+                fs::create_dir_all(&file_from_dir).with_context(|| {
+                    format!(
+                        "failed to create mounted directory {}",
+                        file_from_dir.display()
+                    )
+                })?;
+                fs::create_dir_all(&file_to_dir).with_context(|| {
+                    format!(
+                        "failed to create mounted directory {}",
+                        file_to_dir.display()
+                    )
+                })?;
+
+                let file_from = file_from_dir.join("source.txt");
+                let file_to = file_to_dir.join("renamed.txt");
+                fs::write(&file_from, &local_file_payload).with_context(|| {
+                    format!("failed to write mounted file {}", file_from.display())
+                })?;
+                wait_for_object_bytes(
+                    &sdk,
+                    "local-file-move/from/source.txt",
+                    &local_file_payload,
+                    180,
+                )
+                .await?;
+
+                fs::rename(&file_from, &file_to).with_context(|| {
+                    format!(
+                        "failed to rename mounted file {} -> {}",
+                        file_from.display(),
+                        file_to.display()
+                    )
+                })?;
+                wait_for_file(&file_to, 120).await?;
+                wait_for_absence(&file_from, 120).await?;
+                wait_for_object_bytes(
+                    &sdk,
+                    "local-file-move/to/renamed.txt",
+                    &local_file_payload,
+                    180,
+                )
+                .await?;
+                wait_for_store_index_entry(
+                    &sdk,
+                    None,
+                    64,
+                    "local-file-move/from/source.txt",
+                    "key",
+                    false,
+                    180,
+                )
+                .await?;
+
+                let local_folder_payload = b"local-folder-move-payload".to_vec();
+                let folder_from = mountpoint.join("local-folder-move").join("from");
+                let folder_from_nested = folder_from.join("nested");
+                fs::create_dir_all(&folder_from_nested).with_context(|| {
+                    format!(
+                        "failed to create mounted directory {}",
+                        folder_from_nested.display()
+                    )
+                })?;
+                let folder_from_file = folder_from_nested.join("inside.txt");
+                fs::write(&folder_from_file, &local_folder_payload).with_context(|| {
+                    format!(
+                        "failed to write mounted file {}",
+                        folder_from_file.display()
+                    )
+                })?;
+                wait_for_object_bytes(
+                    &sdk,
+                    "local-folder-move/from/nested/inside.txt",
+                    &local_folder_payload,
+                    180,
+                )
+                .await?;
+
+                let folder_to = mountpoint.join("local-folder-move").join("to");
+                fs::rename(&folder_from, &folder_to).with_context(|| {
+                    format!(
+                        "failed to rename mounted directory {} -> {}",
+                        folder_from.display(),
+                        folder_to.display()
+                    )
+                })?;
+                let folder_to_file = folder_to.join("nested").join("inside.txt");
+                wait_for_file(&folder_to_file, 120).await?;
+                wait_for_absence(&folder_from, 120).await?;
+                wait_for_object_bytes(
+                    &sdk,
+                    "local-folder-move/to/nested/inside.txt",
+                    &local_folder_payload,
+                    200,
+                )
+                .await?;
+                wait_for_store_index_entry(
+                    &sdk,
+                    None,
+                    64,
+                    "local-folder-move/from/nested/inside.txt",
+                    "key",
+                    false,
+                    200,
+                )
+                .await?;
+                wait_for_store_index_entry(
+                    &sdk,
+                    Some("local-folder-move"),
+                    1,
+                    "local-folder-move/to/",
+                    "prefix",
+                    true,
+                    200,
+                )
+                .await?;
+                wait_for_remote_directory_absence(&sdk, "local-folder-move/from", 200).await?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
+    async fn run_remote_rename_move_refresh_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-remote-rename-move");
+        let mut server = start_server(bind).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            sdk.put_large_aware(
+                "seed-remote-rename.txt",
+                Bytes::from_static(b"seed-remote-rename"),
+            )
+            .await?;
+
+            let mut adapter =
+                start_linux_fuse_adapter_with_refresh(&base_url, &mountpoint, 250).await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-remote-rename.txt");
+                wait_for_file(&seed_path, 120).await?;
+
+                let remote_file_payload = b"remote-file-move-payload".to_vec();
+                let remote_file_from = "remote-file-move/from.txt";
+                let remote_file_to = "remote-file-move/sub/renamed.txt";
+                sdk.put_large_aware(remote_file_from, Bytes::from(remote_file_payload.clone()))
+                    .await?;
+
+                let mounted_remote_file_from = mountpoint.join(remote_file_from);
+                wait_for_file(&mounted_remote_file_from, 180).await?;
+                sdk.rename_path(remote_file_from, remote_file_to, false)
+                    .await?;
+
+                let mounted_remote_file_to = mountpoint.join(remote_file_to);
+                wait_for_file(&mounted_remote_file_to, 240).await?;
+                wait_for_file_bytes(&mounted_remote_file_to, &remote_file_payload, 240).await?;
+                wait_for_absence(&mounted_remote_file_from, 240).await?;
+
+                let remote_folder_payload = b"remote-folder-move-payload".to_vec();
+                let old_root = "remote-folder-move/from";
+                let old_nested_marker = "remote-folder-move/from/nested/";
+                let old_root_marker = "remote-folder-move/from/";
+                let old_file = "remote-folder-move/from/nested/inside.txt";
+                let new_root_marker = "remote-folder-move/to/";
+                let new_nested_marker = "remote-folder-move/to/nested/";
+                let new_file = "remote-folder-move/to/nested/inside.txt";
+
+                sdk.put(old_root_marker, Bytes::new()).await?;
+                sdk.put(old_nested_marker, Bytes::new()).await?;
+                sdk.put_large_aware(old_file, Bytes::from(remote_folder_payload.clone()))
+                    .await?;
+
+                let mounted_old_file = mountpoint.join(old_file);
+                wait_for_file(&mounted_old_file, 220).await?;
+
+                sdk.rename_path(old_file, new_file, false).await?;
+                sdk.rename_path(old_nested_marker, new_nested_marker, false)
+                    .await?;
+                sdk.rename_path(old_root_marker, new_root_marker, false)
+                    .await?;
+
+                let mounted_new_file = mountpoint.join(new_file);
+                wait_for_file(&mounted_new_file, 260).await?;
+                wait_for_file_bytes(&mounted_new_file, &remote_folder_payload, 260).await?;
+                wait_for_absence(&mountpoint.join(old_root), 260).await?;
+                wait_for_dir(&mountpoint.join("remote-folder-move/to"), 260).await?;
+                wait_for_remote_directory_absence(&sdk, old_root, 220).await?;
+                wait_for_store_index_entry(
+                    &sdk,
+                    Some("remote-folder-move"),
+                    1,
+                    "remote-folder-move/to/",
+                    "prefix",
+                    true,
+                    220,
+                )
+                .await?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
     #[tokio::test]
     async fn linux_fuse_server_mode_uploads_small_payload() -> Result<()> {
         run_server_mode_upload_case(
@@ -545,5 +833,15 @@ mod tests {
     #[tokio::test]
     async fn linux_fuse_remote_file_update_refreshes_without_remount() -> Result<()> {
         run_remote_update_refresh_case("127.0.0.1:19364").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_local_file_and_folder_renames_moves_sync_to_remote() -> Result<()> {
+        run_local_rename_move_case("127.0.0.1:19366").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_remote_file_and_folder_renames_moves_refresh_in_place() -> Result<()> {
+        run_remote_rename_move_refresh_case("127.0.0.1:19367").await
     }
 }

@@ -303,6 +303,22 @@ impl IronMeshClient {
         runtime.block_on(self.delete_path(key))
     }
 
+    pub fn rename_path_blocking(
+        &self,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<()> {
+        let from_path = from_path.into();
+        let to_path = to_path.into();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for rename request")?;
+        runtime.block_on(self.rename_path(from_path, to_path, overwrite))
+    }
+
     pub async fn put_large_aware(
         &self,
         key: impl Into<String>,

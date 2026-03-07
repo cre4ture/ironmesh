@@ -49,6 +49,9 @@ pub enum FuseAction {
         local_version: Option<String>,
         remote_version: Option<String>,
     },
+    RemovePath {
+        path: String,
+    },
 }
 
 pub fn map_sync_plan_to_fuse_actions(sync_plan: &SyncPlan) -> FuseActionPlan {
@@ -158,6 +161,10 @@ pub mod runtime {
             reader: &mut dyn std::io::Read,
             length: u64,
         ) -> Result<Option<String>>;
+
+        fn rename_path(&self, from_path: &str, to_path: &str, overwrite: bool) -> Result<()>;
+
+        fn delete_path(&self, path: &str) -> Result<()>;
     }
 
     #[derive(Debug, Default, Clone)]
@@ -183,6 +190,14 @@ pub mod runtime {
             _length: u64,
         ) -> Result<Option<String>> {
             Ok(Some("demo-upload".to_string()))
+        }
+
+        fn rename_path(&self, _from_path: &str, _to_path: &str, _overwrite: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete_path(&self, _path: &str) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -339,7 +354,9 @@ pub mod runtime {
                     } => {
                         fs.ensure_placeholder_file(path, remote_version);
                     }
-                    FuseAction::UploadOnFlush { .. } | FuseAction::MarkConflict { .. } => {}
+                    FuseAction::UploadOnFlush { .. }
+                    | FuseAction::MarkConflict { .. }
+                    | FuseAction::RemovePath { .. } => {}
                 }
             }
 
@@ -484,7 +501,66 @@ pub mod runtime {
             }
         }
 
-        fn apply_remote_action_plan_additive(&mut self, action_plan: &FuseActionPlan) {
+        fn remove_inode_recursive(&mut self, inode: u64) {
+            let Some(node) = self.nodes.get(&inode).cloned() else {
+                return;
+            };
+
+            for child_inode in node.children.values() {
+                self.remove_inode_recursive(*child_inode);
+            }
+
+            self.open_handles.retain(|_, handle| handle.inode != inode);
+            self.nodes.remove(&inode);
+        }
+
+        fn remove_path_for_refresh(&mut self, relative_path: &str) {
+            let segments: Vec<&str> = relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            if segments.is_empty() {
+                return;
+            }
+
+            let mut parent_inode = ROOT_INODE;
+            for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+                let Some(next_inode) = self
+                    .nodes
+                    .get(&parent_inode)
+                    .and_then(|node| node.children.get(*segment).copied())
+                else {
+                    return;
+                };
+                parent_inode = next_inode;
+            }
+
+            let leaf_name = segments.last().copied().unwrap_or_default();
+            let Some(target_inode) = self
+                .nodes
+                .get(&parent_inode)
+                .and_then(|node| node.children.get(leaf_name).copied())
+            else {
+                return;
+            };
+
+            if self.inode_has_active_writer(target_inode) {
+                return;
+            }
+
+            if let Some(parent) = self.nodes.get_mut(&parent_inode) {
+                parent.children.remove(leaf_name);
+            }
+            self.remove_inode_recursive(target_inode);
+        }
+
+        fn apply_remote_action_plan_refresh(&mut self, action_plan: &FuseActionPlan) {
+            for action in &action_plan.actions {
+                if let FuseAction::RemovePath { path } = action {
+                    self.remove_path_for_refresh(path);
+                }
+            }
+
             for action in &action_plan.actions {
                 match action {
                     FuseAction::EnsureDirectory { path } => {
@@ -500,7 +576,9 @@ pub mod runtime {
                     } => {
                         self.ensure_placeholder_file_for_refresh(path, remote_version);
                     }
-                    FuseAction::UploadOnFlush { .. } | FuseAction::MarkConflict { .. } => {}
+                    FuseAction::UploadOnFlush { .. }
+                    | FuseAction::MarkConflict { .. }
+                    | FuseAction::RemovePath { .. } => {}
                 }
             }
         }
@@ -514,8 +592,147 @@ pub mod runtime {
             }
 
             for action_plan in pending {
-                self.apply_remote_action_plan_additive(&action_plan);
+                self.apply_remote_action_plan_refresh(&action_plan);
             }
+        }
+
+        fn child_path(parent_path: &str, name: &str) -> String {
+            if parent_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{parent_path}/{name}")
+            }
+        }
+
+        fn collect_subtree_nodes(
+            &self,
+            inode: u64,
+            directories: &mut Vec<u64>,
+            files: &mut Vec<u64>,
+        ) -> Result<()> {
+            let node = self
+                .nodes
+                .get(&inode)
+                .ok_or_else(|| anyhow!("inode not found: {inode}"))?;
+
+            match node.kind {
+                FileType::Directory => {
+                    directories.push(inode);
+                    for child_inode in node.children.values() {
+                        self.collect_subtree_nodes(*child_inode, directories, files)?;
+                    }
+                }
+                FileType::RegularFile => files.push(inode),
+                _ => return Err(anyhow!("unsupported inode kind for rename: {}", node.inode)),
+            }
+
+            Ok(())
+        }
+
+        fn ensure_remote_directory_marker(&self, path: &str) -> Result<()> {
+            let marker = format!("{}/", path.trim_end_matches('/'));
+            let mut reader = Cursor::new(Vec::new());
+            self.uploader.upload_reader(&marker, &mut reader, 0)?;
+            Ok(())
+        }
+
+        fn path_depth(path: &str) -> usize {
+            path.split('/')
+                .filter(|segment| !segment.is_empty())
+                .count()
+        }
+
+        fn remote_rename_file(&self, from_path: &str, to_path: &str) -> Result<()> {
+            self.uploader
+                .rename_path(from_path, to_path, false)
+                .with_context(|| format!("failed to rename remote file {from_path} -> {to_path}"))
+        }
+
+        fn remote_rename_directory_subtree(
+            &self,
+            directory_inode: u64,
+            from_root: &str,
+            to_root: &str,
+        ) -> Result<()> {
+            let mut directories = Vec::new();
+            let mut files = Vec::new();
+            self.collect_subtree_nodes(directory_inode, &mut directories, &mut files)?;
+
+            for inode in files {
+                let old_path = self.resolve_full_path(inode);
+                let relative = old_path
+                    .strip_prefix(from_root)
+                    .and_then(|value| value.strip_prefix('/'))
+                    .ok_or_else(|| anyhow!("file path escaped rename root: {old_path}"))?;
+                let new_path = format!("{to_root}/{relative}");
+                self.remote_rename_file(&old_path, &new_path)?;
+            }
+
+            let mut directory_paths: Vec<String> = directories
+                .into_iter()
+                .map(|inode| self.resolve_full_path(inode))
+                .collect();
+
+            directory_paths.sort_by_key(|path| Self::path_depth(path));
+            for old_path in &directory_paths {
+                let relative = old_path
+                    .strip_prefix(from_root)
+                    .and_then(|value| {
+                        if value.is_empty() {
+                            Some("")
+                        } else {
+                            value.strip_prefix('/')
+                        }
+                    })
+                    .ok_or_else(|| anyhow!("directory path escaped rename root: {old_path}"))?;
+                let new_path = if relative.is_empty() {
+                    to_root.to_string()
+                } else {
+                    format!("{to_root}/{relative}")
+                };
+                self.ensure_remote_directory_marker(&new_path)?;
+            }
+
+            directory_paths.sort_by_key(|path| std::cmp::Reverse(Self::path_depth(path)));
+            for old_path in &directory_paths {
+                let old_marker = format!("{}/", old_path.trim_end_matches('/'));
+                self.uploader
+                    .delete_path(&old_marker)
+                    .with_context(|| format!("failed to delete stale marker {old_marker}"))?;
+            }
+
+            Ok(())
+        }
+
+        fn apply_local_rename(
+            &mut self,
+            old_parent: u64,
+            old_name: &str,
+            new_parent: u64,
+            new_name: &str,
+            inode: u64,
+        ) -> Result<()> {
+            if let Some(parent) = self.nodes.get_mut(&old_parent) {
+                parent.children.remove(old_name);
+            } else {
+                return Err(anyhow!("old parent inode missing during rename"));
+            }
+
+            if let Some(parent) = self.nodes.get_mut(&new_parent) {
+                parent.children.insert(new_name.to_string(), inode);
+            } else {
+                return Err(anyhow!("new parent inode missing during rename"));
+            }
+
+            if let Some(node) = self.nodes.get_mut(&inode) {
+                node.parent_inode = new_parent;
+                node.name = new_name.to_string();
+                node.modified_at = SystemTime::now();
+            } else {
+                return Err(anyhow!("inode missing during rename update"));
+            }
+
+            Ok(())
         }
 
         fn next_inode(&self) -> u64 {
@@ -885,6 +1102,126 @@ pub mod runtime {
                 parent_node.children.remove(name);
             }
             self.nodes.remove(&child_inode);
+            reply.ok();
+        }
+
+        fn rename(
+            &mut self,
+            _req: &Request<'_>,
+            parent: u64,
+            name: &OsStr,
+            newparent: u64,
+            newname: &OsStr,
+            flags: u32,
+            reply: ReplyEmpty,
+        ) {
+            self.drain_remote_updates();
+
+            if flags != 0 {
+                reply.error(EINVAL);
+                return;
+            }
+
+            let Some(old_name) = name.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+            let Some(new_name) = newname.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+            if old_name.is_empty()
+                || new_name.is_empty()
+                || old_name.contains('/')
+                || new_name.contains('/')
+            {
+                reply.error(EINVAL);
+                return;
+            }
+
+            let Some(old_parent_node) = self.nodes.get(&parent) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if old_parent_node.kind != FileType::Directory {
+                reply.error(ENOTDIR);
+                return;
+            }
+
+            let Some(new_parent_node) = self.nodes.get(&newparent) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if new_parent_node.kind != FileType::Directory {
+                reply.error(ENOTDIR);
+                return;
+            }
+
+            let Some(inode) = old_parent_node.children.get(old_name).copied() else {
+                reply.error(ENOENT);
+                return;
+            };
+
+            if parent == newparent && old_name == new_name {
+                reply.ok();
+                return;
+            }
+
+            if let Some(existing_inode) = new_parent_node.children.get(new_name).copied() {
+                if existing_inode == inode {
+                    reply.ok();
+                    return;
+                }
+                reply.error(EEXIST);
+                return;
+            }
+
+            let Some(node) = self.nodes.get(&inode) else {
+                reply.error(ENOENT);
+                return;
+            };
+
+            if node.kind == FileType::Directory {
+                let mut current = newparent;
+                while current != ROOT_INODE {
+                    if current == inode {
+                        reply.error(EINVAL);
+                        return;
+                    }
+                    let Some(ancestor) = self.nodes.get(&current) else {
+                        reply.error(EIO);
+                        return;
+                    };
+                    current = ancestor.parent_inode;
+                }
+            }
+
+            let old_parent_path = self.resolve_full_path(parent);
+            let new_parent_path = self.resolve_full_path(newparent);
+            let old_full_path = Self::child_path(&old_parent_path, old_name);
+            let new_full_path = Self::child_path(&new_parent_path, new_name);
+
+            let remote_result = match node.kind {
+                FileType::RegularFile => self.remote_rename_file(&old_full_path, &new_full_path),
+                FileType::Directory => {
+                    self.remote_rename_directory_subtree(inode, &old_full_path, &new_full_path)
+                }
+                _ => Err(anyhow!("unsupported inode type for rename")),
+            };
+
+            if remote_result.is_err() {
+                reply.error(EIO);
+                return;
+            }
+
+            if self
+                .apply_local_rename(parent, old_name, newparent, new_name, inode)
+                .is_err()
+            {
+                reply.error(EIO);
+                return;
+            }
+
             reply.ok();
         }
 

@@ -2473,6 +2473,7 @@ fn admin_request_metadata(headers: &HeaderMap) -> AdminRequestMetadata {
     AdminRequestMetadata { actor, source_node }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_admin_audit(
     state: &ServerState,
     action: &str,

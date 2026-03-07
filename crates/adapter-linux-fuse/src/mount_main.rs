@@ -139,7 +139,8 @@ fn filter_refresh_action_plan(plan: FuseActionPlan, changed_paths: &[String]) ->
         changed.insert(path.as_str());
     }
 
-    let actions = plan
+    let mut planned_paths = std::collections::HashSet::new();
+    let mut actions: Vec<FuseAction> = plan
         .actions
         .into_iter()
         .filter(|action| {
@@ -148,11 +149,20 @@ fn filter_refresh_action_plan(plan: FuseActionPlan, changed_paths: &[String]) ->
                 | FuseAction::EnsurePlaceholder { path, .. }
                 | FuseAction::HydrateOnRead { path, .. }
                 | FuseAction::UploadOnFlush { path, .. }
-                | FuseAction::MarkConflict { path, .. } => path,
+                | FuseAction::MarkConflict { path, .. }
+                | FuseAction::RemovePath { path } => path,
             };
+            planned_paths.insert(path.clone());
             changed.contains(path.as_str())
         })
         .collect();
+
+    for path in changed_paths {
+        if planned_paths.contains(path) {
+            continue;
+        }
+        actions.push(FuseAction::RemovePath { path: path.clone() });
+    }
 
     FuseActionPlan { actions }
 }
@@ -192,6 +202,18 @@ impl Uploader for ServerNodeIo {
             .with_context(|| format!("failed to upload object for path {path}"))?;
         Ok(Some("server-head".to_string()))
     }
+
+    fn rename_path(&self, from_path: &str, to_path: &str, overwrite: bool) -> Result<()> {
+        self.sdk
+            .rename_path_blocking(from_path.to_string(), to_path.to_string(), overwrite)
+            .with_context(|| format!("failed to rename object {from_path} -> {to_path}"))
+    }
+
+    fn delete_path(&self, path: &str) -> Result<()> {
+        self.sdk
+            .delete_path_blocking(path)
+            .with_context(|| format!("failed to delete object {path}"))
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +246,34 @@ mod tests {
                 path: "docs/new.txt".to_string(),
                 remote_version: "v1".to_string(),
             }],
+        );
+    }
+
+    #[test]
+    fn filter_refresh_action_plan_marks_deleted_paths_for_removal() {
+        let plan = FuseActionPlan {
+            actions: vec![FuseAction::EnsurePlaceholder {
+                path: "docs/new.txt".to_string(),
+                remote_version: "v2".to_string(),
+            }],
+        };
+
+        let filtered = filter_refresh_action_plan(
+            plan,
+            &["docs/new.txt".to_string(), "docs/old.txt".to_string()],
+        );
+
+        assert_eq!(
+            filtered.actions,
+            vec![
+                FuseAction::EnsurePlaceholder {
+                    path: "docs/new.txt".to_string(),
+                    remote_version: "v2".to_string(),
+                },
+                FuseAction::RemovePath {
+                    path: "docs/old.txt".to_string(),
+                },
+            ],
         );
     }
 }
