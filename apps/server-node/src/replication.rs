@@ -128,13 +128,8 @@ pub(crate) async fn execute_replication_repair_inner(
             await_repair_busy_threshold(state).await;
 
             attempted_transfers += 1;
-            let transfer_result = replicate_bundle_to_target(
-                &http,
-                &node.internal_url,
-                &bundle,
-                &state.store,
-            )
-            .await;
+            let transfer_result =
+                replicate_bundle_to_target(&http, &node.internal_url, &bundle, &state.store).await;
 
             match transfer_result {
                 Ok(remote_version_id) => {

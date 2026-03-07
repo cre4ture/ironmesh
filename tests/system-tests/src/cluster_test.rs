@@ -1554,7 +1554,11 @@ mod tests {
 
         let https_only = https_client_with_root_from_data_dir(&data_dir)?;
         assert!(
-            https_only.get(format!("{internal_base}/health")).send().await.is_err(),
+            https_only
+                .get(format!("{internal_base}/health"))
+                .send()
+                .await
+                .is_err(),
             "expected internal listener to reject missing client certificate"
         );
 

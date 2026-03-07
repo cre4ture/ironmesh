@@ -5,7 +5,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::SocketAddr;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, Query, Request, State};
 use axum::extract::FromRequestParts;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::header;
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +25,7 @@ use axum_server::accept::Accept;
 use axum_server::tls_rustls::RustlsConfig;
 use bytes::Bytes;
 use common::{HealthStatus, NodeId};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
@@ -46,11 +48,21 @@ mod replication;
 mod storage;
 mod ui;
 
+const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'&')
+    .add(b'+')
+    .add(b'/')
+    .add(b'=')
+    .add(b'?');
+
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
-    AdminAuditEvent, ObjectReadMode, PathMutationResult, PersistentStore, PutOptions,
-    ReconcileVersionEntry, RepairAttemptRecord, StoreReadError, UploadChunkRef,
-    VersionConsistencyState,
+    AdminAuditEvent, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, ObjectReadMode,
+    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
+    StoreReadError, UploadChunkRef, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -157,10 +169,10 @@ impl MtlsCallerAcceptor {
 impl<S> Accept<tokio::net::TcpStream, S> for MtlsCallerAcceptor
 where
     axum_server::tls_rustls::RustlsAcceptor: Accept<
-        tokio::net::TcpStream,
-        S,
-        Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-    >,
+            tokio::net::TcpStream,
+            S,
+            Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        >,
     <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Service:
         Send + 'static,
     <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Future:
@@ -208,10 +220,10 @@ fn extract_node_id_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result<NodeI
         let parsed_extension = extension.parsed_extension();
         if let ParsedExtension::SubjectAlternativeName(san) = parsed_extension {
             for name in &san.general_names {
-                if let x509_parser::extensions::GeneralName::URI(uri) = name {
-                    if let Some(node_id) = parse_node_id_from_san_uri(uri) {
-                        return Ok(node_id);
-                    }
+                if let x509_parser::extensions::GeneralName::URI(uri) = name
+                    && let Some(node_id) = parse_node_id_from_san_uri(uri)
+                {
+                    return Ok(node_id);
                 }
             }
         }
@@ -572,7 +584,8 @@ async fn main() -> Result<()> {
             .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
     );
     let internal_tls_cert_path = PathBuf::from(
-        std::env::var("IRONMESH_INTERNAL_TLS_CERT").context("missing IRONMESH_INTERNAL_TLS_CERT")?,
+        std::env::var("IRONMESH_INTERNAL_TLS_CERT")
+            .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
     );
     let internal_tls_key_path = PathBuf::from(
         std::env::var("IRONMESH_INTERNAL_TLS_KEY").context("missing IRONMESH_INTERNAL_TLS_KEY")?,
@@ -700,6 +713,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
@@ -765,6 +779,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
@@ -1161,6 +1176,45 @@ struct StoreIndexQuery {
     snapshot: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MediaThumbnailQuery {
+    key: String,
+    snapshot: Option<String>,
+    version: Option<String>,
+    read_mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MediaGpsResponse {
+    latitude: f64,
+    longitude: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct MediaThumbnailResponse {
+    url: String,
+    profile: String,
+    width: u32,
+    height: u32,
+    format: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct MediaIndexResponse {
+    status: String,
+    content_fingerprint: String,
+    media_type: Option<String>,
+    mime_type: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    orientation: Option<u16>,
+    taken_at_unix: Option<u64>,
+    gps: Option<MediaGpsResponse>,
+    thumbnail: Option<MediaThumbnailResponse>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct StoreIndexEntry {
     path: String,
@@ -1169,6 +1223,10 @@ struct StoreIndexEntry {
     version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media: Option<MediaIndexResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1237,6 +1295,20 @@ fn should_trigger_autonomous_post_write_replication(
     internal_replication: bool,
 ) -> bool {
     autonomous_replication_on_put_enabled && !internal_replication
+}
+
+fn spawn_media_cache_warmup(state: ServerState, key: String, manifest_hash: String) {
+    tokio::spawn(async move {
+        let store = state.store.lock().await;
+        if let Err(err) = store.ensure_media_cache(&manifest_hash).await {
+            warn!(
+                key = %key,
+                manifest_hash = %manifest_hash,
+                error = %err,
+                "failed to warm media cache after write"
+            );
+        }
+    });
 }
 
 async fn delete_object_by_query(
@@ -1350,6 +1422,7 @@ async fn put_object(
     {
         Ok(outcome) => {
             drop(store);
+            spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
             let mut cluster = state.cluster.lock().await;
             cluster.note_replica(&key, state.node_id);
@@ -1466,6 +1539,7 @@ async fn complete_chunked_upload(
     {
         Ok(outcome) => {
             drop(store);
+            spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
             let mut cluster = state.cluster.lock().await;
             cluster.note_replica(&key, state.node_id);
@@ -1632,7 +1706,40 @@ async fn list_store_index(
         }
     };
 
-    let entries = build_store_index_entries_with_hashes(&keys, &prefix, depth, Some(&key_hashes));
+    let mut entries =
+        build_store_index_entries_with_hashes(&keys, &prefix, depth, Some(&key_hashes));
+    {
+        let store = state.store.lock().await;
+        for entry in &mut entries {
+            if entry.entry_type != "key" || !looks_like_image_path(&entry.path) {
+                continue;
+            }
+
+            let Some(manifest_hash) = entry.content_hash.as_deref() else {
+                continue;
+            };
+
+            match store.lookup_media_cache(manifest_hash).await {
+                Ok(Some(lookup)) => {
+                    entry.content_fingerprint = Some(lookup.content_fingerprint.clone());
+                    entry.media = Some(build_media_index_response(
+                        &entry.path,
+                        query.snapshot.as_deref(),
+                        &lookup,
+                    ));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        key = %entry.path,
+                        manifest_hash = %manifest_hash,
+                        error = %err,
+                        "failed to read cached media metadata for store index"
+                    );
+                }
+            }
+        }
+    }
 
     (
         StatusCode::OK,
@@ -1644,6 +1751,98 @@ async fn list_store_index(
         }),
     )
         .into_response()
+}
+
+fn build_media_index_response(
+    key: &str,
+    snapshot: Option<&str>,
+    lookup: &MediaCacheLookup,
+) -> MediaIndexResponse {
+    let thumbnail_url = build_thumbnail_url(key, snapshot);
+    match lookup.metadata.as_ref() {
+        Some(metadata) => MediaIndexResponse {
+            status: media_cache_status_label(&metadata.status).to_string(),
+            content_fingerprint: lookup.content_fingerprint.clone(),
+            media_type: metadata.media_type.clone(),
+            mime_type: metadata.mime_type.clone(),
+            width: metadata.width,
+            height: metadata.height,
+            orientation: metadata.orientation,
+            taken_at_unix: metadata.taken_at_unix,
+            gps: metadata.gps.as_ref().map(media_gps_response),
+            thumbnail: metadata
+                .thumbnail
+                .as_ref()
+                .map(|thumb| MediaThumbnailResponse {
+                    url: thumbnail_url.clone(),
+                    profile: thumb.profile.clone(),
+                    width: thumb.width,
+                    height: thumb.height,
+                    format: thumb.format.clone(),
+                    size_bytes: thumb.size_bytes,
+                }),
+            error: metadata.error.clone(),
+        },
+        None => MediaIndexResponse {
+            status: "pending".to_string(),
+            content_fingerprint: lookup.content_fingerprint.clone(),
+            media_type: Some("image".to_string()),
+            mime_type: None,
+            width: None,
+            height: None,
+            orientation: None,
+            taken_at_unix: None,
+            gps: None,
+            thumbnail: Some(MediaThumbnailResponse {
+                url: thumbnail_url,
+                profile: "grid".to_string(),
+                width: 256,
+                height: 256,
+                format: "jpeg".to_string(),
+                size_bytes: 0,
+            }),
+            error: None,
+        },
+    }
+}
+
+fn build_thumbnail_url(key: &str, snapshot: Option<&str>) -> String {
+    let encoded_key = utf8_percent_encode(key, QUERY_COMPONENT_ENCODE_SET).to_string();
+    match snapshot {
+        Some(snapshot_id) => {
+            let encoded_snapshot =
+                utf8_percent_encode(snapshot_id, QUERY_COMPONENT_ENCODE_SET).to_string();
+            format!("/media/thumbnail?key={encoded_key}&snapshot={encoded_snapshot}")
+        }
+        None => format!("/media/thumbnail?key={encoded_key}"),
+    }
+}
+
+fn media_cache_status_label(status: &MediaCacheStatus) -> &'static str {
+    match status {
+        MediaCacheStatus::Ready => "ready",
+        MediaCacheStatus::Unsupported => "unsupported",
+        MediaCacheStatus::Failed => "failed",
+    }
+}
+
+fn media_gps_response(value: &MediaGpsCoordinates) -> MediaGpsResponse {
+    MediaGpsResponse {
+        latitude: value.latitude,
+        longitude: value.longitude,
+    }
+}
+
+fn looks_like_image_path(path: &str) -> bool {
+    let extension = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "bmp" | "gif" | "jpeg" | "jpg" | "png" | "webp"
+    )
 }
 
 #[cfg(test)]
@@ -1705,6 +1904,8 @@ fn build_store_index_entries_with_hashes(
             entry_type: "prefix".to_string(),
             version: None,
             content_hash: None,
+            content_fingerprint: None,
+            media: None,
         });
     }
     for path in file_entries {
@@ -1714,6 +1915,8 @@ fn build_store_index_entries_with_hashes(
             entry_type: "key".to_string(),
             version: None,
             content_hash,
+            content_fingerprint: None,
+            media: None,
         });
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1725,11 +1928,9 @@ async fn get_object(
     Path(key): Path<String>,
     Query(query): Query<ObjectGetQuery>,
 ) -> impl IntoResponse {
-    let read_mode = match query.read_mode.as_deref() {
-        None | Some("preferred") => ObjectReadMode::Preferred,
-        Some("confirmed_only") => ObjectReadMode::ConfirmedOnly,
-        Some("provisional_allowed") => ObjectReadMode::ProvisionalAllowed,
-        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
+    let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
+        Some(value) => value,
+        None => return StatusCode::BAD_REQUEST.into_response(),
     };
 
     let store = state.store.lock().await;
@@ -1752,6 +1953,96 @@ async fn get_object(
             tracing::error!(key = %key, error = %err, "internal error while reading object");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+async fn get_media_thumbnail(
+    State(state): State<ServerState>,
+    Query(query): Query<MediaThumbnailQuery>,
+) -> impl IntoResponse {
+    let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
+        Some(value) => value,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let metadata = {
+        let store = state.store.lock().await;
+        let manifest_hash = match store
+            .resolve_manifest_hash_for_key(
+                &query.key,
+                query.snapshot.as_deref(),
+                query.version.as_deref(),
+                read_mode,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(StoreReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+            Err(StoreReadError::Corrupt(msg)) => {
+                tracing::error!(key = %query.key, error = %msg, "corrupt object while resolving media thumbnail");
+                return StatusCode::CONFLICT.into_response();
+            }
+            Err(StoreReadError::Internal(err)) => {
+                tracing::error!(key = %query.key, error = %err, "internal error while resolving media thumbnail");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+        match store.ensure_media_cache(&manifest_hash).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!(key = %query.key, error = %err, "failed to build media thumbnail cache");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    if metadata.status != MediaCacheStatus::Ready {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let Some(thumbnail) = metadata.thumbnail.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let payload = {
+        let store = state.store.lock().await;
+        let thumbnail_path =
+            store.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
+        match tokio::fs::read(&thumbnail_path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Err(err) => {
+                tracing::error!(
+                    key = %query.key,
+                    path = %thumbnail_path.display(),
+                    error = %err,
+                    "failed to read generated thumbnail"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    (
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        payload,
+    )
+        .into_response()
+}
+
+fn parse_read_mode(value: Option<&str>) -> Option<ObjectReadMode> {
+    match value {
+        None | Some("preferred") => Some(ObjectReadMode::Preferred),
+        Some("confirmed_only") => Some(ObjectReadMode::ConfirmedOnly),
+        Some("provisional_allowed") => Some(ObjectReadMode::ProvisionalAllowed),
+        Some(_) => None,
     }
 }
 
@@ -1962,7 +2253,6 @@ async fn placement_for_key(
     Json(cluster.placement_for_key(&key))
 }
 
-
 async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationPlan> {
     let keys = {
         let store = state.store.lock().await;
@@ -2000,9 +2290,7 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
     Json(plan)
 }
 
-async fn local_replication_subjects(
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
+async fn local_replication_subjects(State(state): State<ServerState>) -> impl IntoResponse {
     let subjects = {
         let store = state.store.lock().await;
         store
@@ -2397,8 +2685,8 @@ fn build_internal_mtls_http_client(
     cert_path: &PathBuf,
     key_path: &PathBuf,
 ) -> Result<reqwest::Client> {
-    let ca_pem = std::fs::read(ca_path)
-        .with_context(|| format!("failed reading {}", ca_path.display()))?;
+    let ca_pem =
+        std::fs::read(ca_path).with_context(|| format!("failed reading {}", ca_path.display()))?;
     let ca_cert =
         reqwest::Certificate::from_pem(&ca_pem).context("failed parsing internal CA PEM")?;
 

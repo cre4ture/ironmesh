@@ -1,10 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
 use common::NodeId;
+use exif::{In, Reader as ExifReader, Tag, Value};
+use image::codecs::jpeg::JpegEncoder;
+use image::{GenericImageView, ImageFormat};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -12,6 +16,9 @@ use uuid::Uuid;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
+const MEDIA_CACHE_SCHEMA_VERSION: u32 = 1;
+const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
+const GRID_THUMBNAIL_PROFILE: &str = "grid";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkRef {
@@ -279,10 +286,59 @@ pub struct RepairAttemptRecord {
 pub struct PutResult {
     pub snapshot_id: String,
     pub version_id: String,
+    pub manifest_hash: String,
     pub state: VersionConsistencyState,
     pub new_chunks: usize,
     pub dedup_reused_chunks: usize,
     pub created_new_version: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaCacheStatus {
+    Ready,
+    Unsupported,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaGpsCoordinates {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedThumbnailInfo {
+    pub profile: String,
+    pub format: String,
+    pub width: u32,
+    pub height: u32,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedMediaMetadata {
+    pub schema_version: u32,
+    pub content_fingerprint: String,
+    pub source_manifest_hash: String,
+    pub status: MediaCacheStatus,
+    pub media_type: Option<String>,
+    pub mime_type: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub orientation: Option<u16>,
+    pub taken_at_unix: Option<u64>,
+    pub gps: Option<MediaGpsCoordinates>,
+    pub thumbnail: Option<CachedThumbnailInfo>,
+    pub source_size_bytes: usize,
+    pub generated_at_unix: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaCacheLookup {
+    pub content_fingerprint: String,
+    pub metadata: Option<CachedMediaMetadata>,
 }
 
 pub struct PersistentStore {
@@ -296,6 +352,8 @@ pub struct PersistentStore {
     repair_attempts_path: PathBuf,
     cluster_replicas_path: PathBuf,
     admin_audit_log_path: PathBuf,
+    media_metadata_dir: PathBuf,
+    media_thumbnails_dir: PathBuf,
     current_state: CurrentState,
 }
 
@@ -330,6 +388,9 @@ impl PersistentStore {
         let repair_attempts_path = state_dir.join("repair_attempts.json");
         let cluster_replicas_path = state_dir.join("cluster_replicas.json");
         let admin_audit_log_path = state_dir.join("admin_audit.jsonl");
+        let media_cache_dir = state_dir.join("media_cache");
+        let media_metadata_dir = media_cache_dir.join("metadata");
+        let media_thumbnails_dir = media_cache_dir.join("thumbnails");
 
         fs::create_dir_all(&chunks_dir).await?;
         fs::create_dir_all(&manifests_dir).await?;
@@ -337,6 +398,8 @@ impl PersistentStore {
         fs::create_dir_all(&versions_dir).await?;
         fs::create_dir_all(&reconcile_markers_dir).await?;
         fs::create_dir_all(&state_dir).await?;
+        fs::create_dir_all(&media_metadata_dir).await?;
+        fs::create_dir_all(&media_thumbnails_dir).await?;
 
         let current_state = if fs::try_exists(&current_state_path).await? {
             let payload = fs::read(&current_state_path).await?;
@@ -358,6 +421,8 @@ impl PersistentStore {
             repair_attempts_path,
             cluster_replicas_path,
             admin_audit_log_path,
+            media_metadata_dir,
+            media_thumbnails_dir,
             current_state,
         })
     }
@@ -448,6 +513,115 @@ impl PersistentStore {
         let manifest = serde_json::from_slice::<SnapshotManifest>(&payload)
             .with_context(|| format!("invalid snapshot manifest {}", snapshot_path.display()))?;
         Ok(Some(manifest))
+    }
+
+    pub async fn resolve_manifest_hash_for_key(
+        &self,
+        key: &str,
+        snapshot_id: Option<&str>,
+        version_id: Option<&str>,
+        read_mode: ObjectReadMode,
+    ) -> std::result::Result<String, StoreReadError> {
+        let manifest_hash = if let Some(version_id) = version_id {
+            let Some(object_id) = self.object_id_for_key(key) else {
+                return Err(StoreReadError::NotFound);
+            };
+            let index = self
+                .load_version_index_by_object_id(&object_id)
+                .await
+                .map_err(StoreReadError::Internal)?;
+            let Some(index) = index else {
+                return Err(StoreReadError::NotFound);
+            };
+
+            index
+                .versions
+                .get(version_id)
+                .map(|record| record.manifest_hash.clone())
+        } else if let Some(snapshot_id) = snapshot_id {
+            let snapshot = self
+                .read_snapshot(snapshot_id)
+                .await
+                .map_err(StoreReadError::Internal)?;
+
+            match snapshot {
+                Some(snapshot) => snapshot.objects.get(key).cloned(),
+                None => None,
+            }
+        } else {
+            match self.object_id_for_key(key) {
+                Some(object_id) => {
+                    let index = self
+                        .load_version_index_by_object_id(&object_id)
+                        .await
+                        .map_err(StoreReadError::Internal)?;
+                    match index {
+                        Some(index) => manifest_hash_for_read_mode(&index, read_mode),
+                        None => self.current_state.objects.get(key).cloned(),
+                    }
+                }
+                None => self.current_state.objects.get(key).cloned(),
+            }
+        }
+        .ok_or(StoreReadError::NotFound)?;
+
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Err(StoreReadError::NotFound);
+        }
+
+        Ok(manifest_hash)
+    }
+
+    pub async fn lookup_media_cache(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Option<MediaCacheLookup>> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            return Ok(None);
+        };
+        let content_fingerprint = content_fingerprint_from_manifest(&manifest);
+        let metadata = self
+            .load_cached_media_metadata(&content_fingerprint)
+            .await?;
+
+        Ok(Some(MediaCacheLookup {
+            content_fingerprint,
+            metadata,
+        }))
+    }
+
+    pub async fn ensure_media_cache(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Option<CachedMediaMetadata>> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            return Ok(None);
+        };
+        let content_fingerprint = content_fingerprint_from_manifest(&manifest);
+        if let Some(existing) = self
+            .load_cached_media_metadata(&content_fingerprint)
+            .await?
+        {
+            return Ok(Some(existing));
+        }
+
+        let payload = self.read_object_by_manifest_hash(manifest_hash).await?;
+        let metadata = self.build_media_cache_record(
+            manifest_hash,
+            &content_fingerprint,
+            manifest.total_size_bytes,
+            &payload,
+        );
+        self.persist_media_cache_record(&metadata).await?;
+        Ok(Some(metadata))
     }
 
     pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
@@ -652,6 +826,7 @@ impl PersistentStore {
             return Ok(PutResult {
                 snapshot_id,
                 version_id,
+                manifest_hash: manifest_hash.to_string(),
                 state: existing.state.clone(),
                 new_chunks,
                 dedup_reused_chunks,
@@ -677,6 +852,7 @@ impl PersistentStore {
                 return Ok(PutResult {
                     snapshot_id: format!("snap-skipped-{preferred_head_id}"),
                     version_id: preferred_head_id,
+                    manifest_hash: preferred_head.manifest_hash.clone(),
                     state: preferred_head.state.clone(),
                     new_chunks,
                     dedup_reused_chunks,
@@ -723,6 +899,7 @@ impl PersistentStore {
         Ok(PutResult {
             snapshot_id,
             version_id,
+            manifest_hash: manifest_hash.to_string(),
             state: requested_state,
             new_chunks,
             dedup_reused_chunks,
@@ -1150,78 +1327,31 @@ impl PersistentStore {
         Ok(output)
     }
 
-    pub async fn get_object(
-        &self,
-        key: &str,
-        snapshot_id: Option<&str>,
-        version_id: Option<&str>,
-        read_mode: ObjectReadMode,
-    ) -> std::result::Result<Bytes, StoreReadError> {
-        let manifest_hash = if let Some(version_id) = version_id {
-            let Some(object_id) = self.object_id_for_key(key) else {
-                return Err(StoreReadError::NotFound);
-            };
-            let index = self
-                .load_version_index_by_object_id(&object_id)
-                .await
-                .map_err(StoreReadError::Internal)?;
-            let Some(index) = index else {
-                return Err(StoreReadError::NotFound);
-            };
-
-            index
-                .versions
-                .get(version_id)
-                .map(|record| record.manifest_hash.clone())
-        } else if let Some(snapshot_id) = snapshot_id {
-            let snapshot = self
-                .read_snapshot(snapshot_id)
-                .await
-                .map_err(StoreReadError::Internal)?;
-
-            match snapshot {
-                Some(snapshot) => snapshot.objects.get(key).cloned(),
-                None => None,
-            }
-        } else {
-            match self.object_id_for_key(key) {
-                Some(object_id) => {
-                    let index = self
-                        .load_version_index_by_object_id(&object_id)
-                        .await
-                        .map_err(StoreReadError::Internal)?;
-                    match index {
-                        Some(index) => manifest_hash_for_read_mode(&index, read_mode),
-                        None => self.current_state.objects.get(key).cloned(),
-                    }
-                }
-                None => self.current_state.objects.get(key).cloned(),
-            }
-        }
-        .ok_or(StoreReadError::NotFound)?;
-
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Err(StoreReadError::NotFound);
-        }
-
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
         let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
 
-        if !fs::try_exists(&manifest_path)
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn read_object_by_manifest_hash(
+        &self,
+        manifest_hash: &str,
+    ) -> std::result::Result<Bytes, StoreReadError> {
+        let Some(manifest) = self
+            .load_manifest_by_hash(manifest_hash)
             .await
-            .map_err(|err| StoreReadError::Internal(err.into()))?
-        {
+            .map_err(StoreReadError::Internal)?
+        else {
             return Err(StoreReadError::Corrupt(format!(
                 "manifest missing for hash={manifest_hash}"
             )));
-        }
-
-        let manifest_bytes = fs::read(&manifest_path)
-            .await
-            .map_err(|err| StoreReadError::Internal(err.into()))?;
-
-        let manifest = serde_json::from_slice::<ObjectManifest>(&manifest_bytes)
-            .with_context(|| format!("invalid manifest {}", manifest_path.display()))
-            .map_err(StoreReadError::Internal)?;
+        };
 
         let mut assembled = BytesMut::with_capacity(manifest.total_size_bytes);
 
@@ -1271,6 +1401,118 @@ impl PersistentStore {
         }
 
         Ok(assembled.freeze())
+    }
+
+    async fn load_cached_media_metadata(
+        &self,
+        content_fingerprint: &str,
+    ) -> Result<Option<CachedMediaMetadata>> {
+        let metadata_path = self.media_metadata_path(content_fingerprint);
+        if !fs::try_exists(&metadata_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&metadata_path).await?;
+        let metadata = serde_json::from_slice::<CachedMediaMetadata>(&payload)
+            .with_context(|| format!("invalid media metadata {}", metadata_path.display()))?;
+        Ok(Some(metadata))
+    }
+
+    fn build_media_cache_record(
+        &self,
+        manifest_hash: &str,
+        content_fingerprint: &str,
+        source_size_bytes: usize,
+        payload: &[u8],
+    ) -> CachedMediaMetadata {
+        let generated_at_unix = unix_ts();
+        match derive_image_media_cache(
+            manifest_hash,
+            content_fingerprint,
+            source_size_bytes,
+            payload,
+        ) {
+            Ok(derived) => derived,
+            Err(err) => CachedMediaMetadata {
+                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                content_fingerprint: content_fingerprint.to_string(),
+                source_manifest_hash: manifest_hash.to_string(),
+                status: MediaCacheStatus::Failed,
+                media_type: None,
+                mime_type: None,
+                width: None,
+                height: None,
+                orientation: None,
+                taken_at_unix: None,
+                gps: None,
+                thumbnail: None,
+                source_size_bytes,
+                generated_at_unix,
+                error: Some(err.to_string()),
+            },
+        }
+    }
+
+    async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
+        if let Some(thumbnail) = &metadata.thumbnail {
+            let thumbnail_path =
+                self.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
+            let payload = self
+                .render_thumbnail_payload(
+                    &metadata.source_manifest_hash,
+                    GRID_THUMBNAIL_MAX_DIMENSION,
+                )
+                .await?;
+            write_atomic(&thumbnail_path, &payload).await?;
+        }
+
+        let metadata_path = self.media_metadata_path(&metadata.content_fingerprint);
+        let payload = serde_json::to_vec_pretty(metadata)?;
+        write_atomic(&metadata_path, &payload).await
+    }
+
+    async fn render_thumbnail_payload(
+        &self,
+        manifest_hash: &str,
+        max_dimension: u32,
+    ) -> Result<Vec<u8>> {
+        let payload = self
+            .read_object_by_manifest_hash(manifest_hash)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to read object for thumbnail render: {err}"))?;
+        let image = image::load_from_memory(&payload)
+            .context("failed to decode image while rendering thumbnail")?;
+        let thumbnail = image.thumbnail(max_dimension, max_dimension);
+        let mut encoded = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut encoded, 82);
+        encoder
+            .encode_image(&thumbnail)
+            .context("failed to encode thumbnail")?;
+        Ok(encoded)
+    }
+
+    pub fn media_thumbnail_path(&self, content_fingerprint: &str, profile: &str) -> PathBuf {
+        self.media_thumbnails_dir
+            .join(content_fingerprint)
+            .join(format!("{profile}.jpg"))
+    }
+
+    fn media_metadata_path(&self, content_fingerprint: &str) -> PathBuf {
+        self.media_metadata_dir
+            .join(format!("{content_fingerprint}.json"))
+    }
+
+    pub async fn get_object(
+        &self,
+        key: &str,
+        snapshot_id: Option<&str>,
+        version_id: Option<&str>,
+        read_mode: ObjectReadMode,
+    ) -> std::result::Result<Bytes, StoreReadError> {
+        let manifest_hash = self
+            .resolve_manifest_hash_for_key(key, snapshot_id, version_id, read_mode)
+            .await?;
+        self.read_object_by_manifest_hash(&manifest_hash).await
     }
 
     pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
@@ -1516,7 +1758,7 @@ impl PersistentStore {
         let mut skipped_recent_manifests = 0usize;
         let mut deleted_manifests = 0usize;
 
-        for (manifest_hash, _manifest) in &all_manifests {
+        for manifest_hash in all_manifests.keys() {
             if referenced_manifests.contains(manifest_hash) {
                 continue;
             }
@@ -1548,8 +1790,10 @@ impl PersistentStore {
         }
 
         let mut protected_chunks = HashSet::<String>::new();
+        let mut protected_media_fingerprints = HashSet::<String>::new();
         for manifest_hash in &retained_manifests {
             if let Some(manifest) = all_manifests.get(manifest_hash) {
+                protected_media_fingerprints.insert(content_fingerprint_from_manifest(manifest));
                 for chunk in &manifest.chunks {
                     protected_chunks.insert(chunk.hash.clone());
                 }
@@ -1588,6 +1832,36 @@ impl PersistentStore {
 
             fs::remove_file(&chunk_path).await?;
             deleted_chunks += 1;
+        }
+
+        if fs::try_exists(&self.media_metadata_dir).await? {
+            let mut media_entries = fs::read_dir(&self.media_metadata_dir).await?;
+            while let Some(entry) = media_entries.next_entry().await? {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+
+                let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if protected_media_fingerprints.contains(stem) {
+                    continue;
+                }
+
+                if dry_run {
+                    continue;
+                }
+
+                if fs::try_exists(&path).await? {
+                    fs::remove_file(&path).await?;
+                }
+
+                let thumb_dir = self.media_thumbnails_dir.join(stem);
+                if fs::try_exists(&thumb_dir).await? {
+                    let _ = fs::remove_dir_all(&thumb_dir).await;
+                }
+            }
         }
 
         Ok(CleanupReport {
@@ -2202,6 +2476,182 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
         versions: HashMap::new(),
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
+    }
+}
+
+fn content_fingerprint_from_manifest(manifest: &ObjectManifest) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ironmesh-content-fingerprint-v1");
+    hasher.update(&(manifest.total_size_bytes as u64).to_le_bytes());
+    for chunk in &manifest.chunks {
+        hasher.update(chunk.hash.as_bytes());
+        hasher.update(&(chunk.size_bytes as u64).to_le_bytes());
+    }
+    format!("cfp-{}", hasher.finalize().to_hex())
+}
+
+fn derive_image_media_cache(
+    manifest_hash: &str,
+    content_fingerprint: &str,
+    source_size_bytes: usize,
+    payload: &[u8],
+) -> Result<CachedMediaMetadata> {
+    let generated_at_unix = unix_ts();
+    let format = match image::guess_format(payload) {
+        Ok(format) => format,
+        Err(_) => {
+            return Ok(CachedMediaMetadata {
+                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                content_fingerprint: content_fingerprint.to_string(),
+                source_manifest_hash: manifest_hash.to_string(),
+                status: MediaCacheStatus::Unsupported,
+                media_type: None,
+                mime_type: None,
+                width: None,
+                height: None,
+                orientation: None,
+                taken_at_unix: None,
+                gps: None,
+                thumbnail: None,
+                source_size_bytes,
+                generated_at_unix,
+                error: Some("unsupported media format".to_string()),
+            });
+        }
+    };
+
+    let mime_type = match image_format_mime_type(format) {
+        Some(value) => value.to_string(),
+        None => {
+            return Ok(CachedMediaMetadata {
+                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                content_fingerprint: content_fingerprint.to_string(),
+                source_manifest_hash: manifest_hash.to_string(),
+                status: MediaCacheStatus::Unsupported,
+                media_type: None,
+                mime_type: None,
+                width: None,
+                height: None,
+                orientation: None,
+                taken_at_unix: None,
+                gps: None,
+                thumbnail: None,
+                source_size_bytes,
+                generated_at_unix,
+                error: Some("media format is not supported for thumbnail extraction".to_string()),
+            });
+        }
+    };
+
+    let image = image::load_from_memory_with_format(payload, format)
+        .context("failed to decode image payload")?;
+    let (width, height) = image.dimensions();
+    let thumbnail = image.thumbnail(GRID_THUMBNAIL_MAX_DIMENSION, GRID_THUMBNAIL_MAX_DIMENSION);
+    let mut thumbnail_payload = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut thumbnail_payload, 82);
+    encoder
+        .encode_image(&thumbnail)
+        .context("failed to encode thumbnail")?;
+
+    let (orientation, gps) = extract_exif_fields(payload);
+
+    Ok(CachedMediaMetadata {
+        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+        content_fingerprint: content_fingerprint.to_string(),
+        source_manifest_hash: manifest_hash.to_string(),
+        status: MediaCacheStatus::Ready,
+        media_type: Some("image".to_string()),
+        mime_type: Some(mime_type),
+        width: Some(width),
+        height: Some(height),
+        orientation,
+        taken_at_unix: None,
+        gps,
+        thumbnail: Some(CachedThumbnailInfo {
+            profile: GRID_THUMBNAIL_PROFILE.to_string(),
+            format: "jpeg".to_string(),
+            width: thumbnail.width(),
+            height: thumbnail.height(),
+            size_bytes: thumbnail_payload.len() as u64,
+        }),
+        source_size_bytes,
+        generated_at_unix,
+        error: None,
+    })
+}
+
+fn image_format_mime_type(format: ImageFormat) -> Option<&'static str> {
+    match format {
+        ImageFormat::Bmp => Some("image/bmp"),
+        ImageFormat::Gif => Some("image/gif"),
+        ImageFormat::Jpeg => Some("image/jpeg"),
+        ImageFormat::Png => Some("image/png"),
+        ImageFormat::WebP => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn extract_exif_fields(payload: &[u8]) -> (Option<u16>, Option<MediaGpsCoordinates>) {
+    let mut cursor = Cursor::new(payload);
+    let exif = match ExifReader::new().read_from_container(&mut cursor) {
+        Ok(value) => value,
+        Err(_) => return (None, None),
+    };
+
+    let orientation = exif
+        .get_field(Tag::Orientation, In::PRIMARY)
+        .and_then(|field| field.value.get_uint(0))
+        .and_then(|value| u16::try_from(value).ok());
+
+    let latitude = exif
+        .get_field(Tag::GPSLatitude, In::PRIMARY)
+        .and_then(|field| exif_gps_coordinate(&field.value))
+        .map(
+            |value| match exif_ascii_ref(exif.get_field(Tag::GPSLatitudeRef, In::PRIMARY)) {
+                Some('S') | Some('s') => -value,
+                _ => value,
+            },
+        );
+    let longitude = exif
+        .get_field(Tag::GPSLongitude, In::PRIMARY)
+        .and_then(|field| exif_gps_coordinate(&field.value))
+        .map(
+            |value| match exif_ascii_ref(exif.get_field(Tag::GPSLongitudeRef, In::PRIMARY)) {
+                Some('W') | Some('w') => -value,
+                _ => value,
+            },
+        );
+
+    let gps = match (latitude, longitude) {
+        (Some(latitude), Some(longitude)) => Some(MediaGpsCoordinates {
+            latitude,
+            longitude,
+        }),
+        _ => None,
+    };
+
+    (orientation, gps)
+}
+
+fn exif_ascii_ref(field: Option<&exif::Field>) -> Option<char> {
+    match &field?.value {
+        Value::Ascii(values) => {
+            let value = values.first()?;
+            std::str::from_utf8(value).ok()?.chars().next()
+        }
+        _ => None,
+    }
+}
+
+fn exif_gps_coordinate(value: &Value) -> Option<f64> {
+    match value {
+        Value::Rational(values) if values.len() >= 3 => {
+            let degrees = values[0].to_f64();
+            let minutes = values[1].to_f64();
+            let seconds = values[2].to_f64();
+            Some(degrees + (minutes / 60.0) + (seconds / 3600.0))
+        }
+        _ => None,
     }
 }
 

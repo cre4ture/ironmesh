@@ -46,10 +46,12 @@
       <li><code>GET /logs?limit=&lt;n&gt;</code> — latest server log lines</li>
       <li><code>GET /health</code> — node health JSON</li>
       <li><code>GET /snapshots</code> — snapshot metadata</li>
+      <li><code>GET /store/index</code> — directory index with cached media metadata when available</li>
       <li><code>PUT /store/{key}</code> — store object bytes</li>
       <li><code>POST /store-chunks/upload</code> — upload one deduplicated content chunk (hash returned)</li>
       <li><code>POST /store/{key}?complete</code> — finalize object from uploaded chunk refs</li>
       <li><code>GET /store/{key}</code> — fetch object bytes from latest state</li>
+      <li><code>GET /media/thumbnail?key=&lt;path&gt;</code> — cached on-node image thumbnail for gallery views</li>
       <li><code>GET /store/{key}?snapshot=&lt;id&gt;</code> — fetch object from snapshot state</li>
       <li><code>GET /store/{key}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
       <li><code>GET /store/{key}?read_mode=preferred|confirmed_only|provisional_allowed</code> — read latest via explicit consistency mode</li>

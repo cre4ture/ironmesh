@@ -55,14 +55,17 @@ fn issue_node_cert(node_id: &str) -> Result<(String, String)> {
 
     let node_key = rcgen::KeyPair::generate().context("failed generating node key")?;
     let mut params = rcgen::CertificateParams::default();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, format!("ironmesh-node-{node_id}"));
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        format!("ironmesh-node-{node_id}"),
+    );
 
     let uri = format!("urn:ironmesh:node:{node_id}");
-    params.subject_alt_names.push(rcgen::SanType::IpAddress(IpAddr::V4(
-        Ipv4Addr::new(127, 0, 0, 1),
-    )));
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1,
+        ))));
     params.subject_alt_names.push(rcgen::SanType::URI(
         rcgen::string::Ia5String::try_from(uri.as_str()).context("invalid SAN URI")?,
     ));
@@ -93,7 +96,10 @@ fn internal_bind_from_public_bind(public_bind: &str) -> Result<String> {
 }
 
 pub fn internal_base_url_from_public_bind(public_bind: &str) -> Result<String> {
-    Ok(format!("https://{}", internal_bind_from_public_bind(public_bind)?))
+    Ok(format!(
+        "https://{}",
+        internal_bind_from_public_bind(public_bind)?
+    ))
 }
 
 pub fn mtls_client_from_data_dir(data_dir: &Path) -> Result<reqwest::Client> {

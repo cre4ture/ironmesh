@@ -26,6 +26,15 @@ fn mk_record(
     }
 }
 
+fn sample_png_bytes() -> Vec<u8> {
+    let image = image::DynamicImage::new_rgba8(4, 3);
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .unwrap();
+    cursor.into_inner()
+}
+
 #[test]
 fn preferred_head_prioritizes_confirmed_over_newer_provisional() {
     let mut index = empty_version_index("k");
@@ -1000,6 +1009,92 @@ async fn persist_and_load_cluster_replicas_roundtrip() {
     let loaded = store.load_cluster_replicas().await.unwrap();
 
     assert_eq!(loaded.get("subject-a").map(Vec::len), Some(2));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn ensure_media_cache_generates_thumbnail_and_dimensions_for_png() {
+    let root = test_store_dir("media-cache-png");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    let put = store
+        .put_object_versioned(
+            "photos/cat.png",
+            Bytes::from(sample_png_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert_eq!(metadata.media_type.as_deref(), Some("image"));
+    assert_eq!(metadata.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(metadata.width, Some(4));
+    assert_eq!(metadata.height, Some(3));
+    assert!(metadata.thumbnail.is_some());
+
+    let thumb = metadata.thumbnail.as_ref().unwrap();
+    let thumb_path = store.media_thumbnail_path(&metadata.content_fingerprint, &thumb.profile);
+    assert!(fs::try_exists(&thumb_path).await.unwrap());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes() {
+    let root = test_store_dir("media-cache-fingerprint");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+    let payload = sample_png_bytes();
+
+    let first = store
+        .put_object_versioned(
+            "photos/a.png",
+            Bytes::from(payload.clone()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = store
+        .put_object_versioned(
+            "archive/b.png",
+            Bytes::from(payload),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let first_lookup = store
+        .lookup_media_cache(&first.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let second_lookup = store
+        .lookup_media_cache(&second.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        first_lookup.content_fingerprint,
+        second_lookup.content_fingerprint
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }

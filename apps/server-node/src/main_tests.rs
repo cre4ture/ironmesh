@@ -3,8 +3,7 @@ use super::{
     ServerState, StartupRepairStatus, await_repair_busy_threshold, build_store_index_entries,
     cluster, constant_time_eq, jittered_backoff_secs,
     replication::build_internal_replication_put_url, run_startup_replication_repair_once,
-    should_trigger_autonomous_post_write_replication,
-    token_matches,
+    should_trigger_autonomous_post_write_replication, token_matches,
 };
 use common::NodeId;
 use std::path::PathBuf;
@@ -13,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
+use axum::body::to_bytes;
 use axum::http::HeaderMap;
 use std::collections::HashMap;
 use tokio::time::{Duration, Instant};
@@ -36,6 +36,15 @@ fn constant_time_eq_compares_equal_and_non_equal_values() {
     assert!(constant_time_eq(b"secret", b"secret"));
     assert!(!constant_time_eq(b"secret", b"Secret"));
     assert!(!constant_time_eq(b"secret", b"secret-long"));
+}
+
+fn sample_png_bytes() -> Vec<u8> {
+    let image = image::DynamicImage::new_rgba8(4, 3);
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .unwrap();
+    cursor.into_inner()
 }
 
 #[test]
@@ -258,6 +267,58 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key() {
         store.current_keys()
     };
     assert!(!keys.contains(&key));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn list_store_index_includes_cached_media_metadata_for_images() {
+    let state = build_test_state(1, false).await;
+    let put = {
+        let mut locked = state.store.lock().await;
+        locked
+            .put_object_versioned(
+                "gallery/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let locked = state.store.lock().await;
+        locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+    let media = &entries[0]["media"];
+
+    assert_eq!(entries[0]["path"], "gallery/cat.png");
+    assert_eq!(media["status"], "ready");
+    assert_eq!(media["mime_type"], "image/png");
+    assert_eq!(media["width"], 4);
+    assert_eq!(media["height"], 3);
+    assert!(
+        media["thumbnail"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("/media/thumbnail?key=gallery%2Fcat.png")
+    );
 
     cleanup_test_state(&state).await;
 }
