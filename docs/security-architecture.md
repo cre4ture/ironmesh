@@ -37,6 +37,14 @@ Each plane must be independently authenticated, authorized, encrypted, and audit
 - Every server-node gets a unique workload identity (certificate subject/SPIFFE-like ID).
 - Every agent gets a unique device/workload identity.
 
+### 4.1.2 Suggested Rust Library Stack (Pure Rust)
+Cluster-internal mTLS (server-node <-> server-node) can be implemented with the following Rust crates:
+- `rustls` + `tokio-rustls`: TLS 1.3 implementation and async I/O integration (mTLS supported).
+- `axum-server` (`tls-rustls` feature): ergonomic TLS listener for Axum/Hyper stacks.
+- `rustls-pemfile`: parse PEM-encoded cert chains and private keys.
+- `x509-parser`: parse peer certificate DER and extract the logical `node_id` from SAN URI.
+- `rcgen` (tests/dev tooling): generate a local CA and per-node certificates for system tests.
+
 ### 4.1.1 Compromise: Stable Logical `node_id` + mTLS-Proven Identity (Cluster Internal)
 For server-node <-> server-node communication we adopt a compromise that keeps a stable logical `node_id`
 (UUID) for cluster membership and placement, while relying on mTLS for cryptographic authentication.

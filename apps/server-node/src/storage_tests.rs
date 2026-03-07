@@ -308,7 +308,6 @@ async fn cleanup_unreferenced_dry_run_reports_without_deleting() {
     let orphan_manifest = ObjectManifest {
         key: "orphan-key".to_string(),
         total_size_bytes: orphan_chunk_payload.len(),
-        created_at_unix: 0,
         chunks: vec![ChunkRef {
             hash: orphan_chunk_hash.clone(),
             size_bytes: orphan_chunk_payload.len(),
@@ -360,7 +359,6 @@ async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk() {
     let orphan_manifest = ObjectManifest {
         key: "orphan-key-delete".to_string(),
         total_size_bytes: orphan_chunk_payload.len(),
-        created_at_unix: 0,
         chunks: vec![ChunkRef {
             hash: orphan_chunk_hash.clone(),
             size_bytes: orphan_chunk_payload.len(),
@@ -1002,34 +1000,6 @@ async fn persist_and_load_cluster_replicas_roundtrip() {
     let loaded = store.load_cluster_replicas().await.unwrap();
 
     assert_eq!(loaded.get("subject-a").map(Vec::len), Some(2));
-
-    let _ = fs::remove_dir_all(root).await;
-}
-
-#[tokio::test]
-async fn load_internal_node_tokens_returns_empty_when_file_missing() {
-    let root = test_store_dir("internal-node-tokens-empty");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
-
-    let tokens = store.load_internal_node_tokens().await.unwrap();
-    assert!(tokens.is_empty());
-
-    let _ = fs::remove_dir_all(root).await;
-}
-
-#[tokio::test]
-async fn persist_and_load_internal_node_tokens_roundtrip() {
-    let root = test_store_dir("internal-node-tokens-roundtrip");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
-
-    let mut tokens = HashMap::new();
-    let node_id = NodeId::new_v4();
-    tokens.insert(node_id, "token-1".to_string());
-
-    store.persist_internal_node_tokens(&tokens).await.unwrap();
-    let loaded = store.load_internal_node_tokens().await.unwrap();
-
-    assert_eq!(loaded.get(&node_id).map(String::as_str), Some("token-1"));
 
     let _ = fs::remove_dir_all(root).await;
 }

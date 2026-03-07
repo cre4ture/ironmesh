@@ -3,12 +3,150 @@ use anyhow::{Result, bail};
 use client_sdk::IronMeshClient;
 use reqwest::StatusCode;
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
+use uuid::Uuid;
+
+struct TestCa {
+    ca_pem: String,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+static TEST_CA: OnceLock<TestCa> = OnceLock::new();
+
+fn test_ca() -> Result<&'static TestCa> {
+    if let Some(ca) = TEST_CA.get() {
+        return Ok(ca);
+    }
+
+    let ca_key = rcgen::KeyPair::generate().context("failed generating CA key")?;
+    let mut params = rcgen::CertificateParams::default();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ironmesh-test-node-ca");
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+
+    let ca_cert = params
+        .self_signed(&ca_key)
+        .context("failed creating CA certificate")?;
+    let ca_pem = ca_cert.pem();
+
+    let issuer = rcgen::Issuer::new(params, ca_key);
+    let _ = TEST_CA.set(TestCa { ca_pem, issuer });
+
+    Ok(TEST_CA
+        .get()
+        .expect("TEST_CA was just initialized but is missing"))
+}
+
+fn issue_node_cert(node_id: &str) -> Result<(String, String)> {
+    let ca = test_ca()?;
+
+    let node_key = rcgen::KeyPair::generate().context("failed generating node key")?;
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("ironmesh-node-{node_id}"));
+
+    let uri = format!("urn:ironmesh:node:{node_id}");
+    params.subject_alt_names.push(rcgen::SanType::IpAddress(IpAddr::V4(
+        Ipv4Addr::new(127, 0, 0, 1),
+    )));
+    params.subject_alt_names.push(rcgen::SanType::URI(
+        rcgen::string::Ia5String::try_from(uri.as_str()).context("invalid SAN URI")?,
+    ));
+
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+
+    let cert = params
+        .signed_by(&node_key, &ca.issuer)
+        .context("failed signing node certificate")?;
+    let cert_pem = cert.pem();
+    let key_pem = node_key.serialize_pem();
+
+    Ok((cert_pem, key_pem))
+}
+
+fn internal_bind_from_public_bind(public_bind: &str) -> Result<String> {
+    let (host, port_str) = public_bind
+        .rsplit_once(':')
+        .context("invalid bind address (expected host:port)")?;
+    let port: u16 = port_str.parse().context("invalid bind port")?;
+    let internal_port = port
+        .checked_add(10_000)
+        .context("bind port too high to derive internal port")?;
+    Ok(format!("{host}:{internal_port}"))
+}
+
+pub fn internal_base_url_from_public_bind(public_bind: &str) -> Result<String> {
+    Ok(format!("https://{}", internal_bind_from_public_bind(public_bind)?))
+}
+
+pub fn mtls_client_from_data_dir(data_dir: &Path) -> Result<reqwest::Client> {
+    let tls_dir = data_dir.join("tls");
+    let ca_pem = fs::read(tls_dir.join("ca.pem")).context("failed reading ca.pem")?;
+    let cert_pem = fs::read(tls_dir.join("node.pem")).context("failed reading node.pem")?;
+    let key_pem = fs::read(tls_dir.join("node.key")).context("failed reading node.key")?;
+
+    let ca_cert = reqwest::Certificate::from_pem(&ca_pem).context("failed parsing ca.pem")?;
+
+    let mut identity_pem = Vec::new();
+    identity_pem.extend_from_slice(&cert_pem);
+    identity_pem.extend_from_slice(b"\n");
+    identity_pem.extend_from_slice(&key_pem);
+    let identity =
+        reqwest::Identity::from_pem(&identity_pem).context("failed parsing node identity pem")?;
+
+    reqwest::Client::builder()
+        .add_root_certificate(ca_cert)
+        .identity(identity)
+        .build()
+        .context("failed building mtls client")
+}
+
+pub fn https_client_with_root_from_data_dir(data_dir: &Path) -> Result<reqwest::Client> {
+    let tls_dir = data_dir.join("tls");
+    let ca_pem = fs::read(tls_dir.join("ca.pem")).context("failed reading ca.pem")?;
+    let ca_cert = reqwest::Certificate::from_pem(&ca_pem).context("failed parsing ca.pem")?;
+    reqwest::Client::builder()
+        .add_root_certificate(ca_cert)
+        .build()
+        .context("failed building https client")
+}
+
+pub fn mtls_client_for_node_id(node_id: &str) -> Result<reqwest::Client> {
+    let ca = test_ca()?;
+    let ca_cert =
+        reqwest::Certificate::from_pem(ca.ca_pem.as_bytes()).context("failed parsing CA pem")?;
+
+    let (cert_pem, key_pem) = issue_node_cert(node_id)?;
+    let mut identity_pem = Vec::new();
+    identity_pem.extend_from_slice(cert_pem.as_bytes());
+    identity_pem.extend_from_slice(b"\n");
+    identity_pem.extend_from_slice(key_pem.as_bytes());
+    let identity =
+        reqwest::Identity::from_pem(&identity_pem).context("failed parsing node identity pem")?;
+
+    reqwest::Client::builder()
+        .add_root_certificate(ca_cert)
+        .identity(identity)
+        .build()
+        .context("failed building mtls client for node id")
+}
 
 pub struct ChildGuard {
     child: Option<Child>,
@@ -108,16 +246,52 @@ pub async fn start_server_with_env_options(
 ) -> Result<ChildGuard> {
     let server_bin = binary_path("server-node")?;
 
+    let node_id = if node_id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        node_id.to_string()
+    };
+
+    let public_url = format!("http://{bind}");
+    let internal_bind = internal_bind_from_public_bind(bind)?;
+    let internal_url = format!("https://{internal_bind}");
+
+    let tls_dir = data_dir.join("tls");
+    fs::create_dir_all(&tls_dir).context("failed creating tls dir")?;
+
+    let ca_pem = test_ca()?.ca_pem.as_bytes().to_vec();
+    let (node_cert_pem, node_key_pem) = issue_node_cert(&node_id)?;
+
+    let ca_path = tls_dir.join("ca.pem");
+    let cert_path = tls_dir.join("node.pem");
+    let key_path = tls_dir.join("node.key");
+    fs::write(&ca_path, ca_pem).context("failed writing CA pem")?;
+    fs::write(&cert_path, node_cert_pem).context("failed writing node cert pem")?;
+    fs::write(&key_path, node_key_pem).context("failed writing node key pem")?;
+
     let mut command = Command::new(server_bin);
+
+    let stdout_log = data_dir.join("server-node.stdout.log");
+    let stderr_log = data_dir.join("server-node.stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_log).context("failed creating stdout log")?;
+    let stderr_file = std::fs::File::create(&stderr_log).context("failed creating stderr log")?;
+
     let command = command
         .env("IRONMESH_SERVER_BIND", bind)
+        .env("IRONMESH_PUBLIC_URL", public_url)
         .env("IRONMESH_DATA_DIR", data_dir)
+        .env("IRONMESH_NODE_ID", &node_id)
+        .env("IRONMESH_INTERNAL_BIND", internal_bind)
+        .env("IRONMESH_INTERNAL_URL", internal_url)
+        .env("IRONMESH_INTERNAL_TLS_CA_CERT", ca_path)
+        .env("IRONMESH_INTERNAL_TLS_CERT", cert_path)
+        .env("IRONMESH_INTERNAL_TLS_KEY", key_path)
         .env(
             "IRONMESH_REPLICATION_FACTOR",
             replication_factor.to_string(),
         )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
 
     if let Some(mode) = metadata_commit_mode {
         command.env("IRONMESH_METADATA_COMMIT_MODE", mode);
@@ -125,10 +299,6 @@ pub async fn start_server_with_env_options(
 
     if let Some(timeout) = heartbeat_timeout_secs {
         command.env("IRONMESH_HEARTBEAT_TIMEOUT_SECS", timeout.to_string());
-    }
-
-    if !node_id.is_empty() {
-        command.env("IRONMESH_NODE_ID", node_id);
     }
 
     command.env("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "false");
@@ -140,7 +310,31 @@ pub async fn start_server_with_env_options(
 
     let mut child = command.spawn().context("failed to spawn server-node")?;
 
-    wait_for_server(bind, 40).await?;
+    if let Err(err) = wait_for_server(bind, 40).await {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to query server-node process state")?
+        {
+            let stderr_tail = std::fs::read_to_string(&stderr_log)
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "server-node exited early on {bind} with status {status}: {err}\n--- stderr (tail) ---\n{stderr_tail}"
+            );
+        }
+        bail!(
+            "server-node did not become healthy on {bind}: {err} (logs at {} and {})",
+            stdout_log.display(),
+            stderr_log.display()
+        );
+    }
     if let Some(status) = child
         .try_wait()
         .context("failed to query server-node process state")?
@@ -158,8 +352,18 @@ pub async fn register_node(
     dc: &str,
     rack: &str,
 ) -> Result<()> {
+    let internal_url = {
+        let trimmed = public_url.trim_end_matches('/');
+        let host_port = trimmed
+            .strip_prefix("http://")
+            .or_else(|| trimmed.strip_prefix("https://"))
+            .context("public_url must include http(s):// scheme")?;
+        format!("https://{}", internal_bind_from_public_bind(host_port)?)
+    };
+
     let body = serde_json::json!({
         "public_url": public_url,
+        "internal_url": internal_url,
         "labels": {
             "region": "local",
             "dc": dc,

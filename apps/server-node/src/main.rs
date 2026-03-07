@@ -1,8 +1,12 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::net::SocketAddr;
+use std::path::{PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,16 +14,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, Request, State};
+use axum::extract::FromRequestParts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use axum_server::accept::Accept;
+use axum_server::tls_rustls::RustlsConfig;
 use bytes::Bytes;
 use common::{HealthStatus, NodeId};
+use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
+use tower::Service;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
 use tracing::{info, warn};
@@ -27,6 +38,8 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
+use x509_parser::extensions::ParsedExtension;
+use x509_parser::prelude::FromDer;
 
 mod cluster;
 mod replication;
@@ -46,7 +59,7 @@ struct ServerState {
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     metadata_commit_mode: MetadataCommitMode,
-    internal_node_tokens: Arc<Mutex<HashMap<NodeId, String>>>,
+    internal_http: reqwest::Client,
     autonomous_replication_on_put_enabled: bool,
     inflight_requests: Arc<AtomicUsize>,
     replication_audit_interval_secs: u64,
@@ -56,6 +69,161 @@ struct ServerState {
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
     admin_control: AdminControl,
+}
+
+#[derive(Debug, Clone)]
+struct InternalCaller {
+    node_id: NodeId,
+}
+
+impl<S> FromRequestParts<S> for InternalCaller
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
+        std::future::ready(
+            parts
+                .extensions
+                .get::<InternalCaller>()
+                .cloned()
+                .ok_or((StatusCode::UNAUTHORIZED, "missing internal caller identity")),
+        )
+    }
+}
+
+async fn require_internal_caller(
+    State(_state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> std::result::Result<Response, StatusCode> {
+    if request.extensions().get::<InternalCaller>().is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
+}
+
+#[derive(Clone)]
+struct WithInternalCaller<S> {
+    inner: S,
+    caller: InternalCaller,
+}
+
+impl<S> WithInternalCaller<S> {
+    fn new(inner: S, caller: InternalCaller) -> Self {
+        Self { inner, caller }
+    }
+}
+
+impl<S, B> Service<axum::http::Request<B>> for WithInternalCaller<S>
+where
+    S: Service<axum::http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
+        req.extensions_mut().insert(self.caller.clone());
+        self.inner.call(req)
+    }
+}
+
+#[derive(Clone)]
+struct MtlsCallerAcceptor {
+    inner: axum_server::tls_rustls::RustlsAcceptor,
+}
+
+impl MtlsCallerAcceptor {
+    fn new(config: RustlsConfig) -> Self {
+        Self {
+            inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
+        }
+    }
+}
+
+impl<S> Accept<tokio::net::TcpStream, S> for MtlsCallerAcceptor
+where
+    axum_server::tls_rustls::RustlsAcceptor: Accept<
+        tokio::net::TcpStream,
+        S,
+        Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    >,
+    <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Service:
+        Send + 'static,
+    <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Future:
+        Send + 'static,
+    S: Send + 'static,
+{
+    type Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Service = WithInternalCaller<
+        <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Service,
+    >;
+    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let fut = self.inner.accept(stream, service);
+        Box::pin(async move {
+            let (tls_stream, service) = fut.await?;
+            let caller = internal_caller_from_tls_stream(&tls_stream)
+                .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
+            Ok((tls_stream, WithInternalCaller::new(service, caller)))
+        })
+    }
+}
+
+fn internal_caller_from_tls_stream<T>(
+    tls_stream: &tokio_rustls::server::TlsStream<T>,
+) -> Result<InternalCaller> {
+    let (_, conn) = tls_stream.get_ref();
+    let certs = conn
+        .peer_certificates()
+        .context("missing peer certificate")?;
+
+    let node_id = extract_node_id_from_peer_certs(certs)?;
+    Ok(InternalCaller { node_id })
+}
+
+fn extract_node_id_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result<NodeId> {
+    let cert = certs
+        .first()
+        .context("missing end-entity peer certificate")?;
+
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
+        .context("failed parsing peer certificate")?;
+
+    for extension in parsed.extensions() {
+        let parsed_extension = extension.parsed_extension();
+        if let ParsedExtension::SubjectAlternativeName(san) = parsed_extension {
+            for name in &san.general_names {
+                if let x509_parser::extensions::GeneralName::URI(uri) = name {
+                    if let Some(node_id) = parse_node_id_from_san_uri(uri) {
+                        return Ok(node_id);
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("missing urn:ironmesh:node:<uuid> SAN URI in peer certificate");
+}
+
+fn parse_node_id_from_san_uri(uri: &str) -> Option<NodeId> {
+    let prefix = "urn:ironmesh:node:";
+    uri.strip_prefix(prefix)
+        .and_then(|rest| rest.trim().parse::<NodeId>().ok())
 }
 
 struct LogBuffer {
@@ -327,6 +495,11 @@ async fn main() -> Result<()> {
         .with(LogCaptureLayer::new(log_buffer.clone()))
         .init();
 
+    // Rustls 0.23 requires explicitly selecting a process-wide CryptoProvider when multiple
+    // providers are enabled via transitive features (e.g. reqwest brings `ring`, axum-server may
+    // bring `aws-lc-rs`). Installing once avoids startup panics.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let node_id = std::env::var("IRONMESH_NODE_ID")
         .ok()
         .and_then(|value| value.parse::<NodeId>().ok())
@@ -338,6 +511,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
         .parse()
         .context("invalid IRONMESH_SERVER_BIND")?;
+
+    let internal_bind_addr: SocketAddr = std::env::var("IRONMESH_INTERNAL_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:18080".to_string())
+        .parse()
+        .context("invalid IRONMESH_INTERNAL_BIND")?;
 
     let mut initial_labels = HashMap::new();
     initial_labels.insert(
@@ -355,6 +533,9 @@ async fn main() -> Result<()> {
 
     let public_url =
         std::env::var("IRONMESH_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind_addr}"));
+
+    let internal_url = std::env::var("IRONMESH_INTERNAL_URL")
+        .unwrap_or_else(|_| format!("https://{internal_bind_addr}"));
 
     let heartbeat_timeout_secs = std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
         .ok()
@@ -386,11 +567,16 @@ async fn main() -> Result<()> {
             .as_str(),
     )?;
 
-    let env_node_tokens = std::env::var("IRONMESH_INTERNAL_NODE_TOKENS")
-        .ok()
-        .map(|raw| parse_internal_node_tokens(raw.as_str()))
-        .transpose()?
-        .unwrap_or_default();
+    let internal_tls_ca_path = PathBuf::from(
+        std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
+            .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
+    );
+    let internal_tls_cert_path = PathBuf::from(
+        std::env::var("IRONMESH_INTERNAL_TLS_CERT").context("missing IRONMESH_INTERNAL_TLS_CERT")?,
+    );
+    let internal_tls_key_path = PathBuf::from(
+        std::env::var("IRONMESH_INTERNAL_TLS_KEY").context("missing IRONMESH_INTERNAL_TLS_KEY")?,
+    );
 
     let repair_config = RepairConfig::from_env();
     let autonomous_replication_on_put_enabled =
@@ -416,6 +602,7 @@ async fn main() -> Result<()> {
     cluster.register_node(NodeDescriptor {
         node_id,
         public_url,
+        internal_url,
         labels: initial_labels,
         capacity_bytes: 0,
         free_bytes: 0,
@@ -424,24 +611,13 @@ async fn main() -> Result<()> {
     });
 
     let store = Arc::new(Mutex::new(PersistentStore::init(data_dir).await?));
-    let persisted_internal_node_tokens = {
-        let store_guard = store.lock().await;
-        store_guard
-            .load_internal_node_tokens()
-            .await
-            .context("failed to load internal node token state")?
-    };
-    let internal_node_tokens = if persisted_internal_node_tokens.is_empty() {
-        env_node_tokens
-    } else {
-        persisted_internal_node_tokens
-    };
 
-    if !internal_node_tokens.is_empty() && !internal_node_tokens.contains_key(&node_id) {
-        return Err(anyhow::anyhow!(
-            "internal node tokens are configured but have no token for local node {node_id}"
-        ));
-    }
+    let internal_http = build_internal_mtls_http_client(
+        &internal_tls_ca_path,
+        &internal_tls_cert_path,
+        &internal_tls_key_path,
+    )?;
+
     let persisted_cluster_replicas = {
         let store_guard = store.lock().await;
         match store_guard.load_cluster_replicas().await {
@@ -459,7 +635,7 @@ async fn main() -> Result<()> {
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         metadata_commit_mode,
-        internal_node_tokens: Arc::new(Mutex::new(internal_node_tokens)),
+        internal_http,
         autonomous_replication_on_put_enabled,
         inflight_requests: Arc::new(AtomicUsize::new(0)),
         replication_audit_interval_secs: audit_interval_secs,
@@ -470,13 +646,6 @@ async fn main() -> Result<()> {
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         admin_control,
     };
-
-    if let Err(err) = persist_internal_node_tokens_state(&state).await {
-        warn!(
-            error = %err,
-            "failed to persist internal node tokens during startup"
-        );
-    }
 
     let persisted_attempts = {
         let store = state.store.lock().await;
@@ -517,7 +686,13 @@ async fn main() -> Result<()> {
         spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
     }
 
-    let app = Router::new()
+    let internal_tls = build_internal_mtls_rustls_config(
+        &internal_tls_ca_path,
+        &internal_tls_cert_path,
+        &internal_tls_key_path,
+    )?;
+
+    let public_app = Router::new()
         .route("/", get(ui::index))
         .route("/ui/app.css", get(ui::app_css))
         .route("/ui/app.js", get(ui::app_js))
@@ -548,25 +723,8 @@ async fn main() -> Result<()> {
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
         )
-        .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route("/cluster/placement/{key}", get(placement_for_key))
-        .route(
-            "/cluster/internal-auth/tokens",
-            get(list_internal_node_tokens),
-        )
-        .route(
-            "/cluster/internal-auth/tokens/rotate",
-            post(rotate_internal_node_token),
-        )
-        .route(
-            "/cluster/internal-auth/tokens/{node_id}",
-            delete(revoke_internal_node_token),
-        )
         .route("/cluster/replication/plan", get(replication_plan))
-        .route(
-            "/cluster/replication/subjects/local",
-            get(local_replication_subjects),
-        )
         .route(
             "/cluster/replication/audit",
             post(trigger_replication_audit),
@@ -578,19 +736,6 @@ async fn main() -> Result<()> {
         .route(
             "/cluster/replication/cleanup",
             post(execute_replication_cleanup),
-        )
-        .route(
-            "/cluster/replication/push/chunk/{hash}",
-            post(push_replication_chunk),
-        )
-        .route(
-            "/cluster/replication/push/manifest",
-            post(push_replication_manifest),
-        )
-        .route("/cluster/replication/drop", post(drop_replication_subject))
-        .route(
-            "/cluster/reconcile/export/provisional",
-            get(export_provisional_versions),
         )
         .route("/cluster/reconcile/{node_id}", post(reconcile_from_node))
         .route("/maintenance/cleanup", post(run_cleanup))
@@ -616,10 +761,73 @@ async fn main() -> Result<()> {
             track_inflight_requests,
         ));
 
+    let internal_app = Router::new()
+        .route("/health", get(health))
+        .route("/snapshots", get(list_snapshots))
+        .route("/store/index", get(list_store_index))
+        .route("/store/delete", post(delete_object_by_query))
+        .route("/store/rename", post(rename_object_path))
+        .route("/store/copy", post(copy_object_path))
+        .route("/store-chunks/upload", post(upload_store_chunk))
+        .route(
+            "/store/{key}",
+            put(put_object)
+                .get(get_object)
+                .delete(delete_object)
+                .post(complete_chunked_upload),
+        )
+        .route("/versions/{key}", get(list_versions))
+        .route(
+            "/versions/{key}/confirm/{version_id}",
+            post(confirm_version),
+        )
+        .route("/versions/{key}/commit/{version_id}", post(commit_version))
+        .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
+        .route(
+            "/cluster/replication/subjects/local",
+            get(local_replication_subjects),
+        )
+        .route(
+            "/cluster/replication/push/chunk/{hash}",
+            post(push_replication_chunk),
+        )
+        .route(
+            "/cluster/replication/push/manifest",
+            post(push_replication_manifest),
+        )
+        .route("/cluster/replication/drop", post(drop_replication_subject))
+        .route(
+            "/cluster/reconcile/export/provisional",
+            get(export_provisional_versions),
+        )
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_internal_caller,
+        ));
+
+    let internal_state = state.clone();
+    tokio::spawn(async move {
+        info!(
+            bind_addr = %internal_bind_addr,
+            node_id = %internal_state.node_id,
+            "server node internal (mTLS) listener"
+        );
+
+        let acceptor = MtlsCallerAcceptor::new(internal_tls);
+        if let Err(err) = axum_server::Server::bind(internal_bind_addr)
+            .acceptor(acceptor)
+            .serve(internal_app.into_make_service())
+            .await
+        {
+            warn!(error = %err, "internal server listener stopped");
+        }
+    });
+
     info!(%bind_addr, %node_id, "server node listening");
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, public_app).await?;
 
     Ok(())
 }
@@ -678,7 +886,7 @@ struct LocalReplicationSubjectsResponse {
 
 fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
     tokio::spawn(async move {
-        let http = reqwest::Client::new();
+        let http = state.internal_http.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
 
         loop {
@@ -709,19 +917,11 @@ fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
                     .collect::<Vec<_>>()
             };
 
-            let internal_token = internal_outbound_token(&state).await;
-
             for peer in peers {
-                let base = peer.public_url.trim_end_matches('/');
+                let base = peer.internal_url.trim_end_matches('/');
                 let url = format!("{base}/cluster/replication/subjects/local");
 
-                let mut request = http.get(url);
-                if let Some(token) = &internal_token {
-                    request = request.header("x-ironmesh-internal-token", token);
-                    request = request.header("x-ironmesh-node-id", state.node_id.to_string());
-                }
-
-                match request.send().await {
+                match http.get(url).send().await {
                     Ok(response) if response.status().is_success() => {
                         match response.json::<LocalReplicationSubjectsResponse>().await {
                             Ok(payload) => {
@@ -869,7 +1069,7 @@ async fn run_startup_replication_repair_once(
 
 fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
     tokio::spawn(async move {
-        let http = reqwest::Client::new();
+        let http = state.internal_http.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
 
         loop {
@@ -903,7 +1103,7 @@ fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
             };
 
             for peer in peers {
-                let base = peer.public_url.trim_end_matches('/');
+                let base = peer.internal_url.trim_end_matches('/');
                 let url = format!("{base}/cluster/nodes/{}/heartbeat", state.node_id);
 
                 match http.post(url).json(&payload).send().await {
@@ -1618,6 +1818,7 @@ async fn commit_version_inner(state: ServerState, key: String, version_id: Strin
 #[derive(Debug, Deserialize)]
 struct RegisterNodeRequest {
     public_url: String,
+    internal_url: String,
     labels: HashMap<String, String>,
     capacity_bytes: Option<u64>,
     free_bytes: Option<u64>,
@@ -1653,24 +1854,6 @@ struct TombstoneRestoreQuery {
     approve: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct InternalNodeTokenRotateRequest {
-    node_id: NodeId,
-    token: String,
-}
-
-#[derive(Debug, Serialize)]
-struct InternalNodeTokenListResponse {
-    count: usize,
-    node_ids: Vec<NodeId>,
-}
-
-#[derive(Debug, Serialize)]
-struct InternalNodeTokenMutationResponse {
-    node_id: NodeId,
-    changed: bool,
-}
-
 async fn cluster_status(State(state): State<ServerState>) -> Json<cluster::ClusterSummary> {
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
@@ -1697,6 +1880,7 @@ async fn register_node(
     cluster.register_node(NodeDescriptor {
         node_id,
         public_url: request.public_url,
+        internal_url: request.internal_url,
         labels: request.labels,
         capacity_bytes: request.capacity_bytes.unwrap_or(0),
         free_bytes: request.free_bytes.unwrap_or(0),
@@ -1729,11 +1913,6 @@ async fn remove_node(
         return StatusCode::NOT_FOUND;
     }
 
-    {
-        let mut tokens = state.internal_node_tokens.lock().await;
-        tokens.remove(&node_id);
-    }
-
     if let Err(err) = persist_cluster_replicas_state(&state).await {
         warn!(
             error = %err,
@@ -1743,20 +1922,12 @@ async fn remove_node(
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
 
-    if let Err(err) = persist_internal_node_tokens_state(&state).await {
-        warn!(
-            error = %err,
-            node_id = %node_id,
-            "failed to persist internal tokens after node removal"
-        );
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
     StatusCode::NO_CONTENT
 }
 
 async fn node_heartbeat(
     State(state): State<ServerState>,
+    caller: InternalCaller,
     Path(node_id): Path<String>,
     Json(request): Json<NodeHeartbeatRequest>,
 ) -> impl IntoResponse {
@@ -1764,6 +1935,10 @@ async fn node_heartbeat(
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
+
+    if caller.node_id != node_id {
+        return StatusCode::FORBIDDEN;
+    }
 
     let mut cluster = state.cluster.lock().await;
     if cluster.touch_heartbeat(
@@ -1787,124 +1962,6 @@ async fn placement_for_key(
     Json(cluster.placement_for_key(&key))
 }
 
-async fn list_internal_node_tokens(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers).await {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    let mut node_ids = {
-        let tokens = state.internal_node_tokens.lock().await;
-        tokens.keys().cloned().collect::<Vec<_>>()
-    };
-    node_ids.sort_by_key(|node_id| node_id.to_string());
-
-    (
-        StatusCode::OK,
-        Json(InternalNodeTokenListResponse {
-            count: node_ids.len(),
-            node_ids,
-        }),
-    )
-        .into_response()
-}
-
-async fn rotate_internal_node_token(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(request): Json<InternalNodeTokenRotateRequest>,
-) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers).await {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    let token = request.token.trim();
-    if token.is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    let previous = {
-        let mut tokens = state.internal_node_tokens.lock().await;
-        tokens.insert(request.node_id, token.to_string())
-    };
-
-    if let Err(err) = persist_internal_node_tokens_state(&state).await {
-        warn!(
-            error = %err,
-            node_id = %request.node_id,
-            "failed to persist internal token rotation"
-        );
-
-        let mut tokens = state.internal_node_tokens.lock().await;
-        if let Some(previous) = previous {
-            tokens.insert(request.node_id, previous);
-        } else {
-            tokens.remove(&request.node_id);
-        }
-
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    (
-        StatusCode::OK,
-        Json(InternalNodeTokenMutationResponse {
-            node_id: request.node_id,
-            changed: true,
-        }),
-    )
-        .into_response()
-}
-
-async fn revoke_internal_node_token(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(node_id): Path<String>,
-) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers).await {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    let node_id = match node_id.parse::<NodeId>() {
-        Ok(node_id) => node_id,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
-
-    if node_id == state.node_id {
-        return StatusCode::CONFLICT.into_response();
-    }
-
-    let removed = {
-        let mut tokens = state.internal_node_tokens.lock().await;
-        tokens.remove(&node_id)
-    };
-
-    let Some(removed) = removed else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    if let Err(err) = persist_internal_node_tokens_state(&state).await {
-        warn!(
-            error = %err,
-            node_id = %node_id,
-            "failed to persist internal token revocation"
-        );
-
-        let mut tokens = state.internal_node_tokens.lock().await;
-        tokens.insert(node_id, removed);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    (
-        StatusCode::OK,
-        Json(InternalNodeTokenMutationResponse {
-            node_id,
-            changed: true,
-        }),
-    )
-        .into_response()
-}
 
 async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationPlan> {
     let keys = {
@@ -1945,12 +2002,7 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
 
 async fn local_replication_subjects(
     State(state): State<ServerState>,
-    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers).await {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
     let subjects = {
         let store = state.store.lock().await;
         store
@@ -2005,13 +2057,8 @@ struct ReplicationCleanupReport {
 
 async fn drop_replication_subject(
     State(state): State<ServerState>,
-    headers: HeaderMap,
     Query(query): Query<ReplicationDropQuery>,
 ) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers).await {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
     let dropped = {
         let mut store = state.store.lock().await;
         match store
@@ -2053,7 +2100,7 @@ struct CleanupCandidate {
     key: String,
     version_id: String,
     node_id: NodeId,
-    node_public_url: String,
+    node_internal_url: String,
     size_bytes: u64,
     node_free_bytes: u64,
 }
@@ -2128,7 +2175,7 @@ async fn execute_replication_cleanup(
                 key: key.clone(),
                 version_id: version_id.clone(),
                 node_id: *extra_node,
-                node_public_url: node.public_url.clone(),
+                node_internal_url: node.internal_url.clone(),
                 size_bytes,
                 node_free_bytes: node.free_bytes,
             });
@@ -2169,24 +2216,19 @@ async fn execute_replication_cleanup(
         successful_deletions = selected.len();
         reclaimed_bytes = selected_bytes;
     } else {
-        let http = reqwest::Client::new();
+        let http = state.internal_http.clone();
         for candidate in selected {
             attempted_deletions += 1;
 
-            let mut request = http
+            let request = http
                 .post(format!(
                     "{}/cluster/replication/drop",
-                    candidate.node_public_url
+                    candidate.node_internal_url
                 ))
                 .query(&ReplicationDropQuery {
                     key: candidate.key.clone(),
                     version_id: Some(candidate.version_id.clone()),
                 });
-
-            if let Some(token) = internal_outbound_token(&state).await {
-                request = request.header("x-ironmesh-internal-token", token);
-                request = request.header("x-ironmesh-node-id", state.node_id.to_string());
-            }
 
             let response = request.send().await;
 
@@ -2255,14 +2297,9 @@ struct ReplicationManifestPushReport {
 
 async fn push_replication_chunk(
     State(state): State<ServerState>,
-    headers: HeaderMap,
     Path(hash): Path<String>,
     payload: Bytes,
 ) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers).await {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
     let store = state.store.lock().await;
     match store.ingest_chunk(&hash, &payload).await {
         Ok(stored) => (StatusCode::OK, Json(ReplicationChunkPushReport { stored })).into_response(),
@@ -2275,14 +2312,9 @@ async fn push_replication_chunk(
 
 async fn push_replication_manifest(
     State(state): State<ServerState>,
-    headers: HeaderMap,
     Query(query): Query<ReplicationManifestPushQuery>,
     payload: Bytes,
 ) -> impl IntoResponse {
-    if !is_internal_request_authorized(&state, &headers).await {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
     let import_result = {
         let mut store = state.store.lock().await;
         store
@@ -2360,14 +2392,82 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
     store.persist_cluster_replicas(&replicas).await
 }
 
-async fn persist_internal_node_tokens_state(state: &ServerState) -> Result<()> {
-    let tokens = {
-        let tokens = state.internal_node_tokens.lock().await;
-        tokens.clone()
-    };
+fn build_internal_mtls_http_client(
+    ca_path: &PathBuf,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+) -> Result<reqwest::Client> {
+    let ca_pem = std::fs::read(ca_path)
+        .with_context(|| format!("failed reading {}", ca_path.display()))?;
+    let ca_cert =
+        reqwest::Certificate::from_pem(&ca_pem).context("failed parsing internal CA PEM")?;
 
-    let store = state.store.lock().await;
-    store.persist_internal_node_tokens(&tokens).await
+    let mut identity_pem = Vec::new();
+    identity_pem.extend_from_slice(
+        &std::fs::read(cert_path)
+            .with_context(|| format!("failed reading {}", cert_path.display()))?,
+    );
+    identity_pem.extend_from_slice(b"\n");
+    identity_pem.extend_from_slice(
+        &std::fs::read(key_path)
+            .with_context(|| format!("failed reading {}", key_path.display()))?,
+    );
+
+    let identity = reqwest::Identity::from_pem(&identity_pem)
+        .context("failed parsing internal node identity PEM")?;
+
+    reqwest::Client::builder()
+        .add_root_certificate(ca_cert)
+        .identity(identity)
+        .build()
+        .context("failed building internal mTLS http client")
+}
+
+fn build_internal_mtls_rustls_config(
+    ca_path: &PathBuf,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+) -> Result<RustlsConfig> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let mut ca_reader = BufReader::new(
+        File::open(ca_path).with_context(|| format!("failed reading {}", ca_path.display()))?,
+    );
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_reader) {
+        let cert = cert.context("failed parsing internal CA certificate")?;
+        roots
+            .add(cert)
+            .context("failed adding internal CA certificate to trust store")?;
+    }
+
+    let mut cert_reader = BufReader::new(
+        File::open(cert_path).with_context(|| format!("failed reading {}", cert_path.display()))?,
+    );
+    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed parsing internal node certificate chain")?;
+
+    let mut key_reader = BufReader::new(
+        File::open(key_path).with_context(|| format!("failed reading {}", key_path.display()))?,
+    );
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+        .context("failed parsing internal node private key")?
+        .context("missing internal node private key")?;
+
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("failed creating internal client certificate verifier")?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .context("failed creating internal rustls server config")?;
+
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(RustlsConfig::from_config(Arc::new(config)))
 }
 
 fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u32) -> u64 {
@@ -2382,69 +2482,6 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
     let jitter = hasher.finish() % (jitter_max + 1);
 
     base_backoff_secs.saturating_add(jitter)
-}
-
-async fn is_internal_request_authorized(state: &ServerState, headers: &HeaderMap) -> bool {
-    let (auth_enabled, expected_for_caller) = {
-        let tokens = state.internal_node_tokens.lock().await;
-        let auth_enabled = !tokens.is_empty();
-
-        let node_id_header = headers
-            .get("x-ironmesh-node-id")
-            .and_then(|value| value.to_str().ok());
-        let caller_node_id = node_id_header.and_then(|value| value.parse::<NodeId>().ok());
-        let expected_for_caller = caller_node_id.and_then(|node_id| {
-            expected_internal_token_for_node(&tokens, node_id).map(str::to_string)
-        });
-
-        (auth_enabled, expected_for_caller)
-    };
-
-    if !auth_enabled {
-        return true;
-    }
-
-    let provided_token = headers
-        .get("x-ironmesh-internal-token")
-        .and_then(|value| value.to_str().ok());
-
-    let node_id_header = headers
-        .get("x-ironmesh-node-id")
-        .and_then(|value| value.to_str().ok());
-
-    if !internal_node_header_valid(node_id_header) {
-        return false;
-    }
-
-    let Some(node_id_header) = node_id_header else {
-        return false;
-    };
-
-    let Ok(caller_node_id) = node_id_header.parse::<NodeId>() else {
-        return false;
-    };
-
-    let cluster = state.cluster.lock().await;
-    let caller_is_registered = cluster
-        .list_nodes()
-        .iter()
-        .any(|node| node.node_id == caller_node_id);
-    drop(cluster);
-
-    if !caller_is_registered {
-        return false;
-    }
-
-    let Some(expected) = expected_for_caller else {
-        return false;
-    };
-
-    internal_token_matches(expected.as_str(), provided_token)
-}
-
-async fn internal_outbound_token(state: &ServerState) -> Option<String> {
-    let tokens = state.internal_node_tokens.lock().await;
-    expected_internal_token_for_node(&tokens, state.node_id).map(ToString::to_string)
 }
 
 const ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
@@ -2516,7 +2553,7 @@ async fn authorize_admin_request(
         let provided = headers
             .get(ADMIN_TOKEN_HEADER)
             .and_then(|value| value.to_str().ok());
-        if !internal_token_matches(expected, provided) {
+        if !token_matches(expected, provided) {
             append_admin_audit(
                 state,
                 action,
@@ -2550,59 +2587,10 @@ async fn authorize_admin_request(
     Ok(request)
 }
 
-fn expected_internal_token_for_node(
-    node_tokens: &HashMap<NodeId, String>,
-    node_id: NodeId,
-) -> Option<&str> {
-    node_tokens.get(&node_id).map(|value| value.as_str())
-}
-
-fn parse_internal_node_tokens(raw: &str) -> Result<HashMap<NodeId, String>> {
-    let mut parsed = HashMap::new();
-
-    for pair in raw.split(',') {
-        let entry = pair.trim();
-        if entry.is_empty() {
-            continue;
-        }
-
-        let Some((node_id_raw, token_raw)) = entry.split_once('=') else {
-            return Err(anyhow::anyhow!(
-                "invalid IRONMESH_INTERNAL_NODE_TOKENS entry '{entry}', expected '<node_id>=<token>'"
-            ));
-        };
-
-        let node_id = node_id_raw.trim().parse::<NodeId>().with_context(|| {
-            format!("invalid node id in IRONMESH_INTERNAL_NODE_TOKENS: {node_id_raw}")
-        })?;
-        let token = token_raw.trim();
-
-        if token.is_empty() {
-            return Err(anyhow::anyhow!(
-                "empty token for node {node_id} in IRONMESH_INTERNAL_NODE_TOKENS"
-            ));
-        }
-
-        if parsed.insert(node_id, token.to_string()).is_some() {
-            return Err(anyhow::anyhow!(
-                "duplicate node id {node_id} in IRONMESH_INTERNAL_NODE_TOKENS"
-            ));
-        }
-    }
-
-    Ok(parsed)
-}
-
-fn internal_token_matches(expected: &str, provided: Option<&str>) -> bool {
+fn token_matches(expected: &str, provided: Option<&str>) -> bool {
     provided
         .map(|token| constant_time_eq(expected.as_bytes(), token.as_bytes()))
         .unwrap_or(false)
-}
-
-fn internal_node_header_valid(provided: Option<&str>) -> bool {
-    provided
-        .and_then(|value| value.parse::<NodeId>().ok())
-        .is_some()
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -3060,10 +3048,10 @@ async fn reconcile_from_node(
             return StatusCode::NOT_FOUND.into_response();
         };
 
-        node.public_url
+        node.internal_url
     };
 
-    let http = reqwest::Client::new();
+    let http = state.internal_http.clone();
 
     let export_url = format!("{remote_url}/cluster/reconcile/export/provisional");
     let remote_entries: Vec<ReconcileVersionEntry> = match http.get(export_url).send().await {

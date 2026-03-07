@@ -10,9 +10,11 @@ anyhow = "1"
 bytes = "1"
 client-sdk = { path = "../../crates/client-sdk" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rcgen = "0.14"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 server_node = { path = "../../apps/server-node", package = "server-node", artifact = "bin" }

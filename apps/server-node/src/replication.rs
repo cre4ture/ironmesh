@@ -64,7 +64,7 @@ pub(crate) async fn execute_replication_repair_inner(
     let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
     let now = unix_ts();
 
-    let http = reqwest::Client::new();
+    let http = state.internal_http.clone();
 
     for item in plan.items {
         if attempted_transfers >= max_transfers {
@@ -130,11 +130,9 @@ pub(crate) async fn execute_replication_repair_inner(
             attempted_transfers += 1;
             let transfer_result = replicate_bundle_to_target(
                 &http,
-                &node.public_url,
+                &node.internal_url,
                 &bundle,
                 &state.store,
-                internal_outbound_token(state).await,
-                state.node_id,
             )
             .await;
 
@@ -207,8 +205,6 @@ async fn replicate_bundle_to_target(
     target_base_url: &str,
     bundle: &ReplicationExportBundle,
     store: &Arc<Mutex<PersistentStore>>,
-    internal_token: Option<String>,
-    source_node_id: NodeId,
 ) -> Result<String> {
     if bundle.version_id.is_some() {
         for chunk in &bundle.manifest.chunks {
@@ -224,12 +220,11 @@ async fn replicate_bundle_to_target(
                 "{target_base_url}/cluster/replication/push/chunk/{}",
                 chunk.hash
             );
-            let mut request = http.post(chunk_url).body(payload);
-            if let Some(token) = &internal_token {
-                request = request.header("x-ironmesh-internal-token", token);
-                request = request.header("x-ironmesh-node-id", source_node_id.to_string());
-            }
-            request.send().await?.error_for_status()?;
+            http.post(chunk_url)
+                .body(payload)
+                .send()
+                .await?
+                .error_for_status()?;
         }
     } else {
         let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
@@ -265,7 +260,7 @@ async fn replicate_bundle_to_target(
     }
 
     let manifest_url = format!("{target_base_url}/cluster/replication/push/manifest");
-    let mut request = http
+    let request = http
         .post(manifest_url)
         .query(&ReplicationManifestPushQuery {
             key: bundle.key.clone(),
@@ -274,11 +269,6 @@ async fn replicate_bundle_to_target(
             manifest_hash: bundle.manifest_hash.clone(),
         })
         .body(bundle.manifest_bytes.clone());
-
-    if let Some(token) = internal_token {
-        request = request.header("x-ironmesh-internal-token", token);
-        request = request.header("x-ironmesh-node-id", source_node_id.to_string());
-    }
 
     let response = request.send().await?.error_for_status()?;
 

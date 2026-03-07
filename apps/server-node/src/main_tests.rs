@@ -1,10 +1,10 @@
 use super::{
     AdminControl, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState,
     ServerState, StartupRepairStatus, await_repair_busy_threshold, build_store_index_entries,
-    cluster, constant_time_eq, expected_internal_token_for_node, internal_node_header_valid,
-    internal_token_matches, jittered_backoff_secs, parse_internal_node_tokens,
+    cluster, constant_time_eq, jittered_backoff_secs,
     replication::build_internal_replication_put_url, run_startup_replication_repair_once,
     should_trigger_autonomous_post_write_replication,
+    token_matches,
 };
 use common::NodeId;
 use std::path::PathBuf;
@@ -39,10 +39,10 @@ fn constant_time_eq_compares_equal_and_non_equal_values() {
 }
 
 #[test]
-fn internal_token_auth_requires_exact_match_when_configured() {
-    assert!(!internal_token_matches("secret", None));
-    assert!(!internal_token_matches("secret", Some("wrong")));
-    assert!(internal_token_matches("secret", Some("secret")));
+fn token_matches_requires_exact_match() {
+    assert!(!token_matches("secret", None));
+    assert!(!token_matches("secret", Some("wrong")));
+    assert!(token_matches("secret", Some("secret")));
 }
 
 #[tokio::test]
@@ -87,49 +87,6 @@ async fn admin_authorization_requires_explicit_approval_for_destructive_action()
     );
 
     cleanup_test_state(&state).await;
-}
-
-#[test]
-fn internal_node_header_rules_match_token_mode() {
-    assert!(!internal_node_header_valid(None));
-    assert!(!internal_node_header_valid(Some("not-a-uuid")));
-    assert!(internal_node_header_valid(Some(
-        "00000000-0000-0000-0000-000000000001"
-    )));
-}
-
-#[test]
-fn parse_internal_node_tokens_parses_multiple_entries() {
-    let parsed = parse_internal_node_tokens(
-        "00000000-0000-0000-0000-000000000001=tok-a,00000000-0000-0000-0000-000000000002=tok-b",
-    )
-    .unwrap();
-
-    assert_eq!(parsed.len(), 2);
-}
-
-#[test]
-fn parse_internal_node_tokens_rejects_duplicate_node_ids() {
-    let duplicate =
-        "00000000-0000-0000-0000-000000000001=tok-a,00000000-0000-0000-0000-000000000001=tok-b";
-    assert!(parse_internal_node_tokens(duplicate).is_err());
-}
-
-#[test]
-fn expected_internal_token_returns_none_when_node_missing() {
-    let node_tokens = HashMap::new();
-    let expected = expected_internal_token_for_node(&node_tokens, NodeId::new_v4());
-    assert_eq!(expected, None);
-}
-
-#[test]
-fn expected_internal_token_returns_node_token() {
-    let node = NodeId::new_v4();
-    let mut node_tokens = HashMap::new();
-    node_tokens.insert(node, "node-token".to_string());
-
-    let expected = expected_internal_token_for_node(&node_tokens, node);
-    assert_eq!(expected, Some("node-token"));
 }
 
 #[test]
@@ -325,6 +282,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
     service.register_node(cluster::NodeDescriptor {
         node_id: local_node_id,
         public_url: "http://127.0.0.1:39080".to_string(),
+        internal_url: "https://127.0.0.1:49080".to_string(),
         labels: HashMap::new(),
         capacity_bytes: 1_000_000,
         free_bytes: 900_000,
@@ -336,6 +294,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
         service.register_node(cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
             public_url: "http://127.0.0.1:9".to_string(),
+            internal_url: "https://127.0.0.1:10009".to_string(),
             labels: HashMap::new(),
             capacity_bytes: 1_000_000,
             free_bytes: 800_000,
@@ -349,7 +308,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
         metadata_commit_mode: MetadataCommitMode::Local,
-        internal_node_tokens: Arc::new(Mutex::new(HashMap::new())),
+        internal_http: reqwest::Client::new(),
         autonomous_replication_on_put_enabled: false,
         inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         replication_audit_interval_secs: 3600,

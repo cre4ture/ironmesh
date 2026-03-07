@@ -15,6 +15,7 @@ pub enum NodeStatus {
 pub struct NodeDescriptor {
     pub node_id: NodeId,
     pub public_url: String,
+    pub internal_url: String,
     pub labels: HashMap<String, String>,
     pub capacity_bytes: u64,
     pub free_bytes: u64,
@@ -504,6 +505,7 @@ mod tests {
         NodeDescriptor {
             node_id: id,
             public_url: format!("http://{id}"),
+            internal_url: format!("https://{id}"),
             labels,
             capacity_bytes: 1_000,
             free_bytes,
