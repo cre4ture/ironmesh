@@ -1,5 +1,4 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
-use crate::cfapi::path_is_placeholder;
 use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
 use crate::monitor::SyncRootMonitor;
 use anyhow::{Result, anyhow};
@@ -262,14 +261,6 @@ struct CallbackContext {
     uploader: std::sync::Arc<dyn Uploader>,
     hydrated_once_paths: Mutex<HashSet<String>>,
     paths_by_file_id: Mutex<std::collections::HashMap<i64, String>>,
-    /// Map of request key -> recorded open info (flags + initial metadata)
-    opens: Mutex<std::collections::HashMap<u64, OpenInfo>>,
-}
-
-struct OpenInfo {
-    flags: u32,
-    size: u64,
-    mtime_secs: u64,
 }
 
 pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
@@ -513,7 +504,6 @@ pub fn connect_sync_root(
         uploader: uploader.clone(),
         hydrated_once_paths: Mutex::new(HashSet::new()),
         paths_by_file_id: Mutex::new(std::collections::HashMap::new()),
-        opens: Mutex::new(std::collections::HashMap::new()),
     });
 
     let callback_table = vec![
@@ -659,44 +649,13 @@ unsafe extern "system" fn callback_file_open(
     }
     let context = unsafe { &*context_ptr };
 
-    // Record the OpenCompletion flags keyed by RequestKey so close-completion
-    // can consult them if needed. Note: CF provides OpenCompletion flags, not
-    // the full desired-access mask, so this is best-effort tracking.
-    let request_key = callback_info_ref.RequestKey as u64;
-    let open_flags = unsafe { (*callback_parameters).Anonymous.OpenCompletion.Flags } as u32;
-
-    // Capture initial metadata (size + mtime) if available so we can detect writes.
+    // Map FileId -> relative path for follow-up callbacks that may not include NormalizedPath.
     let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
     let relative = path_to_relative(&context.sync_root, &normalized_path);
     if !relative.is_empty()
         && let Ok(mut paths_by_file_id) = context.paths_by_file_id.lock()
     {
         paths_by_file_id.insert(callback_info_ref.FileId, relative.clone());
-    }
-    let full_path = context.sync_root.join(&relative);
-    let (size, mtime_secs) = match std::fs::metadata(&full_path) {
-        Ok(m) => {
-            let size = m.len();
-            let mtime_secs = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            (size, mtime_secs)
-        }
-        Err(_) => (0u64, 0u64),
-    };
-
-    if let Ok(mut opens) = context.opens.lock() {
-        opens.insert(
-            request_key,
-            OpenInfo {
-                flags: open_flags,
-                size,
-                mtime_secs,
-            },
-        );
     }
 }
 
@@ -746,29 +705,10 @@ unsafe extern "system" fn callback_file_close_completion(
 
     let full_path = context.sync_root.join(&relative_path);
 
-    // If we recorded an open for this request, consult it. If the open did not
-    // request write access, skip upload. If it did request write access, compare
-    // initial metadata to current metadata and skip upload when unchanged.
-    let request_key = callback_info_ref.RequestKey as u64;
-    if let Ok(mut opens) = context.opens.lock()
-        && let Some(open_info) = opens.remove(&request_key)
-        && let Ok(metadata) = std::fs::metadata(&full_path)
-    {
-        let size = metadata.len();
-        let mtime_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if size == open_info.size && mtime_secs == open_info.mtime_secs {
-            eprintln!(
-                "close-completion: unchanged file close (flags=0x{:08x}); skipping upload for {}",
-                open_info.flags, relative_path
-            );
-            return;
-        }
-    }
+    // Do not skip uploads based on open/close metadata heuristics.
+    // In practice, OpenCompletion callbacks can be delayed such that the "open" metadata
+    // already reflects the post-write state, causing false "unchanged" classifications.
+    // Always decide based on the file state at close time.
 
     // Remove hydrated_once_paths logic: always handle upload for any file closed in sync root
     // This allows new files and folders to be uploaded, matching OneDrive behavior
@@ -789,13 +729,8 @@ unsafe extern "system" fn callback_file_close_completion(
             return;
         }
     };
-    if path_is_placeholder(&full_path) {
-        eprintln!(
-            "close-completion: {} is still a placeholder; skipping upload",
-            relative_path
-        );
-        return;
-    }
+    // A hydrated (and even modified) file can still be a CFAPI placeholder.
+    // Do not skip uploads solely because placeholder info is present.
     if metadata.is_dir() {
         eprintln!(
             "close-completion: {} is a directory, uploading directory metadata",
