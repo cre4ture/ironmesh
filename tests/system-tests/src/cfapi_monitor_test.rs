@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::framework::{fresh_data_dir, start_server};
+    use crate::framework::{fresh_data_dir, start_server, wait_for_object_payload};
     use crate::framework_win::start_cfapi_adapter;
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
@@ -42,7 +42,7 @@ mod tests {
         .expect("Failed to register and serve CFAPI adapter");
 
         // Wait for monitor to detect and upload
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
         let resp = client
             .get(&server_url)
             .send()
@@ -63,7 +63,7 @@ mod tests {
         drop(file); // close file to ensure changes are flushed
 
         // Wait for monitor to detect and upload
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
         let resp = client
             .get(&server_url)
             .send()

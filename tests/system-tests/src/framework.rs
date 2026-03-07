@@ -8,7 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -630,10 +630,7 @@ pub fn workspace_root() -> Result<PathBuf> {
 }
 
 pub fn fresh_data_dir(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let unique = Uuid::new_v4();
     let path = std::env::temp_dir().join(format!("ironmesh-{name}-{unique}"));
     let _ = fs::remove_dir_all(&path);
     let _ = fs::create_dir_all(&path);
