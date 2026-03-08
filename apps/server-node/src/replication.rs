@@ -1,6 +1,6 @@
 use super::*;
 use bytes::BytesMut;
-use storage::ReplicationExportBundle;
+use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ReplicationRepairReport {
@@ -16,6 +16,14 @@ pub(crate) struct ReplicationRepairReport {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReplicationRepairQuery {
     batch_size: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalReplicationDeleteQuery<'a> {
+    key: &'a str,
+    state: &'a str,
+    version_id: Option<&'a str>,
+    internal_replication: bool,
 }
 
 pub(crate) async fn execute_replication_repair(
@@ -201,6 +209,30 @@ async fn replicate_bundle_to_target(
     bundle: &ReplicationExportBundle,
     store: &Arc<Mutex<PersistentStore>>,
 ) -> Result<String> {
+    if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+        let state_query = match bundle.state {
+            VersionConsistencyState::Confirmed => "confirmed",
+            VersionConsistencyState::Provisional => "provisional",
+        };
+
+        let delete_url = format!("{target_base_url}/store/delete");
+        http.post(delete_url)
+            .query(&InternalReplicationDeleteQuery {
+                key: &bundle.key,
+                state: state_query,
+                version_id: bundle.version_id.as_deref(),
+                internal_replication: true,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+
+        return bundle
+            .version_id
+            .clone()
+            .context("tombstone replication bundle missing version id");
+    }
+
     if bundle.version_id.is_some() {
         for chunk in &bundle.manifest.chunks {
             let payload = {

@@ -770,6 +770,73 @@ async fn tombstone_creates_tombstone_version_and_removes_current_key() {
 }
 
 #[tokio::test]
+async fn tombstone_replication_subjects_keep_deleted_head_version() {
+    let root = test_store_dir("tombstone-replication-subjects");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    store
+        .put_object_versioned(
+            "will-delete",
+            Bytes::from_static(b"to-be-deleted"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let tombstone_version_id = store
+        .tombstone_object("will-delete", PutOptions::default())
+        .await
+        .unwrap();
+
+    let subjects = store.list_replication_subjects().await.unwrap();
+    assert!(!subjects.contains(&"will-delete".to_string()));
+    assert!(subjects.contains(&format!("will-delete@{tombstone_version_id}")));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn export_replication_bundle_supports_tombstone_versions() {
+    let root = test_store_dir("tombstone-export-bundle");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    store
+        .put_object_versioned(
+            "will-delete",
+            Bytes::from_static(b"to-be-deleted"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let tombstone_version_id = store
+        .tombstone_object("will-delete", PutOptions::default())
+        .await
+        .unwrap();
+
+    let bundle = store
+        .export_replication_bundle(
+            "will-delete",
+            Some(&tombstone_version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected tombstone replication bundle");
+
+    assert_eq!(bundle.key, "will-delete");
+    assert_eq!(
+        bundle.version_id.as_deref(),
+        Some(tombstone_version_id.as_str())
+    );
+    assert_eq!(bundle.manifest_hash, TOMBSTONE_MANIFEST_HASH);
+    assert!(bundle.manifest.chunks.is_empty());
+    assert_eq!(bundle.manifest.total_size_bytes, 0);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn rename_preserves_object_id_and_history() {
     let root = test_store_dir("rename-preserves-object-id");
     let mut store = PersistentStore::init(root.clone()).await.unwrap();

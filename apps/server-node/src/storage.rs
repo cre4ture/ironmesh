@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
-const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
+pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
 const MEDIA_CACHE_SCHEMA_VERSION: u32 = 1;
 const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
@@ -626,10 +626,43 @@ impl PersistentStore {
 
     pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
         let mut subjects: HashSet<String> = self.current_state.objects.keys().cloned().collect();
+        let mut indexed_object_ids = HashSet::new();
         for (path, object_id) in &self.current_state.object_ids {
             if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
+                indexed_object_ids.insert(object_id.clone());
                 for head_version_id in &index.head_version_ids {
                     subjects.insert(format!("{path}@{head_version_id}"));
+                }
+            }
+        }
+
+        let mut entries = fs::read_dir(&self.versions_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = fs::read(&path).await?;
+            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
+                .with_context(|| format!("invalid version index {}", path.display()))?;
+
+            if indexed_object_ids.contains(&index.object_id) {
+                continue;
+            }
+
+            let Some(key) = self.resolve_key_for_version_index(&index).await? else {
+                continue;
+            };
+
+            for head_version_id in &index.head_version_ids {
+                if index
+                    .versions
+                    .get(head_version_id)
+                    .map(|record| record.manifest_hash == TOMBSTONE_MANIFEST_HASH)
+                    .unwrap_or(false)
+                {
+                    subjects.insert(format!("{key}@{head_version_id}"));
                 }
             }
         }
@@ -999,7 +1032,11 @@ impl PersistentStore {
         version_id: Option<&str>,
         read_mode: ObjectReadMode,
     ) -> Result<Option<ReplicationExportBundle>> {
-        let object_id = self.object_id_for_key(key);
+        let object_id = if version_id.is_some() {
+            self.resolve_object_id_for_key_history(key).await?
+        } else {
+            self.object_id_for_key(key)
+        };
         let (selected_version_id, state, manifest_hash) = if let Some(version_id) = version_id {
             let Some(object_id) = object_id.as_ref() else {
                 return Ok(None);
@@ -1048,6 +1085,21 @@ impl PersistentStore {
                 }
             }
         };
+
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(Some(ReplicationExportBundle {
+                key: key.to_string(),
+                version_id: selected_version_id,
+                state,
+                manifest_hash,
+                manifest_bytes: Vec::new(),
+                manifest: ReplicationManifestPayload {
+                    key: key.to_string(),
+                    total_size_bytes: 0,
+                    chunks: Vec::new(),
+                },
+            }));
+        }
 
         let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
         if !fs::try_exists(&manifest_path).await? {
@@ -2282,6 +2334,47 @@ impl PersistentStore {
     async fn persist_current_state(&self) -> Result<()> {
         let payload = serde_json::to_vec_pretty(&self.current_state)?;
         write_atomic(&self.current_state_path, &payload).await
+    }
+
+    async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {
+        if let Some(object_id) = self.object_id_for_key(key) {
+            return Ok(Some(object_id));
+        }
+
+        let mut entries = fs::read_dir(&self.versions_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = fs::read(&path).await?;
+            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
+                .with_context(|| format!("invalid version index {}", path.display()))?;
+
+            if self.resolve_key_for_version_index(&index).await?.as_deref() == Some(key) {
+                return Ok(Some(index.object_id));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_key_for_version_index(
+        &self,
+        index: &FileVersionIndex,
+    ) -> Result<Option<String>> {
+        for record in index.versions.values() {
+            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            if let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await? {
+                return Ok(Some(manifest.key));
+            }
+        }
+
+        Ok(None)
     }
 
     async fn create_snapshot(&self) -> Result<String> {

@@ -1050,6 +1050,12 @@ pub mod runtime {
                 return;
             }
 
+            let child_path = self.resolve_full_path(child_inode);
+            if self.uploader.delete_path(&child_path).is_err() {
+                reply.error(EIO);
+                return;
+            }
+
             if let Some(parent_node) = self.nodes.get_mut(&parent) {
                 parent_node.children.remove(name);
             }
@@ -1095,6 +1101,15 @@ pub mod runtime {
             }
             if !child_node.children.is_empty() {
                 reply.error(ENOTEMPTY);
+                return;
+            }
+
+            let directory_marker_path = format!(
+                "{}/",
+                self.resolve_full_path(child_inode).trim_end_matches('/')
+            );
+            if self.uploader.delete_path(&directory_marker_path).is_err() {
+                reply.error(EIO);
                 return;
             }
 

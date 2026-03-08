@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        ChildGuard, binary_path, fresh_data_dir, start_server, stop_server,
-        wait_for_store_index_entry,
+        ChildGuard, binary_path, fresh_data_dir, register_node, start_server,
+        start_server_with_env, stop_server, wait_for_online_nodes, wait_for_store_index_entry,
     };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
@@ -204,6 +204,26 @@ mod tests {
         bail!("store index still reports remote directory subtree for {expected_prefix}");
     }
 
+    async fn wait_for_remote_file_absence(
+        sdk: &IronMeshClient,
+        key: &str,
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            let get_missing = sdk.get(key).await.is_err();
+            if let Ok(index) = sdk.store_index(None, 64, None).await {
+                let index_missing = !index.entries.iter().any(|entry| entry.path == key);
+                if get_missing && index_missing {
+                    return Ok(());
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("remote file {key} was expected to be deleted");
+    }
+
     async fn run_server_mode_upload_case(
         bind: &str,
         seed_key: &str,
@@ -356,6 +376,7 @@ mod tests {
                     fs::remove_file(&mounted_path).with_context(|| {
                         format!("failed to remove mounted file {}", mounted_path.display())
                     })?;
+                    wait_for_remote_file_absence(&sdk, key, 180).await?;
                 }
 
                 for step_index in (0..nested_steps.len()).rev() {
@@ -369,6 +390,7 @@ mod tests {
                         "expected mounted directory to be deleted: {}",
                         dir_path.display()
                     );
+                    wait_for_remote_directory_absence(&sdk, dir, 180).await?;
                 }
 
                 Ok::<(), anyhow::Error>(())
@@ -381,6 +403,97 @@ mod tests {
 
         stop_server(&mut server).await;
         let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
+    async fn run_cluster_delete_propagation_case(bind_a: &str, bind_b: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let mountpoint = fresh_data_dir("linux-fuse-cluster-delete");
+        let data_a = fresh_data_dir("linux-fuse-cluster-delete-node-a");
+        let data_b = fresh_data_dir("linux-fuse-cluster-delete-node-b");
+        let node_id_a = "00000000-0000-0000-0000-00000000f101";
+        let node_id_b = "00000000-0000-0000-0000-00000000f102";
+
+        let extra_env = [
+            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
+            ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
+            ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
+        ];
+
+        let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 2, &extra_env).await?;
+        let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 2, &extra_env).await?;
+        let sdk_a = IronMeshClient::new(&base_a);
+        let sdk_b = IronMeshClient::new(&base_b);
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&http, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+            wait_for_online_nodes(&http, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&http, &base_b, 2, 120).await?;
+
+            sdk_a
+                .put_large_aware(
+                    "seed-cluster-delete.txt",
+                    Bytes::from_static(b"seed-cluster-delete"),
+                )
+                .await?;
+
+            let mut adapter = start_linux_fuse_adapter(&base_a, &mountpoint).await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-cluster-delete.txt");
+                wait_for_file(&seed_path, 150).await?;
+
+                let dir_name = "cluster-delete";
+                let file_key = "cluster-delete/target.txt";
+                let file_payload = b"cluster-delete-payload".to_vec();
+                let dir_path = mountpoint.join(dir_name);
+                let file_path = mountpoint.join(file_key);
+
+                fs::create_dir(&dir_path).with_context(|| {
+                    format!("failed to create mounted directory {}", dir_path.display())
+                })?;
+                wait_for_remote_directory_existence(&sdk_a, dir_name, 180).await?;
+                wait_for_remote_directory_existence(&sdk_b, dir_name, 220).await?;
+
+                fs::write(&file_path, &file_payload).with_context(|| {
+                    format!("failed to write mounted file {}", file_path.display())
+                })?;
+                wait_for_object_bytes(&sdk_a, file_key, &file_payload, 180).await?;
+                wait_for_object_bytes(&sdk_b, file_key, &file_payload, 220).await?;
+
+                fs::remove_file(&file_path).with_context(|| {
+                    format!("failed to remove mounted file {}", file_path.display())
+                })?;
+                wait_for_remote_file_absence(&sdk_a, file_key, 220).await?;
+                wait_for_remote_file_absence(&sdk_b, file_key, 260).await?;
+
+                fs::remove_dir(&dir_path).with_context(|| {
+                    format!("failed to remove mounted directory {}", dir_path.display())
+                })?;
+                wait_for_remote_directory_absence(&sdk_a, dir_name, 220).await?;
+                wait_for_remote_directory_absence(&sdk_b, dir_name, 260).await?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
         result
     }
 
@@ -843,5 +956,10 @@ mod tests {
     #[tokio::test]
     async fn linux_fuse_remote_file_and_folder_renames_moves_refresh_in_place() -> Result<()> {
         run_remote_rename_move_refresh_case("127.0.0.1:19367").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_local_deletes_propagate_across_cluster() -> Result<()> {
+        run_cluster_delete_propagation_case("127.0.0.1:19368", "127.0.0.1:19369").await
     }
 }
