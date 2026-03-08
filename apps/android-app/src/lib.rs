@@ -78,6 +78,9 @@ fn start_embedded_web_ui(base_url: String) -> Result<String> {
 }
 
 fn throw_java_error(env: &mut JNIEnv, message: impl AsRef<str>) {
+    if env.exception_check().unwrap_or(false) {
+        return;
+    }
     let _ = env.throw_new("java/lang/RuntimeException", message.as_ref());
 }
 
