@@ -1,6 +1,5 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
-use crate::monitor::SyncRootMonitor;
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::os::windows::ffi::OsStrExt;
@@ -39,6 +38,10 @@ pub trait Uploader: Send + Sync + 'static {
         reader: &mut dyn std::io::Read,
         length: u64,
     ) -> Result<Option<String>>;
+
+    fn delete_path(&self, _path: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -77,6 +80,11 @@ impl Uploader for DemoUploader {
 
         eprintln!("demo upload: path={} bytes={}", path, read_bytes);
         Ok(Some("demo-upload".to_string()))
+    }
+
+    fn delete_path(&self, path: &str) -> Result<()> {
+        eprintln!("demo delete: path={path}");
+        Ok(())
     }
 }
 
@@ -478,24 +486,6 @@ pub fn connect_sync_root(
     hydrator: Box<dyn Hydrator>,
     uploader: std::sync::Arc<dyn Uploader>,
 ) -> Result<SyncRootConnection> {
-    let sync_root = registration.root_path.clone();
-    eprintln!(
-        "startup-scan: scanning {} for pre-existing files",
-        sync_root.display()
-    );
-    let mut startup_monitor =
-        SyncRootMonitor::new("startup-scan", sync_root.clone(), uploader.clone());
-    startup_monitor.walk();
-
-    // Spawn a background thread to monitor the sync root for new files/folders
-    // use std::sync::Arc; // Removed unused import
-    let sync_root_clone = sync_root.clone();
-    let uploader_thread = uploader.clone();
-
-    std::thread::spawn(move || {
-        SyncRootMonitor::new("monitor", sync_root_clone, uploader_thread).run();
-    });
-
     let root_path = utf16_path(&registration.root_path);
     let mut callback_context = Box::new(CallbackContext {
         sync_root: registration.root_path.clone(),

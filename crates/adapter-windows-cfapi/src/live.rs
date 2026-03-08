@@ -40,6 +40,13 @@ impl Uploader for ServerNodeHydrator {
 
         Ok(Some(format!("server-head:size={length}")))
     }
+
+    fn delete_path(&self, path: &str) -> Result<()> {
+        self.sdk
+            .delete_path_blocking(path)
+            .with_context(|| format!("failed to delete remote object for path {path}"))?;
+        Ok(())
+    }
 }
 
 pub fn normalize_base_url(input: &str) -> Result<Url> {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,11 +6,16 @@ use crate::cfapi::{path_is_placeholder, try_convert_materialized_file};
 use crate::helpers::path_to_relative;
 use crate::runtime::Uploader;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SeenEntry {
+    is_dir: bool,
+}
+
 pub struct SyncRootMonitor {
     name: String,
     sync_root: PathBuf,
     uploader: Arc<dyn Uploader>,
-    seen: HashSet<String>,
+    seen: HashMap<String, SeenEntry>,
 }
 
 impl SyncRootMonitor {
@@ -19,7 +24,7 @@ impl SyncRootMonitor {
             name: name.to_string(),
             sync_root,
             uploader,
-            seen: HashSet::new(),
+            seen: HashMap::new(),
         }
     }
 
@@ -32,28 +37,47 @@ impl SyncRootMonitor {
     }
 
     pub fn walk(&mut self) {
+        let mut current = HashMap::new();
         let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
         for entry in walker.flatten() {
             let path = entry.path();
             let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
-            self.handle_entry(path, rel_path);
+            self.handle_entry(path, rel_path, &mut current);
         }
+
+        self.handle_deleted_entries(&current);
+        self.seen = current;
     }
 
-    fn handle_entry(&mut self, path: &std::path::Path, rel_path: String) {
-        if rel_path.is_empty() || self.seen.contains(&rel_path) {
+    fn handle_entry(
+        &mut self,
+        path: &std::path::Path,
+        rel_path: String,
+        current: &mut HashMap<String, SeenEntry>,
+    ) {
+        if rel_path.is_empty() {
             return;
         }
         let metadata = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(_) => return,
         };
+        let entry = SeenEntry {
+            is_dir: metadata.is_dir(),
+        };
+        current.insert(rel_path.clone(), entry);
+
+        if self.seen.get(&rel_path) == Some(&entry) {
+            return;
+        }
+
         if metadata.is_dir() {
             eprintln!("{}: detected new directory {}", self.name, rel_path);
             let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
+            let remote_path = directory_marker_path(&rel_path);
             let _ = self
                 .uploader
-                .upload_reader(&rel_path, &mut cursor, b"<DIR>".len() as u64);
+                .upload_reader(&remote_path, &mut cursor, b"<DIR>".len() as u64);
         } else {
             // Check if file is already a CFAPI placeholder using Windows file attributes
             let is_placeholder = path_is_placeholder(path);
@@ -88,6 +112,58 @@ impl SyncRootMonitor {
                 }
             }
         }
-        self.seen.insert(rel_path);
+    }
+
+    fn handle_deleted_entries(&self, current: &HashMap<String, SeenEntry>) {
+        let mut deleted_paths = self
+            .seen
+            .iter()
+            .filter_map(|(path, entry)| {
+                if current.contains_key(path) {
+                    None
+                } else {
+                    Some((path.as_str(), *entry))
+                }
+            })
+            .collect::<Vec<_>>();
+        deleted_paths.sort_by(|(left_path, _), (right_path, _)| right_path.cmp(left_path));
+
+        for (path, entry) in deleted_paths {
+            if entry.is_dir {
+                let canonical_path = directory_marker_path(path);
+                eprintln!("{}: detected deleted directory {}", self.name, path);
+                if let Err(err) = self.uploader.delete_path(&canonical_path) {
+                    eprintln!(
+                        "{}: failed to delete remote directory marker {}: {}",
+                        self.name, canonical_path, err
+                    );
+                }
+
+                // Clean up legacy plain-key folder entries created by earlier buggy builds.
+                if let Err(err) = self.uploader.delete_path(path) {
+                    eprintln!(
+                        "{}: failed to delete legacy remote directory key {}: {}",
+                        self.name, path, err
+                    );
+                }
+            } else {
+                eprintln!("{}: detected deleted file {}", self.name, path);
+                if let Err(err) = self.uploader.delete_path(path) {
+                    eprintln!(
+                        "{}: failed to delete remote file {}: {}",
+                        self.name, path, err
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn directory_marker_path(path: &str) -> String {
+    let trimmed = path.trim_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{}{}", trimmed.replace('\\', "/"), "/")
     }
 }

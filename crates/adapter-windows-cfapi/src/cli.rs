@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::adapter::WindowsCfapiAdapter;
 use crate::live::{ServerNodeHydrator, normalize_base_url};
+use crate::monitor::SyncRootMonitor;
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root, register_sync_root,
 };
@@ -88,7 +89,7 @@ pub fn cli_main() -> anyhow::Result<()> {
             let hydrator = Box::new(ServerNodeHydrator::new(base_url.clone()));
             let uploader = Arc::new(ServerNodeHydrator::new(base_url));
             let _connection =
-                connect_sync_root(&registration, runtime.clone(), hydrator, uploader)?;
+                connect_sync_root(&registration, runtime.clone(), hydrator, uploader.clone())?;
 
             apply_action_plan(&registration.root_path, &action_plan)?;
             let _ = runtime.sync_from_action_plan(&action_plan);
@@ -96,6 +97,20 @@ pub fn cli_main() -> anyhow::Result<()> {
                 "materialized {} planned entries under sync root",
                 action_plan.actions.len()
             );
+
+            eprintln!(
+                "startup-scan: scanning {} for pre-existing files",
+                registration.root_path.display()
+            );
+            let mut monitor = SyncRootMonitor::new(
+                "monitor",
+                registration.root_path.clone(),
+                uploader.clone(),
+            );
+            monitor.walk();
+            std::thread::spawn(move || {
+                monitor.run();
+            });
 
             eprintln!("connected to CFAPI callbacks; serving hydration requests");
             let running = std::sync::Arc::new(AtomicBool::new(true));
