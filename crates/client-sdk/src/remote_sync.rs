@@ -221,11 +221,10 @@ pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) ->
     changed_paths
 }
 
-type RemoteSnapshotIndex = BTreeMap<String, (EntryKind, Option<String>, Option<String>, Option<u64>)>;
+type RemoteSnapshotIndex =
+    BTreeMap<String, (EntryKind, Option<String>, Option<String>, Option<u64>)>;
 
-fn remote_snapshot_index(
-    snapshot: &SyncSnapshot,
-) -> RemoteSnapshotIndex {
+fn remote_snapshot_index(snapshot: &SyncSnapshot) -> RemoteSnapshotIndex {
     let mut index = BTreeMap::new();
     for entry in &snapshot.remote {
         index.insert(
