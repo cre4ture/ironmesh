@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.util.Log
 import android.util.Size
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -621,16 +622,14 @@ private fun loadDocumentThumbnail(
     sizePx: Int,
 ): Bitmap? {
     return runCatching {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            contentResolver.loadThumbnail(documentUri, Size(sizePx, sizePx), null)
-        } else {
-            DocumentsContract.getDocumentThumbnail(
-                contentResolver,
-                documentUri,
-                Point(sizePx, sizePx),
-                null,
-            )
-        }
+        DocumentsContract.getDocumentThumbnail(
+            contentResolver,
+            documentUri,
+            Point(sizePx, sizePx),
+            null,
+        )
+    }.onFailure { error ->
+        Log.w("MainActivity", "Thumbnail load failed for $documentUri: ${error.message}")
     }.getOrNull()
 }
 

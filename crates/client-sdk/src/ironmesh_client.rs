@@ -48,6 +48,10 @@ pub struct StoreIndexEntry {
     pub content_hash: Option<String>,
     #[serde(default)]
     pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub content_fingerprint: Option<String>,
+    #[serde(default)]
+    pub media: Option<StoreIndexMedia>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +64,46 @@ pub struct StoreIndexResponse {
     pub entry_count: usize,
     #[serde(default)]
     pub entries: Vec<StoreIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreIndexMedia {
+    pub status: String,
+    pub content_fingerprint: String,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub orientation: Option<u16>,
+    #[serde(default)]
+    pub taken_at_unix: Option<u64>,
+    #[serde(default)]
+    pub gps: Option<StoreIndexGps>,
+    #[serde(default)]
+    pub thumbnail: Option<StoreIndexThumbnail>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreIndexGps {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreIndexThumbnail {
+    pub url: String,
+    pub profile: String,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -767,6 +811,8 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
                 version: None,
                 content_hash: None,
                 size_bytes: None,
+                content_fingerprint: None,
+                media: None,
             });
         }
     }
@@ -832,6 +878,8 @@ mod tests {
                 version: None,
                 content_hash: None,
                 size_bytes: None,
+                content_fingerprint: None,
+                media: None,
             },
             StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
@@ -839,6 +887,8 @@ mod tests {
                 version: None,
                 content_hash: None,
                 size_bytes: Some(42),
+                content_fingerprint: None,
+                media: None,
             },
         ]);
 
@@ -864,6 +914,8 @@ mod tests {
             version: None,
             content_hash: None,
             size_bytes: Some(7),
+            content_fingerprint: None,
+            media: None,
         }];
 
         ensure_missing_folder_markers(&mut entries);
@@ -884,6 +936,8 @@ mod tests {
                 version: None,
                 content_hash: None,
                 size_bytes: None,
+                content_fingerprint: None,
+                media: None,
             },
             StoreIndexEntry {
                 path: "docs/guides/readme.md".to_string(),
@@ -891,6 +945,8 @@ mod tests {
                 version: None,
                 content_hash: None,
                 size_bytes: Some(11),
+                content_fingerprint: None,
+                media: None,
             },
         ];
 

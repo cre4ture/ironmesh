@@ -1,7 +1,6 @@
 package io.ironmesh.android.ui
 
 import android.app.Application
-import android.database.Cursor
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
@@ -362,28 +361,4 @@ class MainViewModel(
             },
         )
     }
-}
-
-private fun Cursor.stringOrNull(columnName: String): String? {
-    val index = getColumnIndex(columnName)
-    if (index < 0 || isNull(index)) {
-        return null
-    }
-    return getString(index)
-}
-
-private fun Cursor.longOrNull(columnName: String): Long? {
-    val index = getColumnIndex(columnName)
-    if (index < 0 || isNull(index)) {
-        return null
-    }
-    return getLong(index)
-}
-
-private fun Cursor.intOrNull(columnName: String): Int? {
-    val index = getColumnIndex(columnName)
-    if (index < 0 || isNull(index)) {
-        return null
-    }
-    return getInt(index)
 }
