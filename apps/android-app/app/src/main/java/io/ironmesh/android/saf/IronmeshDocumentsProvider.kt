@@ -1,21 +1,26 @@
 package io.ironmesh.android.saf
 
+import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
+import android.graphics.Point
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
+import android.util.Log
 import android.webkit.MimeTypeMap
+import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import kotlinx.coroutines.runBlocking
-import android.util.Log
-import java.io.IOException
 import java.io.FileNotFoundException
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 
 class IronmeshDocumentsProvider : DocumentsProvider() {
     private val repository = IronmeshRepository()
+    private val documentEntries = ConcurrentHashMap<String, StoreIndexEntry>()
 
     override fun onCreate(): Boolean = true
 
@@ -56,12 +61,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
 
         val prefix = parent.path.takeIf { it.isNotBlank() }
         val entries = runBlocking {
-            repository.storeIndex(
-                baseUrl = resolveBaseUrl(),
-                prefix = prefix,
-                depth = 1,
-                snapshot = null,
-            )
+            loadDirectoryEntries(prefix)
         }
 
         entries.forEach { entry ->
@@ -69,7 +69,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 val dirPath = entry.path.trimEnd('/')
                 includeDirectory(result, directoryDocumentId(dirPath), dirPath)
             } else {
-                includeFile(result, fileDocumentId(entry.path), entry.path)
+                includeFile(result, fileDocumentId(entry.path), entry)
             }
         }
 
@@ -153,6 +153,46 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         }
     }
 
+    override fun openDocumentThumbnail(
+        documentId: String,
+        sizeHint: Point,
+        signal: CancellationSignal?,
+    ): AssetFileDescriptor {
+        val target = parseDocumentId(documentId)
+        if (target.kind != DocumentKind.File) {
+            throw FileNotFoundException("not a file document")
+        }
+
+        val entry = resolveFileEntry(target.path)
+        val thumbnailUrl = entry.media?.thumbnail?.url
+            ?: throw FileNotFoundException("thumbnail not available")
+
+        try {
+            val pipe = ParcelFileDescriptor.createPipe()
+            val readSide = pipe[0]
+            val writeSide = pipe[1]
+
+            Thread {
+                ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { output ->
+                    try {
+                        runBlocking {
+                            repository.streamRelativeUrlTo(resolveBaseUrl(), thumbnailUrl, output)
+                        }
+                        output.flush()
+                    } catch (e: IOException) {
+                        Log.w(TAG, "Client closed thumbnail pipe: ${e.message}")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error streaming thumbnail", e)
+                    }
+                }
+            }.start()
+
+            return AssetFileDescriptor(readSide, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
+        } catch (e: IOException) {
+            throw FileNotFoundException("failed to open thumbnail: ${e.message}")
+        }
+    }
+
     private fun includeDocumentRow(cursor: MatrixCursor, documentId: String) {
         when (val parsed = parseDocumentId(documentId)) {
             ParsedDocument(DocumentKind.Directory, "") -> includeDirectory(cursor, documentId, ROOT_TITLE)
@@ -160,7 +200,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 includeDirectory(cursor, documentId, parsed.path.substringAfterLast('/'))
             }
             ParsedDocument(DocumentKind.File, parsed.path) -> {
-                includeFile(cursor, documentId, parsed.path)
+                includeFile(cursor, documentId, resolveFileEntry(parsed.path))
             }
         }
     }
@@ -176,17 +216,76 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         )
     }
 
-    private fun includeFile(cursor: MatrixCursor, documentId: String, fullPath: String) {
+    private fun includeFile(cursor: MatrixCursor, documentId: String, entry: StoreIndexEntry) {
+        val fullPath = entry.path
         val fileName = fullPath.substringAfterLast('/')
-        val mime = mimeForName(fileName)
+        val mime = entry.media?.mime_type ?: mimeForName(fileName)
+        val createdAtMillis = entry.media?.taken_at_unix?.times(1000)
+        val thumbnail = entry.media?.thumbnail
         val row = cursor.newRow()
         row.add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, documentId)
         row.add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, fileName)
         row.add(DocumentsContract.Document.COLUMN_MIME_TYPE, mime)
         row.add(
             DocumentsContract.Document.COLUMN_FLAGS,
-            DocumentsContract.Document.FLAG_SUPPORTS_WRITE,
+            DocumentsContract.Document.FLAG_SUPPORTS_WRITE or
+                if (thumbnail != null) DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL else 0,
         )
+        row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, createdAtMillis)
+        row.add(DocumentsContract.Document.COLUMN_SUMMARY, buildSummary(entry))
+        row.add(IronmeshDocumentColumns.COLUMN_REMOTE_PATH, fullPath)
+        row.add(IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS, createdAtMillis)
+        row.add(IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH, entry.media?.width)
+        row.add(IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT, entry.media?.height)
+        row.add(IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS, entry.media?.status)
+        row.add(IronmeshDocumentColumns.COLUMN_THUMBNAIL_WIDTH, thumbnail?.width)
+        row.add(IronmeshDocumentColumns.COLUMN_THUMBNAIL_HEIGHT, thumbnail?.height)
+    }
+
+    private suspend fun loadDirectoryEntries(prefix: String?): List<StoreIndexEntry> {
+        val entries = repository.storeIndex(
+            baseUrl = resolveBaseUrl(),
+            prefix = prefix,
+            depth = 1,
+            snapshot = null,
+        )
+
+        entries.forEach { entry ->
+            if (entry.entry_type == "key") {
+                documentEntries[entry.path] = entry
+            }
+        }
+
+        return entries
+    }
+
+    private fun resolveFileEntry(path: String): StoreIndexEntry {
+        documentEntries[path]?.let { return it }
+
+        val parentPrefix = path.substringBeforeLast('/', "")
+        val loaded = runBlocking {
+            loadDirectoryEntries(parentPrefix.takeIf { it.isNotBlank() })
+        }
+        loaded.firstOrNull { it.entry_type == "key" && it.path == path }?.let { return it }
+
+        return StoreIndexEntry(
+            path = path,
+            entry_type = "key",
+            media = null,
+        )
+    }
+
+    private fun buildSummary(entry: StoreIndexEntry): String? {
+        val parts = mutableListOf<String>()
+        entry.media?.let { media ->
+            if (media.width != null && media.height != null) {
+                parts += "${media.width} x ${media.height}"
+            }
+            if (media.status.isNotBlank()) {
+                parts += media.status
+            }
+        }
+        return parts.takeIf { it.isNotEmpty() }?.joinToString(" - ")
     }
 
     private fun resolveBaseUrl(): String {
@@ -218,6 +317,14 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             DocumentsContract.Document.COLUMN_FLAGS,
             DocumentsContract.Document.COLUMN_SIZE,
             DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+            DocumentsContract.Document.COLUMN_SUMMARY,
+            IronmeshDocumentColumns.COLUMN_REMOTE_PATH,
+            IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH,
+            IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT,
+            IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS,
+            IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS,
+            IronmeshDocumentColumns.COLUMN_THUMBNAIL_WIDTH,
+            IronmeshDocumentColumns.COLUMN_THUMBNAIL_HEIGHT,
         )
     }
 

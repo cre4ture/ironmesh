@@ -1,16 +1,36 @@
 package io.ironmesh.android.ui
 
 import android.app.Application
+import android.database.Cursor
+import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import io.ironmesh.android.saf.IronmeshDocumentColumns
 import io.ironmesh.android.work.FolderSyncScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
+
+enum class GallerySortOption {
+    CREATION_TIME,
+    NAME,
+}
+
+data class GalleryImageItem(
+    val documentUri: Uri,
+    val displayName: String,
+    val remotePath: String,
+    val mimeType: String,
+    val createdAtUnixMs: Long? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    val thumbnailStatus: String? = null,
+)
 
 data class MainUiState(
     val baseUrl: String = IronmeshPreferences.DEFAULT_BASE_URL,
@@ -23,6 +43,9 @@ data class MainUiState(
     val newSyncLabel: String = "",
     val newSyncPrefix: String = "",
     val newSyncLocalFolder: String = "",
+    val galleryItems: List<GalleryImageItem> = emptyList(),
+    val gallerySort: GallerySortOption = GallerySortOption.CREATION_TIME,
+    val galleryLoading: Boolean = false,
     val loading: Boolean = false,
 )
 
@@ -107,6 +130,38 @@ class MainViewModel(
 
     fun updateNewSyncLocalFolder(value: String) {
         uiState.value = uiState.value.copy(newSyncLocalFolder = value)
+    }
+
+    fun refreshGallery() {
+        uiState.value = uiState.value.copy(galleryLoading = true, status = "Loading gallery...")
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    loadGalleryItems()
+                }
+            }
+                .onSuccess { items ->
+                    val sorted = sortGallery(items, uiState.value.gallerySort)
+                    uiState.value = uiState.value.copy(
+                        galleryItems = sorted,
+                        galleryLoading = false,
+                        status = "Gallery loaded: ${sorted.size} images",
+                    )
+                }
+                .onFailure { error ->
+                    uiState.value = uiState.value.copy(
+                        galleryLoading = false,
+                        status = "Error: ${error.message}",
+                    )
+                }
+        }
+    }
+
+    fun updateGallerySort(sort: GallerySortOption) {
+        uiState.value = uiState.value.copy(
+            gallerySort = sort,
+            galleryItems = sortGallery(uiState.value.galleryItems, sort),
+        )
     }
 
     fun addFolderSyncProfile() {
@@ -209,4 +264,110 @@ class MainViewModel(
                 }
         }
     }
+
+    private fun loadGalleryItems(): List<GalleryImageItem> {
+        val application = getApplication<Application>()
+        val authority = "${application.packageName}.documents"
+        val rootDocumentId = "dir:"
+        val items = mutableListOf<GalleryImageItem>()
+
+        collectGalleryImages(
+            authority = authority,
+            parentDocumentId = rootDocumentId,
+            output = items,
+        )
+        return items
+    }
+
+    private fun collectGalleryImages(
+        authority: String,
+        parentDocumentId: String,
+        output: MutableList<GalleryImageItem>,
+    ) {
+        val resolver = getApplication<Application>().contentResolver
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+            IronmeshDocumentColumns.COLUMN_REMOTE_PATH,
+            IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH,
+            IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT,
+            IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS,
+            IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS,
+        )
+
+        val childrenUri = DocumentsContract.buildChildDocumentsUri(authority, parentDocumentId)
+        resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            while (cursor.moveToNext()) {
+                val documentId = cursor.stringOrNull(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    ?: continue
+                val mimeType = cursor.stringOrNull(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    ?: continue
+
+                if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    collectGalleryImages(authority, documentId, output)
+                    continue
+                }
+
+                if (!mimeType.startsWith("image/")) {
+                    continue
+                }
+
+                output += GalleryImageItem(
+                    documentUri = DocumentsContract.buildDocumentUri(authority, documentId),
+                    displayName = cursor.stringOrNull(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                        ?: documentId,
+                    remotePath = cursor.stringOrNull(IronmeshDocumentColumns.COLUMN_REMOTE_PATH)
+                        ?: documentId,
+                    mimeType = mimeType,
+                    createdAtUnixMs = cursor.longOrNull(IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS)
+                        ?: cursor.longOrNull(DocumentsContract.Document.COLUMN_LAST_MODIFIED),
+                    width = cursor.intOrNull(IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH),
+                    height = cursor.intOrNull(IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT),
+                    thumbnailStatus = cursor.stringOrNull(IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS),
+                )
+            }
+        }
+    }
+
+    private fun sortGallery(
+        items: List<GalleryImageItem>,
+        sort: GallerySortOption,
+    ): List<GalleryImageItem> {
+        return items.sortedWith(
+            when (sort) {
+                GallerySortOption.CREATION_TIME -> compareByDescending<GalleryImageItem> {
+                    it.createdAtUnixMs ?: Long.MIN_VALUE
+                }.thenBy { it.displayName.lowercase() }
+                GallerySortOption.NAME -> compareBy<GalleryImageItem> {
+                    it.displayName.lowercase()
+                }.thenBy { it.remotePath.lowercase() }
+            },
+        )
+    }
+}
+
+private fun Cursor.stringOrNull(columnName: String): String? {
+    val index = getColumnIndex(columnName)
+    if (index < 0 || isNull(index)) {
+        return null
+    }
+    return getString(index)
+}
+
+private fun Cursor.longOrNull(columnName: String): Long? {
+    val index = getColumnIndex(columnName)
+    if (index < 0 || isNull(index)) {
+        return null
+    }
+    return getLong(index)
+}
+
+private fun Cursor.intOrNull(columnName: String): Int? {
+    val index = getColumnIndex(columnName)
+    if (index < 0 || isNull(index)) {
+        return null
+    }
+    return getInt(index)
 }

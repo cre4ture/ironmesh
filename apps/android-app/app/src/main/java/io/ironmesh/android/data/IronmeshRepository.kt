@@ -9,9 +9,11 @@ import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
+import java.net.URL
 import java.io.OutputStream
 
 class IronmeshRepository {
@@ -25,22 +27,24 @@ class IronmeshRepository {
         return if (withScheme.endsWith('/')) withScheme else "$withScheme/"
     }
 
-    private fun createApi(baseUrl: String): IronmeshApi {
+    private fun createHttpClient(): OkHttpClient {
         val logging = HttpLoggingInterceptor().apply {
             level = HttpLoggingInterceptor.Level.BASIC
         }
 
-        val client = OkHttpClient.Builder()
+        return OkHttpClient.Builder()
             .addInterceptor(logging)
             .build()
+    }
 
+    private fun createApi(baseUrl: String): IronmeshApi {
         val moshi = Moshi.Builder()
             .add(KotlinJsonAdapterFactory())
             .build()
 
         return Retrofit.Builder()
             .baseUrl(sanitizeBaseUrl(baseUrl))
-            .client(client)
+            .client(createHttpClient())
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
             .create(IronmeshApi::class.java)
@@ -186,6 +190,27 @@ class IronmeshRepository {
             version,
         )
         return
+    }
+
+    suspend fun streamRelativeUrlTo(
+        baseUrl: String,
+        relativeUrl: String,
+        output: OutputStream,
+    ) {
+        val request = Request.Builder()
+            .url(URL(URL(sanitizeBaseUrl(baseUrl)), relativeUrl))
+            .build()
+
+        createHttpClient().newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("GET failed with HTTP ${response.code}")
+            }
+
+            val body = response.body ?: throw IllegalStateException("GET failed: empty response body")
+            body.byteStream().use { input ->
+                input.copyTo(output)
+            }
+        }
     }
 
     fun startWebUi(baseUrl: String): String {

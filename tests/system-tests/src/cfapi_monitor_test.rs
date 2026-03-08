@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::framework::{fresh_data_dir, start_server, wait_for_object_payload};
+    use crate::framework::{fresh_data_dir, start_server};
     use crate::framework_win::start_cfapi_adapter;
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
