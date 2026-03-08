@@ -27,17 +27,19 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(resolveRootProjection(projection))
         val row = result.newRow()
-        row.add(DocumentsContract.Root.COLUMN_ROOT_ID, ROOT_ID)
-        row.add(DocumentsContract.Root.COLUMN_DOCUMENT_ID, rootDocumentId())
-        row.add(DocumentsContract.Root.COLUMN_TITLE, ROOT_TITLE)
-        row.add(DocumentsContract.Root.COLUMN_SUMMARY, "Ironmesh distributed storage")
-        row.add(
-            DocumentsContract.Root.COLUMN_FLAGS,
+        IronmeshCursorRows.populateRootRow(
+            cursor = result,
+            row = row,
+            rootId = ROOT_ID,
+            documentId = rootDocumentId(),
+            title = ROOT_TITLE,
+            summary = "Ironmesh distributed storage",
+            flags =
             DocumentsContract.Root.FLAG_SUPPORTS_CREATE or
                 DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD,
+            mimeTypes = "*/*",
+            icon = android.R.drawable.sym_def_app_icon,
         )
-        row.add(DocumentsContract.Root.COLUMN_MIME_TYPES, "*/*")
-        row.add(DocumentsContract.Root.COLUMN_ICON, android.R.drawable.sym_def_app_icon)
         return result
     }
 
@@ -207,39 +209,21 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
 
     private fun includeDirectory(cursor: MatrixCursor, documentId: String, name: String) {
         val row = cursor.newRow()
-        row.add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, documentId)
-        row.add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, name)
-        row.add(DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.MIME_TYPE_DIR)
-        row.add(
-            DocumentsContract.Document.COLUMN_FLAGS,
-            DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE,
-        )
+        IronmeshCursorRows.populateDirectoryRow(cursor, row, documentId, name)
     }
 
     private fun includeFile(cursor: MatrixCursor, documentId: String, entry: StoreIndexEntry) {
         val fullPath = entry.path
         val fileName = fullPath.substringAfterLast('/')
-        val mime = entry.media?.mime_type ?: mimeForName(fileName)
-        val createdAtMillis = entry.media?.taken_at_unix?.times(1000)
-        val thumbnail = entry.media?.thumbnail
         val row = cursor.newRow()
-        row.add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, documentId)
-        row.add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, fileName)
-        row.add(DocumentsContract.Document.COLUMN_MIME_TYPE, mime)
-        row.add(
-            DocumentsContract.Document.COLUMN_FLAGS,
-            DocumentsContract.Document.FLAG_SUPPORTS_WRITE or
-                if (thumbnail != null) DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL else 0,
+        IronmeshCursorRows.populateFileRow(
+            cursor = cursor,
+            row = row,
+            documentId = documentId,
+            entry = entry,
+            fallbackMimeType = mimeForName(fileName),
+            summary = buildSummary(entry),
         )
-        row.add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, createdAtMillis)
-        row.add(DocumentsContract.Document.COLUMN_SUMMARY, buildSummary(entry))
-        row.add(IronmeshDocumentColumns.COLUMN_REMOTE_PATH, fullPath)
-        row.add(IronmeshDocumentColumns.COLUMN_CREATED_AT_UNIX_MS, createdAtMillis)
-        row.add(IronmeshDocumentColumns.COLUMN_IMAGE_WIDTH, entry.media?.width)
-        row.add(IronmeshDocumentColumns.COLUMN_IMAGE_HEIGHT, entry.media?.height)
-        row.add(IronmeshDocumentColumns.COLUMN_THUMBNAIL_STATUS, entry.media?.status)
-        row.add(IronmeshDocumentColumns.COLUMN_THUMBNAIL_WIDTH, thumbnail?.width)
-        row.add(IronmeshDocumentColumns.COLUMN_THUMBNAIL_HEIGHT, thumbnail?.height)
     }
 
     private suspend fun loadDirectoryEntries(prefix: String?): List<StoreIndexEntry> {

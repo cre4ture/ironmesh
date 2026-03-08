@@ -167,5 +167,8 @@ dependencies {
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
     implementation("com.squareup.moshi:moshi-kotlin:1.15.1")
 
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.1")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

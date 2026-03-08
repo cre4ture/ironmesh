@@ -1,5 +1,6 @@
 package io.ironmesh.android
 
+import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.ContentResolver
 import android.content.Intent
@@ -10,6 +11,9 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.util.Size
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -49,9 +53,11 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.ironmesh.android.ui.GalleryImageItem
 import io.ironmesh.android.ui.GallerySortOption
+import io.ironmesh.android.ui.MainSection
 import io.ironmesh.android.ui.MainUiState
 import io.ironmesh.android.ui.MainViewModel
 import kotlinx.coroutines.Dispatchers
@@ -74,31 +80,33 @@ class MainActivity : ComponentActivity() {
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
-                            .verticalScroll(rememberScrollState())
                             .padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         Text("Ironmesh Android MVP", style = MaterialTheme.typography.headlineSmall)
+                        SectionMenu(state = state, vm = vm)
+                        StatusPanel(state = state)
 
-                        ServerControls(
-                            state = state,
-                            vm = vm,
-                            onOpenFiles = { openFilesAtIronmeshRoot(vm) },
-                            onOpenWebUi = { vm.openWebUi(::openWebUi) },
-                        )
-                        FolderSyncControls(state = state, vm = vm)
-                        GallerySection(state = state, vm = vm)
-
-                        if (state.loading) {
-                            CircularProgressIndicator()
-                        }
-
-                        Text("Status: ${state.status}")
-                        if (state.replicationSummary.isNotBlank()) {
-                            Text("Replication: ${state.replicationSummary}")
-                        }
-                        if (state.objectBody.isNotBlank()) {
-                            Text("Object body:\n${state.objectBody}")
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
+                        ) {
+                            when (state.selectedSection) {
+                                MainSection.SETTINGS -> SettingsView(
+                                    state = state,
+                                    vm = vm,
+                                    onOpenFiles = { openFilesAtIronmeshRoot(vm) },
+                                )
+                                MainSection.WEB_UI -> WebUiSection(
+                                    state = state,
+                                    vm = vm,
+                                )
+                                MainSection.GALLERY -> GalleryView(
+                                    state = state,
+                                    vm = vm,
+                                )
+                            }
                         }
                     }
                 }
@@ -143,9 +151,142 @@ class MainActivity : ComponentActivity() {
             vm.setStatus("No compatible Files app found on this device")
         }
     }
+}
 
-    private fun openWebUi(url: String) {
-        startActivity(WebUiActivity.intent(this, url))
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SectionMenu(
+    state: MainUiState,
+    vm: MainViewModel,
+) {
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        FilterChip(
+            selected = state.selectedSection == MainSection.SETTINGS,
+            onClick = { vm.selectSection(MainSection.SETTINGS) },
+            label = { Text("Settings") },
+        )
+        FilterChip(
+            selected = state.selectedSection == MainSection.WEB_UI,
+            onClick = { vm.selectSection(MainSection.WEB_UI) },
+            label = { Text("Web UI") },
+        )
+        FilterChip(
+            selected = state.selectedSection == MainSection.GALLERY,
+            onClick = { vm.selectSection(MainSection.GALLERY) },
+            label = { Text("Gallery") },
+        )
+    }
+}
+
+@Composable
+private fun StatusPanel(state: MainUiState) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 1.dp,
+        shape = RoundedCornerShape(16.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (state.loading || state.galleryLoading) {
+                CircularProgressIndicator()
+            }
+            Text("Status: ${state.status}")
+            if (state.replicationSummary.isNotBlank()) {
+                Text("Replication: ${state.replicationSummary}")
+            }
+            if (state.objectBody.isNotBlank() && state.selectedSection == MainSection.SETTINGS) {
+                Text("Object body:\n${state.objectBody}")
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsView(
+    state: MainUiState,
+    vm: MainViewModel,
+    onOpenFiles: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        ServerControls(
+            state = state,
+            vm = vm,
+            onOpenFiles = onOpenFiles,
+        )
+        FolderSyncControls(state = state, vm = vm)
+    }
+}
+
+@Composable
+private fun WebUiSection(
+    state: MainUiState,
+    vm: MainViewModel,
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Web UI", style = MaterialTheme.typography.titleMedium)
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = vm::startWebUi) {
+                Text(if (state.webUiUrl.isBlank()) "Start Web UI" else "Restart Web UI")
+            }
+        }
+
+        if (state.webUiUrl.isBlank()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                tonalElevation = 2.dp,
+                shape = RoundedCornerShape(18.dp),
+            ) {
+                Text(
+                    text = "Start the embedded Web UI to load it in this view.",
+                    modifier = Modifier.padding(16.dp),
+                )
+            }
+        } else {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                tonalElevation = 2.dp,
+                shape = RoundedCornerShape(18.dp),
+            ) {
+                EmbeddedWebUi(
+                    url = state.webUiUrl,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun GalleryView(
+    state: MainUiState,
+    vm: MainViewModel,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        GallerySection(state = state, vm = vm)
     }
 }
 
@@ -154,7 +295,6 @@ private fun ServerControls(
     state: MainUiState,
     vm: MainViewModel,
     onOpenFiles: () -> Unit,
-    onOpenWebUi: () -> Unit,
 ) {
     OutlinedTextField(
         modifier = Modifier.fillMaxWidth(),
@@ -191,10 +331,6 @@ private fun ServerControls(
 
     Button(onClick = onOpenFiles) {
         Text("Open Files")
-    }
-
-    Button(onClick = onOpenWebUi) {
-        Text("Open Web UI")
     }
 }
 
@@ -442,6 +578,26 @@ private fun ProviderThumbnail(
     }
 }
 
+@Composable
+private fun EmbeddedWebUi(
+    url: String,
+    modifier: Modifier = Modifier,
+) {
+    AndroidView(
+        modifier = modifier,
+        factory = { context ->
+            WebView(context).apply {
+                configureForIronmesh(url)
+            }
+        },
+        update = { webView ->
+            if (webView.url != url) {
+                webView.loadUrl(url)
+            }
+        },
+    )
+}
+
 private fun galleryMetaText(item: GalleryImageItem): String? {
     val parts = mutableListOf<String>()
     if (item.width != null && item.height != null) {
@@ -476,4 +632,15 @@ private fun loadDocumentThumbnail(
             )
         }
     }.getOrNull()
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+private fun WebView.configureForIronmesh(url: String) {
+    settings.javaScriptEnabled = true
+    settings.domStorageEnabled = true
+    settings.allowFileAccess = false
+    settings.allowContentAccess = false
+    settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+    webViewClient = WebViewClient()
+    loadUrl(url)
 }

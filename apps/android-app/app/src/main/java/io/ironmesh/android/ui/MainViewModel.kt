@@ -21,6 +21,12 @@ enum class GallerySortOption {
     NAME,
 }
 
+enum class MainSection {
+    SETTINGS,
+    WEB_UI,
+    GALLERY,
+}
+
 data class GalleryImageItem(
     val documentUri: Uri,
     val displayName: String,
@@ -43,6 +49,8 @@ data class MainUiState(
     val newSyncLabel: String = "",
     val newSyncPrefix: String = "",
     val newSyncLocalFolder: String = "",
+    val selectedSection: MainSection = MainSection.SETTINGS,
+    val webUiUrl: String = "",
     val galleryItems: List<GalleryImageItem> = emptyList(),
     val gallerySort: GallerySortOption = GallerySortOption.CREATION_TIME,
     val galleryLoading: Boolean = false,
@@ -130,6 +138,10 @@ class MainViewModel(
 
     fun updateNewSyncLocalFolder(value: String) {
         uiState.value = uiState.value.copy(newSyncLocalFolder = value)
+    }
+
+    fun selectSection(section: MainSection) {
+        uiState.value = uiState.value.copy(selectedSection = section)
     }
 
     fun refreshGallery() {
@@ -224,9 +236,13 @@ class MainViewModel(
         setStatus("Folder sync scheduled")
     }
 
-    fun openWebUi(onReady: (String) -> Unit) {
+    fun startWebUi() {
         val baseUrl = uiState.value.baseUrl
-        uiState.value = uiState.value.copy(loading = true, status = "Starting embedded Web UI...")
+        uiState.value = uiState.value.copy(
+            loading = true,
+            selectedSection = MainSection.WEB_UI,
+            status = "Starting embedded Web UI...",
+        )
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
@@ -236,9 +252,9 @@ class MainViewModel(
                 .onSuccess { url ->
                     uiState.value = uiState.value.copy(
                         loading = false,
+                        webUiUrl = url,
                         status = "Web UI ready at $url",
                     )
-                    onReady(url)
                 }
                 .onFailure { error ->
                     uiState.value = uiState.value.copy(
