@@ -117,7 +117,10 @@ mod tests {
 
         for _ in 0..retries {
             if let Ok(index) = sdk.store_index(None, 64, None).await {
-                let has_directory_marker = index.entries.iter().any(|entry| entry.path == expected_marker);
+                let has_directory_marker = index
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == expected_marker);
                 let has_plain_file = index
                     .entries
                     .iter()
@@ -148,7 +151,11 @@ mod tests {
         );
     }
 
-    async fn wait_for_remote_directory_absence(sdk: &IronMeshClient, dir_name: &str, retries: usize) {
+    async fn wait_for_remote_directory_absence(
+        sdk: &IronMeshClient,
+        dir_name: &str,
+        retries: usize,
+    ) {
         let normalized = dir_name.trim_matches('/').replace('\\', "/");
         let expected_prefix = format!("{normalized}/");
 
@@ -378,7 +385,8 @@ mod tests {
         .expect("failed to register and serve CFAPI adapter");
 
         let empty_dir = sync_root.join("created-empty-folder");
-        std::fs::create_dir_all(&empty_dir).expect("failed to create empty folder inside sync root");
+        std::fs::create_dir_all(&empty_dir)
+            .expect("failed to create empty folder inside sync root");
         wait_for_path(&empty_dir, 50).await;
 
         wait_for_remote_directory_marker_shape(&sdk, "created-empty-folder", 220).await;
@@ -412,7 +420,8 @@ mod tests {
         let old_dir = sync_root.join("rename-empty").join("from");
         let new_dir = sync_root.join("rename-empty").join("to");
         wait_for_path(&old_dir, 220).await;
-        std::fs::rename(&old_dir, &new_dir).expect("failed to rename empty folder inside sync root");
+        std::fs::rename(&old_dir, &new_dir)
+            .expect("failed to rename empty folder inside sync root");
         wait_for_path(&new_dir, 50).await;
 
         wait_for_remote_directory_presence_any_shape(&sdk, "rename-empty/to", 220).await;

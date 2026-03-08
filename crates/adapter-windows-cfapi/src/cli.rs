@@ -102,11 +102,8 @@ pub fn cli_main() -> anyhow::Result<()> {
                 "startup-scan: scanning {} for pre-existing files",
                 registration.root_path.display()
             );
-            let mut monitor = SyncRootMonitor::new(
-                "monitor",
-                registration.root_path.clone(),
-                uploader.clone(),
-            );
+            let mut monitor =
+                SyncRootMonitor::new("monitor", registration.root_path.clone(), uploader.clone());
             monitor.walk();
             std::thread::spawn(move || {
                 monitor.run();
