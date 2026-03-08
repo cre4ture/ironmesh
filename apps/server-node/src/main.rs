@@ -1224,6 +1224,8 @@ struct StoreIndexEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     content_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     media: Option<MediaIndexResponse>,
@@ -1683,14 +1685,21 @@ async fn list_store_index(
     let prefix = query.prefix.unwrap_or_default();
     let depth = query.depth.unwrap_or(1).max(1);
 
-    let (keys, key_hashes) = {
+    let (keys, key_hashes, key_sizes) = {
         let store = state.store.lock().await;
         if let Some(snapshot_id) = query.snapshot.as_deref() {
             match store.snapshot_object_hashes(snapshot_id).await {
                 Ok(Some(object_hashes)) => {
                     let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
                     keys.sort();
-                    (keys, object_hashes)
+                    let sizes = match store.object_sizes_by_key(&object_hashes).await {
+                        Ok(sizes) => sizes,
+                        Err(err) => {
+                            tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to compute snapshot key sizes");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    };
+                    (keys, object_hashes, sizes)
                 }
                 Ok(None) => return StatusCode::NOT_FOUND.into_response(),
                 Err(err) => {
@@ -1702,12 +1711,24 @@ async fn list_store_index(
             let object_hashes = store.current_object_hashes();
             let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
             keys.sort();
-            (keys, object_hashes)
+            let sizes = match store.object_sizes_by_key(&object_hashes).await {
+                Ok(sizes) => sizes,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to compute current key sizes");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            (keys, object_hashes, sizes)
         }
     };
 
-    let mut entries =
-        build_store_index_entries_with_hashes(&keys, &prefix, depth, Some(&key_hashes));
+    let mut entries = build_store_index_entries_with_hashes(
+        &keys,
+        &prefix,
+        depth,
+        Some(&key_hashes),
+        Some(&key_sizes),
+    );
     {
         let store = state.store.lock().await;
         for entry in &mut entries {
@@ -1847,7 +1868,7 @@ fn looks_like_image_path(path: &str) -> bool {
 
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
-    build_store_index_entries_with_hashes(keys, prefix, depth, None)
+    build_store_index_entries_with_hashes(keys, prefix, depth, None, None)
 }
 
 fn build_store_index_entries_with_hashes(
@@ -1855,6 +1876,7 @@ fn build_store_index_entries_with_hashes(
     prefix: &str,
     depth: usize,
     hashes_by_key: Option<&HashMap<String, String>>,
+    sizes_by_key: Option<&HashMap<String, u64>>,
 ) -> Vec<StoreIndexEntry> {
     let normalized_prefix = prefix.trim_end_matches('/');
     let mut file_entries = BTreeSet::new();
@@ -1904,17 +1926,20 @@ fn build_store_index_entries_with_hashes(
             entry_type: "prefix".to_string(),
             version: None,
             content_hash: None,
+            size_bytes: None,
             content_fingerprint: None,
             media: None,
         });
     }
     for path in file_entries {
         let content_hash = hashes_by_key.and_then(|values| values.get(&path)).cloned();
+        let size_bytes = sizes_by_key.and_then(|values| values.get(&path)).copied();
         entries.push(StoreIndexEntry {
             path,
             entry_type: "key".to_string(),
             version: None,
             content_hash,
+            size_bytes,
             content_fingerprint: None,
             media: None,
         });

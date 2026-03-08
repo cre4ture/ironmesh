@@ -25,6 +25,8 @@ pub struct NamespaceEntry {
     pub kind: EntryKind,
     pub version: Option<String>,
     pub content_hash: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
 }
 
 impl NamespaceEntry {
@@ -33,11 +35,21 @@ impl NamespaceEntry {
         version: impl Into<String>,
         hash: impl Into<String>,
     ) -> Self {
+        Self::file_sized(path, version, hash, None)
+    }
+
+    pub fn file_sized(
+        path: impl Into<String>,
+        version: impl Into<String>,
+        hash: impl Into<String>,
+        size_bytes: Option<u64>,
+    ) -> Self {
         Self {
             path: normalize_path(path),
             kind: EntryKind::File,
             version: Some(version.into()),
             content_hash: Some(hash.into()),
+            size_bytes,
         }
     }
 
@@ -47,6 +59,7 @@ impl NamespaceEntry {
             kind: EntryKind::Directory,
             version: None,
             content_hash: None,
+            size_bytes: None,
         }
     }
 }

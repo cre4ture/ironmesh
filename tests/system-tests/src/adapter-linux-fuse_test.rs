@@ -79,6 +79,71 @@ mod tests {
         );
     }
 
+    async fn wait_for_ls_reported_size(
+        dir: &Path,
+        file_name: &str,
+        expected_size: u64,
+        retries: usize,
+    ) -> Result<()> {
+        let dir_arg = dir.to_string_lossy().to_string();
+
+        for _ in 0..retries {
+            let output = Command::new("ls")
+                .arg("-ln")
+                .arg(&dir_arg)
+                .output()
+                .await
+                .with_context(|| format!("failed to run ls -ln {}", dir.display()))?;
+
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let columns: Vec<&str> = line.split_whitespace().collect();
+                    if columns.len() < 9 {
+                        continue;
+                    }
+                    if columns[8] != file_name {
+                        continue;
+                    }
+
+                    if let Ok(size) = columns[4].parse::<u64>()
+                        && size == expected_size
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "ls -ln {} did not report size {} for {}",
+            dir.display(),
+            expected_size,
+            file_name
+        );
+    }
+
+    async fn wait_for_metadata_size(path: &Path, expected_size: u64, retries: usize) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(metadata) = fs::metadata(path)
+                && metadata.is_file()
+                && metadata.len() == expected_size
+            {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "metadata for {} did not report size {}",
+            path.display(),
+            expected_size
+        );
+    }
+
     async fn wait_for_dir(path: &Path, retries: usize) -> Result<()> {
         for _ in 0..retries {
             if path.is_dir() {
@@ -647,6 +712,57 @@ mod tests {
         result
     }
 
+    async fn run_remote_file_size_reporting_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-size-reporting");
+        let mut server = start_server(bind).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            let size_probe_payload = b"size-probe-remote-file".to_vec();
+            sdk.put_large_aware("seed-size-reporting.txt", Bytes::from_static(b"seed-size"))
+                .await?;
+            sdk.put_large_aware("reported-size.txt", Bytes::from(size_probe_payload.clone()))
+                .await?;
+
+            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-size-reporting.txt");
+                wait_for_file(&seed_path, 120).await?;
+
+                wait_for_ls_reported_size(
+                    &mountpoint,
+                    "reported-size.txt",
+                    size_probe_payload.len() as u64,
+                    180,
+                )
+                .await?;
+                wait_for_metadata_size(
+                    &mountpoint.join("reported-size.txt"),
+                    size_probe_payload.len() as u64,
+                    180,
+                )
+                .await?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
     async fn run_local_rename_move_case(bind: &str) -> Result<()> {
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
@@ -946,6 +1062,11 @@ mod tests {
     #[tokio::test]
     async fn linux_fuse_remote_file_update_refreshes_without_remount() -> Result<()> {
         run_remote_update_refresh_case("127.0.0.1:19364").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_reports_remote_file_sizes_to_ls() -> Result<()> {
+        run_remote_file_size_reporting_case("127.0.0.1:19370").await
     }
 
     #[tokio::test]

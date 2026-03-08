@@ -2,6 +2,8 @@
 
 pub mod mount_main;
 
+use std::collections::HashMap;
+
 use sync_core::{SyncOperation, SyncPlan, SyncPolicy, SyncSnapshot, plan_sync};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,7 +20,12 @@ impl LinuxFuseAdapter {
 
     pub fn plan_actions(&self, snapshot: &SyncSnapshot, policy: &SyncPolicy) -> FuseActionPlan {
         let sync_plan = plan_sync(snapshot, policy);
-        map_sync_plan_to_fuse_actions(&sync_plan)
+        let remote_sizes_by_path = snapshot
+            .remote
+            .iter()
+            .filter_map(|entry| entry.size_bytes.map(|size| (entry.path.clone(), size)))
+            .collect::<HashMap<_, _>>();
+        map_sync_plan_to_fuse_actions(&sync_plan, &remote_sizes_by_path)
     }
 }
 
@@ -35,10 +42,12 @@ pub enum FuseAction {
     EnsurePlaceholder {
         path: String,
         remote_version: String,
+        remote_size: Option<u64>,
     },
     HydrateOnRead {
         path: String,
         remote_version: String,
+        remote_size: Option<u64>,
     },
     UploadOnFlush {
         path: String,
@@ -54,7 +63,10 @@ pub enum FuseAction {
     },
 }
 
-pub fn map_sync_plan_to_fuse_actions(sync_plan: &SyncPlan) -> FuseActionPlan {
+pub fn map_sync_plan_to_fuse_actions(
+    sync_plan: &SyncPlan,
+    remote_sizes_by_path: &HashMap<String, u64>,
+) -> FuseActionPlan {
     let mut actions = Vec::with_capacity(sync_plan.operations.len());
 
     for operation in &sync_plan.operations {
@@ -68,6 +80,7 @@ pub fn map_sync_plan_to_fuse_actions(sync_plan: &SyncPlan) -> FuseActionPlan {
             } => FuseAction::EnsurePlaceholder {
                 path: path.clone(),
                 remote_version: remote_version.clone(),
+                remote_size: remote_sizes_by_path.get(path).copied(),
             },
             SyncOperation::Hydrate {
                 path,
@@ -75,6 +88,7 @@ pub fn map_sync_plan_to_fuse_actions(sync_plan: &SyncPlan) -> FuseActionPlan {
             } => FuseAction::HydrateOnRead {
                 path: path.clone(),
                 remote_version: remote_version.clone(),
+                remote_size: remote_sizes_by_path.get(path).copied(),
             },
             SyncOperation::Upload {
                 path,
@@ -234,13 +248,14 @@ pub mod runtime {
             name: String,
             parent_inode: u64,
             remote_version: String,
+            size: u64,
         ) -> Self {
             Self {
                 inode,
                 name,
                 parent_inode,
                 kind: FileType::RegularFile,
-                size: 0,
+                size,
                 modified_at: SystemTime::now(),
                 children: BTreeMap::new(),
                 data: Vec::new(),
@@ -347,12 +362,14 @@ pub mod runtime {
                     FuseAction::EnsurePlaceholder {
                         path,
                         remote_version,
+                        remote_size,
                     }
                     | FuseAction::HydrateOnRead {
                         path,
                         remote_version,
+                        remote_size,
                     } => {
-                        fs.ensure_placeholder_file(path, remote_version);
+                        fs.ensure_placeholder_file(path, remote_version, *remote_size);
                     }
                     FuseAction::UploadOnFlush { .. }
                     | FuseAction::MarkConflict { .. }
@@ -392,7 +409,12 @@ pub mod runtime {
             current_inode
         }
 
-        fn ensure_placeholder_file(&mut self, relative_path: &str, remote_version: &str) {
+        fn ensure_placeholder_file(
+            &mut self,
+            relative_path: &str,
+            remote_version: &str,
+            remote_size: Option<u64>,
+        ) {
             let mut segments: Vec<&str> = relative_path
                 .split('/')
                 .filter(|segment| !segment.is_empty())
@@ -414,7 +436,7 @@ pub mod runtime {
                 if let Some(file) = self.nodes.get_mut(&inode) {
                     file.placeholder_version = Some(remote_version.to_string());
                     file.data.clear();
-                    file.size = 0;
+                    file.size = remote_size.unwrap_or(0);
                 }
                 return;
             }
@@ -425,6 +447,7 @@ pub mod runtime {
                 file_name.to_string(),
                 parent_inode,
                 remote_version.to_string(),
+                remote_size.unwrap_or(0),
             );
 
             self.nodes.insert(inode, file);
@@ -443,6 +466,7 @@ pub mod runtime {
             &mut self,
             relative_path: &str,
             remote_version: &str,
+            remote_size: Option<u64>,
         ) {
             let mut segments: Vec<&str> = relative_path
                 .split('/')
@@ -476,14 +500,14 @@ pub mod runtime {
                 let already_placeholder = file.placeholder_version.as_deref()
                     == Some(remote_version)
                     && file.data.is_empty()
-                    && file.size == 0;
+                    && file.size == remote_size.unwrap_or(0);
                 if already_placeholder {
                     return;
                 }
 
                 file.placeholder_version = Some(remote_version.to_string());
                 file.data.clear();
-                file.size = 0;
+                file.size = remote_size.unwrap_or(0);
                 file.modified_at = SystemTime::now();
                 return;
             }
@@ -494,6 +518,7 @@ pub mod runtime {
                 file_name.to_string(),
                 parent_inode,
                 remote_version.to_string(),
+                remote_size.unwrap_or(0),
             );
             self.nodes.insert(inode, file);
             if let Some(parent) = self.nodes.get_mut(&parent_inode) {
@@ -569,12 +594,18 @@ pub mod runtime {
                     FuseAction::EnsurePlaceholder {
                         path,
                         remote_version,
+                        remote_size,
                     }
                     | FuseAction::HydrateOnRead {
                         path,
                         remote_version,
+                        remote_size,
                     } => {
-                        self.ensure_placeholder_file_for_refresh(path, remote_version);
+                        self.ensure_placeholder_file_for_refresh(
+                            path,
+                            remote_version,
+                            *remote_size,
+                        );
                     }
                     FuseAction::UploadOnFlush { .. }
                     | FuseAction::MarkConflict { .. }
@@ -807,6 +838,16 @@ pub mod runtime {
             (flags & write_flags) != 0
         }
 
+        fn should_hydrate_on_open(flags: i32) -> bool {
+            Self::write_requested(flags) && (flags & libc::O_TRUNC) == 0
+        }
+
+        fn should_hydrate_for_size_change(node: &FsNode, size: u64) -> bool {
+            node.kind == FileType::RegularFile
+                && node.placeholder_version.is_some()
+                && node.size != size
+        }
+
         fn upload_inode(&self, inode: u64) -> Result<()> {
             let node = self
                 .nodes
@@ -901,11 +942,6 @@ pub mod runtime {
 
         fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
             self.drain_remote_updates();
-
-            if let Err(_error) = self.hydrate_if_needed(ino) {
-                reply.error(EIO);
-                return;
-            }
 
             let Some(node) = self.nodes.get(&ino) else {
                 reply.error(ENOENT);
@@ -1259,7 +1295,9 @@ pub mod runtime {
                     reply.error(EIO);
                     return;
                 }
-            } else if let Err(_error) = self.hydrate_if_needed(ino) {
+            } else if Self::should_hydrate_on_open(flags)
+                && let Err(_error) = self.hydrate_if_needed(ino)
+            {
                 reply.error(EIO);
                 return;
             }
@@ -1450,7 +1488,14 @@ pub mod runtime {
             self.drain_remote_updates();
 
             if let Some(size) = size {
-                if let Err(_error) = self.hydrate_if_needed(ino) {
+                let Some(node) = self.nodes.get(&ino) else {
+                    reply.error(ENOENT);
+                    return;
+                };
+
+                if Self::should_hydrate_for_size_change(node, size)
+                    && let Err(_error) = self.hydrate_if_needed(ino)
+                {
                     reply.error(EIO);
                     return;
                 }
@@ -1576,6 +1621,71 @@ pub mod runtime {
         drop(session);
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn placeholder_files_keep_remote_size_metadata() {
+            let plan = FuseActionPlan {
+                actions: vec![FuseAction::EnsurePlaceholder {
+                    path: "docs/report.txt".to_string(),
+                    remote_version: "v1".to_string(),
+                    remote_size: Some(4096),
+                }],
+            };
+
+            let fs = IronmeshFuseFs::from_action_plan(
+                &plan,
+                Box::new(DemoHydrator),
+                Box::new(DemoUploader),
+                None,
+            );
+
+            let report = fs
+                .nodes
+                .values()
+                .find(|node| node.name == "report.txt")
+                .expect("placeholder file missing");
+            assert_eq!(report.size, 4096);
+            assert_eq!(report.placeholder_version.as_deref(), Some("v1"));
+        }
+
+        #[test]
+        fn open_only_hydrates_for_write_without_truncate() {
+            assert!(!IronmeshFuseFs::should_hydrate_on_open(libc::O_RDONLY));
+            assert!(!IronmeshFuseFs::should_hydrate_on_open(
+                libc::O_WRONLY | libc::O_TRUNC
+            ));
+            assert!(IronmeshFuseFs::should_hydrate_on_open(libc::O_WRONLY));
+            assert!(IronmeshFuseFs::should_hydrate_on_open(libc::O_RDWR));
+        }
+
+        #[test]
+        fn no_op_size_updates_do_not_force_placeholder_hydration() {
+            let placeholder = FsNode::placeholder_file(
+                2,
+                "report.txt".to_string(),
+                ROOT_INODE,
+                "v1".to_string(),
+                2048,
+            );
+            let hydrated = FsNode::regular_file(3, "hydrated.txt".to_string(), ROOT_INODE);
+
+            assert!(!IronmeshFuseFs::should_hydrate_for_size_change(
+                &placeholder,
+                2048,
+            ));
+            assert!(IronmeshFuseFs::should_hydrate_for_size_change(
+                &placeholder,
+                1024,
+            ));
+            assert!(!IronmeshFuseFs::should_hydrate_for_size_change(
+                &hydrated, 0,
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1588,7 +1698,12 @@ mod tests {
         let adapter = LinuxFuseAdapter::new("ironmesh");
         let snapshot = SyncSnapshot {
             local: vec![],
-            remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+            remote: vec![NamespaceEntry::file_sized(
+                "docs/readme.md",
+                "v1",
+                "h1",
+                Some(123),
+            )],
         };
 
         let plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
@@ -1598,6 +1713,7 @@ mod tests {
             vec![FuseAction::EnsurePlaceholder {
                 path: "docs/readme.md".to_string(),
                 remote_version: "v1".to_string(),
+                remote_size: Some(123),
             }],
         );
     }

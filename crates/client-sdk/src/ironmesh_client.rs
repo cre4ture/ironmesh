@@ -46,6 +46,8 @@ pub struct StoreIndexEntry {
     pub version: Option<String>,
     #[serde(default)]
     pub content_hash: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -764,6 +766,7 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
                 entry_type: "prefix".to_string(),
                 version: None,
                 content_hash: None,
+                size_bytes: None,
             });
         }
     }
@@ -787,10 +790,11 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
         let content_hash = entry
             .content_hash
             .unwrap_or_else(|| format!("server-head:{}", entry.path));
-        remote.push(NamespaceEntry::file(
+        remote.push(NamespaceEntry::file_sized(
             entry.path.clone(),
             version,
             content_hash,
+            entry.size_bytes,
         ));
     }
 
@@ -827,12 +831,14 @@ mod tests {
                 entry_type: "prefix".to_string(),
                 version: None,
                 content_hash: None,
+                size_bytes: None,
             },
             StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
                 version: None,
                 content_hash: None,
+                size_bytes: Some(42),
             },
         ]);
 
@@ -841,10 +847,11 @@ mod tests {
         assert_eq!(snapshot.remote[0], NamespaceEntry::directory("docs"));
         assert_eq!(
             snapshot.remote[1],
-            NamespaceEntry::file(
+            NamespaceEntry::file_sized(
                 "docs/readme.txt",
                 "server-head",
-                "server-head:docs/readme.txt"
+                "server-head:docs/readme.txt",
+                Some(42),
             )
         );
     }
@@ -856,6 +863,7 @@ mod tests {
             entry_type: "key".to_string(),
             version: None,
             content_hash: None,
+            size_bytes: Some(7),
         }];
 
         ensure_missing_folder_markers(&mut entries);
@@ -875,12 +883,14 @@ mod tests {
                 entry_type: "prefix".to_string(),
                 version: None,
                 content_hash: None,
+                size_bytes: None,
             },
             StoreIndexEntry {
                 path: "docs/guides/readme.md".to_string(),
                 entry_type: "key".to_string(),
                 version: None,
                 content_hash: None,
+                size_bytes: Some(11),
             },
         ];
 

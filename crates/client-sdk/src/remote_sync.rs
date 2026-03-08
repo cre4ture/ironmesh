@@ -221,9 +221,11 @@ pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) ->
     changed_paths
 }
 
+type RemoteSnapshotIndex = BTreeMap<String, (EntryKind, Option<String>, Option<String>, Option<u64>)>;
+
 fn remote_snapshot_index(
     snapshot: &SyncSnapshot,
-) -> BTreeMap<String, (EntryKind, Option<String>, Option<String>)> {
+) -> RemoteSnapshotIndex {
     let mut index = BTreeMap::new();
     for entry in &snapshot.remote {
         index.insert(
@@ -232,6 +234,7 @@ fn remote_snapshot_index(
                 entry.kind,
                 entry.version.clone(),
                 entry.content_hash.clone(),
+                entry.size_bytes,
             ),
         );
     }
@@ -290,5 +293,31 @@ mod tests {
                 "docs/readme.md".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn changed_paths_between_detects_remote_size_only_changes() {
+        let previous = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file_sized(
+                "docs/readme.md",
+                "v1",
+                "h1",
+                Some(12),
+            )],
+        };
+        let current = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file_sized(
+                "docs/readme.md",
+                "v1",
+                "h1",
+                Some(24),
+            )],
+        };
+
+        let changed = changed_paths_between(&previous, &current);
+
+        assert_eq!(changed, vec!["docs/readme.md".to_string()]);
     }
 }

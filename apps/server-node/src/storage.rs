@@ -493,6 +493,19 @@ impl PersistentStore {
         self.current_state.objects.clone()
     }
 
+    pub async fn object_sizes_by_key(
+        &self,
+        object_hashes: &HashMap<String, String>,
+    ) -> Result<HashMap<String, u64>> {
+        let mut sizes = HashMap::with_capacity(object_hashes.len());
+        for (key, manifest_hash) in object_hashes {
+            if let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? {
+                sizes.insert(key.clone(), manifest.total_size_bytes as u64);
+            }
+        }
+        Ok(sizes)
+    }
+
     pub async fn snapshot_object_hashes(
         &self,
         snapshot_id: &str,

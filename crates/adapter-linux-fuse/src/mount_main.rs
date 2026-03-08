@@ -230,10 +230,12 @@ mod tests {
                 FuseAction::EnsurePlaceholder {
                     path: "docs/new.txt".to_string(),
                     remote_version: "v1".to_string(),
+                    remote_size: Some(12),
                 },
                 FuseAction::EnsurePlaceholder {
                     path: "notes/todo.txt".to_string(),
                     remote_version: "v3".to_string(),
+                    remote_size: Some(8),
                 },
             ],
         };
@@ -245,6 +247,7 @@ mod tests {
             vec![FuseAction::EnsurePlaceholder {
                 path: "docs/new.txt".to_string(),
                 remote_version: "v1".to_string(),
+                remote_size: Some(12),
             }],
         );
     }
@@ -255,6 +258,7 @@ mod tests {
             actions: vec![FuseAction::EnsurePlaceholder {
                 path: "docs/new.txt".to_string(),
                 remote_version: "v2".to_string(),
+                remote_size: Some(14),
             }],
         };
 
@@ -269,6 +273,7 @@ mod tests {
                 FuseAction::EnsurePlaceholder {
                     path: "docs/new.txt".to_string(),
                     remote_version: "v2".to_string(),
+                    remote_size: Some(14),
                 },
                 FuseAction::RemovePath {
                     path: "docs/old.txt".to_string(),
