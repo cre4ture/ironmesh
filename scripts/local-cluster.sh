@@ -24,9 +24,24 @@ node_bind() {
   echo "127.0.0.1:$(node_port "$idx")"
 }
 
+node_internal_port() {
+  local idx="$1"
+  echo "$((BASE_PORT + 10000 + idx - 1))"
+}
+
+node_internal_bind() {
+  local idx="$1"
+  echo "127.0.0.1:$(node_internal_port "$idx")"
+}
+
 node_url() {
   local idx="$1"
   echo "http://$(node_bind "$idx")"
+}
+
+node_internal_url() {
+  local idx="$1"
+  echo "https://$(node_internal_bind "$idx")"
 }
 
 pid_file() {
@@ -44,13 +59,127 @@ data_dir() {
   echo "${CLUSTER_DIR}/node${idx}"
 }
 
+shared_tls_dir() {
+  echo "${CLUSTER_DIR}/tls"
+}
+
+ca_cert_file() {
+  echo "$(shared_tls_dir)/ca.pem"
+}
+
+ca_key_file() {
+  echo "$(shared_tls_dir)/ca.key"
+}
+
+ca_serial_file() {
+  echo "$(shared_tls_dir)/ca.srl"
+}
+
+node_tls_dir() {
+  local idx="$1"
+  echo "$(data_dir "$idx")/tls"
+}
+
+node_cert_file() {
+  local idx="$1"
+  echo "$(node_tls_dir "$idx")/node.pem"
+}
+
+node_key_file() {
+  local idx="$1"
+  echo "$(node_tls_dir "$idx")/node.key"
+}
+
 ensure_binary() {
   if [[ -x "${BIN_PATH}" ]]; then
+    if [[ "${ROOT_DIR}/Cargo.toml" -ot "${BIN_PATH}" ]] \
+      && [[ "${ROOT_DIR}/Cargo.lock" -ot "${BIN_PATH}" ]] \
+      && [[ -z "$(find "${ROOT_DIR}/apps" "${ROOT_DIR}/crates" -type f -newer "${BIN_PATH}" -print -quit 2>/dev/null)" ]]; then
+      return 0
+    fi
+  fi
+
+  echo "[local-cluster] Building fresh server-node binary..."
+  (cd "${ROOT_DIR}" && cargo build -p server-node)
+}
+
+ensure_openssl() {
+  if command -v openssl >/dev/null 2>&1; then
     return 0
   fi
 
-  echo "[local-cluster] Building server-node binary..."
-  (cd "${ROOT_DIR}" && cargo build -p server-node)
+  echo "[local-cluster] ERROR: openssl is required to generate internal mTLS certificates" >&2
+  return 1
+}
+
+generate_ca() {
+  local tls_root
+  tls_root="$(shared_tls_dir)"
+  mkdir -p "${tls_root}"
+
+  echo "[local-cluster] Generating shared internal CA..."
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$(ca_key_file)" \
+    -out "$(ca_cert_file)" \
+    -days 3650 \
+    -sha256 \
+    -subj "/CN=ironmesh-local-cluster-ca" >/dev/null 2>&1
+}
+
+generate_node_cert() {
+  local idx="$1"
+  local tls_dir
+  tls_dir="$(node_tls_dir "$idx")"
+  mkdir -p "${tls_dir}"
+
+  local node_id
+  node_id="${NODE_IDS[$((idx - 1))]}"
+
+  local csr_path
+  csr_path="${tls_dir}/node.csr"
+
+  local ext_path
+  ext_path="${tls_dir}/openssl-node.cnf"
+
+  cat >"${ext_path}" <<EOF
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth,clientAuth
+subjectAltName=IP:127.0.0.1,URI:urn:ironmesh:node:${node_id}
+EOF
+
+  openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$(node_key_file "$idx")" \
+    -out "${csr_path}" \
+    -subj "/CN=ironmesh-node-${node_id}" >/dev/null 2>&1
+
+  openssl x509 -req \
+    -in "${csr_path}" \
+    -CA "$(ca_cert_file)" \
+    -CAkey "$(ca_key_file)" \
+    -CAcreateserial \
+    -CAserial "$(ca_serial_file)" \
+    -out "$(node_cert_file "$idx")" \
+    -days 3650 \
+    -sha256 \
+    -extfile "${ext_path}" >/dev/null 2>&1
+
+  rm -f "${csr_path}" "${ext_path}"
+}
+
+ensure_tls_material() {
+  ensure_openssl
+
+  if [[ ! -f "$(ca_cert_file)" || ! -f "$(ca_key_file)" ]]; then
+    generate_ca
+  fi
+
+  for idx in $(seq 1 "$NODE_COUNT"); do
+    if [[ ! -f "$(node_cert_file "$idx")" || ! -f "$(node_key_file "$idx")" ]]; then
+      echo "[local-cluster] Generating internal cert for node${idx}..."
+      generate_node_cert "$idx"
+    fi
+  done
 }
 
 wait_for_health() {
@@ -80,10 +209,14 @@ register_node() {
   local target_url
   target_url="$(node_url "$target_idx")"
 
+  local target_internal_url
+  target_internal_url="$(node_internal_url "$target_idx")"
+
   local payload
   payload=$(cat <<JSON
 {
   "public_url": "${target_url}",
+  "internal_url": "${target_internal_url}",
   "labels": {
     "region": "local",
     "dc": "local-dc",
@@ -112,6 +245,7 @@ register_full_mesh() {
 start_cluster() {
   mkdir -p "${CLUSTER_DIR}/pids" "${CLUSTER_DIR}/logs"
   ensure_binary
+  ensure_tls_material
 
   for idx in $(seq 1 "$NODE_COUNT"); do
     local pid_path
@@ -133,6 +267,12 @@ start_cluster() {
     local url
     url="$(node_url "$idx")"
 
+    local internal_bind
+    internal_bind="$(node_internal_bind "$idx")"
+
+    local internal_url
+    internal_url="$(node_internal_url "$idx")"
+
     local node_id
     node_id="${NODE_IDS[$((idx - 1))]}"
 
@@ -144,12 +284,18 @@ start_cluster() {
     logfile="$(log_file "$idx")"
 
     echo "[local-cluster] starting node${idx} on ${bind}"
-    IRONMESH_NODE_ID="${node_id}" \
-    IRONMESH_SERVER_BIND="${bind}" \
-    IRONMESH_PUBLIC_URL="${url}" \
-    IRONMESH_DATA_DIR="${ddir}" \
-    IRONMESH_REPLICATION_FACTOR=3 \
-    "${BIN_PATH}" >"${logfile}" 2>&1 &
+    nohup env \
+      IRONMESH_NODE_ID="${node_id}" \
+      IRONMESH_SERVER_BIND="${bind}" \
+      IRONMESH_PUBLIC_URL="${url}" \
+      IRONMESH_INTERNAL_BIND="${internal_bind}" \
+      IRONMESH_INTERNAL_URL="${internal_url}" \
+      IRONMESH_INTERNAL_TLS_CA_CERT="$(ca_cert_file)" \
+      IRONMESH_INTERNAL_TLS_CERT="$(node_cert_file "$idx")" \
+      IRONMESH_INTERNAL_TLS_KEY="$(node_key_file "$idx")" \
+      IRONMESH_DATA_DIR="${ddir}" \
+      IRONMESH_REPLICATION_FACTOR=3 \
+      "${BIN_PATH}" >"${logfile}" 2>&1 </dev/null &
 
     echo "$!" >"${pid_path}"
   done
@@ -201,6 +347,9 @@ status_cluster() {
     local bind
     bind="$(node_bind "$idx")"
 
+    local internal_bind
+    internal_bind="$(node_internal_bind "$idx")"
+
     local health="down"
     if curl -fsS "$(node_url "$idx")/health" >/dev/null 2>&1; then
       health="up"
@@ -210,16 +359,17 @@ status_cluster() {
       local pid
       pid="$(cat "${pid_path}")"
       if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
-        echo "  node${idx}: pid=${pid} bind=${bind} health=${health} data=$(data_dir "$idx")"
+        echo "  node${idx}: pid=${pid} public=${bind} internal=${internal_bind} health=${health} data=$(data_dir "$idx")"
       else
-        echo "  node${idx}: stale pid file bind=${bind} health=${health}"
+        echo "  node${idx}: stale pid file public=${bind} internal=${internal_bind} health=${health}"
       fi
     else
-      echo "  node${idx}: not running bind=${bind} health=${health}"
+      echo "  node${idx}: not running public=${bind} internal=${internal_bind} health=${health}"
     fi
   done
 
   echo "  logs: ${CLUSTER_DIR}/logs"
+  echo "  tls: $(shared_tls_dir)"
 }
 
 clean_cluster() {
@@ -236,6 +386,9 @@ Environment variables:
   IRONMESH_LOCAL_CLUSTER_DIR        Default: ${ROOT_DIR}/data/local-cluster
   IRONMESH_LOCAL_CLUSTER_BASE_PORT  Default: 18080
   IRONMESH_SERVER_BIN               Default: ${ROOT_DIR}/target/debug/server-node
+
+Requirements:
+  openssl                         Used to generate local internal mTLS certificates
 EOF
 }
 

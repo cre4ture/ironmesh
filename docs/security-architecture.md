@@ -23,8 +23,13 @@ This document replaces ad-hoc security decisions with one coherent model.
 These controls are transitional and not sufficient as final architecture.
 
 ## 3. Trust Boundaries
+Definition:
+- A "plane" is a class of operations and APIs that shares the same security boundary and policy model.
+- A plane is not the same thing as an app/binary. Multiple apps may operate on the same plane.
+
 - Data plane:
   - object transfer (`put/get/delete`, replication flows).
+  - regular clients operate here, including `ironmesh-folder-agent`, CLI clients, platform adapters, and future user-facing clients.
 - Control plane:
   - node membership, maintenance, restore/purge tooling.
 - Admin plane:
@@ -35,7 +40,8 @@ Each plane must be independently authenticated, authorized, encrypted, and audit
 ## 4. Identity and Authentication
 ### 4.1 Service Identity
 - Every server-node gets a unique workload identity (certificate subject/SPIFFE-like ID).
-- Every agent gets a unique device/workload identity.
+- Every non-node client gets a unique client/device/workload identity.
+- `ironmesh-folder-agent` is one client implementation under this model; it is not a separate security plane.
 
 ### 4.1.2 Suggested Rust Library Stack (Pure Rust)
 Cluster-internal mTLS (server-node <-> server-node) can be implemented with the following Rust crates:
@@ -71,7 +77,7 @@ Certificate rotation:
 - Require TLS for all HTTP traffic.
 - Prefer mTLS for:
   - server-node <-> server-node,
-  - folder-agent <-> server-node.
+  - client <-> server-node (including `ironmesh-folder-agent`).
 - Reject plaintext HTTP outside explicit local-dev mode.
 
 ### 4.3 Human/Admin Authentication
