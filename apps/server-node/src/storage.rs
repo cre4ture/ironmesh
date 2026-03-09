@@ -197,6 +197,34 @@ pub struct AdminAuditEvent {
     pub created_at_unix: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClientAuthState {
+    #[serde(default)]
+    pub pairing_tokens: Vec<PairingTokenRecord>,
+    #[serde(default)]
+    pub devices: Vec<DeviceAuthRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingTokenRecord {
+    pub token_id: String,
+    pub token_hash: String,
+    pub label: Option<String>,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub used_at_unix: Option<u64>,
+    pub enrolled_device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceAuthRecord {
+    pub device_id: String,
+    pub label: Option<String>,
+    pub token_hash: String,
+    pub created_at_unix: u64,
+    pub revoked_at_unix: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum StoreReadError {
     NotFound,
@@ -351,6 +379,7 @@ pub struct PersistentStore {
     current_state_path: PathBuf,
     repair_attempts_path: PathBuf,
     cluster_replicas_path: PathBuf,
+    client_auth_state_path: PathBuf,
     admin_audit_log_path: PathBuf,
     media_metadata_dir: PathBuf,
     media_thumbnails_dir: PathBuf,
@@ -387,6 +416,7 @@ impl PersistentStore {
         let current_state_path = state_dir.join("current.json");
         let repair_attempts_path = state_dir.join("repair_attempts.json");
         let cluster_replicas_path = state_dir.join("cluster_replicas.json");
+        let client_auth_state_path = state_dir.join("client_auth.json");
         let admin_audit_log_path = state_dir.join("admin_audit.jsonl");
         let media_cache_dir = state_dir.join("media_cache");
         let media_metadata_dir = media_cache_dir.join("metadata");
@@ -420,6 +450,7 @@ impl PersistentStore {
             current_state_path,
             repair_attempts_path,
             cluster_replicas_path,
+            client_auth_state_path,
             admin_audit_log_path,
             media_metadata_dir,
             media_thumbnails_dir,
@@ -475,6 +506,27 @@ impl PersistentStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(replicas)?;
         write_atomic(&self.cluster_replicas_path, &payload).await
+    }
+
+    pub async fn load_client_auth_state(&self) -> Result<ClientAuthState> {
+        if !fs::try_exists(&self.client_auth_state_path).await? {
+            return Ok(ClientAuthState::default());
+        }
+
+        let payload = fs::read(&self.client_auth_state_path).await?;
+        let state = serde_json::from_slice::<ClientAuthState>(&payload).with_context(|| {
+            format!(
+                "invalid client auth state: {}",
+                self.client_auth_state_path.display()
+            )
+        })?;
+
+        Ok(state)
+    }
+
+    pub async fn persist_client_auth_state(&self, state: &ClientAuthState) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(state)?;
+        write_atomic(&self.client_auth_state_path, &payload).await
     }
 
     pub fn root_dir(&self) -> &Path {

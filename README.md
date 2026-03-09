@@ -241,17 +241,35 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ### Internal replication security
 
-- Internal replication mutation endpoints can be restricted with:
-	- `IRONMESH_INTERNAL_NODE_TOKENS` (per-node token map: `<node_uuid>=<token>,<node_uuid>=<token>,...`).
-- When configured, the local server node id must have a token entry in `IRONMESH_INTERNAL_NODE_TOKENS`.
-- Duplicate node ids in `IRONMESH_INTERNAL_NODE_TOKENS` are rejected at startup.
-- When auth is configured, requests to these endpoints must include headers:
-	- `x-ironmesh-internal-token: <token>`
-	- `x-ironmesh-node-id: <uuid>` (must be a registered cluster node)
-- The token must match the caller node id entry in `IRONMESH_INTERNAL_NODE_TOKENS`.
-- Token updates are persisted in node state and take effect without restart.
+- Internal cluster traffic now uses a dedicated mTLS listener.
+- Required server env:
+	- `IRONMESH_INTERNAL_BIND`
+	- `IRONMESH_INTERNAL_URL`
+	- `IRONMESH_INTERNAL_TLS_CA_CERT`
+	- `IRONMESH_INTERNAL_TLS_CERT`
+	- `IRONMESH_INTERNAL_TLS_KEY`
+- Peer node identity is derived from the client certificate SAN:
+	- `urn:ironmesh:node:<uuid>`
+- This internal listener is used for node-to-node replication, reconcile, and heartbeat traffic.
 
-- Token lifecycle endpoints:
+- Obsolete note: the old internal token lifecycle bullets below are no longer current. Internal node traffic now uses mTLS as described above.
+
+### Client device authentication
+
+- Public client auth can be enabled with:
+	- `IRONMESH_REQUIRE_CLIENT_AUTH=true`
+- Admin can issue one-time pairing tokens:
+	- `POST /auth/pairing-tokens/issue`
+	- header: `x-ironmesh-admin-token: <admin token>`
+- Devices enroll with a pairing token and receive a bearer token:
+	- `POST /auth/device/enroll`
+- Admin can inspect and revoke enrolled devices:
+	- `GET /auth/devices`
+	- `DELETE /auth/devices/{device_id}`
+- When client auth is enabled, data-plane routes require:
+	- `Authorization: Bearer <device token>`
+
+- Historical token lifecycle bullets:
 	- `GET /cluster/internal-auth/tokens` — list configured node ids
 	- `POST /cluster/internal-auth/tokens/rotate` — set/replace token for a node (`{"node_id":"<uuid>","token":"..."}`)
 	- `DELETE /cluster/internal-auth/tokens/{node_id}` — revoke token for a node (local node token revocation is rejected)

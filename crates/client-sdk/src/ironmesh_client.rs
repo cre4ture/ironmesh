@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
+use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 pub struct IronMeshClient {
     http: HttpClient,
     server_base_url: String,
+    bearer_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +132,20 @@ impl IronMeshClient {
         Self {
             http: HttpClient::new(),
             server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
+            bearer_token: None,
+        }
+    }
+
+    pub fn with_bearer_token(mut self, bearer_token: impl Into<String>) -> Self {
+        self.bearer_token = Some(bearer_token.into());
+        self
+    }
+
+    fn apply_auth(&self, request: RequestBuilder) -> RequestBuilder {
+        if let Some(token) = self.bearer_token.as_deref() {
+            request.bearer_auth(token)
+        } else {
+            request
         }
     }
 
@@ -137,8 +153,7 @@ impl IronMeshClient {
         let key = key.into();
         let url = self.store_key_url(&key)?;
 
-        self.http
-            .put(url)
+        self.apply_auth(self.http.put(url))
             .body(data.clone())
             .send()
             .await
@@ -165,7 +180,7 @@ impl IronMeshClient {
         let key = key.as_ref();
         let url = self.store_key_url(key)?;
 
-        let mut request = self.http.get(url);
+        let mut request = self.apply_auth(self.http.get(url));
         if let Some(snapshot) = snapshot {
             request = request.query(&[("snapshot", snapshot)]);
         }
@@ -195,8 +210,7 @@ impl IronMeshClient {
         let url = self.store_rename_url()?;
 
         let response = self
-            .http
-            .post(url)
+            .apply_auth(self.http.post(url))
             .json(&PathMutationRequest {
                 from_path: from_path.clone(),
                 to_path: to_path.clone(),
@@ -227,8 +241,7 @@ impl IronMeshClient {
         let url = self.store_copy_url()?;
 
         let response = self
-            .http
-            .post(url)
+            .apply_auth(self.http.post(url))
             .json(&PathMutationRequest {
                 from_path: from_path.clone(),
                 to_path: to_path.clone(),
@@ -253,8 +266,7 @@ impl IronMeshClient {
         let url = self.store_delete_url()?;
 
         let response = self
-            .http
-            .post(url)
+            .apply_auth(self.http.post(url))
             .query(&[("key", key)])
             .send()
             .await
@@ -275,8 +287,7 @@ impl IronMeshClient {
         let url = self.store_index_url()?;
 
         let mut request = self
-            .http
-            .get(url)
+            .apply_auth(self.http.get(url))
             .query(&[("depth", depth.max(1).to_string())]);
         if let Some(prefix) = prefix {
             request = request.query(&[("prefix", prefix)]);
@@ -379,8 +390,7 @@ impl IronMeshClient {
             let mut chunk_refs = Vec::new();
             for chunk in data.chunks(CHUNK_UPLOAD_SIZE_BYTES) {
                 let response = self
-                    .http
-                    .post(&chunk_upload_url)
+                    .apply_auth(self.http.post(&chunk_upload_url))
                     .body(chunk.to_vec())
                     .send()
                     .await
@@ -404,8 +414,7 @@ impl IronMeshClient {
                 chunks: chunk_refs,
             };
 
-            self.http
-                .post(complete_url)
+            self.apply_auth(self.http.post(complete_url))
                 .json(&complete_payload)
                 .send()
                 .await
@@ -489,8 +498,7 @@ impl IronMeshClient {
 
             let response = runtime
                 .block_on(
-                    self.http
-                        .post(&chunk_upload_url)
+                    self.apply_auth(self.http.post(&chunk_upload_url))
                         .body(chunk[..read_bytes].to_vec())
                         .send(),
                 )
@@ -524,7 +532,11 @@ impl IronMeshClient {
         };
 
         runtime
-            .block_on(self.http.post(complete_url).json(&complete_payload).send())
+            .block_on(
+                self.apply_auth(self.http.post(complete_url))
+                    .json(&complete_payload)
+                    .send(),
+            )
             .with_context(|| format!("failed to finalize chunked upload for key={key}"))?
             .error_for_status()
             .with_context(|| format!("chunked finalize rejected for key={key}"))?;
@@ -550,7 +562,7 @@ impl IronMeshClient {
         let key = key.as_ref();
         let url = self.store_key_url(key)?;
 
-        let mut request = self.http.get(url);
+        let mut request = self.apply_auth(self.http.get(url));
         if let Some(snapshot) = snapshot {
             request = request.query(&[("snapshot", snapshot)]);
         }
@@ -597,7 +609,7 @@ impl IronMeshClient {
         let key = key.as_ref();
         let url = self.store_key_url(key)?;
 
-        let mut request = self.http.head(url);
+        let mut request = self.apply_auth(self.http.head(url));
         if let Some(snapshot) = snapshot {
             request = request.query(&[("snapshot", snapshot)]);
         }

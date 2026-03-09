@@ -12,10 +12,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
+use axum::Router;
+use axum::body::Body;
 use axum::body::to_bytes;
-use axum::http::HeaderMap;
+use axum::extract::{Json, State};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::get;
 use std::collections::HashMap;
 use tokio::time::{Duration, Instant};
+use tower::ServiceExt;
 
 #[test]
 fn jittered_backoff_is_deterministic_for_same_inputs() {
@@ -94,6 +100,102 @@ async fn admin_authorization_requires_explicit_approval_for_destructive_action()
         result.err(),
         Some(axum::http::StatusCode::PRECONDITION_FAILED)
     );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn enroll_client_device_consumes_pairing_token_and_persists_device() {
+    let state = build_test_state(1, false).await;
+    let now = super::unix_ts();
+    {
+        let mut auth = state.client_auth.lock().await;
+        auth.pairing_tokens.push(super::PairingTokenRecord {
+            token_id: "pair-1".to_string(),
+            token_hash: super::hash_token("pair-secret"),
+            label: Some("Pixel".to_string()),
+            created_at_unix: now,
+            expires_at_unix: now + 300,
+            used_at_unix: None,
+            enrolled_device_id: None,
+        });
+    }
+
+    let response = super::enroll_client_device(
+        State(state.clone()),
+        Json(super::ClientDeviceEnrollRequest {
+            pairing_token: "pair-secret".to_string(),
+            device_id: Some("device-a".to_string()),
+            label: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let enrolled: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(enrolled["device_id"], "device-a");
+    assert!(
+        enrolled["device_token"]
+            .as_str()
+            .unwrap()
+            .starts_with("im-dev-")
+    );
+
+    let auth = state.client_auth.lock().await;
+    assert_eq!(auth.devices.len(), 1);
+    assert_eq!(auth.devices[0].device_id, "device-a");
+    assert!(auth.pairing_tokens[0].used_at_unix.is_some());
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn client_auth_middleware_requires_valid_bearer_when_enabled() {
+    let mut state = build_test_state(1, false).await;
+    state.client_auth_control.require_client_auth = true;
+    {
+        let mut auth = state.client_auth.lock().await;
+        auth.devices.push(super::DeviceAuthRecord {
+            device_id: "device-a".to_string(),
+            label: Some("Pixel".to_string()),
+            token_hash: super::hash_token("device-secret"),
+            created_at_unix: super::unix_ts(),
+            revoked_at_unix: None,
+        });
+    }
+
+    let app = Router::new()
+        .route("/store/index", get(|| async { StatusCode::OK }))
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::require_client_auth,
+        ));
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/store/index")
+                .header("Authorization", "Bearer device-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
 
     cleanup_test_state(&state).await;
 }
@@ -368,6 +470,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
         node_id: local_node_id,
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
+        client_auth: Arc::new(Mutex::new(super::storage::ClientAuthState::default())),
         metadata_commit_mode: MetadataCommitMode::Local,
         internal_http: reqwest::Client::new(),
         autonomous_replication_on_put_enabled: false,
@@ -392,6 +495,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
         startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         admin_control: AdminControl::default(),
+        client_auth_control: super::ClientAuthControl::default(),
     };
 
     if seed_gap {

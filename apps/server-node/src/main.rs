@@ -60,9 +60,10 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
 
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
-    AdminAuditEvent, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, ObjectReadMode,
-    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    StoreReadError, UploadChunkRef, VersionConsistencyState,
+    AdminAuditEvent, ClientAuthState, DeviceAuthRecord, MediaCacheLookup, MediaCacheStatus,
+    MediaGpsCoordinates, ObjectReadMode, PairingTokenRecord, PathMutationResult, PersistentStore,
+    PutOptions, ReconcileVersionEntry, RepairAttemptRecord, StoreReadError, UploadChunkRef,
+    VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -70,6 +71,7 @@ struct ServerState {
     node_id: NodeId,
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
+    client_auth: Arc<Mutex<ClientAuthState>>,
     metadata_commit_mode: MetadataCommitMode,
     internal_http: reqwest::Client,
     autonomous_replication_on_put_enabled: bool,
@@ -81,11 +83,29 @@ struct ServerState {
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
     admin_control: AdminControl,
+    client_auth_control: ClientAuthControl,
 }
 
 #[derive(Debug, Clone)]
 struct InternalCaller {
     node_id: NodeId,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClientAuthControl {
+    require_client_auth: bool,
+}
+
+impl ClientAuthControl {
+    fn from_env() -> Self {
+        let require_client_auth = std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(false);
+        Self {
+            require_client_auth,
+        }
+    }
 }
 
 impl<S> FromRequestParts<S> for InternalCaller
@@ -118,6 +138,60 @@ async fn require_internal_caller(
     }
 
     Ok(next.run(request).await)
+}
+
+async fn require_client_auth(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> std::result::Result<Response, StatusCode> {
+    if !state.client_auth_control.require_client_auth {
+        return Ok(next.run(request).await);
+    }
+
+    let provided = extract_bearer_token(request.headers()).ok_or(StatusCode::UNAUTHORIZED)?;
+    let provided_hash = hash_token(provided);
+    let auth_state = state.client_auth.lock().await;
+    let authorized = auth_state.devices.iter().any(|device| {
+        device.revoked_at_unix.is_none()
+            && token_matches(device.token_hash.as_str(), Some(provided_hash.as_str()))
+    });
+    drop(auth_state);
+
+    if !authorized {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn hash_token(token: &str) -> String {
+    blake3::hash(token.as_bytes()).to_hex().to_string()
+}
+
+fn generate_pairing_token() -> String {
+    format!(
+        "im-pair-{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn generate_device_token() -> String {
+    format!(
+        "im-dev-{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
 }
 
 #[derive(Clone)]
@@ -599,6 +673,7 @@ async fn main() -> Result<()> {
             .unwrap_or(true);
     let peer_heartbeat_config = PeerHeartbeatConfig::from_env();
     let admin_control = AdminControl::from_env();
+    let client_auth_control = ClientAuthControl::from_env();
     let startup_repair_status = if repair_config.startup_repair_enabled {
         StartupRepairStatus::Scheduled
     } else {
@@ -643,10 +718,22 @@ async fn main() -> Result<()> {
     };
     cluster.import_replicas_by_key(persisted_cluster_replicas);
 
+    let persisted_client_auth = {
+        let store_guard = store.lock().await;
+        match store_guard.load_client_auth_state().await {
+            Ok(state) => state,
+            Err(err) => {
+                warn!(error = %err, "failed to load client auth state; starting empty");
+                ClientAuthState::default()
+            }
+        }
+    };
+
     let state = ServerState {
         node_id,
         store,
         cluster: Arc::new(Mutex::new(cluster)),
+        client_auth: Arc::new(Mutex::new(persisted_client_auth)),
         metadata_commit_mode,
         internal_http,
         autonomous_replication_on_put_enabled,
@@ -658,6 +745,7 @@ async fn main() -> Result<()> {
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         admin_control,
+        client_auth_control,
     };
 
     let persisted_attempts = {
@@ -705,12 +793,7 @@ async fn main() -> Result<()> {
         &internal_tls_key_path,
     )?;
 
-    let public_app = Router::new()
-        .route("/", get(ui::index))
-        .route("/ui/app.css", get(ui::app_css))
-        .route("/ui/app.js", get(ui::app_js))
-        .route("/logs", get(ui::list_logs))
-        .route("/health", get(health))
+    let public_client_api = Router::new()
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route("/media/thumbnail", get(get_media_thumbnail))
@@ -731,6 +814,26 @@ async fn main() -> Result<()> {
             post(confirm_version),
         )
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_auth,
+        ));
+
+    let public_admin_api = Router::new()
+        .route("/auth/devices", get(list_client_devices))
+        .route(
+            "/auth/devices/{device_id}",
+            axum::routing::delete(revoke_client_device),
+        )
+        .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
+
+    let public_app = Router::new()
+        .route("/", get(ui::index))
+        .route("/ui/app.css", get(ui::app_css))
+        .route("/ui/app.js", get(ui::app_js))
+        .route("/logs", get(ui::list_logs))
+        .route("/health", get(health))
+        .route("/auth/device/enroll", post(enroll_client_device))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
         .route(
@@ -769,6 +872,8 @@ async fn main() -> Result<()> {
             "/maintenance/tombstones/archive/purge",
             post(run_tombstone_archive_purge),
         )
+        .merge(public_admin_api)
+        .merge(public_client_api)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2168,6 +2273,306 @@ struct TombstoneRestoreQuery {
     overwrite: Option<bool>,
     dry_run: Option<bool>,
     approve: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairingTokenIssueRequest {
+    label: Option<String>,
+    expires_in_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PairingTokenIssueResponse {
+    token_id: String,
+    pairing_token: String,
+    label: Option<String>,
+    created_at_unix: u64,
+    expires_at_unix: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientDeviceEnrollRequest {
+    pairing_token: String,
+    device_id: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientDeviceEnrollResponse {
+    device_id: String,
+    device_token: String,
+    label: Option<String>,
+    created_at_unix: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientDeviceView {
+    device_id: String,
+    label: Option<String>,
+    created_at_unix: u64,
+    revoked_at_unix: Option<u64>,
+}
+
+async fn persist_client_auth_state(state: &ServerState) -> Result<()> {
+    let snapshot = {
+        let auth = state.client_auth.lock().await;
+        auth.clone()
+    };
+    let store = state.store.lock().await;
+    store.persist_client_auth_state(&snapshot).await
+}
+
+async fn issue_pairing_token(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<PairingTokenIssueRequest>,
+) -> impl IntoResponse {
+    let action = "auth/pairing-tokens/issue";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "label": request.label,
+            "expires_in_secs": request.expires_in_secs,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let now = unix_ts();
+    let expires_in_secs = request
+        .expires_in_secs
+        .unwrap_or(15 * 60)
+        .clamp(60, 24 * 60 * 60);
+    let pairing_token = generate_pairing_token();
+    let record = PairingTokenRecord {
+        token_id: Uuid::now_v7().to_string(),
+        token_hash: hash_token(&pairing_token),
+        label: request.label.clone(),
+        created_at_unix: now,
+        expires_at_unix: now + expires_in_secs,
+        used_at_unix: None,
+        enrolled_device_id: None,
+    };
+
+    {
+        let mut auth_state = state.client_auth.lock().await;
+        auth_state
+            .pairing_tokens
+            .retain(|token| token.used_at_unix.is_none() && token.expires_at_unix > now);
+        auth_state.pairing_tokens.push(record.clone());
+    }
+
+    if let Err(err) = persist_client_auth_state(&state).await {
+        warn!(error = %err, "failed to persist client auth state after pairing token issue");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "token_id": record.token_id,
+            "label": record.label,
+            "expires_at_unix": record.expires_at_unix,
+        }),
+    )
+    .await;
+
+    (
+        StatusCode::CREATED,
+        Json(PairingTokenIssueResponse {
+            token_id: record.token_id,
+            pairing_token,
+            label: record.label,
+            created_at_unix: record.created_at_unix,
+            expires_at_unix: record.expires_at_unix,
+        }),
+    )
+        .into_response()
+}
+
+async fn enroll_client_device(
+    State(state): State<ServerState>,
+    Json(request): Json<ClientDeviceEnrollRequest>,
+) -> impl IntoResponse {
+    let pairing_token = request.pairing_token.trim();
+    if pairing_token.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let now = unix_ts();
+    let device_id = request
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    let provided_hash = hash_token(pairing_token);
+    let label = request
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let device_token = generate_device_token();
+    let device_token_hash = hash_token(&device_token);
+
+    let response = {
+        let mut auth_state = state.client_auth.lock().await;
+        auth_state
+            .pairing_tokens
+            .retain(|token| token.used_at_unix.is_none() && token.expires_at_unix > now);
+
+        if auth_state
+            .devices
+            .iter()
+            .any(|device| device.device_id == device_id && device.revoked_at_unix.is_none())
+        {
+            return StatusCode::CONFLICT.into_response();
+        }
+
+        let Some(token_record) = auth_state.pairing_tokens.iter_mut().find(|token| {
+            token.used_at_unix.is_none()
+                && token.expires_at_unix > now
+                && token_matches(token.token_hash.as_str(), Some(provided_hash.as_str()))
+        }) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+
+        token_record.used_at_unix = Some(now);
+        token_record.enrolled_device_id = Some(device_id.clone());
+
+        let final_label = label.or_else(|| token_record.label.clone());
+        let device = DeviceAuthRecord {
+            device_id: device_id.clone(),
+            label: final_label.clone(),
+            token_hash: device_token_hash,
+            created_at_unix: now,
+            revoked_at_unix: None,
+        };
+        auth_state.devices.push(device);
+
+        ClientDeviceEnrollResponse {
+            device_id,
+            device_token,
+            label: final_label,
+            created_at_unix: now,
+        }
+    };
+
+    if let Err(err) = persist_client_auth_state(&state).await {
+        warn!(error = %err, "failed to persist client auth state after enrollment");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+async fn list_client_devices(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/devices/list";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let devices = {
+        let auth_state = state.client_auth.lock().await;
+        auth_state
+            .devices
+            .iter()
+            .map(|device| ClientDeviceView {
+                device_id: device.device_id.clone(),
+                label: device.label.clone(),
+                created_at_unix: device.created_at_unix,
+                revoked_at_unix: device.revoked_at_unix,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({ "devices": devices.len() }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(devices)).into_response()
+}
+
+async fn revoke_client_device(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> impl IntoResponse {
+    let action = "auth/devices/revoke";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "device_id": device_id }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let now = unix_ts();
+    let revoked = {
+        let mut auth_state = state.client_auth.lock().await;
+        let Some(device) = auth_state
+            .devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id && device.revoked_at_unix.is_none())
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        device.revoked_at_unix = Some(now);
+        true
+    };
+
+    if revoked && let Err(err) = persist_client_auth_state(&state).await {
+        warn!(error = %err, "failed to persist client auth state after device revocation");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({ "device_id": device_id }),
+    )
+    .await;
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn cluster_status(State(state): State<ServerState>) -> Json<cluster::ClusterSummary> {
