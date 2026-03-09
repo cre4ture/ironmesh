@@ -2,8 +2,13 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::framework::{fresh_data_dir, start_server};
-    use crate::framework_win::{start_cfapi_adapter, start_cfapi_adapter_with_refresh};
+    use crate::framework::{
+        fresh_data_dir, issue_pairing_token, start_server, start_server_with_env, stop_server,
+    };
+    use crate::framework_win::{
+        start_cfapi_adapter, start_cfapi_adapter_with_refresh,
+        start_cfapi_adapter_with_refresh_and_pairing,
+    };
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
     use reqwest::Client;
@@ -102,6 +107,30 @@ mod tests {
         panic!(
             "placeholder did not hydrate at {} (expected {} bytes, got {} bytes)",
             path.display(),
+            expected.len(),
+            final_bytes.len()
+        );
+    }
+
+    async fn wait_for_remote_payload(
+        sdk: &IronMeshClient,
+        key: &str,
+        expected: &[u8],
+        retries: usize,
+    ) {
+        for _ in 0..retries {
+            if let Ok(bytes) = sdk.get(key).await
+                && bytes.as_ref() == expected
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let final_bytes = sdk.get(key).await.unwrap_or_default();
+        panic!(
+            "remote payload did not match for {key} (expected {} bytes, got {} bytes)",
             expected.len(),
             final_bytes.len()
         );
@@ -426,5 +455,106 @@ mod tests {
 
         wait_for_remote_directory_presence_any_shape(&sdk, "rename-empty/to", 220).await;
         wait_for_remote_directory_absence(&sdk, "rename-empty/from", 220).await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_adapter_enrolls_and_uses_client_auth() {
+        let bind = "127.0.0.1:19097";
+        let base_url = format!("http://{bind}");
+        let admin_token = "system-tests-admin-secret";
+        let server_data_dir = fresh_data_dir("cfapi-auth-server");
+        let sync_root = fresh_data_dir("cfapi-auth-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+        let mut server = start_server_with_env(
+            bind,
+            &server_data_dir,
+            "",
+            1,
+            &[
+                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+                ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ],
+        )
+        .await
+        .expect("failed to start auth-enabled server-node");
+
+        let result = async {
+            let http = Client::new();
+            let pairing_token = issue_pairing_token(
+                &http,
+                &base_url,
+                admin_token,
+                Some("cfapi-system-test"),
+                Some(600),
+            )
+            .await?;
+
+            let sync_root_id = format!(
+                "ironmesh.systemtest.authenticated.{}",
+                bind.replace(['.', ':'], "_")
+            );
+            let _adapter = start_cfapi_adapter_with_refresh_and_pairing(
+                &sync_root_id,
+                "ironmesh System Test Authenticated Root",
+                &sync_root,
+                &base_url,
+                500,
+                Some(&pairing_token),
+            )
+            .await?;
+
+            let auth_file = sync_root.join(".ironmesh-device-auth.json");
+            wait_for_path(&auth_file, 120).await;
+
+            let auth_payload = std::fs::read_to_string(&auth_file)
+                .expect("failed to read persisted device auth file");
+            let auth_json: serde_json::Value = serde_json::from_str(&auth_payload)
+                .expect("failed to parse persisted device auth file");
+            let device_token = auth_json
+                .get("device_token")
+                .and_then(|value| value.as_str())
+                .expect("device_token missing in persisted auth file")
+                .to_string();
+
+            let sdk = IronMeshClient::new(&base_url).with_bearer_token(device_token);
+
+            let local_file = sync_root.join("authenticated-upload.txt");
+            std::fs::write(&local_file, b"cfapi auth upload")
+                .expect("failed to write local file for authenticated upload");
+            wait_for_remote_payload(&sdk, "authenticated-upload.txt", b"cfapi auth upload", 220)
+                .await;
+            let index = sdk
+                .store_index(None, 64, None)
+                .await
+                .expect("failed to inspect remote index after authenticated upload");
+            assert!(
+                index
+                    .entries
+                    .iter()
+                    .all(|entry| entry.path != ".ironmesh-device-auth.json"),
+                "internal auth file leaked into remote namespace"
+            );
+
+            sdk.put_large_aware(
+                "remote-auth/seeded.txt",
+                Bytes::from_static(b"remote auth payload"),
+            )
+            .await
+            .expect("failed to seed authenticated remote file");
+
+            let remote_file = sync_root.join("remote-auth").join("seeded.txt");
+            wait_for_path(&remote_file, 250).await;
+            wait_for_hydrated_payload(&remote_file, b"remote auth payload", 200).await;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = std::fs::remove_dir_all(&server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+
+        result.expect("authenticated CFAPI adapter flow failed");
     }
 }

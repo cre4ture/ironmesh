@@ -23,6 +23,9 @@ class FolderSyncWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val baseUrl = IronmeshPreferences.getBaseUrl(applicationContext)
+        val authToken = IronmeshPreferences.getDeviceAuthState(applicationContext)
+            .deviceToken
+            .takeIf { it.isNotBlank() }
         val profiles = IronmeshPreferences
             .getFolderSyncConfigs(applicationContext)
             .filter { it.enabled }
@@ -35,7 +38,7 @@ class FolderSyncWorker(
 
         for (profile in profiles) {
             runCatching {
-                syncProfile(baseUrl, profile)
+                syncProfile(baseUrl, authToken, profile)
             }.onFailure { error ->
                 failures += "${profile.label}: ${error.message ?: "unknown"}"
                 Log.e(TAG, "folder sync failed for profile=${profile.id}", error)
@@ -49,7 +52,7 @@ class FolderSyncWorker(
         }
     }
 
-    private suspend fun syncProfile(baseUrl: String, profile: FolderSyncConfig) {
+    private suspend fun syncProfile(baseUrl: String, authToken: String?, profile: FolderSyncConfig) {
         val scope = SyncPathScope(profile.prefix)
         val localRoot = File(profile.localFolder)
         if (!localRoot.exists()) {
@@ -66,6 +69,7 @@ class FolderSyncWorker(
             prefix = scope.remotePrefixOrNull(),
             depth = profile.depth.coerceAtLeast(1),
             snapshot = null,
+            authToken = authToken,
         )
 
         val remoteFiles = mutableSetOf<String>()
@@ -99,7 +103,7 @@ class FolderSyncWorker(
             localFile.parentFile?.mkdirs()
             val remoteKey = scope.localToRemote(relativePath)
             FileOutputStream(localFile).use { output ->
-                repository.streamObjectTo(baseUrl, remoteKey, output)
+                repository.streamObjectTo(baseUrl, remoteKey, output, authToken = authToken)
             }
         }
 
@@ -111,7 +115,7 @@ class FolderSyncWorker(
                 continue
             }
             val markerKey = scope.localToRemote(directory).trimEnd('/') + "/"
-            repository.putObjectBytes(baseUrl, markerKey, ByteArray(0))
+            repository.putObjectBytes(baseUrl, markerKey, ByteArray(0), authToken)
         }
 
         // Upload local new/changed files.
@@ -124,7 +128,7 @@ class FolderSyncWorker(
 
             val remoteKey = scope.localToRemote(relativePath)
             FileInputStream(File(localRoot, relativePath)).use { input ->
-                repository.streamPutObject(baseUrl, remoteKey, input)
+                repository.streamPutObject(baseUrl, remoteKey, input, authToken)
             }
         }
 
@@ -136,7 +140,7 @@ class FolderSyncWorker(
             }
 
             val remoteKey = scope.localToRemote(relativePath)
-            repository.deleteObject(baseUrl, remoteKey)
+            repository.deleteObject(baseUrl, remoteKey, authToken)
         }
 
         val finalState = scanLocalTree(localRoot)

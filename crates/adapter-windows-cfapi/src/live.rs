@@ -9,10 +9,12 @@ pub struct ServerNodeHydrator {
 }
 
 impl ServerNodeHydrator {
-    pub fn new(base_url: Url) -> Self {
-        Self {
-            sdk: IronMeshClient::new(base_url.as_str()),
-        }
+    pub fn new(base_url: Url, bearer_token: Option<String>) -> Self {
+        let sdk = match bearer_token {
+            Some(token) => IronMeshClient::new(base_url.as_str()).with_bearer_token(token),
+            None => IronMeshClient::new(base_url.as_str()),
+        };
+        Self { sdk }
     }
 }
 

@@ -15,8 +15,15 @@ pub async fn start_cfapi_adapter(
     root_path: &Path,
     server_base_url: &str,
 ) -> Result<ChildGuard> {
-    start_cfapi_adapter_with_refresh(sync_root_id, display_name, root_path, server_base_url, 500)
-        .await
+    start_cfapi_adapter_with_refresh_and_pairing(
+        sync_root_id,
+        display_name,
+        root_path,
+        server_base_url,
+        500,
+        None,
+    )
+    .await
 }
 
 pub async fn start_cfapi_adapter_with_refresh(
@@ -25,6 +32,25 @@ pub async fn start_cfapi_adapter_with_refresh(
     root_path: &Path,
     server_base_url: &str,
     remote_refresh_interval_ms: u64,
+) -> Result<ChildGuard> {
+    start_cfapi_adapter_with_refresh_and_pairing(
+        sync_root_id,
+        display_name,
+        root_path,
+        server_base_url,
+        remote_refresh_interval_ms,
+        None,
+    )
+    .await
+}
+
+pub async fn start_cfapi_adapter_with_refresh_and_pairing(
+    sync_root_id: &str,
+    display_name: &str,
+    root_path: &Path,
+    server_base_url: &str,
+    remote_refresh_interval_ms: u64,
+    pairing_token: Option<&str>,
 ) -> Result<ChildGuard> {
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
@@ -48,7 +74,8 @@ pub async fn start_cfapi_adapter_with_refresh(
         );
     }
 
-    let child = Command::new(os_integration_bin)
+    let mut command = Command::new(os_integration_bin);
+    command
         .arg("serve")
         .arg("--sync-root-id")
         .arg(sync_root_id)
@@ -59,7 +86,13 @@ pub async fn start_cfapi_adapter_with_refresh(
         .arg("--server-base-url")
         .arg(server_base_url)
         .arg("--remote-refresh-interval-ms")
-        .arg(remote_refresh_interval_ms.to_string())
+        .arg(remote_refresh_interval_ms.to_string());
+
+    if let Some(pairing_token) = pairing_token {
+        command.arg("--pairing-token").arg(pairing_token);
+    }
+
+    let child = command
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()

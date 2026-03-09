@@ -1,5 +1,7 @@
 package io.ironmesh.android.data
 
+import io.ironmesh.android.api.ClientDeviceEnrollRequest
+import io.ironmesh.android.api.ClientDeviceEnrollResponse
 import io.ironmesh.android.api.HealthResponse
 import io.ironmesh.android.api.IronmeshApi
 import io.ironmesh.android.api.ReplicationPlanResponse
@@ -9,12 +11,15 @@ import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Request
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 import java.net.URL
 import java.io.OutputStream
+import java.io.InputStream
 
 class IronmeshRepository {
     fun sanitizeBaseUrl(input: String): String {
@@ -27,42 +32,75 @@ class IronmeshRepository {
         return if (withScheme.endsWith('/')) withScheme else "$withScheme/"
     }
 
-    private fun createHttpClient(): OkHttpClient {
+    private fun createHttpClient(authToken: String? = null): OkHttpClient {
         val logging = HttpLoggingInterceptor().apply {
             level = HttpLoggingInterceptor.Level.BASIC
         }
 
         return OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val request = if (!authToken.isNullOrBlank()) {
+                    chain.request()
+                        .newBuilder()
+                        .header("Authorization", "Bearer $authToken")
+                        .build()
+                } else {
+                    chain.request()
+                }
+                chain.proceed(request)
+            }
             .addInterceptor(logging)
             .build()
     }
 
-    private fun createApi(baseUrl: String): IronmeshApi {
+    private fun createApi(baseUrl: String, authToken: String? = null): IronmeshApi {
         val moshi = Moshi.Builder()
             .add(KotlinJsonAdapterFactory())
             .build()
 
         return Retrofit.Builder()
             .baseUrl(sanitizeBaseUrl(baseUrl))
-            .client(createHttpClient())
+            .client(createHttpClient(authToken))
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
             .create(IronmeshApi::class.java)
     }
 
-    suspend fun health(baseUrl: String): HealthResponse {
-        return createApi(baseUrl).health()
+    private fun shouldUseRustBridge(authToken: String?): Boolean {
+        return authToken.isNullOrBlank() && RustClientBridge.isAvailable()
     }
 
-    suspend fun replicationPlan(baseUrl: String): ReplicationPlanResponse {
-        return createApi(baseUrl).replicationPlan()
+    suspend fun health(baseUrl: String, authToken: String? = null): HealthResponse {
+        return createApi(baseUrl, authToken).health()
     }
 
-    suspend fun putObject(baseUrl: String, key: String, payload: String): Int {
-        if (!RustClientBridge.isAvailable()) {
-            throw IllegalStateException("Rust client bridge is not available")
+    suspend fun replicationPlan(baseUrl: String, authToken: String? = null): ReplicationPlanResponse {
+        return createApi(baseUrl, authToken).replicationPlan()
+    }
+
+    suspend fun enrollDevice(
+        baseUrl: String,
+        pairingToken: String,
+        deviceId: String? = null,
+        label: String? = null,
+    ): ClientDeviceEnrollResponse {
+        val response = createApi(baseUrl).enrollDevice(
+            ClientDeviceEnrollRequest(
+                pairing_token = pairingToken,
+                device_id = deviceId,
+                label = label,
+            ),
+        )
+        if (!response.isSuccessful) {
+            throw IllegalStateException("Enroll failed with HTTP ${response.code()}")
         }
+        return response.body() ?: throw IllegalStateException("Enroll failed: empty response body")
+    }
 
+    suspend fun putObject(baseUrl: String, key: String, payload: String, authToken: String? = null): Int {
+        if (!shouldUseRustBridge(authToken)) {
+            return putObjectBytes(baseUrl, key, payload.toByteArray(Charsets.UTF_8), authToken)
+        }
         return RustClientBridge.putObject(
             sanitizeBaseUrl(baseUrl),
             key,
@@ -75,18 +113,10 @@ class IronmeshRepository {
         key: String,
         snapshot: String? = null,
         version: String? = null,
+        authToken: String? = null,
     ): String {
-        if (!RustClientBridge.isAvailable()) {
-            throw IllegalStateException("Rust client bridge is not available")
-        }
-
-        return RustClientBridge.getObject(
-            sanitizeBaseUrl(baseUrl),
-            key,
-            snapshot,
-            version,
-        )
-            .toString(Charsets.UTF_8)
+        val bytes = getObjectBytes(baseUrl, key, snapshot, version, authToken)
+        return bytes.toString(Charsets.UTF_8)
     }
 
     suspend fun storeIndex(
@@ -94,9 +124,14 @@ class IronmeshRepository {
         prefix: String? = null,
         depth: Int = 1,
         snapshot: String? = null,
+        authToken: String? = null,
     ): List<StoreIndexEntry> {
-        if (!RustClientBridge.isAvailable()) {
-            throw IllegalStateException("Rust client bridge is not available")
+        if (!shouldUseRustBridge(authToken)) {
+            return createApi(baseUrl, authToken).storeIndex(
+                prefix = prefix,
+                depth = depth.coerceAtLeast(1),
+                snapshot = snapshot,
+            ).entries
         }
 
         val responseJson = RustClientBridge.storeIndex(
@@ -116,9 +151,21 @@ class IronmeshRepository {
         return parsed.entries
     }
 
-    suspend fun putObjectBytes(baseUrl: String, key: String, payload: ByteArray): Int {
-        if (!RustClientBridge.isAvailable()) {
-            throw IllegalStateException("Rust client bridge is not available")
+    suspend fun putObjectBytes(
+        baseUrl: String,
+        key: String,
+        payload: ByteArray,
+        authToken: String? = null,
+    ): Int {
+        if (!shouldUseRustBridge(authToken)) {
+            val response = createApi(baseUrl, authToken).putObject(
+                key,
+                payload.toRequestBody("application/octet-stream".toMediaType()),
+            )
+            if (!response.isSuccessful) {
+                throw IllegalStateException("PUT failed with HTTP ${response.code()}")
+            }
+            return response.code()
         }
 
         return RustClientBridge.putObject(sanitizeBaseUrl(baseUrl), key, payload)
@@ -127,21 +174,37 @@ class IronmeshRepository {
     suspend fun streamPutObject(
         baseUrl: String,
         key: String,
-        input: java.io.InputStream,
+        input: InputStream,
+        authToken: String? = null,
     ): Int {
-        if (!RustClientBridge.isAvailable()) {
-            throw IllegalStateException("Rust client bridge is not available")            
+        if (!shouldUseRustBridge(authToken)) {
+            val requestBody = object : RequestBody() {
+                override fun contentType() = "application/octet-stream".toMediaType()
+
+                override fun writeTo(sink: okio.BufferedSink) {
+                    input.use { source ->
+                        sink.outputStream().use { output ->
+                            source.copyTo(output)
+                        }
+                    }
+                }
+            }
+            val response = createApi(baseUrl, authToken).putObject(key, requestBody)
+            if (!response.isSuccessful) {
+                throw IllegalStateException("PUT failed with HTTP ${response.code()}")
+            }
+            return response.code()
         }
 
         return RustClientBridge.streamPutObject(sanitizeBaseUrl(baseUrl), key, input)
     }
 
-    suspend fun deleteObject(baseUrl: String, key: String): Int {
-        if (RustClientBridge.isAvailable()) {
+    suspend fun deleteObject(baseUrl: String, key: String, authToken: String? = null): Int {
+        if (shouldUseRustBridge(authToken)) {
             return RustClientBridge.deleteObject(sanitizeBaseUrl(baseUrl), key)
         }
 
-        val response = createApi(baseUrl).deleteObject(key)
+        val response = createApi(baseUrl, authToken).deleteObject(key)
         if (!response.isSuccessful) {
             throw IllegalStateException("DELETE failed with HTTP ${response.code()}")
         }
@@ -153,8 +216,9 @@ class IronmeshRepository {
         key: String,
         snapshot: String? = null,
         version: String? = null,
+        authToken: String? = null,
     ): ByteArray {
-        if (RustClientBridge.isAvailable()) {
+        if (shouldUseRustBridge(authToken)) {
             return RustClientBridge.getObject(
                 sanitizeBaseUrl(baseUrl),
                 key,
@@ -163,7 +227,7 @@ class IronmeshRepository {
             )
         }
 
-        val response = createApi(baseUrl).getObjectBinary(key, snapshot = snapshot, version = version)
+        val response = createApi(baseUrl, authToken).getObjectBinary(key, snapshot = snapshot, version = version)
         if (!response.isSuccessful) {
             throw IllegalStateException("GET failed with HTTP ${response.code()}")
         }
@@ -177,11 +241,24 @@ class IronmeshRepository {
         output: OutputStream,
         snapshot: String? = null,
         version: String? = null,
+        authToken: String? = null,
     ) {
-        if (!RustClientBridge.isAvailable()) {
-            throw IllegalStateException("Rust client bridge is not available")
+        if (!shouldUseRustBridge(authToken)) {
+            val response = createApi(baseUrl, authToken).getObjectBinary(
+                key,
+                snapshot = snapshot,
+                version = version,
+            )
+            if (!response.isSuccessful) {
+                throw IllegalStateException("GET failed with HTTP ${response.code()}")
+            }
+            val body = response.body() ?: throw IllegalStateException("GET failed: empty response body")
+            body.byteStream().use { input ->
+                input.copyTo(output)
+            }
+            return
         }
-        
+
         RustClientBridge.streamObjectTo(
             sanitizeBaseUrl(baseUrl),
             key,
@@ -196,12 +273,13 @@ class IronmeshRepository {
         baseUrl: String,
         relativeUrl: String,
         output: OutputStream,
+        authToken: String? = null,
     ) {
         val request = Request.Builder()
             .url(URL(URL(sanitizeBaseUrl(baseUrl)), relativeUrl))
             .build()
 
-        createHttpClient().newCall(request).execute().use { response ->
+        createHttpClient(authToken).newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IllegalStateException("GET failed with HTTP ${response.code}")
             }
@@ -213,7 +291,10 @@ class IronmeshRepository {
         }
     }
 
-    fun startWebUi(baseUrl: String): String {
+    fun startWebUi(baseUrl: String, authToken: String? = null): String {
+        if (!authToken.isNullOrBlank()) {
+            throw IllegalStateException("Embedded Web UI is not yet wired for authenticated clusters")
+        }
         if (!RustClientBridge.isAvailable()) {
             throw IllegalStateException("Rust client bridge is not available")
         }

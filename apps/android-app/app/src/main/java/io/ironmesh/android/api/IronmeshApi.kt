@@ -6,6 +6,7 @@ import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
+import retrofit2.http.POST
 import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
@@ -42,6 +43,9 @@ interface IronmeshApi {
         @Query("depth") depth: Int = 1,
         @Query("snapshot") snapshot: String? = null,
     ): StoreIndexResponse
+
+    @POST("auth/device/enroll")
+    suspend fun enrollDevice(@Body request: ClientDeviceEnrollRequest): Response<ClientDeviceEnrollResponse>
 }
 
 data class HealthResponse(
@@ -101,4 +105,17 @@ data class StoreIndexThumbnail(
     val height: Int,
     val format: String,
     val size_bytes: Long,
+)
+
+data class ClientDeviceEnrollRequest(
+    val pairing_token: String,
+    val device_id: String? = null,
+    val label: String? = null,
+)
+
+data class ClientDeviceEnrollResponse(
+    val device_id: String,
+    val device_token: String,
+    val label: String? = null,
+    val created_at_unix: Long,
 )

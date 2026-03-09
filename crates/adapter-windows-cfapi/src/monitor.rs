@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::auth::is_internal_device_auth_relative_path;
 use crate::cfapi::{path_is_placeholder, try_convert_materialized_file};
 use crate::helpers::path_to_relative;
 use crate::runtime::Uploader;
@@ -56,6 +57,9 @@ impl SyncRootMonitor {
         current: &mut HashMap<String, SeenEntry>,
     ) {
         if rel_path.is_empty() {
+            return;
+        }
+        if is_internal_device_auth_relative_path(&rel_path) {
             return;
         }
         let metadata = match std::fs::metadata(path) {
@@ -129,6 +133,9 @@ impl SyncRootMonitor {
         deleted_paths.sort_by(|(left_path, _), (right_path, _)| right_path.cmp(left_path));
 
         for (path, entry) in deleted_paths {
+            if is_internal_device_auth_relative_path(path) {
+                continue;
+            }
             if entry.is_dir {
                 let canonical_path = directory_marker_path(path);
                 eprintln!("{}: detected deleted directory {}", self.name, path);

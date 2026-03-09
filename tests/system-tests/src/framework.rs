@@ -450,6 +450,33 @@ pub async fn run_cli(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+pub async fn issue_pairing_token(
+    http: &reqwest::Client,
+    base_url: &str,
+    admin_token: &str,
+    label: Option<&str>,
+    expires_in_secs: Option<u64>,
+) -> Result<String> {
+    let response: serde_json::Value = http
+        .post(format!("{base_url}/auth/pairing-tokens/issue"))
+        .header("x-ironmesh-admin-token", admin_token)
+        .json(&serde_json::json!({
+            "label": label,
+            "expires_in_secs": expires_in_secs,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    response
+        .get("pairing_token")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .context("pairing token missing in response")
+}
+
 pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {
     let cli_bin = binary_path("cli-client")?;
 

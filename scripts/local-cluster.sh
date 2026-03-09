@@ -6,6 +6,7 @@ CLUSTER_DIR="${IRONMESH_LOCAL_CLUSTER_DIR:-${ROOT_DIR}/data/local-cluster}"
 BASE_PORT="${IRONMESH_LOCAL_CLUSTER_BASE_PORT:-18080}"
 NODE_COUNT=4
 BIN_PATH="${IRONMESH_SERVER_BIN:-${ROOT_DIR}/target/debug/server-node}"
+CLIENT_AUTH_ENABLED="${IRONMESH_LOCAL_CLUSTER_ENABLE_CLIENT_AUTH:-true}"
 
 NODE_IDS=(
   "00000000-0000-0000-0000-00000000a001"
@@ -63,6 +64,10 @@ shared_tls_dir() {
   echo "${CLUSTER_DIR}/tls"
 }
 
+admin_token_file() {
+  echo "${CLUSTER_DIR}/admin-token"
+}
+
 ca_cert_file() {
   echo "$(shared_tls_dir)/ca.pem"
 }
@@ -88,6 +93,23 @@ node_cert_file() {
 node_key_file() {
   local idx="$1"
   echo "$(node_tls_dir "$idx")/node.key"
+}
+
+admin_token() {
+  if [[ -f "$(admin_token_file)" ]]; then
+    tr -d '\r\n' <"$(admin_token_file)"
+    return 0
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24 | tee "$(admin_token_file)" >/dev/null
+  else
+    local fallback
+    fallback="ironmesh-local-admin-$(date +%s)"
+    printf '%s\n' "${fallback}" | tee "$(admin_token_file)" >/dev/null
+  fi
+  chmod 600 "$(admin_token_file)" 2>/dev/null || true
+  tr -d '\r\n' <"$(admin_token_file)"
 }
 
 ensure_binary() {
@@ -182,6 +204,13 @@ ensure_tls_material() {
   done
 }
 
+ensure_admin_token() {
+  mkdir -p "${CLUSTER_DIR}"
+  if [[ "${CLIENT_AUTH_ENABLED}" == "true" ]]; then
+    admin_token >/dev/null
+  fi
+}
+
 wait_for_health() {
   local url="$1"
   local retries=80
@@ -242,10 +271,52 @@ register_full_mesh() {
   done
 }
 
+issue_pairing_token() {
+  local label="${1:-local-device}"
+  local expires_in_secs="${2:-3600}"
+  local node_idx="${3:-1}"
+
+  if [[ "${CLIENT_AUTH_ENABLED}" != "true" ]]; then
+    echo "[local-cluster] client auth is disabled; no pairing token needed"
+    return 0
+  fi
+
+  local controller_url
+  controller_url="$(node_url "${node_idx}")"
+
+  local payload
+  payload=$(cat <<JSON
+{
+  "label": "${label}",
+  "expires_in_secs": ${expires_in_secs}
+}
+JSON
+)
+
+  echo "[local-cluster] issuing pairing token via ${controller_url}"
+  curl -fsS -X POST "${controller_url}/auth/pairing-tokens/issue" \
+    -H "content-type: application/json" \
+    -H "x-ironmesh-admin-token: $(admin_token)" \
+    --data "${payload}"
+  echo
+}
+
+print_client_auth_help() {
+  if [[ "${CLIENT_AUTH_ENABLED}" != "true" ]]; then
+    return 0
+  fi
+
+  echo "  client auth: enabled"
+  echo "  admin token file: $(admin_token_file)"
+  echo "  pairing token helper:"
+  echo "    scripts/local-cluster.sh pairing-token [label] [expires_in_secs] [node_idx]"
+}
+
 start_cluster() {
   mkdir -p "${CLUSTER_DIR}/pids" "${CLUSTER_DIR}/logs"
   ensure_binary
   ensure_tls_material
+  ensure_admin_token
 
   for idx in $(seq 1 "$NODE_COUNT"); do
     local pid_path
@@ -295,6 +366,8 @@ start_cluster() {
       IRONMESH_INTERNAL_TLS_KEY="$(node_key_file "$idx")" \
       IRONMESH_DATA_DIR="${ddir}" \
       IRONMESH_REPLICATION_FACTOR=3 \
+      IRONMESH_REQUIRE_CLIENT_AUTH="${CLIENT_AUTH_ENABLED}" \
+      IRONMESH_ADMIN_TOKEN="$(admin_token)" \
       "${BIN_PATH}" >"${logfile}" 2>&1 </dev/null &
 
     echo "$!" >"${pid_path}"
@@ -370,6 +443,7 @@ status_cluster() {
 
   echo "  logs: ${CLUSTER_DIR}/logs"
   echo "  tls: $(shared_tls_dir)"
+  print_client_auth_help
 }
 
 clean_cluster() {
@@ -382,10 +456,14 @@ usage() {
   cat <<EOF
 Usage: scripts/local-cluster.sh <start|stop|restart|status|clean>
 
+Extra commands:
+  pairing-token [label] [expires_in_secs] [node_idx]
+
 Environment variables:
   IRONMESH_LOCAL_CLUSTER_DIR        Default: ${ROOT_DIR}/data/local-cluster
   IRONMESH_LOCAL_CLUSTER_BASE_PORT  Default: 18080
   IRONMESH_SERVER_BIN               Default: ${ROOT_DIR}/target/debug/server-node
+  IRONMESH_LOCAL_CLUSTER_ENABLE_CLIENT_AUTH  Default: true
 
 Requirements:
   openssl                         Used to generate local internal mTLS certificates
@@ -411,6 +489,9 @@ main() {
       ;;
     clean)
       clean_cluster
+      ;;
+    pairing-token)
+      issue_pairing_token "${2:-local-device}" "${3:-3600}" "${4:-1}"
       ;;
     *)
       usage

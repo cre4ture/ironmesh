@@ -5,6 +5,7 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
@@ -39,6 +40,9 @@ data class GalleryImageItem(
 
 data class MainUiState(
     val baseUrl: String = IronmeshPreferences.DEFAULT_BASE_URL,
+    val deviceAuthState: DeviceAuthState = DeviceAuthState(),
+    val pairingTokenInput: String = "",
+    val deviceLabelInput: String = "",
     val key: String = "demo-key",
     val payload: String = "hello from android",
     val status: String = "Ready",
@@ -68,8 +72,13 @@ class MainViewModel(
     init {
         val persistedBaseUrl = IronmeshPreferences.getBaseUrl(getApplication())
         val persistedProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication())
-        uiState.value = uiState.value.copy(baseUrl = persistedBaseUrl)
-        uiState.value = uiState.value.copy(syncProfiles = persistedProfiles)
+        val persistedDeviceAuth = IronmeshPreferences.getDeviceAuthState(getApplication())
+        uiState.value = uiState.value.copy(
+            baseUrl = persistedBaseUrl,
+            syncProfiles = persistedProfiles,
+            deviceAuthState = persistedDeviceAuth,
+            deviceLabelInput = persistedDeviceAuth.label.orEmpty(),
+        )
         FolderSyncScheduler.reschedule(getApplication())
     }
 
@@ -82,20 +91,28 @@ class MainViewModel(
         uiState.value = uiState.value.copy(key = value)
     }
 
+    fun updatePairingTokenInput(value: String) {
+        uiState.value = uiState.value.copy(pairingTokenInput = value)
+    }
+
+    fun updateDeviceLabelInput(value: String) {
+        uiState.value = uiState.value.copy(deviceLabelInput = value)
+    }
+
     fun updatePayload(value: String) {
         uiState.value = uiState.value.copy(payload = value)
     }
 
     fun checkHealth() {
         execute("Checking health...") {
-            val health = repository.health(uiState.value.baseUrl)
+            val health = repository.health(uiState.value.baseUrl, currentAuthToken())
             "Health: online=${health.online} node=${health.node_id ?: "n/a"}"
         }
     }
 
     fun loadReplicationPlan() {
         execute("Loading replication plan...") {
-            val plan = repository.replicationPlan(uiState.value.baseUrl)
+            val plan = repository.replicationPlan(uiState.value.baseUrl, currentAuthToken())
             val keys = plan.items.take(5).joinToString { it.key }
             val summary = "under=${plan.under_replicated}, over=${plan.over_replicated}, items=${plan.items.size}" +
                 if (keys.isNotBlank()) "\nSample: $keys" else ""
@@ -110,6 +127,7 @@ class MainViewModel(
                 uiState.value.baseUrl,
                 uiState.value.key,
                 uiState.value.payload,
+                currentAuthToken(),
             )
             "PUT ok: HTTP $statusCode"
         }
@@ -117,7 +135,11 @@ class MainViewModel(
 
     fun getObject() {
         execute("Downloading object...") {
-            val body = repository.getObject(uiState.value.baseUrl, uiState.value.key)
+            val body = repository.getObject(
+                uiState.value.baseUrl,
+                uiState.value.key,
+                authToken = currentAuthToken(),
+            )
             uiState.value = uiState.value.copy(objectBody = body)
             "GET ok: ${body.length} bytes"
         }
@@ -237,6 +259,7 @@ class MainViewModel(
 
     fun startWebUi() {
         val baseUrl = uiState.value.baseUrl
+        val authToken = currentAuthToken()
         uiState.value = uiState.value.copy(
             loading = true,
             selectedSection = MainSection.WEB_UI,
@@ -245,7 +268,7 @@ class MainViewModel(
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    repository.startWebUi(baseUrl)
+                    repository.startWebUi(baseUrl, authToken)
                 }
             }
                 .onSuccess { url ->
@@ -262,6 +285,63 @@ class MainViewModel(
                     )
                 }
         }
+    }
+
+    fun enrollDevice() {
+        val pairingToken = uiState.value.pairingTokenInput.trim()
+        if (pairingToken.isBlank()) {
+            setStatus("Error: Pairing token is required")
+            return
+        }
+
+        val baseUrl = uiState.value.baseUrl
+        val label = uiState.value.deviceLabelInput.trim().takeIf { it.isNotBlank() }
+        uiState.value = uiState.value.copy(loading = true, status = "Enrolling device...")
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    repository.enrollDevice(
+                        baseUrl = baseUrl,
+                        pairingToken = pairingToken,
+                        deviceId = uiState.value.deviceAuthState.deviceId.takeIf { it.isNotBlank() },
+                        label = label,
+                    )
+                }
+            }
+                .onSuccess { response ->
+                    val authState = DeviceAuthState(
+                        deviceId = response.device_id,
+                        deviceToken = response.device_token,
+                        label = response.label,
+                    )
+                    IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        deviceAuthState = authState,
+                        pairingTokenInput = "",
+                        deviceLabelInput = authState.label.orEmpty(),
+                        status = "Device enrolled: ${authState.deviceId}",
+                    )
+                    FolderSyncScheduler.reschedule(getApplication())
+                }
+                .onFailure { error ->
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = "Error: ${error.message}",
+                    )
+                }
+        }
+    }
+
+    fun clearDeviceEnrollment() {
+        IronmeshPreferences.clearDeviceAuthState(getApplication())
+        uiState.value = uiState.value.copy(
+            deviceAuthState = DeviceAuthState(),
+            pairingTokenInput = "",
+            deviceLabelInput = "",
+            status = "Cleared local device credential",
+        )
+        FolderSyncScheduler.reschedule(getApplication())
     }
 
     private fun execute(loadingMessage: String, action: suspend () -> String) {
@@ -292,6 +372,10 @@ class MainViewModel(
             output = items,
         )
         return items
+    }
+
+    private fun currentAuthToken(): String? {
+        return uiState.value.deviceAuthState.deviceToken.takeIf { it.isNotBlank() }
     }
 
     private fun collectGalleryImages(

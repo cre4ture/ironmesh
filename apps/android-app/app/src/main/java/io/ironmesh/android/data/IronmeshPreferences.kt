@@ -11,6 +11,7 @@ object IronmeshPreferences {
     private const val PREF_BASE_URL = "base_url"
     private const val PREF_SYNC_CONFIGS = "folder_sync_configs"
     private const val PREF_SYNC_RUNTIME_STATES = "folder_sync_runtime_states"
+    private const val PREF_DEVICE_AUTH_STATE = "device_auth_state"
 
     private val moshi: Moshi by lazy {
         Moshi.Builder()
@@ -27,6 +28,10 @@ object IronmeshPreferences {
         val valueType = FolderSyncRuntimeState::class.java
         val mapType = Types.newParameterizedType(Map::class.java, String::class.java, valueType)
         moshi.adapter<Map<String, FolderSyncRuntimeState>>(mapType)
+    }
+
+    private val deviceAuthStateAdapter by lazy {
+        moshi.adapter(DeviceAuthState::class.java)
     }
 
     private fun prefs(context: Context) =
@@ -73,6 +78,21 @@ object IronmeshPreferences {
         val states = getFolderSyncRuntimeStates(context).toMutableMap()
         states.remove(profileId)
         setFolderSyncRuntimeStates(context, states)
+    }
+
+    fun getDeviceAuthState(context: Context): DeviceAuthState {
+        val raw = prefs(context).getString(PREF_DEVICE_AUTH_STATE, null) ?: return DeviceAuthState()
+        return runCatching { deviceAuthStateAdapter.fromJson(raw) ?: DeviceAuthState() }
+            .getOrDefault(DeviceAuthState())
+    }
+
+    fun setDeviceAuthState(context: Context, state: DeviceAuthState) {
+        val payload = deviceAuthStateAdapter.toJson(state)
+        prefs(context).edit().putString(PREF_DEVICE_AUTH_STATE, payload).apply()
+    }
+
+    fun clearDeviceAuthState(context: Context) {
+        prefs(context).edit().remove(PREF_DEVICE_AUTH_STATE).apply()
     }
 
     private fun getFolderSyncRuntimeStates(context: Context): Map<String, FolderSyncRuntimeState> {

@@ -305,6 +305,38 @@ private fun ServerControls(
         singleLine = true,
     )
 
+    Text("Device Auth", style = MaterialTheme.typography.titleMedium)
+
+    if (state.deviceAuthState.hasToken()) {
+        Text("Enrolled device: ${state.deviceAuthState.deviceId}")
+        if (!state.deviceAuthState.label.isNullOrBlank()) {
+            Text("Label: ${state.deviceAuthState.label}")
+        }
+    } else {
+        Text("This device is not enrolled yet.")
+    }
+
+    OutlinedTextField(
+        modifier = Modifier.fillMaxWidth(),
+        value = state.deviceLabelInput,
+        onValueChange = vm::updateDeviceLabelInput,
+        label = { Text("Device Label") },
+        singleLine = true,
+    )
+
+    OutlinedTextField(
+        modifier = Modifier.fillMaxWidth(),
+        value = state.pairingTokenInput,
+        onValueChange = vm::updatePairingTokenInput,
+        label = { Text("Pairing Token") },
+        singleLine = true,
+    )
+
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = vm::enrollDevice) { Text("Enroll Device") }
+        OutlinedButton(onClick = vm::clearDeviceEnrollment) { Text("Clear Device Auth") }
+    }
+
     OutlinedTextField(
         modifier = Modifier.fillMaxWidth(),
         value = state.key,
