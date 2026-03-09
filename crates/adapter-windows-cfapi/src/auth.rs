@@ -110,7 +110,9 @@ fn enroll_device(
         .context("failed to parse /auth/device/enroll response")?;
 
     if enrolled.device_id.trim().is_empty() || enrolled.device_token.trim().is_empty() {
-        return Err(anyhow!("device enrollment returned an incomplete credential"));
+        return Err(anyhow!(
+            "device enrollment returned an incomplete credential"
+        ));
     }
 
     Ok(DeviceAuthRecord {
@@ -135,7 +137,8 @@ fn persist_device_auth(path: &Path, record: &DeviceAuthRecord) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create auth directory {}", parent.display()))?;
     }
-    let payload = serde_json::to_string_pretty(record).context("failed to serialize device auth")?;
+    let payload =
+        serde_json::to_string_pretty(record).context("failed to serialize device auth")?;
     fs::write(path, payload)
         .with_context(|| format!("failed to write device auth file {}", path.display()))
 }
@@ -145,13 +148,19 @@ fn validate_device_auth(record: &DeviceAuthRecord, path: &Path) -> Result<()> {
         bail!("device auth file {} is missing device_id", path.display());
     }
     if record.device_token.trim().is_empty() {
-        bail!("device auth file {} is missing device_token", path.display());
+        bail!(
+            "device auth file {} is missing device_token",
+            path.display()
+        );
     }
     Ok(())
 }
 
 fn normalize_optional(value: Option<&str>) -> Option<String> {
-    value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string)
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 #[cfg(test)]
@@ -169,8 +178,14 @@ mod tests {
 
     #[test]
     fn internal_device_auth_path_detection_matches_nested_and_root_relative_paths() {
-        assert!(is_internal_device_auth_relative_path(".ironmesh-device-auth.json"));
-        assert!(is_internal_device_auth_relative_path("nested/.ironmesh-device-auth.json"));
-        assert!(!is_internal_device_auth_relative_path("nested/not-auth.json"));
+        assert!(is_internal_device_auth_relative_path(
+            ".ironmesh-device-auth.json"
+        ));
+        assert!(is_internal_device_auth_relative_path(
+            "nested/.ironmesh-device-auth.json"
+        ));
+        assert!(!is_internal_device_auth_relative_path(
+            "nested/not-auth.json"
+        ));
     }
 }

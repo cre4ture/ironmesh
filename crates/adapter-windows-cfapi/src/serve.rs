@@ -5,7 +5,9 @@ use crate::auth::{DeviceEnrollmentOptions, resolve_or_enroll_device_auth};
 use crate::live::{ServerNodeHydrator, normalize_base_url};
 use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root};
 use clap::Parser;
-use client_sdk::{IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
+use client_sdk::{
+    IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,7 +79,10 @@ pub fn serve_main() -> anyhow::Result<()> {
     let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
 
     let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
-    let hydrator = Box::new(ServerNodeHydrator::new(base_url.clone(), bearer_token.clone()));
+    let hydrator = Box::new(ServerNodeHydrator::new(
+        base_url.clone(),
+        bearer_token.clone(),
+    ));
     let uploader = Arc::new(ServerNodeHydrator::new(base_url, bearer_token));
     let _connection = connect_sync_root(&registration, runtime.clone(), hydrator, uploader)?;
 

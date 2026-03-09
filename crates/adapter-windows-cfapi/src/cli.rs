@@ -1,12 +1,14 @@
 #![cfg(windows)]
 
 use clap::{Parser, Subcommand};
-use client_sdk::{IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
+use client_sdk::{
+    IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use std::path::PathBuf;
 
 use crate::adapter::WindowsCfapiAdapter;
 use crate::auth::{DeviceEnrollmentOptions, resolve_or_enroll_device_auth};
@@ -99,7 +101,9 @@ pub fn cli_main() -> anyhow::Result<()> {
             }
             let bearer_token = device_auth.as_ref().map(|auth| auth.device_token.clone());
             let client = match bearer_token.as_ref() {
-                Some(token) => IronMeshClient::new(base_url.as_str()).with_bearer_token(token.clone()),
+                Some(token) => {
+                    IronMeshClient::new(base_url.as_str()).with_bearer_token(token.clone())
+                }
                 None => IronMeshClient::new(base_url.as_str()),
             };
 
@@ -112,7 +116,10 @@ pub fn cli_main() -> anyhow::Result<()> {
             let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
 
             let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
-            let hydrator = Box::new(ServerNodeHydrator::new(base_url.clone(), bearer_token.clone()));
+            let hydrator = Box::new(ServerNodeHydrator::new(
+                base_url.clone(),
+                bearer_token.clone(),
+            ));
             let uploader = Arc::new(ServerNodeHydrator::new(base_url, bearer_token));
             let _connection =
                 connect_sync_root(&registration, runtime.clone(), hydrator, uploader.clone())?;

@@ -685,7 +685,10 @@ unsafe extern "system" fn callback_file_close_completion(
 
     let relative_path = path_to_relative(&context.sync_root, &normalized_path);
     if is_internal_device_auth_relative_path(&relative_path) {
-        eprintln!("close-completion: skipping internal auth file {}", relative_path);
+        eprintln!(
+            "close-completion: skipping internal auth file {}",
+            relative_path
+        );
         return;
     }
     if !relative_path.is_empty()
