@@ -450,6 +450,7 @@ pub async fn run_cli(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+#[allow(dead_code)]
 pub async fn issue_pairing_token(
     http: &reqwest::Client,
     base_url: &str,

@@ -2322,7 +2322,6 @@ async fn persist_client_auth_state(state: &ServerState) -> Result<()> {
     store.persist_client_auth_state(&snapshot).await
 }
 
-#[allow(dead_code)]
 async fn issue_pairing_token(
     State(state): State<ServerState>,
     headers: HeaderMap,
