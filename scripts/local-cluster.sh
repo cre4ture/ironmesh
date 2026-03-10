@@ -22,7 +22,7 @@ node_port() {
 
 node_bind() {
   local idx="$1"
-  echo "127.0.0.1:$(node_port "$idx")"
+  echo "0.0.0.0:$(node_port "$idx")"
 }
 
 node_internal_port() {
