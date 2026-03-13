@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLUSTER_DIR="${IRONMESH_LOCAL_CLUSTER_DIR:-${ROOT_DIR}/data/local-cluster}"
 BASE_PORT="${IRONMESH_LOCAL_CLUSTER_BASE_PORT:-18080}"
+PUBLIC_HOST="${IRONMESH_LOCAL_CLUSTER_PUBLIC_HOST:-127.0.0.1}"
+PUBLIC_HOST_ALT_NAMES="${IRONMESH_LOCAL_CLUSTER_PUBLIC_HOST_ALT_NAMES:-}"
 NODE_COUNT=4
 BIN_PATH="${IRONMESH_SERVER_BIN:-${ROOT_DIR}/target/debug/server-node}"
 CLIENT_AUTH_ENABLED="${IRONMESH_LOCAL_CLUSTER_ENABLE_CLIENT_AUTH:-true}"
@@ -35,9 +37,13 @@ node_internal_bind() {
   echo "127.0.0.1:$(node_internal_port "$idx")"
 }
 
+node_public_host() {
+  echo "${PUBLIC_HOST}"
+}
+
 node_url() {
   local idx="$1"
-  echo "http://$(node_bind "$idx")"
+  echo "https://$(node_public_host):$(node_port "$idx")"
 }
 
 node_internal_url() {
@@ -78,6 +84,18 @@ ca_key_file() {
 
 ca_serial_file() {
   echo "$(shared_tls_dir)/ca.srl"
+}
+
+public_cert_file() {
+  echo "$(shared_tls_dir)/public.pem"
+}
+
+public_key_file() {
+  echo "$(shared_tls_dir)/public.key"
+}
+
+public_san_file() {
+  echo "$(shared_tls_dir)/public-san.txt"
 }
 
 node_tls_dir() {
@@ -134,6 +152,47 @@ ensure_openssl() {
   return 1
 }
 
+is_ip_literal() {
+  local value="$1"
+  [[ "${value}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+discover_ipv4_hosts() {
+  if command -v hostname >/dev/null 2>&1; then
+    hostname -I 2>/dev/null | tr ' ' '\n' | sed '/^$/d' || true
+  fi
+
+  if command -v ip >/dev/null 2>&1; then
+    ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true
+  fi
+}
+
+public_san_values() {
+  {
+    printf '%s\n' "localhost"
+    printf '%s\n' "127.0.0.1"
+    printf '%s\n' "$(node_public_host)"
+    if [[ -n "${PUBLIC_HOST_ALT_NAMES}" ]]; then
+      tr ',' '\n' <<<"${PUBLIC_HOST_ALT_NAMES}"
+    fi
+    discover_ipv4_hosts
+  } | sed '/^$/d' | awk '!seen[$0]++'
+}
+
+public_san_entries() {
+  while IFS= read -r value; do
+    if is_ip_literal "${value}"; then
+      printf 'IP:%s\n' "${value}"
+    else
+      printf 'DNS:%s\n' "${value}"
+    fi
+  done < <(public_san_values)
+}
+
+public_san_config() {
+  public_san_entries | tr '\n' ',' | sed 's/,$//'
+}
+
 generate_ca() {
   local tls_root
   tls_root="$(shared_tls_dir)"
@@ -146,6 +205,48 @@ generate_ca() {
     -days 3650 \
     -sha256 \
     -subj "/CN=ironmesh-local-cluster-ca" >/dev/null 2>&1
+}
+
+generate_public_cert() {
+  local tls_root
+  tls_root="$(shared_tls_dir)"
+  mkdir -p "${tls_root}"
+
+  local csr_path
+  csr_path="${tls_root}/public.csr"
+
+  local ext_path
+  ext_path="${tls_root}/openssl-public.cnf"
+
+  local san_line
+  san_line="$(public_san_config)"
+
+  cat >"${ext_path}" <<EOF
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=${san_line}
+EOF
+
+  echo "[local-cluster] Generating shared public HTTPS certificate..."
+  openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$(public_key_file)" \
+    -out "${csr_path}" \
+    -subj "/CN=$(node_public_host)" >/dev/null 2>&1
+
+  openssl x509 -req \
+    -in "${csr_path}" \
+    -CA "$(ca_cert_file)" \
+    -CAkey "$(ca_key_file)" \
+    -CAcreateserial \
+    -CAserial "$(ca_serial_file)" \
+    -out "$(public_cert_file)" \
+    -days 3650 \
+    -sha256 \
+    -extfile "${ext_path}" >/dev/null 2>&1
+
+  printf '%s\n' "${san_line}" >"$(public_san_file)"
+  rm -f "${csr_path}" "${ext_path}"
 }
 
 generate_node_cert() {
@@ -196,6 +297,13 @@ ensure_tls_material() {
     generate_ca
   fi
 
+  local expected_public_san
+  expected_public_san="$(public_san_config)"
+  if [[ ! -f "$(public_cert_file)" || ! -f "$(public_key_file)" || ! -f "$(public_san_file)" ]] \
+    || [[ "$(tr -d '\r\n' <"$(public_san_file)")" != "${expected_public_san}" ]]; then
+    generate_public_cert
+  fi
+
   for idx in $(seq 1 "$NODE_COUNT"); do
     if [[ ! -f "$(node_cert_file "$idx")" || ! -f "$(node_key_file "$idx")" ]]; then
       echo "[local-cluster] Generating internal cert for node${idx}..."
@@ -215,7 +323,7 @@ wait_for_health() {
   local url="$1"
   local retries=80
   for _ in $(seq 1 "$retries"); do
-    if curl -fsS "${url}/health" >/dev/null 2>&1; then
+    if curl --cacert "$(ca_cert_file)" -fsS "${url}/health" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.2
@@ -257,7 +365,7 @@ register_node() {
 JSON
 )
 
-  curl -fsS -X PUT "${controller_url}/cluster/nodes/${target_id}" \
+  curl --cacert "$(ca_cert_file)" -fsS -X PUT "${controller_url}/cluster/nodes/${target_id}" \
     -H "content-type: application/json" \
     --data "${payload}" >/dev/null
 }
@@ -294,7 +402,7 @@ JSON
 )
 
   echo "[local-cluster] issuing pairing token via ${controller_url}"
-  curl -fsS -X POST "${controller_url}/auth/pairing-tokens/issue" \
+  curl --cacert "$(ca_cert_file)" -fsS -X POST "${controller_url}/auth/pairing-tokens/issue" \
     -H "content-type: application/json" \
     -H "x-ironmesh-admin-token: $(admin_token)" \
     --data "${payload}"
@@ -359,6 +467,8 @@ start_cluster() {
       IRONMESH_NODE_ID="${node_id}" \
       IRONMESH_SERVER_BIND="${bind}" \
       IRONMESH_PUBLIC_URL="${url}" \
+      IRONMESH_PUBLIC_TLS_CERT="$(public_cert_file)" \
+      IRONMESH_PUBLIC_TLS_KEY="$(public_key_file)" \
       IRONMESH_INTERNAL_BIND="${internal_bind}" \
       IRONMESH_INTERNAL_URL="${internal_url}" \
       IRONMESH_INTERNAL_TLS_CA_CERT="$(ca_cert_file)" \
@@ -424,7 +534,7 @@ status_cluster() {
     internal_bind="$(node_internal_bind "$idx")"
 
     local health="down"
-    if curl -fsS "$(node_url "$idx")/health" >/dev/null 2>&1; then
+    if curl --cacert "$(ca_cert_file)" -fsS "$(node_url "$idx")/health" >/dev/null 2>&1; then
       health="up"
     fi
 
@@ -443,6 +553,8 @@ status_cluster() {
 
   echo "  logs: ${CLUSTER_DIR}/logs"
   echo "  tls: $(shared_tls_dir)"
+  echo "  public ca cert: $(ca_cert_file)"
+  echo "  public host: $(node_public_host)"
   print_client_auth_help
 }
 
@@ -462,11 +574,13 @@ Extra commands:
 Environment variables:
   IRONMESH_LOCAL_CLUSTER_DIR        Default: ${ROOT_DIR}/data/local-cluster
   IRONMESH_LOCAL_CLUSTER_BASE_PORT  Default: 18080
+  IRONMESH_LOCAL_CLUSTER_PUBLIC_HOST  Default: 127.0.0.1
+  IRONMESH_LOCAL_CLUSTER_PUBLIC_HOST_ALT_NAMES  Optional comma-separated extra DNS/IP SANs
   IRONMESH_SERVER_BIN               Default: ${ROOT_DIR}/target/debug/server-node
   IRONMESH_LOCAL_CLUSTER_ENABLE_CLIENT_AUTH  Default: true
 
 Requirements:
-  openssl                         Used to generate local internal mTLS certificates
+  openssl                         Used to generate local TLS certificates
 EOF
 }
 
