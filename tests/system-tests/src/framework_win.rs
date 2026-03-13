@@ -52,6 +52,27 @@ pub async fn start_cfapi_adapter_with_refresh_and_pairing(
     remote_refresh_interval_ms: u64,
     pairing_token: Option<&str>,
 ) -> Result<ChildGuard> {
+    start_cfapi_adapter_with_refresh_pairing_and_ca(
+        sync_root_id,
+        display_name,
+        root_path,
+        server_base_url,
+        remote_refresh_interval_ms,
+        pairing_token,
+        None,
+    )
+    .await
+}
+
+pub async fn start_cfapi_adapter_with_refresh_pairing_and_ca(
+    sync_root_id: &str,
+    display_name: &str,
+    root_path: &Path,
+    server_base_url: &str,
+    remote_refresh_interval_ms: u64,
+    pairing_token: Option<&str>,
+    server_ca_cert: Option<&Path>,
+) -> Result<ChildGuard> {
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
 
@@ -90,6 +111,9 @@ pub async fn start_cfapi_adapter_with_refresh_and_pairing(
 
     if let Some(pairing_token) = pairing_token {
         command.arg("--pairing-token").arg(pairing_token);
+    }
+    if let Some(server_ca_cert) = server_ca_cert {
+        command.arg("--server-ca-cert").arg(server_ca_cert);
     }
 
     let child = command

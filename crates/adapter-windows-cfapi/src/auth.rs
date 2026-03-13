@@ -1,13 +1,23 @@
 #![cfg(windows)]
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
+use client_sdk::{DeviceEnrollmentRequest, enroll_device_blocking};
 use reqwest::Url;
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_DEVICE_AUTH_FILE_NAME: &str = ".ironmesh-device-auth.json";
+
+
+#[derive(Debug, Clone)]
+pub struct DeviceEnrollmentOptions {
+    pub pairing_token: Option<String>,
+    pub device_id: Option<String>,
+    pub device_label: Option<String>,
+    pub device_token_file: Option<PathBuf>,
+    pub server_ca_cert: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceAuthRecord {
@@ -16,29 +26,7 @@ pub struct DeviceAuthRecord {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct DeviceEnrollmentOptions {
-    pub pairing_token: Option<String>,
-    pub device_id: Option<String>,
-    pub device_label: Option<String>,
-    pub device_token_file: Option<PathBuf>,
-}
 
-#[derive(Debug, Serialize)]
-struct ClientDeviceEnrollRequest {
-    pairing_token: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    device_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    label: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientDeviceEnrollResponse {
-    device_id: String,
-    device_token: String,
-    label: Option<String>,
-}
 
 pub fn resolve_or_enroll_device_auth(
     base_url: &Url,
@@ -83,37 +71,15 @@ fn enroll_device(
     pairing_token: &str,
     options: &DeviceEnrollmentOptions,
 ) -> Result<DeviceAuthRecord> {
-    let enroll_url = base_url
-        .join("auth/device/enroll")
-        .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
-    let client = Client::new();
-    let response = client
-        .post(enroll_url)
-        .json(&ClientDeviceEnrollRequest {
+    let enrolled = enroll_device_blocking(
+        base_url,
+        options.server_ca_cert.as_deref(),
+        &DeviceEnrollmentRequest {
             pairing_token: pairing_token.to_string(),
             device_id: normalize_optional(options.device_id.as_deref()),
             label: normalize_optional(options.device_label.as_deref()),
-        })
-        .send()
-        .context("failed to call /auth/device/enroll")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response
-            .text()
-            .unwrap_or_else(|_| "<failed to read response body>".to_string());
-        bail!("device enrollment failed with HTTP {status}: {body}");
-    }
-
-    let enrolled = response
-        .json::<ClientDeviceEnrollResponse>()
-        .context("failed to parse /auth/device/enroll response")?;
-
-    if enrolled.device_id.trim().is_empty() || enrolled.device_token.trim().is_empty() {
-        return Err(anyhow!(
-            "device enrollment returned an incomplete credential"
-        ));
-    }
+        },
+    )?;
 
     Ok(DeviceAuthRecord {
         device_id: enrolled.device_id,
@@ -121,6 +87,14 @@ fn enroll_device(
         label: enrolled.label,
     })
 }
+
+fn normalize_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 
 fn load_device_auth(path: &Path) -> Result<DeviceAuthRecord> {
     let raw = fs::read_to_string(path)
@@ -154,13 +128,6 @@ fn validate_device_auth(record: &DeviceAuthRecord, path: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn normalize_optional(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 #[cfg(test)]

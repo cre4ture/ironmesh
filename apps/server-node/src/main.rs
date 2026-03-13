@@ -617,8 +617,37 @@ async fn main() -> Result<()> {
         std::env::var("IRONMESH_RACK").unwrap_or_else(|_| "local-rack".to_string()),
     );
 
-    let public_url =
-        std::env::var("IRONMESH_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind_addr}"));
+    let internal_tls_ca_path = PathBuf::from(
+        std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
+            .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
+    );
+    let internal_tls_cert_path = PathBuf::from(
+        std::env::var("IRONMESH_INTERNAL_TLS_CERT")
+            .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
+    );
+    let internal_tls_key_path = PathBuf::from(
+        std::env::var("IRONMESH_INTERNAL_TLS_KEY").context("missing IRONMESH_INTERNAL_TLS_KEY")?,
+    );
+    let public_tls = match (
+        std::env::var("IRONMESH_PUBLIC_TLS_CERT").ok(),
+        std::env::var("IRONMESH_PUBLIC_TLS_KEY").ok(),
+    ) {
+        (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
+        (None, None) => None,
+        _ => {
+            anyhow::bail!(
+                "IRONMESH_PUBLIC_TLS_CERT and IRONMESH_PUBLIC_TLS_KEY must be set together"
+            )
+        }
+    };
+    let public_url = std::env::var("IRONMESH_PUBLIC_URL").unwrap_or_else(|_| {
+        let scheme = if public_tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{bind_addr}")
+    });
 
     let internal_url = std::env::var("IRONMESH_INTERNAL_URL")
         .unwrap_or_else(|_| format!("https://{internal_bind_addr}"));
@@ -652,18 +681,6 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "local".to_string())
             .as_str(),
     )?;
-
-    let internal_tls_ca_path = PathBuf::from(
-        std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
-            .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
-    );
-    let internal_tls_cert_path = PathBuf::from(
-        std::env::var("IRONMESH_INTERNAL_TLS_CERT")
-            .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
-    );
-    let internal_tls_key_path = PathBuf::from(
-        std::env::var("IRONMESH_INTERNAL_TLS_KEY").context("missing IRONMESH_INTERNAL_TLS_KEY")?,
-    );
 
     let repair_config = RepairConfig::from_env();
     let autonomous_replication_on_put_enabled =
@@ -944,10 +961,30 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!(%bind_addr, %node_id, "server node listening");
+    info!(
+        %bind_addr,
+        %node_id,
+        tls_enabled = public_tls.is_some(),
+        "server node listening"
+    );
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, public_app).await?;
+    if let Some((cert_path, key_path)) = public_tls {
+        let config = RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed building public TLS config from {} and {}",
+                    cert_path.display(),
+                    key_path.display()
+                )
+            })?;
+        axum_server::bind_rustls(bind_addr, config)
+            .serve(public_app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+        axum::serve(listener, public_app).await?;
+    }
 
     Ok(())
 }

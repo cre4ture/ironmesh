@@ -241,6 +241,26 @@ pub async fn start_server_with_env(
     .await
 }
 
+pub async fn start_server_with_public_https_env(
+    bind: &str,
+    data_dir: &Path,
+    node_id: &str,
+    replication_factor: usize,
+    extra_env: &[(&str, &str)],
+) -> Result<ChildGuard> {
+    start_server_with_env_options_inner(
+        bind,
+        data_dir,
+        node_id,
+        replication_factor,
+        None,
+        None,
+        extra_env,
+        true,
+    )
+    .await
+}
+
 pub async fn start_server_with_env_options(
     bind: &str,
     data_dir: &Path,
@@ -250,6 +270,30 @@ pub async fn start_server_with_env_options(
     heartbeat_timeout_secs: Option<u64>,
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
+    start_server_with_env_options_inner(
+        bind,
+        data_dir,
+        node_id,
+        replication_factor,
+        metadata_commit_mode,
+        heartbeat_timeout_secs,
+        extra_env,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_server_with_env_options_inner(
+    bind: &str,
+    data_dir: &Path,
+    node_id: &str,
+    replication_factor: usize,
+    metadata_commit_mode: Option<&str>,
+    heartbeat_timeout_secs: Option<u64>,
+    extra_env: &[(&str, &str)],
+    public_https: bool,
+) -> Result<ChildGuard> {
     let server_bin = binary_path("server-node")?;
 
     let node_id = if node_id.is_empty() {
@@ -258,7 +302,8 @@ pub async fn start_server_with_env_options(
         node_id.to_string()
     };
 
-    let public_url = format!("http://{bind}");
+    let public_scheme = if public_https { "https" } else { "http" };
+    let public_url = format!("{public_scheme}://{bind}");
     let internal_bind = internal_bind_from_public_bind(bind)?;
     let internal_url = format!("https://{internal_bind}");
 
@@ -290,8 +335,8 @@ pub async fn start_server_with_env_options(
         .env("IRONMESH_INTERNAL_BIND", internal_bind)
         .env("IRONMESH_INTERNAL_URL", internal_url)
         .env("IRONMESH_INTERNAL_TLS_CA_CERT", ca_path)
-        .env("IRONMESH_INTERNAL_TLS_CERT", cert_path)
-        .env("IRONMESH_INTERNAL_TLS_KEY", key_path)
+        .env("IRONMESH_INTERNAL_TLS_CERT", &cert_path)
+        .env("IRONMESH_INTERNAL_TLS_KEY", &key_path)
         .env(
             "IRONMESH_REPLICATION_FACTOR",
             replication_factor.to_string(),
@@ -314,9 +359,21 @@ pub async fn start_server_with_env_options(
         command.env(key, value);
     }
 
+    if public_https {
+        command
+            .env("IRONMESH_PUBLIC_TLS_CERT", &cert_path)
+            .env("IRONMESH_PUBLIC_TLS_KEY", &key_path);
+    }
+
     let mut child = command.spawn().context("failed to spawn server-node")?;
 
-    if let Err(err) = wait_for_server(bind, 40).await {
+    let startup_result = if public_https {
+        wait_for_https_server(data_dir, bind, 40).await
+    } else {
+        wait_for_server(bind, 40).await
+    };
+
+    if let Err(err) = startup_result {
         if let Some(status) = child
             .try_wait()
             .context("failed to query server-node process state")?
@@ -500,9 +557,23 @@ pub async fn wait_for_server(bind: &str, retries: usize) -> Result<()> {
     wait_for_url_status(&health_url, StatusCode::OK, retries).await
 }
 
+pub async fn wait_for_https_server(data_dir: &Path, bind: &str, retries: usize) -> Result<()> {
+    let health_url = format!("https://{bind}/health");
+    let http = https_client_with_root_from_data_dir(data_dir)?;
+    wait_for_url_status_with_client(&http, &health_url, StatusCode::OK, retries).await
+}
+
 pub async fn wait_for_url_status(url: &str, expected: StatusCode, retries: usize) -> Result<()> {
     let http = reqwest::Client::new();
+    wait_for_url_status_with_client(&http, url, expected, retries).await
+}
 
+pub async fn wait_for_url_status_with_client(
+    http: &reqwest::Client,
+    url: &str,
+    expected: StatusCode,
+    retries: usize,
+) -> Result<()> {
     for _ in 0..retries {
         if let Ok(resp) = http.get(url).send().await
             && resp.status() == expected

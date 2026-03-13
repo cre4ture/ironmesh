@@ -3,11 +3,12 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        fresh_data_dir, issue_pairing_token, start_server, start_server_with_env, stop_server,
+        fresh_data_dir, https_client_with_root_from_data_dir, issue_pairing_token, start_server,
+        start_server_with_public_https_env, stop_server,
     };
     use crate::framework_win::{
         start_cfapi_adapter, start_cfapi_adapter_with_refresh,
-        start_cfapi_adapter_with_refresh_and_pairing,
+        start_cfapi_adapter_with_refresh_pairing_and_ca,
     };
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
@@ -460,13 +461,13 @@ mod tests {
     #[tokio::test]
     async fn test_cfapi_adapter_enrolls_and_uses_client_auth() {
         let bind = "127.0.0.1:19097";
-        let base_url = format!("http://{bind}");
+        let base_url = format!("https://{bind}");
         let admin_token = "system-tests-admin-secret";
         let server_data_dir = fresh_data_dir("cfapi-auth-server");
         let sync_root = fresh_data_dir("cfapi-auth-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
-        let mut server = start_server_with_env(
+        let mut server = start_server_with_public_https_env(
             bind,
             &server_data_dir,
             "",
@@ -480,7 +481,7 @@ mod tests {
         .expect("failed to start auth-enabled server-node");
 
         let result = async {
-            let http = Client::new();
+            let http = https_client_with_root_from_data_dir(&server_data_dir)?;
             let pairing_token = issue_pairing_token(
                 &http,
                 &base_url,
@@ -494,13 +495,15 @@ mod tests {
                 "ironmesh.systemtest.authenticated.{}",
                 bind.replace(['.', ':'], "_")
             );
-            let _adapter = start_cfapi_adapter_with_refresh_and_pairing(
+            let server_ca_cert = server_data_dir.join("tls").join("ca.pem");
+            let _adapter = start_cfapi_adapter_with_refresh_pairing_and_ca(
                 &sync_root_id,
                 "ironmesh System Test Authenticated Root",
                 &sync_root,
                 &base_url,
                 500,
                 Some(&pairing_token),
+                Some(&server_ca_cert),
             )
             .await?;
 
@@ -517,7 +520,9 @@ mod tests {
                 .expect("device_token missing in persisted auth file")
                 .to_string();
 
-            let sdk = IronMeshClient::new(&base_url).with_bearer_token(device_token);
+            let sdk_http = https_client_with_root_from_data_dir(&server_data_dir)?;
+            let sdk = IronMeshClient::with_http_client(&base_url, sdk_http)
+                .with_bearer_token(device_token);
 
             let local_file = sync_root.join("authenticated-upload.txt");
             std::fs::write(&local_file, b"cfapi auth upload")

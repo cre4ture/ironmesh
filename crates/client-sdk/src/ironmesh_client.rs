@@ -129,8 +129,12 @@ struct PathMutationRequest {
 
 impl IronMeshClient {
     pub fn new(server_base_url: impl Into<String>) -> Self {
+        Self::with_http_client(server_base_url, HttpClient::new())
+    }
+
+    pub fn with_http_client(server_base_url: impl Into<String>, http: HttpClient) -> Self {
         Self {
-            http: HttpClient::new(),
+            http,
             server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
             bearer_token: None,
         }

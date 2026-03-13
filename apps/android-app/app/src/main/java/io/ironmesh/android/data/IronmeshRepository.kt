@@ -66,8 +66,17 @@ class IronmeshRepository {
             .create(IronmeshApi::class.java)
     }
 
-    private fun shouldUseRustBridge(authToken: String?): Boolean {
-        return authToken.isNullOrBlank() && RustClientBridge.isAvailable()
+    private fun shouldUseRustBridge(): Boolean {
+        return RustClientBridge.isAvailable()
+    }
+
+    private fun <T> decodeJson(json: String, clazz: Class<T>): T {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(clazz)
+        return adapter.fromJson(json)
+            ?: throw IllegalStateException("failed to decode ${clazz.simpleName}")
     }
 
     suspend fun health(baseUrl: String, authToken: String? = null): HealthResponse {
@@ -84,6 +93,18 @@ class IronmeshRepository {
         deviceId: String? = null,
         label: String? = null,
     ): ClientDeviceEnrollResponse {
+        if (shouldUseRustBridge()) {
+            return decodeJson(
+                RustClientBridge.enrollDevice(
+                    sanitizeBaseUrl(baseUrl),
+                    pairingToken,
+                    deviceId,
+                    label,
+                ),
+                ClientDeviceEnrollResponse::class.java,
+            )
+        }
+
         val response = createApi(baseUrl).enrollDevice(
             ClientDeviceEnrollRequest(
                 pairing_token = pairingToken,
@@ -98,13 +119,14 @@ class IronmeshRepository {
     }
 
     suspend fun putObject(baseUrl: String, key: String, payload: String, authToken: String? = null): Int {
-        if (!shouldUseRustBridge(authToken)) {
+        if (!shouldUseRustBridge()) {
             return putObjectBytes(baseUrl, key, payload.toByteArray(Charsets.UTF_8), authToken)
         }
         return RustClientBridge.putObject(
             sanitizeBaseUrl(baseUrl),
             key,
             payload.toByteArray(Charsets.UTF_8),
+            authToken,
         )
     }
 
@@ -126,7 +148,7 @@ class IronmeshRepository {
         snapshot: String? = null,
         authToken: String? = null,
     ): List<StoreIndexEntry> {
-        if (!shouldUseRustBridge(authToken)) {
+        if (!shouldUseRustBridge()) {
             return createApi(baseUrl, authToken).storeIndex(
                 prefix = prefix,
                 depth = depth.coerceAtLeast(1),
@@ -139,15 +161,9 @@ class IronmeshRepository {
             prefix,
             depth.coerceAtLeast(1),
             snapshot,
+            authToken,
         )
-
-        val adapter = Moshi.Builder()
-            .add(KotlinJsonAdapterFactory())
-            .build()
-            .adapter(StoreIndexResponse::class.java)
-
-        val parsed = adapter.fromJson(responseJson)
-            ?: throw IllegalStateException("storeIndex failed: empty response")
+        val parsed = decodeJson(responseJson, StoreIndexResponse::class.java)
         return parsed.entries
     }
 
@@ -157,7 +173,7 @@ class IronmeshRepository {
         payload: ByteArray,
         authToken: String? = null,
     ): Int {
-        if (!shouldUseRustBridge(authToken)) {
+        if (!shouldUseRustBridge()) {
             val response = createApi(baseUrl, authToken).putObject(
                 key,
                 payload.toRequestBody("application/octet-stream".toMediaType()),
@@ -168,7 +184,7 @@ class IronmeshRepository {
             return response.code()
         }
 
-        return RustClientBridge.putObject(sanitizeBaseUrl(baseUrl), key, payload)
+        return RustClientBridge.putObject(sanitizeBaseUrl(baseUrl), key, payload, authToken)
     }
 
     suspend fun streamPutObject(
@@ -177,7 +193,7 @@ class IronmeshRepository {
         input: InputStream,
         authToken: String? = null,
     ): Int {
-        if (!shouldUseRustBridge(authToken)) {
+        if (!shouldUseRustBridge()) {
             val requestBody = object : RequestBody() {
                 override fun contentType() = "application/octet-stream".toMediaType()
 
@@ -196,12 +212,12 @@ class IronmeshRepository {
             return response.code()
         }
 
-        return RustClientBridge.streamPutObject(sanitizeBaseUrl(baseUrl), key, input)
+        return RustClientBridge.streamPutObject(sanitizeBaseUrl(baseUrl), key, input, authToken)
     }
 
     suspend fun deleteObject(baseUrl: String, key: String, authToken: String? = null): Int {
-        if (shouldUseRustBridge(authToken)) {
-            return RustClientBridge.deleteObject(sanitizeBaseUrl(baseUrl), key)
+        if (shouldUseRustBridge()) {
+            return RustClientBridge.deleteObject(sanitizeBaseUrl(baseUrl), key, authToken)
         }
 
         val response = createApi(baseUrl, authToken).deleteObject(key)
@@ -218,12 +234,13 @@ class IronmeshRepository {
         version: String? = null,
         authToken: String? = null,
     ): ByteArray {
-        if (shouldUseRustBridge(authToken)) {
+        if (shouldUseRustBridge()) {
             return RustClientBridge.getObject(
                 sanitizeBaseUrl(baseUrl),
                 key,
                 snapshot,
                 version,
+                authToken,
             )
         }
 
@@ -243,7 +260,7 @@ class IronmeshRepository {
         version: String? = null,
         authToken: String? = null,
     ) {
-        if (!shouldUseRustBridge(authToken)) {
+        if (!shouldUseRustBridge()) {
             val response = createApi(baseUrl, authToken).getObjectBinary(
                 key,
                 snapshot = snapshot,
@@ -265,6 +282,7 @@ class IronmeshRepository {
             output,
             snapshot,
             version,
+            authToken,
         )
         return
     }

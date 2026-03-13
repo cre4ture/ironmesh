@@ -16,8 +16,16 @@ pub struct ClientNode {
 
 impl ClientNode {
     pub fn new(server_base_url: impl Into<String>) -> Self {
+        Self::with_client(IronMeshClient::new(server_base_url))
+    }
+
+    pub fn with_http_client(server_base_url: impl Into<String>, http: reqwest::Client) -> Self {
+        Self::with_client(IronMeshClient::with_http_client(server_base_url, http))
+    }
+
+    pub fn with_client(client: IronMeshClient) -> Self {
         Self {
-            client: IronMeshClient::new(server_base_url),
+            client,
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }

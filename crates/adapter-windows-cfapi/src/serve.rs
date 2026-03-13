@@ -6,7 +6,8 @@ use crate::live::{ServerNodeHydrator, normalize_base_url};
 use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root};
 use clap::Parser;
 use client_sdk::{
-    IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+    build_http_client,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +42,8 @@ struct Args {
     device_label: Option<String>,
     #[arg(long)]
     device_token_file: Option<PathBuf>,
+    #[arg(long)]
+    server_ca_cert: Option<PathBuf>,
 }
 
 pub fn serve_main() -> anyhow::Result<()> {
@@ -57,16 +60,14 @@ pub fn serve_main() -> anyhow::Result<()> {
             device_id: args.device_id.clone(),
             device_label: args.device_label.clone(),
             device_token_file: args.device_token_file.clone(),
+            server_ca_cert: args.server_ca_cert.clone(),
         },
     )?;
     if let Some(auth) = device_auth.as_ref() {
         eprintln!("using enrolled device auth for {}", auth.device_id);
     }
     let bearer_token = device_auth.as_ref().map(|auth| auth.device_token.clone());
-    let client = match bearer_token.as_ref() {
-        Some(token) => IronMeshClient::new(base_url.as_str()).with_bearer_token(token.clone()),
-        None => IronMeshClient::new(base_url.as_str()),
-    };
+    let client = build_http_client(args.server_ca_cert.as_deref(), base_url.as_str(), &bearer_token)?;
 
     let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
     let fetcher = RemoteSnapshotFetcher::new(
@@ -82,8 +83,13 @@ pub fn serve_main() -> anyhow::Result<()> {
     let hydrator = Box::new(ServerNodeHydrator::new(
         base_url.clone(),
         bearer_token.clone(),
-    ));
-    let uploader = Arc::new(ServerNodeHydrator::new(base_url, bearer_token));
+        args.server_ca_cert.as_deref(),
+    )?);
+    let uploader = Arc::new(ServerNodeHydrator::new(
+        base_url,
+        bearer_token,
+        args.server_ca_cert.as_deref(),
+    )?);
     let _connection = connect_sync_root(&registration, runtime.clone(), hydrator, uploader)?;
 
     apply_action_plan(&registration.root_path, &action_plan)?;
