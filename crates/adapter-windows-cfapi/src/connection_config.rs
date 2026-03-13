@@ -13,6 +13,7 @@ pub struct ResolvedConnectionConfig {
     pub base_url: Url,
     pub server_ca_pem: Option<String>,
     pub pairing_token: Option<String>,
+    pub force_reenroll: bool,
     pub device_id: Option<String>,
     pub device_label: Option<String>,
     pub bootstrap_path: PathBuf,
@@ -49,6 +50,7 @@ pub fn resolve_connection_config(
 
     if bootstrap_path.exists() {
         let bundle = ConnectionBootstrap::from_path(&bootstrap_path)?;
+        let bootstrap_pairing_token = normalize_optional(bundle.pairing_token.as_deref());
         let resolved = bundle.resolve_blocking()?;
         let base_url = Url::parse(&resolved.server_base_url)
             .with_context(|| format!("invalid resolved server URL {}", resolved.server_base_url))?;
@@ -56,6 +58,7 @@ pub fn resolve_connection_config(
             base_url,
             server_ca_pem: direct_ca_pem.or(resolved.server_ca_pem),
             pairing_token: normalize_optional(pairing_token).or(resolved.pairing_token),
+            force_reenroll: bootstrap_pairing_token.is_some(),
             device_id: normalize_optional(device_id).or(resolved.device_id),
             device_label: normalize_optional(device_label).or(resolved.device_label),
             bootstrap_path,
@@ -69,6 +72,7 @@ pub fn resolve_connection_config(
         base_url,
         server_ca_pem: direct_ca_pem,
         pairing_token: normalize_optional(pairing_token),
+        force_reenroll: false,
         device_id: normalize_optional(device_id),
         device_label: normalize_optional(device_label),
         bootstrap_path,

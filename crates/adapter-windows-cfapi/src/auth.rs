@@ -12,6 +12,7 @@ const DEFAULT_DEVICE_AUTH_FILE_NAME: &str = ".ironmesh-device-auth.json";
 #[derive(Debug, Clone)]
 pub struct DeviceEnrollmentOptions {
     pub pairing_token: Option<String>,
+    pub force_reenroll: bool,
     pub device_id: Option<String>,
     pub device_label: Option<String>,
     pub device_token_file: Option<PathBuf>,
@@ -35,7 +36,7 @@ pub fn resolve_or_enroll_device_auth(
         .clone()
         .unwrap_or_else(|| default_device_auth_path(sync_root_path));
 
-    if auth_file.exists() {
+    if auth_file.exists() && !options.force_reenroll {
         return load_device_auth(&auth_file).map(Some);
     }
 

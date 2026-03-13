@@ -106,6 +106,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                 &registration.root_path,
                 &DeviceEnrollmentOptions {
                     pairing_token: connection.pairing_token.clone(),
+                    force_reenroll: connection.force_reenroll,
                     device_id: connection.device_id.clone(),
                     device_label: connection.device_label.clone(),
                     device_token_file: args.device_token_file.clone(),
