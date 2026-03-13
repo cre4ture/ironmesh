@@ -448,8 +448,8 @@ extract_json_string_field() {
 json_escape_file() {
   local path="$1"
   sed 's/\\/\\\\/g; s/"/\\"/g' "${path}" \
-    | awk '{printf "%s\\\\n", $0}' \
-    | sed 's/\\\\n$//'
+    | awk '{printf "%s\\n", $0}' \
+    | sed 's/\\n$//'
 }
 
 bootstrap_bundle_json() {
