@@ -5,8 +5,8 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::connection::build_blocking_http_client;
 use crate::connection::load_root_certificate;
-use crate::connection::{build_blocking_http_client};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEnrollmentRequest {
@@ -40,7 +40,8 @@ pub async fn enroll_device(
     } else if base_url.scheme() == "https" {
         bail!("server-ca-cert needed for HTTPS server");
     }
-    let response = builder.build()?
+    let response = builder
+        .build()?
         .post(enroll_url)
         .json(request)
         .send()

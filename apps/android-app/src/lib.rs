@@ -253,7 +253,11 @@ fn configured_sdk(
     server_base_url: impl Into<String>,
     auth_token: Option<String>,
 ) -> Result<IronMeshClient> {
-    build_http_client(None, &server_base_url.into(), &normalize_optional_string(auth_token))
+    build_http_client(
+        None,
+        &server_base_url.into(),
+        &normalize_optional_string(auth_token),
+    )
 }
 
 fn configured_client_node(

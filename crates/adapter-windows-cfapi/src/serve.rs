@@ -6,8 +6,7 @@ use crate::live::{ServerNodeHydrator, normalize_base_url};
 use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root};
 use clap::Parser;
 use client_sdk::{
-    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
-    build_http_client,
+    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,7 +66,11 @@ pub fn serve_main() -> anyhow::Result<()> {
         eprintln!("using enrolled device auth for {}", auth.device_id);
     }
     let bearer_token = device_auth.as_ref().map(|auth| auth.device_token.clone());
-    let client = build_http_client(args.server_ca_cert.as_deref(), base_url.as_str(), &bearer_token)?;
+    let client = build_http_client(
+        args.server_ca_cert.as_deref(),
+        base_url.as_str(),
+        &bearer_token,
+    )?;
 
     let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
     let fetcher = RemoteSnapshotFetcher::new(

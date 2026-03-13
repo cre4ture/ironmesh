@@ -15,7 +15,11 @@ pub fn load_root_certificate(path: &Path) -> Result<Certificate> {
         .with_context(|| format!("failed to parse server CA certificate {}", path.display()))
 }
 
-pub fn build_http_client(server_ca_cert: Option<&Path>, base_url_str: &str, bearer_token: &Option<String>) -> Result<IronMeshClient> {
+pub fn build_http_client(
+    server_ca_cert: Option<&Path>,
+    base_url_str: &str,
+    bearer_token: &Option<String>,
+) -> Result<IronMeshClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let builder = Client::builder();
@@ -54,4 +58,3 @@ pub fn build_blocking_http_client(server_ca_cert: Option<&Path>) -> Result<Block
         .build()
         .context("failed building blocking HTTP client")
 }
-

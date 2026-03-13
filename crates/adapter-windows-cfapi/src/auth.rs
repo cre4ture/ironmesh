@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_DEVICE_AUTH_FILE_NAME: &str = ".ironmesh-device-auth.json";
 
-
 #[derive(Debug, Clone)]
 pub struct DeviceEnrollmentOptions {
     pub pairing_token: Option<String>,
@@ -25,8 +24,6 @@ pub struct DeviceAuthRecord {
     pub device_token: String,
     pub label: Option<String>,
 }
-
-
 
 pub fn resolve_or_enroll_device_auth(
     base_url: &Url,
@@ -94,7 +91,6 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
 }
-
 
 fn load_device_auth(path: &Path) -> Result<DeviceAuthRecord> {
     let raw = fs::read_to_string(path)
