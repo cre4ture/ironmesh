@@ -72,6 +72,7 @@ struct ServerState {
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     client_auth: Arc<Mutex<ClientAuthState>>,
+    public_ca_pem: Option<String>,
     metadata_commit_mode: MetadataCommitMode,
     internal_http: reqwest::Client,
     autonomous_replication_on_put_enabled: bool,
@@ -746,11 +747,25 @@ async fn main() -> Result<()> {
         }
     };
 
+    let public_ca_pem = std::env::var("IRONMESH_PUBLIC_TLS_CA_CERT")
+        .ok()
+        .map(PathBuf::from)
+        .map(|path| {
+            std::fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "failed reading IRONMESH_PUBLIC_TLS_CA_CERT from {}",
+                    path.display()
+                )
+            })
+        })
+        .transpose()?;
+
     let state = ServerState {
         node_id,
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         client_auth: Arc::new(Mutex::new(persisted_client_auth)),
+        public_ca_pem,
         metadata_commit_mode,
         internal_http,
         autonomous_replication_on_put_enabled,
@@ -841,6 +856,10 @@ async fn main() -> Result<()> {
         .route(
             "/auth/devices/{device_id}",
             axum::routing::delete(revoke_client_device),
+        )
+        .route(
+            "/auth/bootstrap-bundles/issue",
+            post(issue_bootstrap_bundle),
         )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
@@ -2327,6 +2346,15 @@ struct PairingTokenIssueResponse {
     expires_at_unix: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct BootstrapBundleIssueResponse {
+    version: u32,
+    endpoints: Vec<String>,
+    server_ca_pem: Option<String>,
+    pairing_token: String,
+    device_label: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ClientDeviceEnrollRequest {
     pairing_token: String,
@@ -2382,6 +2410,105 @@ async fn issue_pairing_token(
         Err(status) => return status.into_response(),
     };
 
+    let response = match issue_pairing_token_impl(&state, request).await {
+        Ok(response) => response,
+        Err(status) => return status.into_response(),
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "token_id": response.token_id,
+            "label": response.label,
+            "expires_at_unix": response.expires_at_unix,
+        }),
+    )
+    .await;
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+async fn issue_bootstrap_bundle(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<PairingTokenIssueRequest>,
+) -> impl IntoResponse {
+    let action = "auth/bootstrap-bundles/issue";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "label": request.label,
+            "expires_in_secs": request.expires_in_secs,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let pairing_response = match issue_pairing_token_impl(&state, request).await {
+        Ok(response) => response,
+        Err(status) => return status.into_response(),
+    };
+
+    let endpoints = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        let mut urls = cluster
+            .list_nodes()
+            .into_iter()
+            .filter(|node| !node.public_url.trim().is_empty())
+            .map(|node| node.public_url)
+            .collect::<Vec<_>>();
+        urls.sort();
+        urls.dedup();
+        urls
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "label": pairing_response.label,
+            "endpoint_count": endpoints.len(),
+            "expires_at_unix": pairing_response.expires_at_unix,
+        }),
+    )
+    .await;
+
+    (
+        StatusCode::CREATED,
+        Json(BootstrapBundleIssueResponse {
+            version: 1,
+            endpoints,
+            server_ca_pem: state.public_ca_pem.clone(),
+            pairing_token: pairing_response.pairing_token,
+            device_label: pairing_response.label,
+        }),
+    )
+        .into_response()
+}
+
+async fn issue_pairing_token_impl(
+    state: &ServerState,
+    request: PairingTokenIssueRequest,
+) -> std::result::Result<PairingTokenIssueResponse, StatusCode> {
     let now = unix_ts();
     let expires_in_secs = request
         .expires_in_secs
@@ -2406,38 +2533,18 @@ async fn issue_pairing_token(
         auth_state.pairing_tokens.push(record.clone());
     }
 
-    if let Err(err) = persist_client_auth_state(&state).await {
+    if let Err(err) = persist_client_auth_state(state).await {
         warn!(error = %err, "failed to persist client auth state after pairing token issue");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    append_admin_audit(
-        &state,
-        action,
-        &authz,
-        true,
-        true,
-        true,
-        "success",
-        json!({
-            "token_id": record.token_id,
-            "label": record.label,
-            "expires_at_unix": record.expires_at_unix,
-        }),
-    )
-    .await;
-
-    (
-        StatusCode::CREATED,
-        Json(PairingTokenIssueResponse {
-            token_id: record.token_id,
-            pairing_token,
-            label: record.label,
-            created_at_unix: record.created_at_unix,
-            expires_at_unix: record.expires_at_unix,
-        }),
-    )
-        .into_response()
+    Ok(PairingTokenIssueResponse {
+        token_id: record.token_id,
+        pairing_token,
+        label: record.label,
+        created_at_unix: record.created_at_unix,
+        expires_at_unix: record.expires_at_unix,
+    })
 }
 
 async fn enroll_client_device(

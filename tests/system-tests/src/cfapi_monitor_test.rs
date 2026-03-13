@@ -3,14 +3,14 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        fresh_data_dir, https_client_with_root_from_data_dir, issue_pairing_token, start_server,
+        fresh_data_dir, https_client_with_root_from_data_dir, issue_bootstrap_bundle, start_server,
         start_server_with_public_https_env, stop_server,
     };
     use crate::framework_win::{
         start_cfapi_adapter, start_cfapi_adapter_with_bootstrap, start_cfapi_adapter_with_refresh,
     };
     use bytes::Bytes;
-    use client_sdk::{ConnectionBootstrap, IronMeshClient};
+    use client_sdk::IronMeshClient;
     use reqwest::Client;
     use std::fs::File;
     use std::io::Write;
@@ -481,7 +481,7 @@ mod tests {
 
         let result = async {
             let http = https_client_with_root_from_data_dir(&server_data_dir)?;
-            let pairing_token = issue_pairing_token(
+            let bootstrap = issue_bootstrap_bundle(
                 &http,
                 &base_url,
                 admin_token,
@@ -495,18 +495,6 @@ mod tests {
                 bind.replace(['.', ':'], "_")
             );
             let bootstrap_file = sync_root.join(".ironmesh-connection.json");
-            let bootstrap = ConnectionBootstrap {
-                version: 1,
-                endpoints: vec![base_url.clone()],
-                resolved_endpoint: None,
-                server_ca_pem: Some(
-                    std::fs::read_to_string(server_data_dir.join("tls").join("ca.pem"))
-                        .expect("failed to read test CA pem"),
-                ),
-                pairing_token: Some(pairing_token.clone()),
-                device_label: Some("cfapi-system-test".to_string()),
-                device_id: None,
-            };
             bootstrap
                 .write_to_path(&bootstrap_file)
                 .expect("failed to write bootstrap bundle");

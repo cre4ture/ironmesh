@@ -471,6 +471,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
         client_auth: Arc::new(Mutex::new(super::storage::ClientAuthState::default())),
+        public_ca_pem: None,
         metadata_commit_mode: MetadataCommitMode::Local,
         internal_http: reqwest::Client::new(),
         autonomous_replication_on_put_enabled: false,

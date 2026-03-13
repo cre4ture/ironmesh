@@ -437,53 +437,32 @@ JSON
     --data "${payload}"
 }
 
-extract_json_string_field() {
-  local json="$1"
-  local field="$2"
-  printf '%s' "${json}" \
-    | tr -d '\r\n' \
-    | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p"
-}
-
-json_escape_file() {
-  local path="$1"
-  sed 's/\\/\\\\/g; s/"/\\"/g' "${path}" \
-    | awk '{printf "%s\\n", $0}' \
-    | sed 's/\\n$//'
-}
-
 bootstrap_bundle_json() {
   local label="${1:-local-device}"
   local expires_in_secs="${2:-3600}"
   local node_idx="${3:-1}"
-  local token_json
-  token_json="$(issue_pairing_token_json "${label}" "${expires_in_secs}" "${node_idx}")"
-  local pairing_token
-  pairing_token="$(extract_json_string_field "${token_json}" "pairing_token")"
 
-  if [[ -z "${pairing_token}" ]]; then
-    echo "[local-cluster] ERROR: failed to extract pairing_token from response" >&2
+  if [[ "${CLIENT_AUTH_ENABLED}" != "true" ]]; then
+    echo "[local-cluster] client auth is disabled; no bootstrap bundle needed" >&2
     return 1
   fi
 
-  local ca_json
-  ca_json="$(json_escape_file "$(ca_cert_file)")"
+  local controller_url
+  controller_url="$(node_url "${node_idx}")"
 
-  local endpoints=()
-  local idx
-  for idx in $(seq 1 "$NODE_COUNT"); do
-    endpoints+=("\"$(node_url "${idx}")\"")
-  done
-
-  cat <<JSON
+  local payload
+  payload=$(cat <<JSON
 {
-  "version": 1,
-  "endpoints": [$(IFS=,; echo "${endpoints[*]}")],
-  "server_ca_pem": "${ca_json}",
-  "pairing_token": "${pairing_token}",
-  "device_label": "${label}"
+  "label": "${label}",
+  "expires_in_secs": ${expires_in_secs}
 }
 JSON
+)
+
+  curl --cacert "$(ca_cert_file)" -fsS -X POST "${controller_url}/auth/bootstrap-bundles/issue" \
+    -H "content-type: application/json" \
+    -H "x-ironmesh-admin-token: $(admin_token)" \
+    --data "${payload}"
 }
 
 write_bootstrap_bundle() {
@@ -559,6 +538,7 @@ start_cluster() {
       IRONMESH_PUBLIC_URL="${url}" \
       IRONMESH_PUBLIC_TLS_CERT="$(public_cert_file)" \
       IRONMESH_PUBLIC_TLS_KEY="$(public_key_file)" \
+      IRONMESH_PUBLIC_TLS_CA_CERT="$(ca_cert_file)" \
       IRONMESH_INTERNAL_BIND="${internal_bind}" \
       IRONMESH_INTERNAL_URL="${internal_url}" \
       IRONMESH_INTERNAL_TLS_CA_CERT="$(ca_cert_file)" \

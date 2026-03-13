@@ -334,7 +334,7 @@ async fn start_server_with_env_options_inner(
         .env("IRONMESH_NODE_ID", &node_id)
         .env("IRONMESH_INTERNAL_BIND", internal_bind)
         .env("IRONMESH_INTERNAL_URL", internal_url)
-        .env("IRONMESH_INTERNAL_TLS_CA_CERT", ca_path)
+        .env("IRONMESH_INTERNAL_TLS_CA_CERT", &ca_path)
         .env("IRONMESH_INTERNAL_TLS_CERT", &cert_path)
         .env("IRONMESH_INTERNAL_TLS_KEY", &key_path)
         .env(
@@ -362,7 +362,8 @@ async fn start_server_with_env_options_inner(
     if public_https {
         command
             .env("IRONMESH_PUBLIC_TLS_CERT", &cert_path)
-            .env("IRONMESH_PUBLIC_TLS_KEY", &key_path);
+            .env("IRONMESH_PUBLIC_TLS_KEY", &key_path)
+            .env("IRONMESH_PUBLIC_TLS_CA_CERT", &ca_path);
     }
 
     let mut child = command.spawn().context("failed to spawn server-node")?;
@@ -533,6 +534,28 @@ pub async fn issue_pairing_token(
         .and_then(|value| value.as_str())
         .map(ToString::to_string)
         .context("pairing token missing in response")
+}
+
+#[allow(dead_code)]
+pub async fn issue_bootstrap_bundle(
+    http: &reqwest::Client,
+    base_url: &str,
+    admin_token: &str,
+    label: Option<&str>,
+    expires_in_secs: Option<u64>,
+) -> Result<client_sdk::ConnectionBootstrap> {
+    http.post(format!("{base_url}/auth/bootstrap-bundles/issue"))
+        .header("x-ironmesh-admin-token", admin_token)
+        .json(&serde_json::json!({
+            "label": label,
+            "expires_in_secs": expires_in_secs,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<client_sdk::ConnectionBootstrap>()
+        .await
+        .context("failed to decode bootstrap bundle response")
 }
 
 pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {

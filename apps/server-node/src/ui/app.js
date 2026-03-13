@@ -54,6 +54,54 @@ async function triggerReplicationRepair() {
   }
 }
 
+async function issueBootstrapBundle() {
+  const output = document.getElementById('bootstrap-bundle-json');
+  const adminToken = document.getElementById('bootstrap-admin-token').value.trim();
+  const deviceLabel = document.getElementById('bootstrap-device-label').value.trim();
+  const expiryRaw = document.getElementById('bootstrap-expiry-secs').value.trim();
+
+  if (!adminToken) {
+    output.textContent = 'admin token is required';
+    return;
+  }
+
+  let expiresInSecs = Number.parseInt(expiryRaw, 10);
+  if (!Number.isFinite(expiresInSecs)) {
+    expiresInSecs = 3600;
+  }
+
+  output.textContent = 'issuing bootstrap bundle...';
+  try {
+    const response = await fetch('/auth/bootstrap-bundles/issue', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+        'x-ironmesh-admin-token': adminToken
+      },
+      body: JSON.stringify({
+        label: deviceLabel || null,
+        expires_in_secs: expiresInSecs
+      })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+  } catch (error) {
+    output.textContent = 'failed to issue bootstrap bundle: ' + error;
+  }
+}
+
 document
   .getElementById('fetch-replication-plan')
   .addEventListener('click', fetchReplicationPlan);
@@ -61,6 +109,10 @@ document
 document
   .getElementById('trigger-replication-repair')
   .addEventListener('click', triggerReplicationRepair);
+
+document
+  .getElementById('issue-bootstrap-bundle')
+  .addEventListener('click', issueBootstrapBundle);
 
 refreshServerLogs();
 setInterval(refreshServerLogs, 2000);

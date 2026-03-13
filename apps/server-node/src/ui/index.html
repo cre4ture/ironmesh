@@ -36,40 +36,52 @@
     <button id="trigger-replication-repair" type="button">Trigger replication repair</button>
     <pre id="replication-repair-json">click the button to trigger manual replication repair</pre>
 
+    <h2>Bootstrap bundle</h2>
+    <p>Issues a client bootstrap bundle via <code>POST /auth/bootstrap-bundles/issue</code>. Requires the admin token.</p>
+    <label for="bootstrap-admin-token">Admin token</label>
+    <input id="bootstrap-admin-token" type="password" autocomplete="off" spellcheck="false" />
+    <label for="bootstrap-device-label">Device label</label>
+    <input id="bootstrap-device-label" type="text" value="desktop-client" autocomplete="off" spellcheck="false" />
+    <label for="bootstrap-expiry-secs">Expires in seconds</label>
+    <input id="bootstrap-expiry-secs" type="number" min="60" max="86400" value="3600" />
+    <button id="issue-bootstrap-bundle" type="button">Issue bootstrap bundle</button>
+    <pre id="bootstrap-bundle-json">provide the admin token and click the button to issue a bootstrap bundle</pre>
+
     <h2>Server logs</h2>
     <p>Recent in-memory log lines from this node.</p>
-    <pre id="server-logs">loading…</pre>
+    <pre id="server-logs">loading...</pre>
 
     <h2>Available routes</h2>
     <ul>
-      <li><code>GET /</code> — info page</li>
-      <li><code>GET /logs?limit=&lt;n&gt;</code> — latest server log lines</li>
-      <li><code>GET /health</code> — node health JSON</li>
-      <li><code>GET /snapshots</code> — snapshot metadata</li>
-      <li><code>GET /store/index</code> — directory index with cached media metadata when available</li>
-      <li><code>PUT /store/{key}</code> — store object bytes</li>
-      <li><code>POST /store-chunks/upload</code> — upload one deduplicated content chunk (hash returned)</li>
-      <li><code>POST /store/{key}?complete</code> — finalize object from uploaded chunk refs</li>
-      <li><code>GET /store/{key}</code> — fetch object bytes from latest state</li>
-      <li><code>GET /media/thumbnail?key=&lt;path&gt;</code> — cached on-node image thumbnail for gallery views</li>
-      <li><code>GET /store/{key}?snapshot=&lt;id&gt;</code> — fetch object from snapshot state</li>
-      <li><code>GET /store/{key}?version=&lt;version_id&gt;</code> — fetch object by specific version</li>
-      <li><code>GET /store/{key}?read_mode=preferred|confirmed_only|provisional_allowed</code> — read latest via explicit consistency mode</li>
-      <li><code>GET /versions/{key}</code> — list version DAG metadata</li>
-      <li><code>POST /versions/{key}/commit/{version_id}</code> — commit version (quorum policy aware)</li>
-      <li><code>POST /versions/{key}/confirm/{version_id}</code> — compatibility alias for commit endpoint</li>
-      <li><code>GET /cluster/status</code> — cluster summary</li>
-      <li><code>GET /cluster/nodes</code> — known node list</li>
-      <li><code>PUT /cluster/nodes/{node_id}</code> — register/update node metadata</li>
-      <li><code>DELETE /cluster/nodes/{node_id}</code> — remove node from cluster membership</li>
-      <li><code>POST /cluster/nodes/{node_id}/heartbeat</code> — refresh node liveness</li>
-      <li><code>GET /cluster/placement/{key}</code> — deterministic placement decision</li>
-      <li><code>GET /cluster/replication/plan</code> — current replication gaps/overages</li>
-      <li><code>POST /cluster/replication/audit</code> — manual audit trigger</li>
-      <li><code>POST /cluster/replication/repair</code> — execute one-pass replica repair for missing placements</li>
-      <li><code>GET /cluster/reconcile/export/provisional</code> — export local provisional metadata for rejoin sync</li>
-      <li><code>POST /cluster/reconcile/{node_id}</code> — import provisional commits from a peer node</li>
-      <li><code>POST /maintenance/cleanup?retention_secs=&lt;n&gt;&amp;dry_run=true|false</code> — retention-safe orphan cleanup for manifests/chunks</li>
+      <li><code>GET /</code> - info page</li>
+      <li><code>GET /logs?limit=&lt;n&gt;</code> - latest server log lines</li>
+      <li><code>GET /health</code> - node health JSON</li>
+      <li><code>GET /snapshots</code> - snapshot metadata</li>
+      <li><code>GET /store/index</code> - directory index with cached media metadata when available</li>
+      <li><code>PUT /store/{key}</code> - store object bytes</li>
+      <li><code>POST /store-chunks/upload</code> - upload one deduplicated content chunk (hash returned)</li>
+      <li><code>POST /store/{key}?complete</code> - finalize object from uploaded chunk refs</li>
+      <li><code>GET /store/{key}</code> - fetch object bytes from latest state</li>
+      <li><code>GET /media/thumbnail?key=&lt;path&gt;</code> - cached on-node image thumbnail for gallery views</li>
+      <li><code>GET /store/{key}?snapshot=&lt;id&gt;</code> - fetch object from snapshot state</li>
+      <li><code>GET /store/{key}?version=&lt;version_id&gt;</code> - fetch object by specific version</li>
+      <li><code>GET /store/{key}?read_mode=preferred|confirmed_only|provisional_allowed</code> - read latest via explicit consistency mode</li>
+      <li><code>GET /versions/{key}</code> - list version DAG metadata</li>
+      <li><code>POST /versions/{key}/commit/{version_id}</code> - commit version (quorum policy aware)</li>
+      <li><code>POST /versions/{key}/confirm/{version_id}</code> - compatibility alias for commit endpoint</li>
+      <li><code>GET /cluster/status</code> - cluster summary</li>
+      <li><code>GET /cluster/nodes</code> - known node list</li>
+      <li><code>PUT /cluster/nodes/{node_id}</code> - register/update node metadata</li>
+      <li><code>DELETE /cluster/nodes/{node_id}</code> - remove node from cluster membership</li>
+      <li><code>POST /cluster/nodes/{node_id}/heartbeat</code> - refresh node liveness</li>
+      <li><code>GET /cluster/placement/{key}</code> - deterministic placement decision</li>
+      <li><code>POST /auth/bootstrap-bundles/issue</code> - issue a bootstrap JSON bundle for client enrollment (admin token required)</li>
+      <li><code>GET /cluster/replication/plan</code> - current replication gaps/overages</li>
+      <li><code>POST /cluster/replication/audit</code> - manual audit trigger</li>
+      <li><code>POST /cluster/replication/repair</code> - execute one-pass replica repair for missing placements</li>
+      <li><code>GET /cluster/reconcile/export/provisional</code> - export local provisional metadata for rejoin sync</li>
+      <li><code>POST /cluster/reconcile/{node_id}</code> - import provisional commits from a peer node</li>
+      <li><code>POST /maintenance/cleanup?retention_secs=&lt;n&gt;&amp;dry_run=true|false</code> - retention-safe orphan cleanup for manifests/chunks</li>
     </ul>
   </main>
   <script src="/ui/app.js"></script>
