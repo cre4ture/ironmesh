@@ -18,7 +18,20 @@ object RustClientBridge {
     ): String
 
     @JvmStatic
-    external fun putObject(baseUrl: String, key: String, payload: ByteArray, authToken: String?): Int
+    external fun enrollWithBootstrap(
+        bootstrapJson: String,
+        deviceId: String?,
+        label: String?,
+    ): String
+
+    @JvmStatic
+    external fun putObject(
+        baseUrl: String,
+        key: String,
+        payload: ByteArray,
+        serverCaPem: String?,
+        authToken: String?,
+    ): Int
 
     @JvmStatic
     external fun getObject(
@@ -26,6 +39,7 @@ object RustClientBridge {
         key: String,
         snapshot: String?,
         version: String?,
+        serverCaPem: String?,
         authToken: String?,
     ): ByteArray
 
@@ -35,6 +49,7 @@ object RustClientBridge {
         prefix: String?,
         depth: Int,
         snapshot: String?,
+        serverCaPem: String?,
         authToken: String?,
     ): String
 
@@ -43,11 +58,17 @@ object RustClientBridge {
         baseUrl: String,
         key: String,
         input: InputStream,
+        serverCaPem: String?,
         authToken: String?,
     ): Int
 
     @JvmStatic
-    external fun deleteObject(baseUrl: String, key: String, authToken: String?): Int
+    external fun deleteObject(
+        baseUrl: String,
+        key: String,
+        serverCaPem: String?,
+        authToken: String?,
+    ): Int
 
     @JvmStatic
     external fun streamObjectTo(
@@ -56,6 +77,7 @@ object RustClientBridge {
         output: OutputStream,
         snapshot: String?,
         version: String?,
+        serverCaPem: String?,
         authToken: String?,
     )
 

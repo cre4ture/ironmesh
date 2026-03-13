@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use client_sdk::{
-    ClientNode, DeviceEnrollmentRequest, IronMeshClient, build_http_client, enroll_device,
+    BootstrapEnrollmentResult, ClientNode, ConnectionBootstrap, DeviceEnrollmentRequest,
+    IronMeshClient, build_http_client_from_pem, enroll_device,
 };
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
@@ -251,10 +252,11 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 
 fn configured_sdk(
     server_base_url: impl Into<String>,
+    server_ca_pem: Option<String>,
     auth_token: Option<String>,
 ) -> Result<IronMeshClient> {
-    build_http_client(
-        None,
+    build_http_client_from_pem(
+        normalize_optional_string(server_ca_pem).as_deref(),
         &server_base_url.into(),
         &normalize_optional_string(auth_token),
     )
@@ -262,10 +264,12 @@ fn configured_sdk(
 
 fn configured_client_node(
     server_base_url: impl Into<String>,
+    server_ca_pem: Option<String>,
     auth_token: Option<String>,
 ) -> Result<ClientNode> {
     Ok(ClientNode::with_client(configured_sdk(
         server_base_url,
+        server_ca_pem,
         auth_token,
     )?))
 }
@@ -354,23 +358,67 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enr
 /// # Safety
 /// This function is intended to be called from Java via JNI.
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enrollWithBootstrap(
+    mut env: JNIEnv,
+    _class: JClass,
+    bootstrap_json: JString,
+    device_id: jstring,
+    label: jstring,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let bootstrap_json: String = env.get_string(&bootstrap_json)?.into();
+        let device_id = normalize_optional_string(optional_jstring(&mut env, device_id)?);
+        let label = normalize_optional_string(optional_jstring(&mut env, label)?);
+        let bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)?;
+        let enrolled: BootstrapEnrollmentResult =
+            bootstrap.enroll_blocking(device_id.as_deref(), label.as_deref())?;
+        serde_json::to_string(&enrolled)
+            .context("failed to serialize bootstrap enrollment response")
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!("rust enrollWithBootstrap failed to create java string: {err:#}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust enrollWithBootstrap failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_putObject(
     mut env: JNIEnv,
     _class: JClass,
     base_url: JString,
     key: JString,
     payload: jbyteArray,
+    server_ca_pem: jstring,
     auth_token: jstring,
 ) -> jint {
     let result = (|| -> Result<jint> {
         let base_url: String = env.get_string(&base_url)?.into();
         let key: String = env.get_string(&key)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let auth_token = optional_jstring(&mut env, auth_token)?;
         let payload_ref = unsafe { JByteArray::from_raw(payload) };
         let payload = env.convert_byte_array(&payload_ref)?;
 
         let rt = runtime()?;
-        let client = configured_client_node(base_url, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
         let report = rt.block_on(client.put_large_aware(key, Bytes::from(payload)))?;
         Ok(report.meta.size_bytes as jint)
     })();
@@ -394,6 +442,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
     key: JString,
     snapshot: jstring,
     version: jstring,
+    server_ca_pem: jstring,
     auth_token: jstring,
 ) -> jbyteArray {
     let result = (|| -> Result<Vec<u8>> {
@@ -401,9 +450,10 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
         let key: String = env.get_string(&key)?.into();
         let snapshot = optional_jstring(&mut env, snapshot)?;
         let version = optional_jstring(&mut env, version)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let auth_token = optional_jstring(&mut env, auth_token)?;
         let rt = runtime()?;
-        let client = configured_client_node(base_url, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
         let bytes = rt
             .block_on(client.get_with_selector(key, snapshot.as_deref(), version.as_deref()))?
             .to_vec();
@@ -438,14 +488,16 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
     prefix: jstring,
     depth: jint,
     snapshot: jstring,
+    server_ca_pem: jstring,
     auth_token: jstring,
 ) -> jstring {
     let result = (|| -> Result<String> {
         let base_url: String = env.get_string(&base_url)?.into();
         let prefix = optional_jstring(&mut env, prefix)?;
         let snapshot = optional_jstring(&mut env, snapshot)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let auth_token = optional_jstring(&mut env, auth_token)?;
-        let sdk = configured_sdk(base_url, auth_token)?;
+        let sdk = configured_sdk(base_url, server_ca_pem, auth_token)?;
         let response = sdk.store_index_blocking(
             prefix.as_deref(),
             usize::try_from(depth).unwrap_or(1).max(1),
@@ -484,14 +536,16 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
     base_url: JString<'local>,
     key: JString<'local>,
     input_stream: JObject<'local>,
+    server_ca_pem: jstring,
     auth_token: jstring,
 ) -> jint {
     let result = (|| -> Result<jint> {
         let base_url: String = env.get_string(&base_url)?.into();
         let key: String = env.get_string(&key)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let auth_token = optional_jstring(&mut env, auth_token)?;
         let mut reader = JavaInputStreamReader::new(&mut env, input_stream)?;
-        let client = configured_client_node(base_url, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
         let report = client.put_chunked_reader(key, &mut reader)?;
         Ok(report.meta.size_bytes as jint)
     })();
@@ -513,14 +567,16 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_del
     _class: JClass,
     base_url: JString,
     key: JString,
+    server_ca_pem: jstring,
     auth_token: jstring,
 ) -> jint {
     let result = (|| -> Result<jint> {
         let base_url: String = env.get_string(&base_url)?.into();
         let key: String = env.get_string(&key)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let auth_token = optional_jstring(&mut env, auth_token)?;
         let rt = runtime()?;
-        let client = configured_client_node(base_url, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
         rt.block_on(client.delete_path(key))?;
         Ok(204)
     })();
@@ -547,6 +603,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
     output_stream: JObject<'local>,
     snapshot: jstring,
     version: jstring,
+    server_ca_pem: jstring,
     auth_token: jstring,
 ) {
     let result = (|| -> Result<()> {
@@ -554,9 +611,10 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let key: String = env.get_string(&key)?.into();
         let snapshot = optional_jstring(&mut env, snapshot)?;
         let version = optional_jstring(&mut env, version)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let auth_token = optional_jstring(&mut env, auth_token)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
-        let client = configured_client_node(base_url, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
         client.get_with_selector_writer(key, snapshot.as_deref(), version.as_deref(), &mut writer)
     })();
 

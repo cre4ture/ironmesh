@@ -409,6 +409,94 @@ JSON
   echo
 }
 
+issue_pairing_token_json() {
+  local label="${1:-local-device}"
+  local expires_in_secs="${2:-3600}"
+  local node_idx="${3:-1}"
+
+  if [[ "${CLIENT_AUTH_ENABLED}" != "true" ]]; then
+    echo "[local-cluster] client auth is disabled; no pairing token needed" >&2
+    return 1
+  fi
+
+  local controller_url
+  controller_url="$(node_url "${node_idx}")"
+
+  local payload
+  payload=$(cat <<JSON
+{
+  "label": "${label}",
+  "expires_in_secs": ${expires_in_secs}
+}
+JSON
+)
+
+  curl --cacert "$(ca_cert_file)" -fsS -X POST "${controller_url}/auth/pairing-tokens/issue" \
+    -H "content-type: application/json" \
+    -H "x-ironmesh-admin-token: $(admin_token)" \
+    --data "${payload}"
+}
+
+extract_json_string_field() {
+  local json="$1"
+  local field="$2"
+  printf '%s' "${json}" \
+    | tr -d '\r\n' \
+    | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p"
+}
+
+json_escape_file() {
+  local path="$1"
+  sed 's/\\/\\\\/g; s/"/\\"/g' "${path}" \
+    | awk '{printf "%s\\\\n", $0}' \
+    | sed 's/\\\\n$//'
+}
+
+bootstrap_bundle_json() {
+  local label="${1:-local-device}"
+  local expires_in_secs="${2:-3600}"
+  local node_idx="${3:-1}"
+  local token_json
+  token_json="$(issue_pairing_token_json "${label}" "${expires_in_secs}" "${node_idx}")"
+  local pairing_token
+  pairing_token="$(extract_json_string_field "${token_json}" "pairing_token")"
+
+  if [[ -z "${pairing_token}" ]]; then
+    echo "[local-cluster] ERROR: failed to extract pairing_token from response" >&2
+    return 1
+  fi
+
+  local ca_json
+  ca_json="$(json_escape_file "$(ca_cert_file)")"
+
+  local endpoints=()
+  local idx
+  for idx in $(seq 1 "$NODE_COUNT"); do
+    endpoints+=("\"$(node_url "${idx}")\"")
+  done
+
+  cat <<JSON
+{
+  "version": 1,
+  "endpoints": [$(IFS=,; echo "${endpoints[*]}")],
+  "server_ca_pem": "${ca_json}",
+  "pairing_token": "${pairing_token}",
+  "device_label": "${label}"
+}
+JSON
+}
+
+write_bootstrap_bundle() {
+  local label="${1:-local-device}"
+  local expires_in_secs="${2:-3600}"
+  local node_idx="${3:-1}"
+  local output_path="${4:-${CLUSTER_DIR}/bootstrap/${label}.json}"
+
+  mkdir -p "$(dirname "${output_path}")"
+  bootstrap_bundle_json "${label}" "${expires_in_secs}" "${node_idx}" >"${output_path}"
+  echo "[local-cluster] wrote bootstrap bundle to ${output_path}"
+}
+
 print_client_auth_help() {
   if [[ "${CLIENT_AUTH_ENABLED}" != "true" ]]; then
     return 0
@@ -418,6 +506,8 @@ print_client_auth_help() {
   echo "  admin token file: $(admin_token_file)"
   echo "  pairing token helper:"
   echo "    scripts/local-cluster.sh pairing-token [label] [expires_in_secs] [node_idx]"
+  echo "  bootstrap bundle helper:"
+  echo "    scripts/local-cluster.sh bootstrap [label] [expires_in_secs] [node_idx] [output_file]"
 }
 
 start_cluster() {
@@ -570,6 +660,7 @@ Usage: scripts/local-cluster.sh <start|stop|restart|status|clean>
 
 Extra commands:
   pairing-token [label] [expires_in_secs] [node_idx]
+  bootstrap [label] [expires_in_secs] [node_idx] [output_file]
 
 Environment variables:
   IRONMESH_LOCAL_CLUSTER_DIR        Default: ${ROOT_DIR}/data/local-cluster
@@ -606,6 +697,9 @@ main() {
       ;;
     pairing-token)
       issue_pairing_token "${2:-local-device}" "${3:-3600}" "${4:-1}"
+      ;;
+    bootstrap)
+      write_bootstrap_bundle "${2:-local-device}" "${3:-3600}" "${4:-1}" "${5:-}"
       ;;
     *)
       usage

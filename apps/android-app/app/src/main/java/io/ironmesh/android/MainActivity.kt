@@ -200,9 +200,6 @@ private fun StatusPanel(state: MainUiState) {
                 CircularProgressIndicator()
             }
             Text("Status: ${state.status}")
-            if (state.replicationSummary.isNotBlank()) {
-                Text("Replication: ${state.replicationSummary}")
-            }
             if (state.objectBody.isNotBlank() && state.selectedSection == MainSection.SETTINGS) {
                 Text("Object body:\n${state.objectBody}")
             }
@@ -326,10 +323,10 @@ private fun ServerControls(
 
     OutlinedTextField(
         modifier = Modifier.fillMaxWidth(),
-        value = state.pairingTokenInput,
-        onValueChange = vm::updatePairingTokenInput,
-        label = { Text("Pairing Token") },
-        singleLine = true,
+        value = state.bootstrapInput,
+        onValueChange = vm::updateBootstrapInput,
+        label = { Text("Connection Bundle") },
+        minLines = 4,
     )
 
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -351,11 +348,6 @@ private fun ServerControls(
         onValueChange = vm::updatePayload,
         label = { Text("Payload") },
     )
-
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = vm::checkHealth) { Text("Health") }
-        Button(onClick = vm::loadReplicationPlan) { Text("Plan") }
-    }
 
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Button(onClick = vm::putObject) { Text("PUT") }

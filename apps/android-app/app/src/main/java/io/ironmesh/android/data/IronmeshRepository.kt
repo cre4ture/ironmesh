@@ -2,9 +2,7 @@ package io.ironmesh.android.data
 
 import io.ironmesh.android.api.ClientDeviceEnrollRequest
 import io.ironmesh.android.api.ClientDeviceEnrollResponse
-import io.ironmesh.android.api.HealthResponse
 import io.ironmesh.android.api.IronmeshApi
-import io.ironmesh.android.api.ReplicationPlanResponse
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.api.StoreIndexResponse
 import com.squareup.moshi.Moshi
@@ -20,6 +18,14 @@ import retrofit2.converter.moshi.MoshiConverterFactory
 import java.net.URL
 import java.io.OutputStream
 import java.io.InputStream
+
+data class BootstrapEnrollmentData(
+    val server_base_url: String,
+    val server_ca_pem: String? = null,
+    val device_id: String,
+    val device_token: String,
+    val label: String? = null,
+)
 
 class IronmeshRepository {
     fun sanitizeBaseUrl(input: String): String {
@@ -79,14 +85,6 @@ class IronmeshRepository {
             ?: throw IllegalStateException("failed to decode ${clazz.simpleName}")
     }
 
-    suspend fun health(baseUrl: String, authToken: String? = null): HealthResponse {
-        return createApi(baseUrl, authToken).health()
-    }
-
-    suspend fun replicationPlan(baseUrl: String, authToken: String? = null): ReplicationPlanResponse {
-        return createApi(baseUrl, authToken).replicationPlan()
-    }
-
     suspend fun enrollDevice(
         baseUrl: String,
         pairingToken: String,
@@ -118,14 +116,49 @@ class IronmeshRepository {
         return response.body() ?: throw IllegalStateException("Enroll failed: empty response body")
     }
 
-    suspend fun putObject(baseUrl: String, key: String, payload: String, authToken: String? = null): Int {
+    suspend fun enrollWithBootstrap(
+        bootstrapJson: String,
+        deviceId: String? = null,
+        label: String? = null,
+    ): DeviceAuthState {
         if (!shouldUseRustBridge()) {
-            return putObjectBytes(baseUrl, key, payload.toByteArray(Charsets.UTF_8), authToken)
+            throw IllegalStateException("Rust client bridge is not available")
+        }
+
+        val enrolled = decodeJson(
+            RustClientBridge.enrollWithBootstrap(bootstrapJson, deviceId, label),
+            BootstrapEnrollmentData::class.java,
+        )
+        return DeviceAuthState(
+            deviceId = enrolled.device_id,
+            deviceToken = enrolled.device_token,
+            label = enrolled.label,
+            serverBaseUrl = enrolled.server_base_url,
+            serverCaPem = enrolled.server_ca_pem,
+        )
+    }
+
+    suspend fun putObject(
+        baseUrl: String,
+        key: String,
+        payload: String,
+        serverCaPem: String? = null,
+        authToken: String? = null,
+    ): Int {
+        if (!shouldUseRustBridge()) {
+            return putObjectBytes(
+                baseUrl,
+                key,
+                payload.toByteArray(Charsets.UTF_8),
+                serverCaPem,
+                authToken,
+            )
         }
         return RustClientBridge.putObject(
             sanitizeBaseUrl(baseUrl),
             key,
             payload.toByteArray(Charsets.UTF_8),
+            serverCaPem,
             authToken,
         )
     }
@@ -135,9 +168,10 @@ class IronmeshRepository {
         key: String,
         snapshot: String? = null,
         version: String? = null,
+        serverCaPem: String? = null,
         authToken: String? = null,
     ): String {
-        val bytes = getObjectBytes(baseUrl, key, snapshot, version, authToken)
+        val bytes = getObjectBytes(baseUrl, key, snapshot, version, serverCaPem, authToken)
         return bytes.toString(Charsets.UTF_8)
     }
 
@@ -146,6 +180,7 @@ class IronmeshRepository {
         prefix: String? = null,
         depth: Int = 1,
         snapshot: String? = null,
+        serverCaPem: String? = null,
         authToken: String? = null,
     ): List<StoreIndexEntry> {
         if (!shouldUseRustBridge()) {
@@ -161,6 +196,7 @@ class IronmeshRepository {
             prefix,
             depth.coerceAtLeast(1),
             snapshot,
+            serverCaPem,
             authToken,
         )
         val parsed = decodeJson(responseJson, StoreIndexResponse::class.java)
@@ -171,6 +207,7 @@ class IronmeshRepository {
         baseUrl: String,
         key: String,
         payload: ByteArray,
+        serverCaPem: String? = null,
         authToken: String? = null,
     ): Int {
         if (!shouldUseRustBridge()) {
@@ -184,13 +221,20 @@ class IronmeshRepository {
             return response.code()
         }
 
-        return RustClientBridge.putObject(sanitizeBaseUrl(baseUrl), key, payload, authToken)
+        return RustClientBridge.putObject(
+            sanitizeBaseUrl(baseUrl),
+            key,
+            payload,
+            serverCaPem,
+            authToken,
+        )
     }
 
     suspend fun streamPutObject(
         baseUrl: String,
         key: String,
         input: InputStream,
+        serverCaPem: String? = null,
         authToken: String? = null,
     ): Int {
         if (!shouldUseRustBridge()) {
@@ -212,12 +256,28 @@ class IronmeshRepository {
             return response.code()
         }
 
-        return RustClientBridge.streamPutObject(sanitizeBaseUrl(baseUrl), key, input, authToken)
+        return RustClientBridge.streamPutObject(
+            sanitizeBaseUrl(baseUrl),
+            key,
+            input,
+            serverCaPem,
+            authToken,
+        )
     }
 
-    suspend fun deleteObject(baseUrl: String, key: String, authToken: String? = null): Int {
+    suspend fun deleteObject(
+        baseUrl: String,
+        key: String,
+        serverCaPem: String? = null,
+        authToken: String? = null,
+    ): Int {
         if (shouldUseRustBridge()) {
-            return RustClientBridge.deleteObject(sanitizeBaseUrl(baseUrl), key, authToken)
+            return RustClientBridge.deleteObject(
+                sanitizeBaseUrl(baseUrl),
+                key,
+                serverCaPem,
+                authToken,
+            )
         }
 
         val response = createApi(baseUrl, authToken).deleteObject(key)
@@ -232,6 +292,7 @@ class IronmeshRepository {
         key: String,
         snapshot: String? = null,
         version: String? = null,
+        serverCaPem: String? = null,
         authToken: String? = null,
     ): ByteArray {
         if (shouldUseRustBridge()) {
@@ -240,6 +301,7 @@ class IronmeshRepository {
                 key,
                 snapshot,
                 version,
+                serverCaPem,
                 authToken,
             )
         }
@@ -258,6 +320,7 @@ class IronmeshRepository {
         output: OutputStream,
         snapshot: String? = null,
         version: String? = null,
+        serverCaPem: String? = null,
         authToken: String? = null,
     ) {
         if (!shouldUseRustBridge()) {
@@ -282,6 +345,7 @@ class IronmeshRepository {
             output,
             snapshot,
             version,
+            serverCaPem,
             authToken,
         )
         return

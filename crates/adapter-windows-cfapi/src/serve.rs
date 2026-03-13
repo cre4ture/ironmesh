@@ -2,11 +2,12 @@
 
 use crate::adapter::WindowsCfapiAdapter;
 use crate::auth::{DeviceEnrollmentOptions, resolve_or_enroll_device_auth};
+use crate::connection_config::{persist_connection_config, resolve_connection_config};
 use crate::live::{ServerNodeHydrator, normalize_base_url};
 use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root};
 use clap::Parser;
 use client_sdk::{
-    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client,
+    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client_from_pem,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ struct Args {
     #[arg(long)]
     root_path: String,
     #[arg(long)]
-    server_base_url: String,
+    server_base_url: Option<String>,
     #[arg(long)]
     prefix: Option<String>,
     #[arg(long, default_value_t = 64)]
@@ -43,6 +44,8 @@ struct Args {
     device_token_file: Option<PathBuf>,
     #[arg(long)]
     server_ca_cert: Option<PathBuf>,
+    #[arg(long)]
+    bootstrap_file: Option<PathBuf>,
 }
 
 pub fn serve_main() -> anyhow::Result<()> {
@@ -50,26 +53,45 @@ pub fn serve_main() -> anyhow::Result<()> {
     let registration =
         SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
 
-    let base_url = normalize_base_url(&args.server_base_url)?;
+    let connection = resolve_connection_config(
+        &registration.root_path,
+        args.server_base_url.as_deref(),
+        args.server_ca_cert.as_deref(),
+        args.bootstrap_file.as_deref(),
+        args.pairing_token.as_deref(),
+        args.device_id.as_deref(),
+        args.device_label.as_deref(),
+    )?;
+    let base_url = normalize_base_url(connection.base_url.as_str())?;
     let device_auth = resolve_or_enroll_device_auth(
         &base_url,
         &registration.root_path,
         &DeviceEnrollmentOptions {
-            pairing_token: args.pairing_token.clone(),
-            device_id: args.device_id.clone(),
-            device_label: args.device_label.clone(),
+            pairing_token: connection.pairing_token.clone(),
+            device_id: connection.device_id.clone(),
+            device_label: connection.device_label.clone(),
             device_token_file: args.device_token_file.clone(),
-            server_ca_cert: args.server_ca_cert.clone(),
+            server_ca_pem: connection.server_ca_pem.clone(),
         },
     )?;
     if let Some(auth) = device_auth.as_ref() {
         eprintln!("using enrolled device auth for {}", auth.device_id);
     }
     let bearer_token = device_auth.as_ref().map(|auth| auth.device_token.clone());
-    let client = build_http_client(
-        args.server_ca_cert.as_deref(),
+    let client = build_http_client_from_pem(
+        connection.server_ca_pem.as_deref(),
         base_url.as_str(),
         &bearer_token,
+    )?;
+    persist_connection_config(
+        &connection.bootstrap_path,
+        &base_url,
+        connection.server_ca_pem.as_deref(),
+        device_auth.as_ref().map(|auth| auth.device_id.as_str()),
+        device_auth
+            .as_ref()
+            .and_then(|auth| auth.label.as_deref())
+            .or(connection.device_label.as_deref()),
     )?;
 
     let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
@@ -86,12 +108,12 @@ pub fn serve_main() -> anyhow::Result<()> {
     let hydrator = Box::new(ServerNodeHydrator::new(
         base_url.clone(),
         bearer_token.clone(),
-        args.server_ca_cert.as_deref(),
+        connection.server_ca_pem.as_deref(),
     )?);
     let uploader = Arc::new(ServerNodeHydrator::new(
         base_url,
         bearer_token,
-        args.server_ca_cert.as_deref(),
+        connection.server_ca_pem.as_deref(),
     )?);
     let _connection = connect_sync_root(&registration, runtime.clone(), hydrator, uploader)?;
 

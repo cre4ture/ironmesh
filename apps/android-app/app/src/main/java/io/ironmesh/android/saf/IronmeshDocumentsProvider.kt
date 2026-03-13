@@ -102,7 +102,13 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
 
         val key = buildChildPath(parent.path, displayName)
         runBlocking {
-            repository.putObjectBytes(resolveBaseUrl(), key, ByteArray(0), resolveAuthToken())
+            repository.putObjectBytes(
+                resolveBaseUrl(),
+                key,
+                ByteArray(0),
+                resolveServerCaPem(),
+                resolveAuthToken(),
+            )
         }
         return fileDocumentId(key)
     }
@@ -125,7 +131,13 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             Thread {
                 ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
                     runBlocking {
-                        repository.streamPutObject(resolveBaseUrl(), target.path, input, resolveAuthToken())
+                        repository.streamPutObject(
+                            resolveBaseUrl(),
+                            target.path,
+                            input,
+                            resolveServerCaPem(),
+                            resolveAuthToken(),
+                        )
                     }
                 }
             }.start()
@@ -140,7 +152,13 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { output ->
                     try {
                         runBlocking {
-                            repository.streamObjectTo(resolveBaseUrl(), target.path, output, authToken = resolveAuthToken())
+                            repository.streamObjectTo(
+                                resolveBaseUrl(),
+                                target.path,
+                                output,
+                                serverCaPem = resolveServerCaPem(),
+                                authToken = resolveAuthToken(),
+                            )
                         }
                         output.flush()
                     } catch (e: IOException) {
@@ -232,6 +250,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             prefix = prefix,
             depth = 1,
             snapshot = null,
+            serverCaPem = resolveServerCaPem(),
             authToken = resolveAuthToken(),
         )
 
@@ -275,7 +294,9 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
 
     private fun resolveBaseUrl(): String {
         val context = context ?: return IronmeshPreferences.DEFAULT_BASE_URL
-        return repository.sanitizeBaseUrl(IronmeshPreferences.getBaseUrl(context))
+        val auth = IronmeshPreferences.getDeviceAuthState(context)
+        val baseUrl = auth.serverBaseUrl.ifBlank { IronmeshPreferences.getBaseUrl(context) }
+        return repository.sanitizeBaseUrl(baseUrl)
     }
 
     private fun resolveAuthToken(): String? {
@@ -283,6 +304,13 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         return IronmeshPreferences.getDeviceAuthState(context)
             .deviceToken
             .takeIf { it.isNotBlank() }
+    }
+
+    private fun resolveServerCaPem(): String? {
+        val context = context ?: return null
+        return IronmeshPreferences.getDeviceAuthState(context)
+            .serverCaPem
+            ?.takeIf { it.isNotBlank() }
     }
 
     private fun resolveRootProjection(projection: Array<out String>?): Array<String> {

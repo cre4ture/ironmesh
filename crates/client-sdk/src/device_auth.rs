@@ -5,8 +5,9 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::connection::build_blocking_http_client;
-use crate::connection::load_root_certificate;
+use crate::connection::{
+    build_blocking_http_client, build_blocking_reqwest_client_from_pem, load_root_certificate,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEnrollmentRequest {
@@ -59,6 +60,27 @@ pub fn enroll_device_blocking(
         .join("auth/device/enroll")
         .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
     let client = build_blocking_http_client(server_ca_cert)?;
+    let response = client
+        .post(enroll_url)
+        .json(request)
+        .send()
+        .context("failed to call /auth/device/enroll")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .unwrap_or_else(|_| "<failed to read response body>".to_string());
+    parse_enrollment_response(status, body)
+}
+
+pub fn enroll_device_blocking_from_pem(
+    base_url: &Url,
+    server_ca_pem: Option<&str>,
+    request: &DeviceEnrollmentRequest,
+) -> Result<DeviceEnrollmentResponse> {
+    let enroll_url = base_url
+        .join("auth/device/enroll")
+        .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
+    let client = build_blocking_reqwest_client_from_pem(server_ca_pem)?;
     let response = client
         .post(enroll_url)
         .json(request)

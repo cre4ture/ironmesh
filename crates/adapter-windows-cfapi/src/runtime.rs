@@ -1,5 +1,6 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_device_auth_relative_path;
+use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
@@ -684,9 +685,11 @@ unsafe extern "system" fn callback_file_close_completion(
     }
 
     let relative_path = path_to_relative(&context.sync_root, &normalized_path);
-    if is_internal_device_auth_relative_path(&relative_path) {
+    if is_internal_device_auth_relative_path(&relative_path)
+        || is_internal_connection_bootstrap_relative_path(&relative_path)
+    {
         eprintln!(
-            "close-completion: skipping internal auth file {}",
+            "close-completion: skipping internal config file {}",
             relative_path
         );
         return;

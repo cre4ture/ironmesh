@@ -73,6 +73,50 @@ pub async fn start_cfapi_adapter_with_refresh_pairing_and_ca(
     pairing_token: Option<&str>,
     server_ca_cert: Option<&Path>,
 ) -> Result<ChildGuard> {
+    start_cfapi_adapter_with_resolved_inputs(
+        sync_root_id,
+        display_name,
+        root_path,
+        Some(server_base_url),
+        remote_refresh_interval_ms,
+        pairing_token,
+        server_ca_cert,
+        None,
+    )
+    .await
+}
+
+pub async fn start_cfapi_adapter_with_bootstrap(
+    sync_root_id: &str,
+    display_name: &str,
+    root_path: &Path,
+    remote_refresh_interval_ms: u64,
+    bootstrap_file: &Path,
+) -> Result<ChildGuard> {
+    start_cfapi_adapter_with_resolved_inputs(
+        sync_root_id,
+        display_name,
+        root_path,
+        None,
+        remote_refresh_interval_ms,
+        None,
+        None,
+        Some(bootstrap_file),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_cfapi_adapter_with_resolved_inputs(
+    sync_root_id: &str,
+    display_name: &str,
+    root_path: &Path,
+    server_base_url: Option<&str>,
+    remote_refresh_interval_ms: u64,
+    pairing_token: Option<&str>,
+    server_ca_cert: Option<&Path>,
+    bootstrap_file: Option<&Path>,
+) -> Result<ChildGuard> {
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
 
@@ -104,16 +148,21 @@ pub async fn start_cfapi_adapter_with_refresh_pairing_and_ca(
         .arg(display_name)
         .arg("--root-path")
         .arg(&root_path_arg)
-        .arg("--server-base-url")
-        .arg(server_base_url)
         .arg("--remote-refresh-interval-ms")
         .arg(remote_refresh_interval_ms.to_string());
+
+    if let Some(server_base_url) = server_base_url {
+        command.arg("--server-base-url").arg(server_base_url);
+    }
 
     if let Some(pairing_token) = pairing_token {
         command.arg("--pairing-token").arg(pairing_token);
     }
     if let Some(server_ca_cert) = server_ca_cert {
         command.arg("--server-ca-cert").arg(server_ca_cert);
+    }
+    if let Some(bootstrap_file) = bootstrap_file {
+        command.arg("--bootstrap-file").arg(bootstrap_file);
     }
 
     let child = command

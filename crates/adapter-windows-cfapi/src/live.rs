@@ -1,8 +1,7 @@
 use crate::runtime::{Hydrator, Uploader};
 use anyhow::{Context, Result};
-use client_sdk::{IronMeshClient, build_http_client, normalize_server_base_url};
+use client_sdk::{IronMeshClient, build_http_client_from_pem, normalize_server_base_url};
 use reqwest::Url;
-use std::path::Path;
 
 #[derive(Clone)]
 pub struct ServerNodeHydrator {
@@ -13,9 +12,9 @@ impl ServerNodeHydrator {
     pub fn new(
         base_url: Url,
         bearer_token: Option<String>,
-        server_ca_cert: Option<&Path>,
+        server_ca_pem: Option<&str>,
     ) -> Result<Self> {
-        let sdk = build_http_client(server_ca_cert, base_url.as_str(), &bearer_token)?;
+        let sdk = build_http_client_from_pem(server_ca_pem, base_url.as_str(), &bearer_token)?;
         Ok(Self { sdk })
     }
 }

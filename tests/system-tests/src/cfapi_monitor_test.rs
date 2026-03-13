@@ -7,11 +7,10 @@ mod tests {
         start_server_with_public_https_env, stop_server,
     };
     use crate::framework_win::{
-        start_cfapi_adapter, start_cfapi_adapter_with_refresh,
-        start_cfapi_adapter_with_refresh_pairing_and_ca,
+        start_cfapi_adapter, start_cfapi_adapter_with_bootstrap, start_cfapi_adapter_with_refresh,
     };
     use bytes::Bytes;
-    use client_sdk::IronMeshClient;
+    use client_sdk::{ConnectionBootstrap, IronMeshClient};
     use reqwest::Client;
     use std::fs::File;
     use std::io::Write;
@@ -495,15 +494,28 @@ mod tests {
                 "ironmesh.systemtest.authenticated.{}",
                 bind.replace(['.', ':'], "_")
             );
-            let server_ca_cert = server_data_dir.join("tls").join("ca.pem");
-            let _adapter = start_cfapi_adapter_with_refresh_pairing_and_ca(
+            let bootstrap_file = sync_root.join(".ironmesh-connection.json");
+            let bootstrap = ConnectionBootstrap {
+                version: 1,
+                endpoints: vec![base_url.clone()],
+                resolved_endpoint: None,
+                server_ca_pem: Some(
+                    std::fs::read_to_string(server_data_dir.join("tls").join("ca.pem"))
+                        .expect("failed to read test CA pem"),
+                ),
+                pairing_token: Some(pairing_token.clone()),
+                device_label: Some("cfapi-system-test".to_string()),
+                device_id: None,
+            };
+            bootstrap
+                .write_to_path(&bootstrap_file)
+                .expect("failed to write bootstrap bundle");
+            let _adapter = start_cfapi_adapter_with_bootstrap(
                 &sync_root_id,
                 "ironmesh System Test Authenticated Root",
                 &sync_root,
-                &base_url,
                 500,
-                Some(&pairing_token),
-                Some(&server_ca_cert),
+                &bootstrap_file,
             )
             .await?;
 
@@ -534,11 +546,11 @@ mod tests {
                 .await
                 .expect("failed to inspect remote index after authenticated upload");
             assert!(
-                index
-                    .entries
-                    .iter()
-                    .all(|entry| entry.path != ".ironmesh-device-auth.json"),
-                "internal auth file leaked into remote namespace"
+                index.entries.iter().all(|entry| {
+                    entry.path != ".ironmesh-device-auth.json"
+                        && entry.path != ".ironmesh-connection.json"
+                }),
+                "internal auth/bootstrap file leaked into remote namespace"
             );
 
             sdk.put_large_aware(

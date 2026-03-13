@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod auth;
 pub mod cfapi;
 pub mod cli;
+pub mod connection_config;
 pub mod helpers;
 pub mod live;
 pub mod monitor;

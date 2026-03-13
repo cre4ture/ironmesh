@@ -12,12 +12,6 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 interface IronmeshApi {
-    @GET("health")
-    suspend fun health(): HealthResponse
-
-    @GET("cluster/replication/plan")
-    suspend fun replicationPlan(): ReplicationPlanResponse
-
     @PUT("store/{key}")
     suspend fun putObject(
         @Path("key") key: String,
@@ -47,22 +41,6 @@ interface IronmeshApi {
     @POST("auth/device/enroll")
     suspend fun enrollDevice(@Body request: ClientDeviceEnrollRequest): Response<ClientDeviceEnrollResponse>
 }
-
-data class HealthResponse(
-    val online: Boolean,
-    val node_id: String? = null,
-)
-
-data class ReplicationPlanResponse(
-    val generated_at_unix: Long,
-    val under_replicated: Int,
-    val over_replicated: Int,
-    val items: List<ReplicationPlanItem>,
-)
-
-data class ReplicationPlanItem(
-    val key: String,
-)
 
 data class StoreIndexResponse(
     val prefix: String,

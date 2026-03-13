@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use anyhow::{Context, Result, bail};
-use client_sdk::{DeviceEnrollmentRequest, enroll_device_blocking};
+use client_sdk::{DeviceEnrollmentRequest, enroll_device_blocking_from_pem};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -15,7 +15,7 @@ pub struct DeviceEnrollmentOptions {
     pub device_id: Option<String>,
     pub device_label: Option<String>,
     pub device_token_file: Option<PathBuf>,
-    pub server_ca_cert: Option<PathBuf>,
+    pub server_ca_pem: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,9 +68,9 @@ fn enroll_device(
     pairing_token: &str,
     options: &DeviceEnrollmentOptions,
 ) -> Result<DeviceAuthRecord> {
-    let enrolled = enroll_device_blocking(
+    let enrolled = enroll_device_blocking_from_pem(
         base_url,
-        options.server_ca_cert.as_deref(),
+        options.server_ca_pem.as_deref(),
         &DeviceEnrollmentRequest {
             pairing_token: pairing_token.to_string(),
             device_id: normalize_optional(options.device_id.as_deref()),
