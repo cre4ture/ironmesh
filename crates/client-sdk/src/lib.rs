@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod client_node;
 pub mod connection;
+pub mod content_addressed_client_cache;
 pub mod device_auth;
 pub mod ironmesh_client;
 pub mod remote_sync;
@@ -12,6 +13,7 @@ pub use connection::{
     build_http_client_from_pem, build_reqwest_client_from_pem, load_root_certificate,
     load_root_certificate_pem,
 };
+pub use content_addressed_client_cache::ContentAddressedClientCache;
 pub use device_auth::{
     DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device, enroll_device_blocking,
     enroll_device_blocking_from_pem,

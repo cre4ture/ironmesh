@@ -6,9 +6,28 @@ mod tests {
 
     use anyhow::{Context, Result};
     use bytes::Bytes;
-    use client_sdk::{ClientNode, IronMeshClient, UploadMode};
+    use client_sdk::{ClientNode, ContentAddressedClientCache, IronMeshClient, UploadMode};
 
-    use crate::framework::{latest_snapshot_id, start_server, stop_server};
+    use crate::framework::{fresh_data_dir, latest_snapshot_id, start_server, stop_server};
+
+    fn count_files_recursively(root: &std::path::Path) -> Result<usize> {
+        fn visit(path: &std::path::Path, total: &mut usize) -> Result<()> {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, total)?;
+                } else {
+                    *total += 1;
+                }
+            }
+            Ok(())
+        }
+
+        let mut total = 0;
+        visit(root, &mut total)?;
+        Ok(total)
+    }
 
     #[tokio::test]
     async fn sdk_roundtrip_against_live_server() -> Result<()> {
@@ -457,6 +476,52 @@ mod tests {
             .await
             .context("missing-key writer task join failed")?;
             assert!(writer_result.is_err());
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn content_addressed_client_cache_persists_and_reuses_local_content() -> Result<()> {
+        let bind = "127.0.0.1:19236";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind).await?;
+        let cache_dir = fresh_data_dir("content-addressed-client-cache");
+
+        let result = async {
+            let client = ContentAddressedClientCache::new(&base_url, &cache_dir)?;
+            let payload = Bytes::from(vec![b'Z'; CHUNK_UPLOAD_THRESHOLD_BYTES + 4096]);
+
+            client.put("cached/a", payload.clone()).await?;
+            client.copy_path("cached/a", "cached/b", false).await?;
+
+            let entries = client.cache_entries().await?;
+            assert_eq!(entries.len(), 2);
+            assert!(entries.iter().any(|entry| entry.key == "cached/a"));
+            assert!(entries.iter().any(|entry| entry.key == "cached/b"));
+
+            let chunk_count_before_rename = count_files_recursively(&cache_dir.join("chunks"))?;
+
+            client.rename_path("cached/b", "cached/c", false).await?;
+            client.delete_path("cached/a").await?;
+
+            let persisted_client = ContentAddressedClientCache::new(&base_url, &cache_dir)?;
+            let cached = persisted_client.get_cached_or_fetch("cached/c").await?;
+            assert_eq!(cached, payload);
+
+            let entries = persisted_client.cache_entries().await?;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].key, "cached/c");
+
+            let chunk_count_after_restart = count_files_recursively(&cache_dir.join("chunks"))?;
+            assert_eq!(chunk_count_after_restart, chunk_count_before_rename);
+
+            persisted_client.remove_cached("cached/c").await?;
+            assert!(persisted_client.remove_cached("cached/c").await.is_err());
 
             Ok::<(), anyhow::Error>(())
         }
