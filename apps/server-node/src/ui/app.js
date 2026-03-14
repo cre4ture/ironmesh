@@ -56,6 +56,7 @@ async function triggerReplicationRepair() {
 
 async function issueBootstrapBundle() {
   const output = document.getElementById('bootstrap-bundle-json');
+  const qrStatus = document.getElementById('bootstrap-bundle-qr-status');
   const adminToken = document.getElementById('bootstrap-admin-token').value.trim();
   const deviceLabel = document.getElementById('bootstrap-device-label').value.trim();
   const expiryRaw = document.getElementById('bootstrap-expiry-secs').value.trim();
@@ -71,6 +72,7 @@ async function issueBootstrapBundle() {
   }
 
   hideBootstrapQr();
+  qrStatus.textContent = '';
   output.textContent = 'issuing bootstrap bundle...';
   try {
     const response = await fetch('/auth/bootstrap-bundles/issue', {
@@ -99,9 +101,13 @@ async function issueBootstrapBundle() {
 
     const bundleText = JSON.stringify(payload, null, 2);
     output.textContent = bundleText;
-    renderBootstrapQr(JSON.stringify(payload));
+    const qrError = renderBootstrapQr(JSON.stringify(payload));
+    if (qrError) {
+      qrStatus.textContent = qrError;
+    }
   } catch (error) {
     output.textContent = 'failed to issue bootstrap bundle: ' + error;
+    qrStatus.textContent = '';
     hideBootstrapQr();
   }
 }
@@ -111,24 +117,28 @@ function renderBootstrapQr(text) {
   const target = document.getElementById('bootstrap-bundle-qr');
   if (typeof QRCode === 'undefined') {
     container.style.display = 'none';
-    return;
+    return 'QR library did not load';
   }
   target.innerHTML = '';
   try {
     new QRCode(target, {
       text,
       width: 320,
-      height: 320
+      height: 320,
+      correctLevel: QRCode.CorrectLevel.L
     });
     container.style.display = 'block';
+    return '';
   } catch {
     container.style.display = 'none';
+    return 'Bootstrap bundle is too large for a single QR code';
   }
 }
 
 function hideBootstrapQr() {
   document.getElementById('bootstrap-bundle-qr-container').style.display = 'none';
   document.getElementById('bootstrap-bundle-qr').innerHTML = '';
+  document.getElementById('bootstrap-bundle-qr-status').textContent = '';
 }
 
 document
