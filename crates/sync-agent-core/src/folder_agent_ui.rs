@@ -1,18 +1,24 @@
-use super::*;
+use crate::{
+    ConflictResolutionResult, ConflictResolutionStrategy, PathScope, StartupStateStore,
+    StoredConflict, newest_remote_conflict_copy, resolve_conflict_action,
+};
+use anyhow::Result;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderValue};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const INDEX_HTML: &str = include_str!("ui/index.html");
-const APP_CSS: &str = include_str!("ui/app.css");
-const APP_JS: &str = include_str!("ui/app.js");
+const INDEX_HTML: &str = include_str!("folder_agent_ui/index.html");
+const APP_CSS: &str = include_str!("folder_agent_ui/app.css");
+const APP_JS: &str = include_str!("folder_agent_ui/app.js");
 
 #[derive(Clone)]
-pub(crate) struct FolderAgentUiState {
+pub struct FolderAgentUiState {
     inner: Arc<FolderAgentUiStateInner>,
 }
 
@@ -25,7 +31,7 @@ struct FolderAgentUiStateInner {
 }
 
 impl FolderAgentUiState {
-    pub(crate) fn new(
+    pub fn new(
         root_dir: PathBuf,
         server_base_url: String,
         scope: PathScope,
@@ -47,11 +53,11 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
 }
 
-pub(crate) fn spawn_ui_server(
+pub fn spawn_ui_server(
     listener: std::net::TcpListener,
     state: FolderAgentUiState,
 ) -> std::thread::JoinHandle<()> {
-    thread::spawn(move || {
+    std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
