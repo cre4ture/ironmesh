@@ -83,4 +83,38 @@ object RustClientBridge {
 
     @JvmStatic
     external fun startWebUi(baseUrl: String): String
+
+    @JvmStatic
+    external fun runFolderSyncOnce(
+        baseUrl: String,
+        localFolder: String,
+        prefix: String?,
+        depth: Int,
+        serverCaPem: String?,
+        authToken: String?,
+    )
+
+    @JvmStatic
+    external fun startContinuousFolderSync(
+        profileId: String,
+        label: String,
+        baseUrl: String,
+        localFolder: String,
+        prefix: String?,
+        depth: Int,
+        serverCaPem: String?,
+        authToken: String?,
+    )
+
+    @JvmStatic
+    external fun stopContinuousFolderSync(profileId: String)
+
+    @JvmStatic
+    external fun stopAllContinuousFolderSync()
+
+    @JvmStatic
+    external fun getContinuousFolderSyncStatus(): String
+
+    @JvmStatic
+    external fun hasContinuousFolderSyncActive(): Boolean
 }

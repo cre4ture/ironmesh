@@ -208,6 +208,8 @@ fn run_agent(args: &Args) -> Result<()> {
     run_folder_agent(&FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
         server_base_url: args.server_base_url.clone(),
+        server_ca_pem: None,
+        auth_token: None,
         prefix: args.prefix.clone(),
         depth: args.depth,
         remote_refresh_interval_ms: args.remote_refresh_interval_ms,

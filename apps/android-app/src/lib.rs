@@ -6,10 +6,19 @@ use client_sdk::{
 };
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
-use jni::sys::{jbyte, jbyteArray, jint, jstring};
+use jni::sys::{jboolean, jbyte, jbyteArray, jint, jstring};
 use reqwest::Url;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::sync::{Mutex, OnceLock};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use sync_agent_core::{
+    FolderAgentRuntimeOptions, FolderAgentRuntimeStatus, FolderAgentStatusCallback,
+    run_folder_agent, run_folder_agent_with_control,
+};
 use tokio::task::JoinHandle;
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -38,6 +47,237 @@ struct WebUiServer {
 fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
     static STATE: OnceLock<Mutex<Option<WebUiServer>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AndroidFolderSyncServiceStatus {
+    service_state: String,
+    service_message: String,
+    profiles: Vec<AndroidFolderSyncProfileStatus>,
+    updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AndroidFolderSyncProfileStatus {
+    profile_id: String,
+    label: String,
+    state: String,
+    message: String,
+    updated_unix_ms: u64,
+}
+
+struct AndroidFolderSyncRun {
+    running: Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
+}
+
+struct AndroidFolderSyncManager {
+    runs: BTreeMap<String, AndroidFolderSyncRun>,
+    status: Arc<Mutex<AndroidFolderSyncServiceStatus>>,
+}
+
+impl AndroidFolderSyncManager {
+    fn new() -> Self {
+        Self {
+            runs: BTreeMap::new(),
+            status: Arc::new(Mutex::new(AndroidFolderSyncServiceStatus {
+                service_state: "stopped".to_string(),
+                service_message: "Continuous sync is stopped".to_string(),
+                profiles: Vec::new(),
+                updated_unix_ms: now_unix_ms(),
+            })),
+        }
+    }
+
+    fn start_profile(
+        &mut self,
+        profile_id: String,
+        label: String,
+        options: FolderAgentRuntimeOptions,
+    ) -> Result<()> {
+        let previous = self.runs.remove(&profile_id);
+        if let Some(previous) = previous {
+            stop_folder_sync_run(previous);
+        }
+
+        update_profile_status(
+            &self.status,
+            AndroidFolderSyncProfileStatus {
+                profile_id: profile_id.clone(),
+                label: label.clone(),
+                state: "starting".to_string(),
+                message: "Starting continuous sync".to_string(),
+                updated_unix_ms: now_unix_ms(),
+            },
+        );
+        refresh_service_summary(&self.status);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let status_store = self.status.clone();
+        let callback_profile_id = profile_id.clone();
+        let callback_label = label.clone();
+        let status_callback: FolderAgentStatusCallback =
+            Arc::new(move |status: FolderAgentRuntimeStatus| {
+                update_profile_status(
+                    &status_store,
+                    AndroidFolderSyncProfileStatus {
+                        profile_id: callback_profile_id.clone(),
+                        label: callback_label.clone(),
+                        state: status.state,
+                        message: status.message,
+                        updated_unix_ms: status.updated_unix_ms,
+                    },
+                );
+                refresh_service_summary(&status_store);
+            });
+
+        let thread_profile_id = profile_id.clone();
+        let thread_label = label.clone();
+        let thread_running = running.clone();
+        let status_store = self.status.clone();
+        let thread = thread::Builder::new()
+            .name(format!("ironmesh-folder-sync-{profile_id}"))
+            .spawn(move || {
+                let result = run_folder_agent_with_control(
+                    &options,
+                    thread_running,
+                    false,
+                    Some(status_callback),
+                );
+                if let Err(error) = result {
+                    update_profile_status(
+                        &status_store,
+                        AndroidFolderSyncProfileStatus {
+                            profile_id: thread_profile_id,
+                            label: thread_label,
+                            state: "error".to_string(),
+                            message: format!("{error:#}"),
+                            updated_unix_ms: now_unix_ms(),
+                        },
+                    );
+                    refresh_service_summary(&status_store);
+                }
+            })
+            .context("failed to spawn continuous folder sync thread")?;
+
+        self.runs
+            .insert(profile_id, AndroidFolderSyncRun { running, thread });
+        refresh_service_summary(&self.status);
+        Ok(())
+    }
+
+    fn stop_profile(&mut self, profile_id: &str) {
+        let previous = self.runs.remove(profile_id);
+        if let Some(previous) = previous {
+            stop_folder_sync_run(previous);
+        }
+        if let Ok(mut status) = self.status.lock() {
+            status
+                .profiles
+                .retain(|profile| profile.profile_id != profile_id);
+            status.updated_unix_ms = now_unix_ms();
+        }
+        refresh_service_summary(&self.status);
+    }
+
+    fn stop_all(&mut self) {
+        let runs = std::mem::take(&mut self.runs);
+        for (_, run) in runs {
+            stop_folder_sync_run(run);
+        }
+        if let Ok(mut status) = self.status.lock() {
+            status.profiles.clear();
+            status.service_state = "stopped".to_string();
+            status.service_message = "Continuous sync is stopped".to_string();
+            status.updated_unix_ms = now_unix_ms();
+        }
+    }
+}
+
+fn folder_sync_manager() -> &'static Mutex<AndroidFolderSyncManager> {
+    static MANAGER: OnceLock<Mutex<AndroidFolderSyncManager>> = OnceLock::new();
+    MANAGER.get_or_init(|| Mutex::new(AndroidFolderSyncManager::new()))
+}
+
+fn stop_folder_sync_run(run: AndroidFolderSyncRun) {
+    run.running.store(false, Ordering::SeqCst);
+    let _ = run.thread.join();
+}
+
+fn update_profile_status(
+    status_store: &Arc<Mutex<AndroidFolderSyncServiceStatus>>,
+    profile_status: AndroidFolderSyncProfileStatus,
+) {
+    if let Ok(mut status) = status_store.lock() {
+        if let Some(existing) = status
+            .profiles
+            .iter_mut()
+            .find(|existing| existing.profile_id == profile_status.profile_id)
+        {
+            *existing = profile_status;
+        } else {
+            status.profiles.push(profile_status);
+            status.profiles.sort_by(|left, right| {
+                left.label
+                    .cmp(&right.label)
+                    .then_with(|| left.profile_id.cmp(&right.profile_id))
+            });
+        }
+        status.updated_unix_ms = now_unix_ms();
+    }
+}
+
+fn refresh_service_summary(status_store: &Arc<Mutex<AndroidFolderSyncServiceStatus>>) {
+    if let Ok(mut status) = status_store.lock() {
+        let active_profiles = status
+            .profiles
+            .iter()
+            .filter(|profile| profile.state != "stopped")
+            .count();
+        let has_error = status
+            .profiles
+            .iter()
+            .any(|profile| profile.state == "error");
+        let has_syncing = status
+            .profiles
+            .iter()
+            .any(|profile| profile.state == "syncing");
+
+        status.service_state = if active_profiles == 0 {
+            "stopped".to_string()
+        } else if has_error {
+            "error".to_string()
+        } else if has_syncing {
+            "syncing".to_string()
+        } else {
+            "running".to_string()
+        };
+        status.service_message = if active_profiles == 0 {
+            "Continuous sync is stopped".to_string()
+        } else if has_error {
+            format!("Continuous sync has errors across {active_profiles} profile(s)")
+        } else if has_syncing {
+            format!("Continuous sync is active for {active_profiles} profile(s)")
+        } else {
+            format!("Watching {active_profiles} profile(s)")
+        };
+        status.updated_unix_ms = now_unix_ms();
+    }
+}
+
+fn current_folder_sync_status_json() -> Result<String> {
+    let status_store = folder_sync_manager()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+        .status
+        .clone();
+    let status = status_store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("folder sync status lock poisoned"))?
+        .clone();
+    serde_json::to_string(&status).context("failed to serialize continuous folder sync status")
 }
 
 fn start_embedded_web_ui(base_url: String) -> Result<String> {
@@ -249,6 +489,15 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn configured_sdk(
@@ -637,4 +886,189 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
             format!("rust streamRelativeUrlTo failed: {err:#}"),
         );
     }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_runFolderSyncOnce(
+    mut env: JNIEnv,
+    _class: JClass,
+    base_url: JString,
+    local_folder: JString,
+    prefix: jstring,
+    depth: jint,
+    server_ca_pem: jstring,
+    auth_token: jstring,
+) {
+    let result = (|| -> Result<()> {
+        let base_url: String = env.get_string(&base_url)?.into();
+        let local_folder: String = env.get_string(&local_folder)?.into();
+        let prefix = optional_jstring(&mut env, prefix)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let auth_token = optional_jstring(&mut env, auth_token)?;
+
+        run_folder_agent(&FolderAgentRuntimeOptions {
+            root_dir: PathBuf::from(local_folder),
+            server_base_url: base_url,
+            server_ca_pem,
+            auth_token,
+            prefix,
+            depth: usize::try_from(depth).unwrap_or(1).max(1),
+            remote_refresh_interval_ms: 3_000,
+            local_scan_interval_ms: 2_000,
+            no_watch_local: true,
+            run_once: true,
+            ui_bind: None,
+        })
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(&mut env, format!("rust runFolderSyncOnce failed: {err:#}"));
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_startContinuousFolderSync(
+    mut env: JNIEnv,
+    _class: JClass,
+    profile_id: JString,
+    label: JString,
+    base_url: JString,
+    local_folder: JString,
+    prefix: jstring,
+    depth: jint,
+    server_ca_pem: jstring,
+    auth_token: jstring,
+) {
+    let result = (|| -> Result<()> {
+        let profile_id: String = env.get_string(&profile_id)?.into();
+        let label: String = env.get_string(&label)?.into();
+        let base_url: String = env.get_string(&base_url)?.into();
+        let local_folder: String = env.get_string(&local_folder)?.into();
+        let prefix = optional_jstring(&mut env, prefix)?;
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let auth_token = optional_jstring(&mut env, auth_token)?;
+
+        let options = FolderAgentRuntimeOptions {
+            root_dir: PathBuf::from(local_folder),
+            server_base_url: base_url,
+            server_ca_pem,
+            auth_token,
+            prefix,
+            depth: usize::try_from(depth).unwrap_or(1).max(1),
+            remote_refresh_interval_ms: 3_000,
+            local_scan_interval_ms: 2_000,
+            no_watch_local: false,
+            run_once: false,
+            ui_bind: None,
+        };
+
+        folder_sync_manager()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .start_profile(profile_id, label, options)
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(
+            &mut env,
+            format!("rust startContinuousFolderSync failed: {err:#}"),
+        );
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopContinuousFolderSync(
+    mut env: JNIEnv,
+    _class: JClass,
+    profile_id: JString,
+) {
+    let result = (|| -> Result<()> {
+        let profile_id: String = env.get_string(&profile_id)?.into();
+        folder_sync_manager()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .stop_profile(&profile_id);
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(
+            &mut env,
+            format!("rust stopContinuousFolderSync failed: {err:#}"),
+        );
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopAllContinuousFolderSync(
+    mut env: JNIEnv,
+    _class: JClass,
+) {
+    let result = (|| -> Result<()> {
+        folder_sync_manager()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .stop_all();
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(
+            &mut env,
+            format!("rust stopAllContinuousFolderSync failed: {err:#}"),
+        );
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getContinuousFolderSyncStatus(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    match current_folder_sync_status_json() {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!(
+                        "rust getContinuousFolderSyncStatus failed to create java string: {err:#}"
+                    ),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust getContinuousFolderSyncStatus failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_hasContinuousFolderSyncActive(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    let active = folder_sync_manager()
+        .lock()
+        .ok()
+        .map(|manager| !manager.runs.is_empty())
+        .unwrap_or(false);
+    if active { 1 } else { 0 }
 }

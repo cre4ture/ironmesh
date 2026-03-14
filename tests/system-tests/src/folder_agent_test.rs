@@ -862,6 +862,79 @@ async fn folder_agent_prefix_scope_maps_local_root_to_selected_remote_subtree() 
 }
 
 #[tokio::test]
+async fn folder_agent_nested_prefix_uploads_camera_files_under_full_scope() -> Result<()> {
+    let bind = "127.0.0.1:19426";
+    let base_url = format!("http://{bind}");
+    let local_root = fresh_data_dir("folder-agent-camera-prefix-root");
+    let scope_prefix = "cameras/vm1";
+
+    let mut server = start_server(bind).await?;
+    let sdk = IronMeshClient::new(&base_url);
+
+    let result = async {
+        sdk.put_large_aware(
+            "cameras/vm1/already-there.jpg",
+            Bytes::from_static(b"seed-camera"),
+        )
+        .await?;
+        sdk.put_large_aware("cameras/vm2/other.jpg", Bytes::from_static(b"other-camera"))
+            .await?;
+
+        let mut agent =
+            start_folder_agent(&base_url, &local_root, Some(scope_prefix), 2_000, 250, true)
+                .await?;
+        let scenario = async {
+            wait_for_local_file_bytes(&local_root.join("already-there.jpg"), b"seed-camera", 220)
+                .await?;
+            assert!(
+                !local_root.join("cameras").exists(),
+                "nested scoped prefix should not be recreated under local root"
+            );
+
+            fs::write(local_root.join("IMG20260314_200501.jpg"), b"camera-one")?;
+            fs::create_dir_all(local_root.join("nested"))?;
+            fs::write(
+                local_root.join("nested/IMG20260314_200502.jpg"),
+                b"camera-two",
+            )?;
+
+            wait_for_remote_file_bytes(
+                &sdk,
+                "cameras/vm1/IMG20260314_200501.jpg",
+                b"camera-one",
+                220,
+            )
+            .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "cameras/vm1/nested/IMG20260314_200502.jpg",
+                b"camera-two",
+                220,
+            )
+            .await?;
+
+            wait_for_remote_file_absence(&sdk, "IMG20260314_200501.jpg", 80).await?;
+            wait_for_remote_file_absence(&sdk, "cameras/IMG20260314_200501.jpg", 80).await?;
+            wait_for_remote_file_absence(&sdk, "cameras/nested/IMG20260314_200502.jpg", 80).await?;
+            wait_for_remote_file_absence(&sdk, "vm1/IMG20260314_200501.jpg", 80).await?;
+
+            wait_for_remote_file_bytes(&sdk, "cameras/vm2/other.jpg", b"other-camera", 220).await?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut agent).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
 async fn folder_agent_recovers_local_offline_changes_after_unfriendly_stop() -> Result<()> {
     let bind = "127.0.0.1:19418";
     let base_url = format!("http://{bind}");

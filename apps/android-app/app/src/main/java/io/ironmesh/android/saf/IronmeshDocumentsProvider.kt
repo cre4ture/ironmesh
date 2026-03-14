@@ -65,13 +65,28 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         val entries = runBlocking {
             loadDirectoryEntries(prefix)
         }
+        val emittedDocumentIds = LinkedHashSet<String>()
 
         entries.forEach { entry ->
             if (entry.entry_type == "prefix") {
                 val dirPath = entry.path.trimEnd('/')
-                includeDirectory(result, directoryDocumentId(dirPath), dirPath)
+                if (!isDirectChildPath(parent.path, dirPath)) {
+                    return@forEach
+                }
+                val documentId = directoryDocumentId(dirPath)
+                if (!emittedDocumentIds.add(documentId)) {
+                    return@forEach
+                }
+                includeDirectory(result, documentId, dirPath.substringAfterLast('/'))
             } else {
-                includeFile(result, fileDocumentId(entry.path), entry)
+                if (!isDirectChildPath(parent.path, entry.path)) {
+                    return@forEach
+                }
+                val documentId = fileDocumentId(entry.path)
+                if (!emittedDocumentIds.add(documentId)) {
+                    return@forEach
+                }
+                includeFile(result, documentId, entry)
             }
         }
 
@@ -386,6 +401,26 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             throw FileNotFoundException("invalid display name")
         }
         return if (parentPath.isBlank()) normalized else "${parentPath.trim('/')}/$normalized"
+    }
+
+    private fun isDirectChildPath(parentPath: String, candidatePath: String): Boolean {
+        val normalizedParent = parentPath.trim('/')
+        val normalizedCandidate = candidatePath.trim('/').removeSuffix("/")
+        if (normalizedCandidate.isBlank()) {
+            return false
+        }
+        if (normalizedParent.isBlank()) {
+            return !normalizedCandidate.contains('/')
+        }
+        if (normalizedCandidate == normalizedParent) {
+            return false
+        }
+        val prefix = "$normalizedParent/"
+        if (!normalizedCandidate.startsWith(prefix)) {
+            return false
+        }
+        val remainder = normalizedCandidate.removePrefix(prefix)
+        return remainder.isNotBlank() && !remainder.contains('/')
     }
 
     private fun mimeForName(name: String): String {

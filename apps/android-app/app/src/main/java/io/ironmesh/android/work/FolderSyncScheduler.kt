@@ -24,8 +24,12 @@ object FolderSyncScheduler {
 
         if (!hasEnabledProfiles) {
             workManager.cancelUniqueWork(UNIQUE_PERIODIC_WORK)
+            workManager.cancelUniqueWork(UNIQUE_IMMEDIATE_WORK)
+            FolderSyncForegroundService.stop(context)
             return
         }
+
+        FolderSyncForegroundService.syncConfigChanged(context)
 
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -50,8 +54,11 @@ object FolderSyncScheduler {
             .getFolderSyncConfigs(context)
             .any { it.enabled }
         if (!hasEnabledProfiles) {
+            FolderSyncForegroundService.stop(context)
             return
         }
+
+        FolderSyncForegroundService.syncConfigChanged(context)
 
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)

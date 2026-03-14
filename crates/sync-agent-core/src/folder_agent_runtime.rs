@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use client_sdk::{
-    IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotUpdate,
-    normalize_server_base_url,
+    IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+    RemoteSnapshotUpdate, build_http_client_from_pem, normalize_server_base_url,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
@@ -31,6 +32,8 @@ use crate::{
 pub struct FolderAgentRuntimeOptions {
     pub root_dir: PathBuf,
     pub server_base_url: String,
+    pub server_ca_pem: Option<String>,
+    pub auth_token: Option<String>,
     pub prefix: Option<String>,
     pub depth: usize,
     pub remote_refresh_interval_ms: u64,
@@ -41,6 +44,68 @@ pub struct FolderAgentRuntimeOptions {
 }
 
 pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    run_folder_agent_with_control(options, running, true, None)
+}
+
+pub type FolderAgentStatusCallback = Arc<dyn Fn(FolderAgentRuntimeStatus) + Send + Sync + 'static>;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderAgentRuntimeStatus {
+    pub state: String,
+    pub message: String,
+    pub updated_unix_ms: u64,
+}
+
+pub fn run_folder_agent_with_control(
+    options: &FolderAgentRuntimeOptions,
+    running: Arc<AtomicBool>,
+    install_signal_handler: bool,
+    status_callback: Option<FolderAgentStatusCallback>,
+) -> Result<()> {
+    let prefix_label = options.prefix.as_deref().unwrap_or("<root>");
+    emit_status(
+        status_callback.as_ref(),
+        "starting",
+        format!(
+            "Starting folder sync runtime for prefix={prefix_label} root={}",
+            options.root_dir.display()
+        ),
+    );
+    let result = run_folder_agent_inner(
+        options,
+        running,
+        install_signal_handler,
+        status_callback.clone(),
+    );
+
+    match &result {
+        Ok(()) => emit_status(
+            status_callback.as_ref(),
+            "stopped",
+            if options.run_once {
+                "Folder sync run completed"
+            } else {
+                "Folder sync runtime stopped"
+            },
+        ),
+        Err(error) => emit_status(
+            status_callback.as_ref(),
+            "error",
+            format!("Folder sync runtime failed: {error:#}"),
+        ),
+    }
+
+    result
+}
+
+fn run_folder_agent_inner(
+    options: &FolderAgentRuntimeOptions,
+    running: Arc<AtomicBool>,
+    install_signal_handler: bool,
+    status_callback: Option<FolderAgentStatusCallback>,
+) -> Result<()> {
     let scope = PathScope::new(options.prefix.clone());
     let base_url = normalize_server_base_url(&options.server_base_url)?;
     let state_store = StartupStateStore::new(&options.root_dir, &scope, base_url.as_str());
@@ -78,8 +143,24 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
         eprintln!("startup-state: failed to cleanup partial download artifacts: {error}");
     }
 
+    emit_status(
+        status_callback.as_ref(),
+        "starting",
+        "Fetching initial remote snapshot",
+    );
     let local_state_before_remote_sync = scan_local_tree(&options.root_dir)
         .context("failed to scan local state before initial remote sync")?;
+    let local_scan_sample = sample_local_paths(&local_state_before_remote_sync, 5);
+    emit_status(
+        status_callback.as_ref(),
+        "starting",
+        format!(
+            "Initial local scan found {} path(s) under root={} sample=[{}]",
+            local_state_before_remote_sync.len(),
+            options.root_dir.display(),
+            local_scan_sample
+        ),
+    );
 
     let baseline_before_remote_sync =
         match load_local_baseline_with_retries(&state_store, 6, Duration::from_millis(100)) {
@@ -102,14 +183,14 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
         BTreeMap::new()
     };
 
-    let client = IronMeshClient::new(base_url.as_str());
-
-    let initial_fetcher = RemoteSnapshotFetcher::from_base_url(
-        base_url.as_str(),
+    let client = configured_client(base_url.as_str(), options)?;
+    let snapshot_scope = RemoteSnapshotScope::new(
         scope.remote_prefix().map(ToString::to_string),
         options.depth,
         None,
     );
+
+    let initial_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope.clone());
     let initial_snapshot = initial_fetcher
         .fetch_snapshot_blocking()
         .context("failed to fetch initial remote snapshot")?;
@@ -202,19 +283,20 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
         return Ok(());
     }
 
-    let running = Arc::new(AtomicBool::new(true));
-    install_ctrlc_handler(running.clone())?;
+    if install_signal_handler {
+        install_ctrlc_handler(running.clone())?;
+    }
+    emit_status(
+        status_callback.as_ref(),
+        "running",
+        "Initial sync complete; watching for changes",
+    );
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
     let local_scan_interval = Duration::from_millis(options.local_scan_interval_ms.max(250));
 
     let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
-    let refresh_fetcher = RemoteSnapshotFetcher::from_base_url(
-        base_url.as_str(),
-        scope.remote_prefix().map(ToString::to_string),
-        options.depth,
-        None,
-    );
+    let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
 
     let (remote_tx, remote_rx) = mpsc::channel::<RemoteSnapshotUpdate>();
     let remote_running = running.clone();
@@ -246,6 +328,11 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
         let mut baseline_dirty = false;
         let mut remote_updates_applied = false;
         while let Ok(update) = remote_rx.try_recv() {
+            emit_status(
+                status_callback.as_ref(),
+                "syncing",
+                format!("Applying {} remote change(s)", update.changed_paths.len()),
+            );
             apply_remote_snapshot(
                 &options.root_dir,
                 &client,
@@ -273,6 +360,11 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
 
         if local_scan_requested || Instant::now() >= next_local_scan {
             let previous_local_state = local_state.clone();
+            emit_status(
+                status_callback.as_ref(),
+                "syncing",
+                "Scanning local files for changes",
+            );
             sync_local_changes(
                 &options.root_dir,
                 &client,
@@ -286,6 +378,7 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
                 baseline_dirty = true;
             }
             next_local_scan = Instant::now() + local_scan_interval;
+            emit_status(status_callback.as_ref(), "running", "Watching for changes");
         }
 
         if baseline_dirty {
@@ -300,6 +393,63 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
     running.store(false, Ordering::SeqCst);
     let _ = remote_thread.join();
     Ok(())
+}
+
+fn emit_status(
+    callback: Option<&FolderAgentStatusCallback>,
+    state: impl Into<String>,
+    message: impl Into<String>,
+) {
+    let Some(callback) = callback else {
+        return;
+    };
+    callback(FolderAgentRuntimeStatus {
+        state: state.into(),
+        message: message.into(),
+        updated_unix_ms: now_unix_ms(),
+    });
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn sample_local_paths(local_state: &LocalTreeState, limit: usize) -> String {
+    let mut sample = local_state
+        .keys()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if sample.is_empty() {
+        sample.push_str("<none>");
+    }
+    sample
+}
+
+fn configured_client(
+    base_url: &str,
+    options: &FolderAgentRuntimeOptions,
+) -> Result<IronMeshClient> {
+    let server_ca_pem = normalized_optional_string(options.server_ca_pem.as_deref());
+    let auth_token = normalized_optional_string(options.auth_token.as_deref());
+    build_http_client_from_pem(server_ca_pem.as_deref(), base_url, &auth_token)
+}
+
+fn normalized_optional_string(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn install_ctrlc_handler(running: Arc<AtomicBool>) -> Result<()> {

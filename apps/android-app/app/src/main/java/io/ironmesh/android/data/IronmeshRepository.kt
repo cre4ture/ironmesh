@@ -207,4 +207,63 @@ class IronmeshRepository {
         }
         return RustClientBridge.startWebUi(sanitizeBaseUrl(baseUrl))
     }
+
+    suspend fun runFolderSyncOnce(
+        baseUrl: String,
+        localFolder: String,
+        prefix: String? = null,
+        depth: Int = 64,
+        serverCaPem: String? = null,
+        authToken: String? = null,
+    ) {
+        RustClientBridge.runFolderSyncOnce(
+            sanitizeBaseUrl(baseUrl),
+            localFolder,
+            prefix,
+            depth.coerceAtLeast(1),
+            serverCaPem,
+            authToken,
+        )
+    }
+
+    fun startContinuousFolderSync(
+        profileId: String,
+        label: String,
+        baseUrl: String,
+        localFolder: String,
+        prefix: String? = null,
+        depth: Int = 64,
+        serverCaPem: String? = null,
+        authToken: String? = null,
+    ) {
+        RustClientBridge.startContinuousFolderSync(
+            profileId,
+            label,
+            sanitizeBaseUrl(baseUrl),
+            localFolder,
+            prefix,
+            depth.coerceAtLeast(1),
+            serverCaPem,
+            authToken,
+        )
+    }
+
+    fun stopContinuousFolderSync(profileId: String) {
+        RustClientBridge.stopContinuousFolderSync(profileId)
+    }
+
+    fun stopAllContinuousFolderSync() {
+        RustClientBridge.stopAllContinuousFolderSync()
+    }
+
+    fun getContinuousFolderSyncStatus(): FolderSyncServiceStatus {
+        return decodeJson(
+            RustClientBridge.getContinuousFolderSyncStatus(),
+            FolderSyncServiceStatus::class.java,
+        )
+    }
+
+    fun hasContinuousFolderSyncActive(): Boolean {
+        return RustClientBridge.hasContinuousFolderSyncActive()
+    }
 }

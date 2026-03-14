@@ -16,9 +16,12 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.ActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -216,10 +219,24 @@ private fun SettingsView(
     vm: MainViewModel,
     onOpenFiles: () -> Unit,
 ) {
+    val context = LocalContext.current
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         if (result.contents != null) {
             vm.updateBootstrapInput(result.contents)
         }
+    }
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        handleFolderPickerResult(
+            context = context,
+            result = result,
+            onResolvedSelection = { path, treeUri ->
+                vm.updateNewSyncLocalFolderSelection(path, treeUri)
+                vm.setStatus("Selected sync folder: $path")
+            },
+            onError = vm::setStatus,
+        )
     }
     val onScanQr: () -> Unit = {
         scanLauncher.launch(
@@ -228,6 +245,12 @@ private fun SettingsView(
                 setBeepEnabled(false)
                 setOrientationLocked(false)
             },
+        )
+    }
+    val onPickLocalFolder: () -> Unit = {
+        launchFolderPicker(
+            launcher = folderPickerLauncher,
+            onError = vm::setStatus,
         )
     }
 
@@ -243,7 +266,11 @@ private fun SettingsView(
             onOpenFiles = onOpenFiles,
             onScanQr = onScanQr,
         )
-        FolderSyncControls(state = state, vm = vm)
+        FolderSyncControls(
+            state = state,
+            vm = vm,
+            onPickLocalFolder = onPickLocalFolder,
+        )
     }
 }
 
@@ -384,11 +411,36 @@ private fun ServerControls(
 private fun FolderSyncControls(
     state: MainUiState,
     vm: MainViewModel,
+    onPickLocalFolder: () -> Unit,
 ) {
+    val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
+
     Text(
         "Folder Sync Profiles",
         style = MaterialTheme.typography.titleMedium,
     )
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 2.dp,
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text("Engine: ${state.folderSyncStatus.serviceState}")
+            Text(state.folderSyncStatus.serviceMessage)
+            if (state.folderSyncStatus.updatedUnixMs > 0L) {
+                Text(
+                    "Updated ${formatTimestamp(state.folderSyncStatus.updatedUnixMs)}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
 
     OutlinedTextField(
         modifier = Modifier.fillMaxWidth(),
@@ -418,9 +470,12 @@ private fun FolderSyncControls(
         Button(onClick = vm::addFolderSyncProfile) {
             Text("Add Sync Profile")
         }
+        OutlinedButton(onClick = onPickLocalFolder) {
+            Text("Pick Folder")
+        }
         OutlinedButton(
             onClick = {
-                vm.updateNewSyncLocalFolder("/storage/emulated/0/DCIM/Camera")
+                vm.updateNewSyncLocalFolderSelection("/storage/emulated/0/DCIM/Camera", null)
             },
         ) {
             Text("Use Camera Folder")
@@ -436,6 +491,7 @@ private fun FolderSyncControls(
     }
 
     state.syncProfiles.forEach { profile ->
+        val profileStatus = profileStatuses[profile.id]
         Surface(
             modifier = Modifier.fillMaxWidth(),
             tonalElevation = 2.dp,
@@ -454,6 +510,20 @@ private fun FolderSyncControls(
                     }",
                 )
                 Text("Local: ${profile.localFolder}")
+                if (profileStatus != null) {
+                    Text("Sync State: ${profileStatus.state}")
+                    if (profileStatus.message.isNotBlank()) {
+                        Text(
+                            profileStatus.message,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                } else {
+                    Text(
+                        if (profile.enabled) "Sync State: waiting to start" else "Sync State: disabled",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Switch(
                         checked = profile.enabled,
@@ -659,6 +729,87 @@ private fun formatTimestamp(value: Long): String {
     return DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
         .withZone(ZoneId.systemDefault())
         .format(Instant.ofEpochMilli(value))
+}
+
+private fun launchFolderPicker(
+    launcher: ManagedActivityResultLauncher<Intent, ActivityResult>,
+    onError: (String) -> Unit,
+) {
+    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+        addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+        )
+    }
+
+    try {
+        launcher.launch(intent)
+    } catch (_: ActivityNotFoundException) {
+        onError("No compatible folder picker found on this device")
+    }
+}
+
+private fun handleFolderPickerResult(
+    context: android.content.Context,
+    result: ActivityResult,
+    onResolvedSelection: (String, String) -> Unit,
+    onError: (String) -> Unit,
+) {
+    val treeUri = result.data?.data
+    if (treeUri == null) {
+        onError("Folder selection was cancelled")
+        return
+    }
+
+    val grantFlags = result.data?.flags
+        ?.and(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        ?: (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+    runCatching {
+        context.contentResolver.takePersistableUriPermission(treeUri, grantFlags)
+    }
+
+    val resolvedPath = resolveTreeUriToFilesystemPath(treeUri)
+    if (resolvedPath != null) {
+        onResolvedSelection(resolvedPath, treeUri.toString())
+    } else {
+        onError(
+            "Selected folder could not be mapped to a filesystem path. Please use a folder under shared storage such as DCIM or Documents.",
+        )
+    }
+}
+
+private fun resolveTreeUriToFilesystemPath(treeUri: Uri): String? {
+    val documentId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+        ?: return null
+    if (documentId.startsWith("raw:")) {
+        return documentId.removePrefix("raw:")
+    }
+
+    val storageRoot = documentId.substringBefore(':', "")
+    val relative = documentId.substringAfter(':', "")
+        .split('/')
+        .filter { it.isNotBlank() }
+
+    val basePath = when {
+        storageRoot.equals("primary", ignoreCase = true) -> "/storage/emulated/0"
+        storageRoot.equals("home", ignoreCase = true) -> "/storage/emulated/0/Documents"
+        storageRoot.length == 9 && storageRoot[4] == '-' -> "/storage/$storageRoot"
+        else -> return null
+    }
+
+    return if (relative.isEmpty()) {
+        basePath
+    } else {
+        buildString {
+            append(basePath.trimEnd('/'))
+            relative.forEach { segment ->
+                append('/')
+                append(segment)
+            }
+        }
+    }
 }
 
 private fun loadDocumentThumbnail(

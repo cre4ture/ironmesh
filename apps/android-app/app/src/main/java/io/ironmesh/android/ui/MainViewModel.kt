@@ -7,11 +7,14 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.FolderSyncConfig
+import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import io.ironmesh.android.saf.IronmeshDocumentColumns
 import io.ironmesh.android.work.FolderSyncScheduler
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
@@ -48,9 +51,11 @@ data class MainUiState(
     val status: String = "Ready",
     val objectBody: String = "",
     val syncProfiles: List<FolderSyncConfig> = emptyList(),
+    val folderSyncStatus: FolderSyncServiceStatus = FolderSyncServiceStatus(),
     val newSyncLabel: String = "",
     val newSyncPrefix: String = "",
     val newSyncLocalFolder: String = "",
+    val newSyncLocalFolderTreeUri: String? = null,
     val selectedSection: MainSection = MainSection.SETTINGS,
     val webUiUrl: String = "",
     val galleryItems: List<GalleryImageItem> = emptyList(),
@@ -79,6 +84,7 @@ class MainViewModel(
             deviceLabelInput = persistedDeviceAuth.label.orEmpty(),
         )
         FolderSyncScheduler.reschedule(getApplication())
+        observeFolderSyncStatus()
     }
 
     fun updateBaseUrl(value: String) {
@@ -141,7 +147,20 @@ class MainViewModel(
     }
 
     fun updateNewSyncLocalFolder(value: String) {
-        uiState.value = uiState.value.copy(newSyncLocalFolder = value)
+        uiState.value = uiState.value.copy(
+            newSyncLocalFolder = value,
+            newSyncLocalFolderTreeUri = null,
+        )
+    }
+
+    fun updateNewSyncLocalFolderSelection(
+        localFolder: String,
+        treeUri: String?,
+    ) {
+        uiState.value = uiState.value.copy(
+            newSyncLocalFolder = localFolder,
+            newSyncLocalFolderTreeUri = treeUri,
+        )
     }
 
     fun selectSection(section: MainSection) {
@@ -197,6 +216,7 @@ class MainViewModel(
             label = label,
             prefix = prefix,
             localFolder = localFolder,
+            localFolderTreeUri = uiState.value.newSyncLocalFolderTreeUri?.takeIf { it.isNotBlank() },
             depth = 64,
             enabled = true,
         )
@@ -208,6 +228,7 @@ class MainViewModel(
             newSyncLabel = "",
             newSyncPrefix = "",
             newSyncLocalFolder = "",
+            newSyncLocalFolderTreeUri = null,
             status = "Added sync profile '${profile.label}'",
         )
 
@@ -227,7 +248,6 @@ class MainViewModel(
     fun removeFolderSyncProfile(profileId: String) {
         val updated = uiState.value.syncProfiles.filterNot { it.id == profileId }
         IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
-        IronmeshPreferences.clearFolderSyncRuntimeState(getApplication(), profileId)
         uiState.value = uiState.value.copy(
             syncProfiles = updated,
             status = "Removed sync profile",
@@ -338,16 +358,31 @@ class MainViewModel(
         }
     }
 
+    private fun observeFolderSyncStatus() {
+        viewModelScope.launch {
+            while (isActive) {
+                val status = withContext(Dispatchers.IO) {
+                    runCatching { repository.getContinuousFolderSyncStatus() }
+                        .getOrDefault(FolderSyncServiceStatus())
+                }
+                uiState.value = uiState.value.copy(folderSyncStatus = status)
+                delay(1_000)
+            }
+        }
+    }
+
     private fun loadGalleryItems(): List<GalleryImageItem> {
         val application = getApplication<Application>()
         val authority = "${application.packageName}.documents"
         val rootDocumentId = "dir:"
         val items = mutableListOf<GalleryImageItem>()
+        val visitedDocumentIds = mutableSetOf<String>()
 
         collectGalleryImages(
             authority = authority,
             parentDocumentId = rootDocumentId,
             output = items,
+            visitedDocumentIds = visitedDocumentIds,
         )
         return items
     }
@@ -368,7 +403,11 @@ class MainViewModel(
         authority: String,
         parentDocumentId: String,
         output: MutableList<GalleryImageItem>,
+        visitedDocumentIds: MutableSet<String>,
     ) {
+        if (!visitedDocumentIds.add(parentDocumentId)) {
+            return
+        }
         val resolver = getApplication<Application>().contentResolver
         val projection = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
@@ -391,7 +430,7 @@ class MainViewModel(
                     ?: continue
 
                 if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
-                    collectGalleryImages(authority, documentId, output)
+                    collectGalleryImages(authority, documentId, output, visitedDocumentIds)
                     continue
                 }
 
