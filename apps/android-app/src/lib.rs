@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use client_sdk::{
-    BootstrapEnrollmentResult, ClientNode, ConnectionBootstrap, DeviceEnrollmentRequest,
-    IronMeshClient, build_http_client_from_pem, build_reqwest_client_from_pem, enroll_device,
+    BootstrapEnrollmentResult, ClientNode, ConnectionBootstrap, IronMeshClient,
+    build_http_client_from_pem, build_reqwest_client_from_pem,
 };
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
@@ -301,56 +301,6 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         },
         Err(err) => {
             throw_java_error(&mut env, format!("rust startWebUi failed: {err:#}"));
-            std::ptr::null_mut()
-        }
-    }
-}
-
-/// # Safety
-/// This function is intended to be called from Java via JNI.
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enrollDevice(
-    mut env: JNIEnv,
-    _class: JClass,
-    base_url: JString,
-    pairing_token: JString,
-    device_id: jstring,
-    label: jstring,
-) -> jstring {
-    let result = (|| -> Result<String> {
-        let base_url: String = env.get_string(&base_url)?.into();
-        let pairing_token: String = env.get_string(&pairing_token)?.into();
-        let device_id = normalize_optional_string(optional_jstring(&mut env, device_id)?);
-        let label = normalize_optional_string(optional_jstring(&mut env, label)?);
-
-        let rt = runtime()?;
-        let base_url = client_sdk::normalize_server_base_url(&base_url)?;
-        let response = rt.block_on(enroll_device(
-            &base_url,
-            None,
-            &DeviceEnrollmentRequest {
-                pairing_token,
-                device_id,
-                label,
-            },
-        ))?;
-
-        serde_json::to_string(&response).context("failed to serialize enroll response")
-    })();
-
-    match result {
-        Ok(json) => match env.new_string(json) {
-            Ok(value) => value.into_raw(),
-            Err(err) => {
-                throw_java_error(
-                    &mut env,
-                    format!("rust enrollDevice failed to create java string: {err:#}"),
-                );
-                std::ptr::null_mut()
-            }
-        },
-        Err(err) => {
-            throw_java_error(&mut env, format!("rust enrollDevice failed: {err:#}"));
             std::ptr::null_mut()
         }
     }

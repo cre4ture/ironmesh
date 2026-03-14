@@ -4,18 +4,9 @@ import java.io.InputStream
 import java.io.OutputStream
 
 object RustClientBridge {
-    private val libraryLoaded: Boolean = runCatching {
+    init {
         System.loadLibrary("android_app")
-        true
-    }.getOrElse { false }
-
-    @JvmStatic
-    external fun enrollDevice(
-        baseUrl: String,
-        pairingToken: String,
-        deviceId: String?,
-        label: String?,
-    ): String
+    }
 
     @JvmStatic
     external fun enrollWithBootstrap(
@@ -92,6 +83,4 @@ object RustClientBridge {
 
     @JvmStatic
     external fun startWebUi(baseUrl: String): String
-
-    fun isAvailable(): Boolean = libraryLoaded
 }
