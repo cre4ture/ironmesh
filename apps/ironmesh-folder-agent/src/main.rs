@@ -2805,6 +2805,7 @@ mod tests {
         let scope = PathScope::new(None);
         let store = StartupStateStore::new(&root, &scope, "http://127.0.0.1:8080");
         remove_sqlite_sidecars(&store.path);
+        ensure_parent_dir(&store.path);
 
         {
             let connection = Connection::open(&store.path).unwrap();
@@ -2885,6 +2886,7 @@ mod tests {
         let scope = PathScope::new(None);
         let store = StartupStateStore::new(&root, &scope, "http://127.0.0.1:8080");
         remove_sqlite_sidecars(&store.path);
+        ensure_parent_dir(&store.path);
 
         {
             let connection = Connection::open(&store.path).unwrap();
@@ -2959,5 +2961,11 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = fs::remove_file(wal);
         let _ = fs::remove_file(shm);
+    }
+
+    fn ensure_parent_dir(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
     }
 }

@@ -241,6 +241,7 @@ pub async fn start_server_with_env(
     .await
 }
 
+#[allow(dead_code)]
 pub async fn start_server_with_public_https_env(
     bind: &str,
     data_dir: &Path,
