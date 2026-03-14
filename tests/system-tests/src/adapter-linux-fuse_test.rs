@@ -52,6 +52,34 @@ mod tests {
         Ok(ChildGuard::new(child))
     }
 
+    async fn start_linux_fuse_adapter_with_local_edge(
+        server_base_url: &str,
+        local_edge_base_url_file: &Path,
+        mountpoint: &Path,
+        remote_refresh_interval_ms: u64,
+    ) -> Result<ChildGuard> {
+        let os_integration_bin = binary_path("os-integration")?;
+        let mountpoint_arg = mountpoint.to_string_lossy().to_string();
+        let local_edge_base_url_file_arg = local_edge_base_url_file.to_string_lossy().to_string();
+
+        let child = Command::new(os_integration_bin)
+            .arg("--server-base-url")
+            .arg(server_base_url)
+            .arg("--local-edge")
+            .arg("--local-edge-base-url-file")
+            .arg(&local_edge_base_url_file_arg)
+            .arg("--mountpoint")
+            .arg(&mountpoint_arg)
+            .arg("--remote-refresh-interval-ms")
+            .arg(remote_refresh_interval_ms.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn linux fuse adapter via os-integration in local-edge mode")?;
+
+        Ok(ChildGuard::new(child))
+    }
+
     async fn wait_for_file(path: &Path, retries: usize) -> Result<()> {
         for _ in 0..retries {
             if path.is_file() {
@@ -158,6 +186,40 @@ mod tests {
         );
     }
 
+    async fn wait_for_mount_active(path: &Path, retries: usize) -> Result<()> {
+        let mountpoint = path.to_string_lossy().to_string();
+
+        for _ in 0..retries {
+            if let Ok(mounts) = fs::read_to_string("/proc/mounts")
+                && mounts.lines().any(|line| {
+                    line.split_whitespace()
+                        .nth(1)
+                        .map(|entry| entry == mountpoint)
+                        .unwrap_or(false)
+                })
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("mountpoint did not become active: {}", path.display());
+    }
+
+    async fn wait_for_file_text(path: &Path, retries: usize) -> Result<String> {
+        for _ in 0..retries {
+            if let Ok(contents) = fs::read_to_string(path) {
+                let trimmed = contents.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Ok(trimmed);
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("expected file {} to contain text", path.display());
+    }
+
     async fn wait_for_absence(path: &Path, retries: usize) -> Result<()> {
         for _ in 0..retries {
             if !path.exists() {
@@ -212,6 +274,36 @@ mod tests {
         }
 
         bail!("server did not expose expected payload for key {key}");
+    }
+
+    async fn wait_for_remote_sync_via_local_edge(
+        local_edge_base_url: &str,
+        sdk: &IronMeshClient,
+        key: &str,
+        expected: &[u8],
+        retries: usize,
+    ) -> Result<()> {
+        let http = reqwest::Client::new();
+
+        for _ in 0..retries {
+            let _ = http
+                .post(format!(
+                    "{}/cluster/replication/repair",
+                    local_edge_base_url.trim_end_matches('/')
+                ))
+                .send()
+                .await;
+
+            if let Ok(bytes) = sdk.get(key).await
+                && bytes.as_ref() == expected
+            {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("server did not expose expected payload for key {key} after local-edge repair");
     }
 
     async fn wait_for_remote_directory_existence(
@@ -1014,6 +1106,82 @@ mod tests {
         result
     }
 
+    async fn run_local_edge_upstream_restart_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let upstream_data_dir = fresh_data_dir("linux-fuse-local-edge-upstream-node");
+        let mountpoint = fresh_data_dir("linux-fuse-local-edge-mount");
+        let control_dir = fresh_data_dir("linux-fuse-local-edge-control");
+        let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
+        let node_id = "4a764850-f4e2-4bb7-ae22-9fe19e17ba40";
+        let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
+        let mut upstream =
+            start_server_with_env(bind, &upstream_data_dir, node_id, 1, &extra_env).await?;
+
+        let base_url = format!("http://{bind}");
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            let mut adapter = start_linux_fuse_adapter_with_local_edge(
+                &base_url,
+                &local_edge_base_url_file,
+                &mountpoint,
+                250,
+            )
+            .await?;
+
+            wait_for_mount_active(&mountpoint, 150).await?;
+            let local_edge_base_url = wait_for_file_text(&local_edge_base_url_file, 150).await?;
+
+            let online_key = "online-edge-write.txt";
+            let online_payload = b"written-while-upstream-online".to_vec();
+            let mounted_online = mountpoint.join(online_key);
+            fs::write(&mounted_online, &online_payload).with_context(|| {
+                format!(
+                    "failed to write mounted online file {}",
+                    mounted_online.display()
+                )
+            })?;
+            wait_for_object_bytes(&sdk, online_key, &online_payload, 300).await?;
+
+            stop_server(&mut upstream).await;
+
+            let offline_key = "offline-edge-write.txt";
+            let offline_payload = b"written-while-upstream-offline".to_vec();
+            let mounted_offline = mountpoint.join(offline_key);
+            fs::write(&mounted_offline, &offline_payload).with_context(|| {
+                format!(
+                    "failed to write mounted offline file {}",
+                    mounted_offline.display()
+                )
+            })?;
+
+            upstream =
+                start_server_with_env(bind, &upstream_data_dir, node_id, 1, &extra_env).await?;
+            wait_for_remote_sync_via_local_edge(
+                &local_edge_base_url,
+                &sdk,
+                offline_key,
+                &offline_payload,
+                300,
+            )
+            .await?;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut upstream).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        let _ = fs::remove_dir_all(&control_dir);
+        let _ = fs::remove_dir_all(&upstream_data_dir);
+        result
+    }
+
     #[tokio::test]
     async fn linux_fuse_server_mode_uploads_small_payload() -> Result<()> {
         run_server_mode_upload_case(
@@ -1082,5 +1250,11 @@ mod tests {
     #[tokio::test]
     async fn linux_fuse_local_deletes_propagate_across_cluster() -> Result<()> {
         run_cluster_delete_propagation_case("127.0.0.1:19368", "127.0.0.1:19369").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_local_edge_mount_survives_upstream_restart_and_syncs_offline_write()
+    -> Result<()> {
+        run_local_edge_upstream_restart_case("127.0.0.1:19371").await
     }
 }

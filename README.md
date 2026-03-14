@@ -150,6 +150,37 @@ Those bridges can be added incrementally without changing the workspace topology
   - Configure with `--remote-refresh-interval-ms` (default `3000`).
   - Polling is implemented via `client-sdk` `RemoteSnapshotPoller`, which keeps the last snapshot in an SDK-owned thread and triggers adapter callbacks with `changed_paths`.
 
+## Linux FUSE mount
+
+The Linux entrypoint is `os-integration`. The mountpoint directory must already exist, and in practice it should be empty before mounting.
+
+Direct server mode:
+
+```bash
+mkdir -p /tmp/ironmesh-mount
+cargo run -p os-integration -- \
+  --server-base-url http://127.0.0.1:18080 \
+  --mountpoint /tmp/ironmesh-mount
+```
+
+Embedded local-edge mode:
+
+```bash
+mkdir -p /tmp/ironmesh-mount
+cargo run -p os-integration -- \
+  --server-base-url http://127.0.0.1:18080 \
+  --local-edge \
+  --mountpoint /tmp/ironmesh-mount
+```
+
+Notes:
+
+- `--local-edge` starts a persistent local edge node and mounts against it instead of talking to the remote server directly.
+- By default, local-edge state is stored under `$XDG_STATE_HOME/ironmesh/os-integration/local-edge/` or `~/.local/state/ironmesh/os-integration/local-edge/`.
+- Use `--local-edge-data-dir` to override that storage path explicitly.
+- `--remote-refresh-interval-ms` controls how often the mounted view polls for namespace updates in live modes.
+- Snapshot mode is still available for debugging with `--snapshot-file`.
+
 ## Cross-environment handover
 
 - Current implementation status, environment bootstrap steps, and Windows-next development handover are documented in [docs/cross-platform-handover.md](docs/cross-platform-handover.md).

@@ -102,7 +102,7 @@ Out of scope for MVP:
 ## Planned phase sequence
 
 1. MVP (this change): shared planner + tests.
-2. Linux pilot: `adapter-linux-fuse` read-only mount using planner metadata decisions. ✅
+2. Linux pilot: `adapter-linux-fuse` mount with live hydration, write-through, and local-edge support. ✅
 3. Windows pilot: sync root registration + read/hydrate callback path. ✅
 4. Android alignment: map `DocumentsProvider` operations to the same planner contracts.
 5. Shared writeback queue + conflict resolution UX.
@@ -136,10 +136,11 @@ Out of scope for MVP:
 
 - Completed:
   - `crates/sync-core` with deterministic reconciliation planner + unit tests.
-  - `crates/adapter-linux-fuse` runtime with feature-gated read-only FUSE mount support.
-  - `adapter-linux-fuse-mount` CLI with two modes:
+  - `crates/adapter-linux-fuse` runtime with Linux FUSE mount support.
+  - Linux `os-integration` mount CLI with three modes:
     - `--snapshot-file` static snapshot mode.
-    - `--server-base-url` live namespace/hydration mode via `server-node` APIs.
+    - `--server-base-url` live namespace/hydration/write-through mode via `server-node` APIs.
+    - `--local-edge` embedded local-edge mode with persistent local storage and upstream sync.
   - CI artifact publication for Ubuntu mount binary (`linux-fuse-mount-binary-ubuntu`).
   - `crates/adapter-windows-cfapi` runtime with:
     - sync-root registration + placeholder creation,
@@ -183,13 +184,12 @@ Key options:
 - `--no-watch-local`: disable native local watcher and rely on scans only.
 - `--run-once`: perform one bootstrap + local scan cycle and exit.
 
-## Linux FUSE MVP test (current)
+## Linux FUSE usage (current)
 
-The Linux adapter now includes a feature-gated read-only FUSE runtime and mount CLI:
+The Linux adapter currently ships through `os-integration`:
 
 - Crate: `crates/adapter-linux-fuse`
-- Binary: `adapter-linux-fuse-mount`
-- Cargo feature: `fuse-runtime`
+- User-facing binary: `apps/os-integration`
 
 Example snapshot file:
 
@@ -217,25 +217,42 @@ Mount command:
 
 ```bash
 mkdir -p /tmp/ironmesh-mount
-cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+cargo run -p os-integration -- \
   --snapshot-file /tmp/snapshot.json \
   --mountpoint /tmp/ironmesh-mount
 ```
 
-Current runtime behavior:
+Snapshot mode behavior:
 
-- Read-only filesystem.
 - Directories and placeholder files materialized from planned actions.
-- File reads trigger hydration (demo hydrator in snapshot mode, live object fetch in server mode).
+- File reads trigger demo hydration.
+- Snapshot mode is for inspection/debugging, not persistent sync.
 
 Direct server-node mode:
 
 ```bash
 mkdir -p /tmp/ironmesh-mount-live
-cargo run -p adapter-linux-fuse --features fuse-runtime --bin adapter-linux-fuse-mount -- \
+cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
   --mountpoint /tmp/ironmesh-mount-live
 ```
 
 - `--server-base-url` loads namespace entries from `/store/index`.
 - File reads hydrate through live `GET /store/{key}` requests.
+- Local writes, deletes, and renames are sent back to the server.
+- `--remote-refresh-interval-ms` controls namespace polling while mounted.
+
+Embedded local-edge mode:
+
+```bash
+mkdir -p /tmp/ironmesh-mount-edge
+cargo run -p os-integration -- \
+  --server-base-url http://127.0.0.1:18080 \
+  --local-edge \
+  --mountpoint /tmp/ironmesh-mount-edge
+```
+
+- `--local-edge` mounts against a spawned local edge node instead of the remote server directly.
+- The local edge persists state on disk and can accept writes while the upstream is unavailable.
+- By default, the local edge stores state under `$XDG_STATE_HOME/ironmesh/os-integration/local-edge/` or `~/.local/state/ironmesh/os-integration/local-edge/`.
+- `--local-edge-data-dir` is the advanced override for choosing that storage path explicitly.

@@ -1,9 +1,10 @@
 use super::{
-    AdminControl, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState,
-    ServerState, StartupRepairStatus, await_repair_busy_threshold, build_store_index_entries,
-    cluster, constant_time_eq, jittered_backoff_secs,
-    replication::build_internal_replication_put_url, run_startup_replication_repair_once,
-    should_trigger_autonomous_post_write_replication, token_matches,
+    AdminControl, LocalNodeHandle, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig,
+    RepairExecutorState, ServerNodeConfig, ServerState, StartupRepairStatus,
+    await_repair_busy_threshold, build_store_index_entries, cluster, constant_time_eq,
+    jittered_backoff_secs, replication::build_internal_replication_put_url, run,
+    run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
+    token_matches,
 };
 use common::NodeId;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use tokio::time::{Duration, Instant};
 use tower::ServiceExt;
 
@@ -51,6 +53,13 @@ fn sample_png_bytes() -> Vec<u8> {
         .write_to(&mut cursor, image::ImageFormat::Png)
         .unwrap();
     cursor.into_inner()
+}
+
+fn free_bind_addr() -> SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
 }
 
 #[test]
@@ -425,6 +434,393 @@ async fn list_store_index_includes_cached_media_metadata_for_images() {
     cleanup_test_state(&state).await;
 }
 
+#[tokio::test]
+async fn local_edge_mode_serves_health_without_internal_tls() {
+    let bind_addr = free_bind_addr();
+    let data_dir = std::env::temp_dir().join(format!(
+        "ironmesh-local-edge-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let mut config = ServerNodeConfig::local_edge(&data_dir, bind_addr);
+    config.public_url = Some(format!("http://{bind_addr}"));
+
+    let handle = tokio::spawn(async move { run(config).await });
+    let client = reqwest::Client::new();
+    let health_url = format!("http://{bind_addr}/health");
+
+    let started = async {
+        for _ in 0..50 {
+            match client.get(&health_url).send().await {
+                Ok(response) if response.status() == StatusCode::OK => return Ok(()),
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        anyhow::bail!("local-edge server did not become healthy at {health_url}");
+    }
+    .await;
+
+    handle.abort();
+    let _ = handle.await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    started.unwrap();
+}
+
+#[test]
+fn local_node_handle_starts_and_reports_base_url() {
+    let data_dir = std::env::temp_dir().join(format!(
+        "ironmesh-local-edge-handle-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let handle = LocalNodeHandle::start_local_edge(&data_dir).unwrap();
+    let response = reqwest::blocking::get(format!("{}/health", handle.base_url())).unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes() {
+    let upstream_dir = fresh_test_dir("edge-upstream-source");
+    let upstream_bind_addr = free_bind_addr();
+    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
+    upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
+    upstream_config.public_peer_api_enabled = true;
+    upstream_config.replication_factor = 2;
+    let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
+
+    let http = reqwest::Client::new();
+    let upstream_base_url = format!("http://{upstream_bind_addr}");
+    wait_for_http_status(
+        &http,
+        &format!("{upstream_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+    let remote_key = "remote.txt";
+    let remote_payload = "from-upstream";
+    let response = http
+        .put(format!("{upstream_base_url}/store/{remote_key}"))
+        .body(remote_payload.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let edge_dir = fresh_test_dir("edge-upstream-target");
+    let edge_bind_addr = free_bind_addr();
+    let mut edge_config =
+        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
+    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
+    edge_config.replica_view_sync_interval_secs = 1;
+    edge_config.startup_repair_delay_secs = 0;
+    let edge_handle = tokio::spawn(async move { run(edge_config).await });
+    let edge_base_url = format!("http://{edge_bind_addr}");
+    wait_for_http_status(
+        &http,
+        &format!("{edge_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_condition("edge sees upstream node", Duration::from_secs(5), || {
+        let http = http.clone();
+        let edge_base_url = edge_base_url.clone();
+        let upstream_base_url = upstream_base_url.clone();
+        async move {
+            let response = match http
+                .get(format!("{edge_base_url}/cluster/nodes"))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => return false,
+            };
+            let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
+                return false;
+            };
+
+            nodes.iter().any(|node| {
+                node.public_url == upstream_base_url || node.internal_url == upstream_base_url
+            })
+        }
+    })
+    .await;
+
+    wait_for_condition(
+        "edge sees remote replication gap",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let edge_base_url = edge_base_url.clone();
+            let remote_key = remote_key.to_string();
+            async move {
+                let response = match http
+                    .get(format!("{edge_base_url}/cluster/replication/plan"))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => return false,
+                };
+                let Ok(plan) = response.json::<cluster::ReplicationPlan>().await else {
+                    return false;
+                };
+                plan.items.iter().any(|item| item.key == remote_key)
+            }
+        },
+    )
+    .await;
+
+    let repair_response = http
+        .post(format!("{edge_base_url}/cluster/replication/repair"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repair_response.status(), StatusCode::OK);
+
+    wait_for_condition("edge pulls remote object", Duration::from_secs(5), || {
+        let http = http.clone();
+        let edge_base_url = edge_base_url.clone();
+        let remote_key = remote_key.to_string();
+        async move {
+            match http
+                .get(format!("{edge_base_url}/store/{remote_key}"))
+                .send()
+                .await
+            {
+                Ok(response) if response.status() == StatusCode::OK => {
+                    match response.text().await {
+                        Ok(body) => body == remote_payload,
+                        Err(_) => false,
+                    }
+                }
+                _ => false,
+            }
+        }
+    })
+    .await;
+
+    let local_key = "local.txt";
+    let local_payload = "from-edge";
+    let response = http
+        .put(format!("{edge_base_url}/store/{local_key}"))
+        .body(local_payload.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let repair_response = http
+        .post(format!("{edge_base_url}/cluster/replication/repair"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repair_response.status(), StatusCode::OK);
+
+    wait_for_condition(
+        "upstream receives pushed object",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let upstream_base_url = upstream_base_url.clone();
+            let local_key = local_key.to_string();
+            async move {
+                match http
+                    .get(format!("{upstream_base_url}/store/{local_key}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status() == StatusCode::OK => {
+                        match response.text().await {
+                            Ok(body) => body == local_payload,
+                            Err(_) => false,
+                        }
+                    }
+                    _ => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    edge_handle.abort();
+    let _ = edge_handle.await;
+    upstream_handle.abort();
+    let _ = upstream_handle.await;
+    let _ = std::fs::remove_dir_all(&edge_dir);
+    let _ = std::fs::remove_dir_all(&upstream_dir);
+}
+
+#[tokio::test]
+async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart() {
+    let upstream_dir = fresh_test_dir("edge-upstream-restart-source");
+    let upstream_bind_addr = free_bind_addr();
+    let upstream_base_url = format!("http://{upstream_bind_addr}");
+    let upstream_node_id = NodeId::new_v4();
+    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
+    upstream_config.node_id = upstream_node_id;
+    upstream_config.public_url = Some(upstream_base_url.clone());
+    upstream_config.public_peer_api_enabled = true;
+    upstream_config.replication_factor = 2;
+    let upstream_restart_config = upstream_config.clone();
+    let mut upstream_handle = tokio::spawn(async move { run(upstream_config).await });
+
+    let http = reqwest::Client::new();
+    wait_for_http_status(
+        &http,
+        &format!("{upstream_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let edge_dir = fresh_test_dir("edge-upstream-restart-target");
+    let edge_bind_addr = free_bind_addr();
+    let mut edge_config =
+        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
+    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
+    edge_config.replica_view_sync_interval_secs = 1;
+    edge_config.startup_repair_delay_secs = 0;
+    let edge_handle = tokio::spawn(async move { run(edge_config).await });
+    let edge_base_url = format!("http://{edge_bind_addr}");
+    wait_for_http_status(
+        &http,
+        &format!("{edge_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_condition("edge sees upstream node", Duration::from_secs(5), || {
+        let http = http.clone();
+        let edge_base_url = edge_base_url.clone();
+        let upstream_base_url = upstream_base_url.clone();
+        async move {
+            let response = match http
+                .get(format!("{edge_base_url}/cluster/nodes"))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => return false,
+            };
+            let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
+                return false;
+            };
+
+            nodes.iter().any(|node| {
+                node.public_url == upstream_base_url || node.internal_url == upstream_base_url
+            })
+        }
+    })
+    .await;
+
+    upstream_handle.abort();
+    let _ = upstream_handle.await;
+
+    let offline_key = "offline-after-restart.txt";
+    let offline_payload = "queued-while-upstream-offline";
+    let response = http
+        .put(format!("{edge_base_url}/store/{offline_key}"))
+        .body(offline_payload.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    upstream_handle = tokio::spawn(async move { run(upstream_restart_config).await });
+    wait_for_http_status(
+        &http,
+        &format!("{upstream_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_condition(
+        "edge refreshes upstream peer after restart",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let edge_base_url = edge_base_url.clone();
+            let upstream_base_url = upstream_base_url.clone();
+            async move {
+                let response = match http
+                    .get(format!("{edge_base_url}/cluster/nodes"))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => return false,
+                };
+                let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
+                    return false;
+                };
+
+                nodes.iter().any(|node| {
+                    (node.public_url == upstream_base_url || node.internal_url == upstream_base_url)
+                        && node.status == cluster::NodeStatus::Online
+                })
+            }
+        },
+    )
+    .await;
+
+    let repair_response = http
+        .post(format!("{edge_base_url}/cluster/replication/repair"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repair_response.status(), StatusCode::OK);
+
+    wait_for_condition(
+        "upstream receives offline object after repair",
+        Duration::from_secs(10),
+        || {
+            let http = http.clone();
+            let upstream_base_url = upstream_base_url.clone();
+            let offline_key = offline_key.to_string();
+            async move {
+                match http
+                    .get(format!("{upstream_base_url}/store/{offline_key}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status() == StatusCode::OK => {
+                        match response.text().await {
+                            Ok(body) => body == offline_payload,
+                            Err(_) => false,
+                        }
+                    }
+                    _ => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    edge_handle.abort();
+    let _ = edge_handle.await;
+    upstream_handle.abort();
+    let _ = upstream_handle.await;
+    let _ = std::fs::remove_dir_all(&edge_dir);
+    let _ = std::fs::remove_dir_all(&upstream_dir);
+}
+
 async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerState {
     let root = fresh_test_dir("startup-repair-main");
     let local_node_id = NodeId::new_v4();
@@ -543,4 +939,45 @@ fn fresh_test_dir(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::create_dir_all(&path);
     path
+}
+
+async fn wait_for_condition<F, Fut>(label: &str, timeout: Duration, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if condition().await {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "{label} was not met within {:?}",
+            timeout,
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_http_status(
+    http: &reqwest::Client,
+    url: &str,
+    expected_status: StatusCode,
+    timeout: Duration,
+) {
+    wait_for_condition("http status", timeout, || {
+        let http = http.clone();
+        let url = url.to_string();
+        async move {
+            match http.get(url).send().await {
+                Ok(response) => response.status() == expected_status,
+                Err(_) => false,
+            }
+        }
+    })
+    .await;
 }

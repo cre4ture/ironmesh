@@ -26,6 +26,12 @@ struct InternalReplicationDeleteQuery<'a> {
     internal_replication: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ReplicationExportRequestQuery<'a> {
+    key: &'a str,
+    version_id: Option<&'a str>,
+}
+
 pub(crate) async fn execute_replication_repair(
     State(state): State<ServerState>,
     Query(query): Query<ReplicationRepairQuery>,
@@ -40,13 +46,7 @@ pub(crate) async fn execute_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ReplicationRepairReport {
-    let keys = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
+    let keys = planning_replication_subjects(state).await;
 
     let (plan, nodes) = {
         let mut cluster = state.cluster.lock().await;
@@ -84,19 +84,112 @@ pub(crate) async fn execute_replication_repair_inner(
             continue;
         };
 
-        let bundle = {
+        let mut bundle = {
             let store = state.store.lock().await;
 
             match store
                 .export_replication_bundle(&key, version_id.as_deref(), ObjectReadMode::Preferred)
                 .await
             {
-                Ok(Some(bundle)) => bundle,
-                _ => {
-                    skipped_items += 1;
-                    continue;
+                Ok(Some(bundle)) => Some(bundle),
+                _ => None,
+            }
+        };
+
+        if bundle.is_none() && item.missing_nodes.contains(&state.node_id) {
+            let Some(source_node) = item
+                .current_nodes
+                .iter()
+                .filter(|node_id| **node_id != state.node_id)
+                .find_map(|node_id| node_by_id.get(node_id))
+            else {
+                skipped_items += 1;
+                continue;
+            };
+
+            let transfer_key = format!("{}|{}", item.key, state.node_id);
+
+            {
+                let repair_state = state.repair_state.lock().await;
+                if let Some(previous) = repair_state.attempts.get(&transfer_key) {
+                    if previous.attempts > max_attempts {
+                        skipped_max_retries += 1;
+                        continue;
+                    }
+
+                    let elapsed = now.saturating_sub(previous.last_failure_unix);
+                    let required_backoff =
+                        jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
+                    if elapsed < required_backoff {
+                        skipped_backoff += 1;
+                        continue;
+                    }
                 }
             }
+
+            await_repair_busy_threshold(state).await;
+            attempted_transfers += 1;
+
+            match pull_bundle_from_source(
+                &http,
+                &source_node.internal_url,
+                &key,
+                version_id.as_deref(),
+                state,
+            )
+            .await
+            {
+                Ok(imported_version_id) => {
+                    successful_transfers += 1;
+
+                    let mut cluster = state.cluster.lock().await;
+                    cluster.note_replica(&key, state.node_id);
+                    cluster.note_replica(format!("{key}@{imported_version_id}"), state.node_id);
+                    drop(cluster);
+                    replicas_state_dirty = true;
+
+                    let mut repair_state = state.repair_state.lock().await;
+                    repair_state.attempts.remove(&transfer_key);
+                    drop(repair_state);
+                    repair_state_dirty = true;
+
+                    bundle = {
+                        let store = state.store.lock().await;
+                        store
+                            .export_replication_bundle(
+                                &key,
+                                version_id.as_deref(),
+                                ObjectReadMode::Preferred,
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+                }
+                Err(err) => {
+                    failed_transfers += 1;
+                    last_error = Some(err.to_string());
+
+                    let mut repair_state = state.repair_state.lock().await;
+                    let entry =
+                        repair_state
+                            .attempts
+                            .entry(transfer_key)
+                            .or_insert(RepairAttemptEntry {
+                                attempts: 0,
+                                last_failure_unix: now,
+                            });
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    entry.last_failure_unix = now;
+                    drop(repair_state);
+                    repair_state_dirty = true;
+                }
+            }
+        }
+
+        let Some(bundle) = bundle else {
+            skipped_items += 1;
+            continue;
         };
 
         for target in item.missing_nodes {
@@ -201,6 +294,52 @@ pub(crate) async fn execute_replication_repair_inner(
         skipped_max_retries,
         last_error,
     }
+}
+
+async fn pull_bundle_from_source(
+    http: &reqwest::Client,
+    source_base_url: &str,
+    key: &str,
+    version_id: Option<&str>,
+    state: &ServerState,
+) -> Result<String> {
+    let source_base_url = source_base_url.trim_end_matches('/');
+    let export_url = format!("{source_base_url}/cluster/replication/export");
+    let bundle = http
+        .get(export_url)
+        .query(&ReplicationExportRequestQuery { key, version_id })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ReplicationExportBundle>()
+        .await?;
+
+    if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+        for chunk in &bundle.manifest.chunks {
+            let chunk_url = format!("{source_base_url}/cluster/replication/chunk/{}", chunk.hash);
+            let payload = http
+                .get(chunk_url)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+
+            let store = state.store.lock().await;
+            store.ingest_chunk(&chunk.hash, payload.as_ref()).await?;
+        }
+    }
+
+    let mut store = state.store.lock().await;
+    store
+        .import_replica_manifest(
+            &bundle.key,
+            bundle.version_id.as_deref(),
+            bundle.state,
+            &bundle.manifest_hash,
+            &bundle.manifest_bytes,
+        )
+        .await
 }
 
 async fn replicate_bundle_to_target(

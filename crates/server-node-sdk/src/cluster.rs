@@ -52,14 +52,14 @@ pub enum ReplicationCleanupOption {
     Recommended,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementDecision {
     pub key: String,
     pub selected_nodes: Vec<NodeId>,
     pub replication_factor: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationPlanItem {
     pub key: String,
     pub desired_nodes: Vec<NodeId>,
@@ -70,7 +70,7 @@ pub struct ReplicationPlanItem {
     pub deferred_extra_nodes: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationPlan {
     pub generated_at_unix: u64,
     pub under_replicated: usize,
@@ -80,7 +80,7 @@ pub struct ReplicationPlan {
     pub items: Vec<ReplicationPlanItem>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterSummary {
     pub local_node_id: NodeId,
     pub total_nodes: usize,
@@ -277,6 +277,12 @@ impl ClusterService {
                 (key.clone(), ordered)
             })
             .collect()
+    }
+
+    pub fn known_replication_subjects(&self) -> Vec<String> {
+        let mut subjects = self.replicas_by_key.keys().cloned().collect::<Vec<_>>();
+        subjects.sort();
+        subjects
     }
 
     pub fn remove_replica(&mut self, key: &str, node_id: NodeId) {

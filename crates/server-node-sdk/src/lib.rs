@@ -4,15 +4,16 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::extract::FromRequestParts;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header;
@@ -96,18 +97,6 @@ struct InternalCaller {
 #[derive(Debug, Clone, Default)]
 struct ClientAuthControl {
     require_client_auth: bool,
-}
-
-impl ClientAuthControl {
-    fn from_env() -> Self {
-        let require_client_auth = std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(false);
-        Self {
-            require_client_auth,
-        }
-    }
 }
 
 impl<S> FromRequestParts<S> for InternalCaller
@@ -407,9 +396,71 @@ where
 }
 
 #[derive(Debug, Clone, Copy)]
-enum MetadataCommitMode {
+pub enum MetadataCommitMode {
     Local,
     Quorum,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerNodeMode {
+    Cluster,
+    LocalEdge,
+}
+
+#[derive(Debug, Clone)]
+pub struct InternalTlsConfig {
+    pub bind_addr: SocketAddr,
+    pub internal_url: Option<String>,
+    pub ca_cert_path: PathBuf,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerNodeConfig {
+    pub mode: ServerNodeMode,
+    pub node_id: NodeId,
+    pub data_dir: PathBuf,
+    pub bind_addr: SocketAddr,
+    pub public_url: Option<String>,
+    pub labels: HashMap<String, String>,
+    pub public_tls: Option<PublicTlsConfig>,
+    pub public_ca_cert_path: Option<PathBuf>,
+    pub public_peer_api_enabled: bool,
+    pub internal_tls: Option<InternalTlsConfig>,
+    pub upstream_public_url: Option<String>,
+    pub heartbeat_timeout_secs: u64,
+    pub audit_interval_secs: u64,
+    pub replica_view_sync_interval_secs: u64,
+    pub replication_factor: usize,
+    pub accepted_over_replication_items: usize,
+    pub metadata_commit_mode: MetadataCommitMode,
+    pub autonomous_replication_on_put_enabled: bool,
+    pub replication_repair_enabled: bool,
+    pub replication_repair_batch_size: usize,
+    pub replication_repair_max_retries: u32,
+    pub replication_repair_backoff_secs: u64,
+    pub repair_busy_throttle_enabled: bool,
+    pub repair_busy_inflight_threshold: usize,
+    pub repair_busy_wait_millis: u64,
+    pub startup_repair_enabled: bool,
+    pub startup_repair_delay_secs: u64,
+    pub peer_heartbeat_enabled: bool,
+    pub peer_heartbeat_interval_secs: u64,
+    pub admin_token: Option<String>,
+    pub require_client_auth: bool,
+}
+
+pub struct LocalNodeHandle {
+    base_url: String,
+    shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -455,98 +506,6 @@ fn startup_repair_status_label(status: StartupRepairStatus) -> &'static str {
     }
 }
 
-impl RepairConfig {
-    fn from_env() -> Self {
-        let enabled = std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-
-        let batch_size = std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(256);
-
-        let max_retries = std::env::var("IRONMESH_REPLICATION_REPAIR_MAX_RETRIES")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3);
-
-        let backoff_secs = std::env::var("IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30);
-
-        let busy_throttle_enabled = std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(false);
-
-        let busy_inflight_threshold = std::env::var("IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(32);
-
-        let busy_wait_millis = std::env::var("IRONMESH_REPAIR_BUSY_WAIT_MILLIS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(100);
-
-        let startup_repair_enabled = std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(true);
-
-        let startup_repair_delay_secs = std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5);
-
-        Self {
-            enabled,
-            batch_size,
-            max_retries,
-            backoff_secs,
-            busy_throttle_enabled,
-            busy_inflight_threshold,
-            busy_wait_millis,
-            startup_repair_enabled,
-            startup_repair_delay_secs,
-        }
-    }
-}
-
-impl PeerHeartbeatConfig {
-    fn from_env() -> Self {
-        let enabled = std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(true);
-
-        let interval_secs = std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(15);
-
-        Self {
-            enabled,
-            interval_secs,
-        }
-    }
-}
-
-impl AdminControl {
-    fn from_env() -> Self {
-        let admin_token = std::env::var("IRONMESH_ADMIN_TOKEN")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        Self { admin_token }
-    }
-}
-
 #[derive(Debug, Default)]
 struct RepairExecutorState {
     attempts: HashMap<String, RepairAttemptEntry>,
@@ -570,6 +529,486 @@ impl MetadataCommitMode {
     }
 }
 
+impl ServerNodeConfig {
+    pub fn from_env() -> Result<Self> {
+        let mode = match std::env::var("IRONMESH_NODE_MODE")
+            .unwrap_or_else(|_| "cluster".to_string())
+            .as_str()
+        {
+            "cluster" => ServerNodeMode::Cluster,
+            "local-edge" => ServerNodeMode::LocalEdge,
+            raw => bail!("invalid IRONMESH_NODE_MODE '{raw}', expected 'cluster' or 'local-edge'"),
+        };
+
+        let node_id = std::env::var("IRONMESH_NODE_ID")
+            .ok()
+            .and_then(|value| value.parse::<NodeId>().ok())
+            .unwrap_or_else(NodeId::new_v4);
+
+        let data_dir = PathBuf::from(
+            std::env::var("IRONMESH_DATA_DIR").unwrap_or_else(|_| "./data/server-node".to_string()),
+        );
+        let bind_addr: SocketAddr = std::env::var("IRONMESH_SERVER_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+            .parse()
+            .context("invalid IRONMESH_SERVER_BIND")?;
+
+        let public_tls = match (
+            std::env::var("IRONMESH_PUBLIC_TLS_CERT").ok(),
+            std::env::var("IRONMESH_PUBLIC_TLS_KEY").ok(),
+        ) {
+            (Some(cert), Some(key)) => Some(PublicTlsConfig {
+                cert_path: PathBuf::from(cert),
+                key_path: PathBuf::from(key),
+            }),
+            (None, None) => None,
+            _ => {
+                bail!("IRONMESH_PUBLIC_TLS_CERT and IRONMESH_PUBLIC_TLS_KEY must be set together")
+            }
+        };
+
+        let public_url = std::env::var("IRONMESH_PUBLIC_URL").ok().or_else(|| {
+            let scheme = if public_tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            Some(format!("{scheme}://{bind_addr}"))
+        });
+
+        let internal_tls = match mode {
+            ServerNodeMode::Cluster => {
+                let internal_bind_addr: SocketAddr = std::env::var("IRONMESH_INTERNAL_BIND")
+                    .unwrap_or_else(|_| "127.0.0.1:18080".to_string())
+                    .parse()
+                    .context("invalid IRONMESH_INTERNAL_BIND")?;
+                Some(InternalTlsConfig {
+                    bind_addr: internal_bind_addr,
+                    internal_url: std::env::var("IRONMESH_INTERNAL_URL")
+                        .ok()
+                        .or_else(|| Some(format!("https://{internal_bind_addr}"))),
+                    ca_cert_path: PathBuf::from(
+                        std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
+                            .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
+                    ),
+                    cert_path: PathBuf::from(
+                        std::env::var("IRONMESH_INTERNAL_TLS_CERT")
+                            .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
+                    ),
+                    key_path: PathBuf::from(
+                        std::env::var("IRONMESH_INTERNAL_TLS_KEY")
+                            .context("missing IRONMESH_INTERNAL_TLS_KEY")?,
+                    ),
+                })
+            }
+            ServerNodeMode::LocalEdge => None,
+        };
+
+        let mut labels = HashMap::new();
+        labels.insert(
+            "region".to_string(),
+            std::env::var("IRONMESH_REGION").unwrap_or_else(|_| "local".to_string()),
+        );
+        labels.insert(
+            "dc".to_string(),
+            std::env::var("IRONMESH_DC").unwrap_or_else(|_| "local-dc".to_string()),
+        );
+        labels.insert(
+            "rack".to_string(),
+            std::env::var("IRONMESH_RACK").unwrap_or_else(|_| "local-rack".to_string()),
+        );
+
+        let default_replication_factor = if mode == ServerNodeMode::LocalEdge {
+            if std::env::var("IRONMESH_UPSTREAM_PUBLIC_URL")
+                .ok()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                2
+            } else {
+                1
+            }
+        } else {
+            3
+        };
+
+        let upstream_public_url = std::env::var("IRONMESH_UPSTREAM_PUBLIC_URL")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+        let upstream_configured = upstream_public_url.is_some();
+        let public_peer_api_enabled = std::env::var("IRONMESH_PUBLIC_PEER_API_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(mode == ServerNodeMode::LocalEdge && upstream_configured);
+        let default_audit_interval_secs =
+            if mode == ServerNodeMode::LocalEdge && upstream_configured {
+                5
+            } else {
+                3600
+            };
+        let default_replication_repair_backoff_secs =
+            if mode == ServerNodeMode::LocalEdge && upstream_configured {
+                2
+            } else {
+                30
+            };
+
+        Ok(Self {
+            mode,
+            node_id,
+            data_dir,
+            bind_addr,
+            public_url,
+            labels,
+            public_tls,
+            public_ca_cert_path: std::env::var("IRONMESH_PUBLIC_TLS_CA_CERT")
+                .ok()
+                .map(PathBuf::from),
+            public_peer_api_enabled,
+            internal_tls,
+            upstream_public_url,
+            heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(90),
+            audit_interval_secs: std::env::var("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(default_audit_interval_secs),
+            replica_view_sync_interval_secs: std::env::var(
+                "IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS",
+            )
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5),
+            replication_factor: std::env::var("IRONMESH_REPLICATION_FACTOR")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(default_replication_factor),
+            accepted_over_replication_items: std::env::var(
+                "IRONMESH_ACCEPTED_OVER_REPLICATION_ITEMS",
+            )
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0),
+            metadata_commit_mode: MetadataCommitMode::parse(
+                std::env::var("IRONMESH_METADATA_COMMIT_MODE")
+                    .unwrap_or_else(|_| "local".to_string())
+                    .as_str(),
+            )?,
+            autonomous_replication_on_put_enabled: match mode {
+                ServerNodeMode::Cluster => {
+                    std::env::var("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED")
+                        .ok()
+                        .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                        .unwrap_or(true)
+                }
+                ServerNodeMode::LocalEdge => upstream_configured,
+            },
+            replication_repair_enabled: match mode {
+                ServerNodeMode::Cluster => std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
+                    .ok()
+                    .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false),
+                ServerNodeMode::LocalEdge => upstream_configured,
+            },
+            replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(256),
+            replication_repair_max_retries: std::env::var(
+                "IRONMESH_REPLICATION_REPAIR_MAX_RETRIES",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3),
+            replication_repair_backoff_secs: std::env::var(
+                "IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default_replication_repair_backoff_secs),
+            repair_busy_throttle_enabled: std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(false),
+            repair_busy_inflight_threshold: std::env::var(
+                "IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD",
+            )
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32),
+            repair_busy_wait_millis: std::env::var("IRONMESH_REPAIR_BUSY_WAIT_MILLIS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(100),
+            startup_repair_enabled: match mode {
+                ServerNodeMode::Cluster => std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
+                    .ok()
+                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                    .unwrap_or(true),
+                ServerNodeMode::LocalEdge => upstream_configured,
+            },
+            startup_repair_delay_secs: std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5),
+            peer_heartbeat_enabled: match mode {
+                ServerNodeMode::Cluster => std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
+                    .ok()
+                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                    .unwrap_or(true),
+                ServerNodeMode::LocalEdge => false,
+            },
+            peer_heartbeat_interval_secs: std::env::var(
+                "IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(15),
+            admin_token: std::env::var("IRONMESH_ADMIN_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            require_client_auth: std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(false),
+        })
+    }
+
+    pub fn local_edge(data_dir: impl Into<PathBuf>, bind_addr: SocketAddr) -> Self {
+        let mut labels = HashMap::new();
+        labels.insert("region".to_string(), "local".to_string());
+        labels.insert("dc".to_string(), "local-edge".to_string());
+        labels.insert("rack".to_string(), "local-edge".to_string());
+
+        Self {
+            mode: ServerNodeMode::LocalEdge,
+            node_id: NodeId::new_v4(),
+            data_dir: data_dir.into(),
+            bind_addr,
+            public_url: Some(format!("http://{bind_addr}")),
+            labels,
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_peer_api_enabled: false,
+            internal_tls: None,
+            upstream_public_url: None,
+            heartbeat_timeout_secs: 90,
+            audit_interval_secs: 3600,
+            replica_view_sync_interval_secs: 5,
+            replication_factor: 1,
+            accepted_over_replication_items: 0,
+            metadata_commit_mode: MetadataCommitMode::Local,
+            autonomous_replication_on_put_enabled: false,
+            replication_repair_enabled: false,
+            replication_repair_batch_size: 256,
+            replication_repair_max_retries: 3,
+            replication_repair_backoff_secs: 30,
+            repair_busy_throttle_enabled: false,
+            repair_busy_inflight_threshold: 32,
+            repair_busy_wait_millis: 100,
+            startup_repair_enabled: false,
+            startup_repair_delay_secs: 5,
+            peer_heartbeat_enabled: false,
+            peer_heartbeat_interval_secs: 15,
+            admin_token: None,
+            require_client_auth: false,
+        }
+    }
+
+    pub fn local_edge_with_upstream(
+        data_dir: impl Into<PathBuf>,
+        bind_addr: SocketAddr,
+        upstream_public_url: impl Into<String>,
+    ) -> Self {
+        let mut config = Self::local_edge(data_dir, bind_addr);
+        config.upstream_public_url = Some(
+            upstream_public_url
+                .into()
+                .trim()
+                .trim_end_matches('/')
+                .to_string(),
+        );
+        config.public_peer_api_enabled = true;
+        config.replication_factor = 2;
+        config.audit_interval_secs = 5;
+        config.autonomous_replication_on_put_enabled = true;
+        config.replication_repair_enabled = true;
+        config.replication_repair_backoff_secs = 1;
+        config.startup_repair_enabled = true;
+        config
+    }
+
+    fn repair_config(&self) -> RepairConfig {
+        RepairConfig {
+            enabled: self.replication_repair_enabled,
+            batch_size: self.replication_repair_batch_size,
+            max_retries: self.replication_repair_max_retries,
+            backoff_secs: self.replication_repair_backoff_secs,
+            busy_throttle_enabled: self.repair_busy_throttle_enabled,
+            busy_inflight_threshold: self.repair_busy_inflight_threshold,
+            busy_wait_millis: self.repair_busy_wait_millis,
+            startup_repair_enabled: self.startup_repair_enabled,
+            startup_repair_delay_secs: self.startup_repair_delay_secs,
+        }
+    }
+
+    fn peer_heartbeat_config(&self) -> PeerHeartbeatConfig {
+        PeerHeartbeatConfig {
+            enabled: self.peer_heartbeat_enabled,
+            interval_secs: self.peer_heartbeat_interval_secs,
+        }
+    }
+
+    fn admin_control(&self) -> AdminControl {
+        AdminControl {
+            admin_token: self.admin_token.clone(),
+        }
+    }
+
+    fn client_auth_control(&self) -> ClientAuthControl {
+        ClientAuthControl {
+            require_client_auth: self.require_client_auth,
+        }
+    }
+}
+
+impl LocalNodeHandle {
+    pub fn start_local_edge(data_dir: impl Into<PathBuf>) -> Result<Self> {
+        let bind_addr = local_loopback_bind_addr()?;
+        let config = ServerNodeConfig::local_edge(data_dir, bind_addr);
+        Self::start(config)
+    }
+
+    pub fn start_local_edge_with_upstream(
+        data_dir: impl Into<PathBuf>,
+        upstream_public_url: impl Into<String>,
+    ) -> Result<Self> {
+        let bind_addr = local_loopback_bind_addr()?;
+        let config =
+            ServerNodeConfig::local_edge_with_upstream(data_dir, bind_addr, upstream_public_url);
+        Self::start(config)
+    }
+
+    pub fn start(config: ServerNodeConfig) -> Result<Self> {
+        let base_url = config.public_url.clone().unwrap_or_else(|| {
+            let scheme = if config.public_tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            format!("{scheme}://{}", config.bind_addr)
+        });
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<()>>();
+
+        let thread = thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let _ = result_tx.send(Err(err).context("failed to build local node runtime"));
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                let mut task = tokio::spawn(async move { run(config).await });
+
+                tokio::select! {
+                    outcome = &mut task => {
+                        let outcome = match outcome {
+                            Ok(result) => result,
+                            Err(err) => Err(err).context("local node task failed"),
+                        };
+                        let _ = result_tx.send(outcome);
+                    }
+                    _ = async {
+                        let _ = shutdown_rx.recv();
+                    } => {
+                        task.abort();
+                        let _ = task.await;
+                        let _ = result_tx.send(Ok(()));
+                    }
+                }
+            });
+        });
+
+        wait_for_local_node_ready(base_url.as_str(), &result_rx)?;
+
+        Ok(Self {
+            base_url,
+            shutdown_tx: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_str()
+    }
+}
+
+impl Drop for LocalNodeHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn local_loopback_bind_addr() -> Result<SocketAddr> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .context("failed to allocate local loopback port")?;
+    let bind_addr = listener
+        .local_addr()
+        .context("failed to read allocated local loopback port")?;
+    drop(listener);
+    Ok(bind_addr)
+}
+
+fn wait_for_local_node_ready(
+    base_url: &str,
+    result_rx: &std::sync::mpsc::Receiver<Result<()>>,
+) -> Result<()> {
+    let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .context("failed to build local node health-check client")?;
+
+    for _ in 0..50 {
+        match result_rx.try_recv() {
+            Ok(Ok(())) => bail!("local node exited before becoming healthy"),
+            Ok(Err(err)) => return Err(err).context("local node failed during startup"),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                bail!("local node startup channel disconnected")
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+
+        if let Ok(response) = client.get(&health_url).send()
+            && response.status() == StatusCode::OK
+        {
+            return Ok(());
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    bail!("local node did not become healthy at {health_url}")
+}
+
 pub async fn run_from_env() -> Result<()> {
     let log_buffer = Arc::new(LogBuffer::new(500));
     tracing_subscriber::registry()
@@ -586,112 +1025,34 @@ pub async fn run_from_env() -> Result<()> {
     // providers are enabled via transitive features (e.g. reqwest brings `ring`, axum-server may
     // bring `aws-lc-rs`). Installing once avoids startup panics.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    run_inner(ServerNodeConfig::from_env()?, Some(log_buffer)).await
+}
 
-    let node_id = std::env::var("IRONMESH_NODE_ID")
-        .ok()
-        .and_then(|value| value.parse::<NodeId>().ok())
-        .unwrap_or_else(NodeId::new_v4);
+pub async fn run(config: ServerNodeConfig) -> Result<()> {
+    run_inner(config, None).await
+}
 
-    let data_dir =
-        std::env::var("IRONMESH_DATA_DIR").unwrap_or_else(|_| "./data/server-node".to_string());
-    let bind_addr: SocketAddr = std::env::var("IRONMESH_SERVER_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
-        .parse()
-        .context("invalid IRONMESH_SERVER_BIND")?;
+async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>) -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let internal_bind_addr: SocketAddr = std::env::var("IRONMESH_INTERNAL_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:18080".to_string())
-        .parse()
-        .context("invalid IRONMESH_INTERNAL_BIND")?;
-
-    let mut initial_labels = HashMap::new();
-    initial_labels.insert(
-        "region".to_string(),
-        std::env::var("IRONMESH_REGION").unwrap_or_else(|_| "local".to_string()),
-    );
-    initial_labels.insert(
-        "dc".to_string(),
-        std::env::var("IRONMESH_DC").unwrap_or_else(|_| "local-dc".to_string()),
-    );
-    initial_labels.insert(
-        "rack".to_string(),
-        std::env::var("IRONMESH_RACK").unwrap_or_else(|_| "local-rack".to_string()),
-    );
-
-    let internal_tls_ca_path = PathBuf::from(
-        std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
-            .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
-    );
-    let internal_tls_cert_path = PathBuf::from(
-        std::env::var("IRONMESH_INTERNAL_TLS_CERT")
-            .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
-    );
-    let internal_tls_key_path = PathBuf::from(
-        std::env::var("IRONMESH_INTERNAL_TLS_KEY").context("missing IRONMESH_INTERNAL_TLS_KEY")?,
-    );
-    let public_tls = match (
-        std::env::var("IRONMESH_PUBLIC_TLS_CERT").ok(),
-        std::env::var("IRONMESH_PUBLIC_TLS_KEY").ok(),
-    ) {
-        (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
-        (None, None) => None,
-        _ => {
-            anyhow::bail!(
-                "IRONMESH_PUBLIC_TLS_CERT and IRONMESH_PUBLIC_TLS_KEY must be set together"
-            )
-        }
-    };
-    let public_url = std::env::var("IRONMESH_PUBLIC_URL").unwrap_or_else(|_| {
-        let scheme = if public_tls.is_some() {
+    let public_url = config.public_url.clone().unwrap_or_else(|| {
+        let scheme = if config.public_tls.is_some() {
             "https"
         } else {
             "http"
         };
-        format!("{scheme}://{bind_addr}")
+        format!("{scheme}://{}", config.bind_addr)
     });
+    let internal_url = config
+        .internal_tls
+        .as_ref()
+        .and_then(|tls| tls.internal_url.clone())
+        .unwrap_or_else(|| public_url.clone());
 
-    let internal_url = std::env::var("IRONMESH_INTERNAL_URL")
-        .unwrap_or_else(|_| format!("https://{internal_bind_addr}"));
-
-    let heartbeat_timeout_secs = std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(90);
-
-    let audit_interval_secs = std::env::var("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(3600);
-
-    let replica_view_sync_interval_secs = std::env::var("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(5);
-
-    let replication_factor = std::env::var("IRONMESH_REPLICATION_FACTOR")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(3);
-    let accepted_over_replication_items = std::env::var("IRONMESH_ACCEPTED_OVER_REPLICATION_ITEMS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-
-    let metadata_commit_mode = MetadataCommitMode::parse(
-        std::env::var("IRONMESH_METADATA_COMMIT_MODE")
-            .unwrap_or_else(|_| "local".to_string())
-            .as_str(),
-    )?;
-
-    let repair_config = RepairConfig::from_env();
-    let autonomous_replication_on_put_enabled =
-        std::env::var("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(true);
-    let peer_heartbeat_config = PeerHeartbeatConfig::from_env();
-    let admin_control = AdminControl::from_env();
-    let client_auth_control = ClientAuthControl::from_env();
+    let repair_config = config.repair_config();
+    let peer_heartbeat_config = config.peer_heartbeat_config();
+    let admin_control = config.admin_control();
+    let client_auth_control = config.client_auth_control();
     let startup_repair_status = if repair_config.startup_repair_enabled {
         StartupRepairStatus::Scheduled
     } else {
@@ -699,30 +1060,36 @@ pub async fn run_from_env() -> Result<()> {
     };
 
     let policy = ReplicationPolicy {
-        replication_factor,
-        accepted_over_replication_items,
+        replication_factor: config.replication_factor,
+        accepted_over_replication_items: config.accepted_over_replication_items,
         ..ReplicationPolicy::default()
     };
 
-    let mut cluster = ClusterService::new(node_id, policy, heartbeat_timeout_secs);
+    let mut cluster = ClusterService::new(config.node_id, policy, config.heartbeat_timeout_secs);
     cluster.register_node(NodeDescriptor {
-        node_id,
-        public_url,
+        node_id: config.node_id,
+        public_url: public_url.clone(),
         internal_url,
-        labels: initial_labels,
+        labels: config.labels.clone(),
         capacity_bytes: 0,
         free_bytes: 0,
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     });
 
-    let store = Arc::new(Mutex::new(PersistentStore::init(data_dir).await?));
+    let store = Arc::new(Mutex::new(
+        PersistentStore::init(config.data_dir.clone()).await?,
+    ));
 
-    let internal_http = build_internal_mtls_http_client(
-        &internal_tls_ca_path,
-        &internal_tls_cert_path,
-        &internal_tls_key_path,
-    )?;
+    let internal_http = if let Some(internal_tls) = config.internal_tls.as_ref() {
+        build_internal_mtls_http_client(
+            &internal_tls.ca_cert_path,
+            &internal_tls.cert_path,
+            &internal_tls.key_path,
+        )?
+    } else {
+        reqwest::Client::new()
+    };
 
     let persisted_cluster_replicas = {
         let store_guard = store.lock().await;
@@ -747,9 +1114,9 @@ pub async fn run_from_env() -> Result<()> {
         }
     };
 
-    let public_ca_pem = std::env::var("IRONMESH_PUBLIC_TLS_CA_CERT")
-        .ok()
-        .map(PathBuf::from)
+    let public_ca_pem = config
+        .public_ca_cert_path
+        .clone()
         .map(|path| {
             std::fs::read_to_string(&path).with_context(|| {
                 format!(
@@ -761,19 +1128,19 @@ pub async fn run_from_env() -> Result<()> {
         .transpose()?;
 
     let state = ServerState {
-        node_id,
+        node_id: config.node_id,
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         client_auth: Arc::new(Mutex::new(persisted_client_auth)),
         public_ca_pem,
-        metadata_commit_mode,
+        metadata_commit_mode: config.metadata_commit_mode,
         internal_http,
-        autonomous_replication_on_put_enabled,
+        autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
         inflight_requests: Arc::new(AtomicUsize::new(0)),
-        replication_audit_interval_secs: audit_interval_secs,
+        replication_audit_interval_secs: config.audit_interval_secs,
         peer_heartbeat_config,
         repair_config,
-        log_buffer,
+        log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         admin_control,
@@ -807,23 +1174,39 @@ pub async fn run_from_env() -> Result<()> {
             .collect();
     }
 
-    spawn_replication_auditor(state.clone(), audit_interval_secs);
-    spawn_replica_view_synchronizer(state.clone(), replica_view_sync_interval_secs);
-    if state.repair_config.startup_repair_enabled {
-        spawn_startup_replication_repair(
+    let peer_sync_enabled =
+        config.mode == ServerNodeMode::Cluster || config.upstream_public_url.is_some();
+
+    if let Some(upstream_public_url) = config.upstream_public_url.clone() {
+        if let Err(err) =
+            refresh_upstream_peer(&state, &state.internal_http, upstream_public_url.as_str()).await
+        {
+            tracing::debug!(
+                error = %err,
+                upstream = %upstream_public_url,
+                "initial upstream peer refresh failed"
+            );
+        }
+        spawn_upstream_peer_bootstrap(
             state.clone(),
-            state.repair_config.startup_repair_delay_secs,
+            upstream_public_url,
+            config.replica_view_sync_interval_secs,
         );
     }
-    if peer_heartbeat_config.enabled {
-        spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
-    }
 
-    let internal_tls = build_internal_mtls_rustls_config(
-        &internal_tls_ca_path,
-        &internal_tls_cert_path,
-        &internal_tls_key_path,
-    )?;
+    if peer_sync_enabled {
+        spawn_replication_auditor(state.clone(), config.audit_interval_secs);
+        spawn_replica_view_synchronizer(state.clone(), config.replica_view_sync_interval_secs);
+        if state.repair_config.startup_repair_enabled {
+            spawn_startup_replication_repair(
+                state.clone(),
+                state.repair_config.startup_repair_delay_secs,
+            );
+        }
+        if peer_heartbeat_config.enabled {
+            spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
+        }
+    }
 
     let public_client_api = Router::new()
         .route("/snapshots", get(list_snapshots))
@@ -863,7 +1246,38 @@ pub async fn run_from_env() -> Result<()> {
         )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
-    let public_app = Router::new()
+    let public_peer_api = Router::new()
+        .route(
+            "/cluster/nodes/{node_id}/heartbeat",
+            post(node_heartbeat_public),
+        )
+        .route(
+            "/cluster/replication/subjects/local",
+            get(local_replication_subjects),
+        )
+        .route(
+            "/cluster/replication/export",
+            get(export_replication_bundle),
+        )
+        .route(
+            "/cluster/replication/chunk/{hash}",
+            get(get_replication_chunk),
+        )
+        .route(
+            "/cluster/replication/push/chunk/{hash}",
+            post(push_replication_chunk),
+        )
+        .route(
+            "/cluster/replication/push/manifest",
+            post(push_replication_manifest),
+        )
+        .route("/cluster/replication/drop", post(drop_replication_subject))
+        .route(
+            "/cluster/reconcile/export/provisional",
+            get(export_provisional_versions),
+        );
+
+    let mut public_app = Router::new()
         .route("/", get(ui::index))
         .route("/ui/app.css", get(ui::app_css))
         .route("/ui/app.js", get(ui::app_js))
@@ -910,7 +1324,13 @@ pub async fn run_from_env() -> Result<()> {
             post(run_tombstone_archive_purge),
         )
         .merge(public_admin_api)
-        .merge(public_client_api)
+        .merge(public_client_api);
+
+    if config.public_peer_api_enabled {
+        public_app = public_app.merge(public_peer_api);
+    }
+
+    let public_app = public_app
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -945,6 +1365,14 @@ pub async fn run_from_env() -> Result<()> {
             get(local_replication_subjects),
         )
         .route(
+            "/cluster/replication/export",
+            get(export_replication_bundle),
+        )
+        .route(
+            "/cluster/replication/chunk/{hash}",
+            get(get_replication_chunk),
+        )
+        .route(
             "/cluster/replication/push/chunk/{hash}",
             post(push_replication_chunk),
         )
@@ -963,46 +1391,55 @@ pub async fn run_from_env() -> Result<()> {
             require_internal_caller,
         ));
 
-    let internal_state = state.clone();
-    tokio::spawn(async move {
-        info!(
-            bind_addr = %internal_bind_addr,
-            node_id = %internal_state.node_id,
-            "server node internal (mTLS) listener"
-        );
+    if let Some(internal_tls) = config.internal_tls.as_ref() {
+        let internal_bind_addr = internal_tls.bind_addr;
+        let internal_tls = build_internal_mtls_rustls_config(
+            &internal_tls.ca_cert_path,
+            &internal_tls.cert_path,
+            &internal_tls.key_path,
+        )?;
+        let internal_state = state.clone();
+        tokio::spawn(async move {
+            info!(
+                bind_addr = %internal_bind_addr,
+                node_id = %internal_state.node_id,
+                "server node internal (mTLS) listener"
+            );
 
-        let acceptor = MtlsCallerAcceptor::new(internal_tls);
-        if let Err(err) = axum_server::Server::bind(internal_bind_addr)
-            .acceptor(acceptor)
-            .serve(internal_app.into_make_service())
-            .await
-        {
-            warn!(error = %err, "internal server listener stopped");
-        }
-    });
+            let acceptor = MtlsCallerAcceptor::new(internal_tls);
+            if let Err(err) = axum_server::Server::bind(internal_bind_addr)
+                .acceptor(acceptor)
+                .serve(internal_app.into_make_service())
+                .await
+            {
+                warn!(error = %err, "internal server listener stopped");
+            }
+        });
+    }
 
     info!(
-        %bind_addr,
-        %node_id,
-        tls_enabled = public_tls.is_some(),
+        bind_addr = %config.bind_addr,
+        node_id = %config.node_id,
+        tls_enabled = config.public_tls.is_some(),
+        mode = ?config.mode,
         "server node listening"
     );
 
-    if let Some((cert_path, key_path)) = public_tls {
-        let config = RustlsConfig::from_pem_file(&cert_path, &key_path)
+    if let Some(public_tls) = config.public_tls.as_ref() {
+        let tls_config = RustlsConfig::from_pem_file(&public_tls.cert_path, &public_tls.key_path)
             .await
             .with_context(|| {
                 format!(
                     "failed building public TLS config from {} and {}",
-                    cert_path.display(),
-                    key_path.display()
+                    public_tls.cert_path.display(),
+                    public_tls.key_path.display()
                 )
             })?;
-        axum_server::bind_rustls(bind_addr, config)
+        axum_server::bind_rustls(config.bind_addr, tls_config)
             .serve(public_app.into_make_service())
             .await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+        let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
         axum::serve(listener, public_app).await?;
     }
 
@@ -1016,13 +1453,7 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
         loop {
             ticker.tick().await;
 
-            let keys = {
-                let store = state.store.lock().await;
-                store
-                    .list_replication_subjects()
-                    .await
-                    .unwrap_or_else(|_| store.current_keys())
-            };
+            let keys = planning_replication_subjects(&state).await;
 
             let mut cluster = state.cluster.lock().await;
             let node_transitioned_offline = cluster.update_health_and_detect_offline_transition();
@@ -1145,6 +1576,122 @@ fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
     });
 }
 
+fn spawn_upstream_peer_bootstrap(
+    state: ServerState,
+    upstream_public_url: String,
+    interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        let http = state.internal_http.clone();
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+        let upstream_public_url = upstream_public_url.trim().trim_end_matches('/').to_string();
+
+        loop {
+            ticker.tick().await;
+
+            match refresh_upstream_peer(&state, &http, upstream_public_url.as_str()).await {
+                Ok(node_id) => {
+                    tracing::debug!(node_id = %node_id, upstream = %upstream_public_url, "refreshed upstream peer registration");
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, upstream = %upstream_public_url, "failed refreshing upstream peer registration");
+                }
+            }
+        }
+    });
+}
+
+async fn refresh_upstream_peer(
+    state: &ServerState,
+    http: &reqwest::Client,
+    upstream_public_url: &str,
+) -> Result<NodeId> {
+    let base = upstream_public_url.trim_end_matches('/');
+    let health_url = format!("{base}/health");
+    let health = http
+        .get(health_url)
+        .send()
+        .await
+        .context("failed calling upstream health endpoint")?
+        .error_for_status()
+        .context("upstream health endpoint returned error")?
+        .json::<HealthStatus>()
+        .await
+        .context("failed decoding upstream health payload")?;
+
+    let mut upstream_descriptor = match http.get(format!("{base}/cluster/nodes")).send().await {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => response
+                .json::<Vec<NodeDescriptor>>()
+                .await
+                .ok()
+                .and_then(|nodes| {
+                    nodes
+                        .into_iter()
+                        .find(|node| node.node_id == health.node_id)
+                })
+                .unwrap_or_else(|| NodeDescriptor {
+                    node_id: health.node_id,
+                    public_url: base.to_string(),
+                    internal_url: base.to_string(),
+                    labels: HashMap::from([
+                        ("region".to_string(), "upstream".to_string()),
+                        ("dc".to_string(), "upstream".to_string()),
+                        ("rack".to_string(), "upstream".to_string()),
+                    ]),
+                    capacity_bytes: 0,
+                    free_bytes: 0,
+                    last_heartbeat_unix: unix_ts(),
+                    status: cluster::NodeStatus::Online,
+                }),
+            Err(_) => NodeDescriptor {
+                node_id: health.node_id,
+                public_url: base.to_string(),
+                internal_url: base.to_string(),
+                labels: HashMap::from([
+                    ("region".to_string(), "upstream".to_string()),
+                    ("dc".to_string(), "upstream".to_string()),
+                    ("rack".to_string(), "upstream".to_string()),
+                ]),
+                capacity_bytes: 0,
+                free_bytes: 0,
+                last_heartbeat_unix: unix_ts(),
+                status: cluster::NodeStatus::Online,
+            },
+        },
+        Err(_) => NodeDescriptor {
+            node_id: health.node_id,
+            public_url: base.to_string(),
+            internal_url: base.to_string(),
+            labels: HashMap::from([
+                ("region".to_string(), "upstream".to_string()),
+                ("dc".to_string(), "upstream".to_string()),
+                ("rack".to_string(), "upstream".to_string()),
+            ]),
+            capacity_bytes: 0,
+            free_bytes: 0,
+            last_heartbeat_unix: unix_ts(),
+            status: cluster::NodeStatus::Online,
+        },
+    };
+    upstream_descriptor.public_url = base.to_string();
+    upstream_descriptor.internal_url = base.to_string();
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.register_node(NodeDescriptor {
+        node_id: upstream_descriptor.node_id,
+        public_url: upstream_descriptor.public_url,
+        internal_url: upstream_descriptor.internal_url,
+        labels: upstream_descriptor.labels,
+        capacity_bytes: upstream_descriptor.capacity_bytes,
+        free_bytes: upstream_descriptor.free_bytes,
+        last_heartbeat_unix: unix_ts(),
+        status: cluster::NodeStatus::Online,
+    });
+
+    Ok(health.node_id)
+}
+
 async fn track_inflight_requests(
     State(state): State<ServerState>,
     request: Request,
@@ -1154,6 +1701,25 @@ async fn track_inflight_requests(
     let response = next.run(request).await;
     state.inflight_requests.fetch_sub(1, Ordering::Relaxed);
     response
+}
+
+async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
+    let local_subjects = {
+        let store = state.store.lock().await;
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+    };
+    let cluster_subjects = {
+        let cluster = state.cluster.lock().await;
+        cluster.known_replication_subjects()
+    };
+
+    let mut subjects = BTreeSet::new();
+    subjects.extend(local_subjects);
+    subjects.extend(cluster_subjects);
+    subjects.into_iter().collect()
 }
 
 async fn await_repair_busy_threshold(state: &ServerState) {
@@ -1222,13 +1788,7 @@ async fn run_startup_replication_repair_once(
         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
     }
 
-    let keys = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
+    let keys = planning_replication_subjects(state).await;
 
     let plan = {
         let mut cluster = state.cluster.lock().await;
@@ -2732,6 +3292,24 @@ async fn list_nodes(State(state): State<ServerState>) -> Json<Vec<NodeDescriptor
     Json(cluster.list_nodes())
 }
 
+async fn apply_node_heartbeat(
+    state: &ServerState,
+    node_id: NodeId,
+    request: NodeHeartbeatRequest,
+) -> StatusCode {
+    let mut cluster = state.cluster.lock().await;
+    if cluster.touch_heartbeat(
+        node_id,
+        request.free_bytes,
+        request.capacity_bytes,
+        request.labels,
+    ) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 async fn register_node(
     State(state): State<ServerState>,
     Path(node_id): Path<String>,
@@ -2806,17 +3384,20 @@ async fn node_heartbeat(
         return StatusCode::FORBIDDEN;
     }
 
-    let mut cluster = state.cluster.lock().await;
-    if cluster.touch_heartbeat(
-        node_id,
-        request.free_bytes,
-        request.capacity_bytes,
-        request.labels,
-    ) {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
-    }
+    apply_node_heartbeat(&state, node_id, request).await
+}
+
+async fn node_heartbeat_public(
+    State(state): State<ServerState>,
+    Path(node_id): Path<String>,
+    Json(request): Json<NodeHeartbeatRequest>,
+) -> impl IntoResponse {
+    let node_id = match node_id.parse::<NodeId>() {
+        Ok(id) => id,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+
+    apply_node_heartbeat(&state, node_id, request).await
 }
 
 async fn placement_for_key(
@@ -2829,13 +3410,7 @@ async fn placement_for_key(
 }
 
 async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationPlan> {
-    let keys = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
+    let keys = planning_replication_subjects(&state).await;
 
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
@@ -2843,13 +3418,7 @@ async fn replication_plan(State(state): State<ServerState>) -> Json<ReplicationP
 }
 
 async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<ReplicationPlan> {
-    let keys = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
+    let keys = planning_replication_subjects(&state).await;
 
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
@@ -2976,13 +3545,7 @@ async fn execute_replication_cleanup(
     let max_deletions = query.max_deletions.unwrap_or(64).max(1);
     let retained_overhead_bytes = query.retained_overhead_bytes.unwrap_or(0);
 
-    let keys = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
+    let keys = planning_replication_subjects(&state).await;
 
     let (plan, nodes) = {
         let mut cluster = state.cluster.lock().await;
@@ -3154,8 +3717,56 @@ struct ReplicationChunkPushReport {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+struct ReplicationExportQuery {
+    key: String,
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct ReplicationManifestPushReport {
     version_id: String,
+}
+
+async fn export_replication_bundle(
+    State(state): State<ServerState>,
+    Query(query): Query<ReplicationExportQuery>,
+) -> impl IntoResponse {
+    let store = state.store.lock().await;
+    match store
+        .export_replication_bundle(
+            &query.key,
+            query.version_id.as_deref(),
+            ObjectReadMode::Preferred,
+        )
+        .await
+    {
+        Ok(Some(bundle)) => (StatusCode::OK, Json(bundle)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::warn!(
+                key = %query.key,
+                version_id = ?query.version_id,
+                error = %err,
+                "failed exporting replication bundle"
+            );
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+async fn get_replication_chunk(
+    State(state): State<ServerState>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    let store = state.store.lock().await;
+    match store.read_chunk_payload(&hash).await {
+        Ok(Some(payload)) => (StatusCode::OK, payload).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::warn!(hash = %hash, error = %err, "failed reading replication chunk");
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
 }
 
 async fn push_replication_chunk(

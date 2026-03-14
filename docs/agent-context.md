@@ -40,15 +40,17 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - `adapter-linux-fuse` now has:
   - operation mapping tests
   - runtime
-  - mount binary `adapter-linux-fuse-mount`
+  - mount entrypoint via `apps/os-integration`
   - snapshot mode (`--snapshot-file`)
   - live server mode (`--server-base-url`) with `/store/index` listing + `GET /store/{key}` hydration
+  - embedded local-edge mode (`--local-edge`) with persistent local state and upstream sync
 
 ## Key files now authoritative
 
 - `crates/sync-core/src/lib.rs`
 - `crates/adapter-linux-fuse/src/lib.rs`
-- `crates/adapter-linux-fuse/src/bin/mount.rs`
+- `crates/adapter-linux-fuse/src/mount_main.rs`
+- `apps/os-integration/src/main.rs`
 - `apps/android-app/app/src/main/java/io/ironmesh/android/ui/MainViewModel.kt`
 - `apps/android-app/app/src/main/java/io/ironmesh/android/data/IronmeshPreferences.kt`
 - `apps/android-app/app/src/main/java/io/ironmesh/android/saf/IronmeshDocumentsProvider.kt`
@@ -69,13 +71,18 @@ cargo check -p adapter-linux-fuse
 Linux mount smoke tests:
 
 ```bash
-cargo run -p adapter-linux-fuse --bin adapter-linux-fuse-mount -- \
+cargo run -p os-integration -- \
   --snapshot-file /tmp/snapshot.json \
   --mountpoint /tmp/ironmesh-mount
 
-cargo run -p adapter-linux-fuse --bin adapter-linux-fuse-mount -- \
+cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
   --mountpoint /tmp/ironmesh-mount-live
+
+cargo run -p os-integration -- \
+  --server-base-url http://127.0.0.1:18080 \
+  --local-edge \
+  --mountpoint /tmp/ironmesh-mount-edge
 ```
 
 ## Immediate next objective

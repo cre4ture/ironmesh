@@ -15,10 +15,11 @@ This document is the handover package for continuing cross-platform filesystem i
   - `crates/adapter-linux-fuse`
   - Action mapping from `sync-core` operations.
   - FUSE runtime.
-  - Mount CLI binary `adapter-linux-fuse-mount`.
-  - Two mount modes:
+  - User-facing Linux mount entrypoint via `apps/os-integration`.
+  - Three mount modes:
     - `--snapshot-file`: static snapshot input.
-    - `--server-base-url`: live namespace + object hydration from `server-node`.
+    - `--server-base-url`: live namespace + object hydration/write-through from `server-node`.
+    - `--local-edge`: embedded local edge node with persistent storage and upstream sync.
 - Android SAF integration:
   - Provider + API/repository wiring.
   - Persisted base URL shared between app UI and provider.
@@ -40,7 +41,6 @@ This document is the handover package for continuing cross-platform filesystem i
 ### Not implemented yet
 
 - Real-time remote-change notifications (current implementation uses polling, not push notifications).
-- Linux write path (current runtime is read-only).
 - Android Rust-bridge alignment to consume `sync-core` directly.
 
 ## Source-of-truth files
@@ -49,7 +49,8 @@ This document is the handover package for continuing cross-platform filesystem i
   - `crates/sync-core/src/lib.rs`
 - Linux adapter runtime and mount entrypoint:
   - `crates/adapter-linux-fuse/src/lib.rs`
-  - `crates/adapter-linux-fuse/src/bin/mount.rs`
+  - `crates/adapter-linux-fuse/src/mount_main.rs`
+  - `apps/os-integration/src/main.rs`
 - Workflow artifact publishing:
   - `.github/workflows/check.yml`
 - Coverage behavior for MVP stage:
@@ -75,7 +76,7 @@ Snapshot mode:
 
 ```bash
 mkdir -p /tmp/ironmesh-mount
-cargo run -p adapter-linux-fuse --bin adapter-linux-fuse-mount -- \
+cargo run -p os-integration -- \
   --snapshot-file /tmp/snapshot.json \
   --mountpoint /tmp/ironmesh-mount
 ```
@@ -84,9 +85,19 @@ Live server mode:
 
 ```bash
 mkdir -p /tmp/ironmesh-mount-live
-cargo run -p adapter-linux-fuse --bin adapter-linux-fuse-mount -- \
+cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
   --mountpoint /tmp/ironmesh-mount-live
+```
+
+Local-edge mode:
+
+```bash
+mkdir -p /tmp/ironmesh-mount-edge
+cargo run -p os-integration -- \
+  --server-base-url http://127.0.0.1:18080 \
+  --local-edge \
+  --mountpoint /tmp/ironmesh-mount-edge
 ```
 
 Unmount:
@@ -141,7 +152,7 @@ Implement CFAPI behavior by mapping existing operations:
 ## Known caveats
 
 - Coverage gate currently excludes `crates/adapter-linux-fuse/` because runtime code is larger than current test surface.
-- Linux runtime is intentionally read-only at this stage.
+- Local-edge restart/offline coverage now exists, but some mount-level sync behavior is still driven by polling rather than push notifications.
 - Live server mode currently maps remote file versions to placeholder synthetic values for planning consistency.
 
 ## Suggested first task on Windows
