@@ -1,0 +1,29 @@
+[package]
+name = "server-node-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+blake3.workspace = true
+bytes.workspace = true
+common = { path = "../common" }
+exif = { package = "kamadak-exif", version = "0.6" }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+percent-encoding = "2"
+reqwest.workspace = true
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = { version = "1.9", features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls = "0.26"
+tower = "0.5"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+x509-parser = "0.16"

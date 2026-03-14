@@ -7,23 +7,5 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
-axum-server = { version = "0.8", features = ["tls-rustls"] }
-blake3.workspace = true
-bytes.workspace = true
-common = { path = "../../crates/common" }
-exif = { package = "kamadak-exif", version = "0.6" }
-image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
-percent-encoding = "2"
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pki-types = { version = "1.9", features = ["std"] }
-serde.workspace = true
-serde_json.workspace = true
+server-node-sdk = { path = "../../crates/server-node-sdk" }
 tokio.workspace = true
-tokio-rustls = "0.26"
-tracing.workspace = true
-tracing-subscriber.workspace = true
-reqwest.workspace = true
-tower = "0.5"
-uuid.workspace = true
-x509-parser = "0.16"

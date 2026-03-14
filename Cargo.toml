@@ -2,6 +2,7 @@
 members = [
     "crates/common",
     "crates/client-sdk",
+    "crates/server-node-sdk",
     "crates/web-ui-backend",
     "crates/sync-core",
     "crates/sync-agent-core",
