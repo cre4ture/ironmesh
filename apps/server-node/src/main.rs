@@ -27,8 +27,8 @@ use bytes::Bytes;
 use common::{HealthStatus, NodeId};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3309,9 +3309,10 @@ fn build_internal_mtls_rustls_config(
     let mut cert_reader = BufReader::new(
         File::open(cert_path).with_context(|| format!("failed reading {}", cert_path.display()))?,
     );
-    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut cert_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed parsing internal node certificate chain")?;
+    let cert_chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_reader_iter(&mut cert_reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed parsing internal node certificate chain")?;
 
     let mut key_reader = BufReader::new(
         File::open(key_path).with_context(|| format!("failed reading {}", key_path.display()))?,
