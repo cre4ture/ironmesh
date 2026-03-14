@@ -12,10 +12,17 @@ mod tests {
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
     use reqwest::Client;
+    use std::ffi::c_void;
     use std::fs::File;
     use std::io::Write;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::time::Duration;
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CF_IN_SYNC_STATE_IN_SYNC, CF_PLACEHOLDER_INFO_STANDARD, CF_PLACEHOLDER_STANDARD_INFO,
+        CfGetPlaceholderInfo,
+    };
 
     async fn run_cfapi_monitor_case(bind: &str, initial_content: &str, modified_content: &str) {
         let _server = start_server(bind)
@@ -133,6 +140,104 @@ mod tests {
             "remote payload did not match for {key} (expected {} bytes, got {} bytes)",
             expected.len(),
             final_bytes.len()
+        );
+    }
+
+    fn placeholder_standard_info_for_file(
+        file: &File,
+    ) -> anyhow::Result<CF_PLACEHOLDER_STANDARD_INFO> {
+        const HRESULT_MORE_DATA: i32 = 0x800700EAu32 as i32;
+
+        let mut buffer_len = 4096usize.max(size_of::<CF_PLACEHOLDER_STANDARD_INFO>());
+
+        loop {
+            let mut info_buf = vec![0u8; buffer_len];
+            let mut returned = 0u32;
+            let hr = unsafe {
+                CfGetPlaceholderInfo(
+                    file.as_raw_handle() as _,
+                    CF_PLACEHOLDER_INFO_STANDARD,
+                    info_buf.as_mut_ptr().cast::<c_void>(),
+                    info_buf.len() as u32,
+                    &mut returned,
+                )
+            };
+
+            if hr == HRESULT_MORE_DATA && returned as usize > info_buf.len() {
+                buffer_len = returned as usize;
+                continue;
+            }
+
+            if hr < 0 {
+                anyhow::bail!(
+                    "CfGetPlaceholderInfo failed with HRESULT 0x{:08X}",
+                    hr as u32
+                );
+            }
+
+            let info = unsafe {
+                std::ptr::read_unaligned(info_buf.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>())
+            };
+            return Ok(info);
+        }
+    }
+
+    fn placeholder_standard_info(path: &Path) -> anyhow::Result<CF_PLACEHOLDER_STANDARD_INFO> {
+        let file = File::open(path)?;
+        placeholder_standard_info_for_file(&file)
+    }
+
+    async fn wait_for_placeholder_in_sync(path: &Path, retries: usize) {
+        let file = File::open(path).expect("failed to open placeholder while waiting for in-sync");
+        for _ in 0..retries {
+            if let Ok(info) = placeholder_standard_info_for_file(&file)
+                && info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC
+                && info.ModifiedDataSize == 0
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let final_state = placeholder_standard_info(path)
+            .map(|info| {
+                format!(
+                    "InSyncState={} ModifiedDataSize={} OnDiskDataSize={}",
+                    info.InSyncState, info.ModifiedDataSize, info.OnDiskDataSize
+                )
+            })
+            .unwrap_or_else(|err| err.to_string());
+        panic!(
+            "placeholder never returned to in-sync state at {}: {}",
+            path.display(),
+            final_state
+        );
+    }
+
+    async fn wait_for_placeholder_present(path: &Path, retries: usize) {
+        let file =
+            File::open(path).expect("failed to open placeholder while waiting for placeholder");
+        for _ in 0..retries {
+            if placeholder_standard_info_for_file(&file).is_ok() {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let final_state = placeholder_standard_info_for_file(&file)
+            .map(|info| {
+                format!(
+                    "InSyncState={} ModifiedDataSize={} OnDiskDataSize={}",
+                    info.InSyncState, info.ModifiedDataSize, info.OnDiskDataSize
+                )
+            })
+            .unwrap_or_else(|err| err.to_string());
+        panic!(
+            "file never became a placeholder at {}: {}",
+            path.display(),
+            final_state
         );
     }
 
@@ -561,5 +666,196 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
 
         result.expect("authenticated CFAPI adapter flow failed");
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_modified_placeholder_returns_to_in_sync_state_after_upload() {
+        let bind = "127.0.0.1:19098";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind)
+            .await
+            .expect("failed to start local server-node");
+
+        let result = async {
+            let sync_root = fresh_data_dir("cfapi-in-sync-state-sync-root");
+            std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+            let sdk = IronMeshClient::new(&base_url);
+            sdk.put_large_aware("sync-status/check.txt", Bytes::from_static(b"remote seed"))
+                .await
+                .expect("failed to seed remote object");
+
+            let _adapter = start_cfapi_adapter(
+                "ironmesh.systemtest.sync.status.check",
+                "ironmesh System Test Sync Status",
+                &sync_root,
+                &base_url,
+            )
+            .await
+            .expect("failed to register and serve CFAPI adapter");
+
+            let local_file = sync_root.join("sync-status").join("check.txt");
+            wait_for_path(&local_file, 220).await;
+            wait_for_hydrated_payload(&local_file, b"remote seed", 200).await;
+
+            std::fs::write(&local_file, b"modified locally via cfapi")
+                .expect("failed to modify hydrated placeholder");
+            wait_for_remote_payload(
+                &sdk,
+                "sync-status/check.txt",
+                b"modified locally via cfapi",
+                220,
+            )
+            .await;
+            wait_for_placeholder_in_sync(&local_file, 220).await;
+
+            Ok::<(std::path::PathBuf,), anyhow::Error>((sync_root,))
+        }
+        .await;
+
+        stop_server(&mut server).await;
+
+        match result {
+            Ok((sync_root,)) => {
+                let _ = std::fs::remove_dir_all(sync_root);
+            }
+            Err(err) => panic!("CFAPI in-sync status flow failed: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_overwrite_waits_for_quiet_period_before_uploading_latest_bytes() {
+        let bind = "127.0.0.1:19099";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind)
+            .await
+            .expect("failed to start local server-node");
+
+        let result = async {
+            let sync_root = fresh_data_dir("cfapi-overwrite-quiet-period-sync-root");
+            std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+            let sdk = IronMeshClient::new(&base_url);
+            sdk.put_large_aware(
+                "overwrite/check.txt",
+                Bytes::from_static(b"original remote"),
+            )
+            .await
+            .expect("failed to seed remote object");
+
+            let _adapter = start_cfapi_adapter(
+                "ironmesh.systemtest.overwrite.quiet.period",
+                "ironmesh System Test Overwrite Quiet Period",
+                &sync_root,
+                &base_url,
+            )
+            .await
+            .expect("failed to register and serve CFAPI adapter");
+
+            let local_file = sync_root.join("overwrite").join("check.txt");
+            wait_for_path(&local_file, 220).await;
+            wait_for_hydrated_payload(&local_file, b"original remote", 200).await;
+
+            {
+                let truncated = File::create(&local_file)
+                    .expect("failed to truncate local placeholder for overwrite");
+                truncated
+                    .sync_all()
+                    .expect("failed to sync truncated local placeholder");
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let still_remote = sdk
+                .get("overwrite/check.txt")
+                .await
+                .expect("failed to fetch remote payload during quiet period");
+            assert_eq!(
+                still_remote,
+                Bytes::from_static(b"original remote"),
+                "remote payload changed before quiet period expired"
+            );
+
+            std::fs::write(&local_file, b"final overwrite payload")
+                .expect("failed to write final overwrite payload");
+            wait_for_remote_payload(&sdk, "overwrite/check.txt", b"final overwrite payload", 220)
+                .await;
+            wait_for_placeholder_in_sync(&local_file, 220).await;
+
+            Ok::<std::path::PathBuf, anyhow::Error>(sync_root)
+        }
+        .await;
+
+        stop_server(&mut server).await;
+
+        match result {
+            Ok(sync_root) => {
+                let _ = std::fs::remove_dir_all(sync_root);
+            }
+            Err(err) => panic!("CFAPI overwrite quiet-period flow failed: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_overwriting_already_uploaded_local_file_returns_to_placeholder() {
+        let bind = "127.0.0.1:19100";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind)
+            .await
+            .expect("failed to start local server-node");
+
+        let result = async {
+            let sync_root = fresh_data_dir("cfapi-overwrite-uploaded-file-sync-root");
+            std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+            let sdk = IronMeshClient::new(&base_url);
+            let _adapter = start_cfapi_adapter(
+                "ironmesh.systemtest.overwrite.uploaded.file",
+                "ironmesh System Test Overwrite Uploaded File",
+                &sync_root,
+                &base_url,
+            )
+            .await
+            .expect("failed to register and serve CFAPI adapter");
+
+            let local_file = sync_root.join("overwrite-local").join("photo.jpg");
+            let parent = local_file
+                .parent()
+                .expect("local test file should have parent");
+            std::fs::create_dir_all(parent).expect("failed to create local test directory");
+
+            let initial_payload = b"initial local upload";
+            std::fs::write(&local_file, initial_payload)
+                .expect("failed to write initial local file");
+            wait_for_remote_payload(&sdk, "overwrite-local/photo.jpg", initial_payload, 220).await;
+            wait_for_placeholder_present(&local_file, 220).await;
+
+            let overwritten_payload = b"overwritten local upload";
+            let mut file =
+                File::create(&local_file).expect("failed to reopen local file for overwrite");
+            file.write_all(overwritten_payload)
+                .expect("failed to write overwritten local file");
+            file.sync_all()
+                .expect("failed to sync overwritten local file");
+            drop(file);
+
+            wait_for_remote_payload(&sdk, "overwrite-local/photo.jpg", overwritten_payload, 220)
+                .await;
+            wait_for_placeholder_in_sync(&local_file, 220).await;
+            wait_for_hydrated_payload(&local_file, overwritten_payload, 200).await;
+
+            Ok::<std::path::PathBuf, anyhow::Error>(sync_root)
+        }
+        .await;
+
+        stop_server(&mut server).await;
+
+        match result {
+            Ok(sync_root) => {
+                let _ = std::fs::remove_dir_all(sync_root);
+            }
+            Err(err) => {
+                panic!("CFAPI overwritten uploaded file placeholder flow failed: {err:#}")
+            }
+        }
     }
 }

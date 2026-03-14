@@ -4,3 +4,5 @@ Cargo.lock
 !tests/system-tests/Cargo.lock
 /data
 server_ca.pem
+target-codex-check
+server_bootstrap.txt

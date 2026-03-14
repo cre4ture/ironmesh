@@ -228,6 +228,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ironmesh_client_put_large_aware_covers_small_and_large_bytes_and_reader_uploads()
+    -> Result<()> {
+        let bind = "127.0.0.1:19236";
+        let base_url = format!("http://{bind}");
+        let mut server = start_server(bind).await?;
+
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            let small_bytes_payload = Bytes::from_static(b"bytes-small-upload");
+            let small_bytes_report = sdk
+                .put_large_aware("coverage/bytes-small", small_bytes_payload.clone())
+                .await?;
+            assert!(matches!(small_bytes_report.upload_mode, UploadMode::Direct));
+            assert_eq!(
+                small_bytes_report.meta.size_bytes,
+                small_bytes_payload.len()
+            );
+            assert_eq!(sdk.get("coverage/bytes-small").await?, small_bytes_payload);
+
+            let large_bytes_payload = vec![b'B'; CHUNK_UPLOAD_THRESHOLD_BYTES + 257];
+            let large_bytes_report = sdk
+                .put_large_aware(
+                    "coverage/bytes-large",
+                    Bytes::from(large_bytes_payload.clone()),
+                )
+                .await?;
+            assert!(matches!(
+                large_bytes_report.upload_mode,
+                UploadMode::Chunked
+            ));
+            assert_eq!(
+                large_bytes_report.chunk_size_bytes,
+                Some(CHUNK_UPLOAD_THRESHOLD_BYTES)
+            );
+            assert_eq!(large_bytes_report.chunk_count, Some(2));
+            assert_eq!(
+                sdk.get("coverage/bytes-large").await?,
+                Bytes::from(large_bytes_payload)
+            );
+
+            let small_reader_sdk = sdk.clone();
+            let small_reader_payload = b"reader-small-upload".to_vec();
+            let small_reader_expected = small_reader_payload.clone();
+            let small_reader_report = tokio::task::spawn_blocking(move || -> Result<_> {
+                let mut reader = Cursor::new(small_reader_payload.clone());
+                small_reader_sdk.put_large_aware_reader(
+                    "coverage/reader-small",
+                    &mut reader,
+                    small_reader_payload.len() as u64,
+                )
+            })
+            .await
+            .context("small put_large_aware_reader task join failed")??;
+            assert!(matches!(
+                small_reader_report.upload_mode,
+                UploadMode::Direct
+            ));
+            assert_eq!(
+                small_reader_report.meta.size_bytes,
+                small_reader_expected.len()
+            );
+            assert_eq!(
+                sdk.get("coverage/reader-small").await?,
+                Bytes::from(small_reader_expected)
+            );
+
+            let large_reader_sdk = sdk.clone();
+            let large_reader_payload =
+                vec![b'R'; CHUNK_UPLOAD_THRESHOLD_BYTES + (CHUNK_UPLOAD_THRESHOLD_BYTES / 2)];
+            let large_reader_expected = large_reader_payload.clone();
+            let expected_chunk_count = large_reader_payload
+                .len()
+                .div_ceil(CHUNK_UPLOAD_THRESHOLD_BYTES);
+            let large_reader_report = tokio::task::spawn_blocking(move || -> Result<_> {
+                let mut reader = Cursor::new(large_reader_payload.clone());
+                large_reader_sdk.put_large_aware_reader(
+                    "coverage/reader-large",
+                    &mut reader,
+                    large_reader_payload.len() as u64,
+                )
+            })
+            .await
+            .context("large put_large_aware_reader task join failed")??;
+            assert!(matches!(
+                large_reader_report.upload_mode,
+                UploadMode::Chunked
+            ));
+            assert_eq!(
+                large_reader_report.chunk_size_bytes,
+                Some(CHUNK_UPLOAD_THRESHOLD_BYTES)
+            );
+            assert_eq!(large_reader_report.chunk_count, Some(expected_chunk_count));
+            assert_eq!(
+                sdk.get("coverage/reader-large").await?,
+                Bytes::from(large_reader_expected)
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
     async fn ironmesh_client_snapshot_store_index_and_snapshot_loading_work() -> Result<()> {
         let bind = "127.0.0.1:19234";
         let base_url = format!("http://{bind}");

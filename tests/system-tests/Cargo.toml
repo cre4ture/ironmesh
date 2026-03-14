@@ -16,6 +16,12 @@ tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_CloudFilters",
+] }
+
 [dev-dependencies]
 server_node = { path = "../../apps/server-node", package = "server-node", artifact = "bin" }
 cli_client = { path = "../../apps/cli-client", package = "cli-client", artifact = "bin" }

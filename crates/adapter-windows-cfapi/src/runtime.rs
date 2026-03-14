@@ -1,5 +1,8 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_device_auth_relative_path;
+use crate::close_upload::{
+    UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
+};
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
 use anyhow::{Result, anyhow};
@@ -268,9 +271,10 @@ struct CallbackContext {
     sync_root: PathBuf,
     runtime: Arc<CfapiRuntime>,
     hydrator: Box<dyn Hydrator>,
-    uploader: std::sync::Arc<dyn Uploader>,
     hydrated_once_paths: Mutex<HashSet<String>>,
     paths_by_file_id: Mutex<std::collections::HashMap<i64, String>>,
+    upload_worker: Arc<UploadWorkerContext>,
+    upload_debounce: Arc<UploadDebounceState>,
 }
 
 pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
@@ -489,13 +493,20 @@ pub fn connect_sync_root(
     uploader: std::sync::Arc<dyn Uploader>,
 ) -> Result<SyncRootConnection> {
     let root_path = utf16_path(&registration.root_path);
+    let upload_worker = Arc::new(UploadWorkerContext {
+        sync_root: registration.root_path.clone(),
+        runtime: runtime.clone(),
+        uploader: uploader.clone(),
+    });
+    let upload_debounce = Arc::new(UploadDebounceState::default());
     let mut callback_context = Box::new(CallbackContext {
         sync_root: registration.root_path.clone(),
         runtime,
         hydrator,
-        uploader: uploader.clone(),
         hydrated_once_paths: Mutex::new(HashSet::new()),
         paths_by_file_id: Mutex::new(std::collections::HashMap::new()),
+        upload_worker,
+        upload_debounce,
     });
 
     let callback_table = vec![
@@ -703,101 +714,11 @@ unsafe extern "system" fn callback_file_close_completion(
         "close-completion: relative_path={}, normalized_path={}, sync_root={:?}",
         relative_path, normalized_path, context.sync_root
     );
-
-    let full_path = context.sync_root.join(&relative_path);
-
-    // Do not skip uploads based on open/close metadata heuristics.
-    // In practice, OpenCompletion callbacks can be delayed such that the "open" metadata
-    // already reflects the post-write state, causing false "unchanged" classifications.
-    // Always decide based on the file state at close time.
-
-    // Remove hydrated_once_paths logic: always handle upload for any file closed in sync root
-    // This allows new files and folders to be uploaded, matching OneDrive behavior
-    // Log for diagnostics
-    eprintln!("close-completion: checking upload for {}", relative_path);
-
-    // Resolve full path relative to the registered sync root to handle
-    // CFAPI NormalizedPath values that may omit the drive letter and
-    // start with a leading backslash (e.g. "\\ironmesh-sync2\\file.txt").
-    let metadata = match std::fs::metadata(&full_path) {
-        Ok(metadata) => metadata,
-        Err(err) => {
-            eprintln!(
-                "close-completion: metadata error for {}: {}",
-                full_path.display(),
-                err
-            );
-            return;
-        }
-    };
-    // A hydrated (and even modified) file can still be a CFAPI placeholder.
-    // Do not skip uploads solely because placeholder info is present.
-    if metadata.is_dir() {
-        eprintln!(
-            "close-completion: {} is a directory, uploading directory metadata",
-            normalized_path
-        );
-        // Optionally: upload directory metadata or create remote folder
-        let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
-        match context
-            .uploader
-            .upload_reader(&relative_path, &mut cursor, b"<DIR>".len() as u64)
-        {
-            Ok(_) => {
-                eprintln!("cfapi uploaded directory: path={}", relative_path);
-            }
-            Err(err) => {
-                eprintln!(
-                    "cfapi upload error (dir): path={} error={}",
-                    relative_path, err
-                );
-            }
-        }
-        return;
-    }
-
-    let file = match std::fs::File::open(&full_path) {
-        Ok(f) => f,
-        Err(err) => {
-            eprintln!(
-                "cfapi close-completion open error: path={} error={}",
-                full_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    eprintln!(
-        "close-completion: uploading {} ({} bytes)",
+    schedule_debounced_close_upload(
+        context.upload_worker.clone(),
+        context.upload_debounce.clone(),
         relative_path,
-        metadata.len()
     );
-
-    let mut reader = file;
-    match context
-        .uploader
-        .upload_reader(&relative_path, &mut reader, metadata.len())
-    {
-        Ok(remote_version) => {
-            if let Some(version) = remote_version {
-                context.runtime.set_remote_version(&relative_path, version);
-            }
-            eprintln!(
-                "cfapi uploaded local file: path={} bytes={}",
-                relative_path,
-                metadata.len()
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "cfapi upload error: path={} bytes={} error={}",
-                relative_path,
-                metadata.len(),
-                err
-            );
-        }
-    }
 }
 
 fn execute_transfer_data(

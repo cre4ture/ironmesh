@@ -2,6 +2,7 @@ use crate::helpers::hresult_nonneg;
 use anyhow::Result;
 use std::os::windows::fs::MetadataExt;
 use std::path::Path;
+use windows_sys::Win32::Storage::CloudFilters::CF_PLACEHOLDER_STANDARD_INFO;
 
 pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
@@ -20,36 +21,107 @@ pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
     hresult_nonneg(hr, "CfConvertToPlaceholder")
 }
 
-pub fn cf_get_placeholder_info(file: &std::fs::File) -> Result<u32> {
-    use core::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::CloudFilters::CfGetPlaceholderInfo;
+pub fn cf_set_in_sync(file: &std::fs::File) -> Result<()> {
+    cf_set_in_sync_state(
+        file,
+        windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE_IN_SYNC,
+        None,
+    )
+}
 
-    let mut info_buf = vec![0u8; 1024];
-    let mut returned: u32 = 0;
-    let hr_info = unsafe {
-        CfGetPlaceholderInfo(
+pub fn cf_set_not_in_sync(file: &std::fs::File) -> Result<i64> {
+    let mut usn = 0i64;
+    cf_set_in_sync_state(
+        file,
+        windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE_NOT_IN_SYNC,
+        Some(&mut usn),
+    )?;
+    Ok(usn)
+}
+
+pub fn cf_set_in_sync_with_usn(file: &std::fs::File, usn: &mut i64) -> Result<()> {
+    cf_set_in_sync_state(
+        file,
+        windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE_IN_SYNC,
+        Some(usn),
+    )
+}
+
+pub fn cf_set_in_sync_state(
+    file: &std::fs::File,
+    in_sync_state: windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE,
+    in_sync_usn: Option<&mut i64>,
+) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::CloudFilters::{CF_SET_IN_SYNC_FLAG_NONE, CfSetInSyncState};
+
+    let hr = unsafe {
+        CfSetInSyncState(
             file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            0,
-            info_buf.as_mut_ptr() as *mut c_void,
-            info_buf.len() as u32,
-            &mut returned,
+            in_sync_state,
+            CF_SET_IN_SYNC_FLAG_NONE,
+            in_sync_usn
+                .map(|value| value as *mut i64)
+                .unwrap_or(std::ptr::null_mut()),
         )
     };
-    hresult_nonneg(hr_info, "CfGetPlaceholderInfo")?;
-    Ok(returned)
+    hresult_nonneg(hr, "CfSetInSyncState")
+}
+
+pub fn cf_get_placeholder_standard_info(
+    file: &std::fs::File,
+) -> Result<windows_sys::Win32::Storage::CloudFilters::CF_PLACEHOLDER_STANDARD_INFO> {
+    use core::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CF_PLACEHOLDER_INFO_STANDARD, CF_PLACEHOLDER_STANDARD_INFO, CfGetPlaceholderInfo,
+    };
+
+    const HRESULT_MORE_DATA: i32 = 0x800700EAu32 as i32;
+
+    let mut buffer_len = 4096usize.max(size_of::<CF_PLACEHOLDER_STANDARD_INFO>());
+    loop {
+        let mut info_buf = vec![0u8; buffer_len];
+        let mut returned = 0u32;
+        let hr_info = unsafe {
+            CfGetPlaceholderInfo(
+                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                CF_PLACEHOLDER_INFO_STANDARD,
+                info_buf.as_mut_ptr().cast::<c_void>(),
+                info_buf.len() as u32,
+                &mut returned,
+            )
+        };
+
+        if hr_info == HRESULT_MORE_DATA && returned as usize > info_buf.len() {
+            buffer_len = returned as usize;
+            continue;
+        }
+
+        hresult_nonneg(hr_info, "CfGetPlaceholderInfo")?;
+        let info = unsafe {
+            std::ptr::read_unaligned(info_buf.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>())
+        };
+        return Ok(info);
+    }
 }
 
 pub fn get_and_log_placeholder_info(
     file: &std::fs::File,
     label: &str,
     rel_path: &str,
-) -> Result<u32> {
-    match cf_get_placeholder_info(file) {
+) -> Result<CF_PLACEHOLDER_STANDARD_INFO> {
+    match cf_get_placeholder_standard_info(file) {
         Ok(returned) => {
             eprintln!(
-                "{}: CfGetPlaceholderInfo for {}: returned={}",
-                label, rel_path, returned
+                "{}: CfGetPlaceholderInfo for {}: returned FileId: {}, OnDiskDataSize: {}, ModifiedDataSize: {}, InSyncState: {:?}",
+                label,
+                rel_path,
+                returned.FileId,
+                returned.OnDiskDataSize,
+                returned.ModifiedDataSize,
+                returned.InSyncState
             );
             Ok(returned)
         }
@@ -64,7 +136,7 @@ pub fn get_and_log_placeholder_info(
 }
 
 pub fn is_placeholder(file: &std::fs::File) -> bool {
-    get_and_log_placeholder_info(file, "", "").unwrap_or(0) > 0
+    get_and_log_placeholder_info(file, "", "").is_ok()
 }
 
 pub fn path_is_placeholder(path: &Path) -> bool {
