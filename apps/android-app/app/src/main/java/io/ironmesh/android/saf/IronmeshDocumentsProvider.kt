@@ -196,7 +196,13 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { output ->
                     try {
                         runBlocking {
-                            repository.streamRelativeUrlTo(resolveBaseUrl(), thumbnailUrl, output, resolveAuthToken())
+                            repository.streamRelativeUrlTo(
+                                resolveBaseUrl(),
+                                thumbnailUrl,
+                                output,
+                                resolveServerCaPem(),
+                                resolveAuthToken(),
+                            )
                         }
                         output.flush()
                     } catch (e: IOException) {

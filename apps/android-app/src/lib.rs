@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use client_sdk::{
     BootstrapEnrollmentResult, ClientNode, ConnectionBootstrap, DeviceEnrollmentRequest,
-    IronMeshClient, build_http_client_from_pem, enroll_device,
+    IronMeshClient, build_http_client_from_pem, build_reqwest_client_from_pem, enroll_device,
 };
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jbyte, jbyteArray, jint, jstring};
+use reqwest::Url;
 use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};
 use tokio::task::JoinHandle;
@@ -620,5 +621,70 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 
     if let Err(err) = result {
         throw_java_error(&mut env, format!("rust streamObjectTo failed: {err:#}"));
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamRelativeUrlTo<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    base_url: JString<'local>,
+    relative_url: JString<'local>,
+    output_stream: JObject<'local>,
+    server_ca_pem: jstring,
+    auth_token: jstring,
+) {
+    let result = (|| -> Result<()> {
+        let base_url: String = env.get_string(&base_url)?.into();
+        let relative_url: String = env.get_string(&relative_url)?.into();
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
+
+        let base = Url::parse(&base_url).context("invalid base URL for relative stream")?;
+        let target = base
+            .join(&relative_url)
+            .with_context(|| format!("failed to resolve relative URL {relative_url}"))?;
+        let client =
+            build_reqwest_client_from_pem(normalize_optional_string(server_ca_pem).as_deref())?;
+        let mut request = client.get(target);
+        if let Some(token) = normalize_optional_string(auth_token) {
+            request = request.bearer_auth(token);
+        }
+
+        let rt = runtime()?;
+        let response = rt.block_on(async {
+            request
+                .send()
+                .await
+                .context("failed to request relative URL")?
+                .error_for_status()
+                .context("relative URL request returned non-success status")
+        })?;
+
+        let body = rt.block_on(async {
+            response
+                .bytes()
+                .await
+                .context("failed reading relative URL response body")
+        })?;
+        writer
+            .write_all(&body)
+            .context("failed streaming relative URL response body")?;
+        writer
+            .flush()
+            .context("failed flushing relative URL output")?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        throw_java_error(
+            &mut env,
+            format!("rust streamRelativeUrlTo failed: {err:#}"),
+        );
     }
 }

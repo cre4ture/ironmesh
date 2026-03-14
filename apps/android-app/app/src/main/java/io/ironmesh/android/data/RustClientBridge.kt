@@ -82,6 +82,15 @@ object RustClientBridge {
     )
 
     @JvmStatic
+    external fun streamRelativeUrlTo(
+        baseUrl: String,
+        relativeUrl: String,
+        output: OutputStream,
+        serverCaPem: String?,
+        authToken: String?,
+    )
+
+    @JvmStatic
     external fun startWebUi(baseUrl: String): String
 
     fun isAvailable(): Boolean = libraryLoaded

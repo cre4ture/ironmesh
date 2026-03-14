@@ -355,8 +355,20 @@ class IronmeshRepository {
         baseUrl: String,
         relativeUrl: String,
         output: OutputStream,
+        serverCaPem: String? = null,
         authToken: String? = null,
     ) {
+        if (shouldUseRustBridge()) {
+            RustClientBridge.streamRelativeUrlTo(
+                sanitizeBaseUrl(baseUrl),
+                relativeUrl,
+                output,
+                serverCaPem,
+                authToken,
+            )
+            return
+        }
+
         val request = Request.Builder()
             .url(URL(URL(sanitizeBaseUrl(baseUrl)), relativeUrl))
             .build()
