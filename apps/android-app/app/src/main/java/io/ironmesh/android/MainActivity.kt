@@ -16,6 +16,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
@@ -56,6 +57,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.ui.GalleryImageItem
 import io.ironmesh.android.ui.GallerySortOption
 import io.ironmesh.android.ui.MainSection
@@ -213,6 +216,21 @@ private fun SettingsView(
     vm: MainViewModel,
     onOpenFiles: () -> Unit,
 ) {
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        if (result.contents != null) {
+            vm.updateBootstrapInput(result.contents)
+        }
+    }
+    val onScanQr: () -> Unit = {
+        scanLauncher.launch(
+            ScanOptions().apply {
+                setPrompt("Scan bootstrap bundle QR code")
+                setBeepEnabled(false)
+                setOrientationLocked(false)
+            },
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -223,6 +241,7 @@ private fun SettingsView(
             state = state,
             vm = vm,
             onOpenFiles = onOpenFiles,
+            onScanQr = onScanQr,
         )
         FolderSyncControls(state = state, vm = vm)
     }
@@ -293,6 +312,7 @@ private fun ServerControls(
     state: MainUiState,
     vm: MainViewModel,
     onOpenFiles: () -> Unit,
+    onScanQr: () -> Unit,
 ) {
     OutlinedTextField(
         modifier = Modifier.fillMaxWidth(),
@@ -331,6 +351,7 @@ private fun ServerControls(
 
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Button(onClick = vm::enrollDevice) { Text("Enroll Device") }
+        OutlinedButton(onClick = onScanQr) { Text("Scan QR") }
         OutlinedButton(onClick = vm::clearDeviceEnrollment) { Text("Clear Device Auth") }
     }
 

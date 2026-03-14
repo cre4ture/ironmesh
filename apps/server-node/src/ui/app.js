@@ -70,6 +70,7 @@ async function issueBootstrapBundle() {
     expiresInSecs = 3600;
   }
 
+  hideBootstrapQr();
   output.textContent = 'issuing bootstrap bundle...';
   try {
     const response = await fetch('/auth/bootstrap-bundles/issue', {
@@ -96,10 +97,33 @@ async function issueBootstrapBundle() {
       throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
     }
 
-    output.textContent = JSON.stringify(payload, null, 2);
+    const bundleText = JSON.stringify(payload, null, 2);
+    output.textContent = bundleText;
+    renderBootstrapQr(JSON.stringify(payload));
   } catch (error) {
     output.textContent = 'failed to issue bootstrap bundle: ' + error;
+    hideBootstrapQr();
   }
+}
+
+function renderBootstrapQr(text) {
+  const container = document.getElementById('bootstrap-bundle-qr-container');
+  const canvas = document.getElementById('bootstrap-bundle-qr');
+  if (typeof QRCode === 'undefined') {
+    container.style.display = 'none';
+    return;
+  }
+  QRCode.toCanvas(canvas, text, { width: 320, errorCorrectionLevel: 'L' }, function (error) {
+    if (error) {
+      container.style.display = 'none';
+    } else {
+      container.style.display = 'block';
+    }
+  });
+}
+
+function hideBootstrapQr() {
+  document.getElementById('bootstrap-bundle-qr-container').style.display = 'none';
 }
 
 document
