@@ -28,6 +28,7 @@ use common::{HealthStatus, NodeId};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::pem::PemObject;
 use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3298,7 +3299,7 @@ fn build_internal_mtls_rustls_config(
         File::open(ca_path).with_context(|| format!("failed reading {}", ca_path.display()))?,
     );
     let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_reader) {
+    for cert in CertificateDer::pem_reader_iter(&mut ca_reader) {
         let cert = cert.context("failed parsing internal CA certificate")?;
         roots
             .add(cert)
@@ -3308,16 +3309,15 @@ fn build_internal_mtls_rustls_config(
     let mut cert_reader = BufReader::new(
         File::open(cert_path).with_context(|| format!("failed reading {}", cert_path.display()))?,
     );
-    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut cert_reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed parsing internal node certificate chain")?;
 
     let mut key_reader = BufReader::new(
         File::open(key_path).with_context(|| format!("failed reading {}", key_path.display()))?,
     );
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-        .context("failed parsing internal node private key")?
-        .context("missing internal node private key")?;
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(&mut key_reader)
+        .context("failed parsing internal node private key")?;
 
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
         .build()

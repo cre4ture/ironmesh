@@ -8,7 +8,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 blake3.workspace = true
 bytes.workspace = true
 common = { path = "../../crates/common" }
@@ -16,7 +16,7 @@ exif = { package = "kamadak-exif", version = "0.6" }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 percent-encoding = "2"
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.9", features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
