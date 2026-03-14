@@ -108,22 +108,27 @@ async function issueBootstrapBundle() {
 
 function renderBootstrapQr(text) {
   const container = document.getElementById('bootstrap-bundle-qr-container');
-  const canvas = document.getElementById('bootstrap-bundle-qr');
+  const target = document.getElementById('bootstrap-bundle-qr');
   if (typeof QRCode === 'undefined') {
     container.style.display = 'none';
     return;
   }
-  QRCode.toCanvas(canvas, text, { width: 320, errorCorrectionLevel: 'L' }, function (error) {
-    if (error) {
-      container.style.display = 'none';
-    } else {
-      container.style.display = 'block';
-    }
-  });
+  target.innerHTML = '';
+  try {
+    new QRCode(target, {
+      text,
+      width: 320,
+      height: 320
+    });
+    container.style.display = 'block';
+  } catch {
+    container.style.display = 'none';
+  }
 }
 
 function hideBootstrapQr() {
   document.getElementById('bootstrap-bundle-qr-container').style.display = 'none';
+  document.getElementById('bootstrap-bundle-qr').innerHTML = '';
 }
 
 document

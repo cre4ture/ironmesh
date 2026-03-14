@@ -48,7 +48,7 @@
     <pre id="bootstrap-bundle-json">provide the admin token and click the button to issue a bootstrap bundle</pre>
     <div id="bootstrap-bundle-qr-container" style="display:none; margin-top: 1rem;">
       <p style="font-weight: 600; margin: 0 0 0.5rem;">Scan with the ironmesh Android app:</p>
-      <canvas id="bootstrap-bundle-qr"></canvas>
+      <div id="bootstrap-bundle-qr"></div>
     </div>
 
     <h2>Server logs</h2>
@@ -88,7 +88,7 @@
       <li><code>POST /maintenance/cleanup?retention_secs=&lt;n&gt;&amp;dry_run=true|false</code> - retention-safe orphan cleanup for manifests/chunks</li>
     </ul>
   </main>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+  <script src="/ui/qrcode.min.js"></script>
   <script src="/ui/app.js"></script>
 </body>
 </html>

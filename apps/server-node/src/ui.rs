@@ -6,6 +6,7 @@ use storage::SnapshotInfo;
 const INDEX_HTML_TEMPLATE: &str = include_str!("ui/index.html");
 const INDEX_CSS: &str = include_str!("ui/app.css");
 const INDEX_JS: &str = include_str!("ui/app.js");
+const INDEX_QRCODE_JS: &str = include_str!("ui/qrcode.min.js");
 
 pub(crate) async fn index(State(state): State<ServerState>) -> Html<String> {
     let (storage_dir, object_count, snapshots) = {
@@ -167,5 +168,16 @@ pub(crate) async fn app_js() -> impl IntoResponse {
             HeaderValue::from_static("application/javascript; charset=utf-8"),
         )],
         INDEX_JS,
+    )
+}
+
+pub(crate) async fn qrcode_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/javascript; charset=utf-8"),
+        )],
+        INDEX_QRCODE_JS,
     )
 }

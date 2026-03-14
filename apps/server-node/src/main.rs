@@ -867,6 +867,7 @@ async fn main() -> Result<()> {
         .route("/", get(ui::index))
         .route("/ui/app.css", get(ui::app_css))
         .route("/ui/app.js", get(ui::app_js))
+        .route("/ui/qrcode.min.js", get(ui::qrcode_js))
         .route("/logs", get(ui::list_logs))
         .route("/health", get(health))
         .route("/auth/device/enroll", post(enroll_client_device))
