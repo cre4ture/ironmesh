@@ -46,6 +46,8 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
 
 struct WebUiServer {
     base_url: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
     local_url: String,
     task: JoinHandle<()>,
 }
@@ -294,14 +296,23 @@ fn current_folder_sync_status_json() -> Result<String> {
     serde_json::to_string(&status).context("failed to serialize continuous folder sync status")
 }
 
-fn start_embedded_web_ui(base_url: String) -> Result<String> {
+fn start_embedded_web_ui(
+    base_url: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+) -> Result<String> {
     let rt = runtime()?;
+    let server_ca_pem = normalize_optional_string(server_ca_pem);
+    let client_identity_json = normalize_optional_string(client_identity_json);
+    let client_identity = parse_client_identity_json(client_identity_json.clone())?;
     let mut state = web_ui_server_state()
         .lock()
         .map_err(|_| anyhow::anyhow!("web ui state lock poisoned"))?;
 
     if let Some(existing) = state.as_ref()
         && existing.base_url == base_url
+        && existing.server_ca_pem == server_ca_pem
+        && existing.client_identity_json == client_identity_json
         && !existing.task.is_finished()
     {
         return Ok(existing.local_url.clone());
@@ -318,9 +329,15 @@ fn start_embedded_web_ui(base_url: String) -> Result<String> {
         .local_addr()
         .context("failed to read embedded web ui listener address")?;
     let local_url = format!("http://127.0.0.1:{}/", address.port());
-    let app = web_ui_backend::router(
-        web_ui_backend::WebUiConfig::new(base_url.clone()).with_service_name("ironmesh-android"),
-    );
+    let mut web_ui_config =
+        web_ui_backend::WebUiConfig::new(base_url.clone()).with_service_name("ironmesh-android");
+    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+        web_ui_config = web_ui_config.with_server_ca_pem(server_ca_pem.clone());
+    }
+    if let Some(client_identity) = client_identity {
+        web_ui_config = web_ui_config.with_client_identity(client_identity);
+    }
+    let app = web_ui_backend::router(web_ui_config);
 
     let task = rt.spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -328,6 +345,8 @@ fn start_embedded_web_ui(base_url: String) -> Result<String> {
 
     *state = Some(WebUiServer {
         base_url,
+        server_ca_pem,
+        client_identity_json,
         local_url: local_url.clone(),
         task,
     });
@@ -474,9 +493,23 @@ pub struct AndroidStorageApp {
 
 impl AndroidStorageApp {
     pub fn new(server_base_url: impl Into<String>) -> Self {
-        Self {
-            client: ClientNode::new(server_base_url),
-        }
+        Self::with_client(ClientNode::new(server_base_url))
+    }
+
+    pub fn configured(
+        server_base_url: impl Into<String>,
+        server_ca_pem: Option<String>,
+        client_identity_json: Option<String>,
+    ) -> Result<Self> {
+        Ok(Self::with_client(configured_client_node(
+            server_base_url,
+            server_ca_pem,
+            client_identity_json,
+        )?))
+    }
+
+    pub fn with_client(client: ClientNode) -> Self {
+        Self { client }
     }
 
     pub async fn store(&self, key: impl Into<String>, data: Vec<u8>) -> Result<()> {
@@ -579,10 +612,14 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
     mut env: JNIEnv,
     _class: JClass,
     base_url: JString,
+    server_ca_pem: jstring,
+    client_identity_json: jstring,
 ) -> jstring {
     let result = (|| -> Result<String> {
         let base_url: String = env.get_string(&base_url)?.into();
-        start_embedded_web_ui(base_url)
+        let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        start_embedded_web_ui(base_url, server_ca_pem, client_identity_json)
     })();
 
     match result {

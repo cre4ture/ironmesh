@@ -132,15 +132,16 @@ async fn main() -> Result<()> {
         }
         Commands::ServeWeb { bind } => {
             let target = resolve_target(&cli)?;
-            if target.client_identity.is_some() {
-                bail!("serve-web is not yet wired for authenticated clusters");
-            }
-
             let bind_addr: SocketAddr = bind.parse()?;
-            let app = web_ui_backend::router(
-                WebUiConfig::new(target.base_url.as_str().to_string())
-                    .with_service_name("cli-client-web"),
-            );
+            let mut web_ui_config = WebUiConfig::new(target.base_url.as_str().to_string())
+                .with_service_name("cli-client-web");
+            if let Some(server_ca_pem) = target.server_ca_pem.as_ref() {
+                web_ui_config = web_ui_config.with_server_ca_pem(server_ca_pem.clone());
+            }
+            if let Some(client_identity) = target.client_identity.clone() {
+                web_ui_config = web_ui_config.with_client_identity(client_identity);
+            }
+            let app = web_ui_backend::router(web_ui_config);
 
             println!("web interface at http://{bind_addr}");
             let listener = tokio::net::TcpListener::bind(bind_addr).await?;

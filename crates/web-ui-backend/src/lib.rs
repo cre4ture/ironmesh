@@ -6,9 +6,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
-use client_sdk::{ClientNode, UploadMode};
-use reqwest::Client;
+use client_sdk::{
+    ClientIdentityMaterial, ClientNode, UploadMode, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, build_reqwest_client_from_pem,
+    build_signed_request_headers,
+};
+use reqwest::{Client, Method, RequestBuilder, Url};
 use serde::Deserialize;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod assets {
     pub fn app_html() -> String {
@@ -32,6 +37,8 @@ pub mod assets {
 pub struct WebUiConfig {
     pub server_url: String,
     pub service_name: String,
+    pub server_ca_pem: Option<String>,
+    pub client_identity: Option<ClientIdentityMaterial>,
 }
 
 impl WebUiConfig {
@@ -39,6 +46,8 @@ impl WebUiConfig {
         Self {
             server_url: server_url.into(),
             service_name: "ironmesh-web".to_string(),
+            server_ca_pem: None,
+            client_identity: None,
         }
     }
 
@@ -46,22 +55,54 @@ impl WebUiConfig {
         self.service_name = service_name.into();
         self
     }
+
+    pub fn with_server_ca_pem(mut self, server_ca_pem: impl Into<String>) -> Self {
+        self.server_ca_pem = Some(server_ca_pem.into());
+        self
+    }
+
+    pub fn with_client_identity(mut self, client_identity: ClientIdentityMaterial) -> Self {
+        self.client_identity = Some(client_identity);
+        self
+    }
 }
 
 #[derive(Clone)]
 struct WebState {
-    server_url: String,
+    server_url: Url,
     service_name: String,
     http: Client,
     client: ClientNode,
+    client_identity: Option<ClientIdentityMaterial>,
 }
 
 pub fn router(config: WebUiConfig) -> Router {
+    let server_url = Url::parse(config.server_url.trim_end_matches('/'))
+        .unwrap_or_else(|error| panic!("invalid web ui server url {}: {error}", config.server_url));
+    let http = build_reqwest_client_from_pem(config.server_ca_pem.as_deref())
+        .unwrap_or_else(|error| panic!("failed building web ui http client: {error:#}"));
+    let client = match config.client_identity.as_ref() {
+        Some(identity) => ClientNode::with_client(
+            build_http_client_with_identity_from_pem(
+                config.server_ca_pem.as_deref(),
+                server_url.as_str(),
+                identity,
+            )
+            .unwrap_or_else(|error| {
+                panic!("failed building web ui authenticated client: {error:#}")
+            }),
+        ),
+        None => ClientNode::with_client(
+            build_http_client_from_pem(config.server_ca_pem.as_deref(), server_url.as_str(), &None)
+                .unwrap_or_else(|error| panic!("failed building web ui client: {error:#}")),
+        ),
+    };
     let state = WebState {
-        server_url: config.server_url.clone(),
+        server_url,
         service_name: config.service_name,
-        http: Client::new(),
-        client: ClientNode::new(config.server_url),
+        http,
+        client,
+        client_identity: config.client_identity,
     };
 
     Router::new()
@@ -129,17 +170,10 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> axum::respo
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
 }
 
-async fn fetch_server_json(
-    http: &Client,
-    server_url: &str,
-    path: &str,
-) -> Result<serde_json::Value> {
-    let url = format!("{}{}", server_url.trim_end_matches('/'), path);
-    let value = http
-        .get(url)
-        .send()
-        .await
-        .context("failed to contact server")?
+async fn fetch_server_json(state: &WebState, path: &str) -> Result<serde_json::Value> {
+    let url = build_joined_url(&state.server_url, path)?;
+    let value = send_request(state, Method::GET, url)
+        .await?
         .error_for_status()
         .context("server returned error status")?
         .json::<serde_json::Value>()
@@ -148,9 +182,18 @@ async fn fetch_server_json(
     Ok(value)
 }
 
-fn build_server_object_url(server_url: &str, key: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(server_url.trim_end_matches('/'))
-        .with_context(|| format!("invalid server URL: {server_url}"))?;
+async fn send_request(state: &WebState, method: Method, url: Url) -> Result<reqwest::Response> {
+    let request = apply_optional_request_auth(
+        state.http.request(method.clone(), url.clone()),
+        method,
+        &url,
+        state.client_identity.as_ref(),
+    )?;
+    request.send().await.context("failed to contact server")
+}
+
+fn build_server_object_url(server_url: &Url, key: &str) -> Result<Url> {
+    let mut url = server_url.clone();
 
     let mut segments = url
         .path_segments_mut()
@@ -159,12 +202,11 @@ fn build_server_object_url(server_url: &str, key: &str) -> Result<String> {
     segments.push(key);
     drop(segments);
 
-    Ok(url.to_string())
+    Ok(url)
 }
 
-fn build_server_versions_url(server_url: &str, key: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(server_url.trim_end_matches('/'))
-        .with_context(|| format!("invalid server URL: {server_url}"))?;
+fn build_server_versions_url(server_url: &Url, key: &str) -> Result<Url> {
+    let mut url = server_url.clone();
 
     let mut segments = url
         .path_segments_mut()
@@ -173,12 +215,11 @@ fn build_server_versions_url(server_url: &str, key: &str) -> Result<String> {
     segments.push(key);
     drop(segments);
 
-    Ok(url.to_string())
+    Ok(url)
 }
 
-fn build_server_store_delete_url(server_url: &str, key: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(server_url.trim_end_matches('/'))
-        .with_context(|| format!("invalid server URL: {server_url}"))?;
+fn build_server_store_delete_url(server_url: &Url, key: &str) -> Result<Url> {
+    let mut url = server_url.clone();
 
     {
         let mut segments = url
@@ -189,7 +230,7 @@ fn build_server_store_delete_url(server_url: &str, key: &str) -> Result<String> 
     }
     url.query_pairs_mut().append_pair("key", key);
 
-    Ok(url.to_string())
+    Ok(url)
 }
 
 fn content_type_for(path: &str) -> &'static str {
@@ -202,6 +243,46 @@ fn content_type_for(path: &str) -> &'static str {
     } else {
         "text/html; charset=utf-8"
     }
+}
+
+fn build_joined_url(base_url: &Url, path: &str) -> Result<Url> {
+    base_url
+        .join(path.trim_start_matches('/'))
+        .with_context(|| format!("failed to build endpoint URL from {base_url} and {path}"))
+}
+
+fn apply_optional_request_auth(
+    request: RequestBuilder,
+    method: Method,
+    url: &Url,
+    client_identity: Option<&ClientIdentityMaterial>,
+) -> Result<RequestBuilder> {
+    let Some(client_identity) = client_identity else {
+        return Ok(request);
+    };
+
+    let signed_headers = build_signed_request_headers(
+        client_identity,
+        method.as_str(),
+        &url_path_and_query(url),
+        unix_ts(),
+        None,
+    )?;
+    Ok(signed_headers.apply_to_reqwest(request))
+}
+
+fn url_path_and_query(url: &Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 async fn web_static_index() -> Response {
@@ -251,14 +332,14 @@ async fn web_ping(State(state): State<WebState>) -> impl IntoResponse {
 }
 
 async fn web_health(State(state): State<WebState>) -> impl IntoResponse {
-    match fetch_server_json(&state.http, &state.server_url, "/health").await {
+    match fetch_server_json(&state, "/health").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
 
 async fn web_snapshots(State(state): State<WebState>) -> impl IntoResponse {
-    match fetch_server_json(&state.http, &state.server_url, "/snapshots").await {
+    match fetch_server_json(&state, "/snapshots").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
@@ -277,7 +358,7 @@ async fn web_versions(
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
     };
 
-    match state.http.get(versions_url).send().await {
+    match send_request(&state, Method::GET, versions_url).await {
         Ok(response) => match response.error_for_status() {
             Ok(ok) => match ok.json::<serde_json::Value>().await {
                 Ok(value) => (StatusCode::OK, Json(value)).into_response(),
@@ -290,21 +371,21 @@ async fn web_versions(
 }
 
 async fn web_cluster_status(State(state): State<WebState>) -> impl IntoResponse {
-    match fetch_server_json(&state.http, &state.server_url, "/cluster/status").await {
+    match fetch_server_json(&state, "/cluster/status").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
 
 async fn web_cluster_nodes(State(state): State<WebState>) -> impl IntoResponse {
-    match fetch_server_json(&state.http, &state.server_url, "/cluster/nodes").await {
+    match fetch_server_json(&state, "/cluster/nodes").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
 
 async fn web_replication_plan(State(state): State<WebState>) -> impl IntoResponse {
-    match fetch_server_json(&state.http, &state.server_url, "/cluster/replication/plan").await {
+    match fetch_server_json(&state, "/cluster/replication/plan").await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
@@ -314,21 +395,24 @@ async fn web_store_list(
     State(state): State<WebState>,
     Query(query): Query<WebStoreListQuery>,
 ) -> impl IntoResponse {
-    let mut request = state
-        .http
-        .get(format!(
-            "{}/store/index",
-            state.server_url.trim_end_matches('/')
-        ))
-        .query(&[("depth", query.depth.unwrap_or(1).max(1).to_string())]);
-    if let Some(prefix) = &query.prefix {
-        request = request.query(&[("prefix", prefix)]);
-    }
-    if let Some(snapshot) = &query.snapshot {
-        request = request.query(&[("snapshot", snapshot)]);
-    }
+    let list_url = match build_joined_url(&state.server_url, "/store/index") {
+        Ok(mut url) => {
+            {
+                let mut pairs = url.query_pairs_mut();
+                pairs.append_pair("depth", &query.depth.unwrap_or(1).max(1).to_string());
+                if let Some(prefix) = &query.prefix {
+                    pairs.append_pair("prefix", prefix);
+                }
+                if let Some(snapshot) = &query.snapshot {
+                    pairs.append_pair("snapshot", snapshot);
+                }
+            }
+            url
+        }
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
 
-    match request.send().await {
+    match send_request(&state, Method::GET, list_url).await {
         Ok(response) => match response.error_for_status() {
             Ok(ok) => match ok.json::<serde_json::Value>().await {
                 Ok(value) => (StatusCode::OK, Json(value)).into_response(),
@@ -412,7 +496,7 @@ async fn web_store_delete(
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
     };
 
-    let primary_result = state.http.post(delete_url).send().await;
+    let primary_result = send_request(&state, Method::POST, delete_url).await;
     let fallback_to_legacy_delete = match primary_result {
         Ok(response) if response.status().is_success() => false,
         Ok(response)
@@ -451,7 +535,7 @@ async fn web_store_delete(
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
     };
 
-    match state.http.delete(object_url).send().await {
+    match send_request(&state, Method::DELETE, object_url).await {
         Ok(response) => match response.error_for_status() {
             Ok(_) => {
                 let _ = state.client.remove_cached(&query.key).await;
@@ -521,19 +605,22 @@ async fn web_store_get_binary(
         }
     } else {
         let object_url = match build_server_object_url(&state.server_url, &query.key) {
-            Ok(url) => url,
+            Ok(mut url) => {
+                {
+                    let mut pairs = url.query_pairs_mut();
+                    if let Some(snapshot) = query.snapshot.as_deref() {
+                        pairs.append_pair("snapshot", snapshot);
+                    }
+                    if let Some(version) = query.version.as_deref() {
+                        pairs.append_pair("version", version);
+                    }
+                }
+                url
+            }
             Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
         };
 
-        let mut request = state.http.get(object_url);
-        if let Some(snapshot) = query.snapshot.as_deref() {
-            request = request.query(&[("snapshot", snapshot)]);
-        }
-        if let Some(version) = query.version.as_deref() {
-            request = request.query(&[("version", version)]);
-        }
-
-        match request.send().await {
+        match send_request(&state, Method::GET, object_url).await {
             Ok(response) => match response.error_for_status() {
                 Ok(ok) => match ok.bytes().await {
                     Ok(bytes) => bytes,

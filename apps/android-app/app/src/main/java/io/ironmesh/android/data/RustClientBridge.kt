@@ -82,7 +82,11 @@ object RustClientBridge {
     )
 
     @JvmStatic
-    external fun startWebUi(baseUrl: String): String
+    external fun startWebUi(
+        baseUrl: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ): String
 
     @JvmStatic
     external fun runFolderSyncOnce(

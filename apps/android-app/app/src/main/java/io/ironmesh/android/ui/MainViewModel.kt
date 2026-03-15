@@ -271,7 +271,7 @@ class MainViewModel(
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    repository.startWebUi(baseUrl, clientIdentityJson)
+                    repository.startWebUi(baseUrl, currentServerCaPem(), clientIdentityJson)
                 }
             }
                 .onSuccess { url ->

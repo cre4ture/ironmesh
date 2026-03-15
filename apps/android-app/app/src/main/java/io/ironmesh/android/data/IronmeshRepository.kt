@@ -220,11 +220,16 @@ class IronmeshRepository {
         )
     }
 
-    fun startWebUi(baseUrl: String, clientIdentityJson: String? = null): String {
-        if (!clientIdentityJson.isNullOrBlank()) {
-            throw IllegalStateException("Embedded Web UI is not yet wired for authenticated clusters")
-        }
-        return RustClientBridge.startWebUi(sanitizeBaseUrl(baseUrl))
+    fun startWebUi(
+        baseUrl: String,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): String {
+        return RustClientBridge.startWebUi(
+            sanitizeBaseUrl(baseUrl),
+            serverCaPem,
+            normalizedClientIdentityJson(clientIdentityJson),
+        )
     }
 
     suspend fun runFolderSyncOnce(
