@@ -2,7 +2,7 @@ use super::{
     AdminControl, LocalNodeHandle, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig,
     RepairExecutorState, ServerNodeConfig, ServerState, StartupRepairStatus,
     await_repair_busy_threshold, build_rendezvous_presence_registration, build_store_index_entries,
-    cluster, constant_time_eq, jittered_backoff_secs,
+    cluster, constant_time_eq, jittered_backoff_secs, node_descriptor_from_presence_entry,
     replication::build_internal_replication_put_url, run, run_startup_replication_repair_once,
     should_trigger_autonomous_post_write_replication, token_matches,
 };
@@ -2024,6 +2024,7 @@ async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
         Some("https://public.example/"),
         Some("https://public.example"),
         true,
+        None,
     );
 
     assert_eq!(
@@ -2057,12 +2058,26 @@ async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
 async fn rendezvous_presence_registration_omits_public_candidate_when_peer_api_disabled() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
 
-    let registration =
-        build_rendezvous_presence_registration(&state, Some("https://public.example"), None, false);
+    let registration = build_rendezvous_presence_registration(
+        &state,
+        Some("https://public.example"),
+        Some("https://internal.example"),
+        false,
+        None,
+    );
 
-    assert!(registration.direct_candidates.is_empty());
+    assert_eq!(registration.public_api_url, None);
+    assert_eq!(
+        registration.peer_api_url.as_deref(),
+        Some("https://internal.example")
+    );
+    assert_eq!(registration.direct_candidates.len(), 1);
+    assert_eq!(
+        registration.direct_candidates[0].endpoint,
+        "https://internal.example"
+    );
     assert!(
-        !registration
+        registration
             .capabilities
             .contains(&transport_sdk::TransportCapability::DirectHttps)
     );
@@ -2073,6 +2088,49 @@ async fn rendezvous_presence_registration_omits_public_candidate_when_peer_api_d
     );
 
     cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_presence_entry_projects_into_node_descriptor() {
+    let entry = transport_sdk::PresenceEntry {
+        registration: transport_sdk::PresenceRegistration {
+            cluster_id: uuid::Uuid::now_v7(),
+            identity: transport_sdk::PeerIdentity::Node(NodeId::new_v4()),
+            public_api_url: Some("https://public.example/".to_string()),
+            peer_api_url: Some("https://internal.example/".to_string()),
+            direct_candidates: vec![transport_sdk::ConnectionCandidate {
+                kind: transport_sdk::CandidateKind::DirectHttps,
+                endpoint: "https://internal.example/".to_string(),
+                rtt_ms: None,
+            }],
+            labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+            capacity_bytes: Some(100),
+            free_bytes: Some(40),
+            capabilities: vec![transport_sdk::TransportCapability::DirectHttps],
+            relay_mode: transport_sdk::RelayMode::Fallback,
+            connected_at_unix: 123,
+        },
+        updated_at_unix: 456,
+    };
+
+    let descriptor = node_descriptor_from_presence_entry(&entry)
+        .expect("presence entry should project into a node descriptor");
+
+    assert_eq!(
+        descriptor.node_id,
+        match entry.registration.identity {
+            transport_sdk::PeerIdentity::Node(node_id) => node_id,
+            _ => unreachable!("test uses node identity"),
+        }
+    );
+    assert_eq!(descriptor.public_url, "https://public.example");
+    assert_eq!(descriptor.internal_url, "https://internal.example");
+    assert_eq!(
+        descriptor.labels.get("dc").map(String::as_str),
+        Some("edge-a")
+    );
+    assert_eq!(descriptor.capacity_bytes, 100);
+    assert_eq!(descriptor.free_bytes, 40);
 }
 
 async fn cleanup_test_state(state: &ServerState) {

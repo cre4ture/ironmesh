@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use common::ClusterId;
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashMap;
 
 use crate::bootstrap::RelayMode;
 use crate::candidates::ConnectionCandidate;
@@ -29,7 +30,17 @@ pub struct PresenceRegistration {
     pub cluster_id: ClusterId,
     pub identity: PeerIdentity,
     #[serde(default)]
+    pub public_api_url: Option<String>,
+    #[serde(default)]
+    pub peer_api_url: Option<String>,
+    #[serde(default)]
     pub direct_candidates: Vec<ConnectionCandidate>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub capacity_bytes: Option<u64>,
+    #[serde(default)]
+    pub free_bytes: Option<u64>,
     #[serde(default)]
     pub capabilities: Vec<TransportCapability>,
     #[serde(default)]
@@ -85,6 +96,8 @@ impl PresenceRegistration {
         if self.cluster_id.is_nil() {
             bail!("presence registration must include a non-nil cluster_id");
         }
+        validate_optional_url("public_api_url", self.public_api_url.as_deref())?;
+        validate_optional_url("peer_api_url", self.peer_api_url.as_deref())?;
         for candidate in &self.direct_candidates {
             candidate.validate()?;
         }
@@ -221,4 +234,12 @@ fn control_url(base_url: &str, path: &str) -> Result<Url> {
         .with_context(|| {
             format!("failed to build rendezvous control URL from {base_url} and {path}")
         })
+}
+
+fn validate_optional_url(field_name: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    Url::parse(value).with_context(|| format!("invalid {field_name} URL {value}"))?;
+    Ok(())
 }

@@ -1401,6 +1401,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
         match rendezvous_client {
             Ok(client) => {
+                spawn_rendezvous_peer_discovery(
+                    state.clone(),
+                    client.clone(),
+                    config.replica_view_sync_interval_secs,
+                );
                 spawn_rendezvous_presence_heartbeat(
                     state.clone(),
                     client,
@@ -1419,8 +1424,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         }
     }
 
-    let peer_sync_enabled =
-        config.mode == ServerNodeMode::Cluster || config.upstream_public_url.is_some();
+    let peer_sync_enabled = config.mode == ServerNodeMode::Cluster
+        || config.upstream_public_url.is_some()
+        || config.rendezvous_registration_enabled;
 
     if let Some(upstream_public_url) = config.upstream_public_url.clone() {
         if let Err(err) =
@@ -1712,11 +1718,19 @@ fn spawn_rendezvous_presence_heartbeat(
         ticker.tick().await;
 
         loop {
+            let local_descriptor = {
+                let cluster = state.cluster.lock().await;
+                cluster
+                    .list_nodes()
+                    .into_iter()
+                    .find(|node| node.node_id == state.node_id)
+            };
             let registration = build_rendezvous_presence_registration(
                 &state,
                 public_url.as_deref(),
                 internal_peer_url.as_deref(),
                 public_peer_api_enabled,
+                local_descriptor.as_ref(),
             );
 
             match client.register_presence(&registration).await {
@@ -1747,9 +1761,14 @@ fn build_rendezvous_presence_registration(
     public_url: Option<&str>,
     internal_peer_url: Option<&str>,
     public_peer_api_enabled: bool,
+    local_descriptor: Option<&NodeDescriptor>,
 ) -> PresenceRegistration {
     let mut direct_candidates = Vec::new();
     let mut seen_endpoints = BTreeSet::new();
+    let public_api_url = public_peer_api_enabled
+        .then(|| normalize_optional_url(public_url))
+        .flatten();
+    let peer_api_url = normalize_optional_url(internal_peer_url).or_else(|| public_api_url.clone());
 
     if public_peer_api_enabled {
         push_rendezvous_direct_candidate(&mut direct_candidates, &mut seen_endpoints, public_url);
@@ -1771,7 +1790,14 @@ fn build_rendezvous_presence_registration(
     PresenceRegistration {
         cluster_id: state.cluster_id,
         identity: PeerIdentity::Node(state.node_id),
+        public_api_url,
+        peer_api_url,
         direct_candidates,
+        labels: local_descriptor
+            .map(|descriptor| descriptor.labels.clone())
+            .unwrap_or_default(),
+        capacity_bytes: local_descriptor.map(|descriptor| descriptor.capacity_bytes),
+        free_bytes: local_descriptor.map(|descriptor| descriptor.free_bytes),
         capabilities,
         relay_mode: state.relay_mode,
         connected_at_unix: unix_ts(),
@@ -1800,6 +1826,123 @@ fn push_rendezvous_direct_candidate(
         endpoint,
         rtt_ms: None,
     });
+}
+
+fn normalize_optional_url(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+}
+
+fn spawn_rendezvous_peer_discovery(
+    state: ServerState,
+    client: RendezvousControlClient,
+    interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(5)));
+        ticker.tick().await;
+
+        loop {
+            match client.list_presence().await {
+                Ok(response) => {
+                    let discovered =
+                        apply_rendezvous_presence_entries(&state, &response.entries).await;
+                    tracing::debug!(
+                        node_id = %state.node_id,
+                        discovered_nodes = discovered,
+                        registered_endpoints = response.registered_endpoints,
+                        "refreshed rendezvous peer discovery"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        node_id = %state.node_id,
+                        rendezvous_urls = ?client.config().rendezvous_urls,
+                        "failed to refresh rendezvous peer discovery"
+                    );
+                }
+            }
+
+            ticker.tick().await;
+        }
+    });
+}
+
+async fn apply_rendezvous_presence_entries(
+    state: &ServerState,
+    entries: &[transport_sdk::PresenceEntry],
+) -> usize {
+    let mut discovered = 0usize;
+    let mut cluster = state.cluster.lock().await;
+
+    for entry in entries {
+        let transport_sdk::PeerIdentity::Node(node_id) = &entry.registration.identity else {
+            continue;
+        };
+        if *node_id == state.node_id {
+            continue;
+        }
+
+        let Some(descriptor) = node_descriptor_from_presence_entry(entry) else {
+            tracing::debug!(
+                node_id = %node_id,
+                "skipping rendezvous peer without direct peer_api_url"
+            );
+            continue;
+        };
+
+        cluster.register_node(descriptor);
+        discovered += 1;
+    }
+
+    discovered
+}
+
+fn node_descriptor_from_presence_entry(
+    entry: &transport_sdk::PresenceEntry,
+) -> Option<NodeDescriptor> {
+    let transport_sdk::PeerIdentity::Node(node_id) = &entry.registration.identity else {
+        return None;
+    };
+
+    let peer_api_url = entry
+        .registration
+        .peer_api_url
+        .as_deref()
+        .and_then(|value| normalize_optional_url(Some(value)))
+        .or_else(|| {
+            entry
+                .registration
+                .direct_candidates
+                .iter()
+                .find_map(|candidate| {
+                    if candidate.kind == CandidateKind::DirectHttps {
+                        normalize_optional_url(Some(candidate.endpoint.as_str()))
+                    } else {
+                        None
+                    }
+                })
+        })?;
+    let public_api_url = entry
+        .registration
+        .public_api_url
+        .as_deref()
+        .and_then(|value| normalize_optional_url(Some(value)))
+        .unwrap_or_else(|| peer_api_url.clone());
+
+    Some(NodeDescriptor {
+        node_id: *node_id,
+        public_url: public_api_url,
+        internal_url: peer_api_url,
+        labels: entry.registration.labels.clone(),
+        capacity_bytes: entry.registration.capacity_bytes.unwrap_or(0),
+        free_bytes: entry.registration.free_bytes.unwrap_or(0),
+        last_heartbeat_unix: entry.updated_at_unix,
+        status: cluster::NodeStatus::Online,
+    })
 }
 
 fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
