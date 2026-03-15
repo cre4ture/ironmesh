@@ -150,6 +150,10 @@ Out of scope for MVP:
     - SDK-owned polling thread (`RemoteSnapshotPoller`),
     - callback contract on `changed_paths` + latest snapshot,
     - adapter-side callback applies platform action plans.
+  - Server-driven remote-change notifications for live filesystem adapters:
+    - `server-node` exposes `/store/index/changes/wait` long-poll wakeups,
+    - Linux FUSE and Windows CFAPI now wait on server change notifications and then refresh snapshots,
+    - periodic polling remains as a compatibility fallback for older servers.
   - `crates/adapter-linux-fuse` live mount now consumes the same polling abstraction to materialize remote additions without remounting.
   - `crates/sync-agent-core` with reusable local tree scanning, diffing, and remote index utilities.
   - `apps/ironmesh-folder-agent`:
@@ -164,8 +168,7 @@ Out of scope for MVP:
     - periodic background sync execution via WorkManager,
     - manual "Sync Now" trigger from UI.
 - Next step:
-  - Add server-driven remote-change notifications to replace polling when backend support is available.
-  - Extend deletion propagation to fully recursive directory semantics.
+  - Align Android with the shared planner/contracts now that recursive directory deletion propagates through the shared `/store/delete` path for directory-marker keys.
 
 ## Folder agent usage (MVP)
 

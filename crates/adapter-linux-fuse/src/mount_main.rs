@@ -137,7 +137,8 @@ pub fn mount_main() -> Result<()> {
     let refresh_enabled = args.server_base_url.is_some();
     let (refresh_rx, refresh_thread, refresh_running) = if refresh_enabled {
         let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
-        let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
+        let refresh_poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_secs(25), refresh_interval);
         let refresh_fetcher = RemoteSnapshotFetcher::from_base_url(
             base_url.as_str(),
             args.prefix.clone(),

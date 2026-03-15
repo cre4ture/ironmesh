@@ -17,6 +17,7 @@ fn mk_record(
         version_id: version_id.to_string(),
         object_id: "obj-k".to_string(),
         manifest_hash: format!("m-{version_id}"),
+        logical_path: None,
         parent_version_ids: Vec::new(),
         state,
         created_at_unix,
@@ -796,6 +797,73 @@ async fn tombstone_replication_subjects_keep_deleted_head_version() {
 }
 
 #[tokio::test]
+async fn recursive_tombstone_removes_directory_marker_and_descendants() {
+    let root = test_store_dir("recursive-tombstone-subtree");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    for (key, payload) in [
+        ("docs/", Bytes::from_static(b"")),
+        ("docs/a.txt", Bytes::from_static(b"a")),
+        ("docs/nested/", Bytes::from_static(b"")),
+        ("docs/nested/b.txt", Bytes::from_static(b"b")),
+        ("other/keep.txt", Bytes::from_static(b"keep")),
+    ] {
+        store
+            .put_object_versioned(key, payload, PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    let deleted = store
+        .tombstone_subtree("docs/", PutOptions::default())
+        .await
+        .unwrap();
+    let deleted_paths = deleted
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        deleted_paths,
+        std::collections::BTreeSet::from([
+            "docs/",
+            "docs/a.txt",
+            "docs/nested/",
+            "docs/nested/b.txt",
+        ])
+    );
+
+    let current_keys = store.current_keys();
+    assert!(
+        !current_keys
+            .iter()
+            .any(|key| key == "docs/" || key.starts_with("docs/"))
+    );
+    assert!(current_keys.contains(&"other/keep.txt".to_string()));
+
+    let subjects = store.list_replication_subjects().await.unwrap();
+    assert!(
+        subjects
+            .iter()
+            .any(|subject| subject.starts_with("docs/a.txt@")),
+        "expected deleted file tombstone subject, subjects={subjects:?}"
+    );
+    assert!(
+        subjects
+            .iter()
+            .any(|subject| subject.starts_with("docs/nested/b.txt@")),
+        "expected nested deleted file tombstone subject, subjects={subjects:?}"
+    );
+
+    let kept = store
+        .get_object("other/keep.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(kept.as_ref(), b"keep");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn export_replication_bundle_supports_tombstone_versions() {
     let root = test_store_dir("tombstone-export-bundle");
     let mut store = PersistentStore::init(root.clone()).await.unwrap();
@@ -882,6 +950,42 @@ async fn rename_preserves_object_id_and_history() {
         .await
         .unwrap();
     assert_eq!(read.as_ref(), b"hello");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn rename_replication_subjects_include_source_path_deletion_event() {
+    let root = test_store_dir("rename-replication-subjects-source-delete");
+    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+
+    store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"hello"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let mutation = store
+        .rename_object_path("docs/a.txt", "docs/b.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    let subjects = store.list_replication_subjects().await.unwrap();
+    assert!(subjects.contains(&"docs/b.txt".to_string()));
+    assert!(
+        subjects
+            .iter()
+            .any(|subject| subject.starts_with("docs/a.txt@")),
+        "expected rename to leave a versioned deletion subject for the old path, subjects={subjects:?}"
+    );
+    assert!(
+        !subjects.contains(&"docs/a.txt".to_string()),
+        "old path should only remain visible as a deletion/version subject, subjects={subjects:?}"
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }

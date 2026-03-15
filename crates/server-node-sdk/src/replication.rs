@@ -46,6 +46,7 @@ pub(crate) async fn execute_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ReplicationRepairReport {
+    sync_replica_views_once(state).await;
     let keys = planning_replication_subjects(state).await;
 
     let (plan, nodes) = {
@@ -74,7 +75,20 @@ pub(crate) async fn execute_replication_repair_inner(
 
     let http = state.internal_http.clone();
 
-    for item in plan.items {
+    let mut plan_items = plan.items;
+    plan_items.sort_by(|a, b| {
+        let a_versioned = parse_replication_subject(&a.key)
+            .and_then(|(_, version_id)| version_id)
+            .is_some();
+        let b_versioned = parse_replication_subject(&b.key)
+            .and_then(|(_, version_id)| version_id)
+            .is_some();
+        b_versioned
+            .cmp(&a_versioned)
+            .then_with(|| a.key.cmp(&b.key))
+    });
+
+    for item in plan_items {
         if attempted_transfers >= max_transfers {
             break;
         }
@@ -141,6 +155,7 @@ pub(crate) async fn execute_replication_repair_inner(
             {
                 Ok(imported_version_id) => {
                     successful_transfers += 1;
+                    publish_namespace_change(state);
 
                     let mut cluster = state.cluster.lock().await;
                     cluster.note_replica(&key, state.node_id);
@@ -168,7 +183,7 @@ pub(crate) async fn execute_replication_repair_inner(
                 }
                 Err(err) => {
                     failed_transfers += 1;
-                    last_error = Some(err.to_string());
+                    last_error = Some(format!("{err:#}"));
 
                     let mut repair_state = state.repair_state.lock().await;
                     let entry =
@@ -254,7 +269,7 @@ pub(crate) async fn execute_replication_repair_inner(
                 }
                 Err(err) => {
                     failed_transfers += 1;
-                    last_error = Some(err.to_string());
+                    last_error = Some(format!("{err:#}"));
 
                     let mut repair_state = state.repair_state.lock().await;
                     let entry =
@@ -335,6 +350,7 @@ async fn pull_bundle_from_source(
         .import_replica_manifest(
             &bundle.key,
             bundle.version_id.as_deref(),
+            &bundle.parent_version_ids,
             bundle.state,
             &bundle.manifest_hash,
             &bundle.manifest_bytes,
@@ -363,7 +379,13 @@ async fn replicate_bundle_to_target(
                 internal_replication: true,
             })
             .send()
-            .await?
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to push tombstone key={} version_id={:?} to target={target_base_url}",
+                    bundle.key, bundle.version_id
+                )
+            })?
             .error_for_status()?;
 
         return bundle
@@ -389,7 +411,13 @@ async fn replicate_bundle_to_target(
             http.post(chunk_url)
                 .body(payload)
                 .send()
-                .await?
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to push chunk hash={} key={} version_id={:?} to target={target_base_url}",
+                        chunk.hash, bundle.key, bundle.version_id
+                    )
+                })?
                 .error_for_status()?;
         }
     } else {
@@ -421,22 +449,43 @@ async fn replicate_bundle_to_target(
         http.put(put_url)
             .body(assembled.freeze())
             .send()
-            .await?
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to push assembled object key={} version_id={:?} to target={target_base_url}",
+                    bundle.key, bundle.version_id
+                )
+            })?
             .error_for_status()?;
     }
 
+    let parent_version_ids_json = if bundle.parent_version_ids.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&bundle.parent_version_ids)?)
+    };
     let manifest_url = format!("{target_base_url}/cluster/replication/push/manifest");
     let request = http
         .post(manifest_url)
         .query(&ReplicationManifestPushQuery {
             key: bundle.key.clone(),
             version_id: bundle.version_id.clone(),
+            parent_version_ids_json,
             state: bundle.state.clone(),
             manifest_hash: bundle.manifest_hash.clone(),
         })
         .body(bundle.manifest_bytes.clone());
 
-    let response = request.send().await?.error_for_status()?;
+    let response = request
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to push manifest key={} version_id={:?} manifest_hash={} to target={target_base_url}",
+                bundle.key, bundle.version_id, bundle.manifest_hash
+            )
+        })?
+        .error_for_status()?;
 
     let report = response.json::<ReplicationManifestPushReport>().await?;
     Ok(report.version_id)

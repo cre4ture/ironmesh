@@ -10,13 +10,35 @@ use sync_core::{EntryKind, SyncSnapshot};
 
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteSyncStrategy {
-    interval: Duration,
+    mode: RemoteSyncMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RemoteSyncMode {
+    Polling {
+        interval: Duration,
+    },
+    ServerNotifications {
+        wait_timeout: Duration,
+        retry_interval: Duration,
+    },
 }
 
 impl RemoteSyncStrategy {
     pub fn polling(interval: Duration) -> Self {
         Self {
-            interval: interval.max(Duration::from_millis(250)),
+            mode: RemoteSyncMode::Polling {
+                interval: interval.max(Duration::from_millis(250)),
+            },
+        }
+    }
+
+    pub fn server_notifications(wait_timeout: Duration, retry_interval: Duration) -> Self {
+        Self {
+            mode: RemoteSyncMode::ServerNotifications {
+                wait_timeout: wait_timeout.max(Duration::from_millis(250)),
+                retry_interval: retry_interval.max(Duration::from_millis(250)),
+            },
         }
     }
 }
@@ -38,17 +60,17 @@ impl RemoteSyncScheduler {
     }
 
     pub fn wait_for_next_tick_blocking(&self, running: &AtomicBool) -> bool {
-        sleep_until_or_stop(self.strategy.interval, running)
+        sleep_until_or_stop(self.fallback_interval(), running)
     }
 
     pub fn spawn_loop<F>(&self, running: Arc<AtomicBool>, mut on_tick: F) -> JoinHandle<()>
     where
         F: FnMut() + Send + 'static,
     {
-        let strategy = self.strategy;
+        let interval = self.fallback_interval();
         thread::spawn(move || {
             while running.load(Ordering::SeqCst) {
-                if !sleep_until_or_stop(strategy.interval, &running) {
+                if !sleep_until_or_stop(interval, &running) {
                     break;
                 }
                 if !running.load(Ordering::SeqCst) {
@@ -57,6 +79,13 @@ impl RemoteSyncScheduler {
                 on_tick();
             }
         })
+    }
+
+    fn fallback_interval(&self) -> Duration {
+        match self.strategy.mode {
+            RemoteSyncMode::Polling { interval } => interval,
+            RemoteSyncMode::ServerNotifications { retry_interval, .. } => retry_interval,
+        }
     }
 }
 
@@ -142,22 +171,95 @@ impl RemoteSnapshotPoller {
         }
     }
 
+    pub fn server_notifications(wait_timeout: Duration, retry_interval: Duration) -> Self {
+        Self {
+            scheduler: RemoteSyncScheduler::new(RemoteSyncStrategy::server_notifications(
+                wait_timeout,
+                retry_interval,
+            )),
+        }
+    }
+
     pub fn spawn_fetcher_loop<C>(
         &self,
         running: Arc<AtomicBool>,
         initial_snapshot: Option<SyncSnapshot>,
         fetcher: RemoteSnapshotFetcher,
-        on_change: C,
+        mut on_change: C,
     ) -> JoinHandle<()>
     where
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
     {
-        self.spawn_changed_paths_loop(
-            running,
-            initial_snapshot,
-            move || fetcher.fetch_snapshot_blocking(),
-            on_change,
-        )
+        match self.scheduler.strategy.mode {
+            RemoteSyncMode::Polling { .. } => self.spawn_changed_paths_loop(
+                running,
+                initial_snapshot,
+                move || fetcher.fetch_snapshot_blocking(),
+                on_change,
+            ),
+            RemoteSyncMode::ServerNotifications {
+                wait_timeout,
+                retry_interval: _,
+            } => {
+                let scheduler = self.scheduler.clone();
+                thread::spawn(move || {
+                    let mut current_snapshot = initial_snapshot;
+                    let mut last_sequence = 0u64;
+                    let mut notifications_available = true;
+
+                    while running.load(Ordering::SeqCst) {
+                        if notifications_available {
+                            match fetcher.client.wait_for_store_index_change_blocking(
+                                last_sequence,
+                                wait_timeout.as_millis() as u64,
+                            ) {
+                                Ok(response) => {
+                                    last_sequence = response.sequence;
+                                    if !response.changed {
+                                        continue;
+                                    }
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "remote-refresh: server change wait unavailable, falling back to polling: {error}"
+                                    );
+                                    notifications_available = false;
+                                }
+                            }
+                        }
+
+                        if !notifications_available
+                            && !scheduler.wait_for_next_tick_blocking(&running)
+                        {
+                            break;
+                        }
+                        if !running.load(Ordering::SeqCst) {
+                            break;
+                        }
+
+                        let next_snapshot = match fetcher.fetch_snapshot_blocking() {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                eprintln!("remote-refresh: snapshot refresh error: {error}");
+                                continue;
+                            }
+                        };
+
+                        if let Some(previous) = current_snapshot.as_ref() {
+                            let changed_paths = changed_paths_between(previous, &next_snapshot);
+                            if !changed_paths.is_empty() {
+                                on_change(RemoteSnapshotUpdate {
+                                    snapshot: next_snapshot.clone(),
+                                    changed_paths,
+                                });
+                            }
+                        }
+
+                        current_snapshot = Some(next_snapshot);
+                    }
+                })
+            }
+        }
     }
 
     pub fn spawn_changed_paths_loop<F, C>(

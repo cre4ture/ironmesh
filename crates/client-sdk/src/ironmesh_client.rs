@@ -68,6 +68,12 @@ pub struct StoreIndexResponse {
     pub entries: Vec<StoreIndexEntry>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoreIndexChangeWaitResponse {
+    pub sequence: u64,
+    pub changed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreIndexMedia {
     pub status: String,
@@ -268,10 +274,14 @@ impl IronMeshClient {
     pub async fn delete_path(&self, key: impl AsRef<str>) -> Result<()> {
         let key = key.as_ref();
         let url = self.store_delete_url()?;
+        let recursive = key.ends_with('/');
 
-        let response = self
-            .apply_auth(self.http.post(url))
-            .query(&[("key", key)])
+        let mut request = self.apply_auth(self.http.post(url)).query(&[("key", key)]);
+        if recursive {
+            request = request.query(&[("recursive", "true")]);
+        }
+
+        let response = request
             .send()
             .await
             .with_context(|| format!("failed to delete path {key}"))?;
@@ -329,6 +339,40 @@ impl IronMeshClient {
             .build()
             .context("failed to create runtime for store index request")?;
         runtime.block_on(self.store_index(prefix, depth, snapshot))
+    }
+
+    pub async fn wait_for_store_index_change(
+        &self,
+        since: u64,
+        timeout_ms: u64,
+    ) -> Result<StoreIndexChangeWaitResponse> {
+        let url = self.store_index_change_wait_url()?;
+
+        self.apply_auth(self.http.get(url))
+            .query(&[
+                ("since", since.to_string()),
+                ("timeout_ms", timeout_ms.max(250).to_string()),
+            ])
+            .send()
+            .await
+            .context("failed to request /store/index/changes/wait")?
+            .error_for_status()
+            .context("/store/index/changes/wait returned non-success status")?
+            .json::<StoreIndexChangeWaitResponse>()
+            .await
+            .context("failed to parse /store/index/changes/wait response")
+    }
+
+    pub fn wait_for_store_index_change_blocking(
+        &self,
+        since: u64,
+        timeout_ms: u64,
+    ) -> Result<StoreIndexChangeWaitResponse> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for store index change wait request")?;
+        runtime.block_on(self.wait_for_store_index_change(since, timeout_ms))
     }
 
     pub async fn load_snapshot_from_server(
@@ -706,6 +750,23 @@ impl IronMeshClient {
                 .map_err(|_| anyhow!("server URL cannot be a base"))?;
             segments.push("store");
             segments.push("index");
+        }
+
+        Ok(url.to_string())
+    }
+
+    fn store_index_change_wait_url(&self) -> Result<String> {
+        let mut url = reqwest::Url::parse(&self.server_base_url)
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("index");
+            segments.push("changes");
+            segments.push("wait");
         }
 
         Ok(url.to_string())

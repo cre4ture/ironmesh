@@ -44,6 +44,8 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
   - snapshot mode (`--snapshot-file`)
   - live server mode (`--server-base-url`) with `/store/index` listing + `GET /store/{key}` hydration
   - embedded local-edge mode (`--local-edge`) with persistent local state and upstream sync
+  - server-driven `/store/index/changes/wait` refresh wakeups with polling fallback
+  - recursive directory deletion through the shared `/store/delete` API when deleting directory-marker paths like `dir/`
 
 ## Key files now authoritative
 

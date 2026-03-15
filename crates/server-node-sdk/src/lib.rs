@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use axum::extract::FromRequestParts;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -33,7 +33,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tower::Service;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
@@ -85,8 +85,18 @@ struct ServerState {
     log_buffer: Arc<LogBuffer>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
+    namespace_change_sequence: Arc<AtomicU64>,
+    namespace_change_tx: watch::Sender<u64>,
     admin_control: AdminControl,
     client_auth_control: ClientAuthControl,
+}
+
+pub(crate) fn publish_namespace_change(state: &ServerState) {
+    let sequence = state
+        .namespace_change_sequence
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    let _ = state.namespace_change_tx.send(sequence);
 }
 
 #[derive(Debug, Clone)]
@@ -1143,6 +1153,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        namespace_change_sequence: Arc::new(AtomicU64::new(0)),
+        namespace_change_tx: watch::channel(0).0,
         admin_control,
         client_auth_control,
     };
@@ -1211,6 +1223,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     let public_client_api = Router::new()
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route(
+            "/store/index/changes/wait",
+            get(wait_for_store_index_change),
+        )
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
@@ -1341,6 +1357,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/health", get(health))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route(
+            "/store/index/changes/wait",
+            get(wait_for_store_index_change),
+        )
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
@@ -1455,9 +1475,13 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
             let keys = planning_replication_subjects(&state).await;
 
-            let mut cluster = state.cluster.lock().await;
-            let node_transitioned_offline = cluster.update_health_and_detect_offline_transition();
-            let plan = cluster.replication_plan(&keys);
+            let (node_transitioned_offline, plan) = {
+                let mut cluster = state.cluster.lock().await;
+                let node_transitioned_offline =
+                    cluster.update_health_and_detect_offline_transition();
+                let plan = cluster.replication_plan(&keys);
+                (node_transitioned_offline, plan)
+            };
 
             if node_transitioned_offline || !plan.items.is_empty() {
                 info!(
@@ -1492,86 +1516,88 @@ struct LocalReplicationSubjectsResponse {
     subjects: Vec<String>,
 }
 
-fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
-    tokio::spawn(async move {
-        let http = state.internal_http.clone();
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+pub(crate) async fn sync_replica_views_once(state: &ServerState) {
+    let http = state.internal_http.clone();
 
-        loop {
-            ticker.tick().await;
+    let local_subjects = {
+        let store = state.store.lock().await;
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+    };
 
-            let local_subjects = {
-                let store = state.store.lock().await;
-                store
-                    .list_replication_subjects()
-                    .await
-                    .unwrap_or_else(|_| store.current_keys())
-            };
+    let mut changed = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.replace_node_replica_view(state.node_id, &local_subjects)
+    };
 
-            let mut changed = {
-                let mut cluster = state.cluster.lock().await;
-                cluster.replace_node_replica_view(state.node_id, &local_subjects)
-            };
+    let peers = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        cluster
+            .list_nodes()
+            .into_iter()
+            .filter(|node| {
+                node.node_id != state.node_id && node.status == cluster::NodeStatus::Online
+            })
+            .collect::<Vec<_>>()
+    };
 
-            let peers = {
-                let mut cluster = state.cluster.lock().await;
-                cluster.update_health_and_detect_offline_transition();
-                cluster
-                    .list_nodes()
-                    .into_iter()
-                    .filter(|node| {
-                        node.node_id != state.node_id && node.status == cluster::NodeStatus::Online
-                    })
-                    .collect::<Vec<_>>()
-            };
+    for peer in peers {
+        let base = peer.internal_url.trim_end_matches('/');
+        let url = format!("{base}/cluster/replication/subjects/local");
 
-            for peer in peers {
-                let base = peer.internal_url.trim_end_matches('/');
-                let url = format!("{base}/cluster/replication/subjects/local");
-
-                match http.get(url).send().await {
-                    Ok(response) if response.status().is_success() => {
-                        match response.json::<LocalReplicationSubjectsResponse>().await {
-                            Ok(payload) => {
-                                let mut cluster = state.cluster.lock().await;
-                                if cluster
-                                    .replace_node_replica_view(payload.node_id, &payload.subjects)
-                                {
-                                    changed = true;
-                                }
-                            }
-                            Err(err) => {
-                                tracing::debug!(
-                                    node_id = %peer.node_id,
-                                    error = %err,
-                                    "failed decoding replica subject sync payload"
-                                );
-                            }
+        match http.get(url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<LocalReplicationSubjectsResponse>().await {
+                    Ok(payload) => {
+                        let mut cluster = state.cluster.lock().await;
+                        if cluster.replace_node_replica_view(payload.node_id, &payload.subjects) {
+                            changed = true;
                         }
-                    }
-                    Ok(response) => {
-                        tracing::debug!(
-                            node_id = %peer.node_id,
-                            status = %response.status(),
-                            "replica subject sync request rejected"
-                        );
                     }
                     Err(err) => {
                         tracing::debug!(
                             node_id = %peer.node_id,
                             error = %err,
-                            "failed replica subject sync request"
+                            "failed decoding replica subject sync payload"
                         );
                     }
                 }
             }
-
-            if changed && let Err(err) = persist_cluster_replicas_state(&state).await {
-                warn!(
-                    error = %err,
-                    "failed persisting cluster replicas after replica subject sync"
+            Ok(response) => {
+                tracing::debug!(
+                    node_id = %peer.node_id,
+                    status = %response.status(),
+                    "replica subject sync request rejected"
                 );
             }
+            Err(err) => {
+                tracing::debug!(
+                    node_id = %peer.node_id,
+                    error = %err,
+                    "failed replica subject sync request"
+                );
+            }
+        }
+    }
+
+    if changed && let Err(err) = persist_cluster_replicas_state(state).await {
+        warn!(
+            error = %err,
+            "failed persisting cluster replicas after replica subject sync"
+        );
+    }
+}
+
+fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+
+        loop {
+            ticker.tick().await;
+            sync_replica_views_once(&state).await;
         }
     });
 }
@@ -1899,6 +1925,18 @@ struct StoreIndexQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct StoreIndexChangeWaitQuery {
+    since: Option<u64>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoreIndexChangeWaitResponse {
+    sequence: u64,
+    changed: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct MediaThumbnailQuery {
     key: String,
     snapshot: Option<String>,
@@ -1969,6 +2007,8 @@ struct PutObjectQuery {
     version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
+    #[serde(default)]
+    recursive: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1980,6 +2020,8 @@ struct DeleteObjectByQuery {
     version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
+    #[serde(default)]
+    recursive: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2051,6 +2093,7 @@ async fn delete_object_by_query(
             parent: query.parent,
             version_id: query.version_id,
             internal_replication: query.internal_replication,
+            recursive: query.recursive,
         }),
     )
     .await
@@ -2070,7 +2113,11 @@ async fn rename_object_path(
         .rename_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
     {
-        Ok(PathMutationResult::Applied) => StatusCode::NO_CONTENT.into_response(),
+        Ok(PathMutationResult::Applied) => {
+            drop(store);
+            publish_namespace_change(&state);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),
         Ok(PathMutationResult::TargetExists) => StatusCode::CONFLICT.into_response(),
         Err(err) => {
@@ -2098,7 +2145,11 @@ async fn copy_object_path(
         .copy_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
     {
-        Ok(PathMutationResult::Applied) => StatusCode::NO_CONTENT.into_response(),
+        Ok(PathMutationResult::Applied) => {
+            drop(store);
+            publish_namespace_change(&state);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),
         Ok(PathMutationResult::TargetExists) => StatusCode::CONFLICT.into_response(),
         Err(err) => {
@@ -2146,6 +2197,7 @@ async fn put_object(
     {
         Ok(outcome) => {
             drop(store);
+            publish_namespace_change(&state);
             spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
             let mut cluster = state.cluster.lock().await;
@@ -2263,6 +2315,7 @@ async fn complete_chunked_upload(
     {
         Ok(outcome) => {
             drop(store);
+            publish_namespace_change(&state);
             spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
             let mut cluster = state.cluster.lock().await;
@@ -2331,6 +2384,9 @@ async fn delete_object(
     Path(key): Path<String>,
     Query(query): Query<PutObjectQuery>,
 ) -> impl IntoResponse {
+    if key.trim().is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
     if query.version_id.is_some() && !query.internal_replication {
         return StatusCode::BAD_REQUEST;
     }
@@ -2340,27 +2396,58 @@ async fn delete_object(
         Some("provisional") => VersionConsistencyState::Provisional,
         Some(_) => return StatusCode::BAD_REQUEST,
     };
+    let recursive = query.recursive
+        || (key.ends_with('/') && !query.internal_replication && query.version_id.is_none());
+    if recursive && (!query.parent.is_empty() || query.version_id.is_some()) {
+        return StatusCode::BAD_REQUEST;
+    }
 
     let mut store = state.store.lock().await;
-    match store
-        .tombstone_object(
-            &key,
-            PutOptions {
-                parent_version_ids: query.parent,
-                state: version_state,
-                inherit_preferred_parent: true,
-                create_snapshot: !query.internal_replication,
-                explicit_version_id: query.version_id,
-            },
-        )
-        .await
-    {
-        Ok(version_id) => {
+    let delete_result = if recursive {
+        store
+            .tombstone_subtree(
+                &key,
+                PutOptions {
+                    parent_version_ids: query.parent,
+                    state: version_state,
+                    inherit_preferred_parent: true,
+                    create_snapshot: !query.internal_replication,
+                    explicit_version_id: query.version_id,
+                },
+            )
+            .await
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|entry| (entry.path, entry.version_id))
+                    .collect::<Vec<_>>()
+            })
+    } else {
+        store
+            .tombstone_object(
+                &key,
+                PutOptions {
+                    parent_version_ids: query.parent,
+                    state: version_state,
+                    inherit_preferred_parent: true,
+                    create_snapshot: !query.internal_replication,
+                    explicit_version_id: query.version_id,
+                },
+            )
+            .await
+            .map(|version_id| vec![(key.clone(), version_id)])
+    };
+
+    match delete_result {
+        Ok(deleted_paths) => {
             drop(store);
+            publish_namespace_change(&state);
 
             let mut cluster = state.cluster.lock().await;
-            cluster.note_replica(&key, state.node_id);
-            cluster.note_replica(format!("{}@{}", key, version_id), state.node_id);
+            for (deleted_path, version_id) in &deleted_paths {
+                cluster.note_replica(deleted_path, state.node_id);
+                cluster.note_replica(format!("{}@{}", deleted_path, version_id), state.node_id);
+            }
             drop(cluster);
 
             if let Err(err) = persist_cluster_replicas_state(&state).await {
@@ -2390,11 +2477,21 @@ async fn delete_object(
                 });
             }
 
-            info!(key = %key, version_id = %version_id, "tombstoned object");
+            info!(
+                key = %key,
+                recursive,
+                deleted_paths = deleted_paths.len(),
+                "tombstoned object path(s)"
+            );
             StatusCode::CREATED
         }
         Err(err) => {
-            tracing::error!(error = %err, key = %key, "failed to tombstone object");
+            tracing::error!(
+                error = %err,
+                key = %key,
+                recursive,
+                "failed to tombstone object path(s)"
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -2484,13 +2581,79 @@ async fn list_store_index(
         }
     }
 
-    (
+    let mut response = (
         StatusCode::OK,
         Json(StoreIndexResponse {
             prefix,
             depth,
             entry_count: entries.len(),
             entries,
+        }),
+    )
+        .into_response();
+    let change_sequence = state.namespace_change_sequence.load(Ordering::SeqCst);
+    if let Ok(header_value) = HeaderValue::from_str(&change_sequence.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-change-sequence", header_value);
+    }
+    response
+}
+
+async fn wait_for_store_index_change(
+    State(state): State<ServerState>,
+    Query(query): Query<StoreIndexChangeWaitQuery>,
+) -> impl IntoResponse {
+    let since = query.since.unwrap_or(0);
+    let timeout_ms = query.timeout_ms.unwrap_or(25_000).clamp(250, 60_000);
+
+    let current = state.namespace_change_sequence.load(Ordering::SeqCst);
+    if current > since {
+        return (
+            StatusCode::OK,
+            Json(StoreIndexChangeWaitResponse {
+                sequence: current,
+                changed: true,
+            }),
+        )
+            .into_response();
+    }
+
+    let mut receiver = state.namespace_change_tx.subscribe();
+    if *receiver.borrow() > since {
+        return (
+            StatusCode::OK,
+            Json(StoreIndexChangeWaitResponse {
+                sequence: *receiver.borrow(),
+                changed: true,
+            }),
+        )
+            .into_response();
+    }
+
+    let waited = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        loop {
+            if receiver.changed().await.is_err() {
+                return state.namespace_change_sequence.load(Ordering::SeqCst);
+            }
+            let sequence = *receiver.borrow_and_update();
+            if sequence > since {
+                return sequence;
+            }
+        }
+    })
+    .await;
+
+    let sequence = match waited {
+        Ok(sequence) => sequence,
+        Err(_) => state.namespace_change_sequence.load(Ordering::SeqCst),
+    };
+
+    (
+        StatusCode::OK,
+        Json(StoreIndexChangeWaitResponse {
+            sequence,
+            changed: sequence > since,
         }),
     )
         .into_response()
@@ -3511,6 +3674,7 @@ async fn drop_replication_subject(
     };
 
     if dropped {
+        publish_namespace_change(&state);
         let mut cluster = state.cluster.lock().await;
         cluster.remove_replica(&query.key, state.node_id);
         if let Some(version_id) = &query.version_id {
@@ -3707,6 +3871,8 @@ async fn execute_replication_cleanup(
 struct ReplicationManifestPushQuery {
     key: String,
     version_id: Option<String>,
+    #[serde(default)]
+    parent_version_ids_json: Option<String>,
     state: VersionConsistencyState,
     manifest_hash: String,
 }
@@ -3789,12 +3955,29 @@ async fn push_replication_manifest(
     Query(query): Query<ReplicationManifestPushQuery>,
     payload: Bytes,
 ) -> impl IntoResponse {
+    let parent_version_ids = match query.parent_version_ids_json.as_deref() {
+        Some(raw) => match serde_json::from_str::<Vec<String>>(raw) {
+            Ok(parent_version_ids) => parent_version_ids,
+            Err(err) => {
+                tracing::warn!(
+                    key = %query.key,
+                    version_id = ?query.version_id,
+                    error = %err,
+                    "failed decoding replication manifest parent_version_ids"
+                );
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        },
+        None => Vec::new(),
+    };
+
     let import_result = {
         let mut store = state.store.lock().await;
         store
             .import_replica_manifest(
                 &query.key,
                 query.version_id.as_deref(),
+                &parent_version_ids,
                 query.state,
                 &query.manifest_hash,
                 &payload,
@@ -3804,6 +3987,7 @@ async fn push_replication_manifest(
 
     match import_result {
         Ok(version_id) => {
+            publish_namespace_change(&state);
             let mut cluster = state.cluster.lock().await;
             cluster.note_replica(&query.key, state.node_id);
             cluster.note_replica(format!("{}@{}", query.key, version_id), state.node_id);

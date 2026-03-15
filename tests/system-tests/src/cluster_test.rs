@@ -11,6 +11,7 @@ mod tests {
     use crate::framework::*;
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
+    use client_sdk::IronMeshClient;
     use reqwest::StatusCode;
     use tokio::time::sleep;
 
@@ -1420,6 +1421,144 @@ mod tests {
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
 
+        result
+    }
+
+    #[tokio::test]
+    async fn manual_replication_repair_propagates_remote_rename_as_old_path_removal() -> Result<()>
+    {
+        let bind_a = "127.0.0.1:19144";
+        let bind_b = "127.0.0.1:19145";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000009a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000009b2";
+
+        let data_a = fresh_data_dir("repair-rename-a");
+        let data_b = fresh_data_dir("repair-rename-b");
+
+        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let http = reqwest::Client::new();
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+            register_node(&http, &base_b, node_id_a, &base_a, "dc-a", "rack-1").await?;
+            wait_for_online_nodes(&http, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&http, &base_b, 2, 120).await?;
+
+            let from_path = "rename-gap-from.txt";
+            let to_path = "rename-gap-to.txt";
+            let payload = "rename-gap-payload";
+
+            http.put(format!("{base_a}/store/{from_path}"))
+                .body(payload)
+                .send()
+                .await?
+                .error_for_status()?;
+
+            http.post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            wait_for_object_payload(&http, &base_b, from_path, payload, 120).await?;
+
+            http.post(format!("{base_a}/store/rename"))
+                .json(&serde_json::json!({
+                    "from_path": from_path,
+                    "to_path": to_path,
+                    "overwrite": false,
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            http.post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                let new_resp = http.get(format!("{base_b}/store/{to_path}")).send().await?;
+                let old_resp = http
+                    .get(format!("{base_b}/store/{from_path}"))
+                    .send()
+                    .await?;
+
+                if new_resp.status() == StatusCode::OK && old_resp.status() == StatusCode::NOT_FOUND
+                {
+                    let new_body = new_resp.text().await?;
+                    assert_eq!(new_body, payload);
+                    return Ok::<(), anyhow::Error>(());
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+
+            bail!(
+                "peer did not converge rename semantics: expected {} to disappear and {} to appear",
+                from_path,
+                to_path
+            )
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn recursive_directory_delete_query_removes_remote_subtree() -> Result<()> {
+        let bind = "127.0.0.1:19146";
+        let base_url = format!("http://{bind}");
+        let sdk = IronMeshClient::new(&base_url);
+        let mut server = start_server(bind).await?;
+
+        let result = async {
+            for (key, payload) in [
+                ("docs/", Bytes::new()),
+                ("docs/a.txt", Bytes::from_static(b"a")),
+                ("docs/nested/", Bytes::new()),
+                ("docs/nested/b.txt", Bytes::from_static(b"b")),
+                ("keep.txt", Bytes::from_static(b"keep")),
+            ] {
+                sdk.put_large_aware(key, payload).await?;
+            }
+
+            sdk.delete_path("docs/").await?;
+
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                let index = sdk.store_index(None, 64, None).await?;
+                let docs_present = index.entries.iter().any(|entry| {
+                    entry.path == "docs" || entry.path == "docs/" || entry.path.starts_with("docs/")
+                });
+                let keep_present = index.entries.iter().any(|entry| entry.path == "keep.txt");
+                let docs_file_missing = sdk.get("docs/a.txt").await.is_err();
+                let nested_file_missing = sdk.get("docs/nested/b.txt").await.is_err();
+
+                if !docs_present && keep_present && docs_file_missing && nested_file_missing {
+                    let keep_bytes = sdk.get("keep.txt").await?;
+                    assert_eq!(keep_bytes.as_ref(), b"keep");
+                    return Ok::<(), anyhow::Error>(());
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+
+            bail!("recursive directory delete did not remove remote subtree")
+        }
+        .await;
+
+        stop_server(&mut server).await;
         result
     }
 

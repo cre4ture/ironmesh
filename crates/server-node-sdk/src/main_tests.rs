@@ -16,10 +16,11 @@ use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
 use axum::Router;
 use axum::body::Body;
 use axum::body::to_bytes;
-use axum::extract::{Json, State};
+use axum::extract::{Json, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use tokio::time::{Duration, Instant};
@@ -209,6 +210,72 @@ async fn client_auth_middleware_requires_valid_bearer_when_enabled() {
     cleanup_test_state(&state).await;
 }
 
+#[tokio::test]
+async fn store_index_change_wait_unblocks_after_put() {
+    let state = build_test_state(1, false).await;
+
+    let waiter_state = state.clone();
+    let waiter = tokio::spawn(async move {
+        let response = super::wait_for_store_index_change(
+            State(waiter_state),
+            Query(super::StoreIndexChangeWaitQuery {
+                since: Some(0),
+                timeout_ms: Some(2_000),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<super::StoreIndexChangeWaitResponse>(&body).unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let response = super::put_object(
+        State(state.clone()),
+        axum::extract::Path("notify.txt".to_string()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"notify-payload"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let payload = waiter.await.unwrap();
+    assert!(payload.changed);
+    assert!(payload.sequence >= 1);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn store_index_change_wait_times_out_without_mutation() {
+    let state = build_test_state(1, false).await;
+
+    let response = super::wait_for_store_index_change(
+        State(state.clone()),
+        Query(super::StoreIndexChangeWaitQuery {
+            since: Some(0),
+            timeout_ms: Some(250),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload = serde_json::from_slice::<super::StoreIndexChangeWaitResponse>(&body).unwrap();
+    assert!(!payload.changed);
+    assert_eq!(payload.sequence, 0);
+
+    cleanup_test_state(&state).await;
+}
+
 #[test]
 fn store_index_depth_groups_prefixes() {
     let keys = vec![
@@ -360,6 +427,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key() {
         parent: Vec::new(),
         version_id: None,
         internal_replication: false,
+        recursive: false,
     });
 
     let resp = super::delete_object(
@@ -378,6 +446,101 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key() {
         store.current_keys()
     };
     assert!(!keys.contains(&key));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn delete_object_handler_recursively_tombstones_directory_subtree() {
+    let state = build_test_state(1, false).await;
+
+    {
+        let mut locked = state.store.lock().await;
+        for (key, payload) in [
+            ("docs/", bytes::Bytes::from_static(b"")),
+            ("docs/a.txt", bytes::Bytes::from_static(b"a")),
+            ("docs/nested/", bytes::Bytes::from_static(b"")),
+            ("docs/nested/b.txt", bytes::Bytes::from_static(b"b")),
+            ("other/keep.txt", bytes::Bytes::from_static(b"keep")),
+        ] {
+            locked
+                .put_object_versioned(key, payload, PutOptions::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let query = axum::extract::Query(super::PutObjectQuery {
+        state: Some("confirmed".to_string()),
+        parent: Vec::new(),
+        version_id: None,
+        internal_replication: false,
+        recursive: true,
+    });
+
+    let resp = super::delete_object(
+        axum::extract::State(state.clone()),
+        axum::extract::Path("docs/".to_string()),
+        query,
+    )
+    .await;
+
+    let response = axum::response::IntoResponse::into_response(resp);
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    let keys = {
+        let store = state.store.lock().await;
+        store.current_keys()
+    };
+    assert!(
+        !keys
+            .iter()
+            .any(|key| key == "docs/" || key.starts_with("docs/"))
+    );
+    assert!(keys.contains(&"other/keep.txt".to_string()));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory_marker() {
+    let state = build_test_state(1, false).await;
+
+    {
+        let mut locked = state.store.lock().await;
+        locked
+            .put_object_versioned(
+                "docs/",
+                bytes::Bytes::from_static(b""),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let query = axum::extract::Query(super::PutObjectQuery {
+        state: Some("confirmed".to_string()),
+        parent: Vec::new(),
+        version_id: Some("repl-tomb-docs-marker".to_string()),
+        internal_replication: true,
+        recursive: false,
+    });
+
+    let resp = super::delete_object(
+        axum::extract::State(state.clone()),
+        axum::extract::Path("docs/".to_string()),
+        query,
+    )
+    .await;
+
+    let response = axum::response::IntoResponse::into_response(resp);
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    let keys = {
+        let store = state.store.lock().await;
+        store.current_keys()
+    };
+    assert!(!keys.contains(&"docs/".to_string()));
 
     cleanup_test_state(&state).await;
 }
@@ -666,6 +829,306 @@ async fn local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes()
 }
 
 #[tokio::test]
+async fn local_edge_pulls_upstream_delete_after_repair() {
+    let upstream_dir = fresh_test_dir("edge-upstream-delete-source");
+    let upstream_bind_addr = free_bind_addr();
+    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
+    upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
+    upstream_config.public_peer_api_enabled = true;
+    upstream_config.replication_factor = 2;
+    let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
+
+    let http = reqwest::Client::new();
+    let upstream_base_url = format!("http://{upstream_bind_addr}");
+    wait_for_http_status(
+        &http,
+        &format!("{upstream_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let remote_key = "remote-delete.txt";
+    let remote_payload = "delete-from-upstream";
+    let response = http
+        .put(format!("{upstream_base_url}/store/{remote_key}"))
+        .body(remote_payload.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let edge_dir = fresh_test_dir("edge-upstream-delete-target");
+    let edge_bind_addr = free_bind_addr();
+    let mut edge_config =
+        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
+    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
+    edge_config.replica_view_sync_interval_secs = 1;
+    edge_config.startup_repair_delay_secs = 0;
+    let edge_handle = tokio::spawn(async move { run(edge_config).await });
+    let edge_base_url = format!("http://{edge_bind_addr}");
+    wait_for_http_status(
+        &http,
+        &format!("{edge_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_condition("edge sees upstream node", Duration::from_secs(5), || {
+        let http = http.clone();
+        let edge_base_url = edge_base_url.clone();
+        let upstream_base_url = upstream_base_url.clone();
+        async move {
+            let response = match http
+                .get(format!("{edge_base_url}/cluster/nodes"))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => return false,
+            };
+            let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
+                return false;
+            };
+
+            nodes.iter().any(|node| {
+                node.public_url == upstream_base_url || node.internal_url == upstream_base_url
+            })
+        }
+    })
+    .await;
+
+    let repair_response = http
+        .post(format!("{edge_base_url}/cluster/replication/repair"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repair_response.status(), StatusCode::OK);
+
+    wait_for_condition(
+        "edge pulls upstream object before delete",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let edge_base_url = edge_base_url.clone();
+            let remote_key = remote_key.to_string();
+            async move {
+                match http
+                    .get(format!("{edge_base_url}/store/{remote_key}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status() == StatusCode::OK => {
+                        match response.text().await {
+                            Ok(body) => body == remote_payload,
+                            Err(_) => false,
+                        }
+                    }
+                    _ => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    let response = http
+        .delete(format!("{upstream_base_url}/store/{remote_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    wait_for_condition(
+        "upstream removes deleted object from current state",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let upstream_base_url = upstream_base_url.clone();
+            let remote_key = remote_key.to_string();
+            async move {
+                match http
+                    .get(format!("{upstream_base_url}/store/{remote_key}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response.status() == StatusCode::NOT_FOUND,
+                    Err(_) => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    wait_for_condition(
+        "edge removes upstream-deleted object after repair",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let edge_base_url = edge_base_url.clone();
+            let remote_key = remote_key.to_string();
+            async move {
+                let _ = http
+                    .post(format!("{edge_base_url}/cluster/replication/repair"))
+                    .send()
+                    .await;
+                match http
+                    .get(format!("{edge_base_url}/store/{remote_key}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response.status() == StatusCode::NOT_FOUND,
+                    Err(_) => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    edge_handle.abort();
+    let _ = edge_handle.await;
+    upstream_handle.abort();
+    let _ = upstream_handle.await;
+    let _ = std::fs::remove_dir_all(&edge_dir);
+    let _ = std::fs::remove_dir_all(&upstream_dir);
+}
+
+#[tokio::test]
+async fn local_edge_pulls_upstream_copy_after_repair() {
+    let upstream_dir = fresh_test_dir("edge-upstream-copy-source");
+    let upstream_bind_addr = free_bind_addr();
+    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
+    upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
+    upstream_config.public_peer_api_enabled = true;
+    upstream_config.replication_factor = 2;
+    let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
+
+    let http = reqwest::Client::new();
+    let upstream_base_url = format!("http://{upstream_bind_addr}");
+    wait_for_http_status(
+        &http,
+        &format!("{upstream_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let source_key = "copy-source.txt";
+    let copy_key = "copy-target.txt";
+    let payload = "copy-upstream-payload";
+    let response = http
+        .put(format!("{upstream_base_url}/store/{source_key}"))
+        .body(payload.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let edge_dir = fresh_test_dir("edge-upstream-copy-target");
+    let edge_bind_addr = free_bind_addr();
+    let mut edge_config =
+        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
+    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
+    edge_config.replica_view_sync_interval_secs = 1;
+    edge_config.startup_repair_delay_secs = 0;
+    let edge_handle = tokio::spawn(async move { run(edge_config).await });
+    let edge_base_url = format!("http://{edge_bind_addr}");
+    wait_for_http_status(
+        &http,
+        &format!("{edge_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    http.post(format!("{edge_base_url}/cluster/replication/repair"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    wait_for_condition(
+        "edge pulls upstream source before copy",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let edge_base_url = edge_base_url.clone();
+            let source_key = source_key.to_string();
+            async move {
+                match http
+                    .get(format!("{edge_base_url}/store/{source_key}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status() == StatusCode::OK => response
+                        .text()
+                        .await
+                        .map(|body| body == payload)
+                        .unwrap_or(false),
+                    _ => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    http.post(format!("{upstream_base_url}/store/copy"))
+        .json(&serde_json::json!({
+            "from_path": source_key,
+            "to_path": copy_key,
+            "overwrite": false,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    wait_for_condition(
+        "edge pulls upstream copy after repair",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let edge_base_url = edge_base_url.clone();
+            let source_key = source_key.to_string();
+            let copy_key = copy_key.to_string();
+            async move {
+                let source = http
+                    .get(format!("{edge_base_url}/store/{source_key}"))
+                    .send()
+                    .await;
+                let copy = http
+                    .get(format!("{edge_base_url}/store/{copy_key}"))
+                    .send()
+                    .await;
+
+                match (source, copy) {
+                    (Ok(source_response), Ok(copy_response))
+                        if source_response.status() == StatusCode::OK
+                            && copy_response.status() == StatusCode::OK =>
+                    {
+                        let source_body = source_response.text().await.ok();
+                        let copy_body = copy_response.text().await.ok();
+                        source_body.as_deref() == Some(payload)
+                            && copy_body.as_deref() == Some(payload)
+                    }
+                    _ => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    edge_handle.abort();
+    let _ = edge_handle.await;
+    upstream_handle.abort();
+    let _ = upstream_handle.await;
+    let _ = std::fs::remove_dir_all(&edge_dir);
+    let _ = std::fs::remove_dir_all(&upstream_dir);
+}
+
+#[tokio::test]
 async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart() {
     let upstream_dir = fresh_test_dir("edge-upstream-restart-source");
     let upstream_bind_addr = free_bind_addr();
@@ -821,6 +1284,198 @@ async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart() {
     let _ = std::fs::remove_dir_all(&upstream_dir);
 }
 
+#[tokio::test]
+async fn local_edge_offline_write_survives_edge_restart_before_upstream_returns() {
+    let upstream_dir = fresh_test_dir("edge-upstream-restart-after-edge-restart-source");
+    let upstream_bind_addr = free_bind_addr();
+    let upstream_base_url = format!("http://{upstream_bind_addr}");
+    let upstream_node_id = NodeId::new_v4();
+    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
+    upstream_config.node_id = upstream_node_id;
+    upstream_config.public_url = Some(upstream_base_url.clone());
+    upstream_config.public_peer_api_enabled = true;
+    upstream_config.replication_factor = 2;
+    let upstream_restart_config = upstream_config.clone();
+    let mut upstream_handle = tokio::spawn(async move { run(upstream_config).await });
+
+    let http = reqwest::Client::new();
+    wait_for_http_status(
+        &http,
+        &format!("{upstream_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let edge_dir = fresh_test_dir("edge-upstream-restart-after-edge-restart-target");
+    let edge_bind_addr = free_bind_addr();
+    let edge_node_id = NodeId::new_v4();
+    let mut edge_config =
+        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
+    edge_config.node_id = edge_node_id;
+    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
+    edge_config.replica_view_sync_interval_secs = 1;
+    edge_config.startup_repair_delay_secs = 0;
+    let edge_restart_config = edge_config.clone();
+    let mut edge_handle = tokio::spawn(async move { run(edge_config).await });
+    let edge_base_url = format!("http://{edge_bind_addr}");
+    wait_for_http_status(
+        &http,
+        &format!("{edge_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_condition("edge sees upstream node", Duration::from_secs(5), || {
+        let http = http.clone();
+        let edge_base_url = edge_base_url.clone();
+        let upstream_base_url = upstream_base_url.clone();
+        async move {
+            let response = match http
+                .get(format!("{edge_base_url}/cluster/nodes"))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => return false,
+            };
+            let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
+                return false;
+            };
+
+            nodes.iter().any(|node| {
+                node.public_url == upstream_base_url || node.internal_url == upstream_base_url
+            })
+        }
+    })
+    .await;
+
+    upstream_handle.abort();
+    let _ = upstream_handle.await;
+
+    let offline_key = "offline-edge-restart-durable.txt";
+    let offline_payload = "persisted-across-edge-restart";
+    let response = http
+        .put(format!("{edge_base_url}/store/{offline_key}"))
+        .body(offline_payload.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    edge_handle.abort();
+    let _ = edge_handle.await;
+
+    edge_handle = tokio::spawn(async move { run(edge_restart_config).await });
+    wait_for_http_status(
+        &http,
+        &format!("{edge_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    upstream_handle = tokio::spawn(async move { run(upstream_restart_config).await });
+    wait_for_http_status(
+        &http,
+        &format!("{upstream_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_condition(
+        "restarted edge refreshes upstream peer after restart",
+        Duration::from_secs(5),
+        || {
+            let http = http.clone();
+            let edge_base_url = edge_base_url.clone();
+            let upstream_base_url = upstream_base_url.clone();
+            async move {
+                let response = match http
+                    .get(format!("{edge_base_url}/cluster/nodes"))
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => return false,
+                };
+                let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
+                    return false;
+                };
+
+                nodes.iter().any(|node| {
+                    (node.public_url == upstream_base_url || node.internal_url == upstream_base_url)
+                        && node.status == cluster::NodeStatus::Online
+                })
+            }
+        },
+    )
+    .await;
+
+    let repair_response = http
+        .post(format!("{edge_base_url}/cluster/replication/repair"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repair_response.status(), StatusCode::OK);
+
+    wait_for_condition(
+        "upstream receives durable offline object after edge restart",
+        Duration::from_secs(10),
+        || {
+            let http = http.clone();
+            let upstream_base_url = upstream_base_url.clone();
+            let offline_key = offline_key.to_string();
+            async move {
+                match http
+                    .get(format!("{upstream_base_url}/store/{offline_key}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status() == StatusCode::OK => {
+                        match response.text().await {
+                            Ok(body) => body == offline_payload,
+                            Err(_) => false,
+                        }
+                    }
+                    _ => false,
+                }
+            }
+        },
+    )
+    .await;
+
+    let versions: serde_json::Value = http
+        .get(format!("{upstream_base_url}/versions/{offline_key}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let version_count = versions
+        .get("versions")
+        .and_then(|value| value.as_array())
+        .map(|entries| entries.len())
+        .unwrap_or(0);
+    assert_eq!(
+        version_count, 1,
+        "expected exactly one synced version after repair"
+    );
+
+    edge_handle.abort();
+    let _ = edge_handle.await;
+    upstream_handle.abort();
+    let _ = upstream_handle.await;
+    let _ = std::fs::remove_dir_all(&edge_dir);
+    let _ = std::fs::remove_dir_all(&upstream_dir);
+}
+
 async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerState {
     let root = fresh_test_dir("startup-repair-main");
     let local_node_id = NodeId::new_v4();
@@ -862,6 +1517,7 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
         });
     }
 
+    let (namespace_change_tx, _) = tokio::sync::watch::channel(0);
     let state = ServerState {
         node_id: local_node_id,
         store: store.clone(),
@@ -891,6 +1547,8 @@ async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerSt
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        namespace_change_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        namespace_change_tx,
         admin_control: AdminControl::default(),
         client_auth_control: super::ClientAuthControl::default(),
     };

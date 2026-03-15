@@ -34,13 +34,13 @@ This document is the handover package for continuing cross-platform filesystem i
   - Live server hydration integration via `os-integration serve`:
     - Placeholder materialization from `/store/index`.
     - On-demand hydration from `GET /store/{key}`.
-    - Remote namespace refresh loop via periodic `/store/index` polling (`--remote-refresh-interval-ms`), implemented through `client-sdk` `RemoteSnapshotPoller` (`changed_paths` callback contract).
-- Linux FUSE live mount now also uses the same `client-sdk` polling abstraction to apply remote additions while mounted.
+    - Remote namespace refresh loop via server-driven `/store/index/changes/wait` long-poll notifications, with `client-sdk` polling fallback controlled by `--remote-refresh-interval-ms`.
+- Linux FUSE live mount now uses the same `client-sdk` remote refresh abstraction, driven by server notifications first and falling back to polling when needed.
+  - Shared delete semantics now treat directory-marker deletes such as `docs/` as recursive subtree tombstones on the server side.
   - Windows compile check lane added to CI.
 
 ### Not implemented yet
 
-- Real-time remote-change notifications (current implementation uses polling, not push notifications).
 - Android Rust-bridge alignment to consume `sync-core` directly.
 
 ## Source-of-truth files
@@ -152,7 +152,7 @@ Implement CFAPI behavior by mapping existing operations:
 ## Known caveats
 
 - Coverage gate currently excludes `crates/adapter-linux-fuse/` because runtime code is larger than current test surface.
-- Local-edge restart/offline coverage now exists, but some mount-level sync behavior is still driven by polling rather than push notifications.
+- Local-edge restart/offline coverage now exists, and live mount refresh prefers server notifications with polling fallback for compatibility.
 - Live server mode currently maps remote file versions to placeholder synthetic values for planning consistency.
 
 ## Suggested first task on Windows
@@ -167,4 +167,4 @@ Status: complete.
 
 ## Suggested next task on Windows
 
-Add a server-driven remote-change mechanism (SSE/WebSocket/long-poll) to reduce polling latency and index refresh load.
+Expand remote rename/delete parity coverage and then reduce compatibility polling further once mixed-version fallback is no longer required.

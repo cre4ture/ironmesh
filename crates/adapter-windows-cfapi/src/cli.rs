@@ -100,7 +100,10 @@ pub fn cli_main() -> anyhow::Result<()> {
             )?;
             let base_url = normalize_base_url(connection.base_url.as_str())?;
             let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
-            let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
+            let refresh_poller = RemoteSnapshotPoller::server_notifications(
+                Duration::from_secs(25),
+                refresh_interval,
+            );
             let device_auth = resolve_or_enroll_device_auth(
                 &base_url,
                 &registration.root_path,

@@ -146,9 +146,10 @@ Those bridges can be added incrementally without changing the workspace topology
 ## Cross-platform filesystem integration strategy
 
 - Cross-platform filesystem integration strategy, requirements, and phased plan are documented in [docs/cross-platform-filesystem-integration-strategy.md](docs/cross-platform-filesystem-integration-strategy.md).
-- Windows CFAPI and Linux FUSE adapters currently refresh remote namespace changes via periodic `/store/index` polling.
-  - Configure with `--remote-refresh-interval-ms` (default `3000`).
-  - Polling is implemented via `client-sdk` `RemoteSnapshotPoller`, which keeps the last snapshot in an SDK-owned thread and triggers adapter callbacks with `changed_paths`.
+- Windows CFAPI and Linux FUSE adapters now refresh remote namespace changes via server-driven `/store/index/changes/wait` long-poll notifications.
+  - Configure `--remote-refresh-interval-ms` (default `3000`) as the fallback polling/retry cadence.
+  - The shared `client-sdk` `RemoteSnapshotPoller` waits for server change notifications first, then refreshes snapshots and triggers adapter callbacks with `changed_paths`.
+- Directory-marker deletes sent through `client-sdk` now recurse on the server side, so deleting `docs/` removes the full `docs/**` subtree.
 
 ## Linux FUSE mount
 
@@ -178,7 +179,7 @@ Notes:
 - `--local-edge` starts a persistent local edge node and mounts against it instead of talking to the remote server directly.
 - By default, local-edge state is stored under `$XDG_STATE_HOME/ironmesh/os-integration/local-edge/` or `~/.local/state/ironmesh/os-integration/local-edge/`.
 - Use `--local-edge-data-dir` to override that storage path explicitly.
-- `--remote-refresh-interval-ms` controls how often the mounted view polls for namespace updates in live modes.
+- `--remote-refresh-interval-ms` controls fallback polling/retry cadence for namespace updates in live modes.
 - Snapshot mode is still available for debugging with `--snapshot-file`.
 
 ## Cross-environment handover

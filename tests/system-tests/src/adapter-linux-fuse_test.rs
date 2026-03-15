@@ -12,7 +12,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::process::Stdio;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::process::Command;
     use tokio::time::sleep;
 
@@ -220,9 +220,29 @@ mod tests {
         bail!("expected file {} to contain text", path.display());
     }
 
+    fn mounted_path_absent(path: &Path) -> bool {
+        if let Some(parent) = path.parent()
+            && let Ok(entries) = fs::read_dir(parent)
+        {
+            let target_name = path.file_name().and_then(|name| name.to_str());
+            let mut found = false;
+            for entry in entries.flatten() {
+                if entry.file_name().to_str() == target_name {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return true;
+            }
+        }
+
+        !path.exists()
+    }
+
     async fn wait_for_absence(path: &Path, retries: usize) -> Result<()> {
         for _ in 0..retries {
-            if !path.exists() {
+            if mounted_path_absent(path) {
                 return Ok(());
             }
             sleep(Duration::from_millis(100)).await;
@@ -304,6 +324,17 @@ mod tests {
         }
 
         bail!("server did not expose expected payload for key {key} after local-edge repair");
+    }
+
+    async fn trigger_local_edge_repair(local_edge_base_url: &str) {
+        let http = reqwest::Client::new();
+        let _ = http
+            .post(format!(
+                "{}/cluster/replication/repair",
+                local_edge_base_url.trim_end_matches('/')
+            ))
+            .send()
+            .await;
     }
 
     async fn wait_for_remote_directory_existence(
@@ -763,6 +794,186 @@ mod tests {
         result
     }
 
+    async fn run_remote_additions_refresh_local_edge_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-remote-refresh-local-edge");
+        let control_dir = fresh_data_dir("linux-fuse-remote-refresh-local-edge-control");
+        let upstream_data_dir = fresh_data_dir("linux-fuse-remote-refresh-local-edge-upstream");
+        let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
+        let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
+        let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            sdk.put_large_aware("seed-refresh.txt", Bytes::from_static(b"seed-refresh"))
+                .await?;
+
+            let mut adapter = start_linux_fuse_adapter_with_local_edge(
+                &base_url,
+                &local_edge_base_url_file,
+                &mountpoint,
+                250,
+            )
+            .await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-refresh.txt");
+                wait_for_mount_active(&mountpoint, 150).await?;
+                let local_edge_base_url =
+                    wait_for_file_text(&local_edge_base_url_file, 150).await?;
+                for _ in 0..220 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if seed_path.is_file() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_file(&seed_path, 40).await?;
+
+                sdk.put_large_aware(
+                    "live-refresh-local-edge/added.txt",
+                    Bytes::from_static(b"remote-refresh-content-local-edge"),
+                )
+                .await?;
+                sdk.put("live-refresh-local-edge/subdir/", Bytes::new())
+                    .await?;
+
+                let folder_path = mountpoint.join("live-refresh-local-edge");
+                let nested_folder_path = mountpoint.join("live-refresh-local-edge").join("subdir");
+                let file_path = mountpoint.join("live-refresh-local-edge").join("added.txt");
+
+                for _ in 0..220 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+
+                    if folder_path.is_dir() && nested_folder_path.is_dir() && file_path.is_file() {
+                        let hydrated = fs::read(&file_path).with_context(|| {
+                            format!("failed to read mounted file {}", file_path.display())
+                        })?;
+                        if hydrated == b"remote-refresh-content-local-edge" {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+
+                    sleep(Duration::from_millis(100)).await;
+                }
+
+                bail!(
+                    "local-edge mounted refresh did not materialize remote additions at {}",
+                    file_path.display()
+                )
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        let _ = fs::remove_dir_all(&control_dir);
+        let _ = fs::remove_dir_all(&upstream_data_dir);
+        result
+    }
+
+    async fn run_remote_delete_refresh_local_edge_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-remote-delete-local-edge");
+        let control_dir = fresh_data_dir("linux-fuse-remote-delete-local-edge-control");
+        let upstream_data_dir = fresh_data_dir("linux-fuse-remote-delete-local-edge-upstream");
+        let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
+        let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
+        let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            sdk.put_large_aware(
+                "seed-remote-delete-local-edge.txt",
+                Bytes::from_static(b"seed"),
+            )
+            .await?;
+
+            let mut adapter = start_linux_fuse_adapter_with_local_edge(
+                &base_url,
+                &local_edge_base_url_file,
+                &mountpoint,
+                250,
+            )
+            .await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-remote-delete-local-edge.txt");
+                wait_for_mount_active(&mountpoint, 150).await?;
+                let local_edge_base_url =
+                    wait_for_file_text(&local_edge_base_url_file, 150).await?;
+                for _ in 0..220 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if seed_path.is_file() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_file(&seed_path, 40).await?;
+
+                let unique = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let remote_file_payload = b"remote-file-delete-local-edge-payload".to_vec();
+                let remote_file = format!("remote-file-delete-local-edge-{unique}/from.txt");
+                sdk.put_large_aware(
+                    remote_file.clone(),
+                    Bytes::from(remote_file_payload.clone()),
+                )
+                .await?;
+
+                let mounted_remote_file = mountpoint.join(&remote_file);
+                for _ in 0..220 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if mounted_remote_file.is_file() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_file(&mounted_remote_file, 40).await?;
+                wait_for_file_bytes(&mounted_remote_file, &remote_file_payload, 40).await?;
+
+                sdk.delete_path(&remote_file).await?;
+                let local_edge_sdk = IronMeshClient::new(&local_edge_base_url);
+                wait_for_remote_file_absence(&local_edge_sdk, &remote_file, 80).await?;
+                for _ in 0..260 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if mounted_path_absent(&mounted_remote_file) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_absence(&mounted_remote_file, 40).await?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        let _ = fs::remove_dir_all(&control_dir);
+        let _ = fs::remove_dir_all(&upstream_data_dir);
+        result
+    }
+
     async fn run_remote_update_refresh_case(bind: &str) -> Result<()> {
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
@@ -1106,6 +1317,115 @@ mod tests {
         result
     }
 
+    async fn run_remote_file_rename_refresh_local_edge_case(bind: &str) -> Result<()> {
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let base_url = format!("http://{bind}");
+        let mountpoint = fresh_data_dir("linux-fuse-remote-rename-move-local-edge");
+        let control_dir = fresh_data_dir("linux-fuse-remote-rename-move-local-edge-control");
+        let upstream_data_dir = fresh_data_dir("linux-fuse-remote-rename-move-local-edge-upstream");
+        let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
+        let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
+        let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
+        let sdk = IronMeshClient::new(&base_url);
+
+        let result = async {
+            sdk.put_large_aware(
+                "seed-remote-rename-local-edge.txt",
+                Bytes::from_static(b"seed-remote-rename-local-edge"),
+            )
+            .await?;
+
+            let mut adapter = start_linux_fuse_adapter_with_local_edge(
+                &base_url,
+                &local_edge_base_url_file,
+                &mountpoint,
+                250,
+            )
+            .await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-remote-rename-local-edge.txt");
+                wait_for_mount_active(&mountpoint, 150).await?;
+                let local_edge_base_url =
+                    wait_for_file_text(&local_edge_base_url_file, 150).await?;
+                let local_edge_sdk = IronMeshClient::new(&local_edge_base_url);
+                for _ in 0..220 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if seed_path.is_file() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_file(&seed_path, 40).await?;
+
+                let remote_file_payload = b"remote-file-move-local-edge-payload".to_vec();
+                let remote_file_from = "remote-file-move-local-edge/from.txt";
+                let remote_file_to = "remote-file-move-local-edge/sub/renamed.txt";
+                sdk.put_large_aware(remote_file_from, Bytes::from(remote_file_payload.clone()))
+                    .await?;
+
+                let mounted_remote_file_from = mountpoint.join(remote_file_from);
+                for _ in 0..220 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if mounted_remote_file_from.is_file() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_file(&mounted_remote_file_from, 40).await?;
+
+                sdk.rename_path(remote_file_from, remote_file_to, false)
+                    .await?;
+                for _ in 0..120 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    let new_ready = local_edge_sdk
+                        .get(remote_file_to)
+                        .await
+                        .map(|bytes| bytes.as_ref() == remote_file_payload.as_slice())
+                        .unwrap_or(false);
+                    let old_missing = local_edge_sdk.get(remote_file_from).await.is_err();
+                    if new_ready && old_missing {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_object_bytes(&local_edge_sdk, remote_file_to, &remote_file_payload, 40)
+                    .await?;
+                wait_for_remote_file_absence(&local_edge_sdk, remote_file_from, 40).await?;
+
+                let mounted_remote_file_to = mountpoint.join(remote_file_to);
+                for _ in 0..260 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if mounted_remote_file_to.is_file()
+                        && mounted_path_absent(&mounted_remote_file_from)
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_file(&mounted_remote_file_to, 40).await?;
+                wait_for_file_bytes(&mounted_remote_file_to, &remote_file_payload, 40).await?;
+                wait_for_absence(&mounted_remote_file_from, 40).await?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        let _ = fs::remove_dir_all(&control_dir);
+        let _ = fs::remove_dir_all(&upstream_data_dir);
+        result
+    }
+
     async fn run_local_edge_upstream_restart_case(bind: &str) -> Result<()> {
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
@@ -1228,6 +1548,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linux_fuse_remote_additions_materialize_without_remount_in_local_edge_mode()
+    -> Result<()> {
+        run_remote_additions_refresh_local_edge_case("127.0.0.1:19372").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_remote_deletes_refresh_in_place_in_local_edge_mode() -> Result<()> {
+        run_remote_delete_refresh_local_edge_case("127.0.0.1:19373").await
+    }
+
+    #[tokio::test]
     async fn linux_fuse_remote_file_update_refreshes_without_remount() -> Result<()> {
         run_remote_update_refresh_case("127.0.0.1:19364").await
     }
@@ -1245,6 +1576,11 @@ mod tests {
     #[tokio::test]
     async fn linux_fuse_remote_file_and_folder_renames_moves_refresh_in_place() -> Result<()> {
         run_remote_rename_move_refresh_case("127.0.0.1:19367").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_remote_file_rename_refreshes_in_place_in_local_edge_mode() -> Result<()> {
+        run_remote_file_rename_refresh_local_edge_case("127.0.0.1:19374").await
     }
 
     #[tokio::test]

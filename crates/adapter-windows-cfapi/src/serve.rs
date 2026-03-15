@@ -103,7 +103,8 @@ pub fn serve_main() -> anyhow::Result<()> {
     let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
     let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
     let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
-    let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
+    let refresh_poller =
+        RemoteSnapshotPoller::server_notifications(Duration::from_secs(25), refresh_interval);
 
     let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
     let hydrator = Box::new(ServerNodeHydrator::new(
