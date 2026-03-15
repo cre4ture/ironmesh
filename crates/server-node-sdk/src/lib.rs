@@ -63,9 +63,9 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
 use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
 use storage::{
     AdminAuditEvent, ClientAuthState, DeviceAuthRecord, MediaCacheLookup, MediaCacheStatus,
-    MediaGpsCoordinates, ObjectReadMode, PairingTokenRecord, PathMutationResult, PersistentStore,
-    PutOptions, ReconcileVersionEntry, RepairAttemptRecord, StoreReadError, UploadChunkRef,
-    VersionConsistencyState,
+    MediaGpsCoordinates, MetadataBackendKind, ObjectReadMode, PairingTokenRecord,
+    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
+    StoreReadError, UploadChunkRef, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -437,6 +437,7 @@ pub struct ServerNodeConfig {
     pub mode: ServerNodeMode,
     pub node_id: NodeId,
     pub data_dir: PathBuf,
+    metadata_backend: MetadataBackendKind,
     pub bind_addr: SocketAddr,
     pub public_url: Option<String>,
     pub labels: HashMap<String, String>,
@@ -536,6 +537,32 @@ impl MetadataCommitMode {
                 "invalid IRONMESH_METADATA_COMMIT_MODE '{raw}', expected 'local' or 'quorum'"
             )),
         }
+    }
+}
+
+fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "sqlite" => Ok(MetadataBackendKind::Sqlite),
+        "turso" => {
+            #[cfg(feature = "turso-metadata")]
+            {
+                Ok(MetadataBackendKind::Turso)
+            }
+            #[cfg(not(feature = "turso-metadata"))]
+            {
+                bail!(
+                    "IRONMESH_METADATA_BACKEND='turso' requires rebuilding server-node-sdk with the 'turso-metadata' feature enabled"
+                )
+            }
+        }
+        other => bail!(
+            "invalid IRONMESH_METADATA_BACKEND '{other}', expected 'sqlite'{}",
+            if cfg!(feature = "turso-metadata") {
+                " or 'turso'"
+            } else {
+                ""
+            }
+        ),
     }
 }
 
@@ -668,6 +695,11 @@ impl ServerNodeConfig {
             mode,
             node_id,
             data_dir,
+            metadata_backend: parse_metadata_backend(
+                std::env::var("IRONMESH_METADATA_BACKEND")
+                    .unwrap_or_else(|_| "sqlite".to_string())
+                    .as_str(),
+            )?,
             bind_addr,
             public_url,
             labels,
@@ -800,6 +832,7 @@ impl ServerNodeConfig {
             mode: ServerNodeMode::LocalEdge,
             node_id: NodeId::new_v4(),
             data_dir: data_dir.into(),
+            metadata_backend: MetadataBackendKind::Sqlite,
             bind_addr,
             public_url: Some(format!("http://{bind_addr}")),
             labels,
@@ -852,6 +885,10 @@ impl ServerNodeConfig {
         config.replication_repair_backoff_secs = 1;
         config.startup_repair_enabled = true;
         config
+    }
+
+    fn metadata_backend(&self) -> MetadataBackendKind {
+        self.metadata_backend
     }
 
     fn repair_config(&self) -> RepairConfig {
@@ -1088,8 +1125,17 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     });
 
     let store = Arc::new(Mutex::new(
-        PersistentStore::init(config.data_dir.clone()).await?,
+        PersistentStore::init_with_metadata_backend(
+            config.data_dir.clone(),
+            config.metadata_backend(),
+        )
+        .await?,
     ));
+    info!(
+        data_dir = %config.data_dir.display(),
+        metadata_backend = ?config.metadata_backend(),
+        "server node metadata backend initialized"
+    );
 
     let internal_http = if let Some(internal_tls) = config.internal_tls.as_ref() {
         build_internal_mtls_http_client(

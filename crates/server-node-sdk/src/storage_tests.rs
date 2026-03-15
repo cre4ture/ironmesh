@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 
 fn test_store_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -34,6 +35,98 @@ fn sample_png_bytes() -> Vec<u8> {
         .write_to(&mut cursor, image::ImageFormat::Png)
         .unwrap();
     cursor.into_inner()
+}
+
+#[derive(Clone, Copy)]
+enum StorageTestBackend {
+    Sqlite,
+    #[cfg(feature = "turso-metadata")]
+    Turso,
+}
+
+impl StorageTestBackend {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => "turso",
+        }
+    }
+
+    async fn init_store(self, name: &str) -> (PathBuf, PersistentStore) {
+        let root = test_store_dir(&format!("{name}-{}", self.suffix()));
+        let store = self.open_store(root.clone()).await;
+        (root, store)
+    }
+
+    async fn open_store(self, root: PathBuf) -> PersistentStore {
+        match self {
+            Self::Sqlite => PersistentStore::init_with_sqlite_metadata(root.clone())
+                .await
+                .unwrap(),
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => PersistentStore::init_with_turso_metadata(root.clone())
+                .await
+                .unwrap(),
+        }
+    }
+}
+
+macro_rules! run_on_all_metadata_backends {
+    ($body:ident, $sqlite_test:ident, $turso_test:ident) => {
+        #[tokio::test]
+        async fn $sqlite_test() {
+            $body(StorageTestBackend::Sqlite).await;
+        }
+
+        #[cfg(feature = "turso-metadata")]
+        #[tokio::test]
+        async fn $turso_test() {
+            $body(StorageTestBackend::Turso).await;
+        }
+    };
+}
+
+async fn load_admin_audit_event_from_metadata_db(
+    backend: StorageTestBackend,
+    metadata_db_path: &Path,
+    event_id: &str,
+) -> AdminAuditEvent {
+    match backend {
+        StorageTestBackend::Sqlite => {
+            let db = rusqlite::Connection::open(metadata_db_path).unwrap();
+            let payload: Vec<u8> = db
+                .query_row(
+                    "SELECT event_json FROM admin_audit_events WHERE event_id = ?1",
+                    rusqlite::params![event_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_slice(&payload).unwrap()
+        }
+        #[cfg(feature = "turso-metadata")]
+        StorageTestBackend::Turso => {
+            let db = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT event_json FROM admin_audit_events WHERE event_id = ?1",
+                    (event_id,),
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("expected audit row");
+            let payload = match row.get_value(0).unwrap() {
+                turso::Value::Blob(value) => value,
+                turso::Value::Text(value) => value.into_bytes(),
+                other => panic!("unexpected audit payload type: {other:?}"),
+            };
+            serde_json::from_slice(&payload).unwrap()
+        }
+    }
 }
 
 #[test]
@@ -219,10 +312,8 @@ fn manifest_hash_provisional_allowed_picks_latest_head_regardless_of_state() {
     assert_eq!(selected.as_deref(), Some("m-v-provisional"));
 }
 
-#[tokio::test]
-async fn reconcile_marker_roundtrip_is_detected() {
-    let root = test_store_dir("reconcile-marker");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
+async fn reconcile_marker_roundtrip_is_detected_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("reconcile-marker").await;
 
     assert!(
         !store
@@ -246,10 +337,16 @@ async fn reconcile_marker_roundtrip_is_detected() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn list_provisional_versions_filters_and_sorts_by_key_then_time() {
-    let root = test_store_dir("provisional-list");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    reconcile_marker_roundtrip_is_detected_impl,
+    reconcile_marker_roundtrip_is_detected,
+    reconcile_marker_roundtrip_is_detected_turso
+);
+
+async fn list_provisional_versions_filters_and_sorts_by_key_then_time_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("provisional-list").await;
 
     store
         .put_object_versioned(
@@ -300,10 +397,14 @@ async fn list_provisional_versions_filters_and_sorts_by_key_then_time() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn cleanup_unreferenced_dry_run_reports_without_deleting() {
-    let root = test_store_dir("cleanup-dry-run");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    list_provisional_versions_filters_and_sorts_by_key_then_time_impl,
+    list_provisional_versions_filters_and_sorts_by_key_then_time,
+    list_provisional_versions_filters_and_sorts_by_key_then_time_turso
+);
+
+async fn cleanup_unreferenced_dry_run_reports_without_deleting_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cleanup-dry-run").await;
 
     let orphan_chunk_payload = b"orphan-chunk";
     let orphan_chunk_hash = hash_hex(orphan_chunk_payload);
@@ -342,10 +443,14 @@ async fn cleanup_unreferenced_dry_run_reports_without_deleting() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk() {
-    let root = test_store_dir("cleanup-delete");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    cleanup_unreferenced_dry_run_reports_without_deleting_impl,
+    cleanup_unreferenced_dry_run_reports_without_deleting,
+    cleanup_unreferenced_dry_run_reports_without_deleting_turso
+);
+
+async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("cleanup-delete").await;
 
     store
         .put_object_versioned(
@@ -398,10 +503,16 @@ async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index() {
-    let root = test_store_dir("tombstone-compact-dry-run");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl,
+    cleanup_unreferenced_deletes_orphan_manifest_and_chunk,
+    cleanup_unreferenced_deletes_orphan_manifest_and_chunk_turso
+);
+
+async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("tombstone-compact-dry-run").await;
 
     store
         .put_object_versioned(
@@ -413,7 +524,6 @@ async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index() {
         .unwrap();
     let before_delete = store.list_versions("gone").await.unwrap().unwrap();
     let object_id = before_delete.object_id.clone();
-    let index_path = store.version_index_path(&object_id);
 
     store
         .tombstone_object("gone", PutOptions::default())
@@ -427,15 +537,21 @@ async fn compact_tombstone_indexes_dry_run_reports_without_deleting_index() {
     assert_eq!(report.archived_indexes, 0);
     assert_eq!(report.removed_indexes, 0);
     assert!(report.archive_path.is_none());
-    assert!(fs::try_exists(&index_path).await.unwrap());
+    assert!(store.has_version_index(&object_id).await.unwrap());
 
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn compact_tombstone_indexes_archives_and_removes_old_tombstoned_index() {
-    let root = test_store_dir("tombstone-compact-delete");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    compact_tombstone_indexes_dry_run_reports_without_deleting_index_impl,
+    compact_tombstone_indexes_dry_run_reports_without_deleting_index,
+    compact_tombstone_indexes_dry_run_reports_without_deleting_index_turso
+);
+
+async fn compact_tombstone_indexes_archives_and_removes_old_tombstoned_index_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("tombstone-compact-delete").await;
 
     store
         .put_object_versioned(
@@ -447,7 +563,6 @@ async fn compact_tombstone_indexes_archives_and_removes_old_tombstoned_index() {
         .unwrap();
     let before_delete = store.list_versions("gone").await.unwrap().unwrap();
     let object_id = before_delete.object_id.clone();
-    let index_path = store.version_index_path(&object_id);
 
     store
         .tombstone_object("gone", PutOptions::default())
@@ -460,7 +575,7 @@ async fn compact_tombstone_indexes_archives_and_removes_old_tombstoned_index() {
     assert_eq!(report.removed_indexes, 1);
     let archive_path = report.archive_path.expect("archive path should exist");
     assert!(fs::try_exists(&archive_path).await.unwrap());
-    assert!(!fs::try_exists(&index_path).await.unwrap());
+    assert!(!store.has_version_index(&object_id).await.unwrap());
 
     let archive_bytes = fs::read(&archive_path).await.unwrap();
     assert!(!archive_bytes.is_empty());
@@ -468,10 +583,16 @@ async fn compact_tombstone_indexes_archives_and_removes_old_tombstoned_index() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn list_tombstone_archives_returns_metadata_for_compaction_artifacts() {
-    let root = test_store_dir("tombstone-archive-list");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    compact_tombstone_indexes_archives_and_removes_old_tombstoned_index_impl,
+    compact_tombstone_indexes_archives_and_removes_old_tombstoned_index,
+    compact_tombstone_indexes_archives_and_removes_old_tombstoned_index_turso
+);
+
+async fn list_tombstone_archives_returns_metadata_for_compaction_artifacts_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("tombstone-archive-list").await;
 
     store
         .put_object_versioned(
@@ -497,10 +618,16 @@ async fn list_tombstone_archives_returns_metadata_for_compaction_artifacts() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn restore_tombstone_index_from_archive_recreates_deleted_index() {
-    let root = test_store_dir("tombstone-archive-restore");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    list_tombstone_archives_returns_metadata_for_compaction_artifacts_impl,
+    list_tombstone_archives_returns_metadata_for_compaction_artifacts,
+    list_tombstone_archives_returns_metadata_for_compaction_artifacts_turso
+);
+
+async fn restore_tombstone_index_from_archive_recreates_deleted_index_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("tombstone-archive-restore").await;
 
     store
         .put_object_versioned(
@@ -512,13 +639,12 @@ async fn restore_tombstone_index_from_archive_recreates_deleted_index() {
         .unwrap();
     let before_delete = store.list_versions("gone").await.unwrap().unwrap();
     let object_id = before_delete.object_id.clone();
-    let index_path = store.version_index_path(&object_id);
     store
         .tombstone_object("gone", PutOptions::default())
         .await
         .unwrap();
     store.compact_tombstone_indexes(0, false).await.unwrap();
-    assert!(!fs::try_exists(&index_path).await.unwrap());
+    assert!(!store.has_version_index(&object_id).await.unwrap());
 
     let dry_run = store
         .restore_tombstone_index_from_archive(&object_id, None, false, true)
@@ -527,7 +653,7 @@ async fn restore_tombstone_index_from_archive_recreates_deleted_index() {
     assert!(dry_run.found);
     assert!(dry_run.would_restore);
     assert!(!dry_run.restored);
-    assert!(!fs::try_exists(&index_path).await.unwrap());
+    assert!(!store.has_version_index(&object_id).await.unwrap());
 
     let restored = store
         .restore_tombstone_index_from_archive(&object_id, None, false, false)
@@ -535,7 +661,7 @@ async fn restore_tombstone_index_from_archive_recreates_deleted_index() {
         .unwrap();
     assert!(restored.found);
     assert!(restored.restored);
-    assert!(fs::try_exists(&index_path).await.unwrap());
+    assert!(store.has_version_index(&object_id).await.unwrap());
 
     let skipped = store
         .restore_tombstone_index_from_archive(&object_id, None, false, false)
@@ -546,10 +672,14 @@ async fn restore_tombstone_index_from_archive_recreates_deleted_index() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn purge_tombstone_archives_dry_run_then_delete() {
-    let root = test_store_dir("tombstone-archive-purge");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    restore_tombstone_index_from_archive_recreates_deleted_index_impl,
+    restore_tombstone_index_from_archive_recreates_deleted_index,
+    restore_tombstone_index_from_archive_recreates_deleted_index_turso
+);
+
+async fn purge_tombstone_archives_dry_run_then_delete_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("tombstone-archive-purge").await;
 
     store
         .put_object_versioned(
@@ -578,10 +708,16 @@ async fn purge_tombstone_archives_dry_run_then_delete() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn append_admin_audit_event_writes_jsonl_log() {
-    let root = test_store_dir("admin-audit-log");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    purge_tombstone_archives_dry_run_then_delete_impl,
+    purge_tombstone_archives_dry_run_then_delete,
+    purge_tombstone_archives_dry_run_then_delete_turso
+);
+
+async fn append_admin_audit_event_roundtrips_via_metadata_backend_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, store) = backend.init_store("admin-audit-log").await;
 
     let event = AdminAuditEvent {
         event_id: "evt-1".to_string(),
@@ -597,15 +733,8 @@ async fn append_admin_audit_event_writes_jsonl_log() {
     };
     store.append_admin_audit_event(&event).await.unwrap();
 
-    let payload = fs::read(root.join("state").join("admin_audit.jsonl"))
-        .await
-        .unwrap();
-    let lines = payload
-        .split(|value| *value == b'\n')
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(lines.len(), 1);
-    let parsed: AdminAuditEvent = serde_json::from_slice(lines[0]).unwrap();
+    let parsed =
+        load_admin_audit_event_from_metadata_db(backend, &store.metadata_db_path, "evt-1").await;
     assert_eq!(parsed.event_id, "evt-1");
     assert_eq!(parsed.action, "maintenance/tombstones/compact");
     assert_eq!(parsed.actor.as_deref(), Some("ci"));
@@ -613,10 +742,14 @@ async fn append_admin_audit_event_writes_jsonl_log() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn load_repair_attempts_returns_empty_when_file_missing() {
-    let root = test_store_dir("repair-attempts-empty");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    append_admin_audit_event_roundtrips_via_metadata_backend_impl,
+    append_admin_audit_event_roundtrips_via_metadata_backend,
+    append_admin_audit_event_roundtrips_via_metadata_backend_turso
+);
+
+async fn load_repair_attempts_returns_empty_when_file_missing_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("repair-attempts-empty").await;
 
     let attempts = store.load_repair_attempts().await.unwrap();
     assert!(attempts.is_empty());
@@ -624,10 +757,14 @@ async fn load_repair_attempts_returns_empty_when_file_missing() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn persist_and_load_repair_attempts_roundtrip() {
-    let root = test_store_dir("repair-attempts-roundtrip");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    load_repair_attempts_returns_empty_when_file_missing_impl,
+    load_repair_attempts_returns_empty_when_file_missing,
+    load_repair_attempts_returns_empty_when_file_missing_turso
+);
+
+async fn persist_and_load_repair_attempts_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("repair-attempts-roundtrip").await;
 
     let mut attempts = HashMap::new();
     attempts.insert(
@@ -648,10 +785,14 @@ async fn persist_and_load_repair_attempts_roundtrip() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn drop_replica_subject_removes_version() {
-    let root = test_store_dir("drop-replica-subject");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    persist_and_load_repair_attempts_roundtrip_impl,
+    persist_and_load_repair_attempts_roundtrip,
+    persist_and_load_repair_attempts_roundtrip_turso
+);
+
+async fn drop_replica_subject_removes_version_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("drop-replica-subject").await;
 
     let put = store
         .put_object_versioned(
@@ -674,10 +815,18 @@ async fn drop_replica_subject_removes_version() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn list_replication_subjects_includes_all_heads_for_divergent_versions() {
-    let root = test_store_dir("replication-subjects-divergent-heads");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    drop_replica_subject_removes_version_impl,
+    drop_replica_subject_removes_version,
+    drop_replica_subject_removes_version_turso
+);
+
+async fn list_replication_subjects_includes_all_heads_for_divergent_versions_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("replication-subjects-divergent-heads")
+        .await;
 
     let first = store
         .put_object_versioned(
@@ -724,10 +873,16 @@ async fn list_replication_subjects_includes_all_heads_for_divergent_versions() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn tombstone_creates_tombstone_version_and_removes_current_key() {
-    let root = test_store_dir("tombstone-storage");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    list_replication_subjects_includes_all_heads_for_divergent_versions_impl,
+    list_replication_subjects_includes_all_heads_for_divergent_versions,
+    list_replication_subjects_includes_all_heads_for_divergent_versions_turso
+);
+
+async fn tombstone_creates_tombstone_version_and_removes_current_key_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("tombstone-storage").await;
 
     let _put = store
         .put_object_versioned(
@@ -770,10 +925,16 @@ async fn tombstone_creates_tombstone_version_and_removes_current_key() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn tombstone_replication_subjects_keep_deleted_head_version() {
-    let root = test_store_dir("tombstone-replication-subjects");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    tombstone_creates_tombstone_version_and_removes_current_key_impl,
+    tombstone_creates_tombstone_version_and_removes_current_key,
+    tombstone_creates_tombstone_version_and_removes_current_key_turso
+);
+
+async fn tombstone_replication_subjects_keep_deleted_head_version_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("tombstone-replication-subjects").await;
 
     store
         .put_object_versioned(
@@ -796,10 +957,16 @@ async fn tombstone_replication_subjects_keep_deleted_head_version() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn recursive_tombstone_removes_directory_marker_and_descendants() {
-    let root = test_store_dir("recursive-tombstone-subtree");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    tombstone_replication_subjects_keep_deleted_head_version_impl,
+    tombstone_replication_subjects_keep_deleted_head_version,
+    tombstone_replication_subjects_keep_deleted_head_version_turso
+);
+
+async fn recursive_tombstone_removes_directory_marker_and_descendants_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("recursive-tombstone-subtree").await;
 
     for (key, payload) in [
         ("docs/", Bytes::from_static(b"")),
@@ -863,10 +1030,14 @@ async fn recursive_tombstone_removes_directory_marker_and_descendants() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn export_replication_bundle_supports_tombstone_versions() {
-    let root = test_store_dir("tombstone-export-bundle");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    recursive_tombstone_removes_directory_marker_and_descendants_impl,
+    recursive_tombstone_removes_directory_marker_and_descendants,
+    recursive_tombstone_removes_directory_marker_and_descendants_turso
+);
+
+async fn export_replication_bundle_supports_tombstone_versions_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("tombstone-export-bundle").await;
 
     store
         .put_object_versioned(
@@ -904,10 +1075,14 @@ async fn export_replication_bundle_supports_tombstone_versions() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn rename_preserves_object_id_and_history() {
-    let root = test_store_dir("rename-preserves-object-id");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    export_replication_bundle_supports_tombstone_versions_impl,
+    export_replication_bundle_supports_tombstone_versions,
+    export_replication_bundle_supports_tombstone_versions_turso
+);
+
+async fn rename_preserves_object_id_and_history_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("rename-preserves-object-id").await;
 
     let put = store
         .put_object_versioned(
@@ -954,10 +1129,18 @@ async fn rename_preserves_object_id_and_history() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn rename_replication_subjects_include_source_path_deletion_event() {
-    let root = test_store_dir("rename-replication-subjects-source-delete");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    rename_preserves_object_id_and_history_impl,
+    rename_preserves_object_id_and_history,
+    rename_preserves_object_id_and_history_turso
+);
+
+async fn rename_replication_subjects_include_source_path_deletion_event_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("rename-replication-subjects-source-delete")
+        .await;
 
     store
         .put_object_versioned(
@@ -990,10 +1173,14 @@ async fn rename_replication_subjects_include_source_path_deletion_event() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn copy_creates_new_object_id_with_provenance() {
-    let root = test_store_dir("copy-provenance-object-id");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    rename_replication_subjects_include_source_path_deletion_event_impl,
+    rename_replication_subjects_include_source_path_deletion_event,
+    rename_replication_subjects_include_source_path_deletion_event_turso
+);
+
+async fn copy_creates_new_object_id_with_provenance_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("copy-provenance-object-id").await;
 
     let _ = store
         .put_object_versioned(
@@ -1068,10 +1255,14 @@ async fn copy_creates_new_object_id_with_provenance() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn load_cluster_replicas_returns_empty_when_file_missing() {
-    let root = test_store_dir("cluster-replicas-empty");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    copy_creates_new_object_id_with_provenance_impl,
+    copy_creates_new_object_id_with_provenance,
+    copy_creates_new_object_id_with_provenance_turso
+);
+
+async fn load_cluster_replicas_returns_empty_when_file_missing_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-replicas-empty").await;
 
     let replicas = store.load_cluster_replicas().await.unwrap();
     assert!(replicas.is_empty());
@@ -1079,10 +1270,14 @@ async fn load_cluster_replicas_returns_empty_when_file_missing() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn explicit_version_id_is_idempotent_for_matching_manifest() {
-    let root = test_store_dir("explicit-version-id-idempotent");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    load_cluster_replicas_returns_empty_when_file_missing_impl,
+    load_cluster_replicas_returns_empty_when_file_missing,
+    load_cluster_replicas_returns_empty_when_file_missing_turso
+);
+
+async fn explicit_version_id_is_idempotent_for_matching_manifest_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("explicit-version-id-idempotent").await;
 
     let first = store
         .put_object_versioned(
@@ -1126,10 +1321,14 @@ async fn explicit_version_id_is_idempotent_for_matching_manifest() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn unchanged_upload_reuses_preferred_head_version() {
-    let root = test_store_dir("unchanged-upload-reuses-version");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    explicit_version_id_is_idempotent_for_matching_manifest_impl,
+    explicit_version_id_is_idempotent_for_matching_manifest,
+    explicit_version_id_is_idempotent_for_matching_manifest_turso
+);
+
+async fn unchanged_upload_reuses_preferred_head_version_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("unchanged-upload-reuses-version").await;
 
     let first = store
         .put_object_versioned(
@@ -1165,10 +1364,14 @@ async fn unchanged_upload_reuses_preferred_head_version() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn persist_and_load_cluster_replicas_roundtrip() {
-    let root = test_store_dir("cluster-replicas-roundtrip");
-    let store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    unchanged_upload_reuses_preferred_head_version_impl,
+    unchanged_upload_reuses_preferred_head_version,
+    unchanged_upload_reuses_preferred_head_version_turso
+);
+
+async fn persist_and_load_cluster_replicas_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-replicas-roundtrip").await;
 
     let mut replicas: HashMap<String, Vec<NodeId>> = HashMap::new();
     replicas.insert(
@@ -1184,10 +1387,57 @@ async fn persist_and_load_cluster_replicas_roundtrip() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn ensure_media_cache_generates_thumbnail_and_dimensions_for_png() {
-    let root = test_store_dir("media-cache-png");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    persist_and_load_cluster_replicas_roundtrip_impl,
+    persist_and_load_cluster_replicas_roundtrip,
+    persist_and_load_cluster_replicas_roundtrip_turso
+);
+
+async fn client_auth_state_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("client-auth-roundtrip").await;
+
+    let state = ClientAuthState {
+        pairing_tokens: vec![PairingTokenRecord {
+            token_id: "tok-1".to_string(),
+            token_hash: "hash-1".to_string(),
+            label: Some("laptop".to_string()),
+            created_at_unix: 11,
+            expires_at_unix: 22,
+            used_at_unix: None,
+            enrolled_device_id: None,
+        }],
+        devices: vec![DeviceAuthRecord {
+            device_id: "dev-1".to_string(),
+            label: Some("Pixel".to_string()),
+            token_hash: "hash-1".to_string(),
+            created_at_unix: 33,
+            revoked_at_unix: None,
+        }],
+    };
+
+    store.persist_client_auth_state(&state).await.unwrap();
+    let loaded = store.load_client_auth_state().await.unwrap();
+
+    assert_eq!(loaded.pairing_tokens.len(), 1);
+    assert_eq!(loaded.pairing_tokens[0].token_id, "tok-1");
+    assert_eq!(loaded.pairing_tokens[0].label.as_deref(), Some("laptop"));
+    assert_eq!(loaded.devices.len(), 1);
+    assert_eq!(loaded.devices[0].device_id, "dev-1");
+    assert_eq!(loaded.devices[0].label.as_deref(), Some("Pixel"));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    client_auth_state_roundtrip_impl,
+    client_auth_state_roundtrip,
+    client_auth_state_roundtrip_turso
+);
+
+async fn ensure_media_cache_generates_thumbnail_and_dimensions_for_png_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("media-cache-png").await;
 
     let put = store
         .put_object_versioned(
@@ -1221,10 +1471,16 @@ async fn ensure_media_cache_generates_thumbnail_and_dimensions_for_png() {
     let _ = fs::remove_dir_all(root).await;
 }
 
-#[tokio::test]
-async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes() {
-    let root = test_store_dir("media-cache-fingerprint");
-    let mut store = PersistentStore::init(root.clone()).await.unwrap();
+run_on_all_metadata_backends!(
+    ensure_media_cache_generates_thumbnail_and_dimensions_for_png_impl,
+    ensure_media_cache_generates_thumbnail_and_dimensions_for_png,
+    ensure_media_cache_generates_thumbnail_and_dimensions_for_png_turso
+);
+
+async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("media-cache-fingerprint").await;
     let payload = sample_png_bytes();
 
     let first = store
@@ -1269,3 +1525,121 @@ async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes() {
 
     let _ = fs::remove_dir_all(root).await;
 }
+
+run_on_all_metadata_backends!(
+    content_fingerprint_is_stable_across_distinct_keys_with_same_bytes_impl,
+    content_fingerprint_is_stable_across_distinct_keys_with_same_bytes,
+    content_fingerprint_is_stable_across_distinct_keys_with_same_bytes_turso
+);
+
+async fn metadata_roundtrips_current_state_version_indexes_and_snapshots_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("metadata-roundtrip").await;
+
+    store
+        .put_object_versioned(
+            "docs/hello.txt",
+            Bytes::from_static(b"v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "docs/hello.txt",
+            Bytes::from_static(b"v2"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let snapshots_before = store.list_snapshots().await.unwrap();
+    assert!(snapshots_before.len() >= 2);
+
+    let before = store
+        .list_versions("docs/hello.txt")
+        .await
+        .unwrap()
+        .expect("expected version history");
+    assert_eq!(before.versions.len(), 2);
+
+    drop(store);
+
+    let reopened = backend.open_store(root.clone()).await;
+    assert_eq!(reopened.object_count(), 1);
+    assert_eq!(reopened.current_keys(), vec!["docs/hello.txt".to_string()]);
+
+    let payload = reopened
+        .get_object("docs/hello.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(payload.as_ref(), b"v2");
+
+    let after = reopened
+        .list_versions("docs/hello.txt")
+        .await
+        .unwrap()
+        .expect("expected version history after reopen");
+    assert_eq!(after.object_id, before.object_id);
+    assert_eq!(after.versions.len(), 2);
+    assert_eq!(
+        reopened.list_snapshots().await.unwrap().len(),
+        snapshots_before.len()
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_roundtrips_current_state_version_indexes_and_snapshots_impl,
+    metadata_roundtrips_current_state_version_indexes_and_snapshots,
+    metadata_roundtrips_current_state_version_indexes_and_snapshots_turso
+);
+
+async fn metadata_roundtrips_media_cache_metadata_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("metadata-media-cache").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/cat.png",
+            Bytes::from(sample_png_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let generated = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected media metadata");
+    assert_eq!(generated.status, MediaCacheStatus::Ready);
+
+    drop(store);
+
+    let reopened = backend.open_store(root.clone()).await;
+    let lookup = reopened
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected cached media lookup after reopen");
+
+    assert_eq!(lookup.content_fingerprint, generated.content_fingerprint);
+    let metadata = lookup.metadata.expect("expected metadata payload");
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert_eq!(metadata.width, Some(4));
+    assert_eq!(metadata.height, Some(3));
+    assert!(metadata.thumbnail.is_some());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_roundtrips_media_cache_metadata_impl,
+    metadata_roundtrips_media_cache_metadata,
+    metadata_roundtrips_media_cache_metadata_turso
+);

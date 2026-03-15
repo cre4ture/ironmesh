@@ -26,6 +26,46 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use tokio::time::{Duration, Instant};
 use tower::ServiceExt;
 
+#[derive(Clone, Copy)]
+enum MainTestBackend {
+    Sqlite,
+    #[cfg(feature = "turso-metadata")]
+    Turso,
+}
+
+impl MainTestBackend {
+    fn kind(self) -> super::storage::MetadataBackendKind {
+        match self {
+            Self::Sqlite => super::storage::MetadataBackendKind::Sqlite,
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => super::storage::MetadataBackendKind::Turso,
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => "turso",
+        }
+    }
+}
+
+macro_rules! run_on_main_metadata_backends {
+    ($body:ident, $sqlite_test:ident, $turso_test:ident) => {
+        #[tokio::test]
+        async fn $sqlite_test() {
+            $body(MainTestBackend::Sqlite).await;
+        }
+
+        #[cfg(feature = "turso-metadata")]
+        #[tokio::test]
+        async fn $turso_test() {
+            $body(MainTestBackend::Turso).await;
+        }
+    };
+}
+
 #[test]
 fn jittered_backoff_is_deterministic_for_same_inputs() {
     let first = jittered_backoff_secs(30, "key@ver|node", 2);
@@ -45,6 +85,27 @@ fn constant_time_eq_compares_equal_and_non_equal_values() {
     assert!(constant_time_eq(b"secret", b"secret"));
     assert!(!constant_time_eq(b"secret", b"Secret"));
     assert!(!constant_time_eq(b"secret", b"secret-long"));
+}
+
+#[test]
+fn metadata_backend_parser_accepts_sqlite() {
+    let backend = super::parse_metadata_backend("sqlite").unwrap();
+    assert!(matches!(
+        backend,
+        super::storage::MetadataBackendKind::Sqlite
+    ));
+}
+
+#[test]
+fn metadata_backend_parser_handles_turso_feature_gate() {
+    let result = super::parse_metadata_backend("turso");
+    #[cfg(feature = "turso-metadata")]
+    assert!(matches!(
+        result.unwrap(),
+        super::storage::MetadataBackendKind::Turso
+    ));
+    #[cfg(not(feature = "turso-metadata"))]
+    assert!(result.unwrap_err().to_string().contains("turso-metadata"));
 }
 
 fn sample_png_bytes() -> Vec<u8> {
@@ -70,9 +131,8 @@ fn token_matches_requires_exact_match() {
     assert!(token_matches("secret", Some("secret")));
 }
 
-#[tokio::test]
-async fn admin_authorization_requires_token_when_configured() {
-    let mut state = build_test_state(1, false).await;
+async fn admin_authorization_requires_token_when_configured_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
     let headers = HeaderMap::new();
 
@@ -90,9 +150,16 @@ async fn admin_authorization_requires_token_when_configured() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn admin_authorization_requires_explicit_approval_for_destructive_action() {
-    let mut state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    admin_authorization_requires_token_when_configured_impl,
+    admin_authorization_requires_token_when_configured,
+    admin_authorization_requires_token_when_configured_turso
+);
+
+async fn admin_authorization_requires_explicit_approval_for_destructive_action_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -114,9 +181,16 @@ async fn admin_authorization_requires_explicit_approval_for_destructive_action()
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn enroll_client_device_consumes_pairing_token_and_persists_device() {
-    let state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    admin_authorization_requires_explicit_approval_for_destructive_action_impl,
+    admin_authorization_requires_explicit_approval_for_destructive_action,
+    admin_authorization_requires_explicit_approval_for_destructive_action_turso
+);
+
+async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
     let now = super::unix_ts();
     {
         let mut auth = state.client_auth.lock().await;
@@ -160,9 +234,14 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn client_auth_middleware_requires_valid_bearer_when_enabled() {
-    let mut state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    enroll_client_device_consumes_pairing_token_and_persists_device_impl,
+    enroll_client_device_consumes_pairing_token_and_persists_device,
+    enroll_client_device_consumes_pairing_token_and_persists_device_turso
+);
+
+async fn client_auth_middleware_requires_valid_bearer_when_enabled_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
     state.client_auth_control.require_client_auth = true;
     {
         let mut auth = state.client_auth.lock().await;
@@ -210,9 +289,14 @@ async fn client_auth_middleware_requires_valid_bearer_when_enabled() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn store_index_change_wait_unblocks_after_put() {
-    let state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    client_auth_middleware_requires_valid_bearer_when_enabled_impl,
+    client_auth_middleware_requires_valid_bearer_when_enabled,
+    client_auth_middleware_requires_valid_bearer_when_enabled_turso
+);
+
+async fn store_index_change_wait_unblocks_after_put_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
 
     let waiter_state = state.clone();
     let waiter = tokio::spawn(async move {
@@ -254,9 +338,14 @@ async fn store_index_change_wait_unblocks_after_put() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn store_index_change_wait_times_out_without_mutation() {
-    let state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    store_index_change_wait_unblocks_after_put_impl,
+    store_index_change_wait_unblocks_after_put,
+    store_index_change_wait_unblocks_after_put_turso
+);
+
+async fn store_index_change_wait_times_out_without_mutation_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
 
     let response = super::wait_for_store_index_change(
         State(state.clone()),
@@ -275,6 +364,12 @@ async fn store_index_change_wait_times_out_without_mutation() {
 
     cleanup_test_state(&state).await;
 }
+
+run_on_main_metadata_backends!(
+    store_index_change_wait_times_out_without_mutation_impl,
+    store_index_change_wait_times_out_without_mutation,
+    store_index_change_wait_times_out_without_mutation_turso
+);
 
 #[test]
 fn store_index_depth_groups_prefixes() {
@@ -338,9 +433,8 @@ fn internal_replication_put_url_sets_internal_flag() {
     assert!(url.contains("internal_replication=true"));
 }
 
-#[tokio::test]
-async fn repair_busy_threshold_returns_immediately_when_disabled() {
-    let mut state = build_test_state(1, false).await;
+async fn repair_busy_threshold_returns_immediately_when_disabled_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
     state.repair_config.busy_throttle_enabled = false;
     state
         .inflight_requests
@@ -353,9 +447,14 @@ async fn repair_busy_threshold_returns_immediately_when_disabled() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn repair_busy_threshold_waits_until_load_drops() {
-    let mut state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    repair_busy_threshold_returns_immediately_when_disabled_impl,
+    repair_busy_threshold_returns_immediately_when_disabled,
+    repair_busy_threshold_returns_immediately_when_disabled_turso
+);
+
+async fn repair_busy_threshold_waits_until_load_drops_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
     state.repair_config.busy_throttle_enabled = true;
     state.repair_config.busy_inflight_threshold = 1;
     state.repair_config.busy_wait_millis = 5;
@@ -376,9 +475,14 @@ async fn repair_busy_threshold_waits_until_load_drops() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn startup_repair_noop_when_plan_is_empty() {
-    let state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    repair_busy_threshold_waits_until_load_drops_impl,
+    repair_busy_threshold_waits_until_load_drops,
+    repair_busy_threshold_waits_until_load_drops_turso
+);
+
+async fn startup_repair_noop_when_plan_is_empty_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
 
     let result = run_startup_replication_repair_once(&state, 0).await;
     assert!(result.is_none());
@@ -386,9 +490,14 @@ async fn startup_repair_noop_when_plan_is_empty() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn startup_repair_runs_when_gaps_exist() {
-    let state = build_test_state(2, true).await;
+run_on_main_metadata_backends!(
+    startup_repair_noop_when_plan_is_empty_impl,
+    startup_repair_noop_when_plan_is_empty,
+    startup_repair_noop_when_plan_is_empty_turso
+);
+
+async fn startup_repair_runs_when_gaps_exist_impl(backend: MainTestBackend) {
+    let state = build_test_state(2, true, backend).await;
 
     let result = run_startup_replication_repair_once(&state, 0).await;
     assert!(result.is_some());
@@ -403,9 +512,16 @@ async fn startup_repair_runs_when_gaps_exist() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn delete_object_handler_marks_tombstone_and_removes_current_key() {
-    let state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    startup_repair_runs_when_gaps_exist_impl,
+    startup_repair_runs_when_gaps_exist,
+    startup_repair_runs_when_gaps_exist_turso
+);
+
+async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
 
     // put an object into underlying store
     let key = "handler-delete-key".to_string();
@@ -450,9 +566,16 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn delete_object_handler_recursively_tombstones_directory_subtree() {
-    let state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    delete_object_handler_marks_tombstone_and_removes_current_key_impl,
+    delete_object_handler_marks_tombstone_and_removes_current_key,
+    delete_object_handler_marks_tombstone_and_removes_current_key_turso
+);
+
+async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
 
     {
         let mut locked = state.store.lock().await;
@@ -502,9 +625,16 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory_marker() {
-    let state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    delete_object_handler_recursively_tombstones_directory_subtree_impl,
+    delete_object_handler_recursively_tombstones_directory_subtree,
+    delete_object_handler_recursively_tombstones_directory_subtree_turso
+);
+
+async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory_marker_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
 
     {
         let mut locked = state.store.lock().await;
@@ -545,9 +675,14 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn list_store_index_includes_cached_media_metadata_for_images() {
-    let state = build_test_state(1, false).await;
+run_on_main_metadata_backends!(
+    delete_object_handler_allows_internal_versioned_tombstone_for_directory_marker_impl,
+    delete_object_handler_allows_internal_versioned_tombstone_for_directory_marker,
+    delete_object_handler_allows_internal_versioned_tombstone_for_directory_marker_turso
+);
+
+async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
     let put = {
         let mut locked = state.store.lock().await;
         locked
@@ -597,11 +732,17 @@ async fn list_store_index_includes_cached_media_metadata_for_images() {
     cleanup_test_state(&state).await;
 }
 
-#[tokio::test]
-async fn local_edge_mode_serves_health_without_internal_tls() {
+run_on_main_metadata_backends!(
+    list_store_index_includes_cached_media_metadata_for_images_impl,
+    list_store_index_includes_cached_media_metadata_for_images,
+    list_store_index_includes_cached_media_metadata_for_images_turso
+);
+
+async fn local_edge_mode_serves_health_without_internal_tls_impl(backend: MainTestBackend) {
     let bind_addr = free_bind_addr();
     let data_dir = std::env::temp_dir().join(format!(
-        "ironmesh-local-edge-{}-{}",
+        "ironmesh-local-edge-{}-{}-{}",
+        backend.suffix(),
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -611,6 +752,7 @@ async fn local_edge_mode_serves_health_without_internal_tls() {
 
     let mut config = ServerNodeConfig::local_edge(&data_dir, bind_addr);
     config.public_url = Some(format!("http://{bind_addr}"));
+    config.metadata_backend = backend.kind();
 
     let handle = tokio::spawn(async move { run(config).await });
     let client = reqwest::Client::new();
@@ -634,6 +776,99 @@ async fn local_edge_mode_serves_health_without_internal_tls() {
     started.unwrap();
 }
 
+run_on_main_metadata_backends!(
+    local_edge_mode_serves_health_without_internal_tls_impl,
+    local_edge_mode_serves_health_without_internal_tls,
+    local_edge_mode_serves_health_without_internal_tls_turso
+);
+
+async fn local_edge_persists_objects_across_restart_impl(
+    backend: super::storage::MetadataBackendKind,
+    label: &str,
+    payload: &str,
+) {
+    let bind_addr = free_bind_addr();
+    let data_dir = std::env::temp_dir().join(format!(
+        "ironmesh-local-edge-{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let mut config = ServerNodeConfig::local_edge(&data_dir, bind_addr);
+    config.public_url = Some(format!("http://{bind_addr}"));
+    config.metadata_backend = backend;
+
+    let handle = tokio::spawn(async move { run(config).await });
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{bind_addr}");
+    let health_url = format!("{base_url}/health");
+
+    wait_for_http_status(&client, &health_url, StatusCode::OK, Duration::from_secs(5)).await;
+
+    let put = client
+        .put(format!("{base_url}/store/persist.txt"))
+        .body(payload.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    handle.abort();
+    let _ = handle.await;
+
+    let restart_bind_addr = free_bind_addr();
+    let mut restart_config = ServerNodeConfig::local_edge(&data_dir, restart_bind_addr);
+    restart_config.public_url = Some(format!("http://{restart_bind_addr}"));
+    restart_config.metadata_backend = backend;
+
+    let restart_handle = tokio::spawn(async move { run(restart_config).await });
+    let restart_base_url = format!("http://{restart_bind_addr}");
+    wait_for_http_status(
+        &client,
+        &format!("{restart_base_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let get = client
+        .get(format!("{restart_base_url}/store/persist.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = get.text().await.unwrap();
+    assert_eq!(body, payload);
+
+    restart_handle.abort();
+    let _ = restart_handle.await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn local_edge_sqlite_persists_objects_across_restart() {
+    local_edge_persists_objects_across_restart_impl(
+        super::storage::MetadataBackendKind::Sqlite,
+        "sqlite",
+        "hello-sqlite",
+    )
+    .await;
+}
+
+#[cfg(feature = "turso-metadata")]
+#[tokio::test]
+async fn local_edge_turso_persists_objects_across_restart() {
+    local_edge_persists_objects_across_restart_impl(
+        super::storage::MetadataBackendKind::Turso,
+        "turso",
+        "hello-turso",
+    )
+    .await;
+}
+
 #[test]
 fn local_node_handle_starts_and_reports_base_url() {
     let data_dir = std::env::temp_dir().join(format!(
@@ -653,14 +888,16 @@ fn local_node_handle_starts_and_reports_base_url() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-#[tokio::test]
-async fn local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes() {
-    let upstream_dir = fresh_test_dir("edge-upstream-source");
+async fn local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes_impl(
+    backend: MainTestBackend,
+) {
+    let upstream_dir = fresh_test_dir(&format!("edge-upstream-source-{}", backend.suffix()));
     let upstream_bind_addr = free_bind_addr();
     let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
     upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
     upstream_config.public_peer_api_enabled = true;
     upstream_config.replication_factor = 2;
+    upstream_config.metadata_backend = backend.kind();
     let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
 
     let http = reqwest::Client::new();
@@ -682,13 +919,14 @@ async fn local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes()
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let edge_dir = fresh_test_dir("edge-upstream-target");
+    let edge_dir = fresh_test_dir(&format!("edge-upstream-target-{}", backend.suffix()));
     let edge_bind_addr = free_bind_addr();
     let mut edge_config =
         ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
     edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
     edge_config.replica_view_sync_interval_secs = 1;
     edge_config.startup_repair_delay_secs = 0;
+    edge_config.metadata_backend = backend.kind();
     let edge_handle = tokio::spawn(async move { run(edge_config).await });
     let edge_base_url = format!("http://{edge_bind_addr}");
     wait_for_http_status(
@@ -828,14 +1066,20 @@ async fn local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes()
     let _ = std::fs::remove_dir_all(&upstream_dir);
 }
 
-#[tokio::test]
-async fn local_edge_pulls_upstream_delete_after_repair() {
-    let upstream_dir = fresh_test_dir("edge-upstream-delete-source");
+run_on_main_metadata_backends!(
+    local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes_impl,
+    local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes,
+    local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes_turso
+);
+
+async fn local_edge_pulls_upstream_delete_after_repair_impl(backend: MainTestBackend) {
+    let upstream_dir = fresh_test_dir(&format!("edge-upstream-delete-source-{}", backend.suffix()));
     let upstream_bind_addr = free_bind_addr();
     let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
     upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
     upstream_config.public_peer_api_enabled = true;
     upstream_config.replication_factor = 2;
+    upstream_config.metadata_backend = backend.kind();
     let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
 
     let http = reqwest::Client::new();
@@ -858,13 +1102,14 @@ async fn local_edge_pulls_upstream_delete_after_repair() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let edge_dir = fresh_test_dir("edge-upstream-delete-target");
+    let edge_dir = fresh_test_dir(&format!("edge-upstream-delete-target-{}", backend.suffix()));
     let edge_bind_addr = free_bind_addr();
     let mut edge_config =
         ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
     edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
     edge_config.replica_view_sync_interval_secs = 1;
     edge_config.startup_repair_delay_secs = 0;
+    edge_config.metadata_backend = backend.kind();
     let edge_handle = tokio::spawn(async move { run(edge_config).await });
     let edge_base_url = format!("http://{edge_bind_addr}");
     wait_for_http_status(
@@ -993,14 +1238,20 @@ async fn local_edge_pulls_upstream_delete_after_repair() {
     let _ = std::fs::remove_dir_all(&upstream_dir);
 }
 
-#[tokio::test]
-async fn local_edge_pulls_upstream_copy_after_repair() {
-    let upstream_dir = fresh_test_dir("edge-upstream-copy-source");
+run_on_main_metadata_backends!(
+    local_edge_pulls_upstream_delete_after_repair_impl,
+    local_edge_pulls_upstream_delete_after_repair,
+    local_edge_pulls_upstream_delete_after_repair_turso
+);
+
+async fn local_edge_pulls_upstream_copy_after_repair_impl(backend: MainTestBackend) {
+    let upstream_dir = fresh_test_dir(&format!("edge-upstream-copy-source-{}", backend.suffix()));
     let upstream_bind_addr = free_bind_addr();
     let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
     upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
     upstream_config.public_peer_api_enabled = true;
     upstream_config.replication_factor = 2;
+    upstream_config.metadata_backend = backend.kind();
     let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
 
     let http = reqwest::Client::new();
@@ -1024,13 +1275,14 @@ async fn local_edge_pulls_upstream_copy_after_repair() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let edge_dir = fresh_test_dir("edge-upstream-copy-target");
+    let edge_dir = fresh_test_dir(&format!("edge-upstream-copy-target-{}", backend.suffix()));
     let edge_bind_addr = free_bind_addr();
     let mut edge_config =
         ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
     edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
     edge_config.replica_view_sync_interval_secs = 1;
     edge_config.startup_repair_delay_secs = 0;
+    edge_config.metadata_backend = backend.kind();
     let edge_handle = tokio::spawn(async move { run(edge_config).await });
     let edge_base_url = format!("http://{edge_bind_addr}");
     wait_for_http_status(
@@ -1128,9 +1380,19 @@ async fn local_edge_pulls_upstream_copy_after_repair() {
     let _ = std::fs::remove_dir_all(&upstream_dir);
 }
 
-#[tokio::test]
-async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart() {
-    let upstream_dir = fresh_test_dir("edge-upstream-restart-source");
+run_on_main_metadata_backends!(
+    local_edge_pulls_upstream_copy_after_repair_impl,
+    local_edge_pulls_upstream_copy_after_repair,
+    local_edge_pulls_upstream_copy_after_repair_turso
+);
+
+async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart_impl(
+    backend: MainTestBackend,
+) {
+    let upstream_dir = fresh_test_dir(&format!(
+        "edge-upstream-restart-source-{}",
+        backend.suffix()
+    ));
     let upstream_bind_addr = free_bind_addr();
     let upstream_base_url = format!("http://{upstream_bind_addr}");
     let upstream_node_id = NodeId::new_v4();
@@ -1139,6 +1401,7 @@ async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart() {
     upstream_config.public_url = Some(upstream_base_url.clone());
     upstream_config.public_peer_api_enabled = true;
     upstream_config.replication_factor = 2;
+    upstream_config.metadata_backend = backend.kind();
     let upstream_restart_config = upstream_config.clone();
     let mut upstream_handle = tokio::spawn(async move { run(upstream_config).await });
 
@@ -1151,13 +1414,17 @@ async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart() {
     )
     .await;
 
-    let edge_dir = fresh_test_dir("edge-upstream-restart-target");
+    let edge_dir = fresh_test_dir(&format!(
+        "edge-upstream-restart-target-{}",
+        backend.suffix()
+    ));
     let edge_bind_addr = free_bind_addr();
     let mut edge_config =
         ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
     edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
     edge_config.replica_view_sync_interval_secs = 1;
     edge_config.startup_repair_delay_secs = 0;
+    edge_config.metadata_backend = backend.kind();
     let edge_handle = tokio::spawn(async move { run(edge_config).await });
     let edge_base_url = format!("http://{edge_bind_addr}");
     wait_for_http_status(
@@ -1284,9 +1551,19 @@ async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart() {
     let _ = std::fs::remove_dir_all(&upstream_dir);
 }
 
-#[tokio::test]
-async fn local_edge_offline_write_survives_edge_restart_before_upstream_returns() {
-    let upstream_dir = fresh_test_dir("edge-upstream-restart-after-edge-restart-source");
+run_on_main_metadata_backends!(
+    local_edge_accepts_offline_write_and_syncs_after_upstream_restart_impl,
+    local_edge_accepts_offline_write_and_syncs_after_upstream_restart,
+    local_edge_accepts_offline_write_and_syncs_after_upstream_restart_turso
+);
+
+async fn local_edge_offline_write_survives_edge_restart_before_upstream_returns_impl(
+    backend: MainTestBackend,
+) {
+    let upstream_dir = fresh_test_dir(&format!(
+        "edge-upstream-restart-after-edge-restart-source-{}",
+        backend.suffix()
+    ));
     let upstream_bind_addr = free_bind_addr();
     let upstream_base_url = format!("http://{upstream_bind_addr}");
     let upstream_node_id = NodeId::new_v4();
@@ -1295,6 +1572,7 @@ async fn local_edge_offline_write_survives_edge_restart_before_upstream_returns(
     upstream_config.public_url = Some(upstream_base_url.clone());
     upstream_config.public_peer_api_enabled = true;
     upstream_config.replication_factor = 2;
+    upstream_config.metadata_backend = backend.kind();
     let upstream_restart_config = upstream_config.clone();
     let mut upstream_handle = tokio::spawn(async move { run(upstream_config).await });
 
@@ -1307,7 +1585,10 @@ async fn local_edge_offline_write_survives_edge_restart_before_upstream_returns(
     )
     .await;
 
-    let edge_dir = fresh_test_dir("edge-upstream-restart-after-edge-restart-target");
+    let edge_dir = fresh_test_dir(&format!(
+        "edge-upstream-restart-after-edge-restart-target-{}",
+        backend.suffix()
+    ));
     let edge_bind_addr = free_bind_addr();
     let edge_node_id = NodeId::new_v4();
     let mut edge_config =
@@ -1316,6 +1597,7 @@ async fn local_edge_offline_write_survives_edge_restart_before_upstream_returns(
     edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
     edge_config.replica_view_sync_interval_secs = 1;
     edge_config.startup_repair_delay_secs = 0;
+    edge_config.metadata_backend = backend.kind();
     let edge_restart_config = edge_config.clone();
     let mut edge_handle = tokio::spawn(async move { run(edge_config).await });
     let edge_base_url = format!("http://{edge_bind_addr}");
@@ -1476,12 +1758,24 @@ async fn local_edge_offline_write_survives_edge_restart_before_upstream_returns(
     let _ = std::fs::remove_dir_all(&upstream_dir);
 }
 
-async fn build_test_state(replication_factor: usize, seed_gap: bool) -> ServerState {
-    let root = fresh_test_dir("startup-repair-main");
+run_on_main_metadata_backends!(
+    local_edge_offline_write_survives_edge_restart_before_upstream_returns_impl,
+    local_edge_offline_write_survives_edge_restart_before_upstream_returns,
+    local_edge_offline_write_survives_edge_restart_before_upstream_returns_turso
+);
+
+async fn build_test_state(
+    replication_factor: usize,
+    seed_gap: bool,
+    backend: MainTestBackend,
+) -> ServerState {
+    let root = fresh_test_dir(&format!("startup-repair-main-{}", backend.suffix()));
     let local_node_id = NodeId::new_v4();
 
     let store = Arc::new(Mutex::new(
-        PersistentStore::init(root.clone()).await.unwrap(),
+        PersistentStore::init_with_metadata_backend(root.clone(), backend.kind())
+            .await
+            .unwrap(),
     ));
 
     let mut service = cluster::ClusterService::new(

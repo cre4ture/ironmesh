@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use exif::{In, Reader as ExifReader, Tag, Value};
@@ -13,6 +14,14 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+mod sqlite_impl;
+#[cfg(feature = "turso-metadata")]
+mod turso_impl;
+
+use self::sqlite_impl::SqliteMetadataStore;
+#[cfg(feature = "turso-metadata")]
+use self::turso_impl::TursoMetadataStore;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
@@ -379,21 +388,22 @@ pub struct MediaCacheLookup {
     pub metadata: Option<CachedMediaMetadata>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataBackendKind {
+    Sqlite,
+    #[cfg(feature = "turso-metadata")]
+    Turso,
+}
+
 pub struct PersistentStore {
     root_dir: PathBuf,
     chunks_dir: PathBuf,
     manifests_dir: PathBuf,
-    snapshots_dir: PathBuf,
-    versions_dir: PathBuf,
-    reconcile_markers_dir: PathBuf,
-    current_state_path: PathBuf,
-    repair_attempts_path: PathBuf,
-    cluster_replicas_path: PathBuf,
-    client_auth_state_path: PathBuf,
-    admin_audit_log_path: PathBuf,
-    media_metadata_dir: PathBuf,
+    metadata_db_path: PathBuf,
     media_thumbnails_dir: PathBuf,
     current_state: CurrentState,
+    metadata_store: Box<dyn MetadataStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,129 +424,138 @@ struct ArchivedTombstoneIndexRecord {
     index: FileVersionIndex,
 }
 
+#[async_trait]
+trait MetadataStore: Send + Sync {
+    async fn load_current_state(&self) -> Result<CurrentState>;
+    async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>>;
+    async fn persist_repair_attempts(
+        &self,
+        attempts: &HashMap<String, RepairAttemptRecord>,
+    ) -> Result<()>;
+    async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>>;
+    async fn persist_cluster_replicas(&self, replicas: &HashMap<String, Vec<NodeId>>)
+    -> Result<()>;
+    async fn load_client_auth_state(&self) -> Result<ClientAuthState>;
+    async fn persist_client_auth_state(&self, state: &ClientAuthState) -> Result<()>;
+    async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>>;
+    async fn load_cached_media_metadata(
+        &self,
+        content_fingerprint: &str,
+    ) -> Result<Option<CachedMediaMetadata>>;
+    async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()>;
+    async fn delete_media_cache_record(&self, content_fingerprint: &str) -> Result<()>;
+    async fn list_snapshot_infos(&self) -> Result<Vec<SnapshotInfo>>;
+    async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()>;
+    async fn load_version_index_by_object_id(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<FileVersionIndex>>;
+    async fn persist_version_index_by_object_id(
+        &self,
+        object_id: &str,
+        index: &FileVersionIndex,
+    ) -> Result<()>;
+    async fn persist_current_state(&self, current_state: &CurrentState) -> Result<()>;
+    async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
+    async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
+    async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
+    async fn has_version_index(&self, object_id: &str) -> Result<bool>;
+    async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()>;
+    async fn list_media_cache_fingerprints(&self) -> Result<Vec<String>>;
+    async fn has_reconcile_marker(
+        &self,
+        source_node_id: &str,
+        key: &str,
+        source_version_id: &str,
+    ) -> Result<bool>;
+    async fn mark_reconciled(&self, marker: &ReconcileMarker) -> Result<()>;
+}
+
 impl PersistentStore {
-    pub async fn init(root_dir: impl Into<PathBuf>) -> Result<Self> {
+    #[allow(dead_code)]
+    pub async fn init_with_sqlite_metadata(root_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::init_with_metadata_backend(root_dir, MetadataBackendKind::Sqlite).await
+    }
+
+    #[allow(dead_code)]
+    #[cfg(feature = "turso-metadata")]
+    pub async fn init_with_turso_metadata(root_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::init_with_metadata_backend(root_dir, MetadataBackendKind::Turso).await
+    }
+
+    pub async fn init_with_metadata_backend(
+        root_dir: impl Into<PathBuf>,
+        backend: MetadataBackendKind,
+    ) -> Result<Self> {
         let root_dir = root_dir.into();
         let chunks_dir = root_dir.join("chunks");
         let manifests_dir = root_dir.join("manifests");
-        let snapshots_dir = root_dir.join("snapshots");
-        let versions_dir = root_dir.join("versions");
-        let reconcile_markers_dir = root_dir.join("reconcile_markers");
         let state_dir = root_dir.join("state");
-        let current_state_path = state_dir.join("current.json");
-        let repair_attempts_path = state_dir.join("repair_attempts.json");
-        let cluster_replicas_path = state_dir.join("cluster_replicas.json");
-        let client_auth_state_path = state_dir.join("client_auth.json");
-        let admin_audit_log_path = state_dir.join("admin_audit.jsonl");
         let media_cache_dir = state_dir.join("media_cache");
-        let media_metadata_dir = media_cache_dir.join("metadata");
         let media_thumbnails_dir = media_cache_dir.join("thumbnails");
 
         fs::create_dir_all(&chunks_dir).await?;
         fs::create_dir_all(&manifests_dir).await?;
-        fs::create_dir_all(&snapshots_dir).await?;
-        fs::create_dir_all(&versions_dir).await?;
-        fs::create_dir_all(&reconcile_markers_dir).await?;
         fs::create_dir_all(&state_dir).await?;
-        fs::create_dir_all(&media_metadata_dir).await?;
         fs::create_dir_all(&media_thumbnails_dir).await?;
 
-        let current_state = if fs::try_exists(&current_state_path).await? {
-            let payload = fs::read(&current_state_path).await?;
-            serde_json::from_slice::<CurrentState>(&payload).with_context(|| {
-                format!("invalid current state: {}", current_state_path.display())
-            })?
-        } else {
-            CurrentState::default()
+        let (metadata_db_path, metadata_store): (PathBuf, Box<dyn MetadataStore>) = match backend {
+            MetadataBackendKind::Sqlite => (
+                state_dir.join("metadata.sqlite"),
+                Box::new(SqliteMetadataStore::open(
+                    &state_dir.join("metadata.sqlite"),
+                )?),
+            ),
+            #[cfg(feature = "turso-metadata")]
+            MetadataBackendKind::Turso => {
+                let turso_path = state_dir.join("metadata.turso.db");
+                (
+                    turso_path.clone(),
+                    Box::new(TursoMetadataStore::open(&turso_path).await?),
+                )
+            }
         };
+        let current_state = metadata_store.load_current_state().await?;
 
         Ok(Self {
             root_dir,
             chunks_dir,
             manifests_dir,
-            snapshots_dir,
-            versions_dir,
-            reconcile_markers_dir,
-            current_state_path,
-            repair_attempts_path,
-            cluster_replicas_path,
-            client_auth_state_path,
-            admin_audit_log_path,
-            media_metadata_dir,
+            metadata_db_path,
             media_thumbnails_dir,
             current_state,
+            metadata_store,
         })
     }
 
     pub async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
-        if !fs::try_exists(&self.repair_attempts_path).await? {
-            return Ok(HashMap::new());
-        }
-
-        let payload = fs::read(&self.repair_attempts_path).await?;
-        let attempts = serde_json::from_slice::<HashMap<String, RepairAttemptRecord>>(&payload)
-            .with_context(|| {
-                format!(
-                    "invalid repair attempts state: {}",
-                    self.repair_attempts_path.display()
-                )
-            })?;
-
-        Ok(attempts)
+        self.metadata_store.load_repair_attempts().await
     }
 
     pub async fn persist_repair_attempts(
         &self,
         attempts: &HashMap<String, RepairAttemptRecord>,
     ) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(attempts)?;
-        write_atomic(&self.repair_attempts_path, &payload).await
+        self.metadata_store.persist_repair_attempts(attempts).await
     }
 
     pub async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
-        if !fs::try_exists(&self.cluster_replicas_path).await? {
-            return Ok(HashMap::new());
-        }
-
-        let payload = fs::read(&self.cluster_replicas_path).await?;
-        let replicas = serde_json::from_slice::<HashMap<String, Vec<NodeId>>>(&payload)
-            .with_context(|| {
-                format!(
-                    "invalid cluster replicas state: {}",
-                    self.cluster_replicas_path.display()
-                )
-            })?;
-
-        Ok(replicas)
+        self.metadata_store.load_cluster_replicas().await
     }
 
     pub async fn persist_cluster_replicas(
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(replicas)?;
-        write_atomic(&self.cluster_replicas_path, &payload).await
+        self.metadata_store.persist_cluster_replicas(replicas).await
     }
 
     pub async fn load_client_auth_state(&self) -> Result<ClientAuthState> {
-        if !fs::try_exists(&self.client_auth_state_path).await? {
-            return Ok(ClientAuthState::default());
-        }
-
-        let payload = fs::read(&self.client_auth_state_path).await?;
-        let state = serde_json::from_slice::<ClientAuthState>(&payload).with_context(|| {
-            format!(
-                "invalid client auth state: {}",
-                self.client_auth_state_path.display()
-            )
-        })?;
-
-        Ok(state)
+        self.metadata_store.load_client_auth_state().await
     }
 
     pub async fn persist_client_auth_state(&self, state: &ClientAuthState) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(state)?;
-        write_atomic(&self.client_auth_state_path, &payload).await
+        self.metadata_store.persist_client_auth_state(state).await
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -579,15 +598,9 @@ impl PersistentStore {
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
-        let snapshot_path = self.snapshots_dir.join(format!("{snapshot_id}.json"));
-        if !fs::try_exists(&snapshot_path).await? {
-            return Ok(None);
-        }
-
-        let payload = fs::read(&snapshot_path).await?;
-        let manifest = serde_json::from_slice::<SnapshotManifest>(&payload)
-            .with_context(|| format!("invalid snapshot manifest {}", snapshot_path.display()))?;
-        Ok(Some(manifest))
+        self.metadata_store
+            .load_snapshot_manifest(snapshot_id)
+            .await
     }
 
     pub async fn resolve_manifest_hash_for_key(
@@ -711,17 +724,7 @@ impl PersistentStore {
             }
         }
 
-        let mut entries = fs::read_dir(&self.versions_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-
-            let payload = fs::read(&path).await?;
-            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
-                .with_context(|| format!("invalid version index {}", path.display()))?;
-
+        for index in self.load_all_version_indexes().await? {
             if indexed_object_ids.contains(&index.object_id) {
                 continue;
             }
@@ -1453,8 +1456,9 @@ impl PersistentStore {
         key: &str,
         source_version_id: &str,
     ) -> Result<bool> {
-        let path = self.reconcile_marker_path(source_node_id, key, source_version_id);
-        fs::try_exists(path).await.map_err(Into::into)
+        self.metadata_store
+            .has_reconcile_marker(source_node_id, key, source_version_id)
+            .await
     }
 
     pub async fn mark_reconciled(
@@ -1471,14 +1475,10 @@ impl PersistentStore {
             local_version_id: local_version_id.map(ToString::to_string),
             imported_at_unix: unix_ts(),
         };
-
-        let path = self.reconcile_marker_path(source_node_id, key, source_version_id);
-        let payload = serde_json::to_vec_pretty(&marker)?;
-        write_atomic(&path, &payload).await
+        self.metadata_store.mark_reconciled(&marker).await
     }
 
     pub async fn list_provisional_versions(&self) -> Result<Vec<ReconcileVersionEntry>> {
-        let mut entries = fs::read_dir(&self.versions_dir).await?;
         let mut output = Vec::new();
         let mut paths_by_object_id: HashMap<String, Vec<String>> = HashMap::new();
         for (path, object_id) in &self.current_state.object_ids {
@@ -1488,16 +1488,7 @@ impl PersistentStore {
                 .push(path.clone());
         }
 
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-
-            let payload = fs::read(&path).await?;
-            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
-                .with_context(|| format!("invalid version index {}", path.display()))?;
-
+        for index in self.load_all_version_indexes().await? {
             for record in index.versions.values() {
                 if record.state != VersionConsistencyState::Provisional {
                     continue;
@@ -1626,15 +1617,9 @@ impl PersistentStore {
         &self,
         content_fingerprint: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
-        let metadata_path = self.media_metadata_path(content_fingerprint);
-        if !fs::try_exists(&metadata_path).await? {
-            return Ok(None);
-        }
-
-        let payload = fs::read(&metadata_path).await?;
-        let metadata = serde_json::from_slice::<CachedMediaMetadata>(&payload)
-            .with_context(|| format!("invalid media metadata {}", metadata_path.display()))?;
-        Ok(Some(metadata))
+        self.metadata_store
+            .load_cached_media_metadata(content_fingerprint)
+            .await
     }
 
     fn build_media_cache_record(
@@ -1684,10 +1669,9 @@ impl PersistentStore {
                 .await?;
             write_atomic(&thumbnail_path, &payload).await?;
         }
-
-        let metadata_path = self.media_metadata_path(&metadata.content_fingerprint);
-        let payload = serde_json::to_vec_pretty(metadata)?;
-        write_atomic(&metadata_path, &payload).await
+        self.metadata_store
+            .persist_media_cache_record(metadata)
+            .await
     }
 
     async fn render_thumbnail_payload(
@@ -1714,11 +1698,6 @@ impl PersistentStore {
         self.media_thumbnails_dir
             .join(content_fingerprint)
             .join(format!("{profile}.jpg"))
-    }
-
-    fn media_metadata_path(&self, content_fingerprint: &str) -> PathBuf {
-        self.media_metadata_dir
-            .join(format!("{content_fingerprint}.json"))
     }
 
     pub async fn get_object(
@@ -2067,28 +2046,7 @@ impl PersistentStore {
     }
 
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
-        let mut entries = fs::read_dir(&self.snapshots_dir).await?;
-        let mut snapshots = Vec::new();
-
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-
-            let payload = fs::read(&path).await?;
-            let manifest = serde_json::from_slice::<SnapshotManifest>(&payload)
-                .with_context(|| format!("invalid snapshot manifest {}", path.display()))?;
-
-            snapshots.push(SnapshotInfo {
-                id: manifest.id,
-                created_at_unix: manifest.created_at_unix,
-                object_count: manifest.objects.len(),
-            });
-        }
-
-        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.created_at_unix));
-        Ok(snapshots)
+        self.metadata_store.list_snapshot_infos().await
     }
 
     pub async fn cleanup_unreferenced(
@@ -2180,33 +2138,22 @@ impl PersistentStore {
             deleted_chunks += 1;
         }
 
-        if fs::try_exists(&self.media_metadata_dir).await? {
-            let mut media_entries = fs::read_dir(&self.media_metadata_dir).await?;
-            while let Some(entry) = media_entries.next_entry().await? {
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                    continue;
-                }
+        for content_fingerprint in self.list_media_cache_fingerprints().await? {
+            if protected_media_fingerprints.contains(&content_fingerprint) {
+                continue;
+            }
 
-                let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-                    continue;
-                };
-                if protected_media_fingerprints.contains(stem) {
-                    continue;
-                }
+            if dry_run {
+                continue;
+            }
 
-                if dry_run {
-                    continue;
-                }
+            self.metadata_store
+                .delete_media_cache_record(&content_fingerprint)
+                .await?;
 
-                if fs::try_exists(&path).await? {
-                    fs::remove_file(&path).await?;
-                }
-
-                let thumb_dir = self.media_thumbnails_dir.join(stem);
-                if fs::try_exists(&thumb_dir).await? {
-                    let _ = fs::remove_dir_all(&thumb_dir).await;
-                }
+            let thumb_dir = self.media_thumbnails_dir.join(&content_fingerprint);
+            if fs::try_exists(&thumb_dir).await? {
+                let _ = fs::remove_dir_all(&thumb_dir).await;
             }
         }
 
@@ -2233,19 +2180,10 @@ impl PersistentStore {
 
         let mut scanned_indexes = 0usize;
         let mut tombstone_head_indexes = 0usize;
-        let mut eligible = Vec::<(PathBuf, String, String, u64, FileVersionIndex)>::new();
+        let mut eligible = Vec::<(String, String, u64, FileVersionIndex)>::new();
 
-        let mut version_entries = fs::read_dir(&self.versions_dir).await?;
-        while let Some(entry) = version_entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-
+        for index in self.load_all_version_indexes().await? {
             scanned_indexes += 1;
-            let payload = fs::read(&path).await?;
-            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
-                .with_context(|| format!("invalid version index {}", path.display()))?;
 
             let Some(preferred_head_id) = index
                 .preferred_head_version_id
@@ -2271,7 +2209,6 @@ impl PersistentStore {
             }
 
             eligible.push((
-                path,
                 index.object_id.clone(),
                 preferred_head.version_id.clone(),
                 preferred_head.created_at_unix,
@@ -2305,11 +2242,11 @@ impl PersistentStore {
 
         let mut archived_indexes = 0usize;
         let mut removed_indexes = 0usize;
-        for (path, object_id, preferred_tombstone_version_id, tombstone_created_at_unix, index) in
+        for (object_id, preferred_tombstone_version_id, tombstone_created_at_unix, index) in
             eligible
         {
             let record = ArchivedTombstoneIndexRecord {
-                object_id,
+                object_id: object_id.clone(),
                 preferred_tombstone_version_id,
                 preferred_tombstone_created_at_unix: tombstone_created_at_unix,
                 archived_at_unix: now,
@@ -2320,10 +2257,8 @@ impl PersistentStore {
             archive_writer.write_all(&line).await?;
             archived_indexes += 1;
 
-            if fs::try_exists(&path).await? {
-                fs::remove_file(&path).await?;
-                removed_indexes += 1;
-            }
+            self.delete_version_index_by_object_id(&object_id).await?;
+            removed_indexes += 1;
         }
         archive_writer.flush().await?;
 
@@ -2441,9 +2376,8 @@ impl PersistentStore {
             }
         }
 
-        let index_path = self.version_index_path(object_id);
-        let index_path_string = index_path.to_string_lossy().to_string();
-        let index_exists = fs::try_exists(&index_path).await?;
+        let index_path_string = self.version_index_locator(object_id);
+        let index_exists = self.has_version_index(object_id).await?;
         if selected.is_none() {
             return Ok(TombstoneRestoreReport {
                 object_id: object_id.to_string(),
@@ -2484,8 +2418,8 @@ impl PersistentStore {
             });
         }
 
-        let payload = serde_json::to_vec_pretty(&record.index)?;
-        write_atomic(&index_path, &payload).await?;
+        self.persist_version_index_by_object_id(object_id, &record.index)
+            .await?;
         Ok(TombstoneRestoreReport {
             object_id: object_id.to_string(),
             source_archive_file: Some(source_archive_file),
@@ -2547,17 +2481,7 @@ impl PersistentStore {
     }
 
     pub async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.admin_audit_log_path)
-            .await
-            .with_context(|| format!("failed to open {}", self.admin_audit_log_path.display()))?;
-        let mut line = serde_json::to_vec(event)?;
-        line.push(b'\n');
-        file.write_all(&line).await?;
-        file.flush().await?;
-        Ok(())
+        self.metadata_store.append_admin_audit_event(event).await
     }
 
     fn object_id_for_key(&self, key: &str) -> Option<String> {
@@ -2568,17 +2492,9 @@ impl PersistentStore {
         &self,
         object_id: &str,
     ) -> Result<Option<FileVersionIndex>> {
-        let path = self.version_index_path(object_id);
-
-        if !fs::try_exists(&path).await? {
-            return Ok(None);
-        }
-
-        let payload = fs::read(&path).await?;
-        let index = serde_json::from_slice::<FileVersionIndex>(&payload)
-            .with_context(|| format!("invalid version index {}", path.display()))?;
-
-        Ok(Some(index))
+        self.metadata_store
+            .load_version_index_by_object_id(object_id)
+            .await
     }
 
     async fn persist_version_index_by_object_id(
@@ -2586,9 +2502,9 @@ impl PersistentStore {
         object_id: &str,
         index: &FileVersionIndex,
     ) -> Result<()> {
-        let path = self.version_index_path(object_id);
-        let payload = serde_json::to_vec_pretty(index)?;
-        write_atomic(&path, &payload).await
+        self.metadata_store
+            .persist_version_index_by_object_id(object_id, index)
+            .await
     }
 
     fn sync_current_state_for_key_from_index(
@@ -2626,8 +2542,9 @@ impl PersistentStore {
     }
 
     async fn persist_current_state(&self) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(&self.current_state)?;
-        write_atomic(&self.current_state_path, &payload).await
+        self.metadata_store
+            .persist_current_state(&self.current_state)
+            .await
     }
 
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {
@@ -2635,17 +2552,7 @@ impl PersistentStore {
             return Ok(Some(object_id));
         }
 
-        let mut entries = fs::read_dir(&self.versions_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-
-            let payload = fs::read(&path).await?;
-            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
-                .with_context(|| format!("invalid version index {}", path.display()))?;
-
+        for index in self.load_all_version_indexes().await? {
             if self.resolve_key_for_version_index(&index).await?.as_deref() == Some(key) {
                 return Ok(Some(index.object_id));
             }
@@ -2704,28 +2611,15 @@ impl PersistentStore {
             object_ids: self.current_state.object_ids.clone(),
         };
 
-        let payload = serde_json::to_vec_pretty(&manifest)?;
-        let path = self.snapshots_dir.join(format!("{snapshot_id}.json"));
-
-        if !fs::try_exists(&path).await? {
-            write_atomic(&path, &payload).await?;
-        }
+        self.metadata_store
+            .persist_snapshot_manifest(&manifest)
+            .await?;
 
         Ok(snapshot_id)
     }
 
     async fn read_snapshot(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
-        let path = self.snapshots_dir.join(format!("{snapshot_id}.json"));
-
-        if !fs::try_exists(&path).await? {
-            return Ok(None);
-        }
-
-        let payload = fs::read(&path).await?;
-        let snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
-            .with_context(|| format!("invalid snapshot manifest {}", path.display()))?;
-
-        Ok(Some(snapshot))
+        self.load_snapshot_manifest(snapshot_id).await
     }
 
     async fn collect_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
@@ -2735,33 +2629,13 @@ impl PersistentStore {
             referenced.insert(manifest_hash.clone());
         }
 
-        let mut snapshot_entries = fs::read_dir(&self.snapshots_dir).await?;
-        while let Some(entry) = snapshot_entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-
-            let payload = fs::read(&path).await?;
-            let snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
-                .with_context(|| format!("invalid snapshot manifest {}", path.display()))?;
-
+        for snapshot in self.load_all_snapshots().await? {
             for manifest_hash in snapshot.objects.values() {
                 referenced.insert(manifest_hash.clone());
             }
         }
 
-        let mut version_entries = fs::read_dir(&self.versions_dir).await?;
-        while let Some(entry) = version_entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-
-            let payload = fs::read(&path).await?;
-            let index = serde_json::from_slice::<FileVersionIndex>(&payload)
-                .with_context(|| format!("invalid version index {}", path.display()))?;
-
+        for index in self.load_all_version_indexes().await? {
             for version in index.versions.values() {
                 referenced.insert(version.manifest_hash.clone());
             }
@@ -2817,24 +2691,38 @@ impl PersistentStore {
         Ok(files)
     }
 
-    fn version_index_path(&self, object_id: &str) -> PathBuf {
-        let object_id_hash = hash_hex(object_id.as_bytes());
-        self.versions_dir.join(format!("{object_id_hash}.json"))
-    }
-
-    fn reconcile_marker_path(
-        &self,
-        source_node_id: &str,
-        key: &str,
-        source_version_id: &str,
-    ) -> PathBuf {
-        let seed = format!("{source_node_id}:{key}:{source_version_id}");
-        let marker_id = hash_hex(seed.as_bytes());
-        self.reconcile_markers_dir.join(format!("{marker_id}.json"))
+    fn version_index_locator(&self, object_id: &str) -> String {
+        format!(
+            "{}#version_indexes/{}",
+            self.metadata_db_path.display(),
+            object_id
+        )
     }
 
     fn tombstone_archive_dir(&self) -> PathBuf {
         self.root_dir.join("state").join("tombstone_archive")
+    }
+
+    async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
+        self.metadata_store.load_all_version_indexes().await
+    }
+
+    async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
+        self.metadata_store.load_all_snapshots().await
+    }
+
+    async fn has_version_index(&self, object_id: &str) -> Result<bool> {
+        self.metadata_store.has_version_index(object_id).await
+    }
+
+    async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
+        self.metadata_store
+            .delete_version_index_by_object_id(object_id)
+            .await
+    }
+
+    async fn list_media_cache_fingerprints(&self) -> Result<Vec<String>> {
+        self.metadata_store.list_media_cache_fingerprints().await
     }
 
     async fn list_archive_paths(&self) -> Result<Vec<PathBuf>> {
