@@ -132,6 +132,54 @@ jobs:
           path: apps/android-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
+  android-instrumentation-tests:
+    runs-on: ubuntu-latest
+    needs: workspace-check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK (side by side)
+        run: sdkmanager --install "ndk;27.1.12297006"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Restore Android keystore
+        run: |
+          mkdir -p $HOME/.android
+          echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 --decode > $HOME/.android/debug.keystore
+          chmod 600 $HOME/.android/debug.keystore
+
+      - name: Run Android instrumentation tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          script: |
+            cd apps/android-app
+            ./gradlew --no-daemon :app:connectedDebugAndroidTest
+
   fuse-mount-build:
     runs-on: ubuntu-latest
     needs: workspace-check
