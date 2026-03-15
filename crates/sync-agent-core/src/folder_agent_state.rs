@@ -1032,6 +1032,70 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn newest_remote_conflict_copy_prefers_highest_timestamp() {
+        let root = test_root();
+        let remote_dir = conflict_copy_dir(&root, "remote", "docs/report.txt");
+        fs::create_dir_all(&remote_dir).unwrap();
+        let older = remote_dir.join("report.txt.remote-conflict-100");
+        let newer = remote_dir.join("report.txt.remote-conflict-200");
+        fs::write(&older, b"older").unwrap();
+        fs::write(&newer, b"newer").unwrap();
+
+        let selected = newest_remote_conflict_copy(&root, "docs/report.txt").unwrap();
+
+        assert_eq!(selected, newer);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_conflict_copies_removes_matching_local_and_remote_backups_only() {
+        let root = test_root();
+        let remote_dir = conflict_copy_dir(&root, "remote", "docs/report.txt");
+        let local_dir = conflict_copy_dir(&root, "local", "docs/report.txt");
+        fs::create_dir_all(&remote_dir).unwrap();
+        fs::create_dir_all(&local_dir).unwrap();
+        fs::write(remote_dir.join("report.txt.remote-conflict-100"), b"remote").unwrap();
+        fs::write(local_dir.join("report.txt.local-conflict-200"), b"local").unwrap();
+        fs::write(remote_dir.join("other.txt.remote-conflict-300"), b"keep").unwrap();
+
+        let removed = delete_conflict_copies(&root, "docs/report.txt").unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!remote_dir.join("report.txt.remote-conflict-100").exists());
+        assert!(!local_dir.join("report.txt.local-conflict-200").exists());
+        assert!(remote_dir.join("other.txt.remote-conflict-300").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_file_atomically_replaces_directory_target_with_file_contents() {
+        let root = test_root();
+        let source = root.join("source.txt");
+        let target = root.join("nested/target.txt");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&source, b"resolved").unwrap();
+
+        copy_file_atomically(&source, &target).unwrap();
+
+        assert!(target.is_file());
+        assert_eq!(fs::read(&target).unwrap(), b"resolved");
+        let leftovers = target
+            .parent()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".ironmesh-part-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn test_root() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -307,3 +307,90 @@ fn preserve_local_conflict_copy(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PathScope;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn validate_user_relative_path_input_normalizes_safe_paths() {
+        assert_eq!(
+            validate_user_relative_path_input(" /docs\\\\notes.txt ").unwrap(),
+            "docs/notes.txt"
+        );
+    }
+
+    #[test]
+    fn validate_user_relative_path_input_rejects_empty_parent_and_colon_segments() {
+        assert!(validate_user_relative_path_input("   ").is_err());
+        assert!(validate_user_relative_path_input("../notes.txt").is_err());
+        assert!(validate_user_relative_path_input("docs/../notes.txt").is_err());
+        assert!(validate_user_relative_path_input("docs:file.txt").is_err());
+    }
+
+    #[test]
+    fn remove_local_path_deletes_files_directories_and_missing_paths() {
+        let root = test_root();
+        fs::create_dir_all(root.join("nested/dir")).unwrap();
+        fs::write(root.join("nested/file.txt"), b"hello").unwrap();
+        fs::write(root.join("nested/dir/child.txt"), b"child").unwrap();
+
+        remove_local_path(&root, "nested/file.txt").unwrap();
+        remove_local_path(&root, "nested/dir").unwrap();
+        remove_local_path(&root, "nested/missing.txt").unwrap();
+
+        assert!(!root.join("nested/file.txt").exists());
+        assert!(!root.join("nested/dir").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserve_local_conflict_copy_moves_file_into_local_conflict_area() {
+        let root = test_root();
+        let local_target = root.join("docs/report.txt");
+        fs::create_dir_all(local_target.parent().unwrap()).unwrap();
+        fs::write(&local_target, b"draft").unwrap();
+
+        preserve_local_conflict_copy(&root, "docs/report.txt", &local_target).unwrap();
+
+        assert!(!local_target.exists());
+        let backup_dir = conflict_copy_dir(&root, "local", "docs/report.txt");
+        let backups = fs::read_dir(&backup_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), b"draft");
+        assert!(
+            backups[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("report.txt.local-conflict-")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_remote_file_skips_empty_local_root_mapping() {
+        let scope = PathScope::new(Some("cameras/vm1".to_string()));
+        let client = IronMeshClient::new("http://127.0.0.1:65535");
+        delete_remote_file(&client, &scope, "").unwrap();
+    }
+
+    fn test_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut root = std::env::temp_dir();
+        root.push(format!("ironmesh-conflicts-test-{nonce}"));
+        root
+    }
+}
