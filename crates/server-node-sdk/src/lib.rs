@@ -42,9 +42,11 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
-    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots,
-    ClientBootstrap as TransportClientBootstrap, RelayMode, SignedRequestHeaders,
-    credential_fingerprint, verify_signed_request_headers,
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, CandidateKind,
+    ClientBootstrap as TransportClientBootstrap, ConnectionCandidate, PeerIdentity,
+    PresenceRegistration, RelayMode, RendezvousClientConfig, RendezvousControlClient,
+    SignedRequestHeaders, TransportCapability, credential_fingerprint,
+    verify_signed_request_headers,
 };
 use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
@@ -534,6 +536,7 @@ pub struct ServerNodeConfig {
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
     pub rendezvous_urls: Vec<String>,
+    pub rendezvous_registration_enabled: bool,
     pub relay_mode: RelayMode,
     pub upstream_public_url: Option<String>,
     pub heartbeat_timeout_secs: u64,
@@ -718,7 +721,7 @@ impl ServerNodeConfig {
             };
             Some(format!("{scheme}://{bind_addr}"))
         });
-        let rendezvous_urls = std::env::var("IRONMESH_RENDEZVOUS_URLS")
+        let explicit_rendezvous_urls = std::env::var("IRONMESH_RENDEZVOUS_URLS")
             .ok()
             .map(|value| {
                 value
@@ -728,7 +731,10 @@ impl ServerNodeConfig {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
             })
-            .filter(|urls| !urls.is_empty())
+            .filter(|urls| !urls.is_empty());
+        let rendezvous_registration_enabled = explicit_rendezvous_urls.is_some();
+        let rendezvous_urls = explicit_rendezvous_urls
+            .clone()
             .or_else(|| public_url.as_ref().map(|url| vec![url.clone()]))
             .unwrap_or_default();
         let relay_mode = parse_relay_mode(
@@ -835,6 +841,7 @@ impl ServerNodeConfig {
             public_peer_api_enabled,
             internal_tls,
             rendezvous_urls,
+            rendezvous_registration_enabled,
             relay_mode,
             upstream_public_url,
             heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
@@ -969,6 +976,7 @@ impl ServerNodeConfig {
             public_peer_api_enabled: false,
             internal_tls: None,
             rendezvous_urls: vec![format!("http://{bind_addr}")],
+            rendezvous_registration_enabled: false,
             relay_mode: RelayMode::Fallback,
             upstream_public_url: None,
             heartbeat_timeout_secs: 90,
@@ -1378,6 +1386,39 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             .collect();
     }
 
+    if config.rendezvous_registration_enabled {
+        let rendezvous_client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: state.cluster_id,
+                rendezvous_urls: config.rendezvous_urls.clone(),
+                heartbeat_interval_secs: config.peer_heartbeat_interval_secs.max(5),
+            },
+            state
+                .public_ca_pem
+                .as_deref()
+                .or(state.cluster_ca_pem.as_deref()),
+        );
+
+        match rendezvous_client {
+            Ok(client) => {
+                spawn_rendezvous_presence_heartbeat(
+                    state.clone(),
+                    client,
+                    Some(public_url.clone()),
+                    config
+                        .internal_tls
+                        .as_ref()
+                        .and_then(|tls| tls.internal_url.clone()),
+                    config.public_peer_api_enabled,
+                    config.peer_heartbeat_interval_secs,
+                );
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to initialize rendezvous presence client");
+            }
+        }
+    }
+
     let peer_sync_enabled =
         config.mode == ServerNodeMode::Cluster || config.upstream_public_url.is_some();
 
@@ -1656,6 +1697,109 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     }
 
     Ok(())
+}
+
+fn spawn_rendezvous_presence_heartbeat(
+    state: ServerState,
+    client: RendezvousControlClient,
+    public_url: Option<String>,
+    internal_peer_url: Option<String>,
+    public_peer_api_enabled: bool,
+    interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(5)));
+        ticker.tick().await;
+
+        loop {
+            let registration = build_rendezvous_presence_registration(
+                &state,
+                public_url.as_deref(),
+                internal_peer_url.as_deref(),
+                public_peer_api_enabled,
+            );
+
+            match client.register_presence(&registration).await {
+                Ok(response) => {
+                    tracing::debug!(
+                        node_id = %state.node_id,
+                        updated_at_unix = response.updated_at_unix,
+                        "registered rendezvous presence"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        node_id = %state.node_id,
+                        rendezvous_urls = ?client.config().rendezvous_urls,
+                        "failed to register rendezvous presence"
+                    );
+                }
+            }
+
+            ticker.tick().await;
+        }
+    });
+}
+
+fn build_rendezvous_presence_registration(
+    state: &ServerState,
+    public_url: Option<&str>,
+    internal_peer_url: Option<&str>,
+    public_peer_api_enabled: bool,
+) -> PresenceRegistration {
+    let mut direct_candidates = Vec::new();
+    let mut seen_endpoints = BTreeSet::new();
+
+    if public_peer_api_enabled {
+        push_rendezvous_direct_candidate(&mut direct_candidates, &mut seen_endpoints, public_url);
+    }
+    push_rendezvous_direct_candidate(
+        &mut direct_candidates,
+        &mut seen_endpoints,
+        internal_peer_url,
+    );
+
+    let mut capabilities = Vec::new();
+    if !direct_candidates.is_empty() {
+        capabilities.push(TransportCapability::DirectHttps);
+    }
+    if state.relay_mode != RelayMode::Disabled {
+        capabilities.push(TransportCapability::RelayTunnel);
+    }
+
+    PresenceRegistration {
+        cluster_id: state.cluster_id,
+        identity: PeerIdentity::Node(state.node_id),
+        direct_candidates,
+        capabilities,
+        relay_mode: state.relay_mode,
+        connected_at_unix: unix_ts(),
+    }
+}
+
+fn push_rendezvous_direct_candidate(
+    candidates: &mut Vec<ConnectionCandidate>,
+    seen_endpoints: &mut BTreeSet<String>,
+    endpoint: Option<&str>,
+) {
+    let Some(endpoint) = endpoint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+    else {
+        return;
+    };
+
+    if !seen_endpoints.insert(endpoint.clone()) {
+        return;
+    }
+
+    candidates.push(ConnectionCandidate {
+        kind: CandidateKind::DirectHttps,
+        endpoint,
+        rtt_ms: None,
+    });
 }
 
 fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {

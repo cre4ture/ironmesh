@@ -1,16 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
-use transport_sdk::rendezvous::PresenceRegistration;
+use transport_sdk::rendezvous::{PresenceEntry, PresenceRegistration};
 
 use crate::auth::peer_identity_key;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PresenceEntry {
-    pub registration: PresenceRegistration,
-    pub updated_at_unix: u64,
-}
 
 #[derive(Clone, Default)]
 pub struct PresenceRegistry {

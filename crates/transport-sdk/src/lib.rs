@@ -19,7 +19,10 @@ pub use identity::{
 };
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
 pub use relay::{RelayTicket, RelayTicketRequest};
-pub use rendezvous::{PresenceRegistration, RendezvousClientConfig, TransportCapability};
+pub use rendezvous::{
+    PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
+    RendezvousClientConfig, RendezvousControlClient, TransportCapability,
+};
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,
     HEADER_CREDENTIAL_FINGERPRINT, HEADER_DEVICE_ID, SignedRequestHeaders,

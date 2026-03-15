@@ -1,10 +1,10 @@
 use super::{
     AdminControl, LocalNodeHandle, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig,
     RepairExecutorState, ServerNodeConfig, ServerState, StartupRepairStatus,
-    await_repair_busy_threshold, build_store_index_entries, cluster, constant_time_eq,
-    jittered_backoff_secs, replication::build_internal_replication_put_url, run,
-    run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
-    token_matches,
+    await_repair_busy_threshold, build_rendezvous_presence_registration, build_store_index_entries,
+    cluster, constant_time_eq, jittered_backoff_secs,
+    replication::build_internal_replication_put_url, run, run_startup_replication_repair_once,
+    should_trigger_autonomous_post_write_replication, token_matches,
 };
 use common::NodeId;
 use std::path::PathBuf;
@@ -2013,6 +2013,66 @@ async fn build_test_state(
     }
 
     state
+}
+
+#[tokio::test]
+async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    let registration = build_rendezvous_presence_registration(
+        &state,
+        Some("https://public.example/"),
+        Some("https://public.example"),
+        true,
+    );
+
+    assert_eq!(
+        registration.identity,
+        transport_sdk::PeerIdentity::Node(state.node_id)
+    );
+    assert_eq!(registration.direct_candidates.len(), 1);
+    assert_eq!(
+        registration.direct_candidates[0].kind,
+        transport_sdk::CandidateKind::DirectHttps
+    );
+    assert_eq!(
+        registration.direct_candidates[0].endpoint,
+        "https://public.example"
+    );
+    assert!(
+        registration
+            .capabilities
+            .contains(&transport_sdk::TransportCapability::DirectHttps)
+    );
+    assert!(
+        registration
+            .capabilities
+            .contains(&transport_sdk::TransportCapability::RelayTunnel)
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_presence_registration_omits_public_candidate_when_peer_api_disabled() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    let registration =
+        build_rendezvous_presence_registration(&state, Some("https://public.example"), None, false);
+
+    assert!(registration.direct_candidates.is_empty());
+    assert!(
+        !registration
+            .capabilities
+            .contains(&transport_sdk::TransportCapability::DirectHttps)
+    );
+    assert!(
+        registration
+            .capabilities
+            .contains(&transport_sdk::TransportCapability::RelayTunnel)
+    );
+
+    cleanup_test_state(&state).await;
 }
 
 async fn cleanup_test_state(state: &ServerState) {
