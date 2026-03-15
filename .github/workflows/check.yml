@@ -117,6 +117,10 @@ jobs:
           echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 --decode > $HOME/.android/debug.keystore
           chmod 600 $HOME/.android/debug.keystore
 
+      - name: Run Android JVM unit tests
+        working-directory: apps/android-app
+        run: ./gradlew --no-daemon :app:testDebugUnitTest
+
       - name: Build Android app
         working-directory: apps/android-app
         run: ./gradlew --no-daemon :app:assembleDebug

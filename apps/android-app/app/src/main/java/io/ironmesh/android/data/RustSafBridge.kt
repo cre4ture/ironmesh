@@ -41,7 +41,7 @@ object RustSafBridge {
             observedChildrenUris = observedChildrenUris,
             output = entries,
         )
-        updateObservedChildrenUris(treeUriString, resolver, observedChildrenUris)
+        updateObservedChildrenUris(treeUriString, observedChildrenUris)
         return entries.toString()
     }
 
@@ -157,7 +157,6 @@ object RustSafBridge {
 
     private fun updateObservedChildrenUris(
         treeUriString: String,
-        resolver: ContentResolver,
         observedChildrenUris: Set<Uri>,
     ) {
         synchronized(observerLock) {
@@ -286,23 +285,11 @@ object RustSafBridge {
     }
 
     private fun normalizeRelativePath(relativePath: String): String {
-        return relativePath
-            .trim()
-            .replace('\\', '/')
-            .trim('/')
-            .split('/')
-            .filter { it.isNotBlank() }
-            .joinToString("/")
+        return RustSafBridgePaths.normalizeRelativePath(relativePath)
     }
 
     private fun shouldIgnorePath(relativePath: String): Boolean {
-        val segments = normalizeRelativePath(relativePath).split('/')
-        return segments.any { segment ->
-            segment == ".ironmesh" ||
-                segment == ".ironmesh-conflicts" ||
-                segment == ".thumbnails" ||
-                segment.contains(".ironmesh-part-")
-        }
+        return RustSafBridgePaths.shouldIgnorePath(relativePath)
     }
 
     private fun guessMimeType(fileName: String): String {
