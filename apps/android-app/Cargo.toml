@@ -11,6 +11,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
 jni = "0.21"
@@ -18,5 +19,6 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sync-agent-core = { path = "../../crates/sync-agent-core" }
+sync-core = { path = "../../crates/sync-core" }
 tokio.workspace = true
 web-ui-backend = { path = "../../crates/web-ui-backend" }

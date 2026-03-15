@@ -10,6 +10,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.data.FolderSyncStorageDiagnosticsHelper
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
@@ -33,6 +34,7 @@ class FolderSyncForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        RustSafBridge.initialize(applicationContext)
         ensureNotificationChannel()
         startForeground(
             NOTIFICATION_ID,
@@ -109,6 +111,7 @@ class FolderSyncForegroundService : Service() {
                     label = profile.label,
                     baseUrl = baseUrl,
                     localFolder = profile.localFolder,
+                    localFolderTreeUri = profile.localFolderTreeUri,
                     prefix = profile.prefix.ifBlank { null },
                     depth = profile.depth,
                     serverCaPem = serverCaPem,

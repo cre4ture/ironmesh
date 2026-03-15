@@ -211,6 +211,7 @@ class IronmeshRepository {
     suspend fun runFolderSyncOnce(
         baseUrl: String,
         localFolder: String,
+        localFolderTreeUri: String? = null,
         prefix: String? = null,
         depth: Int = 64,
         serverCaPem: String? = null,
@@ -219,6 +220,7 @@ class IronmeshRepository {
         RustClientBridge.runFolderSyncOnce(
             sanitizeBaseUrl(baseUrl),
             localFolder,
+            localFolderTreeUri,
             prefix,
             depth.coerceAtLeast(1),
             serverCaPem,
@@ -231,6 +233,7 @@ class IronmeshRepository {
         label: String,
         baseUrl: String,
         localFolder: String,
+        localFolderTreeUri: String? = null,
         prefix: String? = null,
         depth: Int = 64,
         serverCaPem: String? = null,
@@ -241,6 +244,7 @@ class IronmeshRepository {
             label,
             sanitizeBaseUrl(baseUrl),
             localFolder,
+            localFolderTreeUri,
             prefix,
             depth.coerceAtLeast(1),
             serverCaPem,

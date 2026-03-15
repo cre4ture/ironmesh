@@ -207,6 +207,7 @@ fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
 fn run_agent(args: &Args) -> Result<()> {
     run_folder_agent(&FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
+        local_tree_uri: None,
         server_base_url: args.server_base_url.clone(),
         server_ca_pem: None,
         auth_token: None,

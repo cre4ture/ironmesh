@@ -1,3 +1,5 @@
+mod saf_sync;
+
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use client_sdk::{
@@ -20,6 +22,8 @@ use sync_agent_core::{
     run_folder_agent, run_folder_agent_with_control,
 };
 use tokio::task::JoinHandle;
+
+use crate::saf_sync::{initialize_android_saf_bridge, run_saf_folder_agent_with_control};
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -140,12 +144,20 @@ impl AndroidFolderSyncManager {
         let thread = thread::Builder::new()
             .name(format!("ironmesh-folder-sync-{profile_id}"))
             .spawn(move || {
-                let result = run_folder_agent_with_control(
-                    &options,
-                    thread_running,
-                    false,
-                    Some(status_callback),
-                );
+                let result = if options.local_tree_uri.is_some() {
+                    run_saf_folder_agent_with_control(
+                        &options,
+                        thread_running,
+                        Some(status_callback),
+                    )
+                } else {
+                    run_folder_agent_with_control(
+                        &options,
+                        thread_running,
+                        false,
+                        Some(status_callback),
+                    )
+                };
                 if let Err(error) = result {
                     update_profile_status(
                         &status_store,
@@ -896,6 +908,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
     _class: JClass,
     base_url: JString,
     local_folder: JString,
+    local_tree_uri: jstring,
     prefix: jstring,
     depth: jint,
     server_ca_pem: jstring,
@@ -904,12 +917,18 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
     let result = (|| -> Result<()> {
         let base_url: String = env.get_string(&base_url)?.into();
         let local_folder: String = env.get_string(&local_folder)?.into();
+        let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
         let prefix = optional_jstring(&mut env, prefix)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let auth_token = optional_jstring(&mut env, auth_token)?;
 
-        run_folder_agent(&FolderAgentRuntimeOptions {
+        if local_tree_uri.is_some() {
+            initialize_android_saf_bridge(&mut env)?;
+        }
+
+        let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
+            local_tree_uri,
             server_base_url: base_url,
             server_ca_pem,
             auth_token,
@@ -920,7 +939,13 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
             no_watch_local: true,
             run_once: true,
             ui_bind: None,
-        })
+        };
+
+        if options.local_tree_uri.is_some() {
+            run_saf_folder_agent_with_control(&options, Arc::new(AtomicBool::new(true)), None)
+        } else {
+            run_folder_agent(&options)
+        }
     })();
 
     if let Err(err) = result {
@@ -938,6 +963,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
     label: JString,
     base_url: JString,
     local_folder: JString,
+    local_tree_uri: jstring,
     prefix: jstring,
     depth: jint,
     server_ca_pem: jstring,
@@ -948,12 +974,18 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         let label: String = env.get_string(&label)?.into();
         let base_url: String = env.get_string(&base_url)?.into();
         let local_folder: String = env.get_string(&local_folder)?.into();
+        let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
         let prefix = optional_jstring(&mut env, prefix)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let auth_token = optional_jstring(&mut env, auth_token)?;
 
+        if local_tree_uri.is_some() {
+            initialize_android_saf_bridge(&mut env)?;
+        }
+
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
+            local_tree_uri,
             server_base_url: base_url,
             server_ca_pem,
             auth_token,

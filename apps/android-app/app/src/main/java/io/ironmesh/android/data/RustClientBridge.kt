@@ -88,6 +88,7 @@ object RustClientBridge {
     external fun runFolderSyncOnce(
         baseUrl: String,
         localFolder: String,
+        localFolderTreeUri: String?,
         prefix: String?,
         depth: Int,
         serverCaPem: String?,
@@ -100,6 +101,7 @@ object RustClientBridge {
         label: String,
         baseUrl: String,
         localFolder: String,
+        localFolderTreeUri: String?,
         prefix: String?,
         depth: Int,
         serverCaPem: String?,

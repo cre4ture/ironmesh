@@ -62,6 +62,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.ui.GalleryImageItem
 import io.ironmesh.android.ui.GallerySortOption
 import io.ironmesh.android.ui.MainSection
@@ -76,6 +77,7 @@ import java.time.format.DateTimeFormatter
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        RustSafBridge.initialize(applicationContext)
         enableEdgeToEdge()
 
         setContent {
@@ -472,13 +474,6 @@ private fun FolderSyncControls(
         }
         OutlinedButton(onClick = onPickLocalFolder) {
             Text("Pick Folder")
-        }
-        OutlinedButton(
-            onClick = {
-                vm.updateNewSyncLocalFolderSelection("/storage/emulated/0/DCIM/Camera", null)
-            },
-        ) {
-            Text("Use Camera Folder")
         }
     }
 

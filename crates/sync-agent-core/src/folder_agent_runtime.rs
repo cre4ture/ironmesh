@@ -31,6 +31,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct FolderAgentRuntimeOptions {
     pub root_dir: PathBuf,
+    pub local_tree_uri: Option<String>,
     pub server_base_url: String,
     pub server_ca_pem: Option<String>,
     pub auth_token: Option<String>,
