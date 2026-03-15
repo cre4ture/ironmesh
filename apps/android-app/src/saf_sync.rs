@@ -40,16 +40,16 @@ struct AndroidSafBridgeState {
     class: GlobalRef,
 }
 
+static ANDROID_SAF_BRIDGE_STATE: OnceLock<AndroidSafBridgeState> = OnceLock::new();
+
 fn bridge_state() -> Result<&'static AndroidSafBridgeState> {
-    static STATE: OnceLock<AndroidSafBridgeState> = OnceLock::new();
-    STATE
+    ANDROID_SAF_BRIDGE_STATE
         .get()
         .ok_or_else(|| anyhow::anyhow!("android SAF bridge has not been initialized"))
 }
 
 pub(crate) fn initialize_android_saf_bridge(env: &mut JNIEnv) -> Result<()> {
-    static STATE: OnceLock<AndroidSafBridgeState> = OnceLock::new();
-    if STATE.get().is_some() {
+    if ANDROID_SAF_BRIDGE_STATE.get().is_some() {
         return Ok(());
     }
 
@@ -62,7 +62,7 @@ pub(crate) fn initialize_android_saf_bridge(env: &mut JNIEnv) -> Result<()> {
     let global = env
         .new_global_ref(class)
         .context("failed to globalize RustSafBridge class")?;
-    let _ = STATE.set(AndroidSafBridgeState { vm, class: global });
+    let _ = ANDROID_SAF_BRIDGE_STATE.set(AndroidSafBridgeState { vm, class: global });
     Ok(())
 }
 
@@ -121,6 +121,31 @@ fn emit_status(
         state: state.into(),
         message: message.into(),
         updated_unix_ms: now_unix_ms(),
+    });
+}
+
+fn log_android_info(message: &str) {
+    let _ = with_bridge_env(|env, _class| {
+        let log_class = env
+            .find_class("android/util/Log")
+            .context("failed to find android.util.Log")?;
+        let tag = env
+            .new_string("FolderSyncService")
+            .context("failed to allocate Android log tag")?;
+        let message = env
+            .new_string(message)
+            .context("failed to allocate Android log message")?;
+        env.call_static_method(
+            log_class,
+            "i",
+            "(Ljava/lang/String;Ljava/lang/String;)I",
+            &[
+                JValue::Object(tag.as_ref()),
+                JValue::Object(message.as_ref()),
+            ],
+        )
+        .context("failed to write Android logcat info message")?;
+        Ok(())
     });
 }
 
@@ -354,6 +379,14 @@ impl Read for JavaInputStreamReader<'_, '_> {
     }
 }
 
+impl Drop for JavaInputStreamReader<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self
+            .env
+            .call_method(&self.input_stream, "close", "()V", &[]);
+    }
+}
+
 struct JavaOutputStreamWriter<'env, 'local> {
     env: &'env mut JNIEnv<'local>,
     output_stream: JObject<'local>,
@@ -409,6 +442,17 @@ impl Write for JavaOutputStreamWriter<'_, '_> {
             .call_method(&self.output_stream, "flush", "()V", &[])
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         Ok(())
+    }
+}
+
+impl Drop for JavaOutputStreamWriter<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self
+            .env
+            .call_method(&self.output_stream, "flush", "()V", &[]);
+        let _ = self
+            .env
+            .call_method(&self.output_stream, "close", "()V", &[]);
     }
 }
 
@@ -808,6 +852,7 @@ fn apply_remote_snapshot_saf(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_local_changes_saf(
     tree_uri: &str,
     client: &IronMeshClient,
@@ -816,6 +861,7 @@ fn sync_local_changes_saf(
     scope: &PathScope,
     remote_index: &mut RemoteTreeIndex,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
+    status_callback: Option<&FolderAgentStatusCallback>,
 ) -> Result<()> {
     let current = scan_saf_tree(tree_uri).context("failed to scan SAF tree")?;
     let diff = diff_local_trees(local_state, &current);
@@ -850,7 +896,13 @@ fn sync_local_changes_saf(
             continue;
         }
 
+        let remote_key = scope.local_to_remote(path).ok_or_else(|| {
+            anyhow::anyhow!("refusing to upload local root without concrete scoped path")
+        })?;
         let content_hash = upload_saf_file(tree_uri, client, scope, path, entry_state.size_bytes)?;
+        let upload_message = format!("Uploaded SAF file {path} to {remote_key}");
+        emit_status(status_callback, "syncing", upload_message.as_str());
+        log_android_info(upload_message.as_str());
         remote_index.files.insert(path.clone());
         for parent in parent_directories(path) {
             remote_index.directories.insert(parent);
@@ -1046,6 +1098,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
         &scope,
         &mut remote_index,
         &mut suppressed_uploads,
+        status_callback.as_ref(),
     )?;
 
     state_store
@@ -1128,6 +1181,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
                 &scope,
                 &mut remote_index,
                 &mut suppressed_uploads,
+                status_callback.as_ref(),
             )?;
             if local_state != previous_local_state {
                 baseline_dirty = true;
