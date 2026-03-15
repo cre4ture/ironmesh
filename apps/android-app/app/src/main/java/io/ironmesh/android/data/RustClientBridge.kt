@@ -21,7 +21,7 @@ object RustClientBridge {
         key: String,
         payload: ByteArray,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     ): Int
 
     @JvmStatic
@@ -31,7 +31,7 @@ object RustClientBridge {
         snapshot: String?,
         version: String?,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     ): ByteArray
 
     @JvmStatic
@@ -41,7 +41,7 @@ object RustClientBridge {
         depth: Int,
         snapshot: String?,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     ): String
 
     @JvmStatic
@@ -50,7 +50,7 @@ object RustClientBridge {
         key: String,
         input: InputStream,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     ): Int
 
     @JvmStatic
@@ -58,7 +58,7 @@ object RustClientBridge {
         baseUrl: String,
         key: String,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     ): Int
 
     @JvmStatic
@@ -69,7 +69,7 @@ object RustClientBridge {
         snapshot: String?,
         version: String?,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     )
 
     @JvmStatic
@@ -78,7 +78,7 @@ object RustClientBridge {
         relativeUrl: String,
         output: OutputStream,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     )
 
     @JvmStatic
@@ -92,7 +92,7 @@ object RustClientBridge {
         prefix: String?,
         depth: Int,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     )
 
     @JvmStatic
@@ -105,7 +105,7 @@ object RustClientBridge {
         prefix: String?,
         depth: Int,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
     )
 
     @JvmStatic

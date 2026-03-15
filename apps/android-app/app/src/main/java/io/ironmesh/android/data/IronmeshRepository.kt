@@ -20,6 +20,10 @@ data class BootstrapEnrollmentData(
 )
 
 class IronmeshRepository {
+    private fun normalizedClientIdentityJson(clientIdentityJson: String?): String? {
+        return clientIdentityJson?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
     fun sanitizeBaseUrl(input: String): String {
         val trimmed = input.trim()
         val withScheme = if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
@@ -66,14 +70,14 @@ class IronmeshRepository {
         key: String,
         payload: String,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ): Int {
         return RustClientBridge.putObject(
             sanitizeBaseUrl(baseUrl),
             key,
             payload.toByteArray(Charsets.UTF_8),
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
@@ -83,9 +87,16 @@ class IronmeshRepository {
         snapshot: String? = null,
         version: String? = null,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ): String {
-        val bytes = getObjectBytes(baseUrl, key, snapshot, version, serverCaPem, authToken)
+        val bytes = getObjectBytes(
+            baseUrl,
+            key,
+            snapshot,
+            version,
+            serverCaPem,
+            clientIdentityJson,
+        )
         return bytes.toString(Charsets.UTF_8)
     }
 
@@ -95,7 +106,7 @@ class IronmeshRepository {
         depth: Int = 1,
         snapshot: String? = null,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ): List<StoreIndexEntry> {
         val responseJson = RustClientBridge.storeIndex(
             sanitizeBaseUrl(baseUrl),
@@ -103,7 +114,7 @@ class IronmeshRepository {
             depth.coerceAtLeast(1),
             snapshot,
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
         val parsed = decodeJson(responseJson, StoreIndexResponse::class.java)
         return parsed.entries
@@ -114,14 +125,14 @@ class IronmeshRepository {
         key: String,
         payload: ByteArray,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ): Int {
         return RustClientBridge.putObject(
             sanitizeBaseUrl(baseUrl),
             key,
             payload,
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
@@ -130,14 +141,14 @@ class IronmeshRepository {
         key: String,
         input: InputStream,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ): Int {
         return RustClientBridge.streamPutObject(
             sanitizeBaseUrl(baseUrl),
             key,
             input,
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
@@ -145,13 +156,13 @@ class IronmeshRepository {
         baseUrl: String,
         key: String,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ): Int {
         return RustClientBridge.deleteObject(
             sanitizeBaseUrl(baseUrl),
             key,
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
@@ -161,7 +172,7 @@ class IronmeshRepository {
         snapshot: String? = null,
         version: String? = null,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ): ByteArray {
         return RustClientBridge.getObject(
             sanitizeBaseUrl(baseUrl),
@@ -169,7 +180,7 @@ class IronmeshRepository {
             snapshot,
             version,
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
@@ -180,7 +191,7 @@ class IronmeshRepository {
         snapshot: String? = null,
         version: String? = null,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ) {
         RustClientBridge.streamObjectTo(
             sanitizeBaseUrl(baseUrl),
@@ -189,7 +200,7 @@ class IronmeshRepository {
             snapshot,
             version,
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
@@ -198,19 +209,19 @@ class IronmeshRepository {
         relativeUrl: String,
         output: OutputStream,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ) {
         RustClientBridge.streamRelativeUrlTo(
             sanitizeBaseUrl(baseUrl),
             relativeUrl,
             output,
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
-    fun startWebUi(baseUrl: String, authToken: String? = null): String {
-        if (!authToken.isNullOrBlank()) {
+    fun startWebUi(baseUrl: String, clientIdentityJson: String? = null): String {
+        if (!clientIdentityJson.isNullOrBlank()) {
             throw IllegalStateException("Embedded Web UI is not yet wired for authenticated clusters")
         }
         return RustClientBridge.startWebUi(sanitizeBaseUrl(baseUrl))
@@ -223,7 +234,7 @@ class IronmeshRepository {
         prefix: String? = null,
         depth: Int = 64,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ) {
         RustClientBridge.runFolderSyncOnce(
             sanitizeBaseUrl(baseUrl),
@@ -232,7 +243,7 @@ class IronmeshRepository {
             prefix,
             depth.coerceAtLeast(1),
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
@@ -245,7 +256,7 @@ class IronmeshRepository {
         prefix: String? = null,
         depth: Int = 64,
         serverCaPem: String? = null,
-        authToken: String? = null,
+        clientIdentityJson: String? = null,
     ) {
         RustClientBridge.startContinuousFolderSync(
             profileId,
@@ -256,7 +267,7 @@ class IronmeshRepository {
             prefix,
             depth.coerceAtLeast(1),
             serverCaPem,
-            authToken,
+            normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 

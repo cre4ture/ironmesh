@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
-    build_http_client_from_pem, normalize_server_base_url,
+    build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    normalize_server_base_url,
 };
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
@@ -94,8 +95,16 @@ fn configured_client(
     options: &FolderAgentRuntimeOptions,
 ) -> Result<IronMeshClient> {
     let server_ca_pem = normalized_optional_string(options.server_ca_pem.as_deref());
-    let auth_token = normalized_optional_string(options.auth_token.as_deref());
-    build_http_client_from_pem(server_ca_pem.as_deref(), base_url, &auth_token)
+    let client_identity = normalized_optional_string(options.client_identity_json.as_deref())
+        .map(|raw| client_sdk::ClientIdentityMaterial::from_json_str(&raw))
+        .transpose()
+        .context("failed to parse SAF folder sync client identity")?;
+    match client_identity.as_ref() {
+        Some(identity) => {
+            build_http_client_with_identity_from_pem(server_ca_pem.as_deref(), base_url, identity)
+        }
+        None => build_http_client_from_pem(server_ca_pem.as_deref(), base_url, &None),
+    }
 }
 
 fn normalized_optional_string(value: Option<&str>) -> Option<String> {

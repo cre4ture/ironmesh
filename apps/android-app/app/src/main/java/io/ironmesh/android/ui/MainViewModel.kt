@@ -115,7 +115,7 @@ class MainViewModel(
                 uiState.value.key,
                 uiState.value.payload,
                 currentServerCaPem(),
-                currentAuthToken(),
+                currentClientIdentityJson(),
             )
             "PUT ok: HTTP $statusCode"
         }
@@ -127,7 +127,7 @@ class MainViewModel(
                 currentBaseUrl(),
                 uiState.value.key,
                 serverCaPem = currentServerCaPem(),
-                authToken = currentAuthToken(),
+                clientIdentityJson = currentClientIdentityJson(),
             )
             uiState.value = uiState.value.copy(objectBody = body)
             "GET ok: ${body.length} bytes"
@@ -262,7 +262,7 @@ class MainViewModel(
 
     fun startWebUi() {
         val baseUrl = currentBaseUrl()
-        val authToken = currentAuthToken()
+        val clientIdentityJson = currentClientIdentityJson()
         uiState.value = uiState.value.copy(
             loading = true,
             selectedSection = MainSection.WEB_UI,
@@ -271,7 +271,7 @@ class MainViewModel(
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    repository.startWebUi(baseUrl, authToken)
+                    repository.startWebUi(baseUrl, clientIdentityJson)
                 }
             }
                 .onSuccess { url ->
@@ -387,8 +387,8 @@ class MainViewModel(
         return items
     }
 
-    private fun currentAuthToken(): String? {
-        return uiState.value.deviceAuthState.deviceToken.takeIf { it.isNotBlank() }
+    private fun currentClientIdentityJson(): String? {
+        return uiState.value.deviceAuthState.toClientIdentityJson()
     }
 
     private fun currentBaseUrl(): String {

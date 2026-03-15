@@ -3,12 +3,14 @@ mod saf_sync;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use client_sdk::{
-    BootstrapEnrollmentResult, ClientNode, ConnectionBootstrap, IronMeshClient,
-    build_http_client_from_pem, build_reqwest_client_from_pem,
+    BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
+    IronMeshClient, build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    build_reqwest_client_from_pem, build_signed_request_headers,
 };
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyte, jbyteArray, jint, jstring};
+use reqwest::Method;
 use reqwest::Url;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -512,28 +514,62 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn url_path_and_query(url: &Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
 fn configured_sdk(
     server_base_url: impl Into<String>,
     server_ca_pem: Option<String>,
-    auth_token: Option<String>,
+    client_identity_json: Option<String>,
 ) -> Result<IronMeshClient> {
-    build_http_client_from_pem(
-        normalize_optional_string(server_ca_pem).as_deref(),
-        &server_base_url.into(),
-        &normalize_optional_string(auth_token),
-    )
+    let server_base_url = server_base_url.into();
+    let server_ca_pem = normalize_optional_string(server_ca_pem);
+    let client_identity_json = normalize_optional_string(client_identity_json);
+    match client_identity_json.as_deref() {
+        Some(raw) => build_http_client_with_identity_from_pem(
+            server_ca_pem.as_deref(),
+            &server_base_url,
+            &ClientIdentityMaterial::from_json_str(raw)
+                .context("failed to parse android client identity JSON")?,
+        ),
+        None => build_http_client_from_pem(server_ca_pem.as_deref(), &server_base_url, &None),
+    }
 }
 
 fn configured_client_node(
     server_base_url: impl Into<String>,
     server_ca_pem: Option<String>,
-    auth_token: Option<String>,
+    client_identity_json: Option<String>,
 ) -> Result<ClientNode> {
     Ok(ClientNode::with_client(configured_sdk(
         server_base_url,
         server_ca_pem,
-        auth_token,
+        client_identity_json,
     )?))
+}
+
+fn parse_client_identity_json(
+    client_identity_json: Option<String>,
+) -> Result<Option<ClientIdentityMaterial>> {
+    let client_identity_json = normalize_optional_string(client_identity_json);
+    client_identity_json
+        .as_deref()
+        .map(|raw| {
+            ClientIdentityMaterial::from_json_str(raw)
+                .context("failed to parse android client identity JSON")
+        })
+        .transpose()
 }
 
 /// # Safety
@@ -619,18 +655,18 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_put
     key: JString,
     payload: jbyteArray,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) -> jint {
     let result = (|| -> Result<jint> {
         let base_url: String = env.get_string(&base_url)?.into();
         let key: String = env.get_string(&key)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let payload_ref = unsafe { JByteArray::from_raw(payload) };
         let payload = env.convert_byte_array(&payload_ref)?;
 
         let rt = runtime()?;
-        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, client_identity_json)?;
         let report = rt.block_on(client.put_large_aware(key, Bytes::from(payload)))?;
         Ok(report.meta.size_bytes as jint)
     })();
@@ -655,7 +691,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
     snapshot: jstring,
     version: jstring,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) -> jbyteArray {
     let result = (|| -> Result<Vec<u8>> {
         let base_url: String = env.get_string(&base_url)?.into();
@@ -663,9 +699,9 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
         let snapshot = optional_jstring(&mut env, snapshot)?;
         let version = optional_jstring(&mut env, version)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let rt = runtime()?;
-        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, client_identity_json)?;
         let bytes = rt
             .block_on(client.get_with_selector(key, snapshot.as_deref(), version.as_deref()))?
             .to_vec();
@@ -701,15 +737,15 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
     depth: jint,
     snapshot: jstring,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) -> jstring {
     let result = (|| -> Result<String> {
         let base_url: String = env.get_string(&base_url)?.into();
         let prefix = optional_jstring(&mut env, prefix)?;
         let snapshot = optional_jstring(&mut env, snapshot)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
-        let sdk = configured_sdk(base_url, server_ca_pem, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        let sdk = configured_sdk(base_url, server_ca_pem, client_identity_json)?;
         let response = sdk.store_index_blocking(
             prefix.as_deref(),
             usize::try_from(depth).unwrap_or(1).max(1),
@@ -749,15 +785,15 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
     key: JString<'local>,
     input_stream: JObject<'local>,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) -> jint {
     let result = (|| -> Result<jint> {
         let base_url: String = env.get_string(&base_url)?.into();
         let key: String = env.get_string(&key)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let mut reader = JavaInputStreamReader::new(&mut env, input_stream)?;
-        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, client_identity_json)?;
         let report = client.put_chunked_reader(key, &mut reader)?;
         Ok(report.meta.size_bytes as jint)
     })();
@@ -780,15 +816,15 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_del
     base_url: JString,
     key: JString,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) -> jint {
     let result = (|| -> Result<jint> {
         let base_url: String = env.get_string(&base_url)?.into();
         let key: String = env.get_string(&key)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let rt = runtime()?;
-        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, client_identity_json)?;
         rt.block_on(client.delete_path(key))?;
         Ok(204)
     })();
@@ -816,7 +852,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
     snapshot: jstring,
     version: jstring,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
         let base_url: String = env.get_string(&base_url)?.into();
@@ -824,9 +860,9 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let snapshot = optional_jstring(&mut env, snapshot)?;
         let version = optional_jstring(&mut env, version)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
-        let client = configured_client_node(base_url, server_ca_pem, auth_token)?;
+        let client = configured_client_node(base_url, server_ca_pem, client_identity_json)?;
         client.get_with_selector_writer(key, snapshot.as_deref(), version.as_deref(), &mut writer)
     })();
 
@@ -847,13 +883,13 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
     relative_url: JString<'local>,
     output_stream: JObject<'local>,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
         let base_url: String = env.get_string(&base_url)?.into();
         let relative_url: String = env.get_string(&relative_url)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
 
         let base = Url::parse(&base_url).context("invalid base URL for relative stream")?;
@@ -862,9 +898,17 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
             .with_context(|| format!("failed to resolve relative URL {relative_url}"))?;
         let client =
             build_reqwest_client_from_pem(normalize_optional_string(server_ca_pem).as_deref())?;
-        let mut request = client.get(target);
-        if let Some(token) = normalize_optional_string(auth_token) {
-            request = request.bearer_auth(token);
+        let client_identity = parse_client_identity_json(client_identity_json)?;
+        let mut request = client.get(target.clone());
+        if let Some(identity) = client_identity.as_ref() {
+            let signed_headers = build_signed_request_headers(
+                identity,
+                Method::GET.as_str(),
+                &url_path_and_query(&target),
+                now_unix_secs(),
+                None,
+            )?;
+            request = signed_headers.apply_to_reqwest(request);
         }
 
         let rt = runtime()?;
@@ -912,7 +956,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
     prefix: jstring,
     depth: jint,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
         let base_url: String = env.get_string(&base_url)?.into();
@@ -920,7 +964,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
         let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
         let prefix = optional_jstring(&mut env, prefix)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
 
         if local_tree_uri.is_some() {
             initialize_android_saf_bridge(&mut env)?;
@@ -931,7 +975,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
             local_tree_uri,
             server_base_url: base_url,
             server_ca_pem,
-            auth_token,
+            client_identity_json,
             prefix,
             depth: usize::try_from(depth).unwrap_or(1).max(1),
             remote_refresh_interval_ms: 3_000,
@@ -967,7 +1011,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
     prefix: jstring,
     depth: jint,
     server_ca_pem: jstring,
-    auth_token: jstring,
+    client_identity_json: jstring,
 ) {
     let result = (|| -> Result<()> {
         let profile_id: String = env.get_string(&profile_id)?.into();
@@ -977,7 +1021,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
         let prefix = optional_jstring(&mut env, prefix)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
-        let auth_token = optional_jstring(&mut env, auth_token)?;
+        let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
 
         if local_tree_uri.is_some() {
             initialize_android_saf_bridge(&mut env)?;
@@ -988,7 +1032,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
             local_tree_uri,
             server_base_url: base_url,
             server_ca_pem,
-            auth_token,
+            client_identity_json,
             prefix,
             depth: usize::try_from(depth).unwrap_or(1).max(1),
             remote_refresh_interval_ms: 3_000,

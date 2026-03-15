@@ -31,7 +31,7 @@ class FolderSyncWorker(
         val baseUrl = deviceAuth.serverBaseUrl.ifBlank {
             IronmeshPreferences.getBaseUrl(applicationContext)
         }
-        val authToken = deviceAuth.deviceToken.takeIf { it.isNotBlank() }
+        val clientIdentityJson = deviceAuth.toClientIdentityJson()
         val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
         val profiles = IronmeshPreferences
             .getFolderSyncConfigs(applicationContext)
@@ -45,7 +45,7 @@ class FolderSyncWorker(
 
         for (profile in profiles) {
             runCatching {
-                syncProfile(baseUrl, serverCaPem, authToken, profile)
+                syncProfile(baseUrl, serverCaPem, clientIdentityJson, profile)
             }.onFailure { error ->
                 failures += "${profile.label}: ${error.message ?: "unknown"}"
                 Log.e(TAG, "folder sync failed for profile=${profile.id}", error)
@@ -62,7 +62,7 @@ class FolderSyncWorker(
     private suspend fun syncProfile(
         baseUrl: String,
         serverCaPem: String?,
-        authToken: String?,
+        clientIdentityJson: String?,
         profile: FolderSyncConfig,
     ) {
         val localFolder = File(profile.localFolder)
@@ -83,7 +83,7 @@ class FolderSyncWorker(
             prefix = profile.prefix.ifBlank { null },
             depth = profile.depth,
             serverCaPem = serverCaPem,
-            authToken = authToken,
+            clientIdentityJson = clientIdentityJson,
         )
 
         Log.i(TAG, "synced profile=${profile.id} via rust runtime")

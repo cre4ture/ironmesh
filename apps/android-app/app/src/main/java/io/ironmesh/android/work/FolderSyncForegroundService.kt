@@ -79,7 +79,7 @@ class FolderSyncForegroundService : Service() {
             val baseUrl = deviceAuth.serverBaseUrl.ifBlank {
                 IronmeshPreferences.getBaseUrl(applicationContext)
             }
-            val authToken = deviceAuth.deviceToken.takeIf { it.isNotBlank() }
+            val clientIdentityJson = deviceAuth.toClientIdentityJson()
             val serverCaPem = deviceAuth.serverCaPem.takeIf { !it.isNullOrBlank() }
             val profiles = IronmeshPreferences
                 .getFolderSyncConfigs(applicationContext)
@@ -115,7 +115,7 @@ class FolderSyncForegroundService : Service() {
                     prefix = profile.prefix.ifBlank { null },
                     depth = profile.depth,
                     serverCaPem = serverCaPem,
-                    authToken = authToken,
+                    clientIdentityJson = clientIdentityJson,
                 )
             }
             true

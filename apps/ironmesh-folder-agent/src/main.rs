@@ -210,7 +210,7 @@ fn run_agent(args: &Args) -> Result<()> {
         local_tree_uri: None,
         server_base_url: args.server_base_url.clone(),
         server_ca_pem: None,
-        auth_token: None,
+        client_identity_json: None,
         prefix: args.prefix.clone(),
         depth: args.depth,
         remote_refresh_interval_ms: args.remote_refresh_interval_ms,

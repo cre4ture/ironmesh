@@ -28,5 +28,6 @@ pub use remote_sync::{
     RemoteSyncScheduler, RemoteSyncStrategy, changed_paths_between,
 };
 pub use transport_sdk::{
-    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial, RelayMode,
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
+    RelayMode, build_signed_request_headers,
 };

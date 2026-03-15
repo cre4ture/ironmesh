@@ -122,7 +122,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 key,
                 ByteArray(0),
                 resolveServerCaPem(),
-                resolveAuthToken(),
+                resolveClientIdentityJson(),
             )
         }
         return fileDocumentId(key)
@@ -151,7 +151,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                             target.path,
                             input,
                             resolveServerCaPem(),
-                            resolveAuthToken(),
+                            resolveClientIdentityJson(),
                         )
                     }
                 }
@@ -172,7 +172,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                                 target.path,
                                 output,
                                 serverCaPem = resolveServerCaPem(),
-                                authToken = resolveAuthToken(),
+                                clientIdentityJson = resolveClientIdentityJson(),
                             )
                         }
                         output.flush()
@@ -216,7 +216,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                                 thumbnailUrl,
                                 output,
                                 resolveServerCaPem(),
-                                resolveAuthToken(),
+                                resolveClientIdentityJson(),
                             )
                         }
                         output.flush()
@@ -272,7 +272,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             depth = 1,
             snapshot = null,
             serverCaPem = resolveServerCaPem(),
-            authToken = resolveAuthToken(),
+            clientIdentityJson = resolveClientIdentityJson(),
         )
 
         entries.forEach { entry ->
@@ -320,11 +320,9 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         return repository.sanitizeBaseUrl(baseUrl)
     }
 
-    private fun resolveAuthToken(): String? {
+    private fun resolveClientIdentityJson(): String? {
         val context = context ?: return null
-        return IronmeshPreferences.getDeviceAuthState(context)
-            .deviceToken
-            .takeIf { it.isNotBlank() }
+        return IronmeshPreferences.getDeviceAuthState(context).toClientIdentityJson()
     }
 
     private fun resolveServerCaPem(): String? {
