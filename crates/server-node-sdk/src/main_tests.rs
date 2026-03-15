@@ -3,8 +3,9 @@ use super::{
     RepairExecutorState, ServerNodeConfig, ServerState, StartupRepairStatus,
     await_repair_busy_threshold, build_rendezvous_presence_registration, build_store_index_entries,
     cluster, constant_time_eq, jittered_backoff_secs, node_descriptor_from_presence_entry,
-    replication::build_internal_replication_put_url, run, run_startup_replication_repair_once,
-    should_trigger_autonomous_post_write_replication, token_matches,
+    replication::build_internal_replication_put_url, resolve_peer_base_url, run,
+    run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
+    token_matches,
 };
 use common::NodeId;
 use std::path::PathBuf;
@@ -2131,6 +2132,52 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     );
     assert_eq!(descriptor.capacity_bytes, 100);
     assert_eq!(descriptor.free_bytes, 40);
+}
+
+#[tokio::test]
+async fn resolve_peer_base_url_prefers_internal_url() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let node = cluster::NodeDescriptor {
+        node_id: NodeId::new_v4(),
+        public_url: "https://public.example".to_string(),
+        internal_url: "https://internal.example".to_string(),
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    };
+
+    let base_url =
+        resolve_peer_base_url(&state, &node).expect("peer transport should resolve base URL");
+
+    assert_eq!(base_url, "https://internal.example");
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let node = cluster::NodeDescriptor {
+        node_id: NodeId::new_v4(),
+        public_url: String::new(),
+        internal_url: String::new(),
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    };
+
+    let error = resolve_peer_base_url(&state, &node)
+        .expect_err("peer transport should fail without direct candidates");
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not expose any usable peer transport candidates")
+    );
+    cleanup_test_state(&state).await;
 }
 
 async fn cleanup_test_state(state: &ServerState) {

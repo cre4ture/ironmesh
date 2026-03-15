@@ -144,14 +144,8 @@ pub(crate) async fn execute_replication_repair_inner(
             await_repair_busy_threshold(state).await;
             attempted_transfers += 1;
 
-            match pull_bundle_from_source(
-                &http,
-                &source_node.internal_url,
-                &key,
-                version_id.as_deref(),
-                state,
-            )
-            .await
+            match pull_bundle_from_source(&http, source_node, &key, version_id.as_deref(), state)
+                .await
             {
                 Ok(imported_version_id) => {
                     successful_transfers += 1;
@@ -245,7 +239,7 @@ pub(crate) async fn execute_replication_repair_inner(
 
             attempted_transfers += 1;
             let transfer_result =
-                replicate_bundle_to_target(&http, &node.internal_url, &bundle, &state.store).await;
+                replicate_bundle_to_target(&http, node, &bundle, &state.store, state).await;
 
             match transfer_result {
                 Ok(remote_version_id) => {
@@ -313,11 +307,12 @@ pub(crate) async fn execute_replication_repair_inner(
 
 async fn pull_bundle_from_source(
     http: &reqwest::Client,
-    source_base_url: &str,
+    source_node: &NodeDescriptor,
     key: &str,
     version_id: Option<&str>,
     state: &ServerState,
 ) -> Result<String> {
+    let source_base_url = resolve_peer_base_url(state, source_node)?;
     let source_base_url = source_base_url.trim_end_matches('/');
     let export_url = format!("{source_base_url}/cluster/replication/export");
     let bundle = http
@@ -360,10 +355,12 @@ async fn pull_bundle_from_source(
 
 async fn replicate_bundle_to_target(
     http: &reqwest::Client,
-    target_base_url: &str,
+    target_node: &NodeDescriptor,
     bundle: &ReplicationExportBundle,
     store: &Arc<Mutex<PersistentStore>>,
+    state: &ServerState,
 ) -> Result<String> {
+    let target_base_url = resolve_peer_base_url(state, target_node)?;
     if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
         let state_query = match bundle.state {
             VersionConsistencyState::Confirmed => "confirmed",
@@ -441,7 +438,7 @@ async fn replicate_bundle_to_target(
         };
 
         let put_url = build_internal_replication_put_url(
-            target_base_url,
+            &target_base_url,
             &bundle.key,
             state_query,
             bundle.version_id.as_deref(),

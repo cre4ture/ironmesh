@@ -44,9 +44,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, CandidateKind,
     ClientBootstrap as TransportClientBootstrap, ConnectionCandidate, PeerIdentity,
-    PresenceRegistration, RelayMode, RendezvousClientConfig, RendezvousControlClient,
-    SignedRequestHeaders, TransportCapability, credential_fingerprint,
-    verify_signed_request_headers,
+    PeerTransportClient, PeerTransportClientConfig, PresenceRegistration, RelayMode,
+    RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders, TransportCapability,
+    TransportPathKind, credential_fingerprint, verify_signed_request_headers,
 };
 use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
@@ -1945,6 +1945,79 @@ fn node_descriptor_from_presence_entry(
     })
 }
 
+fn peer_transport_client(state: &ServerState) -> Result<PeerTransportClient> {
+    PeerTransportClient::new(PeerTransportClientConfig {
+        cluster_id: state.cluster_id,
+        prefer_direct: true,
+        allow_relay: state.relay_mode != RelayMode::Disabled,
+    })
+}
+
+fn peer_connection_candidates(node: &NodeDescriptor) -> Vec<ConnectionCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen_endpoints = BTreeSet::new();
+
+    push_ranked_peer_candidate(
+        &mut candidates,
+        &mut seen_endpoints,
+        normalize_optional_url(Some(node.internal_url.as_str())),
+        Some(1),
+    );
+    push_ranked_peer_candidate(
+        &mut candidates,
+        &mut seen_endpoints,
+        normalize_optional_url(Some(node.public_url.as_str())),
+        Some(100),
+    );
+
+    candidates
+}
+
+fn push_ranked_peer_candidate(
+    candidates: &mut Vec<ConnectionCandidate>,
+    seen_endpoints: &mut BTreeSet<String>,
+    endpoint: Option<String>,
+    rtt_ms: Option<u32>,
+) {
+    let Some(endpoint) = endpoint else {
+        return;
+    };
+    if !seen_endpoints.insert(endpoint.clone()) {
+        return;
+    }
+
+    candidates.push(ConnectionCandidate {
+        kind: CandidateKind::DirectHttps,
+        endpoint,
+        rtt_ms,
+    });
+}
+
+pub(crate) fn resolve_peer_base_url(state: &ServerState, node: &NodeDescriptor) -> Result<String> {
+    let transport = peer_transport_client(state)?;
+    let candidates = peer_connection_candidates(node);
+    let Some(plan) = transport.plan_session(PeerIdentity::Node(node.node_id), &candidates) else {
+        bail!(
+            "node {} does not expose any usable peer transport candidates",
+            node.node_id
+        );
+    };
+    let candidate = plan
+        .candidate
+        .as_ref()
+        .context("peer transport plan did not include a selected candidate")?;
+
+    match plan.path_kind {
+        TransportPathKind::DirectHttps | TransportPathKind::DirectQuic => {
+            Ok(candidate.endpoint.trim_end_matches('/').to_string())
+        }
+        TransportPathKind::RelayTunnel => bail!(
+            "node {} requires relay peer transport, which is not implemented yet",
+            node.node_id
+        ),
+    }
+}
+
 fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(5)));
@@ -2024,7 +2097,17 @@ pub(crate) async fn sync_replica_views_once(state: &ServerState) {
     };
 
     for peer in peers {
-        let base = peer.internal_url.trim_end_matches('/');
+        let base = match resolve_peer_base_url(state, &peer) {
+            Ok(base) => base,
+            Err(err) => {
+                tracing::debug!(
+                    node_id = %peer.node_id,
+                    error = %err,
+                    "failed resolving peer transport base URL for replica subject sync"
+                );
+                continue;
+            }
+        };
         let url = format!("{base}/cluster/replication/subjects/local");
 
         match http.get(url).send().await {
@@ -2345,7 +2428,17 @@ fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
             };
 
             for peer in peers {
-                let base = peer.internal_url.trim_end_matches('/');
+                let base = match resolve_peer_base_url(&state, &peer) {
+                    Ok(base) => base,
+                    Err(err) => {
+                        tracing::debug!(
+                            node_id = %peer.node_id,
+                            error = %err,
+                            "failed resolving peer transport base URL for heartbeat"
+                        );
+                        continue;
+                    }
+                };
                 let url = format!("{base}/cluster/nodes/{}/heartbeat", state.node_id);
 
                 match http.post(url).json(&payload).send().await {
@@ -5200,7 +5293,7 @@ async fn reconcile_from_node(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let remote_url = {
+    let remote_node = {
         let mut cluster = state.cluster.lock().await;
         cluster.update_health_and_detect_offline_transition();
 
@@ -5212,7 +5305,18 @@ async fn reconcile_from_node(
             return StatusCode::NOT_FOUND.into_response();
         };
 
-        node.internal_url
+        node
+    };
+    let remote_url = match resolve_peer_base_url(&state, &remote_node) {
+        Ok(url) => url,
+        Err(err) => {
+            tracing::error!(
+                source_node_id = %source_node_id,
+                error = %err,
+                "failed resolving reconciliation peer transport"
+            );
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
     };
 
     let http = state.internal_http.clone();
