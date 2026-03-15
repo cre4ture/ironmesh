@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use client_sdk::normalize_server_base_url;
+use client_sdk::{ClientIdentityMaterial, ConnectionBootstrap, normalize_server_base_url};
+use reqwest::Url;
 use serde_json::json;
 use std::path::PathBuf;
 use sync_agent_core::{
@@ -16,8 +17,14 @@ struct Args {
     command: Option<Command>,
     #[arg(long)]
     root_dir: PathBuf,
-    #[arg(long, default_value = "http://127.0.0.1:8080", global = true)]
-    server_base_url: String,
+    #[arg(long, global = true)]
+    server_base_url: Option<String>,
+    #[arg(long, global = true)]
+    bootstrap_file: Option<PathBuf>,
+    #[arg(long, global = true)]
+    server_ca_pem_file: Option<PathBuf>,
+    #[arg(long, global = true)]
+    client_identity_file: Option<PathBuf>,
     #[arg(long, global = true)]
     prefix: Option<String>,
     #[arg(long, default_value_t = 64, global = true)]
@@ -79,6 +86,11 @@ enum ConflictListFormat {
     Table,
 }
 
+struct ResolvedStartupTarget {
+    base_url: Url,
+    server_ca_pem: Option<String>,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -106,8 +118,11 @@ fn run_command(args: &Args, command: &Command) -> Result<()> {
 
 fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
     let scope = PathScope::new(args.prefix.clone());
-    let base_url = normalize_server_base_url(&args.server_base_url)?;
+    let target = resolve_startup_target(args)?;
+    let base_url = target.base_url;
     let state_store = StartupStateStore::new(&args.root_dir, &scope, base_url.as_str());
+    let client_identity_json =
+        read_optional_client_identity_json(args.client_identity_file.as_deref())?;
 
     match command {
         ConflictCommand::List { format } => {
@@ -164,6 +179,8 @@ fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
             let result = resolve_conflict_action(
                 &args.root_dir,
                 base_url.as_str(),
+                target.server_ca_pem.as_deref(),
+                client_identity_json.as_deref(),
                 &scope,
                 &state_store,
                 path.as_str(),
@@ -205,12 +222,15 @@ fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
 }
 
 fn run_agent(args: &Args) -> Result<()> {
+    let target = resolve_startup_target(args)?;
     run_folder_agent(&FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
         local_tree_uri: None,
-        server_base_url: args.server_base_url.clone(),
-        server_ca_pem: None,
-        client_identity_json: None,
+        server_base_url: target.base_url.to_string(),
+        server_ca_pem: target.server_ca_pem,
+        client_identity_json: read_optional_client_identity_json(
+            args.client_identity_file.as_deref(),
+        )?,
         prefix: args.prefix.clone(),
         depth: args.depth,
         remote_refresh_interval_ms: args.remote_refresh_interval_ms,
@@ -219,4 +239,50 @@ fn run_agent(args: &Args) -> Result<()> {
         run_once: args.run_once,
         ui_bind: args.ui_bind.clone(),
     })
+}
+
+fn resolve_startup_target(args: &Args) -> Result<ResolvedStartupTarget> {
+    if args.server_base_url.is_some() && args.bootstrap_file.is_some() {
+        bail!("use either --server-base-url or --bootstrap-file, not both");
+    }
+
+    let server_ca_override = read_optional_utf8_file(args.server_ca_pem_file.as_deref())?;
+    if let Some(bootstrap_path) = args.bootstrap_file.as_deref() {
+        let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
+        let resolved = bootstrap.resolve_blocking()?;
+        return Ok(ResolvedStartupTarget {
+            base_url: normalize_server_base_url(&resolved.server_base_url)?,
+            server_ca_pem: server_ca_override
+                .or(resolved.server_ca_pem)
+                .or(resolved.cluster_ca_pem),
+        });
+    }
+
+    let server_base_url = args
+        .server_base_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("set either --server-base-url or --bootstrap-file"))?;
+    Ok(ResolvedStartupTarget {
+        base_url: normalize_server_base_url(server_base_url)?,
+        server_ca_pem: server_ca_override,
+    })
+}
+
+fn read_optional_utf8_file(path: Option<&std::path::Path>) -> Result<Option<String>> {
+    path.map(|path| {
+        std::fs::read_to_string(path)
+            .map(|value| value.trim().to_string())
+            .map_err(anyhow::Error::from)
+            .map_err(|error| error.context(format!("failed to read UTF-8 file {}", path.display())))
+    })
+    .transpose()
+    .map(|value| value.filter(|value| !value.is_empty()))
+}
+
+fn read_optional_client_identity_json(path: Option<&std::path::Path>) -> Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let identity = ClientIdentityMaterial::from_path(path)?;
+    Ok(Some(identity.to_json_pretty()?))
 }

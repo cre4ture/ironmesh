@@ -8,8 +8,8 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::{
-    PathScope, StartupStateStore, absolute_path, conflict_copy_dir, copy_file_atomically,
-    current_unix_ms, delete_conflict_copies, local_entry_state_for_path,
+    PathScope, StartupStateStore, absolute_path, build_configured_client, conflict_copy_dir,
+    copy_file_atomically, current_unix_ms, delete_conflict_copies, local_entry_state_for_path,
     newest_remote_conflict_copy, normalize_relative_path,
 };
 
@@ -48,9 +48,12 @@ pub fn validate_user_relative_path_input(path: &str) -> Result<String> {
     Ok(normalized)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_conflict_action(
     root_dir: &Path,
     server_base_url: &str,
+    server_ca_pem: Option<&str>,
+    client_identity_json: Option<&str>,
     scope: &PathScope,
     state_store: &StartupStateStore,
     path: &str,
@@ -101,7 +104,11 @@ pub fn resolve_conflict_action(
                         )
                     })?;
 
-                    let client = IronMeshClient::new(server_base_url);
+                    let client = build_configured_client(
+                        server_base_url,
+                        server_ca_pem,
+                        client_identity_json,
+                    )?;
                     let metadata = fs::metadata(&local_target).with_context(|| {
                         format!(
                             "failed to inspect resolved local file {}",
@@ -153,7 +160,11 @@ pub fn resolve_conflict_action(
 
                     remove_local_path(root_dir, normalized_path.as_str())?;
 
-                    let client = IronMeshClient::new(server_base_url);
+                    let client = build_configured_client(
+                        server_base_url,
+                        server_ca_pem,
+                        client_identity_json,
+                    )?;
                     delete_remote_file(&client, scope, normalized_path.as_str())?;
                     state_store.remove_baseline_entry(normalized_path.as_str())?;
 

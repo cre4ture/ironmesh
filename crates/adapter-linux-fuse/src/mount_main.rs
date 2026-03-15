@@ -8,8 +8,11 @@ use crate::{FuseAction, FuseActionPlan, LinuxFuseAdapter};
 use anyhow::{Context, Result};
 use clap::Parser;
 use client_sdk::{
-    IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, normalize_server_base_url,
+    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, RemoteSnapshotFetcher,
+    RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
+use reqwest::Url;
 use server_node_sdk::LocalNodeHandle;
 use std::fs;
 use std::path::PathBuf;
@@ -26,6 +29,12 @@ struct Args {
     snapshot_file: Option<PathBuf>,
     #[arg(long)]
     server_base_url: Option<String>,
+    #[arg(long)]
+    bootstrap_file: Option<PathBuf>,
+    #[arg(long)]
+    server_ca_pem_file: Option<PathBuf>,
+    #[arg(long)]
+    client_identity_file: Option<PathBuf>,
     #[arg(
         long,
         default_value_t = false,
@@ -50,20 +59,30 @@ struct Args {
     remote_refresh_interval_ms: u64,
 }
 
+struct ResolvedUpstreamTarget {
+    base_url: Url,
+    server_ca_pem: Option<String>,
+}
+
 pub fn mount_main() -> Result<()> {
     let args = Args::parse();
 
     let effective_local_edge_data_dir = effective_local_edge_data_dir(&args)?;
+    let upstream_target = resolve_upstream_target(&args)?;
 
     if args.snapshot_file.is_some() {
-        if args.server_base_url.is_some() || args.local_edge_data_dir.is_some() || args.local_edge {
+        if args.server_base_url.is_some()
+            || args.bootstrap_file.is_some()
+            || args.local_edge_data_dir.is_some()
+            || args.local_edge
+        {
             anyhow::bail!(
-                "--snapshot-file cannot be combined with --server-base-url, --local-edge, or --local-edge-data-dir"
+                "--snapshot-file cannot be combined with --server-base-url, --bootstrap-file, --local-edge, or --local-edge-data-dir"
             );
         }
-    } else if args.server_base_url.is_none() && effective_local_edge_data_dir.is_none() {
+    } else if upstream_target.is_none() && effective_local_edge_data_dir.is_none() {
         anyhow::bail!(
-            "set either --snapshot-file, --server-base-url, --local-edge, or --local-edge-data-dir"
+            "set either --snapshot-file, --server-base-url, --bootstrap-file, --local-edge, or --local-edge-data-dir"
         );
     }
 
@@ -90,22 +109,23 @@ pub fn mount_main() -> Result<()> {
     }
 
     let local_node = if let Some(data_dir) = effective_local_edge_data_dir.as_ref() {
-        Some(
-            if let Some(upstream_base_url) = args.server_base_url.as_deref() {
-                LocalNodeHandle::start_local_edge_with_upstream(data_dir, upstream_base_url)
-                    .with_context(|| {
-                        format!(
-                            "failed to start local edge node in {} with upstream {}",
-                            data_dir.display(),
-                            upstream_base_url
-                        )
-                    })?
-            } else {
-                LocalNodeHandle::start_local_edge(data_dir).with_context(|| {
-                    format!("failed to start local edge node in {}", data_dir.display())
-                })?
-            },
-        )
+        Some(if let Some(upstream_target) = upstream_target.as_ref() {
+            LocalNodeHandle::start_local_edge_with_upstream(
+                data_dir,
+                upstream_target.base_url.as_str(),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to start local edge node in {} with upstream {}",
+                    data_dir.display(),
+                    upstream_target.base_url
+                )
+            })?
+        } else {
+            LocalNodeHandle::start_local_edge(data_dir).with_context(|| {
+                format!("failed to start local edge node in {}", data_dir.display())
+            })?
+        })
     } else {
         None
     };
@@ -113,7 +133,10 @@ pub fn mount_main() -> Result<()> {
     let base_url = if let Some(local_node) = local_node.as_ref() {
         normalize_server_base_url(local_node.base_url())?
     } else {
-        normalize_server_base_url(args.server_base_url.as_deref().unwrap_or_default())?
+        upstream_target
+            .as_ref()
+            .map(|target| target.base_url.clone())
+            .ok_or_else(|| anyhow::anyhow!("missing upstream target for live mount"))?
     };
     if let (Some(local_node), Some(output_path)) =
         (local_node.as_ref(), args.local_edge_base_url_file.as_ref())
@@ -125,25 +148,34 @@ pub fn mount_main() -> Result<()> {
             )
         })?;
     }
-    let initial_fetcher = RemoteSnapshotFetcher::from_base_url(
+    let server_ca_pem = upstream_target.as_ref().and_then(|target| {
+        if local_node.is_none() {
+            target.server_ca_pem.clone()
+        } else {
+            None
+        }
+    });
+    let client_identity = read_optional_client_identity(args.client_identity_file.as_deref())?;
+    let client = build_configured_client(
         base_url.as_str(),
-        args.prefix.clone(),
-        args.depth,
-        None,
+        server_ca_pem.as_deref(),
+        client_identity.as_ref(),
+    )?;
+    let initial_fetcher = RemoteSnapshotFetcher::new(
+        client.clone(),
+        RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
     );
     let snapshot = initial_fetcher.fetch_snapshot_blocking()?;
     let action_plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
 
-    let refresh_enabled = args.server_base_url.is_some();
+    let refresh_enabled = upstream_target.is_some();
     let (refresh_rx, refresh_thread, refresh_running) = if refresh_enabled {
         let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
         let refresh_poller =
             RemoteSnapshotPoller::server_notifications(Duration::from_secs(25), refresh_interval);
-        let refresh_fetcher = RemoteSnapshotFetcher::from_base_url(
-            base_url.as_str(),
-            args.prefix.clone(),
-            args.depth,
-            None,
+        let refresh_fetcher = RemoteSnapshotFetcher::new(
+            client.clone(),
+            RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
         );
         let refresh_adapter = adapter.clone();
         let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
@@ -184,7 +216,7 @@ pub fn mount_main() -> Result<()> {
         (None, None, None)
     };
 
-    let io = ServerNodeIo::new(base_url.as_str());
+    let io = ServerNodeIo::with_client(client);
     let result = mount_action_plan_until_shutdown_with_updates(
         &config,
         action_plan,
@@ -243,16 +275,44 @@ fn xdg_state_home() -> Option<PathBuf> {
 
 fn local_edge_scope_label(args: &Args) -> String {
     let mountpoint = args.mountpoint.to_string_lossy().to_string();
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     if let Some(base_url) = args.server_base_url.as_deref() {
-        parts.push(base_url);
+        parts.push(base_url.to_string());
+    } else if let Some(bootstrap_file) = args.bootstrap_file.as_ref() {
+        parts.push(bootstrap_file.to_string_lossy().into_owned());
     }
     if let Some(prefix) = args.prefix.as_deref() {
-        parts.push(prefix);
+        parts.push(prefix.to_string());
     }
-    parts.push(mountpoint.as_str());
+    parts.push(mountpoint);
 
     sanitize_path_component(&parts.join("__"))
+}
+
+fn resolve_upstream_target(args: &Args) -> Result<Option<ResolvedUpstreamTarget>> {
+    if args.server_base_url.is_some() && args.bootstrap_file.is_some() {
+        anyhow::bail!("use either --server-base-url or --bootstrap-file, not both");
+    }
+
+    let server_ca_override = read_optional_utf8_file(args.server_ca_pem_file.as_deref())?;
+    if let Some(bootstrap_path) = args.bootstrap_file.as_deref() {
+        let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
+        let resolved = bootstrap.resolve_blocking()?;
+        return Ok(Some(ResolvedUpstreamTarget {
+            base_url: normalize_server_base_url(&resolved.server_base_url)?,
+            server_ca_pem: server_ca_override
+                .or(resolved.server_ca_pem)
+                .or(resolved.cluster_ca_pem),
+        }));
+    }
+
+    let Some(server_base_url) = args.server_base_url.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some(ResolvedUpstreamTarget {
+        base_url: normalize_server_base_url(server_base_url)?,
+        server_ca_pem: server_ca_override,
+    }))
 }
 
 fn sanitize_path_component(raw: &str) -> String {
@@ -318,10 +378,8 @@ struct ServerNodeIo {
 }
 
 impl ServerNodeIo {
-    fn new(server_base_url: impl Into<String>) -> Self {
-        Self {
-            sdk: IronMeshClient::new(server_base_url),
-        }
+    fn with_client(sdk: IronMeshClient) -> Self {
+        Self { sdk }
     }
 }
 
@@ -361,6 +419,36 @@ impl Uploader for ServerNodeIo {
     }
 }
 
+fn build_configured_client(
+    server_base_url: &str,
+    server_ca_pem: Option<&str>,
+    client_identity: Option<&ClientIdentityMaterial>,
+) -> Result<IronMeshClient> {
+    match client_identity {
+        Some(identity) => {
+            build_http_client_with_identity_from_pem(server_ca_pem, server_base_url, identity)
+        }
+        None => build_http_client_from_pem(server_ca_pem, server_base_url, &None),
+    }
+}
+
+fn read_optional_utf8_file(path: Option<&std::path::Path>) -> Result<Option<String>> {
+    path.map(|path| {
+        std::fs::read_to_string(path)
+            .map(|value| value.trim().to_string())
+            .map_err(anyhow::Error::from)
+            .map_err(|error| error.context(format!("failed to read UTF-8 file {}", path.display())))
+    })
+    .transpose()
+    .map(|value| value.filter(|value| !value.is_empty()))
+}
+
+fn read_optional_client_identity(
+    path: Option<&std::path::Path>,
+) -> Result<Option<ClientIdentityMaterial>> {
+    path.map(ClientIdentityMaterial::from_path).transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +457,9 @@ mod tests {
         Args {
             snapshot_file: None,
             server_base_url: Some("http://127.0.0.1:8080".to_string()),
+            bootstrap_file: None,
+            server_ca_pem_file: None,
+            client_identity_file: None,
             local_edge: false,
             local_edge_data_dir: None,
             local_edge_base_url_file: None,

@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
-    RemoteSnapshotUpdate, build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    normalize_server_base_url,
+    RemoteSnapshotUpdate, normalize_server_base_url,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -19,14 +18,14 @@ use sync_core::{EntryKind, SyncSnapshot};
 
 use crate::{
     FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeState, PathScope,
-    RemoteTreeIndex, StartupStateStore, absolute_path, cleanup_ironmesh_part_files,
-    delete_remote_file, diff_local_trees, load_local_baseline_hashes_with_retries,
-    load_local_baseline_with_retries, local_entry_state_for_path,
-    local_paths_to_preserve_on_startup, materialize_remote_conflict_copies, parent_directories,
-    remote_file_hashes_by_local_path, remote_file_paths_by_local_path, remove_local_path,
-    scan_local_tree, spawn_ui_server, startup_add_delete_conflicts,
-    startup_baseline_state_from_remote_index, startup_dual_modify_conflicts,
-    startup_remote_delete_wins_paths, upload_local_file,
+    RemoteTreeIndex, StartupStateStore, absolute_path, build_configured_client,
+    cleanup_ironmesh_part_files, delete_remote_file, diff_local_trees,
+    load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
+    local_entry_state_for_path, local_paths_to_preserve_on_startup,
+    materialize_remote_conflict_copies, parent_directories, remote_file_hashes_by_local_path,
+    remote_file_paths_by_local_path, remove_local_path, scan_local_tree, spawn_ui_server,
+    startup_add_delete_conflicts, startup_baseline_state_from_remote_index,
+    startup_dual_modify_conflicts, startup_remote_delete_wins_paths, upload_local_file,
 };
 
 #[derive(Debug, Clone)]
@@ -133,6 +132,8 @@ fn run_folder_agent_inner(
         let ui_state = FolderAgentUiState::new(
             options.root_dir.clone(),
             base_url.to_string(),
+            options.server_ca_pem.clone(),
+            options.client_identity_json.clone(),
             scope.clone(),
             state_store.clone(),
         );
@@ -438,28 +439,11 @@ fn configured_client(
     base_url: &str,
     options: &FolderAgentRuntimeOptions,
 ) -> Result<IronMeshClient> {
-    let server_ca_pem = normalized_optional_string(options.server_ca_pem.as_deref());
-    let client_identity = normalized_optional_string(options.client_identity_json.as_deref())
-        .map(|raw| client_sdk::ClientIdentityMaterial::from_json_str(&raw))
-        .transpose()
-        .context("failed to parse folder agent client identity")?;
-    match client_identity.as_ref() {
-        Some(identity) => {
-            build_http_client_with_identity_from_pem(server_ca_pem.as_deref(), base_url, identity)
-        }
-        None => build_http_client_from_pem(server_ca_pem.as_deref(), base_url, &None),
-    }
-}
-
-fn normalized_optional_string(value: Option<&str>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
+    build_configured_client(
+        base_url,
+        options.server_ca_pem.as_deref(),
+        options.client_identity_json.as_deref(),
+    )
 }
 
 fn install_ctrlc_handler(running: Arc<AtomicBool>) -> Result<()> {

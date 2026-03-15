@@ -11,6 +11,10 @@ pub use folder_agent_state::*;
 pub use folder_agent_ui::*;
 
 use anyhow::{Context, Result};
+use client_sdk::{
+    ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,6 +58,39 @@ impl LocalEntryState {
 }
 
 pub type LocalTreeState = BTreeMap<String, LocalEntryState>;
+
+pub(crate) fn build_configured_client(
+    server_base_url: &str,
+    server_ca_pem: Option<&str>,
+    client_identity_json: Option<&str>,
+) -> Result<IronMeshClient> {
+    let server_ca_pem = normalized_optional_string(server_ca_pem);
+    let client_identity_json = normalized_optional_string(client_identity_json);
+    let client_identity = client_identity_json
+        .as_deref()
+        .map(ClientIdentityMaterial::from_json_str)
+        .transpose()
+        .context("failed to parse client identity JSON")?;
+    match client_identity.as_ref() {
+        Some(identity) => build_http_client_with_identity_from_pem(
+            server_ca_pem.as_deref(),
+            server_base_url,
+            identity,
+        ),
+        None => build_http_client_from_pem(server_ca_pem.as_deref(), server_base_url, &None),
+    }
+}
+
+pub(crate) fn normalized_optional_string(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LocalTreeDiff {

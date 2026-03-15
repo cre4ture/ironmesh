@@ -9,6 +9,7 @@ authors.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
+reqwest.workspace = true
 sync-agent-core = { path = "../../crates/sync-agent-core" }
 sync-core = { path = "../../crates/sync-core" }
 serde_json.workspace = true

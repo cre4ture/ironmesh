@@ -25,6 +25,8 @@ pub struct FolderAgentUiState {
 struct FolderAgentUiStateInner {
     root_dir: PathBuf,
     server_base_url: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
     scope: PathScope,
     state_store: StartupStateStore,
     operation_lock: Mutex<()>,
@@ -34,6 +36,8 @@ impl FolderAgentUiState {
     pub fn new(
         root_dir: PathBuf,
         server_base_url: String,
+        server_ca_pem: Option<String>,
+        client_identity_json: Option<String>,
         scope: PathScope,
         state_store: StartupStateStore,
     ) -> Self {
@@ -41,6 +45,8 @@ impl FolderAgentUiState {
             inner: Arc::new(FolderAgentUiStateInner {
                 root_dir,
                 server_base_url,
+                server_ca_pem,
+                client_identity_json,
                 scope,
                 state_store,
                 operation_lock: Mutex::new(()),
@@ -238,6 +244,8 @@ async fn resolve_conflict(
         resolve_conflict_action(
             &inner.root_dir,
             inner.server_base_url.as_str(),
+            inner.server_ca_pem.as_deref(),
+            inner.client_identity_json.as_deref(),
             &inner.scope,
             &inner.state_store,
             path.as_str(),
