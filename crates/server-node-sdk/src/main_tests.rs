@@ -208,9 +208,12 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     let response = super::enroll_client_device(
         State(state.clone()),
         Json(super::ClientDeviceEnrollRequest {
+            cluster_id: state.cluster_id,
             pairing_token: "pair-secret".to_string(),
             device_id: Some("device-a".to_string()),
             label: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
+                .to_string(),
         }),
     )
     .await
@@ -240,15 +243,29 @@ run_on_main_metadata_backends!(
     enroll_client_device_consumes_pairing_token_and_persists_device_turso
 );
 
-async fn client_auth_middleware_requires_valid_bearer_when_enabled_impl(backend: MainTestBackend) {
+async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
+    backend: MainTestBackend,
+) {
     let mut state = build_test_state(1, false, backend).await;
     state.client_auth_control.require_client_auth = true;
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
+    let credential_pem = super::generate_client_credential_pem(
+        state.cluster_id,
+        &identity.device_id.to_string(),
+        &identity.public_key_pem,
+        super::unix_ts(),
+        None,
+    );
+    identity.credential_pem = Some(credential_pem.clone());
     {
         let mut auth = state.client_auth.lock().await;
         auth.devices.push(super::DeviceAuthRecord {
-            device_id: "device-a".to_string(),
+            device_id: identity.device_id.to_string(),
             label: Some("Pixel".to_string()),
-            token_hash: super::hash_token("device-secret"),
+            token_hash: super::hash_token("legacy-device-secret"),
+            public_key_pem: Some(identity.public_key_pem.clone()),
+            issued_credential_pem: Some(credential_pem),
             created_at_unix: super::unix_ts(),
             revoked_at_unix: None,
         });
@@ -261,6 +278,14 @@ async fn client_auth_middleware_requires_valid_bearer_when_enabled_impl(backend:
             state.clone(),
             super::require_client_auth,
         ));
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("nonce-a".to_string()),
+    )
+    .unwrap();
 
     let unauthorized = app
         .clone()
@@ -278,7 +303,30 @@ async fn client_auth_middleware_requires_valid_bearer_when_enabled_impl(backend:
         .oneshot(
             Request::builder()
                 .uri("/store/index")
-                .header("Authorization", "Bearer device-secret")
+                .header(
+                    transport_sdk::HEADER_CLUSTER_ID,
+                    signed_headers.cluster_id.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_DEVICE_ID,
+                    signed_headers.device_id.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                    signed_headers.credential_fingerprint.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_TIMESTAMP,
+                    signed_headers.timestamp_unix.to_string(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_NONCE,
+                    signed_headers.nonce.as_str(),
+                )
+                .header(
+                    transport_sdk::HEADER_AUTH_SIGNATURE,
+                    signed_headers.signature_base64.as_str(),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -290,9 +338,97 @@ async fn client_auth_middleware_requires_valid_bearer_when_enabled_impl(backend:
 }
 
 run_on_main_metadata_backends!(
-    client_auth_middleware_requires_valid_bearer_when_enabled_impl,
-    client_auth_middleware_requires_valid_bearer_when_enabled,
-    client_auth_middleware_requires_valid_bearer_when_enabled_turso
+    client_auth_middleware_requires_valid_signature_when_enabled_impl,
+    client_auth_middleware_requires_valid_signature_when_enabled,
+    client_auth_middleware_requires_valid_signature_when_enabled_turso
+);
+
+async fn client_auth_middleware_rejects_replayed_nonce_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.client_auth_control.require_client_auth = true;
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
+    let credential_pem = super::generate_client_credential_pem(
+        state.cluster_id,
+        &identity.device_id.to_string(),
+        &identity.public_key_pem,
+        super::unix_ts(),
+        None,
+    );
+    identity.credential_pem = Some(credential_pem.clone());
+    {
+        let mut auth = state.client_auth.lock().await;
+        auth.devices.push(super::DeviceAuthRecord {
+            device_id: identity.device_id.to_string(),
+            label: None,
+            token_hash: super::hash_token("legacy-device-secret"),
+            public_key_pem: Some(identity.public_key_pem.clone()),
+            issued_credential_pem: Some(credential_pem),
+            created_at_unix: super::unix_ts(),
+            revoked_at_unix: None,
+        });
+    }
+
+    let app = Router::new()
+        .route("/store/index", get(|| async { StatusCode::OK }))
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::require_client_auth,
+        ));
+    let signed_headers = transport_sdk::build_signed_request_headers(
+        &identity,
+        "GET",
+        "/store/index",
+        super::unix_ts(),
+        Some("nonce-replay".to_string()),
+    )
+    .unwrap();
+
+    let request = || {
+        Request::builder()
+            .uri("/store/index")
+            .header(
+                transport_sdk::HEADER_CLUSTER_ID,
+                signed_headers.cluster_id.to_string(),
+            )
+            .header(
+                transport_sdk::HEADER_DEVICE_ID,
+                signed_headers.device_id.as_str(),
+            )
+            .header(
+                transport_sdk::HEADER_CREDENTIAL_FINGERPRINT,
+                signed_headers.credential_fingerprint.as_str(),
+            )
+            .header(
+                transport_sdk::HEADER_AUTH_TIMESTAMP,
+                signed_headers.timestamp_unix.to_string(),
+            )
+            .header(
+                transport_sdk::HEADER_AUTH_NONCE,
+                signed_headers.nonce.as_str(),
+            )
+            .header(
+                transport_sdk::HEADER_AUTH_SIGNATURE,
+                signed_headers.signature_base64.as_str(),
+            )
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let replayed = app.oneshot(request()).await.unwrap();
+    assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    client_auth_middleware_rejects_replayed_nonce_impl,
+    client_auth_middleware_rejects_replayed_nonce,
+    client_auth_middleware_rejects_replayed_nonce_turso
 );
 
 async fn store_index_change_wait_unblocks_after_put_impl(backend: MainTestBackend) {
@@ -1813,11 +1949,15 @@ async fn build_test_state(
 
     let (namespace_change_tx, _) = tokio::sync::watch::channel(0);
     let state = ServerState {
+        cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
         client_auth: Arc::new(Mutex::new(super::storage::ClientAuthState::default())),
         public_ca_pem: None,
+        cluster_ca_pem: None,
+        rendezvous_urls: vec!["http://127.0.0.1:39080".to_string()],
+        relay_mode: super::RelayMode::Fallback,
         metadata_commit_mode: MetadataCommitMode::Local,
         internal_http: reqwest::Client::new(),
         autonomous_replication_on_put_enabled: false,
@@ -1845,6 +1985,7 @@ async fn build_test_state(
         namespace_change_tx,
         admin_control: AdminControl::default(),
         client_auth_control: super::ClientAuthControl::default(),
+        client_auth_replay_cache: Arc::new(Mutex::new(super::ClientAuthReplayCache::default())),
     };
 
     if seed_gap {

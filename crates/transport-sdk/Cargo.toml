@@ -1,5 +1,5 @@
 [package]
-name = "client-sdk"
+name = "transport-sdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,12 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
-bytes.workspace = true
+base64 = "0.22"
 common = { path = "../common" }
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest.workspace = true
-rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sync-core = { path = "../sync-core" }
-tokio.workspace = true
-transport-sdk = { path = "../transport-sdk" }
 uuid.workspace = true

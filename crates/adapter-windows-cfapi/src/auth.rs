@@ -1,16 +1,20 @@
 #![cfg(windows)]
 
 use anyhow::{Context, Result, bail};
-use client_sdk::{DeviceEnrollmentRequest, enroll_device_blocking_from_pem};
+use client_sdk::{
+    ClientIdentityMaterial, DeviceEnrollmentRequest, enroll_device_blocking_from_pem,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 const DEFAULT_DEVICE_AUTH_FILE_NAME: &str = ".ironmesh-device-auth.json";
 
 #[derive(Debug, Clone)]
 pub struct DeviceEnrollmentOptions {
+    pub cluster_id: Uuid,
     pub pairing_token: Option<String>,
     pub force_reenroll: bool,
     pub device_id: Option<String>,
@@ -21,9 +25,38 @@ pub struct DeviceEnrollmentOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceAuthRecord {
+    pub cluster_id: String,
     pub device_id: String,
     pub device_token: String,
     pub label: Option<String>,
+    pub public_key_pem: String,
+    pub private_key_pem: String,
+    pub credential_pem: String,
+}
+
+impl DeviceAuthRecord {
+    pub fn client_identity_material(&self) -> Result<ClientIdentityMaterial> {
+        let cluster_id = self
+            .cluster_id
+            .parse()
+            .with_context(|| format!("invalid cluster_id {}", self.cluster_id))?;
+        let device_id = self
+            .device_id
+            .parse()
+            .with_context(|| format!("invalid device_id {}", self.device_id))?;
+        let identity = ClientIdentityMaterial {
+            cluster_id,
+            device_id,
+            label: self.label.clone(),
+            private_key_pem: self.private_key_pem.clone(),
+            public_key_pem: self.public_key_pem.clone(),
+            credential_pem: Some(self.credential_pem.clone()),
+            issued_at_unix: None,
+            expires_at_unix: None,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
 }
 
 pub fn resolve_or_enroll_device_auth(
@@ -69,20 +102,37 @@ fn enroll_device(
     pairing_token: &str,
     options: &DeviceEnrollmentOptions,
 ) -> Result<DeviceAuthRecord> {
+    let requested_device_id = normalize_optional(options.device_id.as_deref())
+        .map(|value| {
+            value
+                .parse()
+                .with_context(|| format!("invalid device_id {}", value))
+        })
+        .transpose()?;
+    let label = normalize_optional(options.device_label.as_deref());
+    let mut identity =
+        ClientIdentityMaterial::generate(options.cluster_id, requested_device_id, label.clone())?;
     let enrolled = enroll_device_blocking_from_pem(
         base_url,
         options.server_ca_pem.as_deref(),
         &DeviceEnrollmentRequest {
+            cluster_id: options.cluster_id,
             pairing_token: pairing_token.to_string(),
-            device_id: normalize_optional(options.device_id.as_deref()),
-            label: normalize_optional(options.device_label.as_deref()),
+            device_id: Some(identity.device_id.to_string()),
+            label,
+            public_key_pem: identity.public_key_pem.clone(),
         },
     )?;
+    identity.apply_issued_identity(&enrolled.issued_identity()?)?;
 
     Ok(DeviceAuthRecord {
+        cluster_id: options.cluster_id.to_string(),
         device_id: enrolled.device_id,
         device_token: enrolled.device_token,
         label: enrolled.label,
+        public_key_pem: identity.public_key_pem,
+        private_key_pem: identity.private_key_pem,
+        credential_pem: enrolled.credential_pem,
     })
 }
 
@@ -115,12 +165,33 @@ fn persist_device_auth(path: &Path, record: &DeviceAuthRecord) -> Result<()> {
 }
 
 fn validate_device_auth(record: &DeviceAuthRecord, path: &Path) -> Result<()> {
+    if record.cluster_id.trim().is_empty() {
+        bail!("device auth file {} is missing cluster_id", path.display());
+    }
     if record.device_id.trim().is_empty() {
         bail!("device auth file {} is missing device_id", path.display());
     }
     if record.device_token.trim().is_empty() {
         bail!(
             "device auth file {} is missing device_token",
+            path.display()
+        );
+    }
+    if record.public_key_pem.trim().is_empty() {
+        bail!(
+            "device auth file {} is missing public_key_pem",
+            path.display()
+        );
+    }
+    if record.private_key_pem.trim().is_empty() {
+        bail!(
+            "device auth file {} is missing private_key_pem",
+            path.display()
+        );
+    }
+    if record.credential_pem.trim().is_empty() {
+        bail!(
+            "device auth file {} is missing credential_pem",
             path.display()
         );
     }

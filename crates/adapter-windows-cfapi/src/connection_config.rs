@@ -1,15 +1,20 @@
 #![cfg(windows)]
 
 use anyhow::{Context, Result, anyhow};
-use client_sdk::{ConnectionBootstrap, normalize_server_base_url};
+use client_sdk::{
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ConnectionBootstrap, RelayMode,
+    normalize_server_base_url,
+};
 use reqwest::Url;
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".ironmesh-connection.json";
 
 #[derive(Debug, Clone)]
 pub struct ResolvedConnectionConfig {
+    pub cluster_id: Uuid,
     pub base_url: Url,
     pub server_ca_pem: Option<String>,
     pub pairing_token: Option<String>,
@@ -55,6 +60,7 @@ pub fn resolve_connection_config(
         let base_url = Url::parse(&resolved.server_base_url)
             .with_context(|| format!("invalid resolved server URL {}", resolved.server_base_url))?;
         return Ok(ResolvedConnectionConfig {
+            cluster_id: resolved.cluster_id,
             base_url,
             server_ca_pem: direct_ca_pem.or(resolved.server_ca_pem),
             pairing_token: normalize_optional(pairing_token).or(resolved.pairing_token),
@@ -69,6 +75,7 @@ pub fn resolve_connection_config(
         anyhow!("server-base-url or bootstrap-file is required for first connection")
     })?)?;
     Ok(ResolvedConnectionConfig {
+        cluster_id: Uuid::now_v7(),
         base_url,
         server_ca_pem: direct_ca_pem,
         pairing_token: normalize_optional(pairing_token),
@@ -81,6 +88,7 @@ pub fn resolve_connection_config(
 
 pub fn persist_connection_config(
     path: &Path,
+    cluster_id: Uuid,
     base_url: &Url,
     server_ca_pem: Option<&str>,
     device_id: Option<&str>,
@@ -88,9 +96,17 @@ pub fn persist_connection_config(
 ) -> Result<()> {
     let bundle = ConnectionBootstrap {
         version: 1,
-        endpoints: vec![base_url.to_string()],
-        resolved_endpoint: Some(base_url.to_string()),
-        server_ca_pem: normalize_optional(server_ca_pem),
+        cluster_id,
+        rendezvous_urls: vec![base_url.to_string()],
+        direct_endpoints: vec![BootstrapEndpoint {
+            url: base_url.to_string(),
+            usage: Some(BootstrapEndpointUse::PublicApi),
+        }],
+        relay_mode: RelayMode::Fallback,
+        trust_roots: BootstrapTrustRoots {
+            cluster_ca_pem: normalize_optional(server_ca_pem),
+            public_api_ca_pem: normalize_optional(server_ca_pem),
+        },
         pairing_token: None,
         device_label: normalize_optional(device_label),
         device_id: normalize_optional(device_id),

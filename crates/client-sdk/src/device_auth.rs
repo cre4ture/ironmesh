@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
+use common::ClusterId;
 use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use transport_sdk::IssuedClientIdentity;
 
 use crate::connection::{
     build_blocking_http_client, build_blocking_reqwest_client_from_pem, load_root_certificate,
@@ -11,20 +13,44 @@ use crate::connection::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEnrollmentRequest {
+    pub cluster_id: ClusterId,
     pub pairing_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    pub public_key_pem: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEnrollmentResponse {
+    pub cluster_id: ClusterId,
     pub device_id: String,
     pub device_token: String,
     pub label: Option<String>,
+    pub public_key_pem: String,
+    pub credential_pem: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<u64>,
+}
+
+impl DeviceEnrollmentResponse {
+    pub fn issued_identity(&self) -> Result<IssuedClientIdentity> {
+        Ok(IssuedClientIdentity {
+            cluster_id: self.cluster_id,
+            device_id: self
+                .device_id
+                .parse()
+                .with_context(|| format!("invalid device_id {}", self.device_id))?,
+            label: self.label.clone(),
+            public_key_pem: self.public_key_pem.clone(),
+            credential_pem: self.credential_pem.clone(),
+            issued_at_unix: self.created_at_unix.unwrap_or_default(),
+            expires_at_unix: self.expires_at_unix,
+        })
+    }
 }
 
 pub async fn enroll_device(
@@ -100,7 +126,12 @@ fn parse_enrollment_response(status: StatusCode, body: String) -> Result<DeviceE
 
     let enrolled = serde_json::from_str::<DeviceEnrollmentResponse>(&body)
         .context("failed to parse /auth/device/enroll response")?;
-    if enrolled.device_id.trim().is_empty() || enrolled.device_token.trim().is_empty() {
+    if enrolled.cluster_id.is_nil()
+        || enrolled.device_id.trim().is_empty()
+        || enrolled.device_token.trim().is_empty()
+        || enrolled.public_key_pem.trim().is_empty()
+        || enrolled.credential_pem.trim().is_empty()
+    {
         return Err(anyhow!(
             "device enrollment returned an incomplete credential"
         ));

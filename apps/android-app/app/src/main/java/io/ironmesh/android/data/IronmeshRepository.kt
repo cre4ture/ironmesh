@@ -8,11 +8,15 @@ import java.io.InputStream
 import java.io.OutputStream
 
 data class BootstrapEnrollmentData(
+    val cluster_id: String,
     val server_base_url: String,
     val server_ca_pem: String? = null,
     val device_id: String,
     val device_token: String,
     val label: String? = null,
+    val public_key_pem: String,
+    val private_key_pem: String,
+    val credential_pem: String,
 )
 
 class IronmeshRepository {
@@ -45,11 +49,15 @@ class IronmeshRepository {
             BootstrapEnrollmentData::class.java,
         )
         return DeviceAuthState(
+            clusterId = enrolled.cluster_id,
             deviceId = enrolled.device_id,
             deviceToken = enrolled.device_token,
             label = enrolled.label,
             serverBaseUrl = enrolled.server_base_url,
             serverCaPem = enrolled.server_ca_pem,
+            publicKeyPem = enrolled.public_key_pem,
+            privateKeyPem = enrolled.private_key_pem,
+            credentialPem = enrolled.credential_pem,
         )
     }
 

@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub type NodeId = Uuid;
+pub type ClusterId = Uuid;
+pub type DeviceId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageObjectMeta {

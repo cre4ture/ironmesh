@@ -239,6 +239,10 @@ pub struct DeviceAuthRecord {
     pub device_id: String,
     pub label: Option<String>,
     pub token_hash: String,
+    #[serde(default)]
+    pub public_key_pem: Option<String>,
+    #[serde(default)]
+    pub issued_credential_pem: Option<String>,
     pub created_at_unix: u64,
     pub revoked_at_unix: Option<u64>,
 }

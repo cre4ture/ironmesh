@@ -25,7 +25,7 @@ use axum::{Json, Router};
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::RustlsConfig;
 use bytes::Bytes;
-use common::{HealthStatus, NodeId};
+use common::{ClusterId, HealthStatus, NodeId};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
@@ -41,6 +41,11 @@ use tracing::{info, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use transport_sdk::{
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots,
+    ClientBootstrap as TransportClientBootstrap, RelayMode, SignedRequestHeaders,
+    credential_fingerprint, verify_signed_request_headers,
+};
 use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
@@ -70,11 +75,15 @@ use storage::{
 
 #[derive(Clone)]
 struct ServerState {
+    cluster_id: ClusterId,
     node_id: NodeId,
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     client_auth: Arc<Mutex<ClientAuthState>>,
     public_ca_pem: Option<String>,
+    cluster_ca_pem: Option<String>,
+    rendezvous_urls: Vec<String>,
+    relay_mode: RelayMode,
     metadata_commit_mode: MetadataCommitMode,
     internal_http: reqwest::Client,
     autonomous_replication_on_put_enabled: bool,
@@ -89,6 +98,7 @@ struct ServerState {
     namespace_change_tx: watch::Sender<u64>,
     admin_control: AdminControl,
     client_auth_control: ClientAuthControl,
+    client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
 }
 
 pub(crate) fn publish_namespace_change(state: &ServerState) {
@@ -108,6 +118,28 @@ struct InternalCaller {
 struct ClientAuthControl {
     require_client_auth: bool,
 }
+
+#[derive(Debug, Default)]
+struct ClientAuthReplayCache {
+    seen_requests: HashMap<String, u64>,
+}
+
+impl ClientAuthReplayCache {
+    fn remember(&mut self, device_id: &str, nonce: &str, now: u64) -> bool {
+        self.prune(now);
+        self.seen_requests
+            .insert(format!("{device_id}:{nonce}"), now)
+            .is_none()
+    }
+
+    fn prune(&mut self, now: u64) {
+        let oldest_allowed = now.saturating_sub(CLIENT_AUTH_MAX_CLOCK_SKEW_SECS * 2);
+        self.seen_requests
+            .retain(|_, seen_at| *seen_at >= oldest_allowed);
+    }
+}
+
+const CLIENT_AUTH_MAX_CLOCK_SKEW_SECS: u64 = 300;
 
 impl<S> FromRequestParts<S> for InternalCaller
 where
@@ -150,29 +182,68 @@ async fn require_client_auth(
         return Ok(next.run(request).await);
     }
 
-    let provided = extract_bearer_token(request.headers()).ok_or(StatusCode::UNAUTHORIZED)?;
-    let provided_hash = hash_token(provided);
-    let auth_state = state.client_auth.lock().await;
-    let authorized = auth_state.devices.iter().any(|device| {
-        device.revoked_at_unix.is_none()
-            && token_matches(device.token_hash.as_str(), Some(provided_hash.as_str()))
-    });
-    drop(auth_state);
-
-    if !authorized {
+    let signed_headers = SignedRequestHeaders::from_header_lookup(|name| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string)
+    })
+    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if signed_headers.cluster_id != state.cluster_id {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    Ok(next.run(request).await)
-}
+    let request_path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| request.uri().path())
+        .to_string();
+    let request_method = request.method().as_str().to_string();
+    let now = unix_ts();
+    if signed_headers.timestamp_unix < now.saturating_sub(CLIENT_AUTH_MAX_CLOCK_SKEW_SECS)
+        || signed_headers.timestamp_unix > now.saturating_add(CLIENT_AUTH_MAX_CLOCK_SKEW_SECS)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    let (public_key_pem, stored_credential_fingerprint) = {
+        let auth_state = state.client_auth.lock().await;
+        let Some(device) = auth_state.devices.iter().find(|device| {
+            device.revoked_at_unix.is_none() && device.device_id == signed_headers.device_id
+        }) else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let Some(public_key_pem) = device.public_key_pem.clone() else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let Some(issued_credential_pem) = device.issued_credential_pem.as_deref() else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let stored_credential_fingerprint =
+            credential_fingerprint(issued_credential_pem).map_err(|_| StatusCode::UNAUTHORIZED)?;
+        (public_key_pem, stored_credential_fingerprint)
+    };
+
+    if stored_credential_fingerprint != signed_headers.credential_fingerprint {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    verify_signed_request_headers(
+        &signed_headers,
+        &public_key_pem,
+        &request_method,
+        &request_path_and_query,
+    )
+    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let mut replay_cache = state.client_auth_replay_cache.lock().await;
+    if !replay_cache.remember(&signed_headers.device_id, &signed_headers.nonce, now) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    drop(replay_cache);
+
+    Ok(next.run(request).await)
 }
 
 fn hash_token(token: &str) -> String {
@@ -192,6 +263,22 @@ fn generate_device_token() -> String {
         "im-dev-{}{}",
         Uuid::new_v4().simple(),
         Uuid::new_v4().simple()
+    )
+}
+
+fn generate_client_credential_pem(
+    cluster_id: ClusterId,
+    device_id: &str,
+    public_key_pem: &str,
+    issued_at_unix: u64,
+    expires_at_unix: Option<u64>,
+) -> String {
+    let public_key_fingerprint = blake3::hash(public_key_pem.as_bytes()).to_hex().to_string();
+    let expires_at_unix = expires_at_unix
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "never".to_string());
+    format!(
+        "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\ncluster_id={cluster_id}\ndevice_id={device_id}\nissued_at_unix={issued_at_unix}\nexpires_at_unix={expires_at_unix}\npublic_key_fingerprint={public_key_fingerprint}\n-----END IRONMESH CLIENT CREDENTIAL-----\n"
     )
 }
 
@@ -435,6 +522,7 @@ pub struct PublicTlsConfig {
 #[derive(Debug, Clone)]
 pub struct ServerNodeConfig {
     pub mode: ServerNodeMode,
+    pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub data_dir: PathBuf,
     metadata_backend: MetadataBackendKind,
@@ -445,6 +533,8 @@ pub struct ServerNodeConfig {
     pub public_ca_cert_path: Option<PathBuf>,
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
+    pub rendezvous_urls: Vec<String>,
+    pub relay_mode: RelayMode,
     pub upstream_public_url: Option<String>,
     pub heartbeat_timeout_secs: u64,
     pub audit_interval_secs: u64,
@@ -540,6 +630,18 @@ impl MetadataCommitMode {
     }
 }
 
+fn parse_relay_mode(raw: &str) -> Result<RelayMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "fallback" => Ok(RelayMode::Fallback),
+        "disabled" => Ok(RelayMode::Disabled),
+        "preferred" => Ok(RelayMode::Preferred),
+        "required" => Ok(RelayMode::Required),
+        other => bail!(
+            "invalid IRONMESH_RELAY_MODE '{other}', expected disabled, fallback, preferred, or required"
+        ),
+    }
+}
+
 fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "sqlite" => Ok(MetadataBackendKind::Sqlite),
@@ -581,6 +683,10 @@ impl ServerNodeConfig {
             .ok()
             .and_then(|value| value.parse::<NodeId>().ok())
             .unwrap_or_else(NodeId::new_v4);
+        let cluster_id = std::env::var("IRONMESH_CLUSTER_ID")
+            .ok()
+            .and_then(|value| value.parse::<ClusterId>().ok())
+            .unwrap_or_else(Uuid::now_v7);
 
         let data_dir = PathBuf::from(
             std::env::var("IRONMESH_DATA_DIR").unwrap_or_else(|_| "./data/server-node".to_string()),
@@ -612,6 +718,24 @@ impl ServerNodeConfig {
             };
             Some(format!("{scheme}://{bind_addr}"))
         });
+        let rendezvous_urls = std::env::var("IRONMESH_RENDEZVOUS_URLS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|urls| !urls.is_empty())
+            .or_else(|| public_url.as_ref().map(|url| vec![url.clone()]))
+            .unwrap_or_default();
+        let relay_mode = parse_relay_mode(
+            std::env::var("IRONMESH_RELAY_MODE")
+                .unwrap_or_else(|_| "fallback".to_string())
+                .as_str(),
+        )?;
 
         let internal_tls = match mode {
             ServerNodeMode::Cluster => {
@@ -693,6 +817,7 @@ impl ServerNodeConfig {
 
         Ok(Self {
             mode,
+            cluster_id,
             node_id,
             data_dir,
             metadata_backend: parse_metadata_backend(
@@ -709,6 +834,8 @@ impl ServerNodeConfig {
                 .map(PathBuf::from),
             public_peer_api_enabled,
             internal_tls,
+            rendezvous_urls,
+            relay_mode,
             upstream_public_url,
             heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
                 .ok()
@@ -830,6 +957,7 @@ impl ServerNodeConfig {
 
         Self {
             mode: ServerNodeMode::LocalEdge,
+            cluster_id: Uuid::now_v7(),
             node_id: NodeId::new_v4(),
             data_dir: data_dir.into(),
             metadata_backend: MetadataBackendKind::Sqlite,
@@ -840,6 +968,8 @@ impl ServerNodeConfig {
             public_ca_cert_path: None,
             public_peer_api_enabled: false,
             internal_tls: None,
+            rendezvous_urls: vec![format!("http://{bind_addr}")],
+            relay_mode: RelayMode::Fallback,
             upstream_public_url: None,
             heartbeat_timeout_secs: 90,
             audit_interval_secs: 3600,
@@ -1182,13 +1312,28 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             })
         })
         .transpose()?;
+    let cluster_ca_pem = config
+        .internal_tls
+        .as_ref()
+        .map(|tls| tls.ca_cert_path.clone())
+        .or_else(|| config.public_ca_cert_path.clone())
+        .map(|path| {
+            std::fs::read_to_string(&path).with_context(|| {
+                format!("failed reading cluster CA certificate {}", path.display())
+            })
+        })
+        .transpose()?;
 
     let state = ServerState {
+        cluster_id: config.cluster_id,
         node_id: config.node_id,
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         client_auth: Arc::new(Mutex::new(persisted_client_auth)),
         public_ca_pem,
+        cluster_ca_pem,
+        rendezvous_urls: config.rendezvous_urls.clone(),
+        relay_mode: config.relay_mode,
         metadata_commit_mode: config.metadata_commit_mode,
         internal_http,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
@@ -1203,6 +1348,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         namespace_change_tx: watch::channel(0).0,
         admin_control,
         client_auth_control,
+        client_auth_replay_cache: Arc::new(Mutex::new(ClientAuthReplayCache::default())),
     };
 
     let persisted_attempts = {
@@ -3116,28 +3262,25 @@ struct PairingTokenIssueResponse {
     expires_at_unix: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct BootstrapBundleIssueResponse {
-    version: u32,
-    endpoints: Vec<String>,
-    server_ca_pem: Option<String>,
-    pairing_token: String,
-    device_label: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 struct ClientDeviceEnrollRequest {
+    cluster_id: ClusterId,
     pairing_token: String,
     device_id: Option<String>,
     label: Option<String>,
+    public_key_pem: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ClientDeviceEnrollResponse {
+    cluster_id: ClusterId,
     device_id: String,
     device_token: String,
     label: Option<String>,
+    public_key_pem: String,
+    credential_pem: String,
     created_at_unix: u64,
+    expires_at_unix: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3262,17 +3405,28 @@ async fn issue_bootstrap_bundle(
     )
     .await;
 
-    (
-        StatusCode::CREATED,
-        Json(BootstrapBundleIssueResponse {
-            version: 1,
-            endpoints,
-            server_ca_pem: state.public_ca_pem.clone(),
-            pairing_token: pairing_response.pairing_token,
-            device_label: pairing_response.label,
-        }),
-    )
-        .into_response()
+    let bootstrap = TransportClientBootstrap {
+        version: 1,
+        cluster_id: state.cluster_id,
+        rendezvous_urls: state.rendezvous_urls.clone(),
+        direct_endpoints: endpoints
+            .into_iter()
+            .map(|url| BootstrapEndpoint {
+                url,
+                usage: Some(BootstrapEndpointUse::PublicApi),
+            })
+            .collect(),
+        relay_mode: state.relay_mode,
+        trust_roots: BootstrapTrustRoots {
+            cluster_ca_pem: state.cluster_ca_pem.clone(),
+            public_api_ca_pem: state.public_ca_pem.clone(),
+        },
+        pairing_token: Some(pairing_response.pairing_token),
+        device_label: pairing_response.label,
+        device_id: None,
+    };
+
+    (StatusCode::CREATED, Json(bootstrap)).into_response()
 }
 
 async fn issue_pairing_token_impl(
@@ -3321,12 +3475,18 @@ async fn enroll_client_device(
     State(state): State<ServerState>,
     Json(request): Json<ClientDeviceEnrollRequest>,
 ) -> impl IntoResponse {
+    if request.cluster_id != state.cluster_id {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     let pairing_token = request.pairing_token.trim();
-    if pairing_token.is_empty() {
+    let public_key_pem = request.public_key_pem.trim();
+    if pairing_token.is_empty() || public_key_pem.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
     let now = unix_ts();
+    let credential_expires_at_unix = Some(now + (30 * 24 * 60 * 60));
     let device_id = request
         .device_id
         .as_deref()
@@ -3343,6 +3503,13 @@ async fn enroll_client_device(
         .map(ToString::to_string);
     let device_token = generate_device_token();
     let device_token_hash = hash_token(&device_token);
+    let credential_pem = generate_client_credential_pem(
+        state.cluster_id,
+        device_id.as_str(),
+        public_key_pem,
+        now,
+        credential_expires_at_unix,
+    );
 
     let response = {
         let mut auth_state = state.client_auth.lock().await;
@@ -3374,16 +3541,22 @@ async fn enroll_client_device(
             device_id: device_id.clone(),
             label: final_label.clone(),
             token_hash: device_token_hash,
+            public_key_pem: Some(public_key_pem.to_string()),
+            issued_credential_pem: Some(credential_pem.clone()),
             created_at_unix: now,
             revoked_at_unix: None,
         };
         auth_state.devices.push(device);
 
         ClientDeviceEnrollResponse {
+            cluster_id: state.cluster_id,
             device_id,
             device_token,
             label: final_label,
+            public_key_pem: public_key_pem.to_string(),
+            credential_pem,
             created_at_unix: now,
+            expires_at_unix: credential_expires_at_unix,
         }
     };
 

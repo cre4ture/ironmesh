@@ -8,6 +8,7 @@ use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, conn
 use clap::Parser;
 use client_sdk::{
     RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,6 +68,7 @@ pub fn serve_main() -> anyhow::Result<()> {
         &base_url,
         &registration.root_path,
         &DeviceEnrollmentOptions {
+            cluster_id: connection.cluster_id,
             pairing_token: connection.pairing_token.clone(),
             force_reenroll: connection.force_reenroll,
             device_id: connection.device_id.clone(),
@@ -78,14 +80,21 @@ pub fn serve_main() -> anyhow::Result<()> {
     if let Some(auth) = device_auth.as_ref() {
         eprintln!("using enrolled device auth for {}", auth.device_id);
     }
-    let bearer_token = device_auth.as_ref().map(|auth| auth.device_token.clone());
-    let client = build_http_client_from_pem(
-        connection.server_ca_pem.as_deref(),
-        base_url.as_str(),
-        &bearer_token,
-    )?;
+    let client = match device_auth.as_ref() {
+        Some(auth) => build_http_client_with_identity_from_pem(
+            connection.server_ca_pem.as_deref(),
+            base_url.as_str(),
+            &auth.client_identity_material()?,
+        )?,
+        None => build_http_client_from_pem(
+            connection.server_ca_pem.as_deref(),
+            base_url.as_str(),
+            &None,
+        )?,
+    };
     persist_connection_config(
         &connection.bootstrap_path,
+        connection.cluster_id,
         &base_url,
         connection.server_ca_pem.as_deref(),
         device_auth.as_ref().map(|auth| auth.device_id.as_str()),
@@ -107,14 +116,18 @@ pub fn serve_main() -> anyhow::Result<()> {
         RemoteSnapshotPoller::server_notifications(Duration::from_secs(25), refresh_interval);
 
     let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
+    let client_identity = device_auth
+        .as_ref()
+        .map(|auth| auth.client_identity_material())
+        .transpose()?;
     let hydrator = Box::new(ServerNodeHydrator::new(
         base_url.clone(),
-        bearer_token.clone(),
+        client_identity.clone(),
         connection.server_ca_pem.as_deref(),
     )?);
     let uploader = Arc::new(ServerNodeHydrator::new(
         base_url,
-        bearer_token,
+        client_identity,
         connection.server_ca_pem.as_deref(),
     )?);
     let _connection = connect_sync_root(&registration, runtime.clone(), hydrator, uploader)?;

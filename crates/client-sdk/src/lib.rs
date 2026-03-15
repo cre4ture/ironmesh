@@ -10,7 +10,8 @@ pub use bootstrap::{BootstrapEnrollmentResult, ConnectionBootstrap, ResolvedConn
 pub use client_node::ClientNode;
 pub use connection::{
     build_blocking_http_client, build_blocking_reqwest_client_from_pem, build_http_client,
-    build_http_client_from_pem, build_reqwest_client_from_pem, load_root_certificate,
+    build_http_client_from_pem, build_http_client_with_identity,
+    build_http_client_with_identity_from_pem, build_reqwest_client_from_pem, load_root_certificate,
     load_root_certificate_pem,
 };
 pub use content_addressed_client_cache::ContentAddressedClientCache;
@@ -25,4 +26,7 @@ pub use ironmesh_client::{
 pub use remote_sync::{
     RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
     RemoteSyncScheduler, RemoteSyncStrategy, changed_paths_between,
+};
+pub use transport_sdk::{
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial, RelayMode,
 };

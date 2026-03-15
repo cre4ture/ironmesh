@@ -2,13 +2,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use common::StorageObjectMeta;
 use reqwest::Client as HttpClient;
+use reqwest::Method;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
+use transport_sdk::{ClientIdentityMaterial, build_signed_request_headers};
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
@@ -17,7 +20,14 @@ const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 pub struct IronMeshClient {
     http: HttpClient,
     server_base_url: String,
-    bearer_token: Option<String>,
+    auth: ClientRequestAuth,
+}
+
+#[derive(Clone)]
+enum ClientRequestAuth {
+    None,
+    BearerToken(String),
+    SignedIdentity(ClientIdentityMaterial),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,20 +152,40 @@ impl IronMeshClient {
         Self {
             http,
             server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
-            bearer_token: None,
+            auth: ClientRequestAuth::None,
         }
     }
 
     pub fn with_bearer_token(mut self, bearer_token: impl Into<String>) -> Self {
-        self.bearer_token = Some(bearer_token.into());
+        self.auth = ClientRequestAuth::BearerToken(bearer_token.into());
         self
     }
 
-    fn apply_auth(&self, request: RequestBuilder) -> RequestBuilder {
-        if let Some(token) = self.bearer_token.as_deref() {
-            request.bearer_auth(token)
-        } else {
-            request
+    pub fn with_client_identity(mut self, identity: ClientIdentityMaterial) -> Self {
+        self.auth = ClientRequestAuth::SignedIdentity(identity);
+        self
+    }
+
+    fn apply_auth(
+        &self,
+        method: Method,
+        url: &Url,
+        request: RequestBuilder,
+    ) -> Result<RequestBuilder> {
+        match &self.auth {
+            ClientRequestAuth::None => Ok(request),
+            ClientRequestAuth::BearerToken(token) => Ok(request.bearer_auth(token)),
+            ClientRequestAuth::SignedIdentity(identity) => {
+                let path_and_query = path_and_query(url);
+                let signed_headers = build_signed_request_headers(
+                    identity,
+                    method.as_str(),
+                    &path_and_query,
+                    unix_ts(),
+                    None,
+                )?;
+                Ok(signed_headers.apply_to_reqwest(request))
+            }
         }
     }
 
@@ -163,7 +193,7 @@ impl IronMeshClient {
         let key = key.into();
         let url = self.store_key_url(&key)?;
 
-        self.apply_auth(self.http.put(url))
+        self.apply_auth(Method::PUT, &url, self.http.put(url.clone()))?
             .body(data.clone())
             .send()
             .await
@@ -188,17 +218,11 @@ impl IronMeshClient {
         version: Option<&str>,
     ) -> Result<Bytes> {
         let key = key.as_ref();
-        let url = self.store_key_url(key)?;
+        let mut url = self.store_key_url(key)?;
+        append_optional_query(&mut url, "snapshot", snapshot);
+        append_optional_query(&mut url, "version", version);
 
-        let mut request = self.apply_auth(self.http.get(url));
-        if let Some(snapshot) = snapshot {
-            request = request.query(&[("snapshot", snapshot)]);
-        }
-        if let Some(version) = version {
-            request = request.query(&[("version", version)]);
-        }
-
-        request
+        self.apply_auth(Method::GET, &url, self.http.get(url.clone()))?
             .send()
             .await
             .with_context(|| format!("failed to GET object key={key}"))?
@@ -220,7 +244,7 @@ impl IronMeshClient {
         let url = self.store_rename_url()?;
 
         let response = self
-            .apply_auth(self.http.post(url))
+            .apply_auth(Method::POST, &url, self.http.post(url.clone()))?
             .json(&PathMutationRequest {
                 from_path: from_path.clone(),
                 to_path: to_path.clone(),
@@ -251,7 +275,7 @@ impl IronMeshClient {
         let url = self.store_copy_url()?;
 
         let response = self
-            .apply_auth(self.http.post(url))
+            .apply_auth(Method::POST, &url, self.http.post(url.clone()))?
             .json(&PathMutationRequest {
                 from_path: from_path.clone(),
                 to_path: to_path.clone(),
@@ -273,15 +297,14 @@ impl IronMeshClient {
 
     pub async fn delete_path(&self, key: impl AsRef<str>) -> Result<()> {
         let key = key.as_ref();
-        let url = self.store_delete_url()?;
-        let recursive = key.ends_with('/');
-
-        let mut request = self.apply_auth(self.http.post(url)).query(&[("key", key)]);
-        if recursive {
-            request = request.query(&[("recursive", "true")]);
+        let mut url = self.store_delete_url()?;
+        url.query_pairs_mut().append_pair("key", key);
+        if key.ends_with('/') {
+            url.query_pairs_mut().append_pair("recursive", "true");
         }
 
-        let response = request
+        let response = self
+            .apply_auth(Method::POST, &url, self.http.post(url.clone()))?
             .send()
             .await
             .with_context(|| format!("failed to delete path {key}"))?;
@@ -298,19 +321,14 @@ impl IronMeshClient {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<StoreIndexResponse> {
-        let url = self.store_index_url()?;
+        let mut url = self.store_index_url()?;
+        url.query_pairs_mut()
+            .append_pair("depth", &depth.max(1).to_string());
+        append_optional_query(&mut url, "prefix", prefix);
+        append_optional_query(&mut url, "snapshot", snapshot);
 
-        let mut request = self
-            .apply_auth(self.http.get(url))
-            .query(&[("depth", depth.max(1).to_string())]);
-        if let Some(prefix) = prefix {
-            request = request.query(&[("prefix", prefix)]);
-        }
-        if let Some(snapshot) = snapshot {
-            request = request.query(&[("snapshot", snapshot)]);
-        }
-
-        let mut result = request
+        let mut result = self
+            .apply_auth(Method::GET, &url, self.http.get(url.clone()))?
             .send()
             .await
             .context("failed to request /store/index")?
@@ -346,13 +364,12 @@ impl IronMeshClient {
         since: u64,
         timeout_ms: u64,
     ) -> Result<StoreIndexChangeWaitResponse> {
-        let url = self.store_index_change_wait_url()?;
+        let mut url = self.store_index_change_wait_url()?;
+        url.query_pairs_mut()
+            .append_pair("since", &since.to_string())
+            .append_pair("timeout_ms", &timeout_ms.max(250).to_string());
 
-        self.apply_auth(self.http.get(url))
-            .query(&[
-                ("since", since.to_string()),
-                ("timeout_ms", timeout_ms.max(250).to_string()),
-            ])
+        self.apply_auth(Method::GET, &url, self.http.get(url.clone()))?
             .send()
             .await
             .context("failed to request /store/index/changes/wait")?
@@ -453,7 +470,11 @@ impl IronMeshClient {
                 .context("uploaded byte count overflow")?;
 
             let response = self
-                .apply_auth(self.http.post(&chunk_upload_url))
+                .apply_auth(
+                    Method::POST,
+                    &chunk_upload_url,
+                    self.http.post(chunk_upload_url.clone()),
+                )?
                 .body(chunk.to_vec())
                 .send()
                 .await
@@ -477,13 +498,17 @@ impl IronMeshClient {
             chunks: chunk_refs,
         };
 
-        self.apply_auth(self.http.post(complete_url))
-            .json(&complete_payload)
-            .send()
-            .await
-            .with_context(|| format!("failed to finalize chunked upload for key={key}"))?
-            .error_for_status()
-            .with_context(|| format!("chunked finalize rejected for key={key}"))?;
+        self.apply_auth(
+            Method::POST,
+            &complete_url,
+            self.http.post(complete_url.clone()),
+        )?
+        .json(&complete_payload)
+        .send()
+        .await
+        .with_context(|| format!("failed to finalize chunked upload for key={key}"))?
+        .error_for_status()
+        .with_context(|| format!("chunked finalize rejected for key={key}"))?;
 
         Ok(UploadResult {
             meta: StorageObjectMeta {
@@ -566,9 +591,13 @@ impl IronMeshClient {
 
             let response = runtime
                 .block_on(
-                    self.apply_auth(self.http.post(&chunk_upload_url))
-                        .body(chunk[..read_bytes].to_vec())
-                        .send(),
+                    self.apply_auth(
+                        Method::POST,
+                        &chunk_upload_url,
+                        self.http.post(chunk_upload_url.clone()),
+                    )?
+                    .body(chunk[..read_bytes].to_vec())
+                    .send(),
                 )
                 .with_context(|| format!("failed to upload chunk for key={key}"))?
                 .error_for_status()
@@ -601,9 +630,13 @@ impl IronMeshClient {
 
         runtime
             .block_on(
-                self.apply_auth(self.http.post(complete_url))
-                    .json(&complete_payload)
-                    .send(),
+                self.apply_auth(
+                    Method::POST,
+                    &complete_url,
+                    self.http.post(complete_url.clone()),
+                )?
+                .json(&complete_payload)
+                .send(),
             )
             .with_context(|| format!("failed to finalize chunked upload for key={key}"))?
             .error_for_status()
@@ -628,15 +661,9 @@ impl IronMeshClient {
         writer: &mut dyn Write,
     ) -> Result<()> {
         let key = key.as_ref();
-        let url = self.store_key_url(key)?;
-
-        let mut request = self.apply_auth(self.http.get(url));
-        if let Some(snapshot) = snapshot {
-            request = request.query(&[("snapshot", snapshot)]);
-        }
-        if let Some(version) = version {
-            request = request.query(&[("version", version)]);
-        }
+        let mut url = self.store_key_url(key)?;
+        append_optional_query(&mut url, "snapshot", snapshot);
+        append_optional_query(&mut url, "version", version);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -644,7 +671,10 @@ impl IronMeshClient {
             .context("failed to create runtime for download")?;
 
         let mut response = runtime
-            .block_on(request.send())
+            .block_on(
+                self.apply_auth(Method::GET, &url, self.http.get(url.clone()))?
+                    .send(),
+            )
             .with_context(|| format!("failed to GET object key={key}"))?
             .error_for_status()
             .with_context(|| format!("object not found or inaccessible key={key}"))?;
@@ -675,17 +705,12 @@ impl IronMeshClient {
         version: Option<&str>,
     ) -> Result<u64> {
         let key = key.as_ref();
-        let url = self.store_key_url(key)?;
+        let mut url = self.store_key_url(key)?;
+        append_optional_query(&mut url, "snapshot", snapshot);
+        append_optional_query(&mut url, "version", version);
 
-        let mut request = self.apply_auth(self.http.head(url));
-        if let Some(snapshot) = snapshot {
-            request = request.query(&[("snapshot", snapshot)]);
-        }
-        if let Some(version) = version {
-            request = request.query(&[("version", version)]);
-        }
-
-        let response = request
+        let response = self
+            .apply_auth(Method::HEAD, &url, self.http.head(url.clone()))?
             .send()
             .await
             .with_context(|| format!("failed to HEAD object key={key}"))?;
@@ -726,7 +751,7 @@ impl IronMeshClient {
         runtime.block_on(self.get_object_size(&key, snapshot.as_deref(), version.as_deref()))
     }
 
-    fn store_key_url(&self, key: &str) -> Result<String> {
+    fn store_key_url(&self, key: &str) -> Result<Url> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
 
@@ -737,10 +762,10 @@ impl IronMeshClient {
         segments.push(key);
         drop(segments);
 
-        Ok(url.to_string())
+        Ok(url)
     }
 
-    fn store_index_url(&self) -> Result<String> {
+    fn store_index_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
 
@@ -752,10 +777,10 @@ impl IronMeshClient {
             segments.push("index");
         }
 
-        Ok(url.to_string())
+        Ok(url)
     }
 
-    fn store_index_change_wait_url(&self) -> Result<String> {
+    fn store_index_change_wait_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
 
@@ -769,10 +794,10 @@ impl IronMeshClient {
             segments.push("wait");
         }
 
-        Ok(url.to_string())
+        Ok(url)
     }
 
-    fn store_chunk_upload_url(&self) -> Result<String> {
+    fn store_chunk_upload_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
 
@@ -784,10 +809,10 @@ impl IronMeshClient {
             segments.push("upload");
         }
 
-        Ok(url.to_string())
+        Ok(url)
     }
 
-    fn store_rename_url(&self) -> Result<String> {
+    fn store_rename_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
 
@@ -799,10 +824,10 @@ impl IronMeshClient {
             segments.push("rename");
         }
 
-        Ok(url.to_string())
+        Ok(url)
     }
 
-    fn store_copy_url(&self) -> Result<String> {
+    fn store_copy_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
 
@@ -814,10 +839,10 @@ impl IronMeshClient {
             segments.push("copy");
         }
 
-        Ok(url.to_string())
+        Ok(url)
     }
 
-    fn store_delete_url(&self) -> Result<String> {
+    fn store_delete_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
 
@@ -829,10 +854,10 @@ impl IronMeshClient {
             segments.push("delete");
         }
 
-        Ok(url.to_string())
+        Ok(url)
     }
 
-    fn store_complete_url(&self, key: &str) -> Result<String> {
+    fn store_complete_url(&self, key: &str) -> Result<Url> {
         let mut url = reqwest::Url::parse(&self.server_base_url)
             .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
 
@@ -845,7 +870,7 @@ impl IronMeshClient {
         }
         url.query_pairs_mut().append_pair("complete", "");
 
-        Ok(url.to_string())
+        Ok(url)
     }
 }
 
@@ -917,6 +942,26 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
     entries.sort_by(|left, right| left.path.cmp(&right.path));
 }
 
+fn append_optional_query(url: &mut Url, key: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        url.query_pairs_mut().append_pair(key, value);
+    }
+}
+
+fn path_and_query(url: &Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncSnapshot {
     let mut remote = Vec::with_capacity(entries.len());
 
@@ -957,7 +1002,7 @@ mod tests {
         let url = client
             .store_key_url("read me.txt")
             .expect("object url should build");
-        assert_eq!(url, "http://127.0.0.1:18080/store/read%20me.txt");
+        assert_eq!(url.as_str(), "http://127.0.0.1:18080/store/read%20me.txt");
     }
 
     #[test]
@@ -1063,6 +1108,6 @@ mod tests {
     fn delete_url_builder_builds_expected_path() {
         let client = IronMeshClient::new("http://127.0.0.1:18080/");
         let url = client.store_delete_url().expect("delete url should build");
-        assert_eq!(url, "http://127.0.0.1:18080/store/delete");
+        assert_eq!(url.as_str(), "http://127.0.0.1:18080/store/delete");
     }
 }
