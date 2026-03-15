@@ -5,6 +5,7 @@ import android.content.ActivityNotFoundException
 import android.content.ContentResolver
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Point
 import android.net.Uri
 import android.os.Build
@@ -16,14 +17,21 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -34,13 +42,18 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -49,16 +62,33 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -73,6 +103,7 @@ import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -543,6 +574,8 @@ private fun GallerySection(
     state: MainUiState,
     vm: MainViewModel,
 ) {
+    var fullscreenIndex by remember(state.galleryItems) { mutableStateOf<Int?>(null) }
+
     Text("Gallery", style = MaterialTheme.typography.titleMedium)
 
     FlowRow(
@@ -570,31 +603,77 @@ private fun GallerySection(
     } else if (state.galleryItems.isEmpty()) {
         Text("No images loaded from the document provider.")
     } else {
-        GalleryGrid(items = state.galleryItems)
+        GalleryGrid(
+            items = state.galleryItems,
+            onItemClick = { index -> fullscreenIndex = index },
+        )
+        Text(
+            text = "Pinch the gallery to change thumbnail size.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+
+    val selectedIndex = fullscreenIndex
+    if (selectedIndex != null && state.galleryItems.isNotEmpty()) {
+        GalleryFullscreenViewer(
+            items = state.galleryItems,
+            initialIndex = selectedIndex.coerceIn(0, state.galleryItems.lastIndex),
+            onDismiss = { fullscreenIndex = null },
+        )
     }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun GalleryGrid(items: List<GalleryImageItem>) {
+private fun GalleryGrid(
+    items: List<GalleryImageItem>,
+    onItemClick: (Int) -> Unit,
+) {
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val density = LocalDensity.current
         val gap = 12.dp
-        val columns = when {
+        val autoColumns = when {
             maxWidth < 420.dp -> 2
             maxWidth < 800.dp -> 3
             else -> 4
         }
-        val cardWidth = (maxWidth - gap * (columns - 1)) / columns
+        var columns by rememberSaveable(autoColumns) { mutableIntStateOf(autoColumns) }
+        val maxColumns = 6
+        var accumulatedZoom by remember { mutableFloatStateOf(1f) }
+        val clampedColumns = columns.coerceIn(1, maxColumns)
+        if (clampedColumns != columns) {
+            columns = clampedColumns
+        }
+        val cardWidth = with(density) {
+            val availableWidthPx =
+                (maxWidth.roundToPx() - gap.roundToPx() * (columns - 1)).coerceAtLeast(columns)
+            (availableWidthPx / columns).toDp()
+        }
 
         FlowRow(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .galleryGridPinchGesture(
+                    onPinch = { zoom ->
+                        accumulatedZoom *= zoom
+                        if (accumulatedZoom > 1.12f) {
+                            columns = (columns - 1).coerceAtLeast(1)
+                            accumulatedZoom = 1f
+                        } else if (accumulatedZoom < 0.88f) {
+                            columns = (columns + 1).coerceAtMost(maxColumns)
+                            accumulatedZoom = 1f
+                        }
+                    },
+                ),
             maxItemsInEachRow = columns,
             horizontalArrangement = Arrangement.spacedBy(gap),
             verticalArrangement = Arrangement.spacedBy(gap),
         ) {
-            items.forEach { item ->
+            items.forEachIndexed { index, item ->
                 GalleryCard(
                     item = item,
+                    showDetails = columns < 3,
+                    onClick = { onItemClick(index) },
                     modifier = Modifier.width(cardWidth),
                 )
             }
@@ -605,10 +684,12 @@ private fun GalleryGrid(items: List<GalleryImageItem>) {
 @Composable
 private fun GalleryCard(
     item: GalleryImageItem,
+    showDetails: Boolean,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
-        modifier = modifier,
+        modifier = modifier.clickable(onClick = onClick),
         tonalElevation = 3.dp,
         shape = RoundedCornerShape(20.dp),
     ) {
@@ -621,34 +702,237 @@ private fun GalleryCard(
                     .aspectRatio(1f),
             )
 
+            if (showDetails) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = item.displayName,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = item.remotePath,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    galleryMetaText(item)?.let { meta ->
+                        Text(
+                            text = meta,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    item.createdAtUnixMs?.let { createdAt ->
+                        Text(
+                            text = "Created ${formatTimestamp(createdAt)}",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
+@Composable
+private fun GalleryFullscreenViewer(
+    items: List<GalleryImageItem>,
+    initialIndex: Int,
+    onDismiss: () -> Unit,
+) {
+    val zoomedPages = remember { mutableStateMapOf<Int, Boolean>() }
+    val pagerState = rememberPagerState(
+        initialPage = initialIndex,
+        pageCount = { items.size },
+    )
+    BackHandler(onBack = onDismiss)
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+        ),
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Color.Black,
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                HorizontalPager(
+                    state = pagerState,
+                    userScrollEnabled = zoomedPages[pagerState.currentPage] != true,
+                    modifier = Modifier.fillMaxSize(),
+                ) { page ->
+                    GalleryFullscreenPage(
+                        item = items[page],
+                        onZoomStateChanged = { zoomed ->
+                            zoomedPages[page] = zoomed
+                        },
+                    )
+                }
+
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .statusBarsPadding(),
+                    color = Color.Black.copy(alpha = 0.55f),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        OutlinedButton(onClick = onDismiss) {
+                            Text("Close")
+                        }
+                        Text(
+                            text = items[pagerState.currentPage].displayName,
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            text = "${pagerState.currentPage + 1}/${items.size}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .navigationBarsPadding(),
+                    color = Color.Black.copy(alpha = 0.55f),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        val item = items[pagerState.currentPage]
+                        Text(
+                            text = item.remotePath,
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        galleryMetaText(item)?.let { meta ->
+                            Text(
+                                text = meta,
+                                color = Color.White.copy(alpha = 0.8f),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        item.createdAtUnixMs?.let { createdAt ->
+                            Text(
+                                text = "Created ${formatTimestamp(createdAt)}",
+                                color = Color.White.copy(alpha = 0.8f),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Text(
+                            text = "Swipe left or right to browse",
+                            color = Color.White.copy(alpha = 0.75f),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GalleryFullscreenPage(
+    item: GalleryImageItem,
+    onZoomStateChanged: (Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    var scale by remember(item.documentUri) { mutableFloatStateOf(1f) }
+    var offsetX by remember(item.documentUri) { mutableFloatStateOf(0f) }
+    var offsetY by remember(item.documentUri) { mutableFloatStateOf(0f) }
+    val bitmap by produceState<Bitmap?>(initialValue = null, item.documentUri) {
+        value = withContext(Dispatchers.IO) {
+            loadDocumentBitmap(
+                contentResolver = context.contentResolver,
+                documentUri = item.documentUri,
+                maxDimensionPx = 2048,
+            )
+        }
+    }
+
+    LaunchedEffect(scale) {
+        onZoomStateChanged(scale > 1.01f)
+    }
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .clipToBounds(),
+        contentAlignment = Alignment.Center,
+    ) {
+        val widthPx = with(density) { maxWidth.toPx() }
+        val heightPx = with(density) { maxHeight.toPx() }
+        val loadedBitmap = bitmap
+        if (loadedBitmap != null) {
+            val fittedSize = fittedImageSize(
+                imageWidth = loadedBitmap.width.toFloat(),
+                imageHeight = loadedBitmap.height.toFloat(),
+                containerWidth = widthPx,
+                containerHeight = heightPx,
+            )
+            Image(
+                bitmap = loadedBitmap.asImageBitmap(),
+                contentDescription = item.displayName,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zoomableImageGesture(
+                        gestureKey = item.documentUri,
+                        fittedSize = fittedSize,
+                        containerWidth = widthPx,
+                        containerHeight = heightPx,
+                        scale = { scale },
+                        offset = { Offset(offsetX, offsetY) },
+                        onTransform = { newScale, newOffset ->
+                            scale = newScale
+                            offsetX = newOffset.x
+                            offsetY = newOffset.y
+                        },
+                    )
+                    .graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                        translationX = offsetX
+                        translationY = offsetY
+                    },
+            )
+        } else {
             Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
+                CircularProgressIndicator(color = Color.White)
                 Text(
-                    text = item.displayName,
-                    style = MaterialTheme.typography.titleSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    text = "Loading image...",
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium,
                 )
-                Text(
-                    text = item.remotePath,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                galleryMetaText(item)?.let { meta ->
-                    Text(
-                        text = meta,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                item.createdAtUnixMs?.let { createdAt ->
-                    Text(
-                        text = "Created ${formatTimestamp(createdAt)}",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
             }
         }
     }
@@ -822,6 +1106,182 @@ private fun loadDocumentThumbnail(
     }.onFailure { error ->
         Log.w("MainActivity", "Thumbnail load failed for $documentUri: ${error.message}")
     }.getOrNull()
+}
+
+private fun loadDocumentBitmap(
+    contentResolver: ContentResolver,
+    documentUri: Uri,
+    maxDimensionPx: Int,
+): Bitmap? {
+    return runCatching {
+        val bounds = BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+        contentResolver.openInputStream(documentUri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, bounds)
+        }
+
+        val sampleSize = computeInSampleSize(
+            width = bounds.outWidth,
+            height = bounds.outHeight,
+            maxDimensionPx = maxDimensionPx,
+        )
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+        }
+        contentResolver.openInputStream(documentUri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, decodeOptions)
+        }
+    }.onFailure { error ->
+        Log.w("MainActivity", "Full image load failed for $documentUri: ${error.message}")
+    }.getOrNull()
+}
+
+private fun computeInSampleSize(
+    width: Int,
+    height: Int,
+    maxDimensionPx: Int,
+): Int {
+    if (width <= 0 || height <= 0 || maxDimensionPx <= 0) {
+        return 1
+    }
+
+    var sampleSize = 1
+    while (width / sampleSize > maxDimensionPx || height / sampleSize > maxDimensionPx) {
+        sampleSize *= 2
+    }
+    return sampleSize.coerceAtLeast(1)
+}
+
+private fun Modifier.galleryGridPinchGesture(
+    onPinch: (Float) -> Unit,
+): Modifier = pointerInput(Unit) {
+    awaitEachGesture {
+        awaitFirstDown(requireUnconsumed = false)
+        do {
+            val event = awaitPointerEvent()
+            val pointerCount = event.changes.count { it.pressed }
+            if (pointerCount >= 2) {
+                val zoom = event.calculateZoom()
+                if (abs(zoom - 1f) > 0.01f) {
+                    onPinch(zoom)
+                    event.changes.forEach { change ->
+                        if (change.pressed) {
+                            change.consume()
+                        }
+                    }
+                }
+            }
+        } while (event.changes.any { it.pressed })
+    }
+}
+
+private fun Modifier.zoomableImageGesture(
+    gestureKey: Any?,
+    fittedSize: FittedImageSize,
+    containerWidth: Float,
+    containerHeight: Float,
+    scale: () -> Float,
+    offset: () -> Offset,
+    onTransform: (Float, Offset) -> Unit,
+): Modifier = pointerInput(gestureKey, fittedSize, containerWidth, containerHeight) {
+    awaitEachGesture {
+        awaitFirstDown(requireUnconsumed = false)
+        do {
+            val event = awaitPointerEvent()
+            val pressedChanges = event.changes.filter { it.pressed }
+            if (pressedChanges.isEmpty()) {
+                break
+            }
+
+            val currentScale = scale()
+            val currentOffset = offset()
+            val zoomChange = if (pressedChanges.size >= 2) event.calculateZoom() else 1f
+            val panChange = when {
+                pressedChanges.size >= 2 -> event.calculatePan()
+                currentScale > 1.01f -> pressedChanges.first().positionChange()
+                else -> Offset.Zero
+            }
+            val nextScale = (currentScale * zoomChange).coerceIn(1f, 5f)
+            val shouldHandleZoom = pressedChanges.size >= 2 && abs(zoomChange - 1f) > 0.01f
+            val shouldHandlePan =
+                panChange != Offset.Zero && (currentScale > 1.01f || nextScale > 1.01f)
+            if (!shouldHandleZoom && !shouldHandlePan) {
+                continue
+            }
+
+            onTransform(
+                nextScale,
+                boundedImageOffset(
+                    scale = currentScale,
+                    nextScale = nextScale,
+                    offset = currentOffset,
+                    pan = panChange,
+                    fittedSize = fittedSize,
+                    containerWidth = containerWidth,
+                    containerHeight = containerHeight,
+                ),
+            )
+            event.changes.forEach { change ->
+                if (change.pressed) {
+                    change.consume()
+                }
+            }
+        } while (event.changes.any { it.pressed })
+    }
+}
+
+private data class FittedImageSize(
+    val width: Float,
+    val height: Float,
+)
+
+private fun boundedImageOffset(
+    scale: Float,
+    nextScale: Float,
+    offset: Offset,
+    pan: Offset,
+    fittedSize: FittedImageSize,
+    containerWidth: Float,
+    containerHeight: Float,
+): Offset {
+    if (nextScale <= 1.01f) {
+        return Offset.Zero
+    }
+
+    val scaleChange = if (scale == 0f) 1f else nextScale / scale
+    val rawOffset = Offset(
+        x = (offset.x + pan.x) * scaleChange,
+        y = (offset.y + pan.y) * scaleChange,
+    )
+    val maxOffsetX = ((fittedSize.width * nextScale) - containerWidth).coerceAtLeast(0f) / 2f
+    val maxOffsetY = ((fittedSize.height * nextScale) - containerHeight).coerceAtLeast(0f) / 2f
+    return Offset(
+        x = rawOffset.x.coerceIn(-maxOffsetX, maxOffsetX),
+        y = rawOffset.y.coerceIn(-maxOffsetY, maxOffsetY),
+    )
+}
+
+private fun fittedImageSize(
+    imageWidth: Float,
+    imageHeight: Float,
+    containerWidth: Float,
+    containerHeight: Float,
+): FittedImageSize {
+    if (
+        imageWidth <= 0f ||
+        imageHeight <= 0f ||
+        containerWidth <= 0f ||
+        containerHeight <= 0f
+    ) {
+        return FittedImageSize(containerWidth, containerHeight)
+    }
+
+    val scale = minOf(containerWidth / imageWidth, containerHeight / imageHeight)
+    return FittedImageSize(
+        width = imageWidth * scale,
+        height = imageHeight * scale,
+    )
 }
 
 @SuppressLint("SetJavaScriptEnabled")
