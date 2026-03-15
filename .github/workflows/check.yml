@@ -176,9 +176,7 @@ jobs:
           arch: x86_64
           profile: pixel_6
           disable-animations: true
-          script: |
-            cd apps/android-app
-            ./gradlew --no-daemon :app:connectedDebugAndroidTest
+          script: apps/android-app/gradlew --no-daemon -p apps/android-app :app:connectedDebugAndroidTest
 
   fuse-mount-build:
     runs-on: ubuntu-latest
