@@ -201,6 +201,57 @@ fn list_tree_snapshot_json(tree_uri: &str) -> Result<String> {
     })
 }
 
+fn prepare_tree_observer(tree_uri: &str) -> Result<()> {
+    with_bridge_env(|env, class| {
+        let j_tree_uri = env
+            .new_string(tree_uri)
+            .context("failed to allocate tree URI string")?;
+        env.call_static_method(
+            &class,
+            "prepareTreeObserver",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(j_tree_uri.as_ref())],
+        )
+        .context("RustSafBridge.prepareTreeObserver failed")?;
+        Ok(())
+    })
+}
+
+fn release_tree_observer(tree_uri: &str) -> Result<()> {
+    with_bridge_env(|env, class| {
+        let j_tree_uri = env
+            .new_string(tree_uri)
+            .context("failed to allocate tree URI string")?;
+        env.call_static_method(
+            &class,
+            "releaseTreeObserver",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(j_tree_uri.as_ref())],
+        )
+        .context("RustSafBridge.releaseTreeObserver failed")?;
+        Ok(())
+    })
+}
+
+fn tree_change_version(tree_uri: &str) -> Result<u64> {
+    with_bridge_env(|env, class| {
+        let j_tree_uri = env
+            .new_string(tree_uri)
+            .context("failed to allocate tree URI string")?;
+        let version = env
+            .call_static_method(
+                &class,
+                "getTreeChangeVersion",
+                "(Ljava/lang/String;)J",
+                &[JValue::Object(j_tree_uri.as_ref())],
+            )
+            .context("RustSafBridge.getTreeChangeVersion failed")?
+            .j()
+            .context("RustSafBridge.getTreeChangeVersion returned invalid value")?;
+        Ok(version.max(0) as u64)
+    })
+}
+
 fn scan_saf_tree(tree_uri: &str) -> Result<LocalTreeState> {
     let snapshot_json = list_tree_snapshot_json(tree_uri)?;
     let entries: Vec<AndroidSafSnapshotEntry> =
@@ -221,6 +272,25 @@ fn scan_saf_tree(tree_uri: &str) -> Result<LocalTreeState> {
         );
     }
     Ok(state)
+}
+
+struct SafTreeObserverGuard {
+    tree_uri: String,
+}
+
+impl SafTreeObserverGuard {
+    fn new(tree_uri: &str) -> Result<Self> {
+        prepare_tree_observer(tree_uri)?;
+        Ok(Self {
+            tree_uri: tree_uri.to_string(),
+        })
+    }
+}
+
+impl Drop for SafTreeObserverGuard {
+    fn drop(&mut self) {
+        let _ = release_tree_observer(&self.tree_uri);
+    }
 }
 
 fn open_tree_input_stream<'local>(
@@ -961,6 +1031,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
     status_callback: Option<FolderAgentStatusCallback>,
 ) -> Result<()> {
     let tree_uri = optional_tree_uri(options)?;
+    let _tree_observer_guard = SafTreeObserverGuard::new(tree_uri)?;
     let scope = PathScope::new(options.prefix.clone());
     let base_url = normalize_server_base_url(&options.server_base_url)?;
     let state_store =
@@ -1120,7 +1191,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
     emit_status(
         status_callback.as_ref(),
         "running",
-        "Initial sync complete; polling SAF tree for changes",
+        "Initial sync complete; watching SAF tree for changes",
     );
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
@@ -1143,6 +1214,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
     );
 
     let mut next_local_scan = Instant::now() + local_scan_interval;
+    let mut last_observed_tree_change_version = tree_change_version(tree_uri).unwrap_or(0);
 
     while running.load(Ordering::SeqCst) {
         let mut baseline_dirty = false;
@@ -1166,12 +1238,20 @@ pub(crate) fn run_saf_folder_agent_with_control(
             baseline_dirty = true;
         }
 
-        if Instant::now() >= next_local_scan {
+        let current_tree_change_version =
+            tree_change_version(tree_uri).unwrap_or(last_observed_tree_change_version);
+        let observer_hint_triggered =
+            current_tree_change_version != last_observed_tree_change_version;
+        if observer_hint_triggered || Instant::now() >= next_local_scan {
             let previous_local_state = local_state.clone();
             emit_status(
                 status_callback.as_ref(),
                 "syncing",
-                "Scanning SAF tree for changes",
+                if observer_hint_triggered {
+                    "SAF change hint received; scanning local tree"
+                } else {
+                    "Scanning SAF tree for changes"
+                },
             );
             sync_local_changes_saf(
                 tree_uri,
@@ -1186,11 +1266,13 @@ pub(crate) fn run_saf_folder_agent_with_control(
             if local_state != previous_local_state {
                 baseline_dirty = true;
             }
+            last_observed_tree_change_version =
+                tree_change_version(tree_uri).unwrap_or(current_tree_change_version);
             next_local_scan = Instant::now() + local_scan_interval;
             emit_status(
                 status_callback.as_ref(),
                 "running",
-                "Polling SAF tree for changes",
+                "Watching SAF tree for changes",
             );
         }
 

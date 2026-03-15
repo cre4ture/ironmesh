@@ -2,17 +2,23 @@ package io.ironmesh.android.data
 
 import android.content.ContentResolver
 import android.content.Context
+import android.database.ContentObserver
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.DocumentsContract
 import android.webkit.MimeTypeMap
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.atomic.AtomicLong
 
 object RustSafBridge {
     @Volatile
     private var appContext: Context? = null
+    private val observerLock = Any()
+    private val treeObservers = mutableMapOf<String, TreeObserverState>()
 
     @JvmStatic
     fun initialize(context: Context) {
@@ -25,15 +31,42 @@ object RustSafBridge {
         val treeUri = Uri.parse(treeUriString)
         val rootDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
         val entries = JSONArray()
+        val observedChildrenUris = linkedSetOf<Uri>()
         collectEntries(
             resolver = resolver,
             treeUri = treeUri,
             parentDocumentId = rootDocumentId,
             prefix = "",
             visitedDocumentIds = mutableSetOf(),
+            observedChildrenUris = observedChildrenUris,
             output = entries,
         )
+        updateObservedChildrenUris(treeUriString, resolver, observedChildrenUris)
         return entries.toString()
+    }
+
+    @JvmStatic
+    fun prepareTreeObserver(treeUriString: String) {
+        val resolver = requireResolver()
+        synchronized(observerLock) {
+            treeObservers.getOrPut(treeUriString) {
+                TreeObserverState(treeUriString, resolver)
+            }
+        }
+    }
+
+    @JvmStatic
+    fun releaseTreeObserver(treeUriString: String) {
+        synchronized(observerLock) {
+            treeObservers.remove(treeUriString)?.close()
+        }
+    }
+
+    @JvmStatic
+    fun getTreeChangeVersion(treeUriString: String): Long {
+        synchronized(observerLock) {
+            return treeObservers[treeUriString]?.version?.get() ?: 0L
+        }
     }
 
     @JvmStatic
@@ -81,11 +114,14 @@ object RustSafBridge {
         parentDocumentId: String,
         prefix: String,
         visitedDocumentIds: MutableSet<String>,
+        observedChildrenUris: MutableSet<Uri>,
         output: JSONArray,
     ) {
         if (!visitedDocumentIds.add(parentDocumentId)) {
             return
         }
+
+        observedChildrenUris += DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
 
         for (child in queryChildren(resolver, treeUri, parentDocumentId)) {
             val relativePath = if (prefix.isBlank()) {
@@ -112,9 +148,21 @@ object RustSafBridge {
                     parentDocumentId = child.documentId,
                     prefix = relativePath,
                     visitedDocumentIds = visitedDocumentIds,
+                    observedChildrenUris = observedChildrenUris,
                     output = output,
                 )
             }
+        }
+    }
+
+    private fun updateObservedChildrenUris(
+        treeUriString: String,
+        resolver: ContentResolver,
+        observedChildrenUris: Set<Uri>,
+    ) {
+        synchronized(observerLock) {
+            val state = treeObservers[treeUriString] ?: return
+            state.updateObservedChildrenUris(observedChildrenUris)
         }
     }
 
@@ -272,5 +320,48 @@ object RustSafBridge {
     ) {
         val isDirectory: Boolean
             get() = mimeType == DocumentsContract.Document.MIME_TYPE_DIR
+    }
+
+    private class TreeObserverState(
+        private val treeUriString: String,
+        private val resolver: ContentResolver,
+    ) {
+        val version = AtomicLong(0L)
+        private val handler = Handler(Looper.getMainLooper())
+        private val observers = linkedMapOf<String, ContentObserver>()
+
+        fun updateObservedChildrenUris(childrenUris: Set<Uri>) {
+            val desired = childrenUris.map(Uri::toString).toSet()
+
+            val toRemove = observers.keys.filterNot { it in desired }
+            for (uriString in toRemove) {
+                observers.remove(uriString)?.let(resolver::unregisterContentObserver)
+            }
+
+            for (uri in childrenUris) {
+                val uriString = uri.toString()
+                if (observers.containsKey(uriString)) {
+                    continue
+                }
+                val observer = object : ContentObserver(handler) {
+                    override fun onChange(selfChange: Boolean) {
+                        version.incrementAndGet()
+                    }
+
+                    override fun onChange(selfChange: Boolean, uri: Uri?) {
+                        version.incrementAndGet()
+                    }
+                }
+                resolver.registerContentObserver(uri, false, observer)
+                observers[uriString] = observer
+            }
+        }
+
+        fun close() {
+            for (observer in observers.values) {
+                resolver.unregisterContentObserver(observer)
+            }
+            observers.clear()
+        }
     }
 }
