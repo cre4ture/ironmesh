@@ -1438,30 +1438,31 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 }
             });
         if state.relay_mode != RelayMode::Disabled
-            && let Some(self_base_url) = relay_self_base_url {
-                let self_http = if let Some(internal_tls) = config.internal_tls.as_ref() {
-                    build_internal_mtls_http_client(
-                        &internal_tls.ca_cert_path,
-                        &internal_tls.cert_path,
-                        &internal_tls.key_path,
-                    )
-                } else {
-                    build_http_client_from_optional_pem(state.public_ca_pem.as_deref())
-                };
-                match self_http {
-                    Ok(self_http) => {
-                        spawn_rendezvous_relay_http_agent(
-                            state.clone(),
-                            client,
-                            self_http,
-                            self_base_url,
-                        );
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "failed to initialize relay self HTTP client");
-                    }
+            && let Some(self_base_url) = relay_self_base_url
+        {
+            let self_http = if let Some(internal_tls) = config.internal_tls.as_ref() {
+                build_internal_mtls_http_client(
+                    &internal_tls.ca_cert_path,
+                    &internal_tls.cert_path,
+                    &internal_tls.key_path,
+                )
+            } else {
+                build_http_client_from_optional_pem(state.public_ca_pem.as_deref())
+            };
+            match self_http {
+                Ok(self_http) => {
+                    spawn_rendezvous_relay_http_agent(
+                        state.clone(),
+                        client,
+                        self_http,
+                        self_base_url,
+                    );
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to initialize relay self HTTP client");
                 }
             }
+        }
     }
 
     let peer_sync_enabled = config.mode == ServerNodeMode::Cluster
@@ -1968,7 +1969,8 @@ fn node_descriptor_from_presence_entry(
         });
     let has_relay_capability = entry
         .registration
-        .capabilities.contains(&TransportCapability::RelayTunnel)
+        .capabilities
+        .contains(&TransportCapability::RelayTunnel)
         || entry.registration.relay_mode != RelayMode::Disabled;
     if peer_api_url.is_none() && !has_relay_capability {
         return None;
@@ -1996,7 +1998,7 @@ fn node_descriptor_from_presence_entry(
 fn peer_transport_client(state: &ServerState) -> Result<PeerTransportClient> {
     PeerTransportClient::new(PeerTransportClientConfig {
         cluster_id: state.cluster_id,
-        prefer_direct: true,
+        prefer_direct: !matches!(state.relay_mode, RelayMode::Preferred | RelayMode::Required),
         allow_relay: state.relay_mode != RelayMode::Disabled,
     })
 }
@@ -2008,18 +2010,20 @@ fn peer_connection_candidates(
     let mut candidates = Vec::new();
     let mut seen_endpoints = BTreeSet::new();
 
-    push_ranked_peer_candidate(
-        &mut candidates,
-        &mut seen_endpoints,
-        normalize_optional_url(Some(node.internal_url.as_str())),
-        Some(1),
-    );
-    push_ranked_peer_candidate(
-        &mut candidates,
-        &mut seen_endpoints,
-        normalize_optional_url(Some(node.public_url.as_str())),
-        Some(100),
-    );
+    if state.relay_mode != RelayMode::Required {
+        push_ranked_peer_candidate(
+            &mut candidates,
+            &mut seen_endpoints,
+            normalize_optional_url(Some(node.internal_url.as_str())),
+            Some(1),
+        );
+        push_ranked_peer_candidate(
+            &mut candidates,
+            &mut seen_endpoints,
+            normalize_optional_url(Some(node.public_url.as_str())),
+            Some(100),
+        );
+    }
     if state.relay_mode != RelayMode::Disabled {
         for relay_url in &state.rendezvous_urls {
             let Some(endpoint) = normalize_optional_url(Some(relay_url.as_str())) else {

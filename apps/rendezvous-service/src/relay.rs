@@ -49,11 +49,25 @@ struct RelayBrokerInner {
 struct RelayBrokerState {
     pending_by_target: HashMap<String, VecDeque<PendingRelayHttpRequest>>,
     inflight: HashMap<String, oneshot::Sender<RelayHttpResponse>>,
+    stats: RelayBrokerStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayBrokerStats {
+    pub submitted_requests: u64,
+    pub delivered_requests: u64,
+    pub completed_responses: u64,
 }
 
 impl RelayBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn stats(&self) -> RelayBrokerStats {
+        let state = self.inner.state.lock().await;
+        state.stats
     }
 
     pub async fn submit_and_await(&self, request: RelayHttpRequest) -> Result<RelayHttpResponse> {
@@ -93,6 +107,7 @@ impl RelayBroker {
                 .or_default()
                 .push_back(pending);
             state.inflight.insert(request_id.clone(), tx);
+            state.stats.submitted_requests = state.stats.submitted_requests.saturating_add(1);
         }
         self.inner.notify.notify_waiters();
 
@@ -140,6 +155,8 @@ impl RelayBroker {
         match sender {
             Some(sender) => {
                 let _ = sender.send(response);
+                let mut state = self.inner.state.lock().await;
+                state.stats.completed_responses = state.stats.completed_responses.saturating_add(1);
                 Ok(true)
             }
             None => Ok(false),
@@ -161,6 +178,7 @@ impl RelayBroker {
             state.pending_by_target.remove(target_key);
         }
         if let Some(pending) = pending.as_ref() {
+            state.stats.delivered_requests = state.stats.delivered_requests.saturating_add(1);
             pending.validate()?;
         }
         Ok(pending)

@@ -2238,6 +2238,35 @@ async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() 
     cleanup_test_state(&state).await;
 }
 
+#[tokio::test]
+async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.relay_mode = super::RelayMode::Required;
+    let node = cluster::NodeDescriptor {
+        node_id: NodeId::new_v4(),
+        public_url: "https://public.example".to_string(),
+        internal_url: "https://internal.example".to_string(),
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    };
+
+    let plan =
+        plan_peer_transport(&state, &node).expect("relay-required transport should still plan");
+
+    assert_eq!(
+        plan.path_kind,
+        transport_sdk::TransportPathKind::RelayTunnel
+    );
+    assert_eq!(
+        plan.candidate.as_ref().map(|candidate| candidate.kind),
+        Some(transport_sdk::CandidateKind::Relay)
+    );
+    cleanup_test_state(&state).await;
+}
+
 async fn cleanup_test_state(state: &ServerState) {
     let root = {
         let store = state.store.lock().await;
