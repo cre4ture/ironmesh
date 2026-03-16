@@ -13,7 +13,10 @@ use axum::{Json, Router};
 use serde::Serialize;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use transport_sdk::relay::{RelayTicket, RelayTicketRequest};
+use transport_sdk::relay::{
+    RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
+    RelayTicketRequest,
+};
 use transport_sdk::rendezvous::PresenceRegistration;
 
 use crate::config::RendezvousServiceConfig;
@@ -43,6 +46,9 @@ async fn main() -> Result<()> {
         .route("/control/presence", get(list_presence))
         .route("/control/presence/register", post(register_presence))
         .route("/control/relay/ticket", post(issue_relay_ticket))
+        .route("/relay/http/request", post(submit_relay_http_request))
+        .route("/relay/http/poll", post(poll_relay_http_request))
+        .route("/relay/http/respond", post(complete_relay_http_request))
         .with_state(state.clone());
 
     info!(
@@ -101,4 +107,56 @@ async fn issue_relay_ticket(
         .validate()
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(Json(ticket))
+}
+
+async fn submit_relay_http_request(
+    State(state): State<AppState>,
+    Json(request): Json<RelayHttpRequest>,
+) -> std::result::Result<Json<RelayHttpResponse>, (StatusCode, String)> {
+    request
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    let response = state
+        .relay
+        .submit_and_await(request)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    Ok(Json(response))
+}
+
+async fn poll_relay_http_request(
+    State(state): State<AppState>,
+    Json(request): Json<RelayHttpPollRequest>,
+) -> std::result::Result<Json<RelayHttpPollResponse>, (StatusCode, String)> {
+    request
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    let response = state
+        .relay
+        .poll(request)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    Ok(Json(response))
+}
+
+async fn complete_relay_http_request(
+    State(state): State<AppState>,
+    Json(response): Json<RelayHttpResponse>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    response
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    let completed = state
+        .relay
+        .respond(response)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    if !completed {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "relay request is no longer waiting".to_string(),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "accepted": true })))
 }

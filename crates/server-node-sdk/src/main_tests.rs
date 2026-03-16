@@ -3,8 +3,8 @@ use super::{
     RepairExecutorState, ServerNodeConfig, ServerState, StartupRepairStatus,
     await_repair_busy_threshold, build_rendezvous_presence_registration, build_store_index_entries,
     cluster, constant_time_eq, jittered_backoff_secs, node_descriptor_from_presence_entry,
-    replication::build_internal_replication_put_url, resolve_peer_base_url, run,
-    run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
+    plan_peer_transport, replication::build_internal_replication_put_url, resolve_peer_base_url,
+    run, run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
     token_matches,
 };
 use common::NodeId;
@@ -1958,6 +1958,7 @@ async fn build_test_state(
         public_ca_pem: None,
         cluster_ca_pem: None,
         rendezvous_urls: vec!["http://127.0.0.1:39080".to_string()],
+        rendezvous_control: None,
         relay_mode: super::RelayMode::Fallback,
         metadata_commit_mode: MetadataCommitMode::Local,
         internal_http: reqwest::Client::new(),
@@ -2135,6 +2136,34 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
 }
 
 #[tokio::test]
+async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
+    let node_id = NodeId::new_v4();
+    let entry = transport_sdk::PresenceEntry {
+        registration: transport_sdk::PresenceRegistration {
+            cluster_id: uuid::Uuid::now_v7(),
+            identity: transport_sdk::PeerIdentity::Node(node_id),
+            public_api_url: None,
+            peer_api_url: None,
+            direct_candidates: Vec::new(),
+            labels: HashMap::new(),
+            capacity_bytes: None,
+            free_bytes: None,
+            capabilities: vec![transport_sdk::TransportCapability::RelayTunnel],
+            relay_mode: transport_sdk::RelayMode::Fallback,
+            connected_at_unix: 123,
+        },
+        updated_at_unix: 456,
+    };
+
+    let descriptor = node_descriptor_from_presence_entry(&entry)
+        .expect("relay-only presence entry should still project into a node descriptor");
+
+    assert_eq!(descriptor.node_id, node_id);
+    assert!(descriptor.public_url.is_empty());
+    assert!(descriptor.internal_url.is_empty());
+}
+
+#[tokio::test]
 async fn resolve_peer_base_url_prefers_internal_url() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let node = cluster::NodeDescriptor {
@@ -2157,7 +2186,8 @@ async fn resolve_peer_base_url_prefers_internal_url() {
 
 #[tokio::test]
 async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
-    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.relay_mode = super::RelayMode::Disabled;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         public_url: String::new(),
@@ -2176,6 +2206,34 @@ async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
         error
             .to_string()
             .contains("does not expose any usable peer transport candidates")
+    );
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let node = cluster::NodeDescriptor {
+        node_id: NodeId::new_v4(),
+        public_url: String::new(),
+        internal_url: String::new(),
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    };
+
+    let plan = plan_peer_transport(&state, &node)
+        .expect("peer transport should synthesize a relay path when rendezvous is available");
+
+    assert_eq!(
+        plan.path_kind,
+        transport_sdk::TransportPathKind::RelayTunnel
+    );
+    assert_eq!(
+        plan.candidate.as_ref().map(|candidate| candidate.kind),
+        Some(transport_sdk::CandidateKind::Relay)
     );
     cleanup_test_state(&state).await;
 }

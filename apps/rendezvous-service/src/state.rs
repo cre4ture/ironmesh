@@ -1,10 +1,12 @@
 use crate::config::RendezvousServiceConfig;
 use crate::presence::PresenceRegistry;
+use crate::relay::RelayBroker;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: RendezvousServiceConfig,
     pub presence: PresenceRegistry,
+    pub relay: RelayBroker,
 }
 
 impl AppState {
@@ -12,6 +14,7 @@ impl AppState {
         Self {
             config,
             presence: PresenceRegistry::new(),
+            relay: RelayBroker::new(),
         }
     }
 }

@@ -18,20 +18,6 @@ pub(crate) struct ReplicationRepairQuery {
     batch_size: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
-struct InternalReplicationDeleteQuery<'a> {
-    key: &'a str,
-    state: &'a str,
-    version_id: Option<&'a str>,
-    internal_replication: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ReplicationExportRequestQuery<'a> {
-    key: &'a str,
-    version_id: Option<&'a str>,
-}
-
 pub(crate) async fn execute_replication_repair(
     State(state): State<ServerState>,
     Query(query): Query<ReplicationRepairQuery>,
@@ -72,8 +58,6 @@ pub(crate) async fn execute_replication_repair_inner(
     let backoff_secs = state.repair_config.backoff_secs;
     let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
     let now = unix_ts();
-
-    let http = state.internal_http.clone();
 
     let mut plan_items = plan.items;
     plan_items.sort_by(|a, b| {
@@ -144,9 +128,7 @@ pub(crate) async fn execute_replication_repair_inner(
             await_repair_busy_threshold(state).await;
             attempted_transfers += 1;
 
-            match pull_bundle_from_source(&http, source_node, &key, version_id.as_deref(), state)
-                .await
-            {
+            match pull_bundle_from_source(source_node, &key, version_id.as_deref(), state).await {
                 Ok(imported_version_id) => {
                     successful_transfers += 1;
                     publish_namespace_change(state);
@@ -239,7 +221,7 @@ pub(crate) async fn execute_replication_repair_inner(
 
             attempted_transfers += 1;
             let transfer_result =
-                replicate_bundle_to_target(&http, node, &bundle, &state.store, state).await;
+                replicate_bundle_to_target(node, &bundle, &state.store, state).await;
 
             match transfer_result {
                 Ok(remote_version_id) => {
@@ -306,34 +288,35 @@ pub(crate) async fn execute_replication_repair_inner(
 }
 
 async fn pull_bundle_from_source(
-    http: &reqwest::Client,
     source_node: &NodeDescriptor,
     key: &str,
     version_id: Option<&str>,
     state: &ServerState,
 ) -> Result<String> {
-    let source_base_url = resolve_peer_base_url(state, source_node)?;
-    let source_base_url = source_base_url.trim_end_matches('/');
-    let export_url = format!("{source_base_url}/cluster/replication/export");
-    let bundle = http
-        .get(export_url)
-        .query(&ReplicationExportRequestQuery { key, version_id })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<ReplicationExportBundle>()
-        .await?;
+    let export_path = build_replication_export_path(key, version_id);
+    let bundle = execute_peer_request(
+        state,
+        source_node,
+        reqwest::Method::GET,
+        &export_path,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await?
+    .json::<ReplicationExportBundle>()?;
 
     if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
         for chunk in &bundle.manifest.chunks {
-            let chunk_url = format!("{source_base_url}/cluster/replication/chunk/{}", chunk.hash);
-            let payload = http
-                .get(chunk_url)
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?;
+            let payload = execute_peer_request(
+                state,
+                source_node,
+                reqwest::Method::GET,
+                &format!("/cluster/replication/chunk/{}", chunk.hash),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await?
+            .body;
 
             let store = state.store.lock().await;
             store.ingest_chunk(&chunk.hash, payload.as_ref()).await?;
@@ -354,36 +337,44 @@ async fn pull_bundle_from_source(
 }
 
 async fn replicate_bundle_to_target(
-    http: &reqwest::Client,
     target_node: &NodeDescriptor,
     bundle: &ReplicationExportBundle,
     store: &Arc<Mutex<PersistentStore>>,
     state: &ServerState,
 ) -> Result<String> {
-    let target_base_url = resolve_peer_base_url(state, target_node)?;
     if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
         let state_query = match bundle.state {
             VersionConsistencyState::Confirmed => "confirmed",
             VersionConsistencyState::Provisional => "provisional",
         };
 
-        let delete_url = format!("{target_base_url}/store/delete");
-        http.post(delete_url)
-            .query(&InternalReplicationDeleteQuery {
-                key: &bundle.key,
-                state: state_query,
-                version_id: bundle.version_id.as_deref(),
-                internal_replication: true,
-            })
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to push tombstone key={} version_id={:?} to target={target_base_url}",
-                    bundle.key, bundle.version_id
-                )
-            })?
-            .error_for_status()?;
+        let delete_path = build_internal_replication_delete_path(
+            &bundle.key,
+            state_query,
+            bundle.version_id.as_deref(),
+        );
+        let response = execute_peer_request(
+            state,
+            target_node,
+            reqwest::Method::POST,
+            &delete_path,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to push tombstone key={} version_id={:?} to target={}",
+                bundle.key, bundle.version_id, target_node.node_id
+            )
+        })?;
+        if !response.is_success() {
+            bail!(
+                "tombstone replication target {} returned HTTP {}",
+                target_node.node_id,
+                response.status
+            );
+        }
 
         return bundle
             .version_id
@@ -401,21 +392,31 @@ async fn replicate_bundle_to_target(
                     .with_context(|| format!("missing local chunk {}", chunk.hash))?
             };
 
-            let chunk_url = format!(
-                "{target_base_url}/cluster/replication/push/chunk/{}",
-                chunk.hash
-            );
-            http.post(chunk_url)
-                .body(payload)
-                .send()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to push chunk hash={} key={} version_id={:?} to target={target_base_url}",
-                        chunk.hash, bundle.key, bundle.version_id
-                    )
-                })?
-                .error_for_status()?;
+            let response = execute_peer_request(
+                state,
+                target_node,
+                reqwest::Method::POST,
+                &format!("/cluster/replication/push/chunk/{}", chunk.hash),
+                vec![RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/octet-stream".to_string(),
+                }],
+                payload.to_vec(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to push chunk hash={} key={} version_id={:?} to target={}",
+                    chunk.hash, bundle.key, bundle.version_id, target_node.node_id
+                )
+            })?;
+            if !response.is_success() {
+                bail!(
+                    "chunk replication target {} returned HTTP {}",
+                    target_node.node_id,
+                    response.status
+                );
+            }
         }
     } else {
         let mut assembled = BytesMut::with_capacity(bundle.manifest.total_size_bytes);
@@ -438,22 +439,36 @@ async fn replicate_bundle_to_target(
         };
 
         let put_url = build_internal_replication_put_url(
-            &target_base_url,
+            "",
             &bundle.key,
             state_query,
             bundle.version_id.as_deref(),
         );
-        http.put(put_url)
-            .body(assembled.freeze())
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to push assembled object key={} version_id={:?} to target={target_base_url}",
-                    bundle.key, bundle.version_id
-                )
-            })?
-            .error_for_status()?;
+        let response = execute_peer_request(
+            state,
+            target_node,
+            reqwest::Method::PUT,
+            &put_url,
+            vec![RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/octet-stream".to_string(),
+            }],
+            assembled.freeze().to_vec(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to push assembled object key={} version_id={:?} to target={}",
+                bundle.key, bundle.version_id, target_node.node_id
+            )
+        })?;
+        if !response.is_success() {
+            bail!(
+                "assembled object replication target {} returned HTTP {}",
+                target_node.node_id,
+                response.status
+            );
+        }
     }
 
     let parent_version_ids_json = if bundle.parent_version_ids.is_empty() {
@@ -461,30 +476,40 @@ async fn replicate_bundle_to_target(
     } else {
         Some(serde_json::to_string(&bundle.parent_version_ids)?)
     };
-    let manifest_url = format!("{target_base_url}/cluster/replication/push/manifest");
-    let request = http
-        .post(manifest_url)
-        .query(&ReplicationManifestPushQuery {
-            key: bundle.key.clone(),
-            version_id: bundle.version_id.clone(),
-            parent_version_ids_json,
-            state: bundle.state.clone(),
-            manifest_hash: bundle.manifest_hash.clone(),
-        })
-        .body(bundle.manifest_bytes.clone());
+    let manifest_path = build_replication_manifest_push_path(
+        &bundle.key,
+        &bundle.manifest_hash,
+        bundle.state.clone(),
+        bundle.version_id.as_deref(),
+        parent_version_ids_json.as_deref(),
+    );
+    let response = execute_peer_request(
+        state,
+        target_node,
+        reqwest::Method::POST,
+        &manifest_path,
+        vec![RelayHttpHeader {
+            name: "content-type".to_string(),
+            value: "application/octet-stream".to_string(),
+        }],
+        bundle.manifest_bytes.clone(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to push manifest key={} version_id={:?} manifest_hash={} to target={}",
+            bundle.key, bundle.version_id, bundle.manifest_hash, target_node.node_id
+        )
+    })?;
+    if !response.is_success() {
+        bail!(
+            "manifest replication target {} returned HTTP {}",
+            target_node.node_id,
+            response.status
+        );
+    }
 
-    let response = request
-        .send()
-        .await
-        .with_context(|| {
-            format!(
-                "failed to push manifest key={} version_id={:?} manifest_hash={} to target={target_base_url}",
-                bundle.key, bundle.version_id, bundle.manifest_hash
-            )
-        })?
-        .error_for_status()?;
-
-    let report = response.json::<ReplicationManifestPushReport>().await?;
+    let report = response.json::<ReplicationManifestPushReport>()?;
     Ok(report.version_id)
 }
 
@@ -494,12 +519,90 @@ pub(crate) fn build_internal_replication_put_url(
     state_query: &str,
     version_id: Option<&str>,
 ) -> String {
+    let state_query = encode_query_value(state_query);
     match version_id {
         Some(version_id) => format!(
-            "{target_base_url}/store/{key}?state={state_query}&version_id={version_id}&internal_replication=true"
+            "{target_base_url}/store/{key}?state={state_query}&version_id={}&internal_replication=true",
+            encode_query_value(version_id)
         ),
         None => {
             format!("{target_base_url}/store/{key}?state={state_query}&internal_replication=true")
         }
     }
+}
+
+fn build_replication_export_path(key: &str, version_id: Option<&str>) -> String {
+    match version_id {
+        Some(version_id) => format!(
+            "/cluster/replication/export?key={}&version_id={}",
+            encode_query_value(key),
+            encode_query_value(version_id)
+        ),
+        None => format!(
+            "/cluster/replication/export?key={}",
+            encode_query_value(key)
+        ),
+    }
+}
+
+fn build_internal_replication_delete_path(
+    key: &str,
+    state_query: &str,
+    version_id: Option<&str>,
+) -> String {
+    let mut path = format!(
+        "/store/delete?key={}&state={}&internal_replication=true",
+        encode_query_value(key),
+        encode_query_value(state_query)
+    );
+    if let Some(version_id) = version_id {
+        path.push_str("&version_id=");
+        path.push_str(&encode_query_value(version_id));
+    }
+    path
+}
+
+fn build_replication_manifest_push_path(
+    key: &str,
+    manifest_hash: &str,
+    state: VersionConsistencyState,
+    version_id: Option<&str>,
+    parent_version_ids_json: Option<&str>,
+) -> String {
+    let mut path = format!(
+        "/cluster/replication/push/manifest?key={}&manifest_hash={}&state={}",
+        encode_query_value(key),
+        encode_query_value(manifest_hash),
+        encode_query_value(match state {
+            VersionConsistencyState::Confirmed => "confirmed",
+            VersionConsistencyState::Provisional => "provisional",
+        })
+    );
+    let suffix = build_manifest_push_query_suffix(version_id, parent_version_ids_json);
+    if !suffix.is_empty() {
+        path.push('&');
+        path.push_str(&suffix);
+    }
+    path
+}
+
+fn build_manifest_push_query_suffix(
+    version_id: Option<&str>,
+    parent_version_ids_json: Option<&str>,
+) -> String {
+    let mut segments = Vec::new();
+    if let Some(version_id) = version_id {
+        segments.push(format!("version_id={}", encode_query_value(version_id)));
+    }
+    if let Some(parent_version_ids_json) = parent_version_ids_json {
+        segments.push(format!(
+            "parent_version_ids_json={}",
+            encode_query_value(parent_version_ids_json)
+        ));
+    }
+    segments.join("&")
+}
+
+fn encode_query_value(value: &str) -> String {
+    utf8_percent_encode(value, QUERY_COMPONENT_ENCODE_SET).to_string()
 }

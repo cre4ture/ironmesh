@@ -31,7 +31,7 @@ use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tokio::sync::{Mutex, watch};
 use tower::Service;
@@ -44,9 +44,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, CandidateKind,
     ClientBootstrap as TransportClientBootstrap, ConnectionCandidate, PeerIdentity,
-    PeerTransportClient, PeerTransportClientConfig, PresenceRegistration, RelayMode,
+    PeerTransportClient, PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader,
+    RelayHttpPollRequest, RelayHttpRequest, RelayHttpResponse, RelayMode, RelayTicketRequest,
     RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders, TransportCapability,
-    TransportPathKind, credential_fingerprint, verify_signed_request_headers,
+    TransportPathKind, credential_fingerprint, encode_optional_body_base64,
+    verify_signed_request_headers,
 };
 use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
@@ -85,6 +87,7 @@ struct ServerState {
     public_ca_pem: Option<String>,
     cluster_ca_pem: Option<String>,
     rendezvous_urls: Vec<String>,
+    rendezvous_control: Option<RendezvousControlClient>,
     relay_mode: RelayMode,
     metadata_commit_mode: MetadataCommitMode,
     internal_http: reqwest::Client,
@@ -1331,6 +1334,24 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             })
         })
         .transpose()?;
+    let rendezvous_control = if config.rendezvous_registration_enabled {
+        match RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: config.cluster_id,
+                rendezvous_urls: config.rendezvous_urls.clone(),
+                heartbeat_interval_secs: config.peer_heartbeat_interval_secs.max(5),
+            },
+            public_ca_pem.as_deref().or(cluster_ca_pem.as_deref()),
+        ) {
+            Ok(client) => Some(client),
+            Err(err) => {
+                warn!(error = %err, "failed to initialize rendezvous control client");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let state = ServerState {
         cluster_id: config.cluster_id,
@@ -1341,6 +1362,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         public_ca_pem,
         cluster_ca_pem,
         rendezvous_urls: config.rendezvous_urls.clone(),
+        rendezvous_control,
         relay_mode: config.relay_mode,
         metadata_commit_mode: config.metadata_commit_mode,
         internal_http,
@@ -1386,42 +1408,60 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             .collect();
     }
 
-    if config.rendezvous_registration_enabled {
-        let rendezvous_client = RendezvousControlClient::new(
-            RendezvousClientConfig {
-                cluster_id: state.cluster_id,
-                rendezvous_urls: config.rendezvous_urls.clone(),
-                heartbeat_interval_secs: config.peer_heartbeat_interval_secs.max(5),
-            },
-            state
-                .public_ca_pem
-                .as_deref()
-                .or(state.cluster_ca_pem.as_deref()),
+    if let Some(client) = state.rendezvous_control.clone() {
+        spawn_rendezvous_peer_discovery(
+            state.clone(),
+            client.clone(),
+            config.replica_view_sync_interval_secs,
+        );
+        spawn_rendezvous_presence_heartbeat(
+            state.clone(),
+            client.clone(),
+            Some(public_url.clone()),
+            config
+                .internal_tls
+                .as_ref()
+                .and_then(|tls| tls.internal_url.clone()),
+            config.public_peer_api_enabled,
+            config.peer_heartbeat_interval_secs,
         );
 
-        match rendezvous_client {
-            Ok(client) => {
-                spawn_rendezvous_peer_discovery(
-                    state.clone(),
-                    client.clone(),
-                    config.replica_view_sync_interval_secs,
-                );
-                spawn_rendezvous_presence_heartbeat(
-                    state.clone(),
-                    client,
-                    Some(public_url.clone()),
-                    config
-                        .internal_tls
-                        .as_ref()
-                        .and_then(|tls| tls.internal_url.clone()),
-                    config.public_peer_api_enabled,
-                    config.peer_heartbeat_interval_secs,
-                );
+        let relay_self_base_url = config
+            .internal_tls
+            .as_ref()
+            .and_then(|tls| tls.internal_url.clone())
+            .or_else(|| {
+                if config.public_peer_api_enabled {
+                    Some(public_url.clone())
+                } else {
+                    None
+                }
+            });
+        if state.relay_mode != RelayMode::Disabled
+            && let Some(self_base_url) = relay_self_base_url {
+                let self_http = if let Some(internal_tls) = config.internal_tls.as_ref() {
+                    build_internal_mtls_http_client(
+                        &internal_tls.ca_cert_path,
+                        &internal_tls.cert_path,
+                        &internal_tls.key_path,
+                    )
+                } else {
+                    build_http_client_from_optional_pem(state.public_ca_pem.as_deref())
+                };
+                match self_http {
+                    Ok(self_http) => {
+                        spawn_rendezvous_relay_http_agent(
+                            state.clone(),
+                            client,
+                            self_http,
+                            self_base_url,
+                        );
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to initialize relay self HTTP client");
+                    }
+                }
             }
-            Err(err) => {
-                warn!(error = %err, "failed to initialize rendezvous presence client");
-            }
-        }
     }
 
     let peer_sync_enabled = config.mode == ServerNodeMode::Cluster
@@ -1889,7 +1929,7 @@ async fn apply_rendezvous_presence_entries(
         let Some(descriptor) = node_descriptor_from_presence_entry(entry) else {
             tracing::debug!(
                 node_id = %node_id,
-                "skipping rendezvous peer without direct peer_api_url"
+                "skipping rendezvous peer without a usable transport path"
             );
             continue;
         };
@@ -1925,18 +1965,26 @@ fn node_descriptor_from_presence_entry(
                         None
                     }
                 })
-        })?;
+        });
+    let has_relay_capability = entry
+        .registration
+        .capabilities.contains(&TransportCapability::RelayTunnel)
+        || entry.registration.relay_mode != RelayMode::Disabled;
+    if peer_api_url.is_none() && !has_relay_capability {
+        return None;
+    }
     let public_api_url = entry
         .registration
         .public_api_url
         .as_deref()
         .and_then(|value| normalize_optional_url(Some(value)))
-        .unwrap_or_else(|| peer_api_url.clone());
+        .or_else(|| peer_api_url.clone())
+        .unwrap_or_default();
 
     Some(NodeDescriptor {
         node_id: *node_id,
         public_url: public_api_url,
-        internal_url: peer_api_url,
+        internal_url: peer_api_url.unwrap_or_default(),
         labels: entry.registration.labels.clone(),
         capacity_bytes: entry.registration.capacity_bytes.unwrap_or(0),
         free_bytes: entry.registration.free_bytes.unwrap_or(0),
@@ -1953,7 +2001,10 @@ fn peer_transport_client(state: &ServerState) -> Result<PeerTransportClient> {
     })
 }
 
-fn peer_connection_candidates(node: &NodeDescriptor) -> Vec<ConnectionCandidate> {
+fn peer_connection_candidates(
+    state: &ServerState,
+    node: &NodeDescriptor,
+) -> Vec<ConnectionCandidate> {
     let mut candidates = Vec::new();
     let mut seen_endpoints = BTreeSet::new();
 
@@ -1969,6 +2020,21 @@ fn peer_connection_candidates(node: &NodeDescriptor) -> Vec<ConnectionCandidate>
         normalize_optional_url(Some(node.public_url.as_str())),
         Some(100),
     );
+    if state.relay_mode != RelayMode::Disabled {
+        for relay_url in &state.rendezvous_urls {
+            let Some(endpoint) = normalize_optional_url(Some(relay_url.as_str())) else {
+                continue;
+            };
+            if !seen_endpoints.insert(endpoint.clone()) {
+                continue;
+            }
+            candidates.push(ConnectionCandidate {
+                kind: CandidateKind::Relay,
+                endpoint,
+                rtt_ms: None,
+            });
+        }
+    }
 
     candidates
 }
@@ -1993,15 +2059,25 @@ fn push_ranked_peer_candidate(
     });
 }
 
-pub(crate) fn resolve_peer_base_url(state: &ServerState, node: &NodeDescriptor) -> Result<String> {
+fn plan_peer_transport(
+    state: &ServerState,
+    node: &NodeDescriptor,
+) -> Result<transport_sdk::TransportSessionPlan> {
     let transport = peer_transport_client(state)?;
-    let candidates = peer_connection_candidates(node);
-    let Some(plan) = transport.plan_session(PeerIdentity::Node(node.node_id), &candidates) else {
-        bail!(
-            "node {} does not expose any usable peer transport candidates",
-            node.node_id
-        );
-    };
+    let candidates = peer_connection_candidates(state, node);
+    transport
+        .plan_session(PeerIdentity::Node(node.node_id), &candidates)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "node {} does not expose any usable peer transport candidates",
+                node.node_id
+            )
+        })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_peer_base_url(state: &ServerState, node: &NodeDescriptor) -> Result<String> {
+    let plan = plan_peer_transport(state, node)?;
     let candidate = plan
         .candidate
         .as_ref()
@@ -2016,6 +2092,287 @@ pub(crate) fn resolve_peer_base_url(state: &ServerState, node: &NodeDescriptor) 
             node.node_id
         ),
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PeerHttpResponse {
+    pub(crate) status: u16,
+    #[allow(dead_code)]
+    pub(crate) headers: Vec<RelayHttpHeader>,
+    pub(crate) body: Bytes,
+}
+
+impl PeerHttpResponse {
+    pub(crate) fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    pub(crate) fn json<T>(&self) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        serde_json::from_slice(&self.body).with_context(|| {
+            format!(
+                "failed decoding peer JSON response with status {}",
+                self.status
+            )
+        })
+    }
+}
+
+async fn execute_peer_request(
+    state: &ServerState,
+    node: &NodeDescriptor,
+    method: reqwest::Method,
+    path_and_query: &str,
+    headers: Vec<RelayHttpHeader>,
+    body: Vec<u8>,
+) -> Result<PeerHttpResponse> {
+    let plan = plan_peer_transport(state, node)?;
+
+    match plan.path_kind {
+        TransportPathKind::DirectHttps | TransportPathKind::DirectQuic => {
+            let base_url = plan
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.endpoint.trim_end_matches('/').to_string())
+                .context("peer transport plan did not include a selected candidate")?;
+            execute_direct_peer_request(
+                &state.internal_http,
+                &base_url,
+                method,
+                path_and_query,
+                headers,
+                body,
+            )
+            .await
+        }
+        TransportPathKind::RelayTunnel => {
+            execute_relay_peer_request(state, node, method, path_and_query, headers, body).await
+        }
+    }
+}
+
+async fn execute_direct_peer_request(
+    http: &reqwest::Client,
+    base_url: &str,
+    method: reqwest::Method,
+    path_and_query: &str,
+    headers: Vec<RelayHttpHeader>,
+    body: Vec<u8>,
+) -> Result<PeerHttpResponse> {
+    let url = join_peer_url(base_url, path_and_query)?;
+    let mut request = http.request(method, url);
+    for header in headers {
+        request = request.header(header.name, header.value);
+    }
+    if !body.is_empty() {
+        request = request.body(body);
+    }
+
+    let response = request
+        .send()
+        .await
+        .context("failed sending direct peer request")?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| RelayHttpHeader {
+                name: name.as_str().to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = response
+        .bytes()
+        .await
+        .context("failed reading direct peer response body")?;
+
+    Ok(PeerHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+async fn execute_relay_peer_request(
+    state: &ServerState,
+    node: &NodeDescriptor,
+    method: reqwest::Method,
+    path_and_query: &str,
+    headers: Vec<RelayHttpHeader>,
+    body: Vec<u8>,
+) -> Result<PeerHttpResponse> {
+    let rendezvous = state
+        .rendezvous_control
+        .clone()
+        .context("relay peer transport requires rendezvous control client")?;
+    let ticket = rendezvous
+        .issue_relay_ticket(&RelayTicketRequest {
+            cluster_id: state.cluster_id,
+            source: PeerIdentity::Node(state.node_id),
+            target: PeerIdentity::Node(node.node_id),
+            requested_expires_in_secs: Some(30),
+        })
+        .await
+        .with_context(|| format!("failed issuing relay ticket for node {}", node.node_id))?;
+
+    let response = rendezvous
+        .submit_relay_http_request(&RelayHttpRequest {
+            ticket,
+            request_id: Uuid::now_v7().to_string(),
+            method: method.as_str().to_string(),
+            path_and_query: normalize_peer_path_and_query(path_and_query)?,
+            headers,
+            body_base64: encode_optional_body_base64(&body),
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed executing relayed peer request for node {}",
+                node.node_id
+            )
+        })?;
+
+    let status = response.status;
+    let body = Bytes::from(response.body_bytes()?);
+    let headers = response.headers;
+
+    Ok(PeerHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn join_peer_url(base_url: &str, path_and_query: &str) -> Result<reqwest::Url> {
+    reqwest::Url::parse(base_url.trim())
+        .with_context(|| format!("invalid peer base URL {base_url}"))?
+        .join(path_and_query.trim_start_matches('/'))
+        .with_context(|| format!("failed to join peer URL {base_url} and {path_and_query}"))
+}
+
+fn normalize_peer_path_and_query(path_and_query: &str) -> Result<String> {
+    let trimmed = path_and_query.trim();
+    if trimmed.is_empty() {
+        bail!("peer path_and_query must not be empty");
+    }
+    if trimmed.starts_with('/') {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("/{trimmed}"))
+    }
+}
+
+fn spawn_rendezvous_relay_http_agent(
+    state: ServerState,
+    client: RendezvousControlClient,
+    local_http: reqwest::Client,
+    local_base_url: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            match client
+                .poll_relay_http_request(&RelayHttpPollRequest {
+                    cluster_id: state.cluster_id,
+                    target: PeerIdentity::Node(state.node_id),
+                    wait_timeout_ms: Some(15_000),
+                })
+                .await
+            {
+                Ok(response) => {
+                    let Some(request) = response.request else {
+                        continue;
+                    };
+
+                    let relay_response = match execute_local_relay_http_request(
+                        &local_http,
+                        &local_base_url,
+                        &request,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(err) => RelayHttpResponse {
+                            request_id: request.request_id.clone(),
+                            status: 502,
+                            headers: vec![RelayHttpHeader {
+                                name: "content-type".to_string(),
+                                value: "text/plain; charset=utf-8".to_string(),
+                            }],
+                            body_base64: encode_optional_body_base64(
+                                format!("relay execution failed: {err:#}").as_bytes(),
+                            ),
+                        },
+                    };
+
+                    if let Err(err) = client.respond_relay_http_request(&relay_response).await {
+                        warn!(
+                            error = %err,
+                            request_id = %request.request_id,
+                            "failed to submit relayed HTTP response"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "relay HTTP poll failed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+}
+
+async fn execute_local_relay_http_request(
+    local_http: &reqwest::Client,
+    local_base_url: &str,
+    request: &transport_sdk::PendingRelayHttpRequest,
+) -> Result<RelayHttpResponse> {
+    let url = join_peer_url(local_base_url, &request.path_and_query)?;
+    let method = reqwest::Method::from_bytes(request.method.as_bytes())
+        .with_context(|| format!("invalid relayed HTTP method {}", request.method))?;
+    let mut outbound = local_http.request(method, url);
+    for header in &request.headers {
+        if header.name.eq_ignore_ascii_case("host")
+            || header.name.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        outbound = outbound.header(&header.name, &header.value);
+    }
+    let body = request.body_bytes()?;
+    if !body.is_empty() {
+        outbound = outbound.body(body);
+    }
+
+    let response = outbound
+        .send()
+        .await
+        .context("failed executing local relayed HTTP request")?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| RelayHttpHeader {
+                name: name.as_str().to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = response
+        .bytes()
+        .await
+        .context("failed reading local relayed HTTP response body")?;
+
+    Ok(RelayHttpResponse {
+        request_id: request.request_id.clone(),
+        status,
+        headers,
+        body_base64: encode_optional_body_base64(&body),
+    })
 }
 
 fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
@@ -2069,8 +2426,6 @@ struct LocalReplicationSubjectsResponse {
 }
 
 pub(crate) async fn sync_replica_views_once(state: &ServerState) {
-    let http = state.internal_http.clone();
-
     let local_subjects = {
         let store = state.store.lock().await;
         store
@@ -2097,22 +2452,18 @@ pub(crate) async fn sync_replica_views_once(state: &ServerState) {
     };
 
     for peer in peers {
-        let base = match resolve_peer_base_url(state, &peer) {
-            Ok(base) => base,
-            Err(err) => {
-                tracing::debug!(
-                    node_id = %peer.node_id,
-                    error = %err,
-                    "failed resolving peer transport base URL for replica subject sync"
-                );
-                continue;
-            }
-        };
-        let url = format!("{base}/cluster/replication/subjects/local");
-
-        match http.get(url).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<LocalReplicationSubjectsResponse>().await {
+        match execute_peer_request(
+            state,
+            &peer,
+            reqwest::Method::GET,
+            "/cluster/replication/subjects/local",
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => {
+                match response.json::<LocalReplicationSubjectsResponse>() {
                     Ok(payload) => {
                         let mut cluster = state.cluster.lock().await;
                         if cluster.replace_node_replica_view(payload.node_id, &payload.subjects) {
@@ -2131,7 +2482,7 @@ pub(crate) async fn sync_replica_views_once(state: &ServerState) {
             Ok(response) => {
                 tracing::debug!(
                     node_id = %peer.node_id,
-                    status = %response.status(),
+                    status = response.status,
                     "replica subject sync request rejected"
                 );
             }
@@ -2394,7 +2745,6 @@ async fn run_startup_replication_repair_once(
 
 fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
     tokio::spawn(async move {
-        let http = state.internal_http.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
 
         loop {
@@ -2428,25 +2778,38 @@ fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
             };
 
             for peer in peers {
-                let base = match resolve_peer_base_url(&state, &peer) {
-                    Ok(base) => base,
+                let body = match serde_json::to_vec(&payload)
+                    .context("failed to serialize peer heartbeat payload")
+                {
+                    Ok(body) => body,
                     Err(err) => {
                         tracing::debug!(
                             node_id = %peer.node_id,
                             error = %err,
-                            "failed resolving peer transport base URL for heartbeat"
+                            "failed to serialize peer heartbeat"
                         );
                         continue;
                     }
                 };
-                let url = format!("{base}/cluster/nodes/{}/heartbeat", state.node_id);
 
-                match http.post(url).json(&payload).send().await {
-                    Ok(response) if response.status().is_success() => {}
+                match execute_peer_request(
+                    &state,
+                    &peer,
+                    reqwest::Method::POST,
+                    &format!("/cluster/nodes/{}/heartbeat", state.node_id),
+                    vec![RelayHttpHeader {
+                        name: "content-type".to_string(),
+                        value: "application/json".to_string(),
+                    }],
+                    body,
+                )
+                .await
+                {
+                    Ok(response) if response.is_success() => {}
                     Ok(response) => {
                         tracing::debug!(
                             node_id = %peer.node_id,
-                            status = %response.status(),
+                            status = response.status,
                             "peer heartbeat request rejected"
                         );
                     }
@@ -4649,6 +5012,20 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
     store.persist_cluster_replicas(&replicas).await
 }
 
+fn build_http_client_from_optional_pem(server_ca_pem: Option<&str>) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder();
+    let builder = if let Some(server_ca_pem) = server_ca_pem {
+        builder.add_root_certificate(
+            reqwest::Certificate::from_pem(server_ca_pem.as_bytes())
+                .context("failed parsing relay server CA PEM")?,
+        )
+    } else {
+        builder
+    };
+
+    builder.build().context("failed building relay HTTP client")
+}
+
 fn build_internal_mtls_http_client(
     ca_path: &PathBuf,
     cert_path: &PathBuf,
@@ -5307,24 +5684,18 @@ async fn reconcile_from_node(
 
         node
     };
-    let remote_url = match resolve_peer_base_url(&state, &remote_node) {
-        Ok(url) => url,
-        Err(err) => {
-            tracing::error!(
-                source_node_id = %source_node_id,
-                error = %err,
-                "failed resolving reconciliation peer transport"
-            );
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-    };
-
-    let http = state.internal_http.clone();
-
-    let export_url = format!("{remote_url}/cluster/reconcile/export/provisional");
-    let remote_entries: Vec<ReconcileVersionEntry> = match http.get(export_url).send().await {
-        Ok(response) => match response.error_for_status() {
-            Ok(ok_response) => match ok_response.json::<Vec<ReconcileVersionEntry>>().await {
+    let remote_entries: Vec<ReconcileVersionEntry> = match execute_peer_request(
+        &state,
+        &remote_node,
+        reqwest::Method::GET,
+        "/cluster/reconcile/export/provisional",
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(response) if response.is_success() => {
+            match response.json::<Vec<ReconcileVersionEntry>>() {
                 Ok(entries) => entries,
                 Err(err) => {
                     tracing::error!(
@@ -5334,16 +5705,16 @@ async fn reconcile_from_node(
                     );
                     return StatusCode::BAD_GATEWAY.into_response();
                 }
-            },
-            Err(err) => {
-                tracing::error!(
-                    source_node_id = %source_node_id,
-                    error = %err,
-                    "reconciliation export endpoint returned error"
-                );
-                return StatusCode::BAD_GATEWAY.into_response();
             }
-        },
+        }
+        Ok(response) => {
+            tracing::error!(
+                source_node_id = %source_node_id,
+                status = response.status,
+                "reconciliation export endpoint returned error"
+            );
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
         Err(err) => {
             tracing::error!(
                 source_node_id = %source_node_id,
@@ -5428,38 +5799,29 @@ async fn reconcile_from_node(
             continue;
         }
 
-        let object_url = format!(
-            "{remote_url}/store/{}?version={}",
-            entry.key, entry.version_id
-        );
-        let payload = match http.get(object_url).send().await {
-            Ok(response) => match response.error_for_status() {
-                Ok(ok_response) => match ok_response.bytes().await {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        tracing::error!(
-                            source_node_id = %source_node_id,
-                            key = %entry.key,
-                            version_id = %entry.version_id,
-                            error = %err,
-                            "failed to read reconciliation object payload"
-                        );
-                        failed += 1;
-                        continue;
-                    }
-                },
-                Err(err) => {
-                    tracing::error!(
-                        source_node_id = %source_node_id,
-                        key = %entry.key,
-                        version_id = %entry.version_id,
-                        error = %err,
-                        "reconciliation object fetch returned error"
-                    );
-                    failed += 1;
-                    continue;
-                }
-            },
+        let object_path = format!("/store/{}?version={}", entry.key, entry.version_id);
+        let payload = match execute_peer_request(
+            &state,
+            &remote_node,
+            reqwest::Method::GET,
+            &object_path,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => response.body,
+            Ok(response) => {
+                tracing::error!(
+                    source_node_id = %source_node_id,
+                    key = %entry.key,
+                    version_id = %entry.version_id,
+                    status = response.status,
+                    "reconciliation object fetch returned error"
+                );
+                failed += 1;
+                continue;
+            }
             Err(err) => {
                 tracing::error!(
                     source_node_id = %source_node_id,

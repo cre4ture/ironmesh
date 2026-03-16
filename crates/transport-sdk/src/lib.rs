@@ -18,7 +18,11 @@ pub use identity::{
     ClientEnrollmentRequest, ClientIdentityMaterial, IssuedClientIdentity, next_device_id,
 };
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
-pub use relay::{RelayTicket, RelayTicketRequest};
+pub use relay::{
+    PendingRelayHttpRequest, RelayHttpHeader, RelayHttpPollRequest, RelayHttpPollResponse,
+    RelayHttpRequest, RelayHttpResponse, RelayTicket, RelayTicketRequest,
+    encode_optional_body_base64,
+};
 pub use rendezvous::{
     PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
     RendezvousClientConfig, RendezvousControlClient, TransportCapability,
