@@ -8,14 +8,22 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+common = { path = "../../crates/common" }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = { version = "1.9", features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-rustls = "0.26"
+tower = "0.5"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 transport-sdk = { path = "../../crates/transport-sdk" }
 uuid.workspace = true
+x509-parser = "0.16"
 
 [dev-dependencies]
 reqwest.workspace = true
+rcgen = "0.14"
 server-node-sdk = { path = "../../crates/server-node-sdk" }

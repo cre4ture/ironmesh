@@ -109,7 +109,11 @@ impl PresenceRegistration {
 }
 
 impl RendezvousControlClient {
-    pub fn new(config: RendezvousClientConfig, server_ca_pem: Option<&str>) -> Result<Self> {
+    pub fn new(
+        config: RendezvousClientConfig,
+        server_ca_pem: Option<&str>,
+        client_identity_pem: Option<&[u8]>,
+    ) -> Result<Self> {
         config.validate()?;
 
         let builder = Client::builder();
@@ -117,6 +121,14 @@ impl RendezvousControlClient {
             builder.add_root_certificate(
                 Certificate::from_pem(server_ca_pem.as_bytes())
                     .context("failed to parse rendezvous server CA certificate")?,
+            )
+        } else {
+            builder
+        };
+        let builder = if let Some(client_identity_pem) = client_identity_pem {
+            builder.identity(
+                reqwest::Identity::from_pem(client_identity_pem)
+                    .context("failed to parse rendezvous client identity PEM")?,
             )
         } else {
             builder

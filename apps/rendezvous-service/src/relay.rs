@@ -48,7 +48,7 @@ struct RelayBrokerInner {
 #[derive(Default)]
 struct RelayBrokerState {
     pending_by_target: HashMap<String, VecDeque<PendingRelayHttpRequest>>,
-    inflight: HashMap<String, oneshot::Sender<RelayHttpResponse>>,
+    inflight: HashMap<String, InflightRelayRequest>,
     stats: RelayBrokerStats,
 }
 
@@ -57,6 +57,13 @@ pub struct RelayBrokerStats {
     pub submitted_requests: u64,
     pub delivered_requests: u64,
     pub completed_responses: u64,
+}
+
+struct InflightRelayRequest {
+    response_tx: oneshot::Sender<RelayHttpResponse>,
+    cluster_id: uuid::Uuid,
+    session_id: String,
+    expected_responder: transport_sdk::PeerIdentity,
 }
 
 impl RelayBroker {
@@ -106,7 +113,15 @@ impl RelayBroker {
                 .entry(target_key)
                 .or_default()
                 .push_back(pending);
-            state.inflight.insert(request_id.clone(), tx);
+            state.inflight.insert(
+                request_id.clone(),
+                InflightRelayRequest {
+                    response_tx: tx,
+                    cluster_id: request.ticket.cluster_id,
+                    session_id: request.ticket.session_id.clone(),
+                    expected_responder: request.ticket.target.clone(),
+                },
+            );
             state.stats.submitted_requests = state.stats.submitted_requests.saturating_add(1);
         }
         self.inner.notify.notify_waiters();
@@ -148,13 +163,22 @@ impl RelayBroker {
 
     pub async fn respond(&self, response: RelayHttpResponse) -> Result<bool> {
         response.validate()?;
-        let sender = {
+        let inflight = {
             let mut state = self.inner.state.lock().await;
             state.inflight.remove(&response.request_id)
         };
-        match sender {
-            Some(sender) => {
-                let _ = sender.send(response);
+        match inflight {
+            Some(inflight) => {
+                if inflight.cluster_id != response.cluster_id {
+                    bail!("relay response cluster_id does not match the in-flight request");
+                }
+                if inflight.session_id != response.session_id {
+                    bail!("relay response session_id does not match the in-flight request");
+                }
+                if inflight.expected_responder != response.responder {
+                    bail!("relay response responder does not match the in-flight request target");
+                }
+                let _ = inflight.response_tx.send(response);
                 let mut state = self.inner.state.lock().await;
                 state.stats.completed_responses = state.stats.completed_responses.saturating_add(1);
                 Ok(true)
@@ -263,7 +287,10 @@ mod tests {
 
         let accepted = broker
             .respond(RelayHttpResponse {
-                request_id: pending.request_id,
+                cluster_id,
+                session_id: pending.session_id.clone(),
+                request_id: pending.request_id.clone(),
+                responder: pending.target.clone(),
                 status: 200,
                 headers: Vec::new(),
                 body_base64: encode_optional_body_base64(br#"{"ok":true}"#),
@@ -278,5 +305,65 @@ mod tests {
             response.body_bytes().expect("body should decode"),
             br#"{"ok":true}"#
         );
+    }
+
+    #[tokio::test]
+    async fn relay_broker_rejects_response_from_wrong_responder() {
+        let broker = RelayBroker::new();
+        let cluster_id = uuid::Uuid::now_v7();
+        let source = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let wrong_target = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let ticket = issue_relay_ticket(
+            RelayTicketRequest {
+                cluster_id,
+                source,
+                target: target.clone(),
+                requested_expires_in_secs: Some(60),
+            },
+            &["https://relay.example".to_string()],
+        );
+
+        let broker_for_submit = broker.clone();
+        let submit = tokio::spawn(async move {
+            broker_for_submit
+                .submit_and_await(RelayHttpRequest {
+                    ticket,
+                    request_id: "req-2".to_string(),
+                    method: "GET".to_string(),
+                    path_and_query: "/health".to_string(),
+                    headers: Vec::new(),
+                    body_base64: None,
+                })
+                .await
+        });
+
+        let pending = broker
+            .poll(RelayHttpPollRequest {
+                cluster_id,
+                target,
+                wait_timeout_ms: Some(100),
+            })
+            .await
+            .expect("relay poll should succeed")
+            .request
+            .expect("poll should return a pending request");
+
+        let error = broker
+            .respond(RelayHttpResponse {
+                cluster_id,
+                session_id: pending.session_id,
+                request_id: pending.request_id,
+                responder: wrong_target,
+                status: 200,
+                headers: Vec::new(),
+                body_base64: None,
+            })
+            .await
+            .expect_err("wrong responder should be rejected");
+        assert!(error.to_string().contains("does not match"));
+
+        submit.abort();
+        let _ = submit.await;
     }
 }

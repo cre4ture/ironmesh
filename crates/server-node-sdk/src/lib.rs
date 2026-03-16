@@ -1334,6 +1334,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             })
         })
         .transpose()?;
+    let rendezvous_client_identity_pem = config
+        .internal_tls
+        .as_ref()
+        .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
+        .transpose()?;
     let rendezvous_control = if config.rendezvous_registration_enabled {
         match RendezvousControlClient::new(
             RendezvousClientConfig {
@@ -1342,6 +1347,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 heartbeat_interval_secs: config.peer_heartbeat_interval_secs.max(5),
             },
             public_ca_pem.as_deref().or(cluster_ca_pem.as_deref()),
+            rendezvous_client_identity_pem.as_deref(),
         ) {
             Ok(client) => Some(client),
             Err(err) => {
@@ -2300,7 +2306,10 @@ fn spawn_rendezvous_relay_http_agent(
                     {
                         Ok(response) => response,
                         Err(err) => RelayHttpResponse {
+                            cluster_id: request.cluster_id,
+                            session_id: request.session_id.clone(),
                             request_id: request.request_id.clone(),
+                            responder: request.target.clone(),
                             status: 502,
                             headers: vec![RelayHttpHeader {
                                 name: "content-type".to_string(),
@@ -2372,7 +2381,10 @@ async fn execute_local_relay_http_request(
         .context("failed reading local relayed HTTP response body")?;
 
     Ok(RelayHttpResponse {
+        cluster_id: request.cluster_id,
+        session_id: request.session_id.clone(),
         request_id: request.request_id.clone(),
+        responder: request.target.clone(),
         status,
         headers,
         body_base64: encode_optional_body_base64(&body),
@@ -5030,16 +5042,7 @@ fn build_http_client_from_optional_pem(server_ca_pem: Option<&str>) -> Result<re
     builder.build().context("failed building relay HTTP client")
 }
 
-fn build_internal_mtls_http_client(
-    ca_path: &PathBuf,
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
-) -> Result<reqwest::Client> {
-    let ca_pem =
-        std::fs::read(ca_path).with_context(|| format!("failed reading {}", ca_path.display()))?;
-    let ca_cert =
-        reqwest::Certificate::from_pem(&ca_pem).context("failed parsing internal CA PEM")?;
-
+fn build_identity_pem_from_paths(cert_path: &PathBuf, key_path: &PathBuf) -> Result<Vec<u8>> {
     let mut identity_pem = Vec::new();
     identity_pem.extend_from_slice(
         &std::fs::read(cert_path)
@@ -5050,6 +5053,20 @@ fn build_internal_mtls_http_client(
         &std::fs::read(key_path)
             .with_context(|| format!("failed reading {}", key_path.display()))?,
     );
+    Ok(identity_pem)
+}
+
+fn build_internal_mtls_http_client(
+    ca_path: &PathBuf,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+) -> Result<reqwest::Client> {
+    let ca_pem =
+        std::fs::read(ca_path).with_context(|| format!("failed reading {}", ca_path.display()))?;
+    let ca_cert =
+        reqwest::Certificate::from_pem(&ca_pem).context("failed parsing internal CA PEM")?;
+
+    let identity_pem = build_identity_pem_from_paths(cert_path, key_path)?;
 
     let identity = reqwest::Identity::from_pem(&identity_pem)
         .context("failed parsing internal node identity PEM")?;

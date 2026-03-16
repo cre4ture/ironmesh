@@ -74,7 +74,10 @@ pub struct RelayHttpPollResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayHttpResponse {
+    pub cluster_id: ClusterId,
+    pub session_id: String,
     pub request_id: String,
+    pub responder: PeerIdentity,
     pub status: u16,
     #[serde(default)]
     pub headers: Vec<RelayHttpHeader>,
@@ -165,6 +168,12 @@ impl RelayHttpPollRequest {
 
 impl RelayHttpResponse {
     pub fn validate(&self) -> Result<()> {
+        if self.cluster_id.is_nil() {
+            bail!("relay HTTP response must include a non-nil cluster_id");
+        }
+        if self.session_id.trim().is_empty() {
+            bail!("relay HTTP response must include a session_id");
+        }
         if self.request_id.trim().is_empty() {
             bail!("relay HTTP response must include a request_id");
         }
