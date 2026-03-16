@@ -56,6 +56,7 @@ async function triggerReplicationRepair() {
 
 async function issueBootstrapBundle() {
   const output = document.getElementById('bootstrap-bundle-json');
+  const notes = document.getElementById('bootstrap-bundle-notes');
   const qrStatus = document.getElementById('bootstrap-bundle-qr-status');
   const adminToken = document.getElementById('bootstrap-admin-token').value.trim();
   const deviceLabel = document.getElementById('bootstrap-device-label').value.trim();
@@ -63,6 +64,7 @@ async function issueBootstrapBundle() {
 
   if (!adminToken) {
     output.textContent = 'admin token is required';
+    notes.textContent = '';
     return;
   }
 
@@ -72,6 +74,7 @@ async function issueBootstrapBundle() {
   }
 
   hideBootstrapQr();
+  notes.textContent = '';
   qrStatus.textContent = '';
   output.textContent = 'issuing bootstrap bundle...';
   try {
@@ -101,15 +104,41 @@ async function issueBootstrapBundle() {
 
     const bundleText = JSON.stringify(payload, null, 2);
     output.textContent = bundleText;
+    notes.textContent = summarizeBootstrapBundle(payload);
     const qrError = renderBootstrapQr(JSON.stringify(payload));
     if (qrError) {
       qrStatus.textContent = qrError;
     }
   } catch (error) {
     output.textContent = 'failed to issue bootstrap bundle: ' + error;
+    notes.textContent = '';
     qrStatus.textContent = '';
     hideBootstrapQr();
   }
+}
+
+function summarizeBootstrapBundle(payload) {
+  const rendezvousUrls = Array.isArray(payload.rendezvous_urls) ? payload.rendezvous_urls.length : 0;
+  const directEndpoints = Array.isArray(payload.direct_endpoints) ? payload.direct_endpoints.length : 0;
+  const trustRoots = payload && typeof payload === 'object' ? payload.trust_roots || {} : {};
+  const notes = [
+    `rendezvous URLs: ${rendezvousUrls}`,
+    `direct endpoints: ${directEndpoints}`,
+    `relay mode: ${payload?.relay_mode || 'unknown'}`,
+    `rendezvous mTLS required: ${payload?.rendezvous_mtls_required ? 'yes' : 'no'}`
+  ];
+
+  if (trustRoots.rendezvous_ca_pem) {
+    notes.push('includes rendezvous CA trust root');
+  }
+  if (trustRoots.public_api_ca_pem) {
+    notes.push('includes public API CA trust root');
+  }
+  if (trustRoots.cluster_ca_pem) {
+    notes.push('includes cluster CA trust root');
+  }
+
+  return notes.join(' | ');
 }
 
 function renderBootstrapQr(text) {

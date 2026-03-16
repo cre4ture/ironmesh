@@ -86,8 +86,10 @@ struct ServerState {
     client_auth: Arc<Mutex<ClientAuthState>>,
     public_ca_pem: Option<String>,
     cluster_ca_pem: Option<String>,
+    rendezvous_ca_pem: Option<String>,
     rendezvous_urls: Vec<String>,
     rendezvous_control: Option<RendezvousControlClient>,
+    rendezvous_mtls_required: bool,
     relay_mode: RelayMode,
     metadata_commit_mode: MetadataCommitMode,
     internal_http: reqwest::Client,
@@ -538,8 +540,10 @@ pub struct ServerNodeConfig {
     pub public_ca_cert_path: Option<PathBuf>,
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
+    pub rendezvous_ca_cert_path: Option<PathBuf>,
     pub rendezvous_urls: Vec<String>,
     pub rendezvous_registration_enabled: bool,
+    pub rendezvous_mtls_required: bool,
     pub relay_mode: RelayMode,
     pub upstream_public_url: Option<String>,
     pub heartbeat_timeout_secs: u64,
@@ -740,6 +744,13 @@ impl ServerNodeConfig {
             .clone()
             .or_else(|| public_url.as_ref().map(|url| vec![url.clone()]))
             .unwrap_or_default();
+        let rendezvous_ca_cert_path = std::env::var("IRONMESH_RENDEZVOUS_CA_CERT")
+            .ok()
+            .map(PathBuf::from);
+        let rendezvous_mtls_required = std::env::var("IRONMESH_RENDEZVOUS_MTLS_REQUIRED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(false);
         let relay_mode = parse_relay_mode(
             std::env::var("IRONMESH_RELAY_MODE")
                 .unwrap_or_else(|_| "fallback".to_string())
@@ -843,8 +854,10 @@ impl ServerNodeConfig {
                 .map(PathBuf::from),
             public_peer_api_enabled,
             internal_tls,
+            rendezvous_ca_cert_path,
             rendezvous_urls,
             rendezvous_registration_enabled,
+            rendezvous_mtls_required,
             relay_mode,
             upstream_public_url,
             heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
@@ -978,8 +991,10 @@ impl ServerNodeConfig {
             public_ca_cert_path: None,
             public_peer_api_enabled: false,
             internal_tls: None,
+            rendezvous_ca_cert_path: None,
             rendezvous_urls: vec![format!("http://{bind_addr}")],
             rendezvous_registration_enabled: false,
+            rendezvous_mtls_required: false,
             relay_mode: RelayMode::Fallback,
             upstream_public_url: None,
             heartbeat_timeout_secs: 90,
@@ -1334,6 +1349,18 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             })
         })
         .transpose()?;
+    let rendezvous_ca_pem = config
+        .rendezvous_ca_cert_path
+        .clone()
+        .map(|path| {
+            std::fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "failed reading rendezvous CA certificate {}",
+                    path.display()
+                )
+            })
+        })
+        .transpose()?;
     let rendezvous_client_identity_pem = config
         .internal_tls
         .as_ref()
@@ -1346,7 +1373,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 rendezvous_urls: config.rendezvous_urls.clone(),
                 heartbeat_interval_secs: config.peer_heartbeat_interval_secs.max(5),
             },
-            public_ca_pem.as_deref().or(cluster_ca_pem.as_deref()),
+            rendezvous_ca_pem
+                .as_deref()
+                .or(public_ca_pem.as_deref())
+                .or(cluster_ca_pem.as_deref()),
             rendezvous_client_identity_pem.as_deref(),
         ) {
             Ok(client) => Some(client),
@@ -1367,8 +1397,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         client_auth: Arc::new(Mutex::new(persisted_client_auth)),
         public_ca_pem,
         cluster_ca_pem,
+        rendezvous_ca_pem,
         rendezvous_urls: config.rendezvous_urls.clone(),
         rendezvous_control,
+        rendezvous_mtls_required: config.rendezvous_mtls_required,
         relay_mode: config.relay_mode,
         metadata_commit_mode: config.metadata_commit_mode,
         internal_http,
@@ -4168,6 +4200,7 @@ async fn issue_bootstrap_bundle(
         version: 1,
         cluster_id: state.cluster_id,
         rendezvous_urls: state.rendezvous_urls.clone(),
+        rendezvous_mtls_required: state.rendezvous_mtls_required,
         direct_endpoints: endpoints
             .into_iter()
             .map(|url| BootstrapEndpoint {
@@ -4179,6 +4212,11 @@ async fn issue_bootstrap_bundle(
         trust_roots: BootstrapTrustRoots {
             cluster_ca_pem: state.cluster_ca_pem.clone(),
             public_api_ca_pem: state.public_ca_pem.clone(),
+            rendezvous_ca_pem: state
+                .rendezvous_ca_pem
+                .clone()
+                .or_else(|| state.public_ca_pem.clone())
+                .or_else(|| state.cluster_ca_pem.clone()),
         },
         pairing_token: Some(pairing_response.pairing_token),
         device_label: pairing_response.label,

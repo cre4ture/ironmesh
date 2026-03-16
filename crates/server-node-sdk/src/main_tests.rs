@@ -244,6 +244,57 @@ run_on_main_metadata_backends!(
     enroll_client_device_consumes_pairing_token_and_persists_device_turso
 );
 
+#[tokio::test]
+async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.public_ca_pem = Some("public-ca".to_string());
+    state.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    state.rendezvous_mtls_required = true;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_bootstrap_bundle(
+        State(state.clone()),
+        headers,
+        Json(super::PairingTokenIssueRequest {
+            label: Some("tablet".to_string()),
+            expires_in_secs: Some(600),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let bootstrap: transport_sdk::ClientBootstrap = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        bootstrap.rendezvous_urls,
+        vec!["https://rendezvous.example".to_string()]
+    );
+    assert!(bootstrap.rendezvous_mtls_required);
+    assert_eq!(
+        bootstrap.trust_roots.rendezvous_ca_pem.as_deref(),
+        Some("rendezvous-ca")
+    );
+    assert_eq!(
+        bootstrap.trust_roots.public_api_ca_pem.as_deref(),
+        Some("public-ca")
+    );
+    assert_eq!(
+        bootstrap.trust_roots.cluster_ca_pem.as_deref(),
+        Some("cluster-ca")
+    );
+    assert_eq!(bootstrap.device_label.as_deref(), Some("tablet"));
+    assert!(bootstrap.pairing_token.is_some());
+
+    cleanup_test_state(&state).await;
+}
+
 async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
     backend: MainTestBackend,
 ) {
@@ -1957,8 +2008,10 @@ async fn build_test_state(
         client_auth: Arc::new(Mutex::new(super::storage::ClientAuthState::default())),
         public_ca_pem: None,
         cluster_ca_pem: None,
+        rendezvous_ca_pem: None,
         rendezvous_urls: vec!["http://127.0.0.1:39080".to_string()],
         rendezvous_control: None,
+        rendezvous_mtls_required: false,
         relay_mode: super::RelayMode::Fallback,
         metadata_commit_mode: MetadataCommitMode::Local,
         internal_http: reqwest::Client::new(),

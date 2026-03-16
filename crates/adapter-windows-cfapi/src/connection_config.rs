@@ -98,6 +98,7 @@ pub fn persist_connection_config(
         version: 1,
         cluster_id,
         rendezvous_urls: vec![base_url.to_string()],
+        rendezvous_mtls_required: false,
         direct_endpoints: vec![BootstrapEndpoint {
             url: base_url.to_string(),
             usage: Some(BootstrapEndpointUse::PublicApi),
@@ -106,6 +107,7 @@ pub fn persist_connection_config(
         trust_roots: BootstrapTrustRoots {
             cluster_ca_pem: normalize_optional(server_ca_pem),
             public_api_ca_pem: normalize_optional(server_ca_pem),
+            rendezvous_ca_pem: normalize_optional(server_ca_pem),
         },
         pairing_token: None,
         device_label: normalize_optional(device_label),

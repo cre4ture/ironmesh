@@ -40,6 +40,8 @@ pub struct BootstrapTrustRoots {
     pub cluster_ca_pem: Option<String>,
     #[serde(default)]
     pub public_api_ca_pem: Option<String>,
+    #[serde(default)]
+    pub rendezvous_ca_pem: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +49,8 @@ pub struct ClientBootstrap {
     pub version: u32,
     pub cluster_id: ClusterId,
     pub rendezvous_urls: Vec<String>,
+    #[serde(default)]
+    pub rendezvous_mtls_required: bool,
     #[serde(default)]
     pub direct_endpoints: Vec<BootstrapEndpoint>,
     #[serde(default)]
@@ -66,6 +70,8 @@ pub struct NodeBootstrap {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub rendezvous_urls: Vec<String>,
+    #[serde(default)]
+    pub rendezvous_mtls_required: bool,
     #[serde(default)]
     pub direct_endpoints: Vec<BootstrapEndpoint>,
     #[serde(default)]
@@ -195,6 +201,10 @@ fn validate_trust_roots(trust_roots: &BootstrapTrustRoots) -> Result<()> {
     validate_optional_non_empty(
         "trust_roots.public_api_ca_pem",
         trust_roots.public_api_ca_pem.as_deref(),
+    )?;
+    validate_optional_non_empty(
+        "trust_roots.rendezvous_ca_pem",
+        trust_roots.rendezvous_ca_pem.as_deref(),
     )
 }
 
@@ -254,6 +264,7 @@ mod tests {
             version: CLIENT_BOOTSTRAP_VERSION,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_mtls_required: true,
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://node-a.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
@@ -262,6 +273,7 @@ mod tests {
             trust_roots: BootstrapTrustRoots {
                 cluster_ca_pem: Some("cluster-ca".to_string()),
                 public_api_ca_pem: Some("public-ca".to_string()),
+                rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
             },
             pairing_token: Some("pair-secret".to_string()),
             device_id: Some(Uuid::now_v7()),
@@ -277,11 +289,13 @@ mod tests {
             version: CLIENT_BOOTSTRAP_VERSION,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: Vec::new(),
+            rendezvous_mtls_required: false,
             direct_endpoints: Vec::new(),
             relay_mode: RelayMode::Fallback,
             trust_roots: BootstrapTrustRoots {
                 cluster_ca_pem: Some("cluster-ca".to_string()),
                 public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
             },
             pairing_token: None,
             device_id: None,

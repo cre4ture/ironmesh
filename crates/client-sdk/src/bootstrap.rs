@@ -23,6 +23,8 @@ pub struct ConnectionBootstrap {
     pub cluster_id: ClusterId,
     pub rendezvous_urls: Vec<String>,
     #[serde(default)]
+    pub rendezvous_mtls_required: bool,
+    #[serde(default)]
     pub direct_endpoints: Vec<BootstrapEndpoint>,
     #[serde(default)]
     pub relay_mode: RelayMode,
@@ -39,12 +41,16 @@ pub struct ConnectionBootstrap {
 pub struct ResolvedConnectionBootstrap {
     pub cluster_id: ClusterId,
     pub rendezvous_urls: Vec<String>,
+    #[serde(default)]
+    pub rendezvous_mtls_required: bool,
     pub relay_mode: RelayMode,
     pub server_base_url: String,
     #[serde(default)]
     pub server_ca_pem: Option<String>,
     #[serde(default)]
     pub cluster_ca_pem: Option<String>,
+    #[serde(default)]
+    pub rendezvous_ca_pem: Option<String>,
     #[serde(default)]
     pub pairing_token: Option<String>,
     #[serde(default)]
@@ -172,10 +178,12 @@ impl ConnectionBootstrap {
                 return Ok(ResolvedConnectionBootstrap {
                     cluster_id: self.cluster_id,
                     rendezvous_urls: self.rendezvous_urls.clone(),
+                    rendezvous_mtls_required: self.rendezvous_mtls_required,
                     relay_mode: self.relay_mode,
                     server_base_url: endpoint.to_string(),
                     server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
                     cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
+                    rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
                     pairing_token: self.pairing_token.clone(),
                     device_label: self.device_label.clone(),
                     device_id: self.device_id.clone(),
@@ -246,6 +254,7 @@ impl ConnectionBootstrap {
             version: self.version,
             cluster_id: self.cluster_id,
             rendezvous_urls: self.rendezvous_urls.clone(),
+            rendezvous_mtls_required: self.rendezvous_mtls_required,
             direct_endpoints: self.direct_endpoints.clone(),
             relay_mode: self.relay_mode,
             trust_roots: self.trust_roots.clone(),
