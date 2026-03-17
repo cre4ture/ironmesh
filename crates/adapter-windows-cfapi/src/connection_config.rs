@@ -56,7 +56,7 @@ pub fn resolve_connection_config(
     if bootstrap_path.exists() {
         let bundle = ConnectionBootstrap::from_path(&bootstrap_path)?;
         let bootstrap_pairing_token = normalize_optional(bundle.pairing_token.as_deref());
-        let resolved = bundle.resolve_blocking()?;
+        let resolved = bundle.resolve_direct_http_target_blocking()?;
         let base_url = Url::parse(&resolved.server_base_url)
             .with_context(|| format!("invalid resolved server URL {}", resolved.server_base_url))?;
         return Ok(ResolvedConnectionConfig {

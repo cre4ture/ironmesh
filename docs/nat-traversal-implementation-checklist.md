@@ -16,6 +16,22 @@ Status: Concrete repo-mapped implementation plan for the target architecture
 - Direct env/file CA wiring is still useful for development, testing, externally managed certificates, or other short-lived/manual setups.
 - When trust roots change in that direct env/file path, a node restart is acceptable and may be required; live trust-root reload is not a primary design goal there.
 
+## 1b. Current priority order
+
+Use this section as the current source of truth for remaining work. The detailed checklist below still contains older task wording and should be reconciled over time.
+
+1. Client transport target model and relay-capable client sessions. Status: in progress.
+   The first slice is now in place: client bootstrap can plan ordered direct-vs-relay targets, and direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction.
+   Remaining work: implement a real client-side transport/session connector so relay-planned targets are usable for normal client data-plane traffic, not just surfaced explicitly as the current gap.
+2. Remove the legacy direct-upstream path from server-node.
+   Remaining work: retire `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, and `refresh_upstream_peer(...)` once rendezvous-first startup is the only supported peer discovery path.
+3. Finish removing `base_url` plus `device_token`-shaped app models.
+   Remaining work: clean up the remaining compatibility surfaces in `client-sdk`, Android, Windows CFAPI, iOS, and helper apps so persisted client state is identity-first rather than URL-plus-token-first.
+4. Replace the old reachability model in cluster state.
+   Remaining work: stop projecting everything into `NodeDescriptor { public_url, internal_url, ... }` and move to stable identity plus dynamic reachability/capability records.
+5. Refresh tests and operational docs to match the real implementation state.
+   Remaining work: reconcile this checklist with completed work, add outbound-only system scenarios, and keep platform-facing docs aligned with the new enrollment and transport model.
+
 ## 2. Target workspace shape
 
 Update the root workspace in `Cargo.toml`:

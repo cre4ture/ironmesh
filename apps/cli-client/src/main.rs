@@ -195,7 +195,7 @@ fn resolve_target(cli: &Cli) -> Result<ResolvedCliTarget> {
 
     if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
         let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
-        let resolved = bootstrap.resolve_blocking()?;
+        let resolved = bootstrap.resolve_direct_http_target_blocking()?;
         let base_url = Url::parse(&resolved.server_base_url)
             .with_context(|| format!("invalid resolved server URL {}", resolved.server_base_url))?;
         let server_ca_pem = server_ca_override

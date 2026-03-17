@@ -249,7 +249,7 @@ fn resolve_startup_target(args: &Args) -> Result<ResolvedStartupTarget> {
     let server_ca_override = read_optional_utf8_file(args.server_ca_pem_file.as_deref())?;
     if let Some(bootstrap_path) = args.bootstrap_file.as_deref() {
         let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
-        let resolved = bootstrap.resolve_blocking()?;
+        let resolved = bootstrap.resolve_direct_http_target_blocking()?;
         return Ok(ResolvedStartupTarget {
             base_url: normalize_server_base_url(&resolved.server_base_url)?,
             server_ca_pem: server_ca_override
