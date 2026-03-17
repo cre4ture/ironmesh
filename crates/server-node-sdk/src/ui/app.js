@@ -202,7 +202,6 @@ function buildNodeBootstrapRequest() {
     public_peer_api_enabled: document.getElementById('node-bootstrap-public-peer-api-enabled').checked,
     internal_bind_addr: document.getElementById('node-bootstrap-internal-bind-addr').value.trim() || null,
     internal_url: document.getElementById('node-bootstrap-internal-url').value.trim() || null,
-    upstream_public_url: document.getElementById('node-bootstrap-upstream-public-url').value.trim() || null,
     ...readNodeTlsPolicy()
   };
 

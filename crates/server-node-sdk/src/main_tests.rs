@@ -704,7 +704,6 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
             public_api_ca_pem: Some("public-ca".to_string()),
             rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
         },
-        upstream_public_url: Some("https://upstream.example".to_string()),
         enrollment_issuer_url: Some("https://issuer.example".to_string()),
     }
     .write_to_path(&bootstrap_path)
@@ -748,13 +747,69 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
         Some("tls/public-ca.pem".to_string())
     );
     assert_eq!(
-        config.upstream_public_url.as_deref(),
-        Some("https://upstream.example")
-    );
-    assert_eq!(
         config.enrollment_issuer_url.as_deref(),
         Some("https://issuer.example")
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn local_edge_bootstrap_with_rendezvous_enables_cluster_sync_defaults() {
+    let root = fresh_test_dir("local-edge-bootstrap-config");
+    let bootstrap_path = root.join("node-bootstrap.json");
+    let node_id = NodeId::new_v4();
+    let cluster_id = uuid::Uuid::now_v7();
+    transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id,
+        node_id,
+        mode: transport_sdk::NodeBootstrapMode::LocalEdge,
+        data_dir: root.join("data").to_string_lossy().into_owned(),
+        bind_addr: "127.0.0.1:28080".to_string(),
+        public_url: Some("https://edge.example".to_string()),
+        labels: HashMap::new(),
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_peer_api_enabled: true,
+        internal_bind_addr: None,
+        internal_url: None,
+        internal_tls: None,
+        rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+        rendezvous_mtls_required: false,
+        direct_endpoints: vec![
+            transport_sdk::BootstrapEndpoint {
+                url: "https://edge.example".to_string(),
+                usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+                node_id: Some(node_id),
+            },
+            transport_sdk::BootstrapEndpoint {
+                url: "https://edge.example".to_string(),
+                usage: Some(transport_sdk::BootstrapEndpointUse::PeerApi),
+                node_id: Some(node_id),
+            },
+        ],
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: Some("cluster-ca".to_string()),
+            public_api_ca_pem: Some("public-ca".to_string()),
+            rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
+        },
+        enrollment_issuer_url: Some("https://issuer.example".to_string()),
+    }
+    .write_to_path(&bootstrap_path)
+    .unwrap();
+
+    let config = super::ServerNodeConfig::from_bootstrap_path(&bootstrap_path).unwrap();
+
+    assert!(matches!(config.mode, super::ServerNodeMode::LocalEdge));
+    assert!(config.rendezvous_registration_enabled);
+    assert!(config.public_peer_api_enabled);
+    assert_eq!(config.replication_factor, 2);
+    assert_eq!(config.audit_interval_secs, 5);
+    assert!(config.autonomous_replication_on_put_enabled);
+    assert!(config.replication_repair_enabled);
+    assert!(config.startup_repair_enabled);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -798,7 +853,6 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
                 cert_path: "tls/internal.pem".to_string(),
                 key_path: "tls/internal.key".to_string(),
             }),
-            upstream_public_url: Some("https://upstream.example".to_string()),
             enrollment_issuer_url: None,
             tls_validity_secs: None,
             tls_renewal_window_secs: None,
@@ -869,6 +923,62 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
 }
 
 #[tokio::test]
+async fn issue_local_edge_bootstrap_defaults_public_peer_api_when_rendezvous_is_enabled() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.public_ca_pem = Some("public-ca".to_string());
+    state.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    state.rendezvous_registration_enabled = true;
+    state.relay_mode = transport_sdk::RelayMode::Fallback;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_node_bootstrap(
+        State(state.clone()),
+        headers,
+        Json(super::NodeBootstrapIssueRequest {
+            node_id: Some(NodeId::new_v4()),
+            mode: Some(transport_sdk::NodeBootstrapMode::LocalEdge),
+            data_dir: Some("./data/edge".to_string()),
+            bind_addr: Some("127.0.0.1:28080".to_string()),
+            public_url: Some("https://edge.example".to_string()),
+            labels: None,
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_peer_api_enabled: None,
+            internal_bind_addr: None,
+            internal_url: None,
+            internal_tls: None,
+            enrollment_issuer_url: None,
+            tls_validity_secs: None,
+            tls_renewal_window_secs: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let bootstrap: transport_sdk::NodeBootstrap = serde_json::from_slice(&body).unwrap();
+
+    assert!(matches!(
+        bootstrap.mode,
+        transport_sdk::NodeBootstrapMode::LocalEdge
+    ));
+    assert!(bootstrap.public_peer_api_enabled);
+    assert_eq!(bootstrap.direct_endpoints.len(), 2);
+    assert_eq!(
+        bootstrap.direct_endpoints[1].usage,
+        Some(transport_sdk::BootstrapEndpointUse::PeerApi)
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
@@ -909,7 +1019,6 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
                 cert_path: "tls/internal.pem".to_string(),
                 key_path: "tls/internal.key".to_string(),
             }),
-            upstream_public_url: None,
             enrollment_issuer_url: None,
             tls_validity_secs: None,
             tls_renewal_window_secs: None,
@@ -1004,7 +1113,6 @@ async fn issue_node_enrollment_allows_local_edge_with_public_tls_only() {
             internal_bind_addr: None,
             internal_url: None,
             internal_tls: None,
-            upstream_public_url: None,
             enrollment_issuer_url: None,
             tls_validity_secs: None,
             tls_renewal_window_secs: None,
@@ -1067,7 +1175,6 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
             public_api_ca_pem: state.public_ca_pem.clone(),
             rendezvous_ca_pem: None,
         },
-        upstream_public_url: None,
         enrollment_issuer_url: Some("https://issuer.example".to_string()),
     };
     let issue_policy = default_tls_issue_policy();
@@ -1155,7 +1262,6 @@ async fn node_bootstrap_file_can_start_local_edge_node() {
             public_api_ca_pem: None,
             rendezvous_ca_pem: None,
         },
-        upstream_public_url: None,
         enrollment_issuer_url: None,
     }
     .write_to_path(&bootstrap_path)
@@ -1229,7 +1335,6 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
             public_api_ca_pem: state.public_ca_pem.clone(),
             rendezvous_ca_pem: None,
         },
-        upstream_public_url: None,
         enrollment_issuer_url: Some("https://issuer.example".to_string()),
     };
     let issue_policy = default_tls_issue_policy();
@@ -1316,7 +1421,6 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
                 cert_path: "tls/internal.pem".to_string(),
                 key_path: "tls/internal.key".to_string(),
             }),
-            upstream_public_url: None,
             enrollment_issuer_url: Some("https://issuer.example".to_string()),
             tls_validity_secs: Some(7 * 24 * 60 * 60),
             tls_renewal_window_secs: Some(24 * 60 * 60),
@@ -1456,7 +1560,6 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
             public_api_ca_pem: None,
             rendezvous_ca_pem: None,
         },
-        upstream_public_url: None,
         enrollment_issuer_url: Some(issuer_public_url.clone()),
     };
     let issue_policy = default_tls_issue_policy();
@@ -1705,7 +1808,6 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
             public_api_ca_pem: None,
             rendezvous_ca_pem: None,
         },
-        upstream_public_url: None,
         enrollment_issuer_url: Some(issuer_public_url.clone()),
     };
     let issue_policy = default_tls_issue_policy();
@@ -1943,7 +2045,6 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
             public_api_ca_pem: None,
             rendezvous_ca_pem: Some(cluster_ca_pem.clone()),
         },
-        upstream_public_url: None,
         enrollment_issuer_url: Some(issuer_public_url.clone()),
     };
     let issue_policy = default_tls_issue_policy();
@@ -1999,7 +2100,6 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
             public_api_ca_pem: None,
             rendezvous_ca_pem: Some(cluster_ca_pem.clone()),
         },
-        upstream_public_url: None,
         enrollment_issuer_url: None,
     };
     let capture_material =
@@ -2187,7 +2287,6 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
                 public_api_ca_pem: None,
                 rendezvous_ca_pem: Some(ca1_pem.clone()),
             },
-            upstream_public_url: None,
             enrollment_issuer_url: None,
         },
         public_tls_material: None,
@@ -2336,7 +2435,6 @@ async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metada
             public_api_ca_pem: None,
             rendezvous_ca_pem: None,
         },
-        upstream_public_url: None,
         enrollment_issuer_url: Some("https://issuer.example".to_string()),
     };
     let issue_policy = default_tls_issue_policy();
@@ -3168,882 +3266,6 @@ fn local_node_handle_starts_and_reports_base_url() {
     drop(handle);
     let _ = std::fs::remove_dir_all(&data_dir);
 }
-
-async fn local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes_impl(
-    backend: MainTestBackend,
-) {
-    let upstream_dir = fresh_test_dir(&format!("edge-upstream-source-{}", backend.suffix()));
-    let upstream_bind_addr = free_bind_addr();
-    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
-    upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
-    upstream_config.public_peer_api_enabled = true;
-    upstream_config.replication_factor = 2;
-    upstream_config.metadata_backend = backend.kind();
-    let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
-
-    let http = reqwest::Client::new();
-    let upstream_base_url = format!("http://{upstream_bind_addr}");
-    wait_for_http_status(
-        &http,
-        &format!("{upstream_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-    let remote_key = "remote.txt";
-    let remote_payload = "from-upstream";
-    let response = http
-        .put(format!("{upstream_base_url}/store/{remote_key}"))
-        .body(remote_payload.to_string())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let edge_dir = fresh_test_dir(&format!("edge-upstream-target-{}", backend.suffix()));
-    let edge_bind_addr = free_bind_addr();
-    let mut edge_config =
-        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
-    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
-    edge_config.replica_view_sync_interval_secs = 1;
-    edge_config.startup_repair_delay_secs = 0;
-    edge_config.metadata_backend = backend.kind();
-    let edge_handle = tokio::spawn(async move { run(edge_config).await });
-    let edge_base_url = format!("http://{edge_bind_addr}");
-    wait_for_http_status(
-        &http,
-        &format!("{edge_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    wait_for_condition("edge sees upstream node", Duration::from_secs(5), || {
-        let http = http.clone();
-        let edge_base_url = edge_base_url.clone();
-        let upstream_base_url = upstream_base_url.clone();
-        async move {
-            let response = match http
-                .get(format!("{edge_base_url}/cluster/nodes"))
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(_) => return false,
-            };
-            let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
-                return false;
-            };
-
-            nodes.iter().any(|node| {
-                node.public_url == upstream_base_url || node.internal_url == upstream_base_url
-            })
-        }
-    })
-    .await;
-
-    wait_for_condition(
-        "edge sees remote replication gap",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let edge_base_url = edge_base_url.clone();
-            let remote_key = remote_key.to_string();
-            async move {
-                let response = match http
-                    .get(format!("{edge_base_url}/cluster/replication/plan"))
-                    .send()
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(_) => return false,
-                };
-                let Ok(plan) = response.json::<cluster::ReplicationPlan>().await else {
-                    return false;
-                };
-                plan.items.iter().any(|item| item.key == remote_key)
-            }
-        },
-    )
-    .await;
-
-    let repair_response = http
-        .post(format!("{edge_base_url}/cluster/replication/repair"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(repair_response.status(), StatusCode::OK);
-
-    wait_for_condition("edge pulls remote object", Duration::from_secs(5), || {
-        let http = http.clone();
-        let edge_base_url = edge_base_url.clone();
-        let remote_key = remote_key.to_string();
-        async move {
-            match http
-                .get(format!("{edge_base_url}/store/{remote_key}"))
-                .send()
-                .await
-            {
-                Ok(response) if response.status() == StatusCode::OK => {
-                    match response.text().await {
-                        Ok(body) => body == remote_payload,
-                        Err(_) => false,
-                    }
-                }
-                _ => false,
-            }
-        }
-    })
-    .await;
-
-    let local_key = "local.txt";
-    let local_payload = "from-edge";
-    let response = http
-        .put(format!("{edge_base_url}/store/{local_key}"))
-        .body(local_payload.to_string())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let repair_response = http
-        .post(format!("{edge_base_url}/cluster/replication/repair"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(repair_response.status(), StatusCode::OK);
-
-    wait_for_condition(
-        "upstream receives pushed object",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let upstream_base_url = upstream_base_url.clone();
-            let local_key = local_key.to_string();
-            async move {
-                match http
-                    .get(format!("{upstream_base_url}/store/{local_key}"))
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status() == StatusCode::OK => {
-                        match response.text().await {
-                            Ok(body) => body == local_payload,
-                            Err(_) => false,
-                        }
-                    }
-                    _ => false,
-                }
-            }
-        },
-    )
-    .await;
-
-    edge_handle.abort();
-    let _ = edge_handle.await;
-    upstream_handle.abort();
-    let _ = upstream_handle.await;
-    let _ = std::fs::remove_dir_all(&edge_dir);
-    let _ = std::fs::remove_dir_all(&upstream_dir);
-}
-
-run_on_main_metadata_backends!(
-    local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes_impl,
-    local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes,
-    local_edge_with_upstream_pulls_remote_content_and_pushes_local_writes_turso
-);
-
-async fn local_edge_pulls_upstream_delete_after_repair_impl(backend: MainTestBackend) {
-    let upstream_dir = fresh_test_dir(&format!("edge-upstream-delete-source-{}", backend.suffix()));
-    let upstream_bind_addr = free_bind_addr();
-    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
-    upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
-    upstream_config.public_peer_api_enabled = true;
-    upstream_config.replication_factor = 2;
-    upstream_config.metadata_backend = backend.kind();
-    let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
-
-    let http = reqwest::Client::new();
-    let upstream_base_url = format!("http://{upstream_bind_addr}");
-    wait_for_http_status(
-        &http,
-        &format!("{upstream_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let remote_key = "remote-delete.txt";
-    let remote_payload = "delete-from-upstream";
-    let response = http
-        .put(format!("{upstream_base_url}/store/{remote_key}"))
-        .body(remote_payload.to_string())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let edge_dir = fresh_test_dir(&format!("edge-upstream-delete-target-{}", backend.suffix()));
-    let edge_bind_addr = free_bind_addr();
-    let mut edge_config =
-        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
-    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
-    edge_config.replica_view_sync_interval_secs = 1;
-    edge_config.startup_repair_delay_secs = 0;
-    edge_config.metadata_backend = backend.kind();
-    let edge_handle = tokio::spawn(async move { run(edge_config).await });
-    let edge_base_url = format!("http://{edge_bind_addr}");
-    wait_for_http_status(
-        &http,
-        &format!("{edge_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    wait_for_condition("edge sees upstream node", Duration::from_secs(5), || {
-        let http = http.clone();
-        let edge_base_url = edge_base_url.clone();
-        let upstream_base_url = upstream_base_url.clone();
-        async move {
-            let response = match http
-                .get(format!("{edge_base_url}/cluster/nodes"))
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(_) => return false,
-            };
-            let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
-                return false;
-            };
-
-            nodes.iter().any(|node| {
-                node.public_url == upstream_base_url || node.internal_url == upstream_base_url
-            })
-        }
-    })
-    .await;
-
-    let repair_response = http
-        .post(format!("{edge_base_url}/cluster/replication/repair"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(repair_response.status(), StatusCode::OK);
-
-    wait_for_condition(
-        "edge pulls upstream object before delete",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let edge_base_url = edge_base_url.clone();
-            let remote_key = remote_key.to_string();
-            async move {
-                match http
-                    .get(format!("{edge_base_url}/store/{remote_key}"))
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status() == StatusCode::OK => {
-                        match response.text().await {
-                            Ok(body) => body == remote_payload,
-                            Err(_) => false,
-                        }
-                    }
-                    _ => false,
-                }
-            }
-        },
-    )
-    .await;
-
-    let response = http
-        .delete(format!("{upstream_base_url}/store/{remote_key}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    wait_for_condition(
-        "upstream removes deleted object from current state",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let upstream_base_url = upstream_base_url.clone();
-            let remote_key = remote_key.to_string();
-            async move {
-                match http
-                    .get(format!("{upstream_base_url}/store/{remote_key}"))
-                    .send()
-                    .await
-                {
-                    Ok(response) => response.status() == StatusCode::NOT_FOUND,
-                    Err(_) => false,
-                }
-            }
-        },
-    )
-    .await;
-
-    wait_for_condition(
-        "edge removes upstream-deleted object after repair",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let edge_base_url = edge_base_url.clone();
-            let remote_key = remote_key.to_string();
-            async move {
-                let _ = http
-                    .post(format!("{edge_base_url}/cluster/replication/repair"))
-                    .send()
-                    .await;
-                match http
-                    .get(format!("{edge_base_url}/store/{remote_key}"))
-                    .send()
-                    .await
-                {
-                    Ok(response) => response.status() == StatusCode::NOT_FOUND,
-                    Err(_) => false,
-                }
-            }
-        },
-    )
-    .await;
-
-    edge_handle.abort();
-    let _ = edge_handle.await;
-    upstream_handle.abort();
-    let _ = upstream_handle.await;
-    let _ = std::fs::remove_dir_all(&edge_dir);
-    let _ = std::fs::remove_dir_all(&upstream_dir);
-}
-
-run_on_main_metadata_backends!(
-    local_edge_pulls_upstream_delete_after_repair_impl,
-    local_edge_pulls_upstream_delete_after_repair,
-    local_edge_pulls_upstream_delete_after_repair_turso
-);
-
-async fn local_edge_pulls_upstream_copy_after_repair_impl(backend: MainTestBackend) {
-    let upstream_dir = fresh_test_dir(&format!("edge-upstream-copy-source-{}", backend.suffix()));
-    let upstream_bind_addr = free_bind_addr();
-    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
-    upstream_config.public_url = Some(format!("http://{upstream_bind_addr}"));
-    upstream_config.public_peer_api_enabled = true;
-    upstream_config.replication_factor = 2;
-    upstream_config.metadata_backend = backend.kind();
-    let upstream_handle = tokio::spawn(async move { run(upstream_config).await });
-
-    let http = reqwest::Client::new();
-    let upstream_base_url = format!("http://{upstream_bind_addr}");
-    wait_for_http_status(
-        &http,
-        &format!("{upstream_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let source_key = "copy-source.txt";
-    let copy_key = "copy-target.txt";
-    let payload = "copy-upstream-payload";
-    let response = http
-        .put(format!("{upstream_base_url}/store/{source_key}"))
-        .body(payload.to_string())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let edge_dir = fresh_test_dir(&format!("edge-upstream-copy-target-{}", backend.suffix()));
-    let edge_bind_addr = free_bind_addr();
-    let mut edge_config =
-        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
-    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
-    edge_config.replica_view_sync_interval_secs = 1;
-    edge_config.startup_repair_delay_secs = 0;
-    edge_config.metadata_backend = backend.kind();
-    let edge_handle = tokio::spawn(async move { run(edge_config).await });
-    let edge_base_url = format!("http://{edge_bind_addr}");
-    wait_for_http_status(
-        &http,
-        &format!("{edge_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    http.post(format!("{edge_base_url}/cluster/replication/repair"))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
-    wait_for_condition(
-        "edge pulls upstream source before copy",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let edge_base_url = edge_base_url.clone();
-            let source_key = source_key.to_string();
-            async move {
-                match http
-                    .get(format!("{edge_base_url}/store/{source_key}"))
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status() == StatusCode::OK => response
-                        .text()
-                        .await
-                        .map(|body| body == payload)
-                        .unwrap_or(false),
-                    _ => false,
-                }
-            }
-        },
-    )
-    .await;
-
-    http.post(format!("{upstream_base_url}/store/copy"))
-        .json(&serde_json::json!({
-            "from_path": source_key,
-            "to_path": copy_key,
-            "overwrite": false,
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
-    wait_for_condition(
-        "edge pulls upstream copy after repair",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let edge_base_url = edge_base_url.clone();
-            let source_key = source_key.to_string();
-            let copy_key = copy_key.to_string();
-            async move {
-                let source = http
-                    .get(format!("{edge_base_url}/store/{source_key}"))
-                    .send()
-                    .await;
-                let copy = http
-                    .get(format!("{edge_base_url}/store/{copy_key}"))
-                    .send()
-                    .await;
-
-                match (source, copy) {
-                    (Ok(source_response), Ok(copy_response))
-                        if source_response.status() == StatusCode::OK
-                            && copy_response.status() == StatusCode::OK =>
-                    {
-                        let source_body = source_response.text().await.ok();
-                        let copy_body = copy_response.text().await.ok();
-                        source_body.as_deref() == Some(payload)
-                            && copy_body.as_deref() == Some(payload)
-                    }
-                    _ => false,
-                }
-            }
-        },
-    )
-    .await;
-
-    edge_handle.abort();
-    let _ = edge_handle.await;
-    upstream_handle.abort();
-    let _ = upstream_handle.await;
-    let _ = std::fs::remove_dir_all(&edge_dir);
-    let _ = std::fs::remove_dir_all(&upstream_dir);
-}
-
-run_on_main_metadata_backends!(
-    local_edge_pulls_upstream_copy_after_repair_impl,
-    local_edge_pulls_upstream_copy_after_repair,
-    local_edge_pulls_upstream_copy_after_repair_turso
-);
-
-async fn local_edge_accepts_offline_write_and_syncs_after_upstream_restart_impl(
-    backend: MainTestBackend,
-) {
-    let upstream_dir = fresh_test_dir(&format!(
-        "edge-upstream-restart-source-{}",
-        backend.suffix()
-    ));
-    let upstream_bind_addr = free_bind_addr();
-    let upstream_base_url = format!("http://{upstream_bind_addr}");
-    let upstream_node_id = NodeId::new_v4();
-    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
-    upstream_config.node_id = upstream_node_id;
-    upstream_config.public_url = Some(upstream_base_url.clone());
-    upstream_config.public_peer_api_enabled = true;
-    upstream_config.replication_factor = 2;
-    upstream_config.metadata_backend = backend.kind();
-    let upstream_restart_config = upstream_config.clone();
-    let mut upstream_handle = tokio::spawn(async move { run(upstream_config).await });
-
-    let http = reqwest::Client::new();
-    wait_for_http_status(
-        &http,
-        &format!("{upstream_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let edge_dir = fresh_test_dir(&format!(
-        "edge-upstream-restart-target-{}",
-        backend.suffix()
-    ));
-    let edge_bind_addr = free_bind_addr();
-    let mut edge_config =
-        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
-    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
-    edge_config.replica_view_sync_interval_secs = 1;
-    edge_config.startup_repair_delay_secs = 0;
-    edge_config.metadata_backend = backend.kind();
-    let edge_handle = tokio::spawn(async move { run(edge_config).await });
-    let edge_base_url = format!("http://{edge_bind_addr}");
-    wait_for_http_status(
-        &http,
-        &format!("{edge_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    wait_for_condition("edge sees upstream node", Duration::from_secs(5), || {
-        let http = http.clone();
-        let edge_base_url = edge_base_url.clone();
-        let upstream_base_url = upstream_base_url.clone();
-        async move {
-            let response = match http
-                .get(format!("{edge_base_url}/cluster/nodes"))
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(_) => return false,
-            };
-            let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
-                return false;
-            };
-
-            nodes.iter().any(|node| {
-                node.public_url == upstream_base_url || node.internal_url == upstream_base_url
-            })
-        }
-    })
-    .await;
-
-    upstream_handle.abort();
-    let _ = upstream_handle.await;
-
-    let offline_key = "offline-after-restart.txt";
-    let offline_payload = "queued-while-upstream-offline";
-    let response = http
-        .put(format!("{edge_base_url}/store/{offline_key}"))
-        .body(offline_payload.to_string())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    upstream_handle = tokio::spawn(async move { run(upstream_restart_config).await });
-    wait_for_http_status(
-        &http,
-        &format!("{upstream_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    wait_for_condition(
-        "edge refreshes upstream peer after restart",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let edge_base_url = edge_base_url.clone();
-            let upstream_base_url = upstream_base_url.clone();
-            async move {
-                let response = match http
-                    .get(format!("{edge_base_url}/cluster/nodes"))
-                    .send()
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(_) => return false,
-                };
-                let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
-                    return false;
-                };
-
-                nodes.iter().any(|node| {
-                    (node.public_url == upstream_base_url || node.internal_url == upstream_base_url)
-                        && node.status == cluster::NodeStatus::Online
-                })
-            }
-        },
-    )
-    .await;
-
-    let repair_response = http
-        .post(format!("{edge_base_url}/cluster/replication/repair"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(repair_response.status(), StatusCode::OK);
-
-    wait_for_condition(
-        "upstream receives offline object after repair",
-        Duration::from_secs(10),
-        || {
-            let http = http.clone();
-            let upstream_base_url = upstream_base_url.clone();
-            let offline_key = offline_key.to_string();
-            async move {
-                match http
-                    .get(format!("{upstream_base_url}/store/{offline_key}"))
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status() == StatusCode::OK => {
-                        match response.text().await {
-                            Ok(body) => body == offline_payload,
-                            Err(_) => false,
-                        }
-                    }
-                    _ => false,
-                }
-            }
-        },
-    )
-    .await;
-
-    edge_handle.abort();
-    let _ = edge_handle.await;
-    upstream_handle.abort();
-    let _ = upstream_handle.await;
-    let _ = std::fs::remove_dir_all(&edge_dir);
-    let _ = std::fs::remove_dir_all(&upstream_dir);
-}
-
-run_on_main_metadata_backends!(
-    local_edge_accepts_offline_write_and_syncs_after_upstream_restart_impl,
-    local_edge_accepts_offline_write_and_syncs_after_upstream_restart,
-    local_edge_accepts_offline_write_and_syncs_after_upstream_restart_turso
-);
-
-async fn local_edge_offline_write_survives_edge_restart_before_upstream_returns_impl(
-    backend: MainTestBackend,
-) {
-    let upstream_dir = fresh_test_dir(&format!(
-        "edge-upstream-restart-after-edge-restart-source-{}",
-        backend.suffix()
-    ));
-    let upstream_bind_addr = free_bind_addr();
-    let upstream_base_url = format!("http://{upstream_bind_addr}");
-    let upstream_node_id = NodeId::new_v4();
-    let mut upstream_config = ServerNodeConfig::local_edge(&upstream_dir, upstream_bind_addr);
-    upstream_config.node_id = upstream_node_id;
-    upstream_config.public_url = Some(upstream_base_url.clone());
-    upstream_config.public_peer_api_enabled = true;
-    upstream_config.replication_factor = 2;
-    upstream_config.metadata_backend = backend.kind();
-    let upstream_restart_config = upstream_config.clone();
-    let mut upstream_handle = tokio::spawn(async move { run(upstream_config).await });
-
-    let http = reqwest::Client::new();
-    wait_for_http_status(
-        &http,
-        &format!("{upstream_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let edge_dir = fresh_test_dir(&format!(
-        "edge-upstream-restart-after-edge-restart-target-{}",
-        backend.suffix()
-    ));
-    let edge_bind_addr = free_bind_addr();
-    let edge_node_id = NodeId::new_v4();
-    let mut edge_config =
-        ServerNodeConfig::local_edge_with_upstream(&edge_dir, edge_bind_addr, &upstream_base_url);
-    edge_config.node_id = edge_node_id;
-    edge_config.public_url = Some(format!("http://{edge_bind_addr}"));
-    edge_config.replica_view_sync_interval_secs = 1;
-    edge_config.startup_repair_delay_secs = 0;
-    edge_config.metadata_backend = backend.kind();
-    let edge_restart_config = edge_config.clone();
-    let mut edge_handle = tokio::spawn(async move { run(edge_config).await });
-    let edge_base_url = format!("http://{edge_bind_addr}");
-    wait_for_http_status(
-        &http,
-        &format!("{edge_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    wait_for_condition("edge sees upstream node", Duration::from_secs(5), || {
-        let http = http.clone();
-        let edge_base_url = edge_base_url.clone();
-        let upstream_base_url = upstream_base_url.clone();
-        async move {
-            let response = match http
-                .get(format!("{edge_base_url}/cluster/nodes"))
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(_) => return false,
-            };
-            let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
-                return false;
-            };
-
-            nodes.iter().any(|node| {
-                node.public_url == upstream_base_url || node.internal_url == upstream_base_url
-            })
-        }
-    })
-    .await;
-
-    upstream_handle.abort();
-    let _ = upstream_handle.await;
-
-    let offline_key = "offline-edge-restart-durable.txt";
-    let offline_payload = "persisted-across-edge-restart";
-    let response = http
-        .put(format!("{edge_base_url}/store/{offline_key}"))
-        .body(offline_payload.to_string())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    edge_handle.abort();
-    let _ = edge_handle.await;
-
-    edge_handle = tokio::spawn(async move { run(edge_restart_config).await });
-    wait_for_http_status(
-        &http,
-        &format!("{edge_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    upstream_handle = tokio::spawn(async move { run(upstream_restart_config).await });
-    wait_for_http_status(
-        &http,
-        &format!("{upstream_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    wait_for_condition(
-        "restarted edge refreshes upstream peer after restart",
-        Duration::from_secs(5),
-        || {
-            let http = http.clone();
-            let edge_base_url = edge_base_url.clone();
-            let upstream_base_url = upstream_base_url.clone();
-            async move {
-                let response = match http
-                    .get(format!("{edge_base_url}/cluster/nodes"))
-                    .send()
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(_) => return false,
-                };
-                let Ok(nodes) = response.json::<Vec<cluster::NodeDescriptor>>().await else {
-                    return false;
-                };
-
-                nodes.iter().any(|node| {
-                    (node.public_url == upstream_base_url || node.internal_url == upstream_base_url)
-                        && node.status == cluster::NodeStatus::Online
-                })
-            }
-        },
-    )
-    .await;
-
-    let repair_response = http
-        .post(format!("{edge_base_url}/cluster/replication/repair"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(repair_response.status(), StatusCode::OK);
-
-    wait_for_condition(
-        "upstream receives durable offline object after edge restart",
-        Duration::from_secs(10),
-        || {
-            let http = http.clone();
-            let upstream_base_url = upstream_base_url.clone();
-            let offline_key = offline_key.to_string();
-            async move {
-                match http
-                    .get(format!("{upstream_base_url}/store/{offline_key}"))
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status() == StatusCode::OK => {
-                        match response.text().await {
-                            Ok(body) => body == offline_payload,
-                            Err(_) => false,
-                        }
-                    }
-                    _ => false,
-                }
-            }
-        },
-    )
-    .await;
-
-    let versions: serde_json::Value = http
-        .get(format!("{upstream_base_url}/versions/{offline_key}"))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    let version_count = versions
-        .get("versions")
-        .and_then(|value| value.as_array())
-        .map(|entries| entries.len())
-        .unwrap_or(0);
-    assert_eq!(
-        version_count, 1,
-        "expected exactly one synced version after repair"
-    );
-
-    edge_handle.abort();
-    let _ = edge_handle.await;
-    upstream_handle.abort();
-    let _ = upstream_handle.await;
-    let _ = std::fs::remove_dir_all(&edge_dir);
-    let _ = std::fs::remove_dir_all(&upstream_dir);
-}
-
-run_on_main_metadata_backends!(
-    local_edge_offline_write_survives_edge_restart_before_upstream_returns_impl,
-    local_edge_offline_write_survives_edge_restart_before_upstream_returns,
-    local_edge_offline_write_survives_edge_restart_before_upstream_returns_turso
-);
 
 async fn build_test_state(
     replication_factor: usize,

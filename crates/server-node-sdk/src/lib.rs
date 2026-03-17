@@ -659,7 +659,6 @@ pub struct ServerNodeConfig {
     pub rendezvous_registration_enabled: bool,
     pub rendezvous_mtls_required: bool,
     pub relay_mode: RelayMode,
-    pub upstream_public_url: Option<String>,
     pub enrollment_issuer_url: Option<String>,
     pub node_enrollment_path: Option<PathBuf>,
     pub node_enrollment_auto_renew_enabled: bool,
@@ -1543,11 +1542,8 @@ impl ServerNodeConfig {
                 key_path,
             }
         });
-        let upstream_configured = bootstrap
-            .upstream_public_url
-            .as_deref()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
+        let rendezvous_configured = !bootstrap.rendezvous_urls.is_empty();
+        let local_edge_clustered = mode == ServerNodeMode::LocalEdge && rendezvous_configured;
 
         Ok(Self {
             mode,
@@ -1571,10 +1567,9 @@ impl ServerNodeConfig {
             internal_ca_key_path: None,
             rendezvous_ca_cert_path: None,
             rendezvous_urls: bootstrap.rendezvous_urls,
-            rendezvous_registration_enabled: true,
+            rendezvous_registration_enabled: rendezvous_configured,
             rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
             relay_mode: bootstrap.relay_mode,
-            upstream_public_url: bootstrap.upstream_public_url,
             enrollment_issuer_url: bootstrap.enrollment_issuer_url,
             node_enrollment_path: None,
             node_enrollment_auto_renew_enabled: false,
@@ -1587,13 +1582,7 @@ impl ServerNodeConfig {
             audit_interval_secs: std::env::var("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(
-                    if mode == ServerNodeMode::LocalEdge && upstream_configured {
-                        5
-                    } else {
-                        3600
-                    },
-                ),
+                .unwrap_or(if local_edge_clustered { 5 } else { 3600 }),
             replica_view_sync_interval_secs: std::env::var(
                 "IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS",
             )
@@ -1603,8 +1592,10 @@ impl ServerNodeConfig {
             replication_factor: std::env::var("IRONMESH_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(if mode == ServerNodeMode::LocalEdge {
-                    if upstream_configured { 2 } else { 1 }
+                .unwrap_or(if local_edge_clustered {
+                    2
+                } else if mode == ServerNodeMode::LocalEdge {
+                    1
                 } else {
                     3
                 }),
@@ -1626,14 +1617,14 @@ impl ServerNodeConfig {
                         .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
                         .unwrap_or(true)
                 }
-                ServerNodeMode::LocalEdge => upstream_configured,
+                ServerNodeMode::LocalEdge => local_edge_clustered,
             },
             replication_repair_enabled: match mode {
                 ServerNodeMode::Cluster => std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
                     .ok()
                     .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
                     .unwrap_or(false),
-                ServerNodeMode::LocalEdge => upstream_configured,
+                ServerNodeMode::LocalEdge => local_edge_clustered,
             },
             replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
                 .ok()
@@ -1651,13 +1642,7 @@ impl ServerNodeConfig {
             )
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(
-                if mode == ServerNodeMode::LocalEdge && upstream_configured {
-                    2
-                } else {
-                    30
-                },
-            ),
+            .unwrap_or(if local_edge_clustered { 2 } else { 30 }),
             repair_busy_throttle_enabled: std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
@@ -1677,7 +1662,7 @@ impl ServerNodeConfig {
                     .ok()
                     .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
                     .unwrap_or(true),
-                ServerNodeMode::LocalEdge => upstream_configured,
+                ServerNodeMode::LocalEdge => local_edge_clustered,
             },
             startup_repair_delay_secs: std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
                 .ok()
@@ -1853,41 +1838,21 @@ impl ServerNodeConfig {
             std::env::var("IRONMESH_RACK").unwrap_or_else(|_| "local-rack".to_string()),
         );
 
-        let default_replication_factor = if mode == ServerNodeMode::LocalEdge {
-            if std::env::var("IRONMESH_UPSTREAM_PUBLIC_URL")
-                .ok()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false)
-            {
-                2
-            } else {
-                1
-            }
+        let local_edge_clustered =
+            mode == ServerNodeMode::LocalEdge && rendezvous_registration_enabled;
+        let default_replication_factor = if local_edge_clustered {
+            2
+        } else if mode == ServerNodeMode::LocalEdge {
+            1
         } else {
             3
         };
-
-        let upstream_public_url = std::env::var("IRONMESH_UPSTREAM_PUBLIC_URL")
-            .ok()
-            .map(|value| value.trim().trim_end_matches('/').to_string())
-            .filter(|value| !value.is_empty());
-        let upstream_configured = upstream_public_url.is_some();
         let public_peer_api_enabled = std::env::var("IRONMESH_PUBLIC_PEER_API_ENABLED")
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(mode == ServerNodeMode::LocalEdge && upstream_configured);
-        let default_audit_interval_secs =
-            if mode == ServerNodeMode::LocalEdge && upstream_configured {
-                5
-            } else {
-                3600
-            };
-        let default_replication_repair_backoff_secs =
-            if mode == ServerNodeMode::LocalEdge && upstream_configured {
-                2
-            } else {
-                30
-            };
+            .unwrap_or(local_edge_clustered);
+        let default_audit_interval_secs = if local_edge_clustered { 5 } else { 3600 };
+        let default_replication_repair_backoff_secs = if local_edge_clustered { 2 } else { 30 };
 
         Ok(Self {
             mode,
@@ -1920,7 +1885,6 @@ impl ServerNodeConfig {
             rendezvous_registration_enabled,
             rendezvous_mtls_required,
             relay_mode,
-            upstream_public_url,
             enrollment_issuer_url: None,
             node_enrollment_path: None,
             node_enrollment_auto_renew_enabled: false,
@@ -1962,14 +1926,14 @@ impl ServerNodeConfig {
                         .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
                         .unwrap_or(true)
                 }
-                ServerNodeMode::LocalEdge => upstream_configured,
+                ServerNodeMode::LocalEdge => local_edge_clustered,
             },
             replication_repair_enabled: match mode {
                 ServerNodeMode::Cluster => std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
                     .ok()
                     .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
                     .unwrap_or(false),
-                ServerNodeMode::LocalEdge => upstream_configured,
+                ServerNodeMode::LocalEdge => local_edge_clustered,
             },
             replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
                 .ok()
@@ -2007,7 +1971,7 @@ impl ServerNodeConfig {
                     .ok()
                     .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
                     .unwrap_or(true),
-                ServerNodeMode::LocalEdge => upstream_configured,
+                ServerNodeMode::LocalEdge => local_edge_clustered,
             },
             startup_repair_delay_secs: std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
                 .ok()
@@ -2065,7 +2029,6 @@ impl ServerNodeConfig {
             rendezvous_registration_enabled: false,
             rendezvous_mtls_required: false,
             relay_mode: RelayMode::Fallback,
-            upstream_public_url: None,
             enrollment_issuer_url: None,
             node_enrollment_path: None,
             node_enrollment_auto_renew_enabled: false,
@@ -2092,29 +2055,6 @@ impl ServerNodeConfig {
             admin_token: None,
             require_client_auth: false,
         }
-    }
-
-    pub fn local_edge_with_upstream(
-        data_dir: impl Into<PathBuf>,
-        bind_addr: SocketAddr,
-        upstream_public_url: impl Into<String>,
-    ) -> Self {
-        let mut config = Self::local_edge(data_dir, bind_addr);
-        config.upstream_public_url = Some(
-            upstream_public_url
-                .into()
-                .trim()
-                .trim_end_matches('/')
-                .to_string(),
-        );
-        config.public_peer_api_enabled = true;
-        config.replication_factor = 2;
-        config.audit_interval_secs = 5;
-        config.autonomous_replication_on_put_enabled = true;
-        config.replication_repair_enabled = true;
-        config.replication_repair_backoff_secs = 1;
-        config.startup_repair_enabled = true;
-        config
     }
 
     fn metadata_backend(&self) -> MetadataBackendKind {
@@ -2159,16 +2099,6 @@ impl LocalNodeHandle {
     pub fn start_local_edge(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let bind_addr = local_loopback_bind_addr()?;
         let config = ServerNodeConfig::local_edge(data_dir, bind_addr);
-        Self::start(config)
-    }
-
-    pub fn start_local_edge_with_upstream(
-        data_dir: impl Into<PathBuf>,
-        upstream_public_url: impl Into<String>,
-    ) -> Result<Self> {
-        let bind_addr = local_loopback_bind_addr()?;
-        let config =
-            ServerNodeConfig::local_edge_with_upstream(data_dir, bind_addr, upstream_public_url);
         Self::start(config)
     }
 
@@ -2693,27 +2623,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         }
     }
 
-    let peer_sync_enabled = config.mode == ServerNodeMode::Cluster
-        || config.upstream_public_url.is_some()
-        || config.rendezvous_registration_enabled;
-
-    if let Some(upstream_public_url) = config.upstream_public_url.clone() {
-        let internal_http = current_internal_http(&state).await;
-        if let Err(err) =
-            refresh_upstream_peer(&state, &internal_http, upstream_public_url.as_str()).await
-        {
-            tracing::debug!(
-                error = %err,
-                upstream = %upstream_public_url,
-                "initial upstream peer refresh failed"
-            );
-        }
-        spawn_upstream_peer_bootstrap(
-            state.clone(),
-            upstream_public_url,
-            config.replica_view_sync_interval_secs,
-        );
-    }
+    let peer_sync_enabled =
+        config.mode == ServerNodeMode::Cluster || config.rendezvous_registration_enabled;
 
     if peer_sync_enabled {
         spawn_replication_auditor(state.clone(), config.audit_interval_secs);
@@ -3829,122 +3740,6 @@ fn node_enrollment_auto_renew_interval_secs(interval_secs: u64) -> u64 {
     {
         interval_secs.max(30)
     }
-}
-
-fn spawn_upstream_peer_bootstrap(
-    state: ServerState,
-    upstream_public_url: String,
-    interval_secs: u64,
-) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
-        let upstream_public_url = upstream_public_url.trim().trim_end_matches('/').to_string();
-
-        loop {
-            ticker.tick().await;
-            let http = current_internal_http(&state).await;
-
-            match refresh_upstream_peer(&state, &http, upstream_public_url.as_str()).await {
-                Ok(node_id) => {
-                    tracing::debug!(node_id = %node_id, upstream = %upstream_public_url, "refreshed upstream peer registration");
-                }
-                Err(err) => {
-                    tracing::debug!(error = %err, upstream = %upstream_public_url, "failed refreshing upstream peer registration");
-                }
-            }
-        }
-    });
-}
-
-async fn refresh_upstream_peer(
-    state: &ServerState,
-    http: &reqwest::Client,
-    upstream_public_url: &str,
-) -> Result<NodeId> {
-    let base = upstream_public_url.trim_end_matches('/');
-    let health_url = format!("{base}/health");
-    let health = http
-        .get(health_url)
-        .send()
-        .await
-        .context("failed calling upstream health endpoint")?
-        .error_for_status()
-        .context("upstream health endpoint returned error")?
-        .json::<HealthStatus>()
-        .await
-        .context("failed decoding upstream health payload")?;
-
-    let mut upstream_descriptor = match http.get(format!("{base}/cluster/nodes")).send().await {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => response
-                .json::<Vec<NodeDescriptor>>()
-                .await
-                .ok()
-                .and_then(|nodes| {
-                    nodes
-                        .into_iter()
-                        .find(|node| node.node_id == health.node_id)
-                })
-                .unwrap_or_else(|| NodeDescriptor {
-                    node_id: health.node_id,
-                    public_url: base.to_string(),
-                    internal_url: base.to_string(),
-                    labels: HashMap::from([
-                        ("region".to_string(), "upstream".to_string()),
-                        ("dc".to_string(), "upstream".to_string()),
-                        ("rack".to_string(), "upstream".to_string()),
-                    ]),
-                    capacity_bytes: 0,
-                    free_bytes: 0,
-                    last_heartbeat_unix: unix_ts(),
-                    status: cluster::NodeStatus::Online,
-                }),
-            Err(_) => NodeDescriptor {
-                node_id: health.node_id,
-                public_url: base.to_string(),
-                internal_url: base.to_string(),
-                labels: HashMap::from([
-                    ("region".to_string(), "upstream".to_string()),
-                    ("dc".to_string(), "upstream".to_string()),
-                    ("rack".to_string(), "upstream".to_string()),
-                ]),
-                capacity_bytes: 0,
-                free_bytes: 0,
-                last_heartbeat_unix: unix_ts(),
-                status: cluster::NodeStatus::Online,
-            },
-        },
-        Err(_) => NodeDescriptor {
-            node_id: health.node_id,
-            public_url: base.to_string(),
-            internal_url: base.to_string(),
-            labels: HashMap::from([
-                ("region".to_string(), "upstream".to_string()),
-                ("dc".to_string(), "upstream".to_string()),
-                ("rack".to_string(), "upstream".to_string()),
-            ]),
-            capacity_bytes: 0,
-            free_bytes: 0,
-            last_heartbeat_unix: unix_ts(),
-            status: cluster::NodeStatus::Online,
-        },
-    };
-    upstream_descriptor.public_url = base.to_string();
-    upstream_descriptor.internal_url = base.to_string();
-
-    let mut cluster = state.cluster.lock().await;
-    cluster.register_node(NodeDescriptor {
-        node_id: upstream_descriptor.node_id,
-        public_url: upstream_descriptor.public_url,
-        internal_url: upstream_descriptor.internal_url,
-        labels: upstream_descriptor.labels,
-        capacity_bytes: upstream_descriptor.capacity_bytes,
-        free_bytes: upstream_descriptor.free_bytes,
-        last_heartbeat_unix: unix_ts(),
-        status: cluster::NodeStatus::Online,
-    });
-
-    Ok(health.node_id)
 }
 
 async fn track_inflight_requests(
@@ -5407,7 +5202,6 @@ struct NodeBootstrapIssueRequest {
     internal_bind_addr: Option<String>,
     internal_url: Option<String>,
     internal_tls: Option<BootstrapTlsFiles>,
-    upstream_public_url: Option<String>,
     enrollment_issuer_url: Option<String>,
     tls_validity_secs: Option<u64>,
     tls_renewal_window_secs: Option<u64>,
@@ -5661,14 +5455,9 @@ fn build_issued_node_bootstrap(
     let internal_url = request
         .internal_url
         .or_else(|| internal_bind_addr.as_deref().map(default_internal_url));
-    let public_peer_api_enabled = request.public_peer_api_enabled.unwrap_or(
-        mode == NodeBootstrapMode::LocalEdge
-            && request
-                .upstream_public_url
-                .as_deref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false),
-    );
+    let public_peer_api_enabled = request
+        .public_peer_api_enabled
+        .unwrap_or(mode == NodeBootstrapMode::LocalEdge && !rendezvous_urls.is_empty());
     let bootstrap = TransportNodeBootstrap {
         version: 1,
         cluster_id: state.cluster_id,
@@ -5696,7 +5485,6 @@ fn build_issued_node_bootstrap(
         ),
         relay_mode: state.relay_mode,
         trust_roots: bootstrap_trust_roots(state)?,
-        upstream_public_url: request.upstream_public_url,
         enrollment_issuer_url,
     };
 
@@ -6007,7 +5795,6 @@ async fn issue_node_bootstrap(
             "data_dir": request.data_dir,
             "bind_addr": request.bind_addr,
             "public_url": request.public_url,
-            "upstream_public_url": request.upstream_public_url,
             "enrollment_issuer_url": request.enrollment_issuer_url,
             "tls_validity_secs": request.tls_validity_secs,
             "tls_renewal_window_secs": request.tls_renewal_window_secs,
@@ -6080,7 +5867,6 @@ async fn issue_node_enrollment(
             "data_dir": request.data_dir,
             "bind_addr": request.bind_addr,
             "public_url": request.public_url,
-            "upstream_public_url": request.upstream_public_url,
             "enrollment_issuer_url": request.enrollment_issuer_url,
             "tls_validity_secs": request.tls_validity_secs,
             "tls_renewal_window_secs": request.tls_renewal_window_secs,

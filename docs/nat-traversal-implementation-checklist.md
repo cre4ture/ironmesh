@@ -21,10 +21,10 @@ Status: Concrete repo-mapped implementation plan for the target architecture
 Use this section as the current source of truth for remaining work. The detailed checklist below still contains older task wording and should be reconciled over time.
 
 1. Client transport target model and relay-capable client sessions. Status: in progress.
-   The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs, `IronMeshClient` can execute relay-backed requests through rendezvous for the non-mTLS client path, enrolled client devices can now use relay against an mTLS-required rendezvous service when enrollment provided a rendezvous client TLS identity, the shared sync-agent plus Linux FUSE startup paths can now build clients directly from bootstrap artifacts instead of collapsing them to one direct URL up front, Linux FUSE now only resolves a direct upstream URL when `--local-edge` actually needs one, Windows CFAPI now preserves bootstrap metadata and builds its runtime fetcher/hydrator/uploader from a bootstrap-aware client rather than re-resolving everything to a direct URL, Android now persists bootstrap plus client identity material and uses bootstrap-aware clients for object operations, folder sync, SAF access, and the embedded web UI, the iOS wrapper now accepts the same bootstrap-or-direct connection input shape, normal CLI data plus read-only commands use the shared bootstrap-aware client transport instead of raw direct `reqwest` calls, the embedded web UI backend now runs on top of `IronMeshClient` so CLI and Android `serve-web` flows can use relay-capable client transport too, and the remaining `client-sdk` convenience types like remote snapshot fetchers and content-addressed caches now also have bootstrap-aware constructors instead of only `base_url` entry points.
-   Remaining work: reduce the remaining direct-resolution compatibility paths and helper APIs in `client-sdk` and the smaller direct-only convenience layers that still exist outside the main app/runtime flows. The most notable intentional exception is `--local-edge` style upstream wiring, which still depends on the server-node side retiring `upstream_public_url`.
-2. Remove the legacy direct-upstream path from server-node.
-   Remaining work: retire `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, and `refresh_upstream_peer(...)` once rendezvous-first startup is the only supported peer discovery path.
+   The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs, `IronMeshClient` can execute relay-backed requests through rendezvous for the non-mTLS client path, enrolled client devices can now use relay against an mTLS-required rendezvous service when enrollment provided a rendezvous client TLS identity, the shared sync-agent plus Linux FUSE startup paths can now build clients directly from bootstrap artifacts instead of collapsing them to one direct URL up front, Windows CFAPI now preserves bootstrap metadata and builds its runtime fetcher/hydrator/uploader from a bootstrap-aware client rather than re-resolving everything to a direct URL, Android now persists bootstrap plus client identity material and uses bootstrap-aware clients for object operations, folder sync, SAF access, and the embedded web UI, the iOS wrapper now accepts the same bootstrap-or-direct connection input shape, normal CLI data plus read-only commands use the shared bootstrap-aware client transport instead of raw direct `reqwest` calls, the embedded web UI backend now runs on top of `IronMeshClient` so CLI and Android `serve-web` flows can use relay-capable client transport too, and the remaining `client-sdk` convenience types like remote snapshot fetchers and content-addressed caches now also have bootstrap-aware constructors instead of only `base_url` entry points.
+   Remaining work: reduce the remaining direct-resolution compatibility paths and helper APIs in `client-sdk` and the smaller direct-only convenience layers that still exist outside the main app/runtime flows.
+2. Remove the legacy direct-upstream path from server-node. Status: completed.
+   `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, `refresh_upstream_peer(...)`, and the old local-edge upstream helper flow are gone. Rendezvous-first discovery is now the supported peer discovery model, and Linux FUSE `--local-edge` no longer tries to smuggle a remote upstream URL through the local server-node path.
 3. Finish removing `base_url` plus `device_token`-shaped app models.
    Remaining work: clean up the remaining compatibility surfaces in `client-sdk` and helper apps so persisted client state is identity-first rather than URL-plus-token-first. Android, Windows, and the iOS wrapper are now on bootstrap-aware connection inputs.
 4. Replace the old reachability model in cluster state.
@@ -181,9 +181,9 @@ Recommended responsibilities:
 ### `crates/server-node-sdk`
 
 - [ ] Extend `crates/server-node-sdk/src/lib.rs::ServerNodeConfig` with `cluster_id`, rendezvous URLs, relay policy, and node-identity configuration.
-- [ ] Replace `IRONMESH_UPSTREAM_PUBLIC_URL`-driven logic with rendezvous registration and peer discovery.
+- [x] Replace `IRONMESH_UPSTREAM_PUBLIC_URL`-driven logic with rendezvous registration and peer discovery.
 - [ ] Replace `ServerState::internal_http` with a transport-aware peer client.
-- [ ] Replace `refresh_upstream_peer`, `spawn_upstream_peer_bootstrap`, and related direct-upstream refresh logic with persistent rendezvous presence and peer session management.
+- [x] Replace `refresh_upstream_peer`, `spawn_upstream_peer_bootstrap`, and related direct-upstream refresh logic with persistent rendezvous presence and peer session management.
 - [ ] Replace `RegisterNodeRequest` in `crates/server-node-sdk/src/lib.rs` so admin registration manages policy/labels, not direct reachability coordinates.
 - [ ] Replace `BootstrapBundleIssueResponse` with the final bootstrap schema emitted directly by `/auth/bootstrap-bundles/issue`.
 - [ ] Replace `ClientDeviceEnrollRequest` / `ClientDeviceEnrollResponse` with key-bound client enrollment.
@@ -260,6 +260,7 @@ Keep only if still useful:
 Delete or replace:
 
 - `IRONMESH_UPSTREAM_PUBLIC_URL`
+  removed; rendezvous registration and discovery are now the supported peer discovery path
 - any env whose only purpose is direct one-upstream peering
 
 ## 8. Suggested engineering order
@@ -311,6 +312,7 @@ Candidates to remove once the new transport stack is in place:
 - device-token-based `DeviceEnrollmentResponse`
 - `ServerState::internal_http`
 - direct upstream bootstrap helpers based on `upstream_public_url`
+  removed
 - client startup flows that require `server_base_url` as the primary input
 
 ## 11. Definition of done
