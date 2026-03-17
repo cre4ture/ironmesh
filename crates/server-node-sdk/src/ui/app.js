@@ -117,6 +117,83 @@ async function issueBootstrapBundle() {
   }
 }
 
+async function issueNodeBootstrap() {
+  const output = document.getElementById('node-bootstrap-json');
+  const notes = document.getElementById('node-bootstrap-notes');
+  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
+  if (!adminToken) {
+    output.textContent = 'admin token is required';
+    notes.textContent = '';
+    return;
+  }
+
+  const mode = document.getElementById('node-bootstrap-mode').value;
+  const bindAddr = document.getElementById('node-bootstrap-bind-addr').value.trim();
+  const publicTlsCert = document.getElementById('node-bootstrap-public-tls-cert').value.trim();
+  const publicTlsKey = document.getElementById('node-bootstrap-public-tls-key').value.trim();
+  const internalTlsCa = document.getElementById('node-bootstrap-internal-tls-ca').value.trim();
+  const internalTlsCert = document.getElementById('node-bootstrap-internal-tls-cert').value.trim();
+  const internalTlsKey = document.getElementById('node-bootstrap-internal-tls-key').value.trim();
+  const body = {
+    node_id: document.getElementById('node-bootstrap-node-id').value.trim() || null,
+    mode,
+    data_dir: document.getElementById('node-bootstrap-data-dir').value.trim() || null,
+    bind_addr: bindAddr || null,
+    public_url: document.getElementById('node-bootstrap-public-url').value.trim() || null,
+    public_ca_cert_path: document.getElementById('node-bootstrap-public-ca-cert').value.trim() || null,
+    public_peer_api_enabled: document.getElementById('node-bootstrap-public-peer-api-enabled').checked,
+    internal_bind_addr: document.getElementById('node-bootstrap-internal-bind-addr').value.trim() || null,
+    internal_url: document.getElementById('node-bootstrap-internal-url').value.trim() || null,
+    upstream_public_url: document.getElementById('node-bootstrap-upstream-public-url').value.trim() || null
+  };
+
+  if (publicTlsCert && publicTlsKey) {
+    body.public_tls = {
+      cert_path: publicTlsCert,
+      key_path: publicTlsKey
+    };
+  }
+
+  if (mode === 'cluster' || internalTlsCa || internalTlsCert || internalTlsKey) {
+    body.internal_tls = {
+      ca_cert_path: internalTlsCa,
+      cert_path: internalTlsCert,
+      key_path: internalTlsKey
+    };
+  }
+
+  output.textContent = 'issuing node bootstrap...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/node-bootstraps/issue', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+        'x-ironmesh-admin-token': adminToken
+      },
+      body: JSON.stringify(body)
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeNodeBootstrap(payload);
+  } catch (error) {
+    output.textContent = 'failed to issue node bootstrap: ' + error;
+    notes.textContent = '';
+  }
+}
+
 function summarizeBootstrapBundle(payload) {
   const rendezvousUrls = Array.isArray(payload.rendezvous_urls) ? payload.rendezvous_urls.length : 0;
   const directEndpoints = Array.isArray(payload.direct_endpoints) ? payload.direct_endpoints.length : 0;
@@ -133,6 +210,33 @@ function summarizeBootstrapBundle(payload) {
   }
   if (trustRoots.public_api_ca_pem) {
     notes.push('includes public API CA trust root');
+  }
+  if (trustRoots.cluster_ca_pem) {
+    notes.push('includes cluster CA trust root');
+  }
+
+  return notes.join(' | ');
+}
+
+function summarizeNodeBootstrap(payload) {
+  const directEndpoints = Array.isArray(payload.direct_endpoints) ? payload.direct_endpoints.length : 0;
+  const trustRoots = payload && typeof payload === 'object' ? payload.trust_roots || {} : {};
+  const notes = [
+    `mode: ${payload?.mode || 'unknown'}`,
+    `rendezvous URLs: ${Array.isArray(payload?.rendezvous_urls) ? payload.rendezvous_urls.length : 0}`,
+    `direct endpoints: ${directEndpoints}`,
+    `relay mode: ${payload?.relay_mode || 'unknown'}`,
+    `rendezvous mTLS required: ${payload?.rendezvous_mtls_required ? 'yes' : 'no'}`
+  ];
+
+  if (payload?.internal_tls) {
+    notes.push('includes internal TLS file paths');
+  }
+  if (payload?.public_tls) {
+    notes.push('includes public TLS file paths');
+  }
+  if (trustRoots.rendezvous_ca_pem) {
+    notes.push('includes rendezvous CA trust root');
   }
   if (trustRoots.cluster_ca_pem) {
     notes.push('includes cluster CA trust root');
@@ -181,6 +285,10 @@ document
 document
   .getElementById('issue-bootstrap-bundle')
   .addEventListener('click', issueBootstrapBundle);
+
+document
+  .getElementById('issue-node-bootstrap')
+  .addEventListener('click', issueNodeBootstrap);
 
 refreshServerLogs();
 setInterval(refreshServerLogs, 2000);

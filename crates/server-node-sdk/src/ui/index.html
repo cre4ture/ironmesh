@@ -53,6 +53,47 @@
       <div id="bootstrap-bundle-qr"></div>
     </div>
 
+    <h2>Node bootstrap</h2>
+    <p>Issues a node bootstrap artifact via <code>POST /auth/node-bootstraps/issue</code>. Use it with <code>IRONMESH_NODE_BOOTSTRAP_FILE</code> on the joining node.</p>
+    <label for="node-bootstrap-admin-token">Admin token</label>
+    <input id="node-bootstrap-admin-token" type="password" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-node-id">Node ID (optional)</label>
+    <input id="node-bootstrap-node-id" type="text" placeholder="auto-generate when omitted" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-mode">Mode</label>
+    <select id="node-bootstrap-mode">
+      <option value="cluster" selected>cluster</option>
+      <option value="local_edge">local_edge</option>
+    </select>
+    <label for="node-bootstrap-data-dir">Data directory</label>
+    <input id="node-bootstrap-data-dir" type="text" value="./data/server-node" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-bind-addr">Public bind address</label>
+    <input id="node-bootstrap-bind-addr" type="text" value="127.0.0.1:8080" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-public-url">Public URL</label>
+    <input id="node-bootstrap-public-url" type="text" value="https://node.example" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-public-peer-api-enabled">Public peer API enabled</label>
+    <input id="node-bootstrap-public-peer-api-enabled" type="checkbox" />
+    <label for="node-bootstrap-public-tls-cert">Public TLS cert path</label>
+    <input id="node-bootstrap-public-tls-cert" type="text" value="tls/public.pem" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-public-tls-key">Public TLS key path</label>
+    <input id="node-bootstrap-public-tls-key" type="text" value="tls/public.key" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-public-ca-cert">Public API CA cert path (optional)</label>
+    <input id="node-bootstrap-public-ca-cert" type="text" value="tls/public-ca.pem" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-internal-bind-addr">Internal bind address</label>
+    <input id="node-bootstrap-internal-bind-addr" type="text" value="127.0.0.1:18080" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-internal-url">Internal URL</label>
+    <input id="node-bootstrap-internal-url" type="text" value="https://10.0.0.10:18080" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-internal-tls-ca">Internal TLS CA cert path</label>
+    <input id="node-bootstrap-internal-tls-ca" type="text" value="tls/cluster-ca.pem" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-internal-tls-cert">Internal TLS cert path</label>
+    <input id="node-bootstrap-internal-tls-cert" type="text" value="tls/internal.pem" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-internal-tls-key">Internal TLS key path</label>
+    <input id="node-bootstrap-internal-tls-key" type="text" value="tls/internal.key" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-upstream-public-url">Upstream public URL (local-edge only)</label>
+    <input id="node-bootstrap-upstream-public-url" type="text" autocomplete="off" spellcheck="false" />
+    <button id="issue-node-bootstrap" type="button">Issue node bootstrap</button>
+    <pre id="node-bootstrap-json">provide the admin token and click the button to issue a node bootstrap artifact</pre>
+    <p id="node-bootstrap-notes"></p>
+
     <h2>Server logs</h2>
     <p>Recent in-memory log lines from this node.</p>
     <pre id="server-logs">loading...</pre>
@@ -82,6 +123,7 @@
       <li><code>POST /cluster/nodes/{node_id}/heartbeat</code> - refresh node liveness</li>
       <li><code>GET /cluster/placement/{key}</code> - deterministic placement decision</li>
       <li><code>POST /auth/bootstrap-bundles/issue</code> - issue a bootstrap JSON bundle for client enrollment (admin token required)</li>
+      <li><code>POST /auth/node-bootstraps/issue</code> - issue a node bootstrap JSON artifact for provisioning a server node (admin token required)</li>
       <li><code>GET /cluster/replication/plan</code> - current replication gaps/overages</li>
       <li><code>POST /cluster/replication/audit</code> - manual audit trigger</li>
       <li><code>POST /cluster/replication/repair</code> - execute one-pass replica repair for missing placements</li>

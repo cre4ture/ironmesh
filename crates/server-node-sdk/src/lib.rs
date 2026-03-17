@@ -42,8 +42,9 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
-    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, CandidateKind,
-    ClientBootstrap as TransportClientBootstrap, ConnectionCandidate, PeerIdentity,
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapServerTlsFiles, BootstrapTlsFiles,
+    BootstrapTrustRoots, CandidateKind, ClientBootstrap as TransportClientBootstrap,
+    ConnectionCandidate, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, PeerIdentity,
     PeerTransportClient, PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader,
     RelayHttpPollRequest, RelayHttpRequest, RelayHttpResponse, RelayMode, RelayTicketRequest,
     RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders, TransportCapability,
@@ -88,6 +89,7 @@ struct ServerState {
     cluster_ca_pem: Option<String>,
     rendezvous_ca_pem: Option<String>,
     rendezvous_urls: Vec<String>,
+    rendezvous_registration_enabled: bool,
     rendezvous_control: Option<RendezvousControlClient>,
     rendezvous_mtls_required: bool,
     relay_mode: RelayMode,
@@ -538,6 +540,7 @@ pub struct ServerNodeConfig {
     pub labels: HashMap<String, String>,
     pub public_tls: Option<PublicTlsConfig>,
     pub public_ca_cert_path: Option<PathBuf>,
+    bootstrap_trust_roots: Option<BootstrapTrustRoots>,
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
     pub rendezvous_ca_cert_path: Option<PathBuf>,
@@ -679,7 +682,211 @@ fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
 }
 
 impl ServerNodeConfig {
+    pub fn from_bootstrap_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let bootstrap = TransportNodeBootstrap::from_path(path.as_ref())?;
+        Self::from_bootstrap(bootstrap)
+    }
+
+    pub fn from_bootstrap(bootstrap: TransportNodeBootstrap) -> Result<Self> {
+        bootstrap.validate()?;
+
+        let mode = match bootstrap.mode {
+            NodeBootstrapMode::Cluster => ServerNodeMode::Cluster,
+            NodeBootstrapMode::LocalEdge => ServerNodeMode::LocalEdge,
+        };
+        let bind_addr: SocketAddr = bootstrap
+            .bind_addr
+            .parse()
+            .context("invalid node bootstrap bind_addr")?;
+        let internal_tls = match bootstrap.internal_tls {
+            Some(internal_tls) => {
+                let internal_bind_addr = bootstrap
+                    .internal_bind_addr
+                    .as_deref()
+                    .context("node bootstrap internal_tls requires internal_bind_addr")?
+                    .parse()
+                    .context("invalid node bootstrap internal_bind_addr")?;
+                Some(InternalTlsConfig {
+                    bind_addr: internal_bind_addr,
+                    internal_url: bootstrap.internal_url.clone(),
+                    ca_cert_path: PathBuf::from(internal_tls.ca_cert_path),
+                    cert_path: PathBuf::from(internal_tls.cert_path),
+                    key_path: PathBuf::from(internal_tls.key_path),
+                })
+            }
+            None => None,
+        };
+        let public_tls = bootstrap.public_tls.map(|public_tls| PublicTlsConfig {
+            cert_path: PathBuf::from(public_tls.cert_path),
+            key_path: PathBuf::from(public_tls.key_path),
+        });
+        let upstream_configured = bootstrap
+            .upstream_public_url
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+
+        Ok(Self {
+            mode,
+            cluster_id: bootstrap.cluster_id,
+            node_id: bootstrap.node_id,
+            data_dir: PathBuf::from(bootstrap.data_dir),
+            metadata_backend: parse_metadata_backend(
+                std::env::var("IRONMESH_METADATA_BACKEND")
+                    .unwrap_or_else(|_| "sqlite".to_string())
+                    .as_str(),
+            )?,
+            bind_addr,
+            public_url: bootstrap.public_url,
+            labels: bootstrap.labels,
+            public_tls,
+            public_ca_cert_path: bootstrap.public_ca_cert_path.map(PathBuf::from),
+            bootstrap_trust_roots: Some(bootstrap.trust_roots),
+            public_peer_api_enabled: bootstrap.public_peer_api_enabled,
+            internal_tls,
+            rendezvous_ca_cert_path: None,
+            rendezvous_urls: bootstrap.rendezvous_urls,
+            rendezvous_registration_enabled: true,
+            rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
+            relay_mode: bootstrap.relay_mode,
+            upstream_public_url: bootstrap.upstream_public_url,
+            heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(90),
+            audit_interval_secs: std::env::var("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(
+                    if mode == ServerNodeMode::LocalEdge && upstream_configured {
+                        5
+                    } else {
+                        3600
+                    },
+                ),
+            replica_view_sync_interval_secs: std::env::var(
+                "IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS",
+            )
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5),
+            replication_factor: std::env::var("IRONMESH_REPLICATION_FACTOR")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(if mode == ServerNodeMode::LocalEdge {
+                    if upstream_configured { 2 } else { 1 }
+                } else {
+                    3
+                }),
+            accepted_over_replication_items: std::env::var(
+                "IRONMESH_ACCEPTED_OVER_REPLICATION_ITEMS",
+            )
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0),
+            metadata_commit_mode: MetadataCommitMode::parse(
+                std::env::var("IRONMESH_METADATA_COMMIT_MODE")
+                    .unwrap_or_else(|_| "local".to_string())
+                    .as_str(),
+            )?,
+            autonomous_replication_on_put_enabled: match mode {
+                ServerNodeMode::Cluster => {
+                    std::env::var("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED")
+                        .ok()
+                        .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                        .unwrap_or(true)
+                }
+                ServerNodeMode::LocalEdge => upstream_configured,
+            },
+            replication_repair_enabled: match mode {
+                ServerNodeMode::Cluster => std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
+                    .ok()
+                    .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false),
+                ServerNodeMode::LocalEdge => upstream_configured,
+            },
+            replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(256),
+            replication_repair_max_retries: std::env::var(
+                "IRONMESH_REPLICATION_REPAIR_MAX_RETRIES",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3),
+            replication_repair_backoff_secs: std::env::var(
+                "IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(
+                if mode == ServerNodeMode::LocalEdge && upstream_configured {
+                    2
+                } else {
+                    30
+                },
+            ),
+            repair_busy_throttle_enabled: std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(false),
+            repair_busy_inflight_threshold: std::env::var(
+                "IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD",
+            )
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32),
+            repair_busy_wait_millis: std::env::var("IRONMESH_REPAIR_BUSY_WAIT_MILLIS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(100),
+            startup_repair_enabled: match mode {
+                ServerNodeMode::Cluster => std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
+                    .ok()
+                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                    .unwrap_or(true),
+                ServerNodeMode::LocalEdge => upstream_configured,
+            },
+            startup_repair_delay_secs: std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5),
+            peer_heartbeat_enabled: match mode {
+                ServerNodeMode::Cluster => std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
+                    .ok()
+                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                    .unwrap_or(true),
+                ServerNodeMode::LocalEdge => false,
+            },
+            peer_heartbeat_interval_secs: std::env::var(
+                "IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(15),
+            admin_token: std::env::var("IRONMESH_ADMIN_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            require_client_auth: std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(false),
+        })
+    }
+
     pub fn from_env() -> Result<Self> {
+        if let Some(path) = std::env::var("IRONMESH_NODE_BOOTSTRAP_FILE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Self::from_bootstrap_path(path);
+        }
+
         let mode = match std::env::var("IRONMESH_NODE_MODE")
             .unwrap_or_else(|_| "cluster".to_string())
             .as_str()
@@ -852,6 +1059,7 @@ impl ServerNodeConfig {
             public_ca_cert_path: std::env::var("IRONMESH_PUBLIC_TLS_CA_CERT")
                 .ok()
                 .map(PathBuf::from),
+            bootstrap_trust_roots: None,
             public_peer_api_enabled,
             internal_tls,
             rendezvous_ca_cert_path,
@@ -989,6 +1197,7 @@ impl ServerNodeConfig {
             labels,
             public_tls: None,
             public_ca_cert_path: None,
+            bootstrap_trust_roots: None,
             public_peer_api_enabled: false,
             internal_tls: None,
             rendezvous_ca_cert_path: None,
@@ -1326,6 +1535,16 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         }
     };
 
+    let embedded_trust_roots =
+        config
+            .bootstrap_trust_roots
+            .clone()
+            .unwrap_or(BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            });
+
     let public_ca_pem = config
         .public_ca_cert_path
         .clone()
@@ -1337,7 +1556,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 )
             })
         })
-        .transpose()?;
+        .transpose()?
+        .or(embedded_trust_roots.public_api_ca_pem.clone());
     let cluster_ca_pem = config
         .internal_tls
         .as_ref()
@@ -1348,7 +1568,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 format!("failed reading cluster CA certificate {}", path.display())
             })
         })
-        .transpose()?;
+        .transpose()?
+        .or(embedded_trust_roots.cluster_ca_pem.clone());
     let rendezvous_ca_pem = config
         .rendezvous_ca_cert_path
         .clone()
@@ -1360,7 +1581,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 )
             })
         })
-        .transpose()?;
+        .transpose()?
+        .or(embedded_trust_roots.rendezvous_ca_pem.clone())
+        .or_else(|| public_ca_pem.clone())
+        .or_else(|| cluster_ca_pem.clone());
     let rendezvous_client_identity_pem = config
         .internal_tls
         .as_ref()
@@ -1399,6 +1623,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         cluster_ca_pem,
         rendezvous_ca_pem,
         rendezvous_urls: config.rendezvous_urls.clone(),
+        rendezvous_registration_enabled: config.rendezvous_registration_enabled,
         rendezvous_control,
         rendezvous_mtls_required: config.rendezvous_mtls_required,
         relay_mode: config.relay_mode,
@@ -1578,6 +1803,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/auth/bootstrap-bundles/issue",
             post(issue_bootstrap_bundle),
         )
+        .route("/auth/node-bootstraps/issue", post(issue_node_bootstrap))
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
     let public_peer_api = Router::new()
@@ -4044,6 +4270,23 @@ struct PairingTokenIssueRequest {
     expires_in_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NodeBootstrapIssueRequest {
+    node_id: Option<NodeId>,
+    mode: Option<NodeBootstrapMode>,
+    data_dir: Option<String>,
+    bind_addr: Option<String>,
+    public_url: Option<String>,
+    labels: Option<HashMap<String, String>>,
+    public_tls: Option<BootstrapServerTlsFiles>,
+    public_ca_cert_path: Option<String>,
+    public_peer_api_enabled: Option<bool>,
+    internal_bind_addr: Option<String>,
+    internal_url: Option<String>,
+    internal_tls: Option<BootstrapTlsFiles>,
+    upstream_public_url: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct PairingTokenIssueResponse {
     token_id: String,
@@ -4138,6 +4381,63 @@ async fn issue_pairing_token(
     (StatusCode::CREATED, Json(response)).into_response()
 }
 
+fn bootstrap_trust_roots(state: &ServerState) -> BootstrapTrustRoots {
+    BootstrapTrustRoots {
+        cluster_ca_pem: state.cluster_ca_pem.clone(),
+        public_api_ca_pem: state.public_ca_pem.clone(),
+        rendezvous_ca_pem: state
+            .rendezvous_ca_pem
+            .clone()
+            .or_else(|| state.public_ca_pem.clone())
+            .or_else(|| state.cluster_ca_pem.clone()),
+    }
+}
+
+fn bootstrap_rendezvous_urls(state: &ServerState) -> std::result::Result<Vec<String>, StatusCode> {
+    if !state.rendezvous_registration_enabled {
+        return Err(StatusCode::PRECONDITION_FAILED);
+    }
+    Ok(state.rendezvous_urls.clone())
+}
+
+fn build_bootstrap_direct_endpoints(
+    public_url: Option<&str>,
+    internal_url: Option<&str>,
+    public_peer_api_enabled: bool,
+) -> Vec<BootstrapEndpoint> {
+    let mut endpoints = Vec::new();
+
+    if let Some(public_url) = public_url {
+        endpoints.push(BootstrapEndpoint {
+            url: public_url.to_string(),
+            usage: Some(BootstrapEndpointUse::PublicApi),
+        });
+    }
+
+    let peer_url = if public_peer_api_enabled {
+        internal_url.or(public_url)
+    } else {
+        internal_url
+    };
+    if let Some(peer_url) = peer_url {
+        endpoints.push(BootstrapEndpoint {
+            url: peer_url.to_string(),
+            usage: Some(BootstrapEndpointUse::PeerApi),
+        });
+    }
+
+    endpoints
+}
+
+fn default_public_url(bind_addr: &str, tls_enabled: bool) -> String {
+    let scheme = if tls_enabled { "https" } else { "http" };
+    format!("{scheme}://{bind_addr}")
+}
+
+fn default_internal_url(bind_addr: &str) -> String {
+    format!("https://{bind_addr}")
+}
+
 async fn issue_bootstrap_bundle(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -4158,6 +4458,11 @@ async fn issue_bootstrap_bundle(
     .await
     {
         Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let rendezvous_urls = match bootstrap_rendezvous_urls(&state) {
+        Ok(urls) => urls,
         Err(status) => return status.into_response(),
     };
 
@@ -4199,7 +4504,7 @@ async fn issue_bootstrap_bundle(
     let bootstrap = TransportClientBootstrap {
         version: 1,
         cluster_id: state.cluster_id,
-        rendezvous_urls: state.rendezvous_urls.clone(),
+        rendezvous_urls,
         rendezvous_mtls_required: state.rendezvous_mtls_required,
         direct_endpoints: endpoints
             .into_iter()
@@ -4209,19 +4514,133 @@ async fn issue_bootstrap_bundle(
             })
             .collect(),
         relay_mode: state.relay_mode,
-        trust_roots: BootstrapTrustRoots {
-            cluster_ca_pem: state.cluster_ca_pem.clone(),
-            public_api_ca_pem: state.public_ca_pem.clone(),
-            rendezvous_ca_pem: state
-                .rendezvous_ca_pem
-                .clone()
-                .or_else(|| state.public_ca_pem.clone())
-                .or_else(|| state.cluster_ca_pem.clone()),
-        },
+        trust_roots: bootstrap_trust_roots(&state),
         pairing_token: Some(pairing_response.pairing_token),
         device_label: pairing_response.label,
         device_id: None,
     };
+
+    (StatusCode::CREATED, Json(bootstrap)).into_response()
+}
+
+async fn issue_node_bootstrap(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NodeBootstrapIssueRequest>,
+) -> impl IntoResponse {
+    let action = "auth/node-bootstraps/issue";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "node_id": request.node_id,
+            "mode": request.mode,
+            "data_dir": request.data_dir,
+            "bind_addr": request.bind_addr,
+            "public_url": request.public_url,
+            "upstream_public_url": request.upstream_public_url,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let rendezvous_urls = match bootstrap_rendezvous_urls(&state) {
+        Ok(urls) => urls,
+        Err(status) => return status.into_response(),
+    };
+
+    let mode = request.mode.unwrap_or(NodeBootstrapMode::Cluster);
+    let bind_addr = request
+        .bind_addr
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let public_url = request
+        .public_url
+        .or_else(|| Some(default_public_url(&bind_addr, request.public_tls.is_some())));
+    let internal_bind_addr = request.internal_bind_addr.or_else(|| match mode {
+        NodeBootstrapMode::Cluster => Some("127.0.0.1:18080".to_string()),
+        NodeBootstrapMode::LocalEdge => None,
+    });
+    let internal_url = request
+        .internal_url
+        .or_else(|| internal_bind_addr.as_deref().map(default_internal_url));
+    let public_peer_api_enabled = request.public_peer_api_enabled.unwrap_or(
+        mode == NodeBootstrapMode::LocalEdge
+            && request
+                .upstream_public_url
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+    );
+    let bootstrap = TransportNodeBootstrap {
+        version: 1,
+        cluster_id: state.cluster_id,
+        node_id: request.node_id.unwrap_or_else(NodeId::new_v4),
+        mode,
+        data_dir: request
+            .data_dir
+            .unwrap_or_else(|| "./data/server-node".to_string()),
+        bind_addr,
+        public_url: public_url.clone(),
+        labels: request.labels.unwrap_or_default(),
+        public_tls: request.public_tls,
+        public_ca_cert_path: request.public_ca_cert_path,
+        public_peer_api_enabled,
+        internal_bind_addr: internal_bind_addr.clone(),
+        internal_url: internal_url.clone(),
+        internal_tls: request.internal_tls,
+        rendezvous_urls,
+        rendezvous_mtls_required: state.rendezvous_mtls_required,
+        direct_endpoints: build_bootstrap_direct_endpoints(
+            public_url.as_deref(),
+            internal_url.as_deref(),
+            public_peer_api_enabled,
+        ),
+        relay_mode: state.relay_mode,
+        trust_roots: bootstrap_trust_roots(&state),
+        upstream_public_url: request.upstream_public_url,
+    };
+
+    if let Err(err) = bootstrap.validate() {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "node_id": bootstrap.node_id,
+            "mode": bootstrap.mode,
+            "direct_endpoint_count": bootstrap.direct_endpoints.len(),
+            "rendezvous_url_count": bootstrap.rendezvous_urls.len(),
+        }),
+    )
+    .await;
 
     (StatusCode::CREATED, Json(bootstrap)).into_response()
 }

@@ -252,6 +252,7 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     state.cluster_ca_pem = Some("cluster-ca".to_string());
     state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
     state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
 
     let mut headers = HeaderMap::new();
@@ -293,6 +294,252 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     assert!(bootstrap.pairing_token.is_some());
 
     cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn server_node_config_loads_from_node_bootstrap_file() {
+    let root = fresh_test_dir("node-bootstrap-config");
+    let bootstrap_path = root.join("node-bootstrap.json");
+    let node_id = NodeId::new_v4();
+    let cluster_id = uuid::Uuid::now_v7();
+    transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id,
+        node_id,
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: root.join("data").to_string_lossy().into_owned(),
+        bind_addr: "127.0.0.1:28080".to_string(),
+        public_url: Some("https://node-b.example".to_string()),
+        labels: HashMap::from([("dc".to_string(), "edge-b".to_string())]),
+        public_tls: Some(transport_sdk::BootstrapServerTlsFiles {
+            cert_path: "tls/public.pem".to_string(),
+            key_path: "tls/public.key".to_string(),
+        }),
+        public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+        public_peer_api_enabled: true,
+        internal_bind_addr: Some("127.0.0.1:38080".to_string()),
+        internal_url: Some("https://10.0.0.12:38080".to_string()),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/cluster-ca.pem".to_string(),
+            cert_path: "tls/internal.pem".to_string(),
+            key_path: "tls/internal.key".to_string(),
+        }),
+        rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+        rendezvous_mtls_required: true,
+        direct_endpoints: vec![
+            transport_sdk::BootstrapEndpoint {
+                url: "https://node-b.example".to_string(),
+                usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+            },
+            transport_sdk::BootstrapEndpoint {
+                url: "https://10.0.0.12:38080".to_string(),
+                usage: Some(transport_sdk::BootstrapEndpointUse::PeerApi),
+            },
+        ],
+        relay_mode: transport_sdk::RelayMode::Required,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: Some("cluster-ca".to_string()),
+            public_api_ca_pem: Some("public-ca".to_string()),
+            rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
+        },
+        upstream_public_url: Some("https://upstream.example".to_string()),
+    }
+    .write_to_path(&bootstrap_path)
+    .unwrap();
+
+    let config = super::ServerNodeConfig::from_bootstrap_path(&bootstrap_path).unwrap();
+
+    assert!(matches!(config.mode, super::ServerNodeMode::Cluster));
+    assert_eq!(config.cluster_id, cluster_id);
+    assert_eq!(config.node_id, node_id);
+    assert_eq!(
+        config.bind_addr,
+        "127.0.0.1:28080".parse::<SocketAddr>().unwrap()
+    );
+    assert_eq!(config.public_url.as_deref(), Some("https://node-b.example"));
+    assert!(config.rendezvous_registration_enabled);
+    assert!(config.rendezvous_mtls_required);
+    assert_eq!(
+        config.rendezvous_urls,
+        vec!["https://rendezvous.example".to_string()]
+    );
+    assert_eq!(
+        config
+            .internal_tls
+            .as_ref()
+            .and_then(|tls| tls.internal_url.as_deref()),
+        Some("https://10.0.0.12:38080")
+    );
+    assert_eq!(
+        config
+            .public_tls
+            .as_ref()
+            .map(|tls| tls.cert_path.to_string_lossy().into_owned()),
+        Some("tls/public.pem".to_string())
+    );
+    assert_eq!(
+        config
+            .public_ca_cert_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        Some("tls/public-ca.pem".to_string())
+    );
+    assert_eq!(
+        config.upstream_public_url.as_deref(),
+        Some("https://upstream.example")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.public_ca_pem = Some("public-ca".to_string());
+    state.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    state.rendezvous_registration_enabled = true;
+    state.rendezvous_mtls_required = true;
+    state.relay_mode = transport_sdk::RelayMode::Required;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    let requested_node_id = NodeId::new_v4();
+
+    let response = super::issue_node_bootstrap(
+        State(state.clone()),
+        headers,
+        Json(super::NodeBootstrapIssueRequest {
+            node_id: Some(requested_node_id),
+            mode: Some(transport_sdk::NodeBootstrapMode::Cluster),
+            data_dir: Some("./data/node-b".to_string()),
+            bind_addr: Some("127.0.0.1:28080".to_string()),
+            public_url: Some("https://node-b.example".to_string()),
+            labels: Some(HashMap::from([("rack".to_string(), "rack-b".to_string())])),
+            public_tls: Some(transport_sdk::BootstrapServerTlsFiles {
+                cert_path: "tls/public.pem".to_string(),
+                key_path: "tls/public.key".to_string(),
+            }),
+            public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+            public_peer_api_enabled: Some(true),
+            internal_bind_addr: Some("127.0.0.1:38080".to_string()),
+            internal_url: Some("https://10.0.0.12:38080".to_string()),
+            internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+                ca_cert_path: "tls/cluster-ca.pem".to_string(),
+                cert_path: "tls/internal.pem".to_string(),
+                key_path: "tls/internal.key".to_string(),
+            }),
+            upstream_public_url: Some("https://upstream.example".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let bootstrap: transport_sdk::NodeBootstrap = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(bootstrap.node_id, requested_node_id);
+    assert_eq!(bootstrap.cluster_id, state.cluster_id);
+    assert_eq!(
+        bootstrap.rendezvous_urls,
+        vec!["https://rendezvous.example".to_string()]
+    );
+    assert!(bootstrap.rendezvous_mtls_required);
+    assert_eq!(bootstrap.relay_mode, transport_sdk::RelayMode::Required);
+    assert_eq!(
+        bootstrap.trust_roots.rendezvous_ca_pem.as_deref(),
+        Some("rendezvous-ca")
+    );
+    assert_eq!(
+        bootstrap.trust_roots.public_api_ca_pem.as_deref(),
+        Some("public-ca")
+    );
+    assert_eq!(
+        bootstrap.trust_roots.cluster_ca_pem.as_deref(),
+        Some("cluster-ca")
+    );
+    assert_eq!(
+        bootstrap.public_url.as_deref(),
+        Some("https://node-b.example")
+    );
+    assert_eq!(
+        bootstrap.internal_url.as_deref(),
+        Some("https://10.0.0.12:38080")
+    );
+    assert_eq!(
+        bootstrap.labels.get("rack").map(String::as_str),
+        Some("rack-b")
+    );
+    assert_eq!(bootstrap.direct_endpoints.len(), 2);
+    assert_eq!(
+        bootstrap.direct_endpoints[0].usage,
+        Some(transport_sdk::BootstrapEndpointUse::PublicApi)
+    );
+    assert_eq!(
+        bootstrap.direct_endpoints[1].usage,
+        Some(transport_sdk::BootstrapEndpointUse::PeerApi)
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_bootstrap_file_can_start_local_edge_node() {
+    let root = fresh_test_dir("node-bootstrap-startup");
+    let bootstrap_path = root.join("node-bootstrap.json");
+    let bind_addr = free_bind_addr();
+    let public_url = format!("http://{bind_addr}");
+
+    transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: uuid::Uuid::now_v7(),
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::LocalEdge,
+        data_dir: root.join("data").to_string_lossy().into_owned(),
+        bind_addr: bind_addr.to_string(),
+        public_url: Some(public_url.clone()),
+        labels: HashMap::new(),
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_peer_api_enabled: false,
+        internal_bind_addr: None,
+        internal_url: None,
+        internal_tls: None,
+        rendezvous_urls: vec!["http://127.0.0.1:9".to_string()],
+        rendezvous_mtls_required: false,
+        direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
+            url: public_url.clone(),
+            usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+        }],
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: None,
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: None,
+        },
+        upstream_public_url: None,
+    }
+    .write_to_path(&bootstrap_path)
+    .unwrap();
+
+    let config = super::ServerNodeConfig::from_bootstrap_path(&bootstrap_path).unwrap();
+    let http = reqwest::Client::new();
+    let handle = tokio::spawn(async move { super::run(config).await });
+
+    wait_for_http_status(
+        &http,
+        &format!("{public_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    handle.abort();
+    let _ = handle.await;
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
@@ -2010,6 +2257,7 @@ async fn build_test_state(
         cluster_ca_pem: None,
         rendezvous_ca_pem: None,
         rendezvous_urls: vec!["http://127.0.0.1:39080".to_string()],
+        rendezvous_registration_enabled: false,
         rendezvous_control: None,
         rendezvous_mtls_required: false,
         relay_mode: super::RelayMode::Fallback,

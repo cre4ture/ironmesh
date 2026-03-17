@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -44,6 +44,27 @@ pub struct BootstrapTrustRoots {
     pub rendezvous_ca_pem: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeBootstrapMode {
+    #[default]
+    Cluster,
+    LocalEdge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapTlsFiles {
+    pub ca_cert_path: String,
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapServerTlsFiles {
+    pub cert_path: String,
+    pub key_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientBootstrap {
     pub version: u32,
@@ -69,6 +90,26 @@ pub struct NodeBootstrap {
     pub version: u32,
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
+    #[serde(default)]
+    pub mode: NodeBootstrapMode,
+    pub data_dir: String,
+    pub bind_addr: String,
+    #[serde(default)]
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub public_tls: Option<BootstrapServerTlsFiles>,
+    #[serde(default)]
+    pub public_ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub public_peer_api_enabled: bool,
+    #[serde(default)]
+    pub internal_bind_addr: Option<String>,
+    #[serde(default)]
+    pub internal_url: Option<String>,
+    #[serde(default)]
+    pub internal_tls: Option<BootstrapTlsFiles>,
     pub rendezvous_urls: Vec<String>,
     #[serde(default)]
     pub rendezvous_mtls_required: bool,
@@ -77,6 +118,8 @@ pub struct NodeBootstrap {
     #[serde(default)]
     pub relay_mode: RelayMode,
     pub trust_roots: BootstrapTrustRoots,
+    #[serde(default)]
+    pub upstream_public_url: Option<String>,
 }
 
 impl ClientBootstrap {
@@ -161,6 +204,21 @@ impl NodeBootstrap {
         if self.node_id.is_nil() {
             bail!("node bootstrap must include a non-nil node_id");
         }
+        validate_required_non_empty("data_dir", &self.data_dir)?;
+        validate_socket_addr("bind_addr", &self.bind_addr)?;
+        validate_optional_url("public_url", self.public_url.as_deref())?;
+        validate_optional_non_empty("public_ca_cert_path", self.public_ca_cert_path.as_deref())?;
+        validate_optional_socket_addr("internal_bind_addr", self.internal_bind_addr.as_deref())?;
+        validate_optional_url("internal_url", self.internal_url.as_deref())?;
+        validate_optional_url("upstream_public_url", self.upstream_public_url.as_deref())?;
+        validate_optional_server_tls_files("public_tls", self.public_tls.as_ref())?;
+        validate_optional_tls_files("internal_tls", self.internal_tls.as_ref())?;
+        if self.mode == NodeBootstrapMode::Cluster && self.internal_tls.is_none() {
+            bail!("cluster node bootstrap must include internal_tls");
+        }
+        if self.internal_tls.is_some() && self.internal_bind_addr.is_none() {
+            bail!("node bootstrap internal_tls requires internal_bind_addr");
+        }
         validate_url_list("rendezvous_urls", &self.rendezvous_urls)?;
         validate_endpoint_list(&self.direct_endpoints)?;
         validate_trust_roots(&self.trust_roots)?;
@@ -238,6 +296,58 @@ fn validate_optional_non_empty(field_name: &str, value: Option<&str>) -> Result<
     Ok(())
 }
 
+fn validate_required_non_empty(field_name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{field_name} must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_optional_url(field_name: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    Url::parse(value).with_context(|| format!("invalid URL in {field_name}: {value}"))?;
+    Ok(())
+}
+
+fn validate_socket_addr(field_name: &str, value: &str) -> Result<()> {
+    value
+        .trim()
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid socket address in {field_name}: {value}"))?;
+    Ok(())
+}
+
+fn validate_optional_socket_addr(field_name: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    validate_socket_addr(field_name, value)
+}
+
+fn validate_optional_tls_files(field_name: &str, value: Option<&BootstrapTlsFiles>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_required_non_empty(&format!("{field_name}.ca_cert_path"), &value.ca_cert_path)?;
+    validate_required_non_empty(&format!("{field_name}.cert_path"), &value.cert_path)?;
+    validate_required_non_empty(&format!("{field_name}.key_path"), &value.key_path)?;
+    Ok(())
+}
+
+fn validate_optional_server_tls_files(
+    field_name: &str,
+    value: Option<&BootstrapServerTlsFiles>,
+) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_required_non_empty(&format!("{field_name}.cert_path"), &value.cert_path)?;
+    validate_required_non_empty(&format!("{field_name}.key_path"), &value.key_path)?;
+    Ok(())
+}
+
 fn dedup_urls<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<Vec<Url>> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
@@ -303,5 +413,46 @@ mod tests {
         };
 
         assert!(bootstrap.validate().is_err());
+    }
+
+    #[test]
+    fn node_bootstrap_validates_cluster_runtime_shape() {
+        let bootstrap = NodeBootstrap {
+            version: CLIENT_BOOTSTRAP_VERSION,
+            cluster_id: Uuid::now_v7(),
+            node_id: Uuid::now_v7(),
+            mode: NodeBootstrapMode::Cluster,
+            data_dir: "./data/node-a".to_string(),
+            bind_addr: "127.0.0.1:8080".to_string(),
+            public_url: Some("https://node-a.example".to_string()),
+            labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_peer_api_enabled: false,
+            internal_bind_addr: Some("127.0.0.1:18080".to_string()),
+            internal_url: Some("https://127.0.0.1:18080".to_string()),
+            internal_tls: Some(BootstrapTlsFiles {
+                ca_cert_path: "tls/ca.pem".to_string(),
+                cert_path: "tls/node.pem".to_string(),
+                key_path: "tls/node.key".to_string(),
+            }),
+            rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_mtls_required: true,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "https://node-a.example".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+            }],
+            relay_mode: RelayMode::Required,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: Some("cluster-ca".to_string()),
+                public_api_ca_pem: Some("public-ca".to_string()),
+                rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
+            },
+            upstream_public_url: None,
+        };
+
+        bootstrap
+            .validate()
+            .expect("node bootstrap should validate");
     }
 }
