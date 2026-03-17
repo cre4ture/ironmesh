@@ -60,8 +60,7 @@ struct Args {
 }
 
 struct ResolvedUpstreamTarget {
-    base_url: Option<Url>,
-    server_ca_pem: Option<String>,
+    local_edge_upstream_base_url: Option<Url>,
     client: IronMeshClient,
 }
 
@@ -70,7 +69,11 @@ pub fn mount_main() -> Result<()> {
     let client_identity = read_optional_client_identity(args.client_identity_file.as_deref())?;
 
     let effective_local_edge_data_dir = effective_local_edge_data_dir(&args)?;
-    let upstream_target = resolve_upstream_target(&args, client_identity.as_ref())?;
+    let upstream_target = resolve_upstream_target(
+        &args,
+        client_identity.as_ref(),
+        effective_local_edge_data_dir.is_some(),
+    )?;
 
     if args.snapshot_file.is_some() {
         if args.server_base_url.is_some()
@@ -112,7 +115,10 @@ pub fn mount_main() -> Result<()> {
 
     let local_node = if let Some(data_dir) = effective_local_edge_data_dir.as_ref() {
         Some(if let Some(upstream_target) = upstream_target.as_ref() {
-            let upstream_base_url = upstream_target.base_url.as_ref().ok_or_else(|| {
+            let upstream_base_url = upstream_target
+                .local_edge_upstream_base_url
+                .as_ref()
+                .ok_or_else(|| {
                 anyhow::anyhow!(
                     "--local-edge with --bootstrap-file currently requires a bootstrap that can resolve a direct upstream server URL"
                 )
@@ -134,14 +140,10 @@ pub fn mount_main() -> Result<()> {
         None
     };
 
-    let base_url = if let Some(local_node) = local_node.as_ref() {
-        normalize_server_base_url(local_node.base_url())?
-    } else {
-        upstream_target
-            .as_ref()
-            .and_then(|target| target.base_url.clone())
-            .ok_or_else(|| anyhow::anyhow!("missing upstream target for live mount"))?
-    };
+    let local_edge_base_url = local_node
+        .as_ref()
+        .map(|local_node| normalize_server_base_url(local_node.base_url()))
+        .transpose()?;
     if let (Some(local_node), Some(output_path)) =
         (local_node.as_ref(), args.local_edge_base_url_file.as_ref())
     {
@@ -158,16 +160,12 @@ pub fn mount_main() -> Result<()> {
             .map(|target| target.client.clone())
             .ok_or_else(|| anyhow::anyhow!("missing upstream target for live mount"))?
     } else {
-        let server_ca_pem = upstream_target.as_ref().and_then(|target| {
-            if local_node.is_none() {
-                target.server_ca_pem.clone()
-            } else {
-                None
-            }
-        });
         build_configured_client(
-            base_url.as_str(),
-            server_ca_pem.as_deref(),
+            local_edge_base_url
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing local edge base URL"))?
+                .as_str(),
+            None,
             client_identity.as_ref(),
         )?
     };
@@ -302,6 +300,7 @@ fn local_edge_scope_label(args: &Args) -> String {
 fn resolve_upstream_target(
     args: &Args,
     client_identity: Option<&ClientIdentityMaterial>,
+    needs_local_edge_upstream_direct: bool,
 ) -> Result<Option<ResolvedUpstreamTarget>> {
     if args.server_base_url.is_some() && args.bootstrap_file.is_some() {
         anyhow::bail!("use either --server-base-url or --bootstrap-file, not both");
@@ -313,17 +312,17 @@ fn resolve_upstream_target(
         if let Some(server_ca_override) = server_ca_override.as_ref() {
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_override.clone());
         }
-        let client = match client_identity {
-            Some(identity) => bootstrap.build_client_with_identity(identity)?,
-            None => bootstrap.build_client()?,
+        let client = bootstrap.build_client_with_optional_identity(client_identity)?;
+        let local_edge_upstream_base_url = if needs_local_edge_upstream_direct {
+            bootstrap
+                .resolve_direct_http_target_blocking()
+                .ok()
+                .and_then(|resolved| normalize_server_base_url(&resolved.server_base_url).ok())
+        } else {
+            None
         };
-        let base_url = bootstrap
-            .resolve_direct_http_target_blocking()
-            .ok()
-            .and_then(|resolved| normalize_server_base_url(&resolved.server_base_url).ok());
         return Ok(Some(ResolvedUpstreamTarget {
-            base_url,
-            server_ca_pem: server_ca_override,
+            local_edge_upstream_base_url,
             client,
         }));
     }
@@ -338,8 +337,7 @@ fn resolve_upstream_target(
         client_identity,
     )?;
     Ok(Some(ResolvedUpstreamTarget {
-        base_url: Some(base_url.clone()),
-        server_ca_pem: server_ca_override,
+        local_edge_upstream_base_url: Some(base_url.clone()),
         client,
     }))
 }

@@ -389,6 +389,16 @@ impl ConnectionBootstrap {
         }))
     }
 
+    pub fn build_client_with_optional_identity(
+        &self,
+        identity: Option<&ClientIdentityMaterial>,
+    ) -> Result<IronMeshClient> {
+        match identity {
+            Some(identity) => self.build_client_with_identity(identity),
+            None => self.build_client(),
+        }
+    }
+
     pub fn connection_target_label(&self) -> Result<String> {
         self.validate()?;
 
