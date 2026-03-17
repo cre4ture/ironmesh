@@ -27,8 +27,9 @@ Use this section as the current source of truth for remaining work. The detailed
    `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, `refresh_upstream_peer(...)`, and the old local-edge upstream helper flow are gone. Rendezvous-first discovery is now the supported peer discovery model, and Linux FUSE `--local-edge` no longer tries to smuggle a remote upstream URL through the local server-node path.
 3. Finish removing `base_url` plus `device_token`-shaped app models.
    Remaining work: clean up the remaining compatibility surfaces in `client-sdk` and helper apps so persisted client state is identity-first rather than URL-plus-token-first. Android, Windows, and the iOS wrapper are now on bootstrap-aware connection inputs.
-4. Replace the old reachability model in cluster state.
-   Remaining work: stop projecting everything into `NodeDescriptor { public_url, internal_url, ... }` and move to stable identity plus dynamic reachability/capability records.
+4. Replace the old reachability model in cluster state. Status: in progress.
+   The in-memory cluster model now uses a structured reachability plus capability record under `NodeDescriptor`, and peer planning/projection no longer depends on raw `public_url` / `internal_url` fields directly.
+   Remaining work: finish the admin/control surfaces that still accept direct reachability coordinates, and update the remaining operator-facing docs/examples to show the new `reachability` / `capabilities` shape explicitly.
 5. Refresh tests and operational docs to match the real implementation state.
    Remaining work: reconcile this checklist with completed work, add outbound-only system scenarios, and keep platform-facing docs aligned with the new enrollment and transport model.
 
@@ -192,9 +193,9 @@ Recommended responsibilities:
 
 ### `crates/server-node-sdk/src/cluster.rs`
 
-- [ ] Replace `NodeDescriptor` with a record that separates stable identity from current reachability.
-- [ ] Keep labels, capacity, and status.
-- [ ] Replace raw `public_url` / `internal_url` assumptions with a reachability structure that can represent:
+- [x] Replace `NodeDescriptor` with a record that separates stable identity from current reachability.
+- [x] Keep labels, capacity, and status.
+- [x] Replace raw `public_url` / `internal_url` assumptions with a reachability structure that can represent:
   - direct public API URLs,
   - direct peer candidates,
   - relay-required state,

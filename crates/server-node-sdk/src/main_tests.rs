@@ -3292,8 +3292,16 @@ async fn build_test_state(
 
     service.register_node(cluster::NodeDescriptor {
         node_id: local_node_id,
-        public_url: "http://127.0.0.1:39080".to_string(),
-        internal_url: "https://127.0.0.1:49080".to_string(),
+        reachability: cluster::NodeReachability {
+            public_api_url: Some("http://127.0.0.1:39080".to_string()),
+            peer_api_url: Some("https://127.0.0.1:49080".to_string()),
+            relay_required: false,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: true,
+        },
         labels: HashMap::new(),
         capacity_bytes: 1_000_000,
         free_bytes: 900_000,
@@ -3304,8 +3312,16 @@ async fn build_test_state(
     if replication_factor > 1 {
         service.register_node(cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
-            public_url: "http://127.0.0.1:9".to_string(),
-            internal_url: "https://127.0.0.1:10009".to_string(),
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("http://127.0.0.1:9".to_string()),
+                peer_api_url: Some("https://127.0.0.1:10009".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
             labels: HashMap::new(),
             capacity_bytes: 1_000_000,
             free_bytes: 800_000,
@@ -3507,8 +3523,11 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
             _ => unreachable!("test uses node identity"),
         }
     );
-    assert_eq!(descriptor.public_url, "https://public.example");
-    assert_eq!(descriptor.internal_url, "https://internal.example");
+    assert_eq!(descriptor.public_api_url(), Some("https://public.example"));
+    assert_eq!(descriptor.peer_api_url(), Some("https://internal.example"));
+    assert!(descriptor.capabilities.public_api);
+    assert!(descriptor.capabilities.peer_api);
+    assert!(!descriptor.relay_required());
     assert_eq!(
         descriptor.labels.get("dc").map(String::as_str),
         Some("edge-a")
@@ -3541,8 +3560,9 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
         .expect("relay-only presence entry should still project into a node descriptor");
 
     assert_eq!(descriptor.node_id, node_id);
-    assert!(descriptor.public_url.is_empty());
-    assert!(descriptor.internal_url.is_empty());
+    assert_eq!(descriptor.public_api_url(), None);
+    assert_eq!(descriptor.peer_api_url(), None);
+    assert!(descriptor.relay_capable());
 }
 
 #[tokio::test]
@@ -3550,8 +3570,16 @@ async fn resolve_peer_base_url_prefers_internal_url() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
-        public_url: "https://public.example".to_string(),
-        internal_url: "https://internal.example".to_string(),
+        reachability: cluster::NodeReachability {
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: Some("https://internal.example".to_string()),
+            relay_required: false,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: true,
+        },
         labels: HashMap::new(),
         capacity_bytes: 0,
         free_bytes: 0,
@@ -3572,8 +3600,8 @@ async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
     state.relay_mode = super::RelayMode::Disabled;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
-        public_url: String::new(),
-        internal_url: String::new(),
+        reachability: cluster::NodeReachability::default(),
+        capabilities: cluster::NodeCapabilities::default(),
         labels: HashMap::new(),
         capacity_bytes: 0,
         free_bytes: 0,
@@ -3597,8 +3625,12 @@ async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() 
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
-        public_url: String::new(),
-        internal_url: String::new(),
+        reachability: cluster::NodeReachability::default(),
+        capabilities: cluster::NodeCapabilities {
+            public_api: false,
+            peer_api: false,
+            relay_tunnel: true,
+        },
         labels: HashMap::new(),
         capacity_bytes: 0,
         free_bytes: 0,
@@ -3626,8 +3658,16 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
     state.relay_mode = super::RelayMode::Required;
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
-        public_url: "https://public.example".to_string(),
-        internal_url: "https://internal.example".to_string(),
+        reachability: cluster::NodeReachability {
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: Some("https://internal.example".to_string()),
+            relay_required: false,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: true,
+        },
         labels: HashMap::new(),
         capacity_bytes: 0,
         free_bytes: 0,
@@ -3665,8 +3705,16 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
         } else {
             let node = cluster::NodeDescriptor {
                 node_id: NodeId::new_v4(),
-                public_url: "https://relay-cleanup-remote.example".to_string(),
-                internal_url: "https://relay-cleanup-remote-internal.example".to_string(),
+                reachability: cluster::NodeReachability {
+                    public_api_url: Some("https://relay-cleanup-remote.example".to_string()),
+                    peer_api_url: Some("https://relay-cleanup-remote-internal.example".to_string()),
+                    relay_required: false,
+                },
+                capabilities: cluster::NodeCapabilities {
+                    public_api: true,
+                    peer_api: true,
+                    relay_tunnel: true,
+                },
                 labels: HashMap::new(),
                 capacity_bytes: 1_000_000,
                 free_bytes: 800_000,

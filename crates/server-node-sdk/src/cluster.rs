@@ -11,16 +11,62 @@ pub enum NodeStatus {
     Offline,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeReachability {
+    #[serde(default)]
+    pub public_api_url: Option<String>,
+    #[serde(default)]
+    pub peer_api_url: Option<String>,
+    #[serde(default)]
+    pub relay_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeCapabilities {
+    #[serde(default)]
+    pub public_api: bool,
+    #[serde(default)]
+    pub peer_api: bool,
+    #[serde(default)]
+    pub relay_tunnel: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDescriptor {
     pub node_id: NodeId,
-    pub public_url: String,
-    pub internal_url: String,
+    pub reachability: NodeReachability,
+    pub capabilities: NodeCapabilities,
     pub labels: HashMap<String, String>,
     pub capacity_bytes: u64,
     pub free_bytes: u64,
     pub last_heartbeat_unix: u64,
     pub status: NodeStatus,
+}
+
+impl NodeDescriptor {
+    pub fn public_api_url(&self) -> Option<&str> {
+        self.reachability
+            .public_api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn peer_api_url(&self) -> Option<&str> {
+        self.reachability
+            .peer_api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn relay_required(&self) -> bool {
+        self.reachability.relay_required
+    }
+
+    pub fn relay_capable(&self) -> bool {
+        self.capabilities.relay_tunnel
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -510,8 +556,16 @@ mod tests {
 
         NodeDescriptor {
             node_id: id,
-            public_url: format!("http://{id}"),
-            internal_url: format!("https://{id}"),
+            reachability: NodeReachability {
+                public_api_url: Some(format!("http://{id}")),
+                peer_api_url: Some(format!("https://{id}")),
+                relay_required: false,
+            },
+            capabilities: NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: false,
+            },
             labels,
             capacity_bytes: 1_000,
             free_bytes,

@@ -77,7 +77,10 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'=')
     .add(b'?');
 
-use cluster::{ClusterService, NodeDescriptor, ReplicationPlan, ReplicationPolicy};
+use cluster::{
+    ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, ReplicationPlan,
+    ReplicationPolicy,
+};
 use storage::{
     AdminAuditEvent, ClientAuthState, DeviceAuthRecord, MediaCacheLookup, MediaCacheStatus,
     MediaGpsCoordinates, MetadataBackendKind, ObjectReadMode, PairingTokenRecord,
@@ -2358,8 +2361,17 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     let mut cluster = ClusterService::new(config.node_id, policy, config.heartbeat_timeout_secs);
     cluster.register_node(NodeDescriptor {
         node_id: config.node_id,
-        public_url: public_url.clone(),
-        internal_url,
+        reachability: NodeReachability {
+            public_api_url: Some(public_url.clone()),
+            peer_api_url: Some(internal_url),
+            relay_required: config.relay_mode == RelayMode::Required,
+        },
+        capabilities: NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: config.rendezvous_registration_enabled
+                && config.relay_mode != RelayMode::Disabled,
+        },
         labels: config.labels.clone(),
         capacity_bytes: 0,
         free_bytes: 0,
@@ -3133,14 +3145,20 @@ fn node_descriptor_from_presence_entry(
         .registration
         .public_api_url
         .as_deref()
-        .and_then(|value| normalize_optional_url(Some(value)))
-        .or_else(|| peer_api_url.clone())
-        .unwrap_or_default();
+        .and_then(|value| normalize_optional_url(Some(value)));
 
     Some(NodeDescriptor {
         node_id: *node_id,
-        public_url: public_api_url,
-        internal_url: peer_api_url.unwrap_or_default(),
+        reachability: NodeReachability {
+            public_api_url: public_api_url.clone(),
+            peer_api_url: peer_api_url.clone(),
+            relay_required: entry.registration.relay_mode == RelayMode::Required,
+        },
+        capabilities: NodeCapabilities {
+            public_api: public_api_url.is_some(),
+            peer_api: peer_api_url.is_some(),
+            relay_tunnel: has_relay_capability,
+        },
         labels: entry.registration.labels.clone(),
         capacity_bytes: entry.registration.capacity_bytes.unwrap_or(0),
         free_bytes: entry.registration.free_bytes.unwrap_or(0),
@@ -3164,21 +3182,21 @@ fn peer_connection_candidates(
     let mut candidates = Vec::new();
     let mut seen_endpoints = BTreeSet::new();
 
-    if state.relay_mode != RelayMode::Required {
+    if state.relay_mode != RelayMode::Required && !node.relay_required() {
         push_ranked_peer_candidate(
             &mut candidates,
             &mut seen_endpoints,
-            normalize_optional_url(Some(node.internal_url.as_str())),
+            normalize_optional_url(node.peer_api_url()),
             Some(1),
         );
         push_ranked_peer_candidate(
             &mut candidates,
             &mut seen_endpoints,
-            normalize_optional_url(Some(node.public_url.as_str())),
+            normalize_optional_url(node.public_api_url()),
             Some(100),
         );
     }
-    if state.relay_mode != RelayMode::Disabled {
+    if state.relay_mode != RelayMode::Disabled && node.relay_capable() {
         for relay_url in &state.rendezvous_urls {
             let Some(endpoint) = normalize_optional_url(Some(relay_url.as_str())) else {
                 continue;
@@ -3246,7 +3264,7 @@ pub(crate) fn resolve_peer_base_url(state: &ServerState, node: &NodeDescriptor) 
             Ok(candidate.endpoint.trim_end_matches('/').to_string())
         }
         TransportPathKind::RelayTunnel => bail!(
-            "node {} requires relay peer transport, which is not implemented yet",
+            "node {} requires relay peer transport instead of a direct base URL",
             node.node_id
         ),
     }
@@ -5726,11 +5744,12 @@ async fn issue_bootstrap_bundle(
         let mut endpoints = cluster
             .list_nodes()
             .into_iter()
-            .filter(|node| !node.public_url.trim().is_empty())
-            .map(|node| BootstrapEndpoint {
-                url: node.public_url,
-                usage: Some(BootstrapEndpointUse::PublicApi),
-                node_id: Some(node.node_id),
+            .filter_map(|node| {
+                node.public_api_url().map(|url| BootstrapEndpoint {
+                    url: url.to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(node.node_id),
+                })
             })
             .collect::<Vec<_>>();
         endpoints.sort_by(|left, right| {
@@ -6470,8 +6489,11 @@ async fn local_public_enrollment_issuer_url(state: &ServerState) -> Option<Strin
     cluster
         .list_nodes()
         .into_iter()
-        .find(|node| node.node_id == state.node_id && !node.public_url.trim().is_empty())
-        .map(|node| node.public_url.trim().trim_end_matches('/').to_string())
+        .find(|node| node.node_id == state.node_id)
+        .and_then(|node| {
+            node.public_api_url()
+                .map(|url| url.trim_end_matches('/').to_string())
+        })
 }
 
 async fn apply_node_heartbeat(
@@ -6505,8 +6527,16 @@ async fn register_node(
     let mut cluster = state.cluster.lock().await;
     cluster.register_node(NodeDescriptor {
         node_id,
-        public_url: request.public_url,
-        internal_url: request.internal_url,
+        reachability: NodeReachability {
+            public_api_url: normalize_optional_url(Some(request.public_url.as_str())),
+            peer_api_url: normalize_optional_url(Some(request.internal_url.as_str())),
+            relay_required: false,
+        },
+        capabilities: NodeCapabilities {
+            public_api: !request.public_url.trim().is_empty(),
+            peer_api: !request.internal_url.trim().is_empty(),
+            relay_tunnel: false,
+        },
         labels: request.labels,
         capacity_bytes: request.capacity_bytes.unwrap_or(0),
         free_bytes: request.free_bytes.unwrap_or(0),
