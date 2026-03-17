@@ -92,6 +92,7 @@ struct ServerState {
     cluster: Arc<Mutex<ClusterService>>,
     client_auth: Arc<Mutex<ClientAuthState>>,
     public_ca_pem: Option<String>,
+    public_ca_key_pem: Option<String>,
     cluster_ca_pem: Option<String>,
     internal_ca_key_pem: Option<String>,
     rendezvous_ca_pem: Option<String>,
@@ -547,6 +548,7 @@ pub struct ServerNodeConfig {
     pub labels: HashMap<String, String>,
     pub public_tls: Option<PublicTlsConfig>,
     pub public_ca_cert_path: Option<PathBuf>,
+    pub public_ca_key_path: Option<PathBuf>,
     bootstrap_trust_roots: Option<BootstrapTrustRoots>,
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
@@ -704,10 +706,12 @@ fn materialize_node_enrollment_package(
     package.validate()?;
     let mut bootstrap = package.bootstrap;
     let data_dir = PathBuf::from(&bootstrap.data_dir);
+    let public_tls_material = package.public_tls_material;
+    let internal_tls_material = package.internal_tls_material;
 
     if let (Some(internal_tls), Some(material)) = (
         bootstrap.internal_tls.as_mut(),
-        package.internal_tls_material.as_ref(),
+        internal_tls_material.as_ref(),
     ) {
         let ca_path = resolve_materialized_path(&data_dir, &internal_tls.ca_cert_path);
         let cert_path = resolve_materialized_path(&data_dir, &internal_tls.cert_path);
@@ -731,10 +735,34 @@ fn materialize_node_enrollment_package(
         internal_tls.key_path = key_path.to_string_lossy().into_owned();
     }
 
-    if let (Some(public_ca_cert_path), Some(public_ca_pem)) = (
-        bootstrap.public_ca_cert_path.as_mut(),
-        bootstrap.trust_roots.public_api_ca_pem.as_ref(),
-    ) {
+    if let (Some(public_tls), Some(material)) =
+        (bootstrap.public_tls.as_mut(), public_tls_material.as_ref())
+    {
+        let cert_path = resolve_materialized_path(&data_dir, &public_tls.cert_path);
+        let key_path = resolve_materialized_path(&data_dir, &public_tls.key_path);
+
+        for (path, contents) in [
+            (&cert_path, material.cert_pem.as_str()),
+            (&key_path, material.key_pem.as_str()),
+        ] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed creating {}", parent.display()))?;
+            }
+            std::fs::write(path, contents)
+                .with_context(|| format!("failed writing {}", path.display()))?;
+        }
+
+        public_tls.cert_path = cert_path.to_string_lossy().into_owned();
+        public_tls.key_path = key_path.to_string_lossy().into_owned();
+    }
+
+    if let Some(public_ca_pem) = public_tls_material
+        .as_ref()
+        .map(|material| material.ca_cert_pem.as_str())
+        .or(bootstrap.trust_roots.public_api_ca_pem.as_deref())
+        && let Some(public_ca_cert_path) = bootstrap.public_ca_cert_path.as_mut()
+    {
         let public_ca_path = resolve_materialized_path(&data_dir, public_ca_cert_path);
         if let Some(parent) = public_ca_path.parent() {
             std::fs::create_dir_all(parent)
@@ -818,6 +846,7 @@ impl ServerNodeConfig {
             labels: bootstrap.labels,
             public_tls,
             public_ca_cert_path: bootstrap.public_ca_cert_path.map(PathBuf::from),
+            public_ca_key_path: None,
             bootstrap_trust_roots: Some(bootstrap.trust_roots),
             public_peer_api_enabled: bootstrap.public_peer_api_enabled,
             internal_tls,
@@ -1145,6 +1174,9 @@ impl ServerNodeConfig {
             public_ca_cert_path: std::env::var("IRONMESH_PUBLIC_TLS_CA_CERT")
                 .ok()
                 .map(PathBuf::from),
+            public_ca_key_path: std::env::var("IRONMESH_PUBLIC_TLS_CA_KEY")
+                .ok()
+                .map(PathBuf::from),
             bootstrap_trust_roots: None,
             public_peer_api_enabled,
             internal_tls,
@@ -1286,6 +1318,7 @@ impl ServerNodeConfig {
             labels,
             public_tls: None,
             public_ca_cert_path: None,
+            public_ca_key_path: None,
             bootstrap_trust_roots: None,
             public_peer_api_enabled: false,
             internal_tls: None,
@@ -1644,6 +1677,14 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             })
         })
         .transpose()?;
+    let configured_public_ca_key_pem = config
+        .public_ca_key_path
+        .clone()
+        .map(|path| {
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("failed reading public CA private key {}", path.display()))
+        })
+        .transpose()?;
 
     let public_ca_pem = config
         .public_ca_cert_path
@@ -1670,6 +1711,13 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         })
         .transpose()?
         .or(embedded_trust_roots.cluster_ca_pem.clone());
+    let public_ca_key_pem = configured_public_ca_key_pem.or_else(|| {
+        if public_ca_pem.is_none() || public_ca_pem == cluster_ca_pem {
+            internal_ca_key_pem.clone()
+        } else {
+            None
+        }
+    });
     let rendezvous_ca_pem = config
         .rendezvous_ca_cert_path
         .clone()
@@ -1720,6 +1768,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         cluster: Arc::new(Mutex::new(cluster)),
         client_auth: Arc::new(Mutex::new(persisted_client_auth)),
         public_ca_pem,
+        public_ca_key_pem,
         cluster_ca_pem,
         internal_ca_key_pem,
         rendezvous_ca_pem,
@@ -4641,6 +4690,39 @@ fn build_internal_node_subject_alt_names(
     Ok(subject_alt_names)
 }
 
+fn build_public_node_subject_alt_names(bootstrap: &TransportNodeBootstrap) -> Result<Vec<SanType>> {
+    let mut subject_alt_names = Vec::new();
+    let mut seen_dns = HashSet::new();
+    let mut seen_ips = HashSet::new();
+
+    if let Some(public_url) = bootstrap.public_url.as_deref() {
+        let parsed =
+            reqwest::Url::parse(public_url).with_context(|| format!("invalid {public_url}"))?;
+        if let Some(host) = parsed.host_str() {
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if seen_ips.insert(ip) {
+                    subject_alt_names.push(SanType::IpAddress(ip));
+                }
+            } else if seen_dns.insert(host.to_string()) {
+                subject_alt_names.push(SanType::DnsName(
+                    host.try_into().context("invalid public DNS SAN")?,
+                ));
+            }
+        }
+    }
+
+    let socket_addr = bootstrap
+        .bind_addr
+        .parse::<SocketAddr>()
+        .context("invalid node bootstrap bind_addr")?;
+    let ip = socket_addr.ip();
+    if !ip.is_unspecified() && seen_ips.insert(ip) {
+        subject_alt_names.push(SanType::IpAddress(ip));
+    }
+
+    Ok(subject_alt_names)
+}
+
 fn issue_internal_node_tls_material(
     state: &ServerState,
     bootstrap: &TransportNodeBootstrap,
@@ -4687,6 +4769,53 @@ fn issue_internal_node_tls_material(
         cert_pem: cert.pem(),
         key_pem: key_pair.serialize_pem(),
     })
+}
+
+fn issue_public_node_tls_material(
+    state: &ServerState,
+    bootstrap: &TransportNodeBootstrap,
+) -> std::result::Result<Option<BootstrapMutualTlsMaterial>, StatusCode> {
+    if bootstrap.public_tls.is_none() {
+        return Ok(None);
+    }
+    let ca_cert_pem = state
+        .public_ca_pem
+        .as_deref()
+        .or(state.cluster_ca_pem.as_deref())
+        .ok_or(StatusCode::PRECONDITION_FAILED)?;
+    let ca_key_pem = state
+        .public_ca_key_pem
+        .as_deref()
+        .or(state.internal_ca_key_pem.as_deref())
+        .ok_or(StatusCode::PRECONDITION_FAILED)?;
+
+    let issuer_key =
+        KeyPair::from_pem(ca_key_pem).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, issuer_key)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut params =
+        CertificateParams::new(Vec::new()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(
+        DnType::CommonName,
+        format!("ironmesh-public-{}", bootstrap.node_id),
+    );
+    params.is_ca = IsCa::NoCa;
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.subject_alt_names =
+        build_public_node_subject_alt_names(bootstrap).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let key_pair = KeyPair::generate().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cert = params
+        .signed_by(&key_pair, &issuer)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Some(BootstrapMutualTlsMaterial {
+        ca_cert_pem: ca_cert_pem.to_string(),
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+    }))
 }
 
 async fn issue_bootstrap_bundle(
@@ -4886,7 +5015,32 @@ async fn issue_node_enrollment(
         }
     };
 
-    let internal_tls_material = match issue_internal_node_tls_material(&state, &bootstrap) {
+    let internal_tls_material = if bootstrap.internal_tls.is_some() {
+        match issue_internal_node_tls_material(&state, &bootstrap) {
+            Ok(material) => Some(material),
+            Err(status) => {
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": "failed to issue internal node TLS material" }),
+                )
+                .await;
+                return (
+                    status,
+                    Json(json!({ "error": "failed to issue internal node TLS material" })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+    let public_tls_material = match issue_public_node_tls_material(&state, &bootstrap) {
         Ok(material) => material,
         Err(status) => {
             append_admin_audit(
@@ -4897,12 +5051,12 @@ async fn issue_node_enrollment(
                 true,
                 true,
                 "error",
-                json!({ "error": "failed to issue internal node TLS material" }),
+                json!({ "error": "failed to issue public node TLS material" }),
             )
             .await;
             return (
                 status,
-                Json(json!({ "error": "failed to issue internal node TLS material" })),
+                Json(json!({ "error": "failed to issue public node TLS material" })),
             )
                 .into_response();
         }
@@ -4910,7 +5064,8 @@ async fn issue_node_enrollment(
 
     let package = NodeEnrollmentPackage {
         bootstrap,
-        internal_tls_material: Some(internal_tls_material),
+        public_tls_material,
+        internal_tls_material,
     };
 
     if let Err(err) = package.validate() {
@@ -4943,6 +5098,7 @@ async fn issue_node_enrollment(
         json!({
             "node_id": package.bootstrap.node_id,
             "mode": package.bootstrap.mode,
+            "includes_public_tls_material": package.public_tls_material.is_some(),
         }),
     )
     .await;

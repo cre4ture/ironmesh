@@ -133,6 +133,8 @@ pub struct NodeBootstrap {
 pub struct NodeEnrollmentPackage {
     pub bootstrap: NodeBootstrap,
     #[serde(default)]
+    pub public_tls_material: Option<BootstrapMutualTlsMaterial>,
+    #[serde(default)]
     pub internal_tls_material: Option<BootstrapMutualTlsMaterial>,
 }
 
@@ -271,10 +273,21 @@ impl NodeEnrollmentPackage {
     pub fn validate(&self) -> Result<()> {
         self.bootstrap.validate()?;
         match (
+            self.bootstrap.public_tls.as_ref(),
+            self.public_tls_material.as_ref(),
+        ) {
+            (Some(_), Some(material)) => validate_tls_material("public_tls_material", material)?,
+            (Some(_), None) => bail!("node enrollment package must include public_tls_material"),
+            (None, Some(_)) => {
+                bail!("node enrollment package public_tls_material requires bootstrap.public_tls")
+            }
+            (None, None) => {}
+        }
+        match (
             self.bootstrap.internal_tls.as_ref(),
             self.internal_tls_material.as_ref(),
         ) {
-            (Some(_), Some(material)) => validate_tls_material(material),
+            (Some(_), Some(material)) => validate_tls_material("internal_tls_material", material),
             (Some(_), None) => bail!("node enrollment package must include internal_tls_material"),
             (None, Some(_)) => {
                 bail!(
@@ -408,10 +421,10 @@ fn validate_optional_server_tls_files(
     Ok(())
 }
 
-fn validate_tls_material(value: &BootstrapMutualTlsMaterial) -> Result<()> {
-    validate_required_non_empty("internal_tls_material.ca_cert_pem", &value.ca_cert_pem)?;
-    validate_required_non_empty("internal_tls_material.cert_pem", &value.cert_pem)?;
-    validate_required_non_empty("internal_tls_material.key_pem", &value.key_pem)?;
+fn validate_tls_material(field_name: &str, value: &BootstrapMutualTlsMaterial) -> Result<()> {
+    validate_required_non_empty(&format!("{field_name}.ca_cert_pem"), &value.ca_cert_pem)?;
+    validate_required_non_empty(&format!("{field_name}.cert_pem"), &value.cert_pem)?;
+    validate_required_non_empty(&format!("{field_name}.key_pem"), &value.key_pem)?;
     Ok(())
 }
 
@@ -556,6 +569,46 @@ mod tests {
                 },
                 upstream_public_url: None,
             },
+            public_tls_material: None,
+            internal_tls_material: None,
+        };
+
+        assert!(package.validate().is_err());
+    }
+
+    #[test]
+    fn node_enrollment_package_requires_public_tls_material_when_public_tls_is_present() {
+        let package = NodeEnrollmentPackage {
+            bootstrap: NodeBootstrap {
+                version: CLIENT_BOOTSTRAP_VERSION,
+                cluster_id: Uuid::now_v7(),
+                node_id: Uuid::now_v7(),
+                mode: NodeBootstrapMode::LocalEdge,
+                data_dir: "./data/node-a".to_string(),
+                bind_addr: "127.0.0.1:8080".to_string(),
+                public_url: Some("https://node-a.example".to_string()),
+                labels: HashMap::new(),
+                public_tls: Some(BootstrapServerTlsFiles {
+                    cert_path: "tls/public.pem".to_string(),
+                    key_path: "tls/public.key".to_string(),
+                }),
+                public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+                public_peer_api_enabled: false,
+                internal_bind_addr: None,
+                internal_url: None,
+                internal_tls: None,
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                direct_endpoints: Vec::new(),
+                relay_mode: RelayMode::Fallback,
+                trust_roots: BootstrapTrustRoots {
+                    cluster_ca_pem: None,
+                    public_api_ca_pem: Some("public-ca".to_string()),
+                    rendezvous_ca_pem: None,
+                },
+                upstream_public_url: None,
+            },
+            public_tls_material: None,
             internal_tls_material: None,
         };
 
