@@ -171,11 +171,11 @@ struct PathMutationRequest {
 }
 
 impl IronMeshClient {
-    pub fn new(server_base_url: impl Into<String>) -> Self {
-        Self::with_http_client(server_base_url, HttpClient::new())
+    pub fn from_direct_base_url(server_base_url: impl Into<String>) -> Self {
+        Self::from_direct_http_client(server_base_url, HttpClient::new())
     }
 
-    pub fn with_http_client(server_base_url: impl Into<String>, http: HttpClient) -> Self {
+    pub fn from_direct_http_client(server_base_url: impl Into<String>, http: HttpClient) -> Self {
         Self {
             transport: ClientTransport::Direct {
                 http,
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     fn object_url_builder_escapes_segments() {
-        let client = IronMeshClient::new("http://127.0.0.1:18080/");
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
         let url = client
             .store_key_url("read me.txt")
             .expect("object url should build");
@@ -1398,7 +1398,7 @@ mod tests {
 
     #[test]
     fn delete_url_builder_builds_expected_path() {
-        let client = IronMeshClient::new("http://127.0.0.1:18080/");
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
         let url = client.store_delete_url().expect("delete url should build");
         assert_eq!(url.as_str(), "http://127.0.0.1:18080/store/delete");
     }

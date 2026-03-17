@@ -372,7 +372,7 @@ mod tests {
         let sync_root = fresh_data_dir("cfapi-hydration-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
         let path_parts: Vec<&str> = key.split('/').collect();
         let mut current_dir = String::new();
         for dir in path_parts.iter().take(path_parts.len() - 1) {
@@ -434,7 +434,7 @@ mod tests {
         .await
         .expect("failed to register and serve CFAPI adapter");
 
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
         sdk.put(folder_key, Bytes::new())
             .await
             .expect("failed to seed remote folder marker");
@@ -504,7 +504,7 @@ mod tests {
             .expect("failed to start local server-node");
 
         let base_url = "http://127.0.0.1:19095";
-        let sdk = IronMeshClient::new(base_url);
+        let sdk = IronMeshClient::from_direct_base_url(base_url);
         let sync_root = fresh_data_dir("cfapi-local-empty-folder-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
@@ -533,7 +533,7 @@ mod tests {
             .expect("failed to start local server-node");
 
         let base_url = "http://127.0.0.1:19096";
-        let sdk = IronMeshClient::new(base_url);
+        let sdk = IronMeshClient::from_direct_base_url(base_url);
         sdk.put("rename-empty/from/", Bytes::new())
             .await
             .expect("failed to seed remote empty folder marker");
@@ -679,7 +679,7 @@ mod tests {
             let sync_root = fresh_data_dir("cfapi-in-sync-state-sync-root");
             std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
-            let sdk = IronMeshClient::new(&base_url);
+            let sdk = IronMeshClient::from_direct_base_url(&base_url);
             sdk.put_large_aware("sync-status/check.txt", Bytes::from_static(b"remote seed"))
                 .await
                 .expect("failed to seed remote object");
@@ -734,7 +734,7 @@ mod tests {
             let sync_root = fresh_data_dir("cfapi-overwrite-quiet-period-sync-root");
             std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
-            let sdk = IronMeshClient::new(&base_url);
+            let sdk = IronMeshClient::from_direct_base_url(&base_url);
             sdk.put_large_aware(
                 "overwrite/check.txt",
                 Bytes::from_static(b"original remote"),
@@ -806,7 +806,7 @@ mod tests {
             let sync_root = fresh_data_dir("cfapi-overwrite-uploaded-file-sync-root");
             std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
-            let sdk = IronMeshClient::new(&base_url);
+            let sdk = IronMeshClient::from_direct_base_url(&base_url);
             let _adapter = start_cfapi_adapter(
                 "ironmesh.systemtest.overwrite.uploaded.file",
                 "ironmesh System Test Overwrite Uploaded File",

@@ -55,7 +55,7 @@ pub fn build_http_client_from_pem(
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let http = build_reqwest_client_from_pem(server_ca_pem)?;
 
-    let client = IronMeshClient::with_http_client(base_url.as_str(), http);
+    let client = IronMeshClient::from_direct_http_client(base_url.as_str(), http);
     Ok(match bearer_token.as_ref() {
         Some(token) => client.with_bearer_token(token.clone()),
         None => client,
@@ -70,8 +70,10 @@ pub fn build_http_client_with_identity_from_pem(
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let http = build_reqwest_client_from_pem(server_ca_pem)?;
-    Ok(IronMeshClient::with_http_client(base_url.as_str(), http)
-        .with_client_identity(identity.clone()))
+    Ok(
+        IronMeshClient::from_direct_http_client(base_url.as_str(), http)
+            .with_client_identity(identity.clone()),
+    )
 }
 
 pub fn build_http_client_with_identity_from_planned_target(

@@ -16,14 +16,17 @@ pub struct ClientNode {
 
 impl ClientNode {
     pub fn from_direct_base_url(server_base_url: impl Into<String>) -> Self {
-        Self::with_client(IronMeshClient::new(server_base_url))
+        Self::with_client(IronMeshClient::from_direct_base_url(server_base_url))
     }
 
     pub fn from_direct_http_client(
         server_base_url: impl Into<String>,
         http: reqwest::Client,
     ) -> Self {
-        Self::with_client(IronMeshClient::with_http_client(server_base_url, http))
+        Self::with_client(IronMeshClient::from_direct_http_client(
+            server_base_url,
+            http,
+        ))
     }
 
     pub fn with_client(client: IronMeshClient) -> Self {

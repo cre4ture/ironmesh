@@ -461,7 +461,7 @@ async fn folder_agent_bootstrap_materializes_remote_tree() -> Result<()> {
     let local_root = fresh_data_dir("folder-agent-bootstrap-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware(
@@ -512,7 +512,7 @@ async fn folder_agent_uploads_local_files_and_empty_directory_markers() -> Resul
     let local_root = fresh_data_dir("folder-agent-upload-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         let mut agent = start_folder_agent(&base_url, &local_root, None, 250, 250, true).await?;
@@ -547,7 +547,7 @@ async fn folder_agent_applies_remote_add_update_delete_without_restart() -> Resu
     let local_root = fresh_data_dir("folder-agent-remote-refresh-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("live/item.txt", Bytes::from_static(b"version-one"))
@@ -592,7 +592,7 @@ async fn folder_agent_run_once_bootstraps_and_exits() -> Result<()> {
     let local_root = fresh_data_dir("folder-agent-run-once-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("once/seed.txt", Bytes::from_static(b"seed-remote"))
@@ -623,7 +623,7 @@ async fn folder_agent_propagates_local_file_deletions_to_remote() -> Result<()> 
     let local_root = fresh_data_dir("folder-agent-delete-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("delete-me/target.txt", Bytes::from_static(b"to-delete"))
@@ -660,7 +660,7 @@ async fn folder_agent_detects_remote_add_and_modify_done_while_stopped_after_res
     let local_root = fresh_data_dir("folder-agent-restart-remote-change-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware(
@@ -727,7 +727,7 @@ async fn folder_agent_detects_local_add_and_modify_done_while_stopped_after_rest
     let local_root = fresh_data_dir("folder-agent-restart-local-change-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         fs::create_dir_all(local_root.join("local-offline")).with_context(|| {
@@ -807,7 +807,7 @@ async fn folder_agent_prefix_scope_maps_local_root_to_selected_remote_subtree() 
     let scope_prefix = "scoped/team-a";
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("scoped/team-a/seed.txt", Bytes::from_static(b"scoped-seed"))
@@ -869,7 +869,7 @@ async fn folder_agent_nested_prefix_uploads_camera_files_under_full_scope() -> R
     let scope_prefix = "cameras/vm1";
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware(
@@ -941,7 +941,7 @@ async fn folder_agent_recovers_local_offline_changes_after_unfriendly_stop() -> 
     let local_root = fresh_data_dir("folder-agent-unfriendly-stop-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         fs::create_dir_all(local_root.join("crash-case")).with_context(|| {
@@ -1019,7 +1019,7 @@ async fn folder_agent_applies_path_level_recovery_when_baseline_row_is_missing()
     let local_root = fresh_data_dir("folder-agent-path-recovery-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("path-recovery/a.txt", Bytes::from_static(b"remote-a-v1"))
@@ -1083,7 +1083,7 @@ async fn folder_agent_respects_remote_delete_intent_for_unchanged_local_after_re
     let local_root = fresh_data_dir("folder-agent-remote-delete-intent-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("delete-intent/target.txt", Bytes::from_static(b"remote-v1"))
@@ -1128,7 +1128,7 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_is_missing(
     let local_root = fresh_data_dir("folder-agent-dual-modify-conflict-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("conflict/x.txt", Bytes::from_static(b"remote-v1"))
@@ -1209,7 +1209,7 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_exists() ->
     let local_root = fresh_data_dir("folder-agent-dual-modify-conflict-baseline-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("conflict2/y.txt", Bytes::from_static(b"remote-v1"))
@@ -1288,7 +1288,7 @@ async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result
     let local_root = fresh_data_dir("folder-agent-crash-active-write-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         let large_payload = vec![b'x'; 2 * 1024 * 1024];
@@ -1429,7 +1429,7 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
     let local_root = fresh_data_dir("folder-agent-partial-download-artifacts-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware(
@@ -1535,7 +1535,7 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
     let local_root = fresh_data_dir("folder-agent-conflict-copy-crash-root");
 
     let mut server = start_server(bind).await?;
-    let sdk = IronMeshClient::new(&base_url);
+    let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
     let result = async {
         sdk.put_large_aware("conflict-copy/target.bin", Bytes::from_static(b"remote-v1"))

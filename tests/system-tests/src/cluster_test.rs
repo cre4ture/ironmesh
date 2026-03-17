@@ -1519,7 +1519,7 @@ mod tests {
     async fn recursive_directory_delete_query_removes_remote_subtree() -> Result<()> {
         let bind = "127.0.0.1:19146";
         let base_url = format!("http://{bind}");
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
         let mut server = start_server(bind).await?;
 
         let result = async {

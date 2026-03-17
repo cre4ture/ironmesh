@@ -427,7 +427,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-live-mount");
         let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             sdk.put_large_aware(seed_key, Bytes::from(seed_payload.clone()))
@@ -472,7 +472,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-nested-folders");
         let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let nested_steps = vec![
             ("l1", "l1/small-l1.txt", b"upload-l1".to_vec()),
@@ -616,8 +616,8 @@ mod tests {
 
         let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 2, &extra_env).await?;
         let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 2, &extra_env).await?;
-        let sdk_a = IronMeshClient::new(&base_a);
-        let sdk_b = IronMeshClient::new(&base_b);
+        let sdk_a = IronMeshClient::from_direct_base_url(&base_a);
+        let sdk_b = IronMeshClient::from_direct_base_url(&base_b);
         let http = reqwest::Client::new();
 
         let result = async {
@@ -694,7 +694,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-empty-folder");
         let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             // Seed one remote file so we have a deterministic mount-readiness probe.
@@ -748,7 +748,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-refresh");
         let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             sdk.put_large_aware("seed-refresh.txt", Bytes::from_static(b"seed-refresh"))
@@ -807,7 +807,7 @@ mod tests {
         let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
         let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
         let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             sdk.put_large_aware("seed-refresh.txt", Bytes::from_static(b"seed-refresh"))
@@ -893,7 +893,7 @@ mod tests {
         let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
         let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
         let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             sdk.put_large_aware(
@@ -947,7 +947,7 @@ mod tests {
                 wait_for_file_bytes(&mounted_remote_file, &remote_file_payload, 40).await?;
 
                 sdk.delete_path(&remote_file).await?;
-                let local_edge_sdk = IronMeshClient::new(&local_edge_base_url);
+                let local_edge_sdk = IronMeshClient::from_direct_base_url(&local_edge_base_url);
                 wait_for_remote_file_absence(&local_edge_sdk, &remote_file, 80).await?;
                 for _ in 0..260 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
@@ -983,7 +983,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-update-refresh");
         let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             let remote_key = "live-refresh/updated.txt";
@@ -1024,7 +1024,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-size-reporting");
         let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             let size_probe_payload = b"size-probe-remote-file".to_vec();
@@ -1075,7 +1075,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-local-rename-move");
         let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             sdk.put_large_aware(
@@ -1232,7 +1232,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-rename-move");
         let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             sdk.put_large_aware(
@@ -1330,7 +1330,7 @@ mod tests {
         let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
         let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
         let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             sdk.put_large_aware(
@@ -1351,7 +1351,7 @@ mod tests {
                 wait_for_mount_active(&mountpoint, 150).await?;
                 let local_edge_base_url =
                     wait_for_file_text(&local_edge_base_url_file, 150).await?;
-                let local_edge_sdk = IronMeshClient::new(&local_edge_base_url);
+                let local_edge_sdk = IronMeshClient::from_direct_base_url(&local_edge_base_url);
                 for _ in 0..220 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
                     if seed_path.is_file() {
@@ -1442,7 +1442,7 @@ mod tests {
             start_server_with_env(bind, &upstream_data_dir, node_id, 1, &extra_env).await?;
 
         let base_url = format!("http://{bind}");
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             let mut adapter = start_linux_fuse_adapter_with_local_edge(

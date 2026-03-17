@@ -143,7 +143,7 @@ impl RemoteSnapshotFetcher {
         depth: usize,
         snapshot: Option<String>,
     ) -> Self {
-        let client = IronMeshClient::new(base_url);
+        let client = IronMeshClient::from_direct_base_url(base_url);
         let scope = RemoteSnapshotScope::new(prefix, depth, snapshot);
         Self::new(client, scope)
     }

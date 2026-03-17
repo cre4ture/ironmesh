@@ -171,7 +171,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mut server = start_server(bind).await?;
 
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             let direct_report = sdk
@@ -253,7 +253,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mut server = start_server(bind).await?;
 
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             let small_bytes_payload = Bytes::from_static(b"bytes-small-upload");
@@ -359,7 +359,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mut server = start_server(bind).await?;
 
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
         let http = reqwest::Client::new();
 
         let result = async {
@@ -458,7 +458,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mut server = start_server(bind).await?;
 
-        let sdk = IronMeshClient::new(&base_url);
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             assert!(sdk.get("missing-key").await.is_err());

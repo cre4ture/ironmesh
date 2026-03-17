@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn delete_remote_file_skips_empty_local_root_mapping() {
         let scope = PathScope::new(Some("cameras/vm1".to_string()));
-        let client = IronMeshClient::new("http://127.0.0.1:65535");
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:65535");
         delete_remote_file(&client, &scope, "").unwrap();
     }
 
