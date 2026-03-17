@@ -78,7 +78,7 @@ class MainViewModel(
         val persistedProfiles = IronmeshPreferences.getFolderSyncConfigs(getApplication())
         val persistedDeviceAuth = IronmeshPreferences.getDeviceAuthState(getApplication())
         uiState.value = uiState.value.copy(
-            baseUrl = persistedDeviceAuth.serverBaseUrl.ifBlank { persistedBaseUrl },
+            baseUrl = persistedBaseUrl,
             syncProfiles = persistedProfiles,
             deviceAuthState = persistedDeviceAuth,
             deviceLabelInput = persistedDeviceAuth.label.orEmpty(),
@@ -111,7 +111,7 @@ class MainViewModel(
     fun putObject() {
         execute("Uploading object...") {
             val statusCode = repository.putObject(
-                currentBaseUrl(),
+                currentConnectionInput(),
                 uiState.value.key,
                 uiState.value.payload,
                 currentServerCaPem(),
@@ -124,7 +124,7 @@ class MainViewModel(
     fun getObject() {
         execute("Downloading object...") {
             val body = repository.getObject(
-                currentBaseUrl(),
+                currentConnectionInput(),
                 uiState.value.key,
                 serverCaPem = currentServerCaPem(),
                 clientIdentityJson = currentClientIdentityJson(),
@@ -261,7 +261,7 @@ class MainViewModel(
     }
 
     fun startWebUi() {
-        val baseUrl = currentBaseUrl()
+        val connectionInput = currentConnectionInput()
         val clientIdentityJson = currentClientIdentityJson()
         uiState.value = uiState.value.copy(
             loading = true,
@@ -271,7 +271,11 @@ class MainViewModel(
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    repository.startWebUi(baseUrl, currentServerCaPem(), clientIdentityJson)
+                    repository.startWebUi(
+                        connectionInput,
+                        currentServerCaPem(),
+                        clientIdentityJson,
+                    )
                 }
             }
                 .onSuccess { url ->
@@ -311,10 +315,8 @@ class MainViewModel(
             }
                 .onSuccess { authState ->
                     IronmeshPreferences.setDeviceAuthState(getApplication(), authState)
-                    IronmeshPreferences.setBaseUrl(getApplication(), authState.serverBaseUrl)
                     uiState.value = uiState.value.copy(
                         loading = false,
-                        baseUrl = authState.serverBaseUrl,
                         deviceAuthState = authState,
                         bootstrapInput = "",
                         deviceLabelInput = authState.label.orEmpty(),
@@ -391,8 +393,8 @@ class MainViewModel(
         return uiState.value.deviceAuthState.toClientIdentityJson()
     }
 
-    private fun currentBaseUrl(): String {
-        return uiState.value.deviceAuthState.serverBaseUrl.ifBlank { uiState.value.baseUrl }
+    private fun currentConnectionInput(): String {
+        return uiState.value.deviceAuthState.preferredConnectionInput(uiState.value.baseUrl)
     }
 
     private fun currentServerCaPem(): String? {

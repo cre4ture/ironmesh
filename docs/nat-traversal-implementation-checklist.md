@@ -21,12 +21,12 @@ Status: Concrete repo-mapped implementation plan for the target architecture
 Use this section as the current source of truth for remaining work. The detailed checklist below still contains older task wording and should be reconciled over time.
 
 1. Client transport target model and relay-capable client sessions. Status: in progress.
-   The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs, `IronMeshClient` can execute relay-backed requests through rendezvous for the non-mTLS client path, enrolled client devices can now use relay against an mTLS-required rendezvous service when enrollment provided a rendezvous client TLS identity, the shared sync-agent plus Linux FUSE startup paths can now build clients directly from bootstrap artifacts instead of collapsing them to one direct URL up front, and Windows CFAPI now preserves bootstrap metadata and builds its runtime fetcher/hydrator/uploader from a bootstrap-aware client rather than re-resolving everything to a direct URL.
-   Remaining work: thread the same bootstrap-driven relay-capable client construction through the remaining mobile/iOS direct-storage entry points, then reduce the remaining direct-resolution compatibility paths and helper APIs.
+   The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs, `IronMeshClient` can execute relay-backed requests through rendezvous for the non-mTLS client path, enrolled client devices can now use relay against an mTLS-required rendezvous service when enrollment provided a rendezvous client TLS identity, the shared sync-agent plus Linux FUSE startup paths can now build clients directly from bootstrap artifacts instead of collapsing them to one direct URL up front, Windows CFAPI now preserves bootstrap metadata and builds its runtime fetcher/hydrator/uploader from a bootstrap-aware client rather than re-resolving everything to a direct URL, and Android now persists bootstrap plus client identity material and uses bootstrap-aware clients for object operations, folder sync, SAF access, and the embedded web UI.
+   Remaining work: reduce the remaining direct-resolution compatibility paths and helper APIs, then decide whether the currently dummy iOS wrapper should be brought up to the same bootstrap-first shape now or later.
 2. Remove the legacy direct-upstream path from server-node.
    Remaining work: retire `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, and `refresh_upstream_peer(...)` once rendezvous-first startup is the only supported peer discovery path.
 3. Finish removing `base_url` plus `device_token`-shaped app models.
-   Remaining work: clean up the remaining compatibility surfaces in `client-sdk`, Android, iOS, and helper apps so persisted client state is identity-first rather than URL-plus-token-first.
+   Remaining work: clean up the remaining compatibility surfaces in `client-sdk`, iOS, and helper apps so persisted client state is identity-first rather than URL-plus-token-first. Android and Windows are now on bootstrap plus client-identity persisted state.
 4. Replace the old reachability model in cluster state.
    Remaining work: stop projecting everything into `NodeDescriptor { public_url, internal_url, ... }` and move to stable identity plus dynamic reachability/capability records.
 5. Refresh tests and operational docs to match the real implementation state.
@@ -225,9 +225,9 @@ Recommended responsibilities:
 
 ### `apps/android-app`
 
-- [ ] Replace `apps/android-app/src/lib.rs` JNI APIs that currently take `base_url`, `server_ca_pem`, and `auth_token` with bootstrap- or identity-based configuration.
-- [ ] Replace `BootstrapEnrollmentResult` handling so Android persists client identity material, not a device token.
-- [ ] Update `apps/android-app/app/src/main/java/io/ironmesh/android/data/IronmeshRepository.kt` data models to store rendezvous/bootstrap identity state instead of `server_base_url + device_token`.
+- [x] Replace `apps/android-app/src/lib.rs` JNI APIs that currently take `base_url`, `server_ca_pem`, and `auth_token` with bootstrap- or identity-based configuration.
+- [x] Replace `BootstrapEnrollmentResult` handling so Android persists client identity material, not a device token.
+- [x] Update `apps/android-app/app/src/main/java/io/ironmesh/android/data/IronmeshRepository.kt` data models to store rendezvous/bootstrap identity state instead of `server_base_url + device_token`.
 
 ### `crates/server-node-sdk/src/ui`
 
@@ -295,7 +295,7 @@ This is implementation order, not product rollout order.
   - two server nodes can replicate through relay-only paths,
   - direct path is preferred when available and relay is used after forced failure.
 - [x] Update Windows CFAPI tests so they consume the persisted client identity artifact instead of expecting a `device_token`.
-- [ ] Update Android-facing tests and helpers once the JNI and repository models change.
+- [ ] Update Android-facing tests and helpers to cover bootstrap-aware app/runtime flows and relay-capable connection inputs.
 
 ## 10. Current code that can be deleted after the replacement lands
 

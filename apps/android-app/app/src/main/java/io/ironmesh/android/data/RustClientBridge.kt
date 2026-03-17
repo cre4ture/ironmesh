@@ -17,7 +17,7 @@ object RustClientBridge {
 
     @JvmStatic
     external fun putObject(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         payload: ByteArray,
         serverCaPem: String?,
@@ -26,7 +26,7 @@ object RustClientBridge {
 
     @JvmStatic
     external fun getObject(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         snapshot: String?,
         version: String?,
@@ -36,7 +36,7 @@ object RustClientBridge {
 
     @JvmStatic
     external fun storeIndex(
-        baseUrl: String,
+        connectionInput: String,
         prefix: String?,
         depth: Int,
         snapshot: String?,
@@ -46,7 +46,7 @@ object RustClientBridge {
 
     @JvmStatic
     external fun streamPutObject(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         input: InputStream,
         serverCaPem: String?,
@@ -55,7 +55,7 @@ object RustClientBridge {
 
     @JvmStatic
     external fun deleteObject(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         serverCaPem: String?,
         clientIdentityJson: String?,
@@ -63,7 +63,7 @@ object RustClientBridge {
 
     @JvmStatic
     external fun streamObjectTo(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         output: OutputStream,
         snapshot: String?,
@@ -74,7 +74,7 @@ object RustClientBridge {
 
     @JvmStatic
     external fun streamRelativeUrlTo(
-        baseUrl: String,
+        connectionInput: String,
         relativeUrl: String,
         output: OutputStream,
         serverCaPem: String?,
@@ -83,14 +83,14 @@ object RustClientBridge {
 
     @JvmStatic
     external fun startWebUi(
-        baseUrl: String,
+        connectionInput: String,
         serverCaPem: String?,
         clientIdentityJson: String?,
     ): String
 
     @JvmStatic
     external fun runFolderSyncOnce(
-        baseUrl: String,
+        connectionInput: String,
         localFolder: String,
         localFolderTreeUri: String?,
         prefix: String?,
@@ -103,7 +103,7 @@ object RustClientBridge {
     external fun startContinuousFolderSync(
         profileId: String,
         label: String,
-        baseUrl: String,
+        connectionInput: String,
         localFolder: String,
         localFolderTreeUri: String?,
         prefix: String?,

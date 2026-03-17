@@ -59,7 +59,7 @@ impl LocalEntryState {
 
 pub type LocalTreeState = BTreeMap<String, LocalEntryState>;
 
-pub(crate) fn build_configured_client(
+pub fn build_configured_client(
     server_base_url: Option<&str>,
     client_bootstrap_json: Option<&str>,
     server_ca_pem: Option<&str>,
@@ -97,7 +97,7 @@ pub(crate) fn build_configured_client(
     }
 }
 
-pub(crate) fn describe_connection_target(
+pub fn describe_connection_target(
     server_base_url: Option<&str>,
     client_bootstrap_json: Option<&str>,
 ) -> Result<String> {

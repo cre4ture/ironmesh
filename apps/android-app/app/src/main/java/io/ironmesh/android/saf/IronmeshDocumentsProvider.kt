@@ -118,7 +118,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         val key = buildChildPath(parent.path, displayName)
         runBlocking {
             repository.putObjectBytes(
-                resolveBaseUrl(),
+                resolveConnectionInput(),
                 key,
                 ByteArray(0),
                 resolveServerCaPem(),
@@ -147,7 +147,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
                     runBlocking {
                         repository.streamPutObject(
-                            resolveBaseUrl(),
+                            resolveConnectionInput(),
                             target.path,
                             input,
                             resolveServerCaPem(),
@@ -168,7 +168,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                     try {
                         runBlocking {
                             repository.streamObjectTo(
-                                resolveBaseUrl(),
+                                resolveConnectionInput(),
                                 target.path,
                                 output,
                                 serverCaPem = resolveServerCaPem(),
@@ -212,7 +212,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                     try {
                         runBlocking {
                             repository.streamRelativeUrlTo(
-                                resolveBaseUrl(),
+                                resolveConnectionInput(),
                                 thumbnailUrl,
                                 output,
                                 resolveServerCaPem(),
@@ -267,7 +267,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
 
     private suspend fun loadDirectoryEntries(prefix: String?): List<StoreIndexEntry> {
         val entries = repository.storeIndex(
-            baseUrl = resolveBaseUrl(),
+            connectionInput = resolveConnectionInput(),
             prefix = prefix,
             depth = 1,
             snapshot = null,
@@ -313,11 +313,10 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         return parts.takeIf { it.isNotEmpty() }?.joinToString(" - ")
     }
 
-    private fun resolveBaseUrl(): String {
+    private fun resolveConnectionInput(): String {
         val context = context ?: return IronmeshPreferences.DEFAULT_BASE_URL
         val auth = IronmeshPreferences.getDeviceAuthState(context)
-        val baseUrl = auth.serverBaseUrl.ifBlank { IronmeshPreferences.getBaseUrl(context) }
-        return repository.sanitizeBaseUrl(baseUrl)
+        return auth.preferredConnectionInput(IronmeshPreferences.getBaseUrl(context))
     }
 
     private fun resolveClientIdentityJson(): String? {

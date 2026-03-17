@@ -9,19 +9,24 @@ import java.io.OutputStream
 
 data class BootstrapEnrollmentData(
     val cluster_id: String,
-    val server_base_url: String,
-    val server_ca_pem: String? = null,
     val device_id: String,
-    val device_token: String,
     val label: String? = null,
     val public_key_pem: String,
     val private_key_pem: String,
     val credential_pem: String,
+    val rendezvous_client_identity_pem: String? = null,
+    val server_base_url: String? = null,
+    val server_ca_pem: String? = null,
 )
 
 class IronmeshRepository {
     private fun normalizedClientIdentityJson(clientIdentityJson: String?): String? {
         return clientIdentityJson?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun normalizedConnectionInput(connectionInput: String): String {
+        val trimmed = connectionInput.trim()
+        return if (trimmed.startsWith("{")) trimmed else sanitizeBaseUrl(trimmed)
     }
 
     fun sanitizeBaseUrl(input: String): String {
@@ -55,25 +60,26 @@ class IronmeshRepository {
         return DeviceAuthState(
             clusterId = enrolled.cluster_id,
             deviceId = enrolled.device_id,
-            deviceToken = enrolled.device_token,
             label = enrolled.label,
-            serverBaseUrl = enrolled.server_base_url,
+            connectionBootstrapJson = bootstrapJson.trim(),
+            serverBaseUrl = enrolled.server_base_url.orEmpty(),
             serverCaPem = enrolled.server_ca_pem,
             publicKeyPem = enrolled.public_key_pem,
             privateKeyPem = enrolled.private_key_pem,
             credentialPem = enrolled.credential_pem,
+            rendezvousClientIdentityPem = enrolled.rendezvous_client_identity_pem,
         )
     }
 
     suspend fun putObject(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         payload: String,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): Int {
         return RustClientBridge.putObject(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             key,
             payload.toByteArray(Charsets.UTF_8),
             serverCaPem,
@@ -82,7 +88,7 @@ class IronmeshRepository {
     }
 
     suspend fun getObject(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         snapshot: String? = null,
         version: String? = null,
@@ -90,7 +96,7 @@ class IronmeshRepository {
         clientIdentityJson: String? = null,
     ): String {
         val bytes = getObjectBytes(
-            baseUrl,
+            connectionInput,
             key,
             snapshot,
             version,
@@ -101,7 +107,7 @@ class IronmeshRepository {
     }
 
     suspend fun storeIndex(
-        baseUrl: String,
+        connectionInput: String,
         prefix: String? = null,
         depth: Int = 1,
         snapshot: String? = null,
@@ -109,7 +115,7 @@ class IronmeshRepository {
         clientIdentityJson: String? = null,
     ): List<StoreIndexEntry> {
         val responseJson = RustClientBridge.storeIndex(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             prefix,
             depth.coerceAtLeast(1),
             snapshot,
@@ -121,14 +127,14 @@ class IronmeshRepository {
     }
 
     suspend fun putObjectBytes(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         payload: ByteArray,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): Int {
         return RustClientBridge.putObject(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             key,
             payload,
             serverCaPem,
@@ -137,14 +143,14 @@ class IronmeshRepository {
     }
 
     suspend fun streamPutObject(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         input: InputStream,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): Int {
         return RustClientBridge.streamPutObject(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             key,
             input,
             serverCaPem,
@@ -153,13 +159,13 @@ class IronmeshRepository {
     }
 
     suspend fun deleteObject(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): Int {
         return RustClientBridge.deleteObject(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             key,
             serverCaPem,
             normalizedClientIdentityJson(clientIdentityJson),
@@ -167,7 +173,7 @@ class IronmeshRepository {
     }
 
     suspend fun getObjectBytes(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         snapshot: String? = null,
         version: String? = null,
@@ -175,7 +181,7 @@ class IronmeshRepository {
         clientIdentityJson: String? = null,
     ): ByteArray {
         return RustClientBridge.getObject(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             key,
             snapshot,
             version,
@@ -185,7 +191,7 @@ class IronmeshRepository {
     }
 
     suspend fun streamObjectTo(
-        baseUrl: String,
+        connectionInput: String,
         key: String,
         output: OutputStream,
         snapshot: String? = null,
@@ -194,7 +200,7 @@ class IronmeshRepository {
         clientIdentityJson: String? = null,
     ) {
         RustClientBridge.streamObjectTo(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             key,
             output,
             snapshot,
@@ -205,14 +211,14 @@ class IronmeshRepository {
     }
 
     suspend fun streamRelativeUrlTo(
-        baseUrl: String,
+        connectionInput: String,
         relativeUrl: String,
         output: OutputStream,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ) {
         RustClientBridge.streamRelativeUrlTo(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             relativeUrl,
             output,
             serverCaPem,
@@ -221,19 +227,19 @@ class IronmeshRepository {
     }
 
     fun startWebUi(
-        baseUrl: String,
+        connectionInput: String,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): String {
         return RustClientBridge.startWebUi(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             serverCaPem,
             normalizedClientIdentityJson(clientIdentityJson),
         )
     }
 
     suspend fun runFolderSyncOnce(
-        baseUrl: String,
+        connectionInput: String,
         localFolder: String,
         localFolderTreeUri: String? = null,
         prefix: String? = null,
@@ -242,7 +248,7 @@ class IronmeshRepository {
         clientIdentityJson: String? = null,
     ) {
         RustClientBridge.runFolderSyncOnce(
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             localFolder,
             localFolderTreeUri,
             prefix,
@@ -255,7 +261,7 @@ class IronmeshRepository {
     fun startContinuousFolderSync(
         profileId: String,
         label: String,
-        baseUrl: String,
+        connectionInput: String,
         localFolder: String,
         localFolderTreeUri: String? = null,
         prefix: String? = null,
@@ -266,7 +272,7 @@ class IronmeshRepository {
         RustClientBridge.startContinuousFolderSync(
             profileId,
             label,
-            sanitizeBaseUrl(baseUrl),
+            normalizedConnectionInput(connectionInput),
             localFolder,
             localFolderTreeUri,
             prefix,

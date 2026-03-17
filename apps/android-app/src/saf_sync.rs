@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
-    build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    normalize_server_base_url,
 };
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
@@ -20,10 +18,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_agent_core::{
     FolderAgentRuntimeOptions, FolderAgentRuntimeStatus, FolderAgentStatusCallback, LocalEntryKind,
     LocalEntryState, LocalTreeState, PathScope, RemoteTreeIndex, StartupStateStore,
-    delete_remote_file, diff_local_trees, load_local_baseline_hashes_with_retries,
-    load_local_baseline_with_retries, parent_directories, remote_file_hashes_by_local_path,
-    remote_file_paths_by_local_path, startup_add_delete_conflicts,
-    startup_baseline_state_from_remote_index,
+    build_configured_client, delete_remote_file, describe_connection_target, diff_local_trees,
+    load_local_baseline_hashes_with_retries, load_local_baseline_with_retries, parent_directories,
+    remote_file_hashes_by_local_path, remote_file_paths_by_local_path,
+    startup_add_delete_conflicts, startup_baseline_state_from_remote_index,
 };
 use sync_core::{EntryKind, SyncSnapshot};
 
@@ -90,32 +88,14 @@ fn optional_tree_uri(options: &FolderAgentRuntimeOptions) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("SAF runtime requires a non-empty local_tree_uri"))
 }
 
-fn configured_client(
-    base_url: &str,
-    options: &FolderAgentRuntimeOptions,
-) -> Result<IronMeshClient> {
-    let server_ca_pem = normalized_optional_string(options.server_ca_pem.as_deref());
-    let client_identity = normalized_optional_string(options.client_identity_json.as_deref())
-        .map(|raw| client_sdk::ClientIdentityMaterial::from_json_str(&raw))
-        .transpose()
-        .context("failed to parse SAF folder sync client identity")?;
-    match client_identity.as_ref() {
-        Some(identity) => {
-            build_http_client_with_identity_from_pem(server_ca_pem.as_deref(), base_url, identity)
-        }
-        None => build_http_client_from_pem(server_ca_pem.as_deref(), base_url, &None),
-    }
-}
-
-fn normalized_optional_string(value: Option<&str>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
+fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClient> {
+    build_configured_client(
+        options.server_base_url.as_deref(),
+        options.client_bootstrap_json.as_deref(),
+        options.server_ca_pem.as_deref(),
+        options.client_identity_json.as_deref(),
+    )
+    .context("failed to build SAF folder sync client")
 }
 
 fn emit_status(
@@ -1042,15 +1022,14 @@ pub(crate) fn run_saf_folder_agent_with_control(
     let tree_uri = optional_tree_uri(options)?;
     let _tree_observer_guard = SafTreeObserverGuard::new(tree_uri)?;
     let scope = PathScope::new(options.prefix.clone());
-    let base_url = normalize_server_base_url(
-        options
-            .server_base_url
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("SAF runtime requires server_base_url"))?,
-    )?;
+    let connection_target = describe_connection_target(
+        options.server_base_url.as_deref(),
+        options.client_bootstrap_json.as_deref(),
+    )
+    .context("SAF runtime requires server_base_url or client_bootstrap_json")?;
     let state_store =
-        StartupStateStore::new(&state_identity_root(tree_uri), &scope, base_url.as_str());
-    let client = configured_client(base_url.as_str(), options)?;
+        StartupStateStore::new(&state_identity_root(tree_uri), &scope, &connection_target);
+    let client = configured_client(options)?;
     let snapshot_scope = RemoteSnapshotScope::new(
         scope.remote_prefix().map(ToString::to_string),
         options.depth,
