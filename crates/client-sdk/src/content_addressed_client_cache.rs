@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use uuid::Uuid;
 
+use crate::bootstrap::ConnectionBootstrap;
 use crate::ironmesh_client::{IronMeshClient, UploadResult};
+use transport_sdk::ClientIdentityMaterial;
 
 const CACHE_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
 
@@ -60,6 +62,15 @@ struct GarbageCollectionPlan {
 }
 
 impl ContentAddressedClientCache {
+    pub fn from_bootstrap(
+        bootstrap: &ConnectionBootstrap,
+        identity: Option<&ClientIdentityMaterial>,
+        storage_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let client = bootstrap.build_client_with_optional_identity(identity)?;
+        Self::with_client(client, storage_path)
+    }
+
     pub fn new(
         server_base_url: impl Into<String>,
         storage_path: impl Into<PathBuf>,

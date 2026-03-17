@@ -1,3 +1,4 @@
+use crate::bootstrap::ConnectionBootstrap;
 use crate::ironmesh_client::IronMeshClient;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,6 +8,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use sync_core::{EntryKind, SyncSnapshot};
+use transport_sdk::ClientIdentityMaterial;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteSyncStrategy {
@@ -121,6 +123,18 @@ pub struct RemoteSnapshotFetcher {
 impl RemoteSnapshotFetcher {
     pub fn new(client: IronMeshClient, scope: RemoteSnapshotScope) -> Self {
         Self { client, scope }
+    }
+
+    pub fn from_bootstrap(
+        bootstrap: &ConnectionBootstrap,
+        identity: Option<&ClientIdentityMaterial>,
+        prefix: Option<String>,
+        depth: usize,
+        snapshot: Option<String>,
+    ) -> Result<Self> {
+        let client = bootstrap.build_client_with_optional_identity(identity)?;
+        let scope = RemoteSnapshotScope::new(prefix, depth, snapshot);
+        Ok(Self::new(client, scope))
     }
 
     pub fn from_base_url(
@@ -363,7 +377,34 @@ fn sleep_until_or_stop(duration: Duration, running: &AtomicBool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::changed_paths_between;
+    use super::*;
+    use axum::{Json, Router, routing::get};
+    use common::ClusterId;
     use sync_core::{NamespaceEntry, SyncSnapshot};
+    use transport_sdk::{BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, RelayMode};
+
+    fn sample_bootstrap(base_url: &str) -> ConnectionBootstrap {
+        ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id: ClusterId::now_v7(),
+            rendezvous_urls: vec![base_url.to_string()],
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: base_url.to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+        }
+    }
 
     #[test]
     fn changed_paths_between_detects_add_update_delete() {
@@ -420,5 +461,60 @@ mod tests {
         let changed = changed_paths_between(&previous, &current);
 
         assert_eq!(changed, vec!["docs/readme.md".to_string()]);
+    }
+
+    #[test]
+    fn remote_snapshot_fetcher_from_bootstrap_builds_transport_aware_client() {
+        async fn health() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "ok": true }))
+        }
+
+        async fn store_index() -> Json<crate::ironmesh_client::StoreIndexResponse> {
+            Json(crate::ironmesh_client::StoreIndexResponse {
+                prefix: String::new(),
+                depth: 1,
+                entry_count: 0,
+                entries: Vec::new(),
+            })
+        }
+
+        let router = Router::new()
+            .route("/health", get(health))
+            .route("/store/index", get(store_index));
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener should bind");
+                let addr = listener.local_addr().expect("listener addr");
+                addr_tx.send(addr).expect("listener addr should send");
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .expect("test server should run");
+            });
+        });
+        let addr = addr_rx.recv().expect("listener addr should arrive");
+
+        let bootstrap = sample_bootstrap(&format!("http://{addr}"));
+        let fetcher = RemoteSnapshotFetcher::from_bootstrap(&bootstrap, None, None, 1, None)
+            .expect("bootstrap-backed fetcher should build");
+
+        let snapshot = fetcher
+            .fetch_snapshot_blocking()
+            .expect("bootstrap-backed fetcher should load snapshot");
+
+        assert!(snapshot.remote.is_empty());
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
     }
 }
