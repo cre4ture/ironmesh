@@ -5550,6 +5550,7 @@ fn build_bootstrap_direct_endpoints(
     public_url: Option<&str>,
     internal_url: Option<&str>,
     public_peer_api_enabled: bool,
+    node_id: NodeId,
 ) -> Vec<BootstrapEndpoint> {
     let mut endpoints = Vec::new();
 
@@ -5557,6 +5558,7 @@ fn build_bootstrap_direct_endpoints(
         endpoints.push(BootstrapEndpoint {
             url: public_url.to_string(),
             usage: Some(BootstrapEndpointUse::PublicApi),
+            node_id: Some(node_id),
         });
     }
 
@@ -5569,6 +5571,7 @@ fn build_bootstrap_direct_endpoints(
         endpoints.push(BootstrapEndpoint {
             url: peer_url.to_string(),
             usage: Some(BootstrapEndpointUse::PeerApi),
+            node_id: Some(node_id),
         });
     }
 
@@ -5591,6 +5594,7 @@ fn build_issued_node_bootstrap(
 ) -> std::result::Result<TransportNodeBootstrap, StatusCode> {
     let rendezvous_urls = bootstrap_rendezvous_urls(state)?;
     let mode = request.mode.unwrap_or(NodeBootstrapMode::Cluster);
+    let node_id = request.node_id.unwrap_or_else(NodeId::new_v4);
     let bind_addr = request
         .bind_addr
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
@@ -5615,7 +5619,7 @@ fn build_issued_node_bootstrap(
     let bootstrap = TransportNodeBootstrap {
         version: 1,
         cluster_id: state.cluster_id,
-        node_id: request.node_id.unwrap_or_else(NodeId::new_v4),
+        node_id,
         mode,
         data_dir: request
             .data_dir
@@ -5635,6 +5639,7 @@ fn build_issued_node_bootstrap(
             public_url.as_deref(),
             internal_url.as_deref(),
             public_peer_api_enabled,
+            node_id,
         ),
         relay_mode: state.relay_mode,
         trust_roots: bootstrap_trust_roots(state)?,
@@ -5877,15 +5882,23 @@ async fn issue_bootstrap_bundle(
     let endpoints = {
         let mut cluster = state.cluster.lock().await;
         cluster.update_health_and_detect_offline_transition();
-        let mut urls = cluster
+        let mut endpoints = cluster
             .list_nodes()
             .into_iter()
             .filter(|node| !node.public_url.trim().is_empty())
-            .map(|node| node.public_url)
+            .map(|node| BootstrapEndpoint {
+                url: node.public_url,
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(node.node_id),
+            })
             .collect::<Vec<_>>();
-        urls.sort();
-        urls.dedup();
-        urls
+        endpoints.sort_by(|left, right| {
+            left.url
+                .cmp(&right.url)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        endpoints.dedup_by(|left, right| left.url == right.url && left.node_id == right.node_id);
+        endpoints
     };
 
     append_admin_audit(
@@ -5909,13 +5922,7 @@ async fn issue_bootstrap_bundle(
         cluster_id: state.cluster_id,
         rendezvous_urls,
         rendezvous_mtls_required: state.rendezvous_mtls_required,
-        direct_endpoints: endpoints
-            .into_iter()
-            .map(|url| BootstrapEndpoint {
-                url,
-                usage: Some(BootstrapEndpointUse::PublicApi),
-            })
-            .collect(),
+        direct_endpoints: endpoints,
         relay_mode: state.relay_mode,
         trust_roots: match bootstrap_trust_roots(&state) {
             Ok(trust_roots) => trust_roots,

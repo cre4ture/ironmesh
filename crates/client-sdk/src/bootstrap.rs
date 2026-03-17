@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use common::ClusterId;
+use common::{ClusterId, NodeId};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -47,6 +47,8 @@ pub struct ResolvedConnectionBootstrap {
     pub relay_mode: RelayMode,
     pub server_base_url: String,
     #[serde(default)]
+    pub target_node_id: Option<NodeId>,
+    #[serde(default)]
     pub server_ca_pem: Option<String>,
     #[serde(default)]
     pub cluster_ca_pem: Option<String>,
@@ -70,6 +72,8 @@ pub struct PlannedConnectionBootstrapTarget {
     pub path_kind: TransportPathKind,
     #[serde(default)]
     pub server_base_url: Option<String>,
+    #[serde(default)]
+    pub target_node_id: Option<NodeId>,
     #[serde(default)]
     pub server_ca_pem: Option<String>,
     #[serde(default)]
@@ -161,6 +165,17 @@ impl ConnectionBootstrap {
     }
 
     pub fn candidate_endpoints(&self) -> Result<Vec<Url>> {
+        self.normalized_candidate_direct_endpoints()?
+            .into_iter()
+            .map(|endpoint| {
+                Url::parse(&endpoint.url).with_context(|| {
+                    format!("invalid normalized bootstrap endpoint {}", endpoint.url)
+                })
+            })
+            .collect()
+    }
+
+    fn normalized_candidate_direct_endpoints(&self) -> Result<Vec<BootstrapEndpoint>> {
         let mut seen = BTreeSet::new();
         let mut endpoints = Vec::new();
 
@@ -172,8 +187,20 @@ impl ConnectionBootstrap {
                 continue;
             }
             let url = normalize_server_base_url(&endpoint.url)?;
-            if seen.insert(url.as_str().to_string()) {
-                endpoints.push(url);
+            let seen_key = format!(
+                "{}#{}",
+                url.as_str(),
+                endpoint
+                    .node_id
+                    .map(|node_id| node_id.to_string())
+                    .unwrap_or_default()
+            );
+            if seen.insert(seen_key) {
+                endpoints.push(BootstrapEndpoint {
+                    url: url.to_string(),
+                    usage: endpoint.usage,
+                    node_id: endpoint.node_id,
+                });
             }
         }
 
@@ -184,7 +211,7 @@ impl ConnectionBootstrap {
         self.validate()?;
 
         let direct_targets = self
-            .candidate_endpoints()?
+            .normalized_candidate_direct_endpoints()?
             .into_iter()
             .map(|endpoint| PlannedConnectionBootstrapTarget {
                 cluster_id: self.cluster_id,
@@ -192,7 +219,8 @@ impl ConnectionBootstrap {
                 rendezvous_mtls_required: self.rendezvous_mtls_required,
                 relay_mode: self.relay_mode,
                 path_kind: TransportPathKind::DirectHttps,
-                server_base_url: Some(endpoint.to_string()),
+                server_base_url: Some(endpoint.url),
+                target_node_id: endpoint.node_id,
                 server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
                 cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
                 rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
@@ -202,52 +230,64 @@ impl ConnectionBootstrap {
             })
             .collect::<Vec<_>>();
 
-        let relay_target = if self.relay_mode != RelayMode::Disabled {
+        let relay_targets = if self.relay_mode != RelayMode::Disabled {
             if self.rendezvous_urls.is_empty() {
                 if self.relay_mode == RelayMode::Required {
                     bail!(
                         "bootstrap requires relay connectivity but does not include rendezvous_urls"
                     );
                 }
-                None
+                Vec::new()
             } else {
-                Some(PlannedConnectionBootstrapTarget {
-                    cluster_id: self.cluster_id,
-                    rendezvous_urls: self.rendezvous_urls.clone(),
-                    rendezvous_mtls_required: self.rendezvous_mtls_required,
-                    relay_mode: self.relay_mode,
-                    path_kind: TransportPathKind::RelayTunnel,
-                    server_base_url: None,
-                    server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
-                    cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
-                    rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
-                    pairing_token: self.pairing_token.clone(),
-                    device_label: self.device_label.clone(),
-                    device_id: self.device_id.clone(),
-                })
+                let mut relay_targets = Vec::new();
+                let mut seen_node_ids = BTreeSet::new();
+                for target in &direct_targets {
+                    let Some(target_node_id) = target.target_node_id else {
+                        continue;
+                    };
+                    if !seen_node_ids.insert(target_node_id.to_string()) {
+                        continue;
+                    }
+                    relay_targets.push(PlannedConnectionBootstrapTarget {
+                        cluster_id: self.cluster_id,
+                        rendezvous_urls: self.rendezvous_urls.clone(),
+                        rendezvous_mtls_required: self.rendezvous_mtls_required,
+                        relay_mode: self.relay_mode,
+                        path_kind: TransportPathKind::RelayTunnel,
+                        server_base_url: None,
+                        target_node_id: Some(target_node_id),
+                        server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
+                        cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
+                        rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
+                        pairing_token: self.pairing_token.clone(),
+                        device_label: self.device_label.clone(),
+                        device_id: self.device_id.clone(),
+                    });
+                }
+                if relay_targets.is_empty() && self.relay_mode == RelayMode::Required {
+                    bail!(
+                        "bootstrap requires relay connectivity but does not identify any target node_id for public API endpoints"
+                    );
+                }
+                relay_targets
             }
         } else {
-            None
+            Vec::new()
         };
 
         let planned = match self.relay_mode {
             RelayMode::Disabled => direct_targets,
             RelayMode::Fallback => {
                 let mut planned = direct_targets;
-                if let Some(relay_target) = relay_target {
-                    planned.push(relay_target);
-                }
+                planned.extend(relay_targets);
                 planned
             }
             RelayMode::Preferred => {
-                let mut planned = Vec::new();
-                if let Some(relay_target) = relay_target {
-                    planned.push(relay_target);
-                }
+                let mut planned = relay_targets;
                 planned.extend(direct_targets);
                 planned
             }
-            RelayMode::Required => relay_target.into_iter().collect(),
+            RelayMode::Required => relay_targets,
         };
 
         if planned.is_empty() {
@@ -296,6 +336,7 @@ impl ConnectionBootstrap {
                     rendezvous_mtls_required: target.rendezvous_mtls_required,
                     relay_mode: target.relay_mode,
                     server_base_url: endpoint.to_string(),
+                    target_node_id: target.target_node_id,
                     server_ca_pem: target.server_ca_pem,
                     cluster_ca_pem: target.cluster_ca_pem,
                     rendezvous_ca_pem: target.rendezvous_ca_pem,
@@ -434,14 +475,17 @@ mod tests {
                 BootstrapEndpoint {
                     url: "https://peer.example".to_string(),
                     usage: Some(BootstrapEndpointUse::PeerApi),
+                    node_id: Some(NodeId::new_v4()),
                 },
                 BootstrapEndpoint {
                     url: "https://public.example".to_string(),
                     usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(NodeId::new_v4()),
                 },
                 BootstrapEndpoint {
                     url: "https://rendezvous.example".to_string(),
                     usage: Some(BootstrapEndpointUse::Rendezvous),
+                    node_id: None,
                 },
             ],
             relay_mode: RelayMode::Fallback,
@@ -478,8 +522,10 @@ mod tests {
             planned[0].server_base_url.as_deref(),
             Some("https://public.example/")
         );
+        assert!(planned[0].target_node_id.is_some());
         assert_eq!(planned[1].path_kind, TransportPathKind::RelayTunnel);
         assert!(planned[1].requires_custom_transport());
+        assert_eq!(planned[1].target_node_id, planned[0].target_node_id);
     }
 
     #[test]
@@ -492,6 +538,7 @@ mod tests {
             .expect("planned targets should build");
 
         assert_eq!(planned[0].path_kind, TransportPathKind::RelayTunnel);
+        assert!(planned[0].target_node_id.is_some());
         assert_eq!(planned[1].path_kind, TransportPathKind::DirectHttps);
     }
 
@@ -512,7 +559,6 @@ mod tests {
     fn resolve_direct_http_target_reports_relay_gap_when_only_relay_is_planned() {
         let mut bootstrap = sample_bootstrap();
         bootstrap.relay_mode = RelayMode::Required;
-        bootstrap.direct_endpoints.clear();
 
         let error = bootstrap
             .resolve_direct_http_target_blocking()
@@ -523,5 +569,20 @@ mod tests {
                 .to_string()
                 .contains("client data-plane relay transport")
         );
+    }
+
+    #[test]
+    fn relay_required_without_endpoint_node_ids_is_rejected() {
+        let mut bootstrap = sample_bootstrap();
+        bootstrap.relay_mode = RelayMode::Required;
+        for endpoint in &mut bootstrap.direct_endpoints {
+            endpoint.node_id = None;
+        }
+
+        let error = bootstrap
+            .planned_targets()
+            .expect_err("relay-only bootstrap without endpoint node ids should fail");
+
+        assert!(error.to_string().contains("target node_id"));
     }
 }

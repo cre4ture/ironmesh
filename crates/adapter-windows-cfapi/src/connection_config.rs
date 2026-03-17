@@ -102,6 +102,7 @@ pub fn persist_connection_config(
         direct_endpoints: vec![BootstrapEndpoint {
             url: base_url.to_string(),
             usage: Some(BootstrapEndpointUse::PublicApi),
+            node_id: None,
         }],
         relay_mode: RelayMode::Fallback,
         trust_roots: BootstrapTrustRoots {

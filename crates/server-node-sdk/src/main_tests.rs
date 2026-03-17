@@ -589,6 +589,19 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
         bootstrap.trust_roots.cluster_ca_pem.as_deref(),
         Some("cluster-ca")
     );
+    assert!(!bootstrap.direct_endpoints.is_empty());
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .all(|endpoint| endpoint.node_id.is_some())
+    );
+    assert!(
+        bootstrap
+            .direct_endpoints
+            .iter()
+            .all(|endpoint| endpoint.node_id == Some(state.node_id))
+    );
     assert_eq!(bootstrap.device_label.as_deref(), Some("tablet"));
     assert!(bootstrap.pairing_token.is_some());
 
@@ -629,10 +642,12 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
             transport_sdk::BootstrapEndpoint {
                 url: "https://node-b.example".to_string(),
                 usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+                node_id: Some(node_id),
             },
             transport_sdk::BootstrapEndpoint {
                 url: "https://10.0.0.12:38080".to_string(),
                 usage: Some(transport_sdk::BootstrapEndpointUse::PeerApi),
+                node_id: Some(node_id),
             },
         ],
         relay_mode: transport_sdk::RelayMode::Required,
@@ -790,8 +805,16 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
         Some(transport_sdk::BootstrapEndpointUse::PublicApi)
     );
     assert_eq!(
+        bootstrap.direct_endpoints[0].node_id,
+        Some(requested_node_id)
+    );
+    assert_eq!(
         bootstrap.direct_endpoints[1].usage,
         Some(transport_sdk::BootstrapEndpointUse::PeerApi)
+    );
+    assert_eq!(
+        bootstrap.direct_endpoints[1].node_id,
+        Some(requested_node_id)
     );
 
     cleanup_test_state(&state).await;
@@ -1076,6 +1099,7 @@ async fn node_bootstrap_file_can_start_local_edge_node() {
         direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
             url: public_url.clone(),
             usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+            node_id: Some(NodeId::new_v4()),
         }],
         relay_mode: transport_sdk::RelayMode::Fallback,
         trust_roots: transport_sdk::BootstrapTrustRoots {
@@ -1149,6 +1173,7 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
         direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
             url: public_url.clone(),
             usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+            node_id: Some(NodeId::new_v4()),
         }],
         relay_mode: transport_sdk::RelayMode::Fallback,
         trust_roots: transport_sdk::BootstrapTrustRoots {

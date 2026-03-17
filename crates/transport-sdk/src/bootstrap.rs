@@ -32,6 +32,8 @@ pub struct BootstrapEndpoint {
     pub url: String,
     #[serde(default)]
     pub usage: Option<BootstrapEndpointUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,6 +338,11 @@ fn validate_endpoint_list(endpoints: &[BootstrapEndpoint]) -> Result<()> {
         }
         Url::parse(endpoint.url.trim())
             .with_context(|| format!("invalid bootstrap endpoint URL {}", endpoint.url))?;
+        if let Some(node_id) = endpoint.node_id
+            && node_id.is_nil()
+        {
+            bail!("bootstrap endpoint node_id must not be nil");
+        }
     }
     Ok(())
 }
@@ -506,6 +513,7 @@ mod tests {
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://node-a.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(Uuid::now_v7()),
             }],
             relay_mode: RelayMode::Fallback,
             trust_roots: BootstrapTrustRoots {
@@ -569,6 +577,7 @@ mod tests {
             direct_endpoints: vec![BootstrapEndpoint {
                 url: "https://node-a.example".to_string(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(Uuid::now_v7()),
             }],
             relay_mode: RelayMode::Required,
             trust_roots: BootstrapTrustRoots {
@@ -750,5 +759,31 @@ mod tests {
         };
 
         assert!(package.validate().is_err());
+    }
+
+    #[test]
+    fn bootstrap_endpoint_rejects_nil_node_id() {
+        let bootstrap = ClientBootstrap {
+            version: CLIENT_BOOTSTRAP_VERSION,
+            cluster_id: Uuid::now_v7(),
+            rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_mtls_required: true,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "https://node-a.example".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(Uuid::nil()),
+            }],
+            relay_mode: RelayMode::Fallback,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: Some("cluster-ca".to_string()),
+                public_api_ca_pem: Some("public-ca".to_string()),
+                rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
+            },
+            pairing_token: None,
+            device_id: None,
+            device_label: None,
+        };
+
+        assert!(bootstrap.validate().is_err());
     }
 }
