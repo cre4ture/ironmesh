@@ -5163,8 +5163,9 @@ async fn commit_version_inner(state: ServerState, key: String, version_id: Strin
 
 #[derive(Debug, Deserialize)]
 struct RegisterNodeRequest {
-    public_url: String,
-    internal_url: String,
+    reachability: NodeReachability,
+    #[serde(default)]
+    capabilities: Option<NodeCapabilities>,
     labels: HashMap<String, String>,
     capacity_bytes: Option<u64>,
     free_bytes: Option<u64>,
@@ -6524,19 +6525,31 @@ async fn register_node(
         Err(_) => return StatusCode::BAD_REQUEST,
     };
 
+    let reachability = NodeReachability {
+        public_api_url: request
+            .reachability
+            .public_api_url
+            .as_deref()
+            .and_then(|value| normalize_optional_url(Some(value))),
+        peer_api_url: request
+            .reachability
+            .peer_api_url
+            .as_deref()
+            .and_then(|value| normalize_optional_url(Some(value))),
+        relay_required: request.reachability.relay_required,
+    };
+    let requested_capabilities = request.capabilities.unwrap_or_default();
+    let capabilities = NodeCapabilities {
+        public_api: requested_capabilities.public_api || reachability.public_api_url.is_some(),
+        peer_api: requested_capabilities.peer_api || reachability.peer_api_url.is_some(),
+        relay_tunnel: requested_capabilities.relay_tunnel || reachability.relay_required,
+    };
+
     let mut cluster = state.cluster.lock().await;
     cluster.register_node(NodeDescriptor {
         node_id,
-        reachability: NodeReachability {
-            public_api_url: normalize_optional_url(Some(request.public_url.as_str())),
-            peer_api_url: normalize_optional_url(Some(request.internal_url.as_str())),
-            relay_required: false,
-        },
-        capabilities: NodeCapabilities {
-            public_api: !request.public_url.trim().is_empty(),
-            peer_api: !request.internal_url.trim().is_empty(),
-            relay_tunnel: false,
-        },
+        reachability,
+        capabilities,
         labels: request.labels,
         capacity_bytes: request.capacity_bytes.unwrap_or(0),
         free_bytes: request.free_bytes.unwrap_or(0),

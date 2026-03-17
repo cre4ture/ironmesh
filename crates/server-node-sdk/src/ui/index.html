@@ -139,7 +139,7 @@
       <li><code>POST /versions/{key}/confirm/{version_id}</code> - compatibility alias for commit endpoint</li>
       <li><code>GET /cluster/status</code> - cluster summary</li>
       <li><code>GET /cluster/nodes</code> - known node list</li>
-      <li><code>PUT /cluster/nodes/{node_id}</code> - register/update node metadata</li>
+      <li><code>PUT /cluster/nodes/{node_id}</code> - register/update node metadata using nested reachability/capabilities</li>
       <li><code>DELETE /cluster/nodes/{node_id}</code> - remove node from cluster membership</li>
       <li><code>POST /cluster/nodes/{node_id}/heartbeat</code> - refresh node liveness</li>
       <li><code>GET /cluster/placement/{key}</code> - deterministic placement decision</li>

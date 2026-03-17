@@ -234,7 +234,7 @@ Notes:
 
 - Cluster node membership endpoints:
 	- `GET /cluster/nodes`
-	- `PUT /cluster/nodes/{node_id}`
+	- `PUT /cluster/nodes/{node_id}` with nested `reachability` and optional `capabilities`
 	- `DELETE /cluster/nodes/{node_id}` (rejects local node id)
 
 ### Autonomous peer heartbeats

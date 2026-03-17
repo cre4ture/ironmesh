@@ -28,7 +28,7 @@ use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
 use axum::Router;
 use axum::body::Body;
 use axum::body::to_bytes;
-use axum::extract::{Json, Query, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -3534,6 +3534,55 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     );
     assert_eq!(descriptor.capacity_bytes, 100);
     assert_eq!(descriptor.free_bytes, 40);
+}
+
+#[tokio::test]
+async fn register_node_uses_structured_reachability_payload() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let node_id = NodeId::new_v4();
+
+    let response = axum::response::IntoResponse::into_response(
+        super::register_node(
+            State(state.clone()),
+            Path(node_id.to_string()),
+            Json(super::RegisterNodeRequest {
+                reachability: cluster::NodeReachability {
+                    public_api_url: Some("https://public.example".to_string()),
+                    peer_api_url: Some("https://internal.example".to_string()),
+                    relay_required: true,
+                },
+                capabilities: Some(cluster::NodeCapabilities {
+                    public_api: true,
+                    peer_api: true,
+                    relay_tunnel: true,
+                }),
+                labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+                capacity_bytes: Some(100),
+                free_bytes: Some(40),
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let node = {
+        let cluster = state.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .expect("registered node should exist")
+    };
+
+    assert_eq!(node.public_api_url(), Some("https://public.example"));
+    assert_eq!(node.peer_api_url(), Some("https://internal.example"));
+    assert!(node.relay_required());
+    assert!(node.relay_capable());
+    assert_eq!(node.capacity_bytes, 100);
+    assert_eq!(node.free_bytes, 40);
+
+    cleanup_test_state(&state).await;
 }
 
 #[tokio::test]

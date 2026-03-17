@@ -352,8 +352,16 @@ register_node() {
   local payload
   payload=$(cat <<JSON
 {
-  "public_url": "${target_url}",
-  "internal_url": "${target_internal_url}",
+  "reachability": {
+    "public_api_url": "${target_url}",
+    "peer_api_url": "${target_internal_url}",
+    "relay_required": false
+  },
+  "capabilities": {
+    "public_api": true,
+    "peer_api": true,
+    "relay_tunnel": false
+  },
   "labels": {
     "region": "local",
     "dc": "local-dc",

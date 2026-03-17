@@ -427,8 +427,16 @@ pub async fn register_node(
     };
 
     let body = serde_json::json!({
-        "public_url": public_url,
-        "internal_url": internal_url,
+        "reachability": {
+            "public_api_url": public_url,
+            "peer_api_url": internal_url,
+            "relay_required": false
+        },
+        "capabilities": {
+            "public_api": true,
+            "peer_api": true,
+            "relay_tunnel": false
+        },
         "labels": {
             "region": "local",
             "dc": dc,
