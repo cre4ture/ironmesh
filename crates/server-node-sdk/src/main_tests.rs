@@ -7,13 +7,18 @@ use super::{
     run, run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
     token_matches,
 };
+use axum::Extension;
+use axum_server::accept::Accept;
 use common::NodeId;
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::fs::File;
+use std::future::Future;
+use std::io;
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -31,7 +36,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use tokio::time::{Duration, Instant};
-use tower::ServiceExt;
+use tower::{Service, ServiceExt};
 
 #[derive(Clone, Copy)]
 enum MainTestBackend {
@@ -197,6 +202,151 @@ async fn observe_peer_certificate_fingerprint(
         .cloned()
         .unwrap();
     blake3::hash(peer_cert.as_ref()).to_hex().to_string()
+}
+
+#[derive(Clone)]
+struct WithClientCertificateFingerprint<S> {
+    inner: S,
+    fingerprint: String,
+}
+
+impl<S> WithClientCertificateFingerprint<S> {
+    fn new(inner: S, fingerprint: String) -> Self {
+        Self { inner, fingerprint }
+    }
+}
+
+impl<S, B> Service<Request<B>> for WithClientCertificateFingerprint<S>
+where
+    S: Service<Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        req.extensions_mut().insert(self.fingerprint.clone());
+        self.inner.call(req)
+    }
+}
+
+#[derive(Clone)]
+struct ClientCertificateFingerprintAcceptor {
+    inner: axum_server::tls_rustls::RustlsAcceptor,
+}
+
+impl ClientCertificateFingerprintAcceptor {
+    fn new(config: axum_server::tls_rustls::RustlsConfig) -> Self {
+        Self {
+            inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
+        }
+    }
+}
+
+impl<S> Accept<tokio::net::TcpStream, S> for ClientCertificateFingerprintAcceptor
+where
+    axum_server::tls_rustls::RustlsAcceptor: Accept<
+            tokio::net::TcpStream,
+            S,
+            Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        >,
+    <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Service:
+        Send + 'static,
+    <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Future:
+        Send + 'static,
+    S: Send + 'static,
+{
+    type Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Service = WithClientCertificateFingerprint<
+        <axum_server::tls_rustls::RustlsAcceptor as Accept<tokio::net::TcpStream, S>>::Service,
+    >;
+    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let fut = self.inner.accept(stream, service);
+        Box::pin(async move {
+            let (tls_stream, service) = fut.await?;
+            let fingerprint = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|cert| blake3::hash(cert.as_ref()).to_hex().to_string())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "missing client certificate",
+                    )
+                })?;
+            Ok((
+                tls_stream,
+                WithClientCertificateFingerprint::new(service, fingerprint),
+            ))
+        })
+    }
+}
+
+async fn capture_mtls_health(
+    State(captured_fingerprint): State<Arc<Mutex<Option<String>>>>,
+    Extension(fingerprint): Extension<String>,
+) -> StatusCode {
+    *captured_fingerprint.lock().await = Some(fingerprint);
+    StatusCode::OK
+}
+
+async fn capture_mtls_presence_register(
+    State(captured_fingerprint): State<Arc<Mutex<Option<String>>>>,
+    Extension(fingerprint): Extension<String>,
+    Json(registration): Json<transport_sdk::PresenceRegistration>,
+) -> Json<transport_sdk::RegisterPresenceResponse> {
+    *captured_fingerprint.lock().await = Some(fingerprint);
+    let updated_at_unix = super::unix_ts();
+    Json(transport_sdk::RegisterPresenceResponse {
+        accepted: true,
+        updated_at_unix,
+        entry: transport_sdk::PresenceEntry {
+            registration,
+            updated_at_unix,
+        },
+    })
+}
+
+fn spawn_mtls_client_fingerprint_capture_server(
+    bind_addr: SocketAddr,
+    ca_cert_path: &std::path::Path,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    captured_fingerprint: Arc<Mutex<Option<String>>>,
+) -> tokio::task::JoinHandle<()> {
+    let app = Router::new()
+        .route("/health", get(capture_mtls_health))
+        .route(
+            "/control/presence/register",
+            axum::routing::post(capture_mtls_presence_register),
+        )
+        .with_state(captured_fingerprint);
+    let tls_config = super::build_internal_mtls_rustls_config(
+        &ca_cert_path.to_path_buf(),
+        &cert_path.to_path_buf(),
+        &key_path.to_path_buf(),
+    )
+    .unwrap();
+    let acceptor = ClientCertificateFingerprintAcceptor::new(tls_config);
+
+    tokio::spawn(async move {
+        axum_server::Server::bind(bind_addr)
+            .acceptor(acceptor)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    })
 }
 
 #[test]
@@ -1577,6 +1727,266 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     cleanup_test_state(&state).await;
     node_handle.abort();
     let _ = node_handle.await;
+    issuer_handle.abort();
+    let _ = issuer_handle.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
+    let root = fresh_test_dir("node-auto-renew-outbound-clients");
+    let issuer_dir = root.join("issuer");
+    let issuer_bind_addr = free_bind_addr();
+    let issuer_public_url = format!("http://{issuer_bind_addr}");
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    let cluster_ca_path = issuer_dir.join("cluster-ca.pem");
+    let cluster_ca_key_path = issuer_dir.join("cluster-ca.key");
+    std::fs::create_dir_all(&issuer_dir).unwrap();
+    std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
+    std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
+
+    let mut issuer_config = super::ServerNodeConfig::local_edge(&issuer_dir, issuer_bind_addr);
+    issuer_config.admin_token = Some("admin-secret".to_string());
+    issuer_config.public_url = Some(issuer_public_url.clone());
+    issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
+    issuer_config.internal_ca_key_path = Some(cluster_ca_key_path.clone());
+    let issuer_handle = tokio::spawn(async move { super::run(issuer_config).await });
+    let issuer_http = reqwest::Client::new();
+    wait_for_http_status(
+        &issuer_http,
+        &format!("{issuer_public_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+    state.rendezvous_ca_pem = Some(cluster_ca_pem.clone());
+
+    let package_path = root.join("node-enrollment.json");
+    let internal_bind_addr = free_bind_addr();
+    let bootstrap = transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: state.cluster_id,
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: root.join("node").to_string_lossy().into_owned(),
+        bind_addr: free_bind_addr().to_string(),
+        public_url: None,
+        labels: HashMap::new(),
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_peer_api_enabled: false,
+        internal_bind_addr: Some(internal_bind_addr.to_string()),
+        internal_url: Some(format!("https://{internal_bind_addr}")),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/cluster-ca.pem".to_string(),
+            cert_path: "tls/internal.pem".to_string(),
+            key_path: "tls/internal.key".to_string(),
+        }),
+        rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+        rendezvous_mtls_required: true,
+        direct_endpoints: Vec::new(),
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: Some(cluster_ca_pem.clone()),
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: Some(cluster_ca_pem.clone()),
+        },
+        upstream_public_url: None,
+        enrollment_issuer_url: Some(issuer_public_url.clone()),
+    };
+    let issue_policy = default_tls_issue_policy();
+    let mut internal_material =
+        super::issue_internal_node_tls_material(&state, &bootstrap, issue_policy).unwrap();
+    internal_material.metadata.renew_after_unix = super::unix_ts().saturating_sub(1);
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(internal_material.clone()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+
+    let mut config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    config.enrollment_issuer_url = Some(issuer_public_url.clone());
+    config.node_enrollment_auto_renew_enabled = true;
+    config.node_enrollment_renewal_admin_token = Some("admin-secret".to_string());
+    let internal_tls = config.internal_tls.clone().unwrap();
+    let initial_internal_fingerprint =
+        super::parse_certificate_details_from_path(&internal_tls.cert_path)
+            .unwrap()
+            .certificate_fingerprint;
+
+    let capture_dir = root.join("capture");
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    let capture_bind_addr = free_bind_addr();
+    let capture_bootstrap = transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: state.cluster_id,
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: capture_dir.to_string_lossy().into_owned(),
+        bind_addr: free_bind_addr().to_string(),
+        public_url: None,
+        labels: HashMap::new(),
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_peer_api_enabled: false,
+        internal_bind_addr: Some(capture_bind_addr.to_string()),
+        internal_url: Some(format!("https://{capture_bind_addr}")),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/capture-ca.pem".to_string(),
+            cert_path: "tls/capture-internal.pem".to_string(),
+            key_path: "tls/capture-internal.key".to_string(),
+        }),
+        rendezvous_urls: Vec::new(),
+        rendezvous_mtls_required: true,
+        direct_endpoints: Vec::new(),
+        relay_mode: transport_sdk::RelayMode::Disabled,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: Some(cluster_ca_pem.clone()),
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: Some(cluster_ca_pem.clone()),
+        },
+        upstream_public_url: None,
+        enrollment_issuer_url: None,
+    };
+    let capture_material =
+        super::issue_internal_node_tls_material(&state, &capture_bootstrap, issue_policy).unwrap();
+    let capture_ca_path = capture_dir.join("capture-ca.pem");
+    let capture_cert_path = capture_dir.join("capture-internal.pem");
+    let capture_key_path = capture_dir.join("capture-internal.key");
+    std::fs::write(&capture_ca_path, &capture_material.ca_cert_pem).unwrap();
+    std::fs::write(&capture_cert_path, &capture_material.cert_pem).unwrap();
+    std::fs::write(&capture_key_path, &capture_material.key_pem).unwrap();
+
+    let captured_fingerprint = Arc::new(Mutex::new(None));
+    let capture_handle = spawn_mtls_client_fingerprint_capture_server(
+        capture_bind_addr,
+        &capture_ca_path,
+        &capture_cert_path,
+        &capture_key_path,
+        captured_fingerprint.clone(),
+    );
+    wait_for_condition("capture server ready", Duration::from_secs(5), || {
+        let capture_ca_path = capture_ca_path.clone();
+        let capture_cert_path = capture_cert_path.clone();
+        let capture_key_path = capture_key_path.clone();
+        async move {
+            let result = tokio::spawn(async move {
+                observe_peer_certificate_fingerprint(
+                    capture_bind_addr,
+                    &capture_ca_path,
+                    Some((&capture_cert_path, &capture_key_path)),
+                )
+                .await
+            })
+            .await;
+            result.is_ok()
+        }
+    })
+    .await;
+
+    state.enrollment_issuer_url = config.enrollment_issuer_url.clone();
+    state.node_enrollment_path = Some(package_path.clone());
+    state.rendezvous_urls = vec![format!("https://{capture_bind_addr}")];
+    state.rendezvous_registration_enabled = true;
+    state.internal_tls_runtime = Some(super::InternalTlsRuntime {
+        config: super::build_internal_mtls_rustls_config(
+            &internal_tls.ca_cert_path,
+            &internal_tls.cert_path,
+            &internal_tls.key_path,
+        )
+        .unwrap(),
+        ca_cert_path: internal_tls.ca_cert_path.clone(),
+        cert_path: internal_tls.cert_path.clone(),
+        key_path: internal_tls.key_path.clone(),
+        metadata_path: internal_tls.metadata_path.clone(),
+    });
+    {
+        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+        renewal_state.loaded_internal_tls_fingerprint = Some(initial_internal_fingerprint.clone());
+    }
+    {
+        let outbound_clients = super::build_outbound_clients(&state).unwrap();
+        *state.outbound_clients.write().await = outbound_clients;
+    }
+
+    let internal_http = super::current_internal_http(&state).await;
+    let internal_health_url = format!("https://{capture_bind_addr}/health");
+    let response = internal_http
+        .get(&internal_health_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        captured_fingerprint.lock().await.clone(),
+        Some(initial_internal_fingerprint.clone())
+    );
+
+    let rendezvous = super::current_rendezvous_control(&state).await.unwrap();
+    let registration = transport_sdk::PresenceRegistration {
+        cluster_id: state.cluster_id,
+        identity: transport_sdk::PeerIdentity::Node(state.node_id),
+        public_api_url: None,
+        peer_api_url: Some(format!("https://{internal_bind_addr}")),
+        direct_candidates: Vec::new(),
+        labels: HashMap::new(),
+        capacity_bytes: None,
+        free_bytes: None,
+        capabilities: vec![transport_sdk::TransportCapability::RelayTunnel],
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        connected_at_unix: super::unix_ts(),
+    };
+    rendezvous.register_presence(&registration).await.unwrap();
+    assert_eq!(
+        captured_fingerprint.lock().await.clone(),
+        Some(initial_internal_fingerprint.clone())
+    );
+
+    assert!(
+        super::renew_node_enrollment_package_if_due(&config)
+            .await
+            .unwrap()
+    );
+    super::reload_live_tls_from_disk(&state).await.unwrap();
+
+    let renewed_package = transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap();
+    let renewed_internal_fingerprint = renewed_package
+        .internal_tls_material
+        .as_ref()
+        .unwrap()
+        .metadata
+        .certificate_fingerprint
+        .clone();
+    assert_ne!(renewed_internal_fingerprint, initial_internal_fingerprint);
+
+    let internal_http = super::current_internal_http(&state).await;
+    let response = internal_http
+        .get(&internal_health_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        captured_fingerprint.lock().await.clone(),
+        Some(renewed_internal_fingerprint.clone())
+    );
+
+    let rendezvous = super::current_rendezvous_control(&state).await.unwrap();
+    rendezvous.register_presence(&registration).await.unwrap();
+    assert_eq!(
+        captured_fingerprint.lock().await.clone(),
+        Some(renewed_internal_fingerprint)
+    );
+
+    cleanup_test_state(&state).await;
+    capture_handle.abort();
+    let _ = capture_handle.await;
     issuer_handle.abort();
     let _ = issuer_handle.await;
     let _ = std::fs::remove_dir_all(&root);
@@ -3392,7 +3802,6 @@ async fn build_test_state(
         rendezvous_ca_pem: None,
         rendezvous_urls: vec!["http://127.0.0.1:39080".to_string()],
         rendezvous_registration_enabled: false,
-        rendezvous_control: None,
         rendezvous_mtls_required: false,
         relay_mode: super::RelayMode::Fallback,
         enrollment_issuer_url: None,
@@ -3402,8 +3811,11 @@ async fn build_test_state(
         node_enrollment_auto_renew_state: Arc::new(Mutex::new(
             super::NodeEnrollmentAutoRenewState::default(),
         )),
+        outbound_clients: Arc::new(tokio::sync::RwLock::new(super::OutboundClients {
+            internal_http: reqwest::Client::new(),
+            rendezvous_control: None,
+        })),
         metadata_commit_mode: MetadataCommitMode::Local,
-        internal_http: reqwest::Client::new(),
         autonomous_replication_on_put_enabled: false,
         inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         replication_audit_interval_secs: 3600,

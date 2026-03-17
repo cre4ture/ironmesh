@@ -39,7 +39,7 @@ use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, RwLock, watch};
 use tower::Service;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
@@ -101,7 +101,6 @@ struct ServerState {
     rendezvous_ca_pem: Option<String>,
     rendezvous_urls: Vec<String>,
     rendezvous_registration_enabled: bool,
-    rendezvous_control: Option<RendezvousControlClient>,
     rendezvous_mtls_required: bool,
     relay_mode: RelayMode,
     enrollment_issuer_url: Option<String>,
@@ -109,8 +108,8 @@ struct ServerState {
     node_enrollment_auto_renew_enabled: bool,
     node_enrollment_auto_renew_check_secs: u64,
     node_enrollment_auto_renew_state: Arc<Mutex<NodeEnrollmentAutoRenewState>>,
+    outbound_clients: Arc<RwLock<OutboundClients>>,
     metadata_commit_mode: MetadataCommitMode,
-    internal_http: reqwest::Client,
     autonomous_replication_on_put_enabled: bool,
     inflight_requests: Arc<AtomicUsize>,
     replication_audit_interval_secs: u64,
@@ -132,6 +131,12 @@ struct PublicTlsRuntime {
     cert_path: PathBuf,
     key_path: PathBuf,
     metadata_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct OutboundClients {
+    internal_http: reqwest::Client,
+    rendezvous_control: Option<RendezvousControlClient>,
 }
 
 #[derive(Clone)]
@@ -1064,6 +1069,65 @@ fn node_certificate_restart_required(
     })
 }
 
+async fn current_internal_http(state: &ServerState) -> reqwest::Client {
+    state.outbound_clients.read().await.internal_http.clone()
+}
+
+async fn current_rendezvous_control(state: &ServerState) -> Option<RendezvousControlClient> {
+    state
+        .outbound_clients
+        .read()
+        .await
+        .rendezvous_control
+        .clone()
+}
+
+fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
+    let internal_http = if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
+        build_internal_mtls_http_client(
+            &internal_tls.ca_cert_path,
+            &internal_tls.cert_path,
+            &internal_tls.key_path,
+        )?
+    } else {
+        reqwest::Client::new()
+    };
+
+    let rendezvous_control = if state.rendezvous_registration_enabled {
+        let rendezvous_client_identity_pem = state
+            .internal_tls_runtime
+            .as_ref()
+            .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
+            .transpose()?;
+        Some(RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: state.cluster_id,
+                rendezvous_urls: state.rendezvous_urls.clone(),
+                heartbeat_interval_secs: state.peer_heartbeat_config.interval_secs.max(5),
+            },
+            state
+                .rendezvous_ca_pem
+                .as_deref()
+                .or(state.public_ca_pem.as_deref())
+                .or(state.cluster_ca_pem.as_deref()),
+            rendezvous_client_identity_pem.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    Ok(OutboundClients {
+        internal_http,
+        rendezvous_control,
+    })
+}
+
+async fn reload_live_outbound_clients(state: &ServerState) -> Result<()> {
+    let outbound_clients = build_outbound_clients(state)?;
+    *state.outbound_clients.write().await = outbound_clients;
+    Ok(())
+}
+
 async fn reload_live_tls_from_disk(state: &ServerState) -> Result<()> {
     let mut loaded_public_tls_fingerprint = None;
     let mut loaded_internal_tls_fingerprint = None;
@@ -1142,6 +1206,10 @@ async fn reload_live_tls_from_disk(state: &ServerState) -> Result<()> {
         if let Some(fingerprint) = loaded_internal_tls_fingerprint {
             renewal_state.loaded_internal_tls_fingerprint = Some(fingerprint);
         }
+    }
+
+    if let Err(err) = reload_live_outbound_clients(state).await {
+        reload_errors.push(err.to_string());
     }
 
     if reload_errors.is_empty() {
@@ -2407,7 +2475,6 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         rendezvous_ca_pem,
         rendezvous_urls: config.rendezvous_urls.clone(),
         rendezvous_registration_enabled: config.rendezvous_registration_enabled,
-        rendezvous_control,
         rendezvous_mtls_required: config.rendezvous_mtls_required,
         relay_mode: config.relay_mode,
         enrollment_issuer_url: config.enrollment_issuer_url.clone(),
@@ -2422,8 +2489,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 .clone(),
             ..NodeEnrollmentAutoRenewState::default()
         })),
+        outbound_clients: Arc::new(RwLock::new(OutboundClients {
+            internal_http,
+            rendezvous_control,
+        })),
         metadata_commit_mode: config.metadata_commit_mode,
-        internal_http,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
         inflight_requests: Arc::new(AtomicUsize::new(0)),
         replication_audit_interval_secs: config.audit_interval_secs,
@@ -2466,15 +2536,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             .collect();
     }
 
-    if let Some(client) = state.rendezvous_control.clone() {
-        spawn_rendezvous_peer_discovery(
-            state.clone(),
-            client.clone(),
-            config.replica_view_sync_interval_secs,
-        );
+    if state.rendezvous_registration_enabled {
+        spawn_rendezvous_peer_discovery(state.clone(), config.replica_view_sync_interval_secs);
         spawn_rendezvous_presence_heartbeat(
             state.clone(),
-            client.clone(),
             Some(public_url.clone()),
             config
                 .internal_tls
@@ -2498,28 +2563,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         if state.relay_mode != RelayMode::Disabled
             && let Some(self_base_url) = relay_self_base_url
         {
-            let self_http = if let Some(internal_tls) = config.internal_tls.as_ref() {
-                build_internal_mtls_http_client(
-                    &internal_tls.ca_cert_path,
-                    &internal_tls.cert_path,
-                    &internal_tls.key_path,
-                )
-            } else {
-                build_http_client_from_optional_pem(state.public_ca_pem.as_deref())
-            };
-            match self_http {
-                Ok(self_http) => {
-                    spawn_rendezvous_relay_http_agent(
-                        state.clone(),
-                        client,
-                        self_http,
-                        self_base_url,
-                    );
-                }
-                Err(err) => {
-                    warn!(error = %err, "failed to initialize relay self HTTP client");
-                }
-            }
+            spawn_rendezvous_relay_http_agent(state.clone(), self_base_url);
         }
     }
 
@@ -2528,8 +2572,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         || config.rendezvous_registration_enabled;
 
     if let Some(upstream_public_url) = config.upstream_public_url.clone() {
+        let internal_http = current_internal_http(&state).await;
         if let Err(err) =
-            refresh_upstream_peer(&state, &state.internal_http, upstream_public_url.as_str()).await
+            refresh_upstream_peer(&state, &internal_http, upstream_public_url.as_str()).await
         {
             tracing::debug!(
                 error = %err,
@@ -2817,7 +2862,6 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
 fn spawn_rendezvous_presence_heartbeat(
     state: ServerState,
-    client: RendezvousControlClient,
     public_url: Option<String>,
     internal_peer_url: Option<String>,
     public_peer_api_enabled: bool,
@@ -2842,6 +2886,10 @@ fn spawn_rendezvous_presence_heartbeat(
                 public_peer_api_enabled,
                 local_descriptor.as_ref(),
             );
+            let Some(client) = current_rendezvous_control(&state).await else {
+                ticker.tick().await;
+                continue;
+            };
 
             match client.register_presence(&registration).await {
                 Ok(response) => {
@@ -2945,16 +2993,16 @@ fn normalize_optional_url(value: Option<&str>) -> Option<String> {
         .map(|value| value.trim_end_matches('/').to_string())
 }
 
-fn spawn_rendezvous_peer_discovery(
-    state: ServerState,
-    client: RendezvousControlClient,
-    interval_secs: u64,
-) {
+fn spawn_rendezvous_peer_discovery(state: ServerState, interval_secs: u64) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(5)));
         ticker.tick().await;
 
         loop {
+            let Some(client) = current_rendezvous_control(&state).await else {
+                ticker.tick().await;
+                continue;
+            };
             match client.list_presence().await {
                 Ok(response) => {
                     let discovered =
@@ -3210,8 +3258,9 @@ async fn execute_peer_request(
                 .as_ref()
                 .map(|candidate| candidate.endpoint.trim_end_matches('/').to_string())
                 .context("peer transport plan did not include a selected candidate")?;
+            let internal_http = current_internal_http(state).await;
             execute_direct_peer_request(
-                &state.internal_http,
+                &internal_http,
                 &base_url,
                 method,
                 path_and_query,
@@ -3278,9 +3327,8 @@ async fn execute_relay_peer_request(
     headers: Vec<RelayHttpHeader>,
     body: Vec<u8>,
 ) -> Result<PeerHttpResponse> {
-    let rendezvous = state
-        .rendezvous_control
-        .clone()
+    let rendezvous = current_rendezvous_control(state)
+        .await
         .context("relay peer transport requires rendezvous control client")?;
     let ticket = rendezvous
         .issue_relay_ticket(&RelayTicketRequest {
@@ -3339,14 +3387,13 @@ fn normalize_peer_path_and_query(path_and_query: &str) -> Result<String> {
     }
 }
 
-fn spawn_rendezvous_relay_http_agent(
-    state: ServerState,
-    client: RendezvousControlClient,
-    local_http: reqwest::Client,
-    local_base_url: String,
-) {
+fn spawn_rendezvous_relay_http_agent(state: ServerState, local_base_url: String) {
     tokio::spawn(async move {
         loop {
+            let Some(client) = current_rendezvous_control(&state).await else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
             match client
                 .poll_relay_http_request(&RelayHttpPollRequest {
                     cluster_id: state.cluster_id,
@@ -3359,6 +3406,7 @@ fn spawn_rendezvous_relay_http_agent(
                     let Some(request) = response.request else {
                         continue;
                     };
+                    let local_http = current_internal_http(&state).await;
 
                     let relay_response = match execute_local_relay_http_request(
                         &local_http,
@@ -3663,12 +3711,12 @@ fn spawn_upstream_peer_bootstrap(
     interval_secs: u64,
 ) {
     tokio::spawn(async move {
-        let http = state.internal_http.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         let upstream_public_url = upstream_public_url.trim().trim_end_matches('/').to_string();
 
         loop {
             ticker.tick().await;
+            let http = current_internal_http(&state).await;
 
             match refresh_upstream_peer(&state, &http, upstream_public_url.as_str()).await {
                 Ok(node_id) => {
@@ -6822,7 +6870,7 @@ async fn execute_replication_cleanup(
         successful_deletions = selected.len();
         reclaimed_bytes = selected_bytes;
     } else {
-        let http = state.internal_http.clone();
+        let http = current_internal_http(&state).await;
         for candidate in selected {
             attempted_deletions += 1;
 
