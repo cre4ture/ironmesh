@@ -9,6 +9,13 @@ Status: Concrete repo-mapped implementation plan for the target architecture
 - We do not need to preserve old bootstrap schemas, old auth material, or old direct-only peer registration flows.
 - Keep the current HTTP API semantics where useful, but stop treating a static `base_url` as the transport abstraction.
 
+## 1a. Lifecycle guidance
+
+- Node enrollment is the supported production lifecycle path for server nodes.
+- Production expectations for certificate issuance, renewal, live TLS reload, and live trust-root updates are centered on the enrollment artifact path.
+- Direct env/file CA wiring is still useful for development, testing, externally managed certificates, or other short-lived/manual setups.
+- When trust roots change in that direct env/file path, a node restart is acceptable and may be required; live trust-root reload is not a primary design goal there.
+
 ## 2. Target workspace shape
 
 Update the root workspace in `Cargo.toml`:

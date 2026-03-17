@@ -55,6 +55,7 @@
 
     <h2>Node bootstrap</h2>
     <p>Issues a node bootstrap artifact via <code>POST /auth/node-bootstraps/issue</code>. Use it with <code>IRONMESH_NODE_BOOTSTRAP_FILE</code> on the joining node.</p>
+    <p><strong>Lifecycle note:</strong> For long-lived production nodes, prefer a node enrollment package. A plain node bootstrap plus direct cert/CA file paths is mainly for development/testing, externally managed certificates, or other short-lived/manual setups.</p>
     <label for="node-bootstrap-admin-token">Admin token</label>
     <input id="node-bootstrap-admin-token" type="password" autocomplete="off" spellcheck="false" />
     <label for="node-bootstrap-node-id">Node ID (optional)</label>
@@ -98,7 +99,7 @@
     <button id="issue-node-enrollment" type="button">Issue node enrollment package</button>
     <pre id="node-bootstrap-json">provide the admin token and click the button to issue a node bootstrap artifact</pre>
     <p id="node-bootstrap-notes"></p>
-    <p>Node enrollment packages can generate internal mTLS material and, when public TLS paths are included, public HTTPS certificates too. They require <code>IRONMESH_INTERNAL_TLS_CA_KEY</code> for internal certs and <code>IRONMESH_PUBLIC_TLS_CA_KEY</code> for dedicated public certs. If both listener tiers use the same CA, the internal CA key is reused automatically. Issued material now includes validity and renewal metadata so you can rotate before expiry, and the bootstrap carries an enrollment issuer URL for node-side automatic renewal.</p>
+    <p>Node enrollment packages can generate internal mTLS material and, when public TLS paths are included, public HTTPS certificates too. They require <code>IRONMESH_INTERNAL_TLS_CA_KEY</code> for internal certs and <code>IRONMESH_PUBLIC_TLS_CA_KEY</code> for dedicated public certs. If both listener tiers use the same CA, the internal CA key is reused automatically. Issued material now includes validity and renewal metadata so you can rotate before expiry, and the bootstrap carries an enrollment issuer URL for node-side automatic renewal. This enrollment path is the supported production lifecycle path for node trust and certificate management.</p>
     <pre id="node-enrollment-json">click the enrollment button to issue a bootstrap plus generated TLS PEM material</pre>
     <p id="node-enrollment-notes"></p>
 
@@ -111,7 +112,7 @@
     <p id="node-renewal-notes"></p>
 
     <h3>Node certificate status</h3>
-    <p>Fetches the current lifecycle state for configured public and internal certificates via <code>GET /auth/node-certificates/status</code>. Enrollment-based nodes can automatically refresh the package on disk when <code>IRONMESH_NODE_ENROLLMENT_RENEWAL_ADMIN_TOKEN</code> is configured; use <code>IRONMESH_NODE_ENROLLMENT_AUTO_RENEW_ENABLED</code> and <code>IRONMESH_NODE_ENROLLMENT_RENEWAL_CHECK_SECS</code> to control that behavior.</p>
+    <p>Fetches the current lifecycle state for configured public and internal certificates via <code>GET /auth/node-certificates/status</code>. Enrollment-based nodes can automatically refresh the package on disk when <code>IRONMESH_NODE_ENROLLMENT_RENEWAL_ADMIN_TOKEN</code> is configured; use <code>IRONMESH_NODE_ENROLLMENT_AUTO_RENEW_ENABLED</code> and <code>IRONMESH_NODE_ENROLLMENT_RENEWAL_CHECK_SECS</code> to control that behavior. Direct env/file CA wiring is primarily intended for development/testing or short-lived manual setups and may require a restart after trust-root changes.</p>
     <button id="fetch-node-certificate-status" type="button">Fetch node certificate status</button>
     <pre id="node-certificate-status-json">click the button to inspect current certificate expiry and renewal state</pre>
     <p id="node-certificate-status-notes"></p>
