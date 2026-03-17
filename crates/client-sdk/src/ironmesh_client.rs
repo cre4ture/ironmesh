@@ -581,6 +581,28 @@ impl IronMeshClient {
         runtime.block_on(self.wait_for_store_index_change(since, timeout_ms))
     }
 
+    pub async fn get_json_path(&self, path: &str) -> Result<serde_json::Value> {
+        let url = self.relative_url(path)?;
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to request {path}"))?;
+        if !response.status.is_success() {
+            bail!("{path} returned non-success status: {}", response.status);
+        }
+        serde_json::from_slice::<serde_json::Value>(&response.body)
+            .with_context(|| format!("failed to parse JSON response from {path}"))
+    }
+
+    pub fn get_json_path_blocking(&self, path: &str) -> Result<serde_json::Value> {
+        let path = path.to_string();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for JSON path request")?;
+        runtime.block_on(self.get_json_path(&path))
+    }
+
     pub async fn load_snapshot_from_server(
         &self,
         prefix: Option<&str>,
@@ -979,6 +1001,19 @@ impl IronMeshClient {
         drop(segments);
 
         Ok(url)
+    }
+
+    fn relative_url(&self, path: &str) -> Result<Url> {
+        let path = path.trim();
+        if path.is_empty() {
+            bail!("relative request path is empty");
+        }
+
+        let base_url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        base_url
+            .join(path.trim_start_matches('/'))
+            .with_context(|| format!("failed to build request URL from {} and {path}", base_url))
     }
 
     fn store_index_url(&self) -> Result<Url> {
@@ -1487,6 +1522,108 @@ mod tests {
         );
         assert_eq!(captured.ticket.target, PeerIdentity::Node(target_node_id));
         assert_eq!(captured.path_and_query, "/store/index?depth=1");
+        assert!(
+            captured
+                .headers
+                .iter()
+                .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID
+                    && header.value == identity.device_id.to_string())
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_transport_executes_generic_json_get_request() {
+        async fn issue_ticket(Json(request): Json<RelayTicketRequest>) -> Json<RelayTicket> {
+            Json(RelayTicket {
+                cluster_id: request.cluster_id,
+                session_id: "relay-session-2".to_string(),
+                source: request.source,
+                target: request.target,
+                relay_urls: vec!["http://127.0.0.1:1".to_string()],
+                issued_at_unix: 1,
+                expires_at_unix: 61,
+            })
+        }
+
+        async fn relay_request(
+            State(state): State<RelayTestState>,
+            Json(request): Json<RelayHttpRequest>,
+        ) -> Json<RelayHttpResponse> {
+            *state.captured_request.lock().await = Some(request.clone());
+            Json(RelayHttpResponse {
+                cluster_id: request.ticket.cluster_id,
+                session_id: request.ticket.session_id.clone(),
+                request_id: request.request_id.clone(),
+                responder: request.ticket.target.clone(),
+                status: 200,
+                headers: vec![RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                }],
+                body_base64: encode_optional_body_base64(br#"{"status":"ok"}"#),
+            })
+        }
+
+        let relay_state = RelayTestState {
+            captured_request: Arc::new(Mutex::new(None)),
+        };
+        let router = Router::new()
+            .route("/control/relay/ticket", post(issue_ticket))
+            .route("/relay/http/request", post(relay_request))
+            .with_state(relay_state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("relay test server should run");
+        });
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("relay-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let target_node_id = NodeId::new_v4();
+        let rendezvous = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec![format!("http://{addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let client = IronMeshClient::with_relay_transport(
+            "https://relay.invalid/",
+            rendezvous,
+            target_node_id,
+        )
+        .with_client_identity(identity.clone());
+
+        let response = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("generic JSON GET over relay should succeed");
+
+        assert_eq!(response["status"], "ok");
+
+        let captured = relay_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("relay request should be captured");
+        assert_eq!(captured.path_and_query, "/cluster/status");
         assert!(
             captured
                 .headers

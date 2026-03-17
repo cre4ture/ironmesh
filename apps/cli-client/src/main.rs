@@ -1,16 +1,14 @@
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient,
     build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    build_reqwest_client_from_pem, build_signed_request_headers, normalize_server_base_url,
+    normalize_server_base_url,
 };
-use reqwest::{Method, RequestBuilder, Url};
+use reqwest::Url;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use web_ui_backend::WebUiConfig;
 
 #[derive(Debug, Parser)]
@@ -111,23 +109,23 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Health => {
-            let target = resolve_target(&cli)?;
-            print_json_endpoint(&target, "/health").await
+            let client = build_authenticated_sdk_from_cli(&cli)?;
+            print_json_endpoint(&client, "/health").await
         }
         Commands::ClusterStatus => {
-            let target = resolve_target(&cli)?;
-            print_json_endpoint(&target, "/cluster/status").await
+            let client = build_authenticated_sdk_from_cli(&cli)?;
+            print_json_endpoint(&client, "/cluster/status").await
         }
         Commands::Nodes => {
-            let target = resolve_target(&cli)?;
-            print_json_endpoint(&target, "/cluster/nodes").await
+            let client = build_authenticated_sdk_from_cli(&cli)?;
+            print_json_endpoint(&client, "/cluster/nodes").await
         }
         Commands::ReplicationPlan => {
-            let target = resolve_target(&cli)?;
-            print_json_endpoint(&target, "/cluster/replication/plan").await
+            let client = build_authenticated_sdk_from_cli(&cli)?;
+            print_json_endpoint(&client, "/cluster/replication/plan").await
         }
         Commands::ServeWeb { bind } => {
-            let target = resolve_target(&cli)?;
+            let target = resolve_direct_target(&cli)?;
             let bind_addr: SocketAddr = bind.parse()?;
             let mut web_ui_config = WebUiConfig::new(target.base_url.as_str().to_string())
                 .with_service_name("cli-client-web");
@@ -177,20 +175,16 @@ fn enroll_from_bootstrap(
     Ok(())
 }
 
-fn resolve_target(cli: &Cli) -> Result<ResolvedCliTarget> {
+fn resolve_direct_target(cli: &Cli) -> Result<ResolvedCliTarget> {
     if cli.bootstrap_file.is_some() && cli.server_url.is_some() {
         bail!("use either --bootstrap-file or --server-url, not both");
     }
 
-    let server_ca_override = read_optional_utf8_file(cli.server_ca_pem_file.as_deref())?;
-    let client_identity = cli
-        .client_identity_file
-        .as_deref()
-        .map(ClientIdentityMaterial::from_path)
-        .transpose()?;
+    let server_ca_override = read_server_ca_override_from_cli(cli)?;
+    let client_identity = read_client_identity_from_cli(cli)?;
 
     if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
-        let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
+        let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
         let resolved = bootstrap.resolve_direct_http_target_blocking()?;
         let base_url = Url::parse(&resolved.server_base_url)
             .with_context(|| format!("invalid resolved server URL {}", resolved.server_base_url))?;
@@ -215,37 +209,31 @@ fn resolve_target(cli: &Cli) -> Result<ResolvedCliTarget> {
     })
 }
 
-fn build_authenticated_sdk(target: &ResolvedCliTarget) -> Result<IronMeshClient> {
-    match target.client_identity.as_ref() {
+fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
+    let client_identity = read_client_identity_from_cli(cli)?;
+    let server_ca_override = read_server_ca_override_from_cli(cli)?;
+
+    if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
+        let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
+        return match client_identity.as_ref() {
+            Some(identity) => bootstrap.build_client_with_identity(identity),
+            None => bootstrap.build_client(),
+        };
+    }
+
+    let server_url = cli
+        .server_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("set either --bootstrap-file or --server-url"))?;
+    let base_url = normalize_server_base_url(server_url)?;
+    match client_identity.as_ref() {
         Some(identity) => build_http_client_with_identity_from_pem(
-            target.server_ca_pem.as_deref(),
-            target.base_url.as_str(),
+            server_ca_override.as_deref(),
+            base_url.as_str(),
             identity,
         ),
-        None => build_http_client_from_pem(
-            target.server_ca_pem.as_deref(),
-            target.base_url.as_str(),
-            &None,
-        ),
+        None => build_http_client_from_pem(server_ca_override.as_deref(), base_url.as_str(), &None),
     }
-}
-
-fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
-    let client_identity = cli
-        .client_identity_file
-        .as_deref()
-        .map(ClientIdentityMaterial::from_path)
-        .transpose()?;
-
-    if let Some(bootstrap_path) = cli.bootstrap_file.as_deref()
-        && let Some(identity) = client_identity.as_ref()
-    {
-        let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
-        return bootstrap.build_client_with_identity(identity);
-    }
-
-    let target = resolve_target(cli)?;
-    build_authenticated_sdk(&target)
 }
 
 fn build_client_node_from_cli(cli: &Cli) -> Result<ClientNode> {
@@ -254,71 +242,10 @@ fn build_client_node_from_cli(cli: &Cli) -> Result<ClientNode> {
     )?))
 }
 
-async fn print_json_endpoint(target: &ResolvedCliTarget, path: &str) -> Result<()> {
-    let value = fetch_server_json(target, path).await?;
+async fn print_json_endpoint(client: &IronMeshClient, path: &str) -> Result<()> {
+    let value = client.get_json_path(path).await?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
-}
-
-async fn fetch_server_json(target: &ResolvedCliTarget, path: &str) -> Result<serde_json::Value> {
-    let client = build_reqwest_client_from_pem(target.server_ca_pem.as_deref())?;
-    let url = endpoint_url(&target.base_url, path)?;
-    let response = apply_optional_request_auth(
-        client.get(url.clone()),
-        Method::GET,
-        &url,
-        target.client_identity.as_ref(),
-    )?
-    .send()
-    .await
-    .context("failed to contact server")?
-    .error_for_status()
-    .context("server returned error status")?;
-
-    response
-        .json::<serde_json::Value>()
-        .await
-        .context("failed to decode server response")
-}
-
-fn apply_optional_request_auth(
-    request: RequestBuilder,
-    method: Method,
-    url: &Url,
-    client_identity: Option<&ClientIdentityMaterial>,
-) -> Result<RequestBuilder> {
-    let Some(client_identity) = client_identity else {
-        return Ok(request);
-    };
-
-    let headers = build_signed_request_headers(
-        client_identity,
-        method.as_str(),
-        &url_path_and_query(url),
-        unix_ts(),
-        None,
-    )?;
-    Ok(headers.apply_to_reqwest(request))
-}
-
-fn endpoint_url(base_url: &Url, path: &str) -> Result<Url> {
-    base_url
-        .join(path.trim_start_matches('/'))
-        .with_context(|| format!("failed to build endpoint URL from {base_url} and {path}"))
-}
-
-fn url_path_and_query(url: &Url) -> String {
-    match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    }
-}
-
-fn unix_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn read_optional_utf8_file(path: Option<&Path>) -> Result<Option<String>> {
@@ -330,6 +257,28 @@ fn read_optional_utf8_file(path: Option<&Path>) -> Result<Option<String>> {
     })
     .transpose()
     .map(|value| value.filter(|value| !value.is_empty()))
+}
+
+fn read_client_identity_from_cli(cli: &Cli) -> Result<Option<ClientIdentityMaterial>> {
+    cli.client_identity_file
+        .as_deref()
+        .map(ClientIdentityMaterial::from_path)
+        .transpose()
+}
+
+fn read_server_ca_override_from_cli(cli: &Cli) -> Result<Option<String>> {
+    read_optional_utf8_file(cli.server_ca_pem_file.as_deref())
+}
+
+fn load_bootstrap_from_path(
+    bootstrap_path: &Path,
+    server_ca_override: Option<&str>,
+) -> Result<ConnectionBootstrap> {
+    let mut bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
+    if let Some(server_ca_override) = server_ca_override {
+        bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_override.to_string());
+    }
+    Ok(bootstrap)
 }
 
 fn default_client_identity_path(bootstrap_path: &Path) -> PathBuf {
