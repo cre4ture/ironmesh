@@ -1037,7 +1037,7 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
 }
 
 #[tokio::test]
-async fn automatic_node_enrollment_renewal_rewrites_package_and_requires_restart() {
+async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_required() {
     let root = fresh_test_dir("node-auto-renew");
     let issuer_dir = root.join("issuer");
     let issuer_bind_addr = free_bind_addr();
@@ -1124,19 +1124,75 @@ async fn automatic_node_enrollment_renewal_rewrites_package_and_requires_restart
     config.enrollment_issuer_url = Some(issuer_public_url);
     config.node_enrollment_auto_renew_enabled = true;
     config.node_enrollment_renewal_admin_token = Some("admin-secret".to_string());
+    let loaded_public_fingerprint =
+        super::parse_certificate_details_from_path(&config.public_tls.as_ref().unwrap().cert_path)
+            .unwrap()
+            .certificate_fingerprint;
     let loaded_internal_fingerprint = super::parse_certificate_details_from_path(
         &config.internal_tls.as_ref().unwrap().cert_path,
     )
     .unwrap()
     .certificate_fingerprint;
 
+    state.enrollment_issuer_url = config.enrollment_issuer_url.clone();
+    state.node_enrollment_path = Some(package_path.clone());
+    state.node_enrollment_auto_renew_enabled = true;
+    state.public_tls_runtime = Some(super::PublicTlsRuntime {
+        config: axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &config.public_tls.as_ref().unwrap().cert_path,
+            &config.public_tls.as_ref().unwrap().key_path,
+        )
+        .await
+        .unwrap(),
+        cert_path: config.public_tls.as_ref().unwrap().cert_path.clone(),
+        key_path: config.public_tls.as_ref().unwrap().key_path.clone(),
+        metadata_path: config.public_tls.as_ref().unwrap().metadata_path.clone(),
+    });
+    state.internal_tls_runtime = Some(super::InternalTlsRuntime {
+        config: super::build_internal_mtls_rustls_config(
+            &config.internal_tls.as_ref().unwrap().ca_cert_path,
+            &config.internal_tls.as_ref().unwrap().cert_path,
+            &config.internal_tls.as_ref().unwrap().key_path,
+        )
+        .unwrap(),
+        ca_cert_path: config.internal_tls.as_ref().unwrap().ca_cert_path.clone(),
+        cert_path: config.internal_tls.as_ref().unwrap().cert_path.clone(),
+        key_path: config.internal_tls.as_ref().unwrap().key_path.clone(),
+        metadata_path: config.internal_tls.as_ref().unwrap().metadata_path.clone(),
+    });
+    {
+        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+        renewal_state.loaded_public_tls_fingerprint = Some(loaded_public_fingerprint.clone());
+        renewal_state.loaded_internal_tls_fingerprint = Some(loaded_internal_fingerprint.clone());
+    }
+    let public_config_before = state
+        .public_tls_runtime
+        .as_ref()
+        .unwrap()
+        .config
+        .get_inner();
+    let internal_config_before = state
+        .internal_tls_runtime
+        .as_ref()
+        .unwrap()
+        .config
+        .get_inner();
+
     assert!(
         super::renew_node_enrollment_package_if_due(&config)
             .await
             .unwrap()
     );
+    super::reload_live_tls_from_disk(&state).await.unwrap();
 
     let renewed_package = transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap();
+    let renewed_public_fingerprint = renewed_package
+        .public_tls_material
+        .as_ref()
+        .unwrap()
+        .metadata
+        .certificate_fingerprint
+        .clone();
     let renewed_internal_fingerprint = renewed_package
         .internal_tls_material
         .as_ref()
@@ -1148,22 +1204,45 @@ async fn automatic_node_enrollment_renewal_rewrites_package_and_requires_restart
         renewed_internal_fingerprint,
         internal_material.metadata.certificate_fingerprint
     );
+    assert_ne!(
+        renewed_public_fingerprint,
+        public_material.metadata.certificate_fingerprint
+    );
+    assert!(!Arc::ptr_eq(
+        &public_config_before,
+        &state
+            .public_tls_runtime
+            .as_ref()
+            .unwrap()
+            .config
+            .get_inner()
+    ));
+    assert!(!Arc::ptr_eq(
+        &internal_config_before,
+        &state
+            .internal_tls_runtime
+            .as_ref()
+            .unwrap()
+            .config
+            .get_inner()
+    ));
 
+    let auto_renew_state = state.node_enrollment_auto_renew_state.lock().await.clone();
     let status = super::collect_node_certificate_status(
-        config
-            .public_tls
+        state
+            .public_tls_runtime
             .as_ref()
             .map(|tls| tls.cert_path.as_path()),
-        config
-            .public_tls
+        state
+            .public_tls_runtime
             .as_ref()
             .and_then(|tls| tls.metadata_path.as_deref()),
-        config
-            .internal_tls
+        state
+            .internal_tls_runtime
             .as_ref()
             .map(|tls| tls.cert_path.as_path()),
-        config
-            .internal_tls
+        state
+            .internal_tls_runtime
             .as_ref()
             .and_then(|tls| tls.metadata_path.as_deref()),
         super::NodeCertificateAutoRenewStatusView {
@@ -1180,12 +1259,23 @@ async fn automatic_node_enrollment_renewal_rewrites_package_and_requires_restart
     assert!(super::node_certificate_restart_required(
         &status.public_tls,
         &status.internal_tls,
-        config
-            .public_tls
-            .as_ref()
-            .map(|_| public_material.metadata.certificate_fingerprint.as_str()),
+        Some(loaded_public_fingerprint.as_str()),
         Some(loaded_internal_fingerprint.as_str()),
     ));
+    assert!(!super::node_certificate_restart_required(
+        &status.public_tls,
+        &status.internal_tls,
+        auto_renew_state.loaded_public_tls_fingerprint.as_deref(),
+        auto_renew_state.loaded_internal_tls_fingerprint.as_deref(),
+    ));
+    assert_eq!(
+        auto_renew_state.loaded_public_tls_fingerprint,
+        Some(renewed_public_fingerprint)
+    );
+    assert_eq!(
+        auto_renew_state.loaded_internal_tls_fingerprint,
+        Some(renewed_internal_fingerprint)
+    );
 
     cleanup_test_state(&state).await;
     issuer_handle.abort();
@@ -2998,10 +3088,8 @@ async fn build_test_state(
         public_ca_key_pem: None,
         cluster_ca_pem: None,
         internal_ca_key_pem: None,
-        public_tls_cert_path: None,
-        public_tls_metadata_path: None,
-        internal_tls_cert_path: None,
-        internal_tls_metadata_path: None,
+        public_tls_runtime: None,
+        internal_tls_runtime: None,
         rendezvous_ca_pem: None,
         rendezvous_urls: vec!["http://127.0.0.1:39080".to_string()],
         rendezvous_registration_enabled: false,
@@ -3012,8 +3100,6 @@ async fn build_test_state(
         node_enrollment_path: None,
         node_enrollment_auto_renew_enabled: false,
         node_enrollment_auto_renew_check_secs: 300,
-        node_enrollment_loaded_public_tls_fingerprint: None,
-        node_enrollment_loaded_internal_tls_fingerprint: None,
         node_enrollment_auto_renew_state: Arc::new(Mutex::new(
             super::NodeEnrollmentAutoRenewState::default(),
         )),

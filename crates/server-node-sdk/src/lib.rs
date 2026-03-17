@@ -96,10 +96,8 @@ struct ServerState {
     public_ca_key_pem: Option<String>,
     cluster_ca_pem: Option<String>,
     internal_ca_key_pem: Option<String>,
-    public_tls_cert_path: Option<PathBuf>,
-    public_tls_metadata_path: Option<PathBuf>,
-    internal_tls_cert_path: Option<PathBuf>,
-    internal_tls_metadata_path: Option<PathBuf>,
+    public_tls_runtime: Option<PublicTlsRuntime>,
+    internal_tls_runtime: Option<InternalTlsRuntime>,
     rendezvous_ca_pem: Option<String>,
     rendezvous_urls: Vec<String>,
     rendezvous_registration_enabled: bool,
@@ -110,8 +108,6 @@ struct ServerState {
     node_enrollment_path: Option<PathBuf>,
     node_enrollment_auto_renew_enabled: bool,
     node_enrollment_auto_renew_check_secs: u64,
-    node_enrollment_loaded_public_tls_fingerprint: Option<String>,
-    node_enrollment_loaded_internal_tls_fingerprint: Option<String>,
     node_enrollment_auto_renew_state: Arc<Mutex<NodeEnrollmentAutoRenewState>>,
     metadata_commit_mode: MetadataCommitMode,
     internal_http: reqwest::Client,
@@ -128,6 +124,23 @@ struct ServerState {
     admin_control: AdminControl,
     client_auth_control: ClientAuthControl,
     client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
+}
+
+#[derive(Clone)]
+struct PublicTlsRuntime {
+    config: RustlsConfig,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    metadata_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct InternalTlsRuntime {
+    config: RustlsConfig,
+    ca_cert_path: PathBuf,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    metadata_path: Option<PathBuf>,
 }
 
 pub(crate) fn publish_namespace_change(state: &ServerState) {
@@ -158,6 +171,8 @@ struct NodeEnrollmentAutoRenewState {
     last_attempt_unix: Option<u64>,
     last_success_unix: Option<u64>,
     last_error: Option<String>,
+    loaded_public_tls_fingerprint: Option<String>,
+    loaded_internal_tls_fingerprint: Option<String>,
 }
 
 impl ClientAuthReplayCache {
@@ -1047,6 +1062,93 @@ fn node_certificate_restart_required(
             .as_deref()
             .is_some_and(|current| current != loaded)
     })
+}
+
+async fn reload_live_tls_from_disk(state: &ServerState) -> Result<()> {
+    let mut loaded_public_tls_fingerprint = None;
+    let mut loaded_internal_tls_fingerprint = None;
+    let mut reload_errors = Vec::new();
+
+    if let Some(public_tls) = state.public_tls_runtime.as_ref() {
+        match public_tls
+            .config
+            .reload_from_pem_file(&public_tls.cert_path, &public_tls.key_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed reloading public TLS config from {} and {}",
+                    public_tls.cert_path.display(),
+                    public_tls.key_path.display()
+                )
+            }) {
+            Ok(()) => {
+                match parse_certificate_details_from_path(&public_tls.cert_path).with_context(
+                    || {
+                        format!(
+                            "failed reading reloaded public TLS certificate {}",
+                            public_tls.cert_path.display()
+                        )
+                    },
+                ) {
+                    Ok(details) => {
+                        loaded_public_tls_fingerprint = Some(details.certificate_fingerprint);
+                    }
+                    Err(err) => reload_errors.push(err.to_string()),
+                }
+            }
+            Err(err) => reload_errors.push(err.to_string()),
+        }
+    }
+
+    if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
+        match build_internal_mtls_server_config(
+            &internal_tls.ca_cert_path,
+            &internal_tls.cert_path,
+            &internal_tls.key_path,
+        )
+        .with_context(|| {
+            format!(
+                "failed rebuilding internal TLS config from {}, {}, and {}",
+                internal_tls.ca_cert_path.display(),
+                internal_tls.cert_path.display(),
+                internal_tls.key_path.display()
+            )
+        }) {
+            Ok(config) => {
+                internal_tls.config.reload_from_config(Arc::new(config));
+                match parse_certificate_details_from_path(&internal_tls.cert_path).with_context(
+                    || {
+                        format!(
+                            "failed reading reloaded internal TLS certificate {}",
+                            internal_tls.cert_path.display()
+                        )
+                    },
+                ) {
+                    Ok(details) => {
+                        loaded_internal_tls_fingerprint = Some(details.certificate_fingerprint);
+                    }
+                    Err(err) => reload_errors.push(err.to_string()),
+                }
+            }
+            Err(err) => reload_errors.push(err.to_string()),
+        }
+    }
+
+    {
+        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+        if let Some(fingerprint) = loaded_public_tls_fingerprint {
+            renewal_state.loaded_public_tls_fingerprint = Some(fingerprint);
+        }
+        if let Some(fingerprint) = loaded_internal_tls_fingerprint {
+            renewal_state.loaded_internal_tls_fingerprint = Some(fingerprint);
+        }
+    }
+
+    if reload_errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(reload_errors.join("; "));
+    }
 }
 
 fn log_certificate_lifecycle_status(status: &NodeCertificateStatusResponse) {
@@ -2037,24 +2139,50 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     } else {
         config
     };
-    let public_tls_cert_path = config.public_tls.as_ref().map(|tls| tls.cert_path.clone());
-    let public_tls_metadata_path = config
-        .public_tls
-        .as_ref()
-        .and_then(|tls| tls.metadata_path.clone());
-    let internal_tls_cert_path = config
-        .internal_tls
-        .as_ref()
-        .map(|tls| tls.cert_path.clone());
-    let internal_tls_metadata_path = config
-        .internal_tls
-        .as_ref()
-        .and_then(|tls| tls.metadata_path.clone());
+    let public_tls_runtime = match config.public_tls.as_ref() {
+        Some(public_tls) => Some(PublicTlsRuntime {
+            config: RustlsConfig::from_pem_file(&public_tls.cert_path, &public_tls.key_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed building public TLS config from {} and {}",
+                        public_tls.cert_path.display(),
+                        public_tls.key_path.display()
+                    )
+                })?,
+            cert_path: public_tls.cert_path.clone(),
+            key_path: public_tls.key_path.clone(),
+            metadata_path: public_tls.metadata_path.clone(),
+        }),
+        None => None,
+    };
+    let internal_tls_runtime = match config.internal_tls.as_ref() {
+        Some(internal_tls) => Some(InternalTlsRuntime {
+            config: build_internal_mtls_rustls_config(
+                &internal_tls.ca_cert_path,
+                &internal_tls.cert_path,
+                &internal_tls.key_path,
+            )?,
+            ca_cert_path: internal_tls.ca_cert_path.clone(),
+            cert_path: internal_tls.cert_path.clone(),
+            key_path: internal_tls.key_path.clone(),
+            metadata_path: internal_tls.metadata_path.clone(),
+        }),
+        None => None,
+    };
     let tls_status = collect_node_certificate_status(
-        public_tls_cert_path.as_deref(),
-        public_tls_metadata_path.as_deref(),
-        internal_tls_cert_path.as_deref(),
-        internal_tls_metadata_path.as_deref(),
+        public_tls_runtime
+            .as_ref()
+            .map(|tls| tls.cert_path.as_path()),
+        public_tls_runtime
+            .as_ref()
+            .and_then(|tls| tls.metadata_path.as_deref()),
+        internal_tls_runtime
+            .as_ref()
+            .map(|tls| tls.cert_path.as_path()),
+        internal_tls_runtime
+            .as_ref()
+            .and_then(|tls| tls.metadata_path.as_deref()),
         NodeCertificateAutoRenewStatusView {
             enabled: config.node_enrollment_auto_renew_enabled,
             enrollment_path: config
@@ -2274,10 +2402,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         public_ca_key_pem,
         cluster_ca_pem,
         internal_ca_key_pem,
-        public_tls_cert_path,
-        public_tls_metadata_path,
-        internal_tls_cert_path,
-        internal_tls_metadata_path,
+        public_tls_runtime,
+        internal_tls_runtime,
         rendezvous_ca_pem,
         rendezvous_urls: config.rendezvous_urls.clone(),
         rendezvous_registration_enabled: config.rendezvous_registration_enabled,
@@ -2288,17 +2414,14 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         node_enrollment_path: config.node_enrollment_path.clone(),
         node_enrollment_auto_renew_enabled: config.node_enrollment_auto_renew_enabled,
         node_enrollment_auto_renew_check_secs: config.node_enrollment_auto_renew_check_secs,
-        node_enrollment_loaded_public_tls_fingerprint: tls_status
-            .public_tls
-            .certificate_fingerprint
-            .clone(),
-        node_enrollment_loaded_internal_tls_fingerprint: tls_status
-            .internal_tls
-            .certificate_fingerprint
-            .clone(),
-        node_enrollment_auto_renew_state: Arc::new(Mutex::new(
-            NodeEnrollmentAutoRenewState::default(),
-        )),
+        node_enrollment_auto_renew_state: Arc::new(Mutex::new(NodeEnrollmentAutoRenewState {
+            loaded_public_tls_fingerprint: tls_status.public_tls.certificate_fingerprint.clone(),
+            loaded_internal_tls_fingerprint: tls_status
+                .internal_tls
+                .certificate_fingerprint
+                .clone(),
+            ..NodeEnrollmentAutoRenewState::default()
+        })),
         metadata_commit_mode: config.metadata_commit_mode,
         internal_http,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
@@ -2643,11 +2766,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
     if let Some(internal_tls) = config.internal_tls.as_ref() {
         let internal_bind_addr = internal_tls.bind_addr;
-        let internal_tls = build_internal_mtls_rustls_config(
-            &internal_tls.ca_cert_path,
-            &internal_tls.cert_path,
-            &internal_tls.key_path,
-        )?;
+        let internal_tls = state
+            .internal_tls_runtime
+            .as_ref()
+            .map(|runtime| runtime.config.clone())
+            .context("internal TLS runtime missing for configured internal listener")?;
         let internal_state = state.clone();
         tokio::spawn(async move {
             info!(
@@ -2675,16 +2798,12 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         "server node listening"
     );
 
-    if let Some(public_tls) = config.public_tls.as_ref() {
-        let tls_config = RustlsConfig::from_pem_file(&public_tls.cert_path, &public_tls.key_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed building public TLS config from {} and {}",
-                    public_tls.cert_path.display(),
-                    public_tls.key_path.display()
-                )
-            })?;
+    if config.public_tls.is_some() {
+        let tls_config = state
+            .public_tls_runtime
+            .as_ref()
+            .map(|runtime| runtime.config.clone())
+            .context("public TLS runtime missing for configured public listener")?;
         axum_server::bind_rustls(config.bind_addr, tls_config)
             .serve(public_app.into_make_service())
             .await?;
@@ -3491,17 +3610,25 @@ fn spawn_node_enrollment_auto_renew(
             }
 
             match renew_node_enrollment_package_if_due(&config).await {
-                Ok(true) => {
-                    {
-                        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
-                        renewal_state.last_success_unix = Some(unix_ts());
-                        renewal_state.last_error = None;
+                Ok(true) => match reload_live_tls_from_disk(&state).await {
+                    Ok(()) => {
+                        {
+                            let mut renewal_state =
+                                state.node_enrollment_auto_renew_state.lock().await;
+                            renewal_state.last_success_unix = Some(unix_ts());
+                            renewal_state.last_error = None;
+                        }
+                        info!(
+                            enrollment_path = ?state.node_enrollment_path.as_ref().map(|path| path.display().to_string()),
+                            "node enrollment auto-renew reloaded live TLS material"
+                        );
                     }
-                    warn!(
-                        enrollment_path = ?state.node_enrollment_path.as_ref().map(|path| path.display().to_string()),
-                        "node enrollment auto-renew updated TLS material on disk; restart required to load new certificates"
-                    );
-                }
+                    Err(err) => {
+                        warn!(error = %err, "node enrollment auto-renew reloaded package but failed to apply live TLS reload");
+                        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                        renewal_state.last_error = Some(err.to_string());
+                    }
+                },
                 Ok(false) => {
                     let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
                     renewal_state.last_error = None;
@@ -3871,21 +3998,29 @@ async fn node_certificate_status(
         restart_required: false,
     };
     let mut status = collect_node_certificate_status(
-        state.public_tls_cert_path.as_deref(),
-        state.public_tls_metadata_path.as_deref(),
-        state.internal_tls_cert_path.as_deref(),
-        state.internal_tls_metadata_path.as_deref(),
+        state
+            .public_tls_runtime
+            .as_ref()
+            .map(|tls| tls.cert_path.as_path()),
+        state
+            .public_tls_runtime
+            .as_ref()
+            .and_then(|tls| tls.metadata_path.as_deref()),
+        state
+            .internal_tls_runtime
+            .as_ref()
+            .map(|tls| tls.cert_path.as_path()),
+        state
+            .internal_tls_runtime
+            .as_ref()
+            .and_then(|tls| tls.metadata_path.as_deref()),
         auto_renew,
     );
     status.auto_renew.restart_required = node_certificate_restart_required(
         &status.public_tls,
         &status.internal_tls,
-        state
-            .node_enrollment_loaded_public_tls_fingerprint
-            .as_deref(),
-        state
-            .node_enrollment_loaded_internal_tls_fingerprint
-            .as_deref(),
+        auto_renew_state.loaded_public_tls_fingerprint.as_deref(),
+        auto_renew_state.loaded_internal_tls_fingerprint.as_deref(),
     );
 
     append_admin_audit(
@@ -6967,11 +7102,11 @@ fn build_internal_mtls_http_client(
         .context("failed building internal mTLS http client")
 }
 
-fn build_internal_mtls_rustls_config(
+fn build_internal_mtls_server_config(
     ca_path: &PathBuf,
     cert_path: &PathBuf,
     key_path: &PathBuf,
-) -> Result<RustlsConfig> {
+) -> Result<rustls::ServerConfig> {
     use std::fs::File;
     use std::io::BufReader;
 
@@ -7011,7 +7146,17 @@ fn build_internal_mtls_rustls_config(
 
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    Ok(RustlsConfig::from_config(Arc::new(config)))
+    Ok(config)
+}
+
+fn build_internal_mtls_rustls_config(
+    ca_path: &PathBuf,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+) -> Result<RustlsConfig> {
+    Ok(RustlsConfig::from_config(Arc::new(
+        build_internal_mtls_server_config(ca_path, cert_path, key_path)?,
+    )))
 }
 
 fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u32) -> u64 {

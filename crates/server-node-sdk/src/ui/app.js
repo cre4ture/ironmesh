@@ -493,6 +493,8 @@ function summarizeNodeCertificateStatus(payload) {
     }
     if (payload.auto_renew.restart_required) {
       autoRenew += ', restart required';
+    } else if (payload.auto_renew.last_success_unix) {
+      autoRenew += ', live reload applied';
     }
     if (payload.auto_renew.last_error) {
       autoRenew += `, last error: ${payload.auto_renew.last_error}`;
