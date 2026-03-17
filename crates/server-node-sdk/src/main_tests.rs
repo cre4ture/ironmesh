@@ -359,6 +359,7 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
             rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
         },
         upstream_public_url: Some("https://upstream.example".to_string()),
+        enrollment_issuer_url: Some("https://issuer.example".to_string()),
     }
     .write_to_path(&bootstrap_path)
     .unwrap();
@@ -404,6 +405,10 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
         config.upstream_public_url.as_deref(),
         Some("https://upstream.example")
     );
+    assert_eq!(
+        config.enrollment_issuer_url.as_deref(),
+        Some("https://issuer.example")
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -448,6 +453,7 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
                 key_path: "tls/internal.key".to_string(),
             }),
             upstream_public_url: Some("https://upstream.example".to_string()),
+            enrollment_issuer_url: None,
             tls_validity_secs: None,
             tls_renewal_window_secs: None,
         }),
@@ -486,6 +492,10 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
     assert_eq!(
         bootstrap.internal_url.as_deref(),
         Some("https://10.0.0.12:38080")
+    );
+    assert_eq!(
+        bootstrap.enrollment_issuer_url.as_deref(),
+        Some("http://127.0.0.1:39080")
     );
     assert_eq!(
         bootstrap.labels.get("rack").map(String::as_str),
@@ -546,6 +556,7 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
                 key_path: "tls/internal.key".to_string(),
             }),
             upstream_public_url: None,
+            enrollment_issuer_url: None,
             tls_validity_secs: None,
             tls_renewal_window_secs: None,
         }),
@@ -640,6 +651,7 @@ async fn issue_node_enrollment_allows_local_edge_with_public_tls_only() {
             internal_url: None,
             internal_tls: None,
             upstream_public_url: None,
+            enrollment_issuer_url: None,
             tls_validity_secs: None,
             tls_renewal_window_secs: None,
         }),
@@ -702,6 +714,7 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
             rendezvous_ca_pem: None,
         },
         upstream_public_url: None,
+        enrollment_issuer_url: Some("https://issuer.example".to_string()),
     };
     let issue_policy = default_tls_issue_policy();
     let internal_material =
@@ -788,6 +801,7 @@ async fn node_bootstrap_file_can_start_local_edge_node() {
             rendezvous_ca_pem: None,
         },
         upstream_public_url: None,
+        enrollment_issuer_url: None,
     }
     .write_to_path(&bootstrap_path)
     .unwrap();
@@ -860,6 +874,7 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
             rendezvous_ca_pem: None,
         },
         upstream_public_url: None,
+        enrollment_issuer_url: Some("https://issuer.example".to_string()),
     };
     let issue_policy = default_tls_issue_policy();
     let internal_material =
@@ -946,6 +961,7 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
                 key_path: "tls/internal.key".to_string(),
             }),
             upstream_public_url: None,
+            enrollment_issuer_url: Some("https://issuer.example".to_string()),
             tls_validity_secs: Some(7 * 24 * 60 * 60),
             tls_renewal_window_secs: Some(24 * 60 * 60),
         }),
@@ -1021,6 +1037,163 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
 }
 
 #[tokio::test]
+async fn automatic_node_enrollment_renewal_rewrites_package_and_requires_restart() {
+    let root = fresh_test_dir("node-auto-renew");
+    let issuer_dir = root.join("issuer");
+    let issuer_bind_addr = free_bind_addr();
+    let issuer_public_url = format!("http://{issuer_bind_addr}");
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    let cluster_ca_path = issuer_dir.join("cluster-ca.pem");
+    let cluster_ca_key_path = issuer_dir.join("cluster-ca.key");
+    std::fs::create_dir_all(&issuer_dir).unwrap();
+    std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
+    std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
+
+    let mut issuer_config = super::ServerNodeConfig::local_edge(&issuer_dir, issuer_bind_addr);
+    issuer_config.admin_token = Some("admin-secret".to_string());
+    issuer_config.public_url = Some(issuer_public_url.clone());
+    issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
+    issuer_config.internal_ca_key_path = Some(cluster_ca_key_path.clone());
+    let issuer_handle = tokio::spawn(async move { super::run(issuer_config).await });
+    let http = reqwest::Client::new();
+    wait_for_http_status(
+        &http,
+        &format!("{issuer_public_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+    let package_path = root.join("node-enrollment.json");
+    let internal_bind_addr = free_bind_addr();
+    let bootstrap = transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: state.cluster_id,
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: root.join("node").to_string_lossy().into_owned(),
+        bind_addr: free_bind_addr().to_string(),
+        public_url: Some("https://node-auto-renew.example".to_string()),
+        labels: HashMap::new(),
+        public_tls: Some(transport_sdk::BootstrapServerTlsFiles {
+            cert_path: "tls/public.pem".to_string(),
+            key_path: "tls/public.key".to_string(),
+        }),
+        public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+        public_peer_api_enabled: false,
+        internal_bind_addr: Some(internal_bind_addr.to_string()),
+        internal_url: Some(format!("https://127.0.0.1:{}", internal_bind_addr.port())),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/cluster-ca.pem".to_string(),
+            cert_path: "tls/internal.pem".to_string(),
+            key_path: "tls/internal.key".to_string(),
+        }),
+        rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+        rendezvous_mtls_required: false,
+        direct_endpoints: Vec::new(),
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: Some(cluster_ca_pem.clone()),
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: None,
+        },
+        upstream_public_url: None,
+        enrollment_issuer_url: Some(issuer_public_url.clone()),
+    };
+    let issue_policy = default_tls_issue_policy();
+    let mut internal_material =
+        super::issue_internal_node_tls_material(&state, &bootstrap, issue_policy).unwrap();
+    let mut public_material =
+        super::issue_public_node_tls_material(&state, &bootstrap, issue_policy)
+            .unwrap()
+            .unwrap();
+    internal_material.metadata.renew_after_unix = super::unix_ts().saturating_sub(1);
+    public_material.metadata.renew_after_unix = super::unix_ts().saturating_sub(1);
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: Some(public_material.clone()),
+        internal_tls_material: Some(internal_material.clone()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+
+    let mut config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    config.enrollment_issuer_url = Some(issuer_public_url);
+    config.node_enrollment_auto_renew_enabled = true;
+    config.node_enrollment_renewal_admin_token = Some("admin-secret".to_string());
+    let loaded_internal_fingerprint = super::parse_certificate_details_from_path(
+        &config.internal_tls.as_ref().unwrap().cert_path,
+    )
+    .unwrap()
+    .certificate_fingerprint;
+
+    assert!(
+        super::renew_node_enrollment_package_if_due(&config)
+            .await
+            .unwrap()
+    );
+
+    let renewed_package = transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap();
+    let renewed_internal_fingerprint = renewed_package
+        .internal_tls_material
+        .as_ref()
+        .unwrap()
+        .metadata
+        .certificate_fingerprint
+        .clone();
+    assert_ne!(
+        renewed_internal_fingerprint,
+        internal_material.metadata.certificate_fingerprint
+    );
+
+    let status = super::collect_node_certificate_status(
+        config
+            .public_tls
+            .as_ref()
+            .map(|tls| tls.cert_path.as_path()),
+        config
+            .public_tls
+            .as_ref()
+            .and_then(|tls| tls.metadata_path.as_deref()),
+        config
+            .internal_tls
+            .as_ref()
+            .map(|tls| tls.cert_path.as_path()),
+        config
+            .internal_tls
+            .as_ref()
+            .and_then(|tls| tls.metadata_path.as_deref()),
+        super::NodeCertificateAutoRenewStatusView {
+            enabled: true,
+            enrollment_path: Some(package_path.display().to_string()),
+            issuer_url: config.enrollment_issuer_url.clone(),
+            check_interval_secs: Some(config.node_enrollment_auto_renew_check_secs),
+            last_attempt_unix: Some(super::unix_ts()),
+            last_success_unix: Some(super::unix_ts()),
+            last_error: None,
+            restart_required: false,
+        },
+    );
+    assert!(super::node_certificate_restart_required(
+        &status.public_tls,
+        &status.internal_tls,
+        config
+            .public_tls
+            .as_ref()
+            .map(|_| public_material.metadata.certificate_fingerprint.as_str()),
+        Some(loaded_internal_fingerprint.as_str()),
+    ));
+
+    cleanup_test_state(&state).await;
+    issuer_handle.abort();
+    let _ = issuer_handle.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metadata() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
@@ -1059,6 +1232,7 @@ async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metada
             rendezvous_ca_pem: None,
         },
         upstream_public_url: None,
+        enrollment_issuer_url: Some("https://issuer.example".to_string()),
     };
     let issue_policy = default_tls_issue_policy();
     let internal_material =
@@ -1088,6 +1262,16 @@ async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metada
         None,
         Some(internal_tls.cert_path.as_path()),
         Some(metadata_path.as_path()),
+        super::NodeCertificateAutoRenewStatusView {
+            enabled: false,
+            enrollment_path: None,
+            issuer_url: None,
+            check_interval_secs: None,
+            last_attempt_unix: None,
+            last_success_unix: None,
+            last_error: None,
+            restart_required: false,
+        },
     );
     assert_eq!(
         status.internal_tls.state,
@@ -2824,6 +3008,15 @@ async fn build_test_state(
         rendezvous_control: None,
         rendezvous_mtls_required: false,
         relay_mode: super::RelayMode::Fallback,
+        enrollment_issuer_url: None,
+        node_enrollment_path: None,
+        node_enrollment_auto_renew_enabled: false,
+        node_enrollment_auto_renew_check_secs: 300,
+        node_enrollment_loaded_public_tls_fingerprint: None,
+        node_enrollment_loaded_internal_tls_fingerprint: None,
+        node_enrollment_auto_renew_state: Arc::new(Mutex::new(
+            super::NodeEnrollmentAutoRenewState::default(),
+        )),
         metadata_commit_mode: MetadataCommitMode::Local,
         internal_http: reqwest::Client::new(),
         autonomous_replication_on_put_enabled: false,

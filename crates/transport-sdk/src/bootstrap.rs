@@ -137,6 +137,8 @@ pub struct NodeBootstrap {
     pub trust_roots: BootstrapTrustRoots,
     #[serde(default)]
     pub upstream_public_url: Option<String>,
+    #[serde(default)]
+    pub enrollment_issuer_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +239,10 @@ impl NodeBootstrap {
         validate_optional_socket_addr("internal_bind_addr", self.internal_bind_addr.as_deref())?;
         validate_optional_url("internal_url", self.internal_url.as_deref())?;
         validate_optional_url("upstream_public_url", self.upstream_public_url.as_deref())?;
+        validate_optional_url(
+            "enrollment_issuer_url",
+            self.enrollment_issuer_url.as_deref(),
+        )?;
         validate_optional_server_tls_files("public_tls", self.public_tls.as_ref())?;
         validate_optional_tls_files("internal_tls", self.internal_tls.as_ref())?;
         if self.mode == NodeBootstrapMode::Cluster && self.internal_tls.is_none() {
@@ -571,6 +577,7 @@ mod tests {
                 rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
             },
             upstream_public_url: None,
+            enrollment_issuer_url: Some("https://issuer.example".to_string()),
         };
 
         bootstrap
@@ -610,6 +617,7 @@ mod tests {
                     rendezvous_ca_pem: None,
                 },
                 upstream_public_url: None,
+                enrollment_issuer_url: None,
             },
             public_tls_material: None,
             internal_tls_material: None,
@@ -649,6 +657,7 @@ mod tests {
                     rendezvous_ca_pem: None,
                 },
                 upstream_public_url: None,
+                enrollment_issuer_url: None,
             },
             public_tls_material: None,
             internal_tls_material: None,
@@ -692,6 +701,7 @@ mod tests {
                     rendezvous_ca_pem: None,
                 },
                 upstream_public_url: None,
+                enrollment_issuer_url: Some("https://issuer.example".to_string()),
             },
             public_tls_material: Some(sample_tls_material()),
             internal_tls_material: Some(sample_tls_material()),
@@ -733,6 +743,7 @@ mod tests {
                     rendezvous_ca_pem: None,
                 },
                 upstream_public_url: None,
+                enrollment_issuer_url: Some("https://issuer.example".to_string()),
             },
             public_tls_material: Some(invalid),
             internal_tls_material: None,

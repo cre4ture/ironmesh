@@ -422,6 +422,9 @@ function summarizeNodeBootstrap(payload) {
   if (payload?.public_tls) {
     notes.push('includes public TLS file paths');
   }
+  if (payload?.enrollment_issuer_url) {
+    notes.push(`enrollment issuer: ${payload.enrollment_issuer_url}`);
+  }
   if (trustRoots.rendezvous_ca_pem) {
     notes.push('includes rendezvous CA trust root');
   }
@@ -467,7 +470,7 @@ function summarizeNodeEnrollment(payload) {
 
 function summarizeNodeCertificateStatus(payload) {
   const entries = [payload?.public_tls, payload?.internal_tls].filter(Boolean);
-  return entries
+  const notes = entries
     .map((entry) => {
       let note = `${entry.name}: ${entry.state}`;
       if (entry.expires_at_unix) {
@@ -481,7 +484,23 @@ function summarizeNodeCertificateStatus(payload) {
       }
       return note;
     })
-    .join(' | ');
+    .filter(Boolean);
+
+  if (payload?.auto_renew) {
+    let autoRenew = `auto renew: ${payload.auto_renew.enabled ? 'enabled' : 'disabled'}`;
+    if (payload.auto_renew.issuer_url) {
+      autoRenew += ` via ${payload.auto_renew.issuer_url}`;
+    }
+    if (payload.auto_renew.restart_required) {
+      autoRenew += ', restart required';
+    }
+    if (payload.auto_renew.last_error) {
+      autoRenew += `, last error: ${payload.auto_renew.last_error}`;
+    }
+    notes.push(autoRenew);
+  }
+
+  return notes.join(' | ');
 }
 
 function renderBootstrapQr(text) {

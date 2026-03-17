@@ -106,6 +106,13 @@ struct ServerState {
     rendezvous_control: Option<RendezvousControlClient>,
     rendezvous_mtls_required: bool,
     relay_mode: RelayMode,
+    enrollment_issuer_url: Option<String>,
+    node_enrollment_path: Option<PathBuf>,
+    node_enrollment_auto_renew_enabled: bool,
+    node_enrollment_auto_renew_check_secs: u64,
+    node_enrollment_loaded_public_tls_fingerprint: Option<String>,
+    node_enrollment_loaded_internal_tls_fingerprint: Option<String>,
+    node_enrollment_auto_renew_state: Arc<Mutex<NodeEnrollmentAutoRenewState>>,
     metadata_commit_mode: MetadataCommitMode,
     internal_http: reqwest::Client,
     autonomous_replication_on_put_enabled: bool,
@@ -144,6 +151,13 @@ struct ClientAuthControl {
 #[derive(Debug, Default)]
 struct ClientAuthReplayCache {
     seen_requests: HashMap<String, u64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct NodeEnrollmentAutoRenewState {
+    last_attempt_unix: Option<u64>,
+    last_success_unix: Option<u64>,
+    last_error: Option<String>,
 }
 
 impl ClientAuthReplayCache {
@@ -566,6 +580,11 @@ pub struct ServerNodeConfig {
     pub rendezvous_mtls_required: bool,
     pub relay_mode: RelayMode,
     pub upstream_public_url: Option<String>,
+    pub enrollment_issuer_url: Option<String>,
+    pub node_enrollment_path: Option<PathBuf>,
+    pub node_enrollment_auto_renew_enabled: bool,
+    pub node_enrollment_auto_renew_check_secs: u64,
+    pub node_enrollment_renewal_admin_token: Option<String>,
     pub heartbeat_timeout_secs: u64,
     pub audit_interval_secs: u64,
     pub replica_view_sync_interval_secs: u64,
@@ -809,6 +828,98 @@ fn build_tls_material_metadata(
     })
 }
 
+fn node_enrollment_preserved_tls_policy(
+    package: &NodeEnrollmentPackage,
+) -> (Option<u64>, Option<u64>) {
+    let material = package
+        .internal_tls_material
+        .as_ref()
+        .or(package.public_tls_material.as_ref());
+    let Some(material) = material else {
+        return (None, None);
+    };
+    let validity_secs = material
+        .metadata
+        .not_after_unix
+        .saturating_sub(material.metadata.issued_at_unix);
+    let renewal_window_secs = material
+        .metadata
+        .not_after_unix
+        .saturating_sub(material.metadata.renew_after_unix);
+    if validity_secs < 60 * 60 || renewal_window_secs < 300 || renewal_window_secs >= validity_secs
+    {
+        return (None, None);
+    }
+    (
+        (validity_secs > 0).then_some(validity_secs),
+        (renewal_window_secs > 0).then_some(renewal_window_secs),
+    )
+}
+
+fn node_enrollment_due_for_renewal(package: &NodeEnrollmentPackage, now: u64) -> bool {
+    [
+        package.public_tls_material.as_ref(),
+        package.internal_tls_material.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|material| material.metadata.renew_after_unix <= now)
+}
+
+async fn renew_node_enrollment_package_if_due(config: &ServerNodeConfig) -> Result<bool> {
+    if !config.node_enrollment_auto_renew_enabled {
+        return Ok(false);
+    }
+    let Some(enrollment_path) = config.node_enrollment_path.as_ref() else {
+        return Ok(false);
+    };
+    let Some(admin_token) = config.node_enrollment_renewal_admin_token.as_deref() else {
+        return Ok(false);
+    };
+
+    let package = NodeEnrollmentPackage::from_path(enrollment_path)?;
+    let now = unix_ts();
+    if !node_enrollment_due_for_renewal(&package, now) {
+        return Ok(false);
+    }
+
+    let issuer_url = package
+        .bootstrap
+        .enrollment_issuer_url
+        .as_deref()
+        .or(config.enrollment_issuer_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .context("node enrollment auto-renew requires bootstrap.enrollment_issuer_url")?;
+    let (tls_validity_secs, tls_renewal_window_secs) =
+        node_enrollment_preserved_tls_policy(&package);
+    let client = build_http_client_from_optional_pem(
+        package.bootstrap.trust_roots.public_api_ca_pem.as_deref(),
+    )?;
+    let response = client
+        .post(format!("{issuer_url}/auth/node-enrollments/renew"))
+        .header(ADMIN_TOKEN_HEADER, admin_token)
+        .json(&OutboundNodeEnrollmentRenewRequest {
+            package: package.clone(),
+            tls_validity_secs,
+            tls_renewal_window_secs,
+        })
+        .send()
+        .await
+        .context("failed requesting automatic node enrollment renewal")?
+        .error_for_status()
+        .context("automatic node enrollment renewal returned error")?;
+    let renewed = response
+        .json::<NodeEnrollmentPackage>()
+        .await
+        .context("failed decoding automatic node enrollment renewal response")?;
+    renewed.validate()?;
+    renewed.write_to_path(enrollment_path)?;
+    let _ = materialize_node_enrollment_package(renewed)?;
+    Ok(true)
+}
+
 fn load_tls_material_metadata_sidecar(
     metadata_path: Option<&std::path::Path>,
 ) -> Option<BootstrapTlsMaterialMetadata> {
@@ -906,6 +1017,7 @@ fn collect_node_certificate_status(
     public_metadata_path: Option<&std::path::Path>,
     internal_cert_path: Option<&std::path::Path>,
     internal_metadata_path: Option<&std::path::Path>,
+    auto_renew: NodeCertificateAutoRenewStatusView,
 ) -> NodeCertificateStatusResponse {
     NodeCertificateStatusResponse {
         public_tls: inspect_node_certificate("public_tls", public_cert_path, public_metadata_path),
@@ -914,7 +1026,27 @@ fn collect_node_certificate_status(
             internal_cert_path,
             internal_metadata_path,
         ),
+        auto_renew,
     }
+}
+
+fn node_certificate_restart_required(
+    public_tls: &NodeCertificateStatusView,
+    internal_tls: &NodeCertificateStatusView,
+    loaded_public_fingerprint: Option<&str>,
+    loaded_internal_fingerprint: Option<&str>,
+) -> bool {
+    loaded_public_fingerprint.is_some_and(|loaded| {
+        public_tls
+            .certificate_fingerprint
+            .as_deref()
+            .is_some_and(|current| current != loaded)
+    }) || loaded_internal_fingerprint.is_some_and(|loaded| {
+        internal_tls
+            .certificate_fingerprint
+            .as_deref()
+            .is_some_and(|current| current != loaded)
+    })
 }
 
 fn log_certificate_lifecycle_status(status: &NodeCertificateStatusResponse) {
@@ -1028,10 +1160,39 @@ fn materialize_node_enrollment_package(
     Ok(bootstrap)
 }
 
+fn parse_enrollment_auto_renew_enabled(default_enabled: bool) -> bool {
+    std::env::var("IRONMESH_NODE_ENROLLMENT_AUTO_RENEW_ENABLED")
+        .ok()
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+        .unwrap_or(default_enabled)
+}
+
+fn node_enrollment_auto_renew_check_secs() -> u64 {
+    std::env::var("IRONMESH_NODE_ENROLLMENT_RENEWAL_CHECK_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(300)
+}
+
+fn node_enrollment_renewal_admin_token_from_env() -> Option<String> {
+    std::env::var("IRONMESH_NODE_ENROLLMENT_RENEWAL_ADMIN_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 impl ServerNodeConfig {
     pub fn from_enrollment_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let package = NodeEnrollmentPackage::from_path(path.as_ref())?;
-        Self::from_enrollment(package)
+        let mut config = Self::from_enrollment(package)?;
+        config.node_enrollment_path = Some(path.as_ref().to_path_buf());
+        config.node_enrollment_renewal_admin_token = node_enrollment_renewal_admin_token_from_env();
+        config.node_enrollment_auto_renew_enabled = parse_enrollment_auto_renew_enabled(
+            config.node_enrollment_renewal_admin_token.is_some(),
+        );
+        config.node_enrollment_auto_renew_check_secs = node_enrollment_auto_renew_check_secs();
+        Ok(config)
     }
 
     pub fn from_enrollment(package: NodeEnrollmentPackage) -> Result<Self> {
@@ -1118,6 +1279,11 @@ impl ServerNodeConfig {
             rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
             relay_mode: bootstrap.relay_mode,
             upstream_public_url: bootstrap.upstream_public_url,
+            enrollment_issuer_url: bootstrap.enrollment_issuer_url,
+            node_enrollment_path: None,
+            node_enrollment_auto_renew_enabled: false,
+            node_enrollment_auto_renew_check_secs: node_enrollment_auto_renew_check_secs(),
+            node_enrollment_renewal_admin_token: node_enrollment_renewal_admin_token_from_env(),
             heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -1459,6 +1625,11 @@ impl ServerNodeConfig {
             rendezvous_mtls_required,
             relay_mode,
             upstream_public_url,
+            enrollment_issuer_url: None,
+            node_enrollment_path: None,
+            node_enrollment_auto_renew_enabled: false,
+            node_enrollment_auto_renew_check_secs: node_enrollment_auto_renew_check_secs(),
+            node_enrollment_renewal_admin_token: node_enrollment_renewal_admin_token_from_env(),
             heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -1599,6 +1770,11 @@ impl ServerNodeConfig {
             rendezvous_mtls_required: false,
             relay_mode: RelayMode::Fallback,
             upstream_public_url: None,
+            enrollment_issuer_url: None,
+            node_enrollment_path: None,
+            node_enrollment_auto_renew_enabled: false,
+            node_enrollment_auto_renew_check_secs: node_enrollment_auto_renew_check_secs(),
+            node_enrollment_renewal_admin_token: None,
             heartbeat_timeout_secs: 90,
             audit_interval_secs: 3600,
             replica_view_sync_interval_secs: 5,
@@ -1839,6 +2015,28 @@ pub async fn run(config: ServerNodeConfig) -> Result<()> {
 
 async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = if config.node_enrollment_auto_renew_enabled {
+        if let Some(enrollment_path) = config.node_enrollment_path.clone() {
+            match renew_node_enrollment_package_if_due(&config).await {
+                Ok(true) => {
+                    info!(
+                        enrollment_path = %enrollment_path.display(),
+                        "renewed node enrollment package before startup"
+                    );
+                    ServerNodeConfig::from_enrollment_path(&enrollment_path)?
+                }
+                Ok(false) => config,
+                Err(err) => {
+                    warn!(error = %err, "failed automatic node enrollment renewal before startup");
+                    config
+                }
+            }
+        } else {
+            config
+        }
+    } else {
+        config
+    };
     let public_tls_cert_path = config.public_tls.as_ref().map(|tls| tls.cert_path.clone());
     let public_tls_metadata_path = config
         .public_tls
@@ -1857,6 +2055,21 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         public_tls_metadata_path.as_deref(),
         internal_tls_cert_path.as_deref(),
         internal_tls_metadata_path.as_deref(),
+        NodeCertificateAutoRenewStatusView {
+            enabled: config.node_enrollment_auto_renew_enabled,
+            enrollment_path: config
+                .node_enrollment_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            issuer_url: config.enrollment_issuer_url.clone(),
+            check_interval_secs: config
+                .node_enrollment_auto_renew_enabled
+                .then_some(config.node_enrollment_auto_renew_check_secs),
+            last_attempt_unix: None,
+            last_success_unix: None,
+            last_error: None,
+            restart_required: false,
+        },
     );
     log_certificate_lifecycle_status(&tls_status);
 
@@ -2071,6 +2284,21 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         rendezvous_control,
         rendezvous_mtls_required: config.rendezvous_mtls_required,
         relay_mode: config.relay_mode,
+        enrollment_issuer_url: config.enrollment_issuer_url.clone(),
+        node_enrollment_path: config.node_enrollment_path.clone(),
+        node_enrollment_auto_renew_enabled: config.node_enrollment_auto_renew_enabled,
+        node_enrollment_auto_renew_check_secs: config.node_enrollment_auto_renew_check_secs,
+        node_enrollment_loaded_public_tls_fingerprint: tls_status
+            .public_tls
+            .certificate_fingerprint
+            .clone(),
+        node_enrollment_loaded_internal_tls_fingerprint: tls_status
+            .internal_tls
+            .certificate_fingerprint
+            .clone(),
+        node_enrollment_auto_renew_state: Arc::new(Mutex::new(
+            NodeEnrollmentAutoRenewState::default(),
+        )),
         metadata_commit_mode: config.metadata_commit_mode,
         internal_http,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
@@ -2205,6 +2433,14 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         if peer_heartbeat_config.enabled {
             spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
         }
+    }
+
+    if config.node_enrollment_auto_renew_enabled {
+        spawn_node_enrollment_auto_renew(
+            state.clone(),
+            config.clone(),
+            config.node_enrollment_auto_renew_check_secs,
+        );
     }
 
     let public_client_api = Router::new()
@@ -3239,6 +3475,47 @@ fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
     });
 }
 
+fn spawn_node_enrollment_auto_renew(
+    state: ServerState,
+    config: ServerNodeConfig,
+    interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(30)));
+
+        loop {
+            ticker.tick().await;
+            {
+                let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                renewal_state.last_attempt_unix = Some(unix_ts());
+            }
+
+            match renew_node_enrollment_package_if_due(&config).await {
+                Ok(true) => {
+                    {
+                        let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                        renewal_state.last_success_unix = Some(unix_ts());
+                        renewal_state.last_error = None;
+                    }
+                    warn!(
+                        enrollment_path = ?state.node_enrollment_path.as_ref().map(|path| path.display().to_string()),
+                        "node enrollment auto-renew updated TLS material on disk; restart required to load new certificates"
+                    );
+                }
+                Ok(false) => {
+                    let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                    renewal_state.last_error = None;
+                }
+                Err(err) => {
+                    warn!(error = %err, "node enrollment auto-renew failed");
+                    let mut renewal_state = state.node_enrollment_auto_renew_state.lock().await;
+                    renewal_state.last_error = Some(err.to_string());
+                }
+            }
+        }
+    });
+}
+
 fn spawn_upstream_peer_bootstrap(
     state: ServerState,
     upstream_public_url: String,
@@ -3577,11 +3854,38 @@ async fn node_certificate_status(
         Err(status) => return status.into_response(),
     };
 
-    let status = collect_node_certificate_status(
+    let auto_renew_state = state.node_enrollment_auto_renew_state.lock().await.clone();
+    let auto_renew = NodeCertificateAutoRenewStatusView {
+        enabled: state.node_enrollment_auto_renew_enabled,
+        enrollment_path: state
+            .node_enrollment_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        issuer_url: state.enrollment_issuer_url.clone(),
+        check_interval_secs: state
+            .node_enrollment_auto_renew_enabled
+            .then_some(state.node_enrollment_auto_renew_check_secs),
+        last_attempt_unix: auto_renew_state.last_attempt_unix,
+        last_success_unix: auto_renew_state.last_success_unix,
+        last_error: auto_renew_state.last_error.clone(),
+        restart_required: false,
+    };
+    let mut status = collect_node_certificate_status(
         state.public_tls_cert_path.as_deref(),
         state.public_tls_metadata_path.as_deref(),
         state.internal_tls_cert_path.as_deref(),
         state.internal_tls_metadata_path.as_deref(),
+        auto_renew,
+    );
+    status.auto_renew.restart_required = node_certificate_restart_required(
+        &status.public_tls,
+        &status.internal_tls,
+        state
+            .node_enrollment_loaded_public_tls_fingerprint
+            .as_deref(),
+        state
+            .node_enrollment_loaded_internal_tls_fingerprint
+            .as_deref(),
     );
 
     append_admin_audit(
@@ -3595,6 +3899,8 @@ async fn node_certificate_status(
         json!({
             "public_tls_state": status.public_tls.state,
             "internal_tls_state": status.internal_tls.state,
+            "auto_renew_enabled": status.auto_renew.enabled,
+            "auto_renew_restart_required": status.auto_renew.restart_required,
         }),
     )
     .await;
@@ -4779,12 +5085,20 @@ struct NodeBootstrapIssueRequest {
     internal_url: Option<String>,
     internal_tls: Option<BootstrapTlsFiles>,
     upstream_public_url: Option<String>,
+    enrollment_issuer_url: Option<String>,
     tls_validity_secs: Option<u64>,
     tls_renewal_window_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct NodeEnrollmentRenewRequest {
+    package: NodeEnrollmentPackage,
+    tls_validity_secs: Option<u64>,
+    tls_renewal_window_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutboundNodeEnrollmentRenewRequest {
     package: NodeEnrollmentPackage,
     tls_validity_secs: Option<u64>,
     tls_renewal_window_secs: Option<u64>,
@@ -4865,6 +5179,19 @@ struct NodeCertificateStatusView {
 struct NodeCertificateStatusResponse {
     public_tls: NodeCertificateStatusView,
     internal_tls: NodeCertificateStatusView,
+    auto_renew: NodeCertificateAutoRenewStatusView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NodeCertificateAutoRenewStatusView {
+    enabled: bool,
+    enrollment_path: Option<String>,
+    issuer_url: Option<String>,
+    check_interval_secs: Option<u64>,
+    last_attempt_unix: Option<u64>,
+    last_success_unix: Option<u64>,
+    last_error: Option<String>,
+    restart_required: bool,
 }
 
 async fn persist_client_auth_state(state: &ServerState) -> Result<()> {
@@ -4983,6 +5310,7 @@ fn default_internal_url(bind_addr: &str) -> String {
 fn build_issued_node_bootstrap(
     state: &ServerState,
     request: NodeBootstrapIssueRequest,
+    enrollment_issuer_url: Option<String>,
 ) -> std::result::Result<TransportNodeBootstrap, StatusCode> {
     let rendezvous_urls = bootstrap_rendezvous_urls(state)?;
     let mode = request.mode.unwrap_or(NodeBootstrapMode::Cluster);
@@ -5034,6 +5362,7 @@ fn build_issued_node_bootstrap(
         relay_mode: state.relay_mode,
         trust_roots: bootstrap_trust_roots(state),
         upstream_public_url: request.upstream_public_url,
+        enrollment_issuer_url,
     };
 
     bootstrap.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -5329,6 +5658,7 @@ async fn issue_node_bootstrap(
             "bind_addr": request.bind_addr,
             "public_url": request.public_url,
             "upstream_public_url": request.upstream_public_url,
+            "enrollment_issuer_url": request.enrollment_issuer_url,
             "tls_validity_secs": request.tls_validity_secs,
             "tls_renewal_window_secs": request.tls_renewal_window_secs,
         }),
@@ -5339,7 +5669,11 @@ async fn issue_node_bootstrap(
         Err(status) => return status.into_response(),
     };
 
-    let bootstrap = match build_issued_node_bootstrap(&state, request) {
+    let enrollment_issuer_url = request
+        .enrollment_issuer_url
+        .clone()
+        .or(local_public_enrollment_issuer_url(&state).await);
+    let bootstrap = match build_issued_node_bootstrap(&state, request, enrollment_issuer_url) {
         Ok(bootstrap) => bootstrap,
         Err(status) => {
             let err = "invalid node bootstrap request";
@@ -5397,6 +5731,7 @@ async fn issue_node_enrollment(
             "bind_addr": request.bind_addr,
             "public_url": request.public_url,
             "upstream_public_url": request.upstream_public_url,
+            "enrollment_issuer_url": request.enrollment_issuer_url,
             "tls_validity_secs": request.tls_validity_secs,
             "tls_renewal_window_secs": request.tls_renewal_window_secs,
         }),
@@ -5409,7 +5744,11 @@ async fn issue_node_enrollment(
 
     let tls_validity_secs = request.tls_validity_secs;
     let tls_renewal_window_secs = request.tls_renewal_window_secs;
-    let bootstrap = match build_issued_node_bootstrap(&state, request) {
+    let enrollment_issuer_url = request
+        .enrollment_issuer_url
+        .clone()
+        .or(local_public_enrollment_issuer_url(&state).await);
+    let bootstrap = match build_issued_node_bootstrap(&state, request, enrollment_issuer_url) {
         Ok(bootstrap) => bootstrap,
         Err(status) => {
             let err = "invalid node enrollment request";
@@ -5971,6 +6310,16 @@ async fn list_nodes(State(state): State<ServerState>) -> Json<Vec<NodeDescriptor
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
     Json(cluster.list_nodes())
+}
+
+async fn local_public_enrollment_issuer_url(state: &ServerState) -> Option<String> {
+    let mut cluster = state.cluster.lock().await;
+    cluster.update_health_and_detect_offline_transition();
+    cluster
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == state.node_id && !node.public_url.trim().is_empty())
+        .map(|node| node.public_url.trim().trim_end_matches('/').to_string())
 }
 
 async fn apply_node_heartbeat(
