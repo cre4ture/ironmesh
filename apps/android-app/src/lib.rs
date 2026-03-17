@@ -1010,7 +1010,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
             local_tree_uri,
-            server_base_url: base_url,
+            server_base_url: Some(base_url),
+            client_bootstrap_json: None,
             server_ca_pem,
             client_identity_json,
             prefix,
@@ -1067,7 +1068,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
             local_tree_uri,
-            server_base_url: base_url,
+            server_base_url: Some(base_url),
+            client_bootstrap_json: None,
             server_ca_pem,
             client_identity_json,
             prefix,

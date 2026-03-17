@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
-    RemoteSnapshotUpdate, normalize_server_base_url,
+    RemoteSnapshotUpdate,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -19,7 +19,7 @@ use sync_core::{EntryKind, SyncSnapshot};
 use crate::{
     FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeState, PathScope,
     RemoteTreeIndex, StartupStateStore, absolute_path, build_configured_client,
-    cleanup_ironmesh_part_files, delete_remote_file, diff_local_trees,
+    cleanup_ironmesh_part_files, delete_remote_file, describe_connection_target, diff_local_trees,
     load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
     local_entry_state_for_path, local_paths_to_preserve_on_startup,
     materialize_remote_conflict_copies, parent_directories, remote_file_hashes_by_local_path,
@@ -32,7 +32,8 @@ use crate::{
 pub struct FolderAgentRuntimeOptions {
     pub root_dir: PathBuf,
     pub local_tree_uri: Option<String>,
-    pub server_base_url: String,
+    pub server_base_url: Option<String>,
+    pub client_bootstrap_json: Option<String>,
     pub server_ca_pem: Option<String>,
     pub client_identity_json: Option<String>,
     pub prefix: Option<String>,
@@ -108,8 +109,11 @@ fn run_folder_agent_inner(
     status_callback: Option<FolderAgentStatusCallback>,
 ) -> Result<()> {
     let scope = PathScope::new(options.prefix.clone());
-    let base_url = normalize_server_base_url(&options.server_base_url)?;
-    let state_store = StartupStateStore::new(&options.root_dir, &scope, base_url.as_str());
+    let connection_target = describe_connection_target(
+        options.server_base_url.as_deref(),
+        options.client_bootstrap_json.as_deref(),
+    )?;
+    let state_store = StartupStateStore::new(&options.root_dir, &scope, &connection_target);
 
     fs::create_dir_all(&options.root_dir).with_context(|| {
         format!(
@@ -131,7 +135,9 @@ fn run_folder_agent_inner(
 
         let ui_state = FolderAgentUiState::new(
             options.root_dir.clone(),
-            base_url.to_string(),
+            connection_target.clone(),
+            options.server_base_url.clone(),
+            options.client_bootstrap_json.clone(),
             options.server_ca_pem.clone(),
             options.client_identity_json.clone(),
             scope.clone(),
@@ -186,7 +192,7 @@ fn run_folder_agent_inner(
         BTreeMap::new()
     };
 
-    let client = configured_client(base_url.as_str(), options)?;
+    let client = configured_client(options)?;
     let snapshot_scope = RemoteSnapshotScope::new(
         scope.remote_prefix().map(ToString::to_string),
         options.depth,
@@ -435,12 +441,10 @@ fn sample_local_paths(local_state: &LocalTreeState, limit: usize) -> String {
     sample
 }
 
-fn configured_client(
-    base_url: &str,
-    options: &FolderAgentRuntimeOptions,
-) -> Result<IronMeshClient> {
+fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClient> {
     build_configured_client(
-        base_url,
+        options.server_base_url.as_deref(),
+        options.client_bootstrap_json.as_deref(),
         options.server_ca_pem.as_deref(),
         options.client_identity_json.as_deref(),
     )

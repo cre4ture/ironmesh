@@ -10,10 +10,10 @@ pub use folder_agent_startup::*;
 pub use folder_agent_state::*;
 pub use folder_agent_ui::*;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use client_sdk::{
-    ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem,
+    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -60,17 +60,33 @@ impl LocalEntryState {
 pub type LocalTreeState = BTreeMap<String, LocalEntryState>;
 
 pub(crate) fn build_configured_client(
-    server_base_url: &str,
+    server_base_url: Option<&str>,
+    client_bootstrap_json: Option<&str>,
     server_ca_pem: Option<&str>,
     client_identity_json: Option<&str>,
 ) -> Result<IronMeshClient> {
     let server_ca_pem = normalized_optional_string(server_ca_pem);
+    let client_bootstrap_json = normalized_optional_string(client_bootstrap_json);
     let client_identity_json = normalized_optional_string(client_identity_json);
     let client_identity = client_identity_json
         .as_deref()
         .map(ClientIdentityMaterial::from_json_str)
         .transpose()
         .context("failed to parse client identity JSON")?;
+    if let Some(raw) = client_bootstrap_json.as_deref() {
+        let mut bootstrap = ConnectionBootstrap::from_json_str(raw)
+            .context("failed to parse connection bootstrap JSON")?;
+        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
+        }
+        return match client_identity.as_ref() {
+            Some(identity) => bootstrap.build_client_with_identity(identity),
+            None => bootstrap.build_client(),
+        };
+    }
+
+    let server_base_url = server_base_url
+        .ok_or_else(|| anyhow!("missing server_base_url or client_bootstrap_json"))?;
     match client_identity.as_ref() {
         Some(identity) => build_http_client_with_identity_from_pem(
             server_ca_pem.as_deref(),
@@ -79,6 +95,21 @@ pub(crate) fn build_configured_client(
         ),
         None => build_http_client_from_pem(server_ca_pem.as_deref(), server_base_url, &None),
     }
+}
+
+pub(crate) fn describe_connection_target(
+    server_base_url: Option<&str>,
+    client_bootstrap_json: Option<&str>,
+) -> Result<String> {
+    if let Some(raw) = normalized_optional_string(client_bootstrap_json) {
+        let bootstrap = ConnectionBootstrap::from_json_str(&raw)
+            .context("failed to parse connection bootstrap JSON")?;
+        return bootstrap.connection_target_label();
+    }
+
+    let server_base_url = server_base_url
+        .ok_or_else(|| anyhow!("missing server_base_url or client_bootstrap_json"))?;
+    Ok(normalize_server_base_url(server_base_url)?.to_string())
 }
 
 pub(crate) fn normalized_optional_string(value: Option<&str>) -> Option<String> {

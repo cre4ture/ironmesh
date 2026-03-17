@@ -24,6 +24,7 @@ uuid.workspace = true
 x509-parser = "0.16"
 
 [dev-dependencies]
+client-sdk = { path = "../../crates/client-sdk" }
 reqwest.workspace = true
 rcgen = "0.14"
 server-node-sdk = { path = "../../crates/server-node-sdk" }

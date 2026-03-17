@@ -1042,7 +1042,12 @@ pub(crate) fn run_saf_folder_agent_with_control(
     let tree_uri = optional_tree_uri(options)?;
     let _tree_observer_guard = SafTreeObserverGuard::new(tree_uri)?;
     let scope = PathScope::new(options.prefix.clone());
-    let base_url = normalize_server_base_url(&options.server_base_url)?;
+    let base_url = normalize_server_base_url(
+        options
+            .server_base_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("SAF runtime requires server_base_url"))?,
+    )?;
     let state_store =
         StartupStateStore::new(&state_identity_root(tree_uri), &scope, base_url.as_str());
     let client = configured_client(base_url.as_str(), options)?;

@@ -31,6 +31,8 @@ pub struct DeviceEnrollmentResponse {
     pub public_key_pem: String,
     pub credential_pem: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendezvous_client_identity_pem: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at_unix: Option<u64>,
@@ -131,6 +133,10 @@ fn parse_enrollment_response(status: StatusCode, body: String) -> Result<DeviceE
         || enrolled.device_token.trim().is_empty()
         || enrolled.public_key_pem.trim().is_empty()
         || enrolled.credential_pem.trim().is_empty()
+        || enrolled
+            .rendezvous_client_identity_pem
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
     {
         return Err(anyhow!(
             "device enrollment returned an incomplete credential"

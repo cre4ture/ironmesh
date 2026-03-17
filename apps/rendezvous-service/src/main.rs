@@ -20,7 +20,7 @@ use transport_sdk::relay::{
 use transport_sdk::rendezvous::PresenceRegistration;
 
 use crate::auth::{
-    MaybeAuthenticatedNode, MtlsAuthenticatedNodeAcceptor, ensure_authenticated_peer_identity,
+    MaybeAuthenticatedPeer, MtlsAuthenticatedPeerAcceptor, ensure_authenticated_peer_identity,
     require_authenticated_node,
 };
 use crate::config::RendezvousServiceConfig;
@@ -77,7 +77,7 @@ async fn run_with_state(state: AppState) -> Result<()> {
             &mtls.key_path,
         )?;
         axum_server::bind(bind_addr)
-            .acceptor(MtlsAuthenticatedNodeAcceptor::new(tls_config))
+            .acceptor(MtlsAuthenticatedPeerAcceptor::new(tls_config))
             .serve(app.into_make_service())
             .await?;
         Ok(())
@@ -98,7 +98,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
 async fn register_presence(
     State(state): State<AppState>,
-    authenticated_node: MaybeAuthenticatedNode,
+    authenticated_peer: MaybeAuthenticatedPeer,
     Json(request): Json<PresenceRegistration>,
 ) -> std::result::Result<Json<RegisterPresenceResponse>, (StatusCode, String)> {
     request
@@ -106,7 +106,7 @@ async fn register_presence(
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     ensure_authenticated_peer_identity(
         state.config.mtls.is_some(),
-        &authenticated_node,
+        &authenticated_peer,
         &request.identity,
         "presence registration identity",
     )
@@ -122,9 +122,9 @@ async fn register_presence(
 
 async fn list_presence(
     State(state): State<AppState>,
-    authenticated_node: MaybeAuthenticatedNode,
+    authenticated_peer: MaybeAuthenticatedPeer,
 ) -> std::result::Result<Json<PresenceListResponse>, (StatusCode, String)> {
-    require_authenticated_node(state.config.mtls.is_some(), &authenticated_node)
+    require_authenticated_node(state.config.mtls.is_some(), &authenticated_peer)
         .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
     let entries = state.presence.list();
     Ok(Json(PresenceListResponse {
@@ -135,7 +135,7 @@ async fn list_presence(
 
 async fn issue_relay_ticket(
     State(state): State<AppState>,
-    authenticated_node: MaybeAuthenticatedNode,
+    authenticated_peer: MaybeAuthenticatedPeer,
     Json(request): Json<RelayTicketRequest>,
 ) -> std::result::Result<Json<RelayTicket>, (StatusCode, String)> {
     request
@@ -143,7 +143,7 @@ async fn issue_relay_ticket(
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     ensure_authenticated_peer_identity(
         state.config.mtls.is_some(),
-        &authenticated_node,
+        &authenticated_peer,
         &request.source,
         "relay ticket source",
     )
@@ -158,7 +158,7 @@ async fn issue_relay_ticket(
 
 async fn submit_relay_http_request(
     State(state): State<AppState>,
-    authenticated_node: MaybeAuthenticatedNode,
+    authenticated_peer: MaybeAuthenticatedPeer,
     Json(request): Json<RelayHttpRequest>,
 ) -> std::result::Result<Json<RelayHttpResponse>, (StatusCode, String)> {
     request
@@ -166,7 +166,7 @@ async fn submit_relay_http_request(
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     ensure_authenticated_peer_identity(
         state.config.mtls.is_some(),
-        &authenticated_node,
+        &authenticated_peer,
         &request.ticket.source,
         "relay HTTP request source",
     )
@@ -182,7 +182,7 @@ async fn submit_relay_http_request(
 
 async fn poll_relay_http_request(
     State(state): State<AppState>,
-    authenticated_node: MaybeAuthenticatedNode,
+    authenticated_peer: MaybeAuthenticatedPeer,
     Json(request): Json<RelayHttpPollRequest>,
 ) -> std::result::Result<Json<RelayHttpPollResponse>, (StatusCode, String)> {
     request
@@ -190,7 +190,7 @@ async fn poll_relay_http_request(
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     ensure_authenticated_peer_identity(
         state.config.mtls.is_some(),
-        &authenticated_node,
+        &authenticated_peer,
         &request.target,
         "relay HTTP poll target",
     )
@@ -205,7 +205,7 @@ async fn poll_relay_http_request(
 
 async fn complete_relay_http_request(
     State(state): State<AppState>,
-    authenticated_node: MaybeAuthenticatedNode,
+    authenticated_peer: MaybeAuthenticatedPeer,
     Json(response): Json<RelayHttpResponse>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     response
@@ -213,7 +213,7 @@ async fn complete_relay_http_request(
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     ensure_authenticated_peer_identity(
         state.config.mtls.is_some(),
-        &authenticated_node,
+        &authenticated_peer,
         &response.responder,
         "relay HTTP response responder",
     )
@@ -237,6 +237,10 @@ mod tests {
     use super::*;
     use anyhow::Context;
     use axum::http::StatusCode;
+    use client_sdk::{
+        BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
+        ConnectionBootstrap,
+    };
     use server_node_sdk::{InternalTlsConfig, ServerNodeConfig, ServerNodeMode, run};
     use std::net::IpAddr;
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
@@ -696,6 +700,192 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target_dir);
     }
 
+    #[tokio::test]
+    async fn relay_client_device_flows_through_mtls_authenticated_rendezvous() {
+        let ca = issue_test_ca().expect("test CA should generate");
+
+        let rendezvous_dir = fresh_test_dir("relay-client-device-rendezvous-mtls");
+        let rendezvous_bind_addr = free_bind_addr();
+        let rendezvous_public_url = format!("https://{rendezvous_bind_addr}");
+        let (rendezvous_ca_path, rendezvous_cert_path, rendezvous_key_path) = write_tls_material(
+            &rendezvous_dir,
+            &ca.ca_pem,
+            &issue_server_cert(&ca).expect("rendezvous server cert should issue"),
+        )
+        .expect("rendezvous TLS material should write");
+        let rendezvous_state = AppState::new(RendezvousServiceConfig {
+            bind_addr: rendezvous_bind_addr,
+            public_url: rendezvous_public_url.clone(),
+            relay_public_urls: vec![rendezvous_public_url.clone()],
+            mtls: Some(config::RendezvousMtlsConfig {
+                client_ca_cert_path: rendezvous_ca_path.clone(),
+                cert_path: rendezvous_cert_path,
+                key_path: rendezvous_key_path,
+            }),
+        });
+
+        let target_node_id = Uuid::now_v7();
+        let target_tls =
+            issue_node_cert(&ca, target_node_id).expect("target node cert should issue");
+        let target_identity_pem = format!("{}\n{}", target_tls.0, target_tls.1);
+        let health_dir = fresh_test_dir("relay-client-device-rendezvous-health");
+        let target_tls_paths = write_tls_material(&health_dir, &ca.ca_pem, &target_tls)
+            .expect("target TLS should write");
+        let rendezvous_health_client = build_https_client_with_identity(
+            &rendezvous_ca_path,
+            &target_tls_paths.1,
+            &target_tls_paths.2,
+        )
+        .expect("rendezvous mTLS health client should build");
+
+        let rendezvous_state_for_server = rendezvous_state.clone();
+        let rendezvous_handle = tokio::spawn(async move {
+            run_with_state(rendezvous_state_for_server)
+                .await
+                .expect("mTLS rendezvous service should run");
+        });
+
+        wait_for_http_status(
+            &rendezvous_health_client,
+            &format!("{rendezvous_public_url}/health"),
+            StatusCode::OK,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let cluster_id = Uuid::now_v7();
+        let device_id = Uuid::now_v7();
+        let device_tls =
+            issue_device_cert(&ca, device_id).expect("device client cert should issue");
+        let device_identity_pem = format!("{}\n{}", device_tls.0, device_tls.1);
+        let captured_request = std::sync::Arc::new(tokio::sync::Mutex::new(
+            None::<transport_sdk::PendingRelayHttpRequest>,
+        ));
+
+        let captured_request_for_poller = captured_request.clone();
+        let rendezvous_public_url_for_poller = rendezvous_public_url.clone();
+        let ca_pem_for_poller = ca.ca_pem.clone();
+        let poller_handle = tokio::spawn(async move {
+            let client = transport_sdk::RendezvousControlClient::new(
+                transport_sdk::RendezvousClientConfig {
+                    cluster_id,
+                    rendezvous_urls: vec![rendezvous_public_url_for_poller],
+                    heartbeat_interval_secs: 15,
+                },
+                Some(&ca_pem_for_poller),
+                Some(target_identity_pem.as_bytes()),
+            )
+            .expect("target rendezvous client should build");
+
+            let request = loop {
+                let polled = client
+                    .poll_relay_http_request(&transport_sdk::RelayHttpPollRequest {
+                        cluster_id,
+                        target: transport_sdk::PeerIdentity::Node(target_node_id),
+                        wait_timeout_ms: Some(2_000),
+                    })
+                    .await
+                    .expect("relay poll should succeed");
+                if let Some(request) = polled.request {
+                    break request;
+                }
+            };
+            *captured_request_for_poller.lock().await = Some(request.clone());
+
+            client
+                .respond_relay_http_request(&transport_sdk::RelayHttpResponse {
+                    cluster_id,
+                    session_id: request.session_id,
+                    request_id: request.request_id,
+                    responder: transport_sdk::PeerIdentity::Node(target_node_id),
+                    status: 200,
+                    headers: vec![transport_sdk::RelayHttpHeader {
+                        name: "content-type".to_string(),
+                        value: "application/json".to_string(),
+                    }],
+                    body_base64: transport_sdk::encode_optional_body_base64(
+                        serde_json::to_string(&client_sdk::StoreIndexResponse {
+                            prefix: String::new(),
+                            depth: 1,
+                            entry_count: 1,
+                            entries: vec![client_sdk::StoreIndexEntry {
+                                path: "readme.txt".to_string(),
+                                entry_type: "key".to_string(),
+                                version: Some("v1".to_string()),
+                                content_hash: Some("hash-1".to_string()),
+                                size_bytes: Some(7),
+                                content_fingerprint: None,
+                                media: None,
+                            }],
+                        })
+                        .expect("store index should serialize")
+                        .as_bytes(),
+                    ),
+                })
+                .await
+                .expect("relay response should submit");
+        });
+
+        let mut identity = ClientIdentityMaterial::generate(
+            cluster_id,
+            Some(device_id),
+            Some("Laptop".to_string()),
+        )
+        .expect("client identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        identity.rendezvous_client_identity_pem = Some(device_identity_pem);
+
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec![rendezvous_public_url.clone()],
+            rendezvous_mtls_required: true,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "https://unreachable.example".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(target_node_id),
+            }],
+            relay_mode: RelayMode::Required,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: Some(ca.ca_pem.clone()),
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: Some(ca.ca_pem.clone()),
+            },
+            pairing_token: None,
+            device_label: Some("Laptop".to_string()),
+            device_id: Some(device_id.to_string()),
+        };
+
+        let client = bootstrap
+            .build_client_with_identity(&identity)
+            .expect("bootstrap should build relay client for mTLS rendezvous");
+        let response = client
+            .store_index(None, 1, None)
+            .await
+            .expect("relay-backed client request should succeed");
+
+        assert_eq!(response.entry_count, 1);
+        assert_eq!(response.entries[0].path, "readme.txt");
+
+        let captured = captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("relay request should be captured");
+        assert_eq!(
+            captured.source,
+            transport_sdk::PeerIdentity::Device(device_id)
+        );
+        assert_eq!(captured.path_and_query, "/store/index?depth=1");
+
+        poller_handle.abort();
+        let _ = poller_handle.await;
+        rendezvous_handle.abort();
+        let _ = rendezvous_handle.await;
+        let _ = std::fs::remove_dir_all(&rendezvous_dir);
+        let _ = std::fs::remove_dir_all(&health_dir);
+    }
+
     fn free_bind_addr() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener should bind");
         let addr = listener
@@ -766,6 +956,25 @@ mod tests {
             .signed_by(&node_key, &ca.issuer)
             .context("failed signing node certificate")?;
         Ok((cert.pem(), node_key.serialize_pem()))
+    }
+
+    fn issue_device_cert(ca: &TestCa, device_id: Uuid) -> anyhow::Result<(String, String)> {
+        let device_key = rcgen::KeyPair::generate().context("failed generating device key")?;
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!("ironmesh-device-{device_id}"),
+        );
+        params.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:device:{device_id}"))
+                .context("invalid device SAN URI")?,
+        ));
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+
+        let cert = params
+            .signed_by(&device_key, &ca.issuer)
+            .context("failed signing device certificate")?;
+        Ok((cert.pem(), device_key.serialize_pem()))
     }
 
     fn issue_server_cert(ca: &TestCa) -> anyhow::Result<(String, String)> {

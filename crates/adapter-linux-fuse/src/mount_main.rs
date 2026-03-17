@@ -60,15 +60,17 @@ struct Args {
 }
 
 struct ResolvedUpstreamTarget {
-    base_url: Url,
+    base_url: Option<Url>,
     server_ca_pem: Option<String>,
+    client: IronMeshClient,
 }
 
 pub fn mount_main() -> Result<()> {
     let args = Args::parse();
+    let client_identity = read_optional_client_identity(args.client_identity_file.as_deref())?;
 
     let effective_local_edge_data_dir = effective_local_edge_data_dir(&args)?;
-    let upstream_target = resolve_upstream_target(&args)?;
+    let upstream_target = resolve_upstream_target(&args, client_identity.as_ref())?;
 
     if args.snapshot_file.is_some() {
         if args.server_base_url.is_some()
@@ -110,17 +112,19 @@ pub fn mount_main() -> Result<()> {
 
     let local_node = if let Some(data_dir) = effective_local_edge_data_dir.as_ref() {
         Some(if let Some(upstream_target) = upstream_target.as_ref() {
-            LocalNodeHandle::start_local_edge_with_upstream(
-                data_dir,
-                upstream_target.base_url.as_str(),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to start local edge node in {} with upstream {}",
-                    data_dir.display(),
-                    upstream_target.base_url
+            let upstream_base_url = upstream_target.base_url.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--local-edge with --bootstrap-file currently requires a bootstrap that can resolve a direct upstream server URL"
                 )
-            })?
+            })?;
+            LocalNodeHandle::start_local_edge_with_upstream(data_dir, upstream_base_url.as_str())
+                .with_context(|| {
+                    format!(
+                        "failed to start local edge node in {} with upstream {}",
+                        data_dir.display(),
+                        upstream_base_url
+                    )
+                })?
         } else {
             LocalNodeHandle::start_local_edge(data_dir).with_context(|| {
                 format!("failed to start local edge node in {}", data_dir.display())
@@ -135,7 +139,7 @@ pub fn mount_main() -> Result<()> {
     } else {
         upstream_target
             .as_ref()
-            .map(|target| target.base_url.clone())
+            .and_then(|target| target.base_url.clone())
             .ok_or_else(|| anyhow::anyhow!("missing upstream target for live mount"))?
     };
     if let (Some(local_node), Some(output_path)) =
@@ -148,19 +152,25 @@ pub fn mount_main() -> Result<()> {
             )
         })?;
     }
-    let server_ca_pem = upstream_target.as_ref().and_then(|target| {
-        if local_node.is_none() {
-            target.server_ca_pem.clone()
-        } else {
-            None
-        }
-    });
-    let client_identity = read_optional_client_identity(args.client_identity_file.as_deref())?;
-    let client = build_configured_client(
-        base_url.as_str(),
-        server_ca_pem.as_deref(),
-        client_identity.as_ref(),
-    )?;
+    let client = if local_node.is_none() {
+        upstream_target
+            .as_ref()
+            .map(|target| target.client.clone())
+            .ok_or_else(|| anyhow::anyhow!("missing upstream target for live mount"))?
+    } else {
+        let server_ca_pem = upstream_target.as_ref().and_then(|target| {
+            if local_node.is_none() {
+                target.server_ca_pem.clone()
+            } else {
+                None
+            }
+        });
+        build_configured_client(
+            base_url.as_str(),
+            server_ca_pem.as_deref(),
+            client_identity.as_ref(),
+        )?
+    };
     let initial_fetcher = RemoteSnapshotFetcher::new(
         client.clone(),
         RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
@@ -289,29 +299,48 @@ fn local_edge_scope_label(args: &Args) -> String {
     sanitize_path_component(&parts.join("__"))
 }
 
-fn resolve_upstream_target(args: &Args) -> Result<Option<ResolvedUpstreamTarget>> {
+fn resolve_upstream_target(
+    args: &Args,
+    client_identity: Option<&ClientIdentityMaterial>,
+) -> Result<Option<ResolvedUpstreamTarget>> {
     if args.server_base_url.is_some() && args.bootstrap_file.is_some() {
         anyhow::bail!("use either --server-base-url or --bootstrap-file, not both");
     }
 
     let server_ca_override = read_optional_utf8_file(args.server_ca_pem_file.as_deref())?;
     if let Some(bootstrap_path) = args.bootstrap_file.as_deref() {
-        let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
-        let resolved = bootstrap.resolve_direct_http_target_blocking()?;
+        let mut bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
+        if let Some(server_ca_override) = server_ca_override.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_override.clone());
+        }
+        let client = match client_identity {
+            Some(identity) => bootstrap.build_client_with_identity(identity)?,
+            None => bootstrap.build_client()?,
+        };
+        let base_url = bootstrap
+            .resolve_direct_http_target_blocking()
+            .ok()
+            .and_then(|resolved| normalize_server_base_url(&resolved.server_base_url).ok());
         return Ok(Some(ResolvedUpstreamTarget {
-            base_url: normalize_server_base_url(&resolved.server_base_url)?,
-            server_ca_pem: server_ca_override
-                .or(resolved.server_ca_pem)
-                .or(resolved.cluster_ca_pem),
+            base_url,
+            server_ca_pem: server_ca_override,
+            client,
         }));
     }
 
     let Some(server_base_url) = args.server_base_url.as_deref() else {
         return Ok(None);
     };
+    let base_url = normalize_server_base_url(server_base_url)?;
+    let client = build_configured_client(
+        base_url.as_str(),
+        server_ca_override.as_deref(),
+        client_identity,
+    )?;
     Ok(Some(ResolvedUpstreamTarget {
-        base_url: normalize_server_base_url(server_base_url)?,
+        base_url: Some(base_url.clone()),
         server_ca_pem: server_ca_override,
+        client,
     }))
 }
 

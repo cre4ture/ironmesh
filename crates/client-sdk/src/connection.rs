@@ -89,15 +89,15 @@ pub fn build_http_client_with_identity_from_planned_target(
         );
     }
 
-    if target.rendezvous_mtls_required {
-        bail!(
-            "relay-backed client transport does not support an mTLS-only rendezvous control plane yet"
-        );
-    }
-
     let target_node_id = target
         .target_node_id
         .ok_or_else(|| anyhow!("relay-backed client transport target is missing target_node_id"))?;
+    let rendezvous_client_identity_pem = identity.rendezvous_client_identity_pem.as_deref();
+    if target.rendezvous_mtls_required && rendezvous_client_identity_pem.is_none() {
+        bail!(
+            "relay-backed client transport requires rendezvous_client_identity_pem when rendezvous_mtls_required is true"
+        );
+    }
     let rendezvous = transport_sdk::RendezvousControlClient::new(
         RendezvousClientConfig {
             cluster_id: target.cluster_id,
@@ -108,7 +108,7 @@ pub fn build_http_client_with_identity_from_planned_target(
             .rendezvous_ca_pem
             .as_deref()
             .or(target.cluster_ca_pem.as_deref()),
-        None,
+        rendezvous_client_identity_pem.map(str::as_bytes),
     )?;
 
     Ok(

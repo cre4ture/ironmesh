@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use axum::extract::FromRequestParts;
-use common::NodeId;
+use common::{DeviceId, NodeId};
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -17,20 +17,20 @@ use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
 #[derive(Debug, Clone)]
-pub struct AuthenticatedNode {
-    pub node_id: NodeId,
+pub struct AuthenticatedPeer {
+    pub identity: PeerIdentity,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct MaybeAuthenticatedNode(pub Option<AuthenticatedNode>);
+pub struct MaybeAuthenticatedPeer(pub Option<AuthenticatedPeer>);
 
-impl MaybeAuthenticatedNode {
-    pub fn node_id(&self) -> Option<NodeId> {
-        self.0.as_ref().map(|node| node.node_id)
+impl MaybeAuthenticatedPeer {
+    pub fn identity(&self) -> Option<&PeerIdentity> {
+        self.0.as_ref().map(|peer| &peer.identity)
     }
 }
 
-impl<S> FromRequestParts<S> for MaybeAuthenticatedNode
+impl<S> FromRequestParts<S> for MaybeAuthenticatedPeer
 where
     S: Send + Sync,
 {
@@ -40,7 +40,7 @@ where
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
-        let authenticated = parts.extensions.get::<AuthenticatedNode>().cloned();
+        let authenticated = parts.extensions.get::<AuthenticatedPeer>().cloned();
         std::future::ready(Ok(Self(authenticated)))
     }
 }
@@ -54,56 +54,59 @@ pub fn peer_identity_key(identity: &PeerIdentity) -> String {
 
 pub fn require_authenticated_node(
     mtls_enabled: bool,
-    authenticated_node: &MaybeAuthenticatedNode,
+    authenticated_peer: &MaybeAuthenticatedPeer,
 ) -> Result<Option<NodeId>> {
     if !mtls_enabled {
         return Ok(None);
     }
 
-    authenticated_node
-        .node_id()
-        .map(Some)
-        .context("rendezvous mTLS requires an authenticated node certificate")
+    match authenticated_peer.identity() {
+        Some(PeerIdentity::Node(node_id)) => Ok(Some(*node_id)),
+        Some(PeerIdentity::Device(device_id)) => bail!(
+            "rendezvous mTLS requires an authenticated node certificate, got device:{device_id}"
+        ),
+        None => bail!("rendezvous mTLS requires an authenticated peer certificate"),
+    }
 }
 
 pub fn ensure_authenticated_peer_identity(
     mtls_enabled: bool,
-    authenticated_node: &MaybeAuthenticatedNode,
+    authenticated_peer: &MaybeAuthenticatedPeer,
     identity: &PeerIdentity,
     field_name: &str,
 ) -> Result<()> {
-    let Some(authenticated_node_id) = require_authenticated_node(mtls_enabled, authenticated_node)?
-    else {
+    if !mtls_enabled {
         return Ok(());
+    }
+    let Some(authenticated_identity) = authenticated_peer.identity() else {
+        bail!("rendezvous mTLS requires an authenticated peer certificate");
     };
 
-    match identity {
-        PeerIdentity::Node(node_id) if *node_id == authenticated_node_id => Ok(()),
-        PeerIdentity::Node(node_id) => bail!(
-            "{field_name} node_id {node_id} does not match authenticated rendezvous client node_id {authenticated_node_id}"
-        ),
-        PeerIdentity::Device(device_id) => bail!(
-            "{field_name} device identity {device_id} is not allowed on the mTLS-authenticated rendezvous control plane"
-        ),
+    if authenticated_identity == identity {
+        Ok(())
+    } else {
+        bail!(
+            "{field_name} {identity} does not match authenticated rendezvous client {authenticated_identity}"
+        )
     }
 }
 
 #[derive(Clone)]
-pub struct WithAuthenticatedNode<S> {
+pub struct WithAuthenticatedPeer<S> {
     inner: S,
-    authenticated_node: AuthenticatedNode,
+    authenticated_peer: AuthenticatedPeer,
 }
 
-impl<S> WithAuthenticatedNode<S> {
-    pub fn new(inner: S, authenticated_node: AuthenticatedNode) -> Self {
+impl<S> WithAuthenticatedPeer<S> {
+    pub fn new(inner: S, authenticated_peer: AuthenticatedPeer) -> Self {
         Self {
             inner,
-            authenticated_node,
+            authenticated_peer,
         }
     }
 }
 
-impl<S, B> Service<axum::http::Request<B>> for WithAuthenticatedNode<S>
+impl<S, B> Service<axum::http::Request<B>> for WithAuthenticatedPeer<S>
 where
     S: Service<axum::http::Request<B>>,
 {
@@ -119,17 +122,17 @@ where
     }
 
     fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
-        req.extensions_mut().insert(self.authenticated_node.clone());
+        req.extensions_mut().insert(self.authenticated_peer.clone());
         self.inner.call(req)
     }
 }
 
 #[derive(Clone)]
-pub struct MtlsAuthenticatedNodeAcceptor {
+pub struct MtlsAuthenticatedPeerAcceptor {
     inner: axum_server::tls_rustls::RustlsAcceptor,
 }
 
-impl MtlsAuthenticatedNodeAcceptor {
+impl MtlsAuthenticatedPeerAcceptor {
     pub fn new(config: axum_server::tls_rustls::RustlsConfig) -> Self {
         Self {
             inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
@@ -137,7 +140,7 @@ impl MtlsAuthenticatedNodeAcceptor {
     }
 }
 
-impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for MtlsAuthenticatedNodeAcceptor
+impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for MtlsAuthenticatedPeerAcceptor
 where
     axum_server::tls_rustls::RustlsAcceptor: axum_server::accept::Accept<
             tokio::net::TcpStream,
@@ -155,7 +158,7 @@ where
     S: Send + 'static,
 {
     type Stream = TlsStream<tokio::net::TcpStream>;
-    type Service = WithAuthenticatedNode<
+    type Service = WithAuthenticatedPeer<
         <axum_server::tls_rustls::RustlsAcceptor as axum_server::accept::Accept<
             tokio::net::TcpStream,
             S,
@@ -167,26 +170,26 @@ where
         let fut = self.inner.accept(stream, service);
         Box::pin(async move {
             let (tls_stream, service) = fut.await?;
-            let authenticated_node = authenticated_node_from_tls_stream(&tls_stream)
+            let authenticated_peer = authenticated_peer_from_tls_stream(&tls_stream)
                 .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
             Ok((
                 tls_stream,
-                WithAuthenticatedNode::new(service, authenticated_node),
+                WithAuthenticatedPeer::new(service, authenticated_peer),
             ))
         })
     }
 }
 
-pub fn authenticated_node_from_tls_stream<T>(
+pub fn authenticated_peer_from_tls_stream<T>(
     tls_stream: &TlsStream<T>,
-) -> Result<AuthenticatedNode> {
+) -> Result<AuthenticatedPeer> {
     let (_, conn) = tls_stream.get_ref();
     let certs = conn
         .peer_certificates()
         .context("missing peer certificate")?;
 
-    let node_id = extract_node_id_from_peer_certs(certs)?;
-    Ok(AuthenticatedNode { node_id })
+    let identity = extract_peer_identity_from_peer_certs(certs)?;
+    Ok(AuthenticatedPeer { identity })
 }
 
 pub fn build_mtls_rustls_config(
@@ -241,7 +244,7 @@ pub fn build_mtls_rustls_config(
     ))
 }
 
-fn extract_node_id_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result<NodeId> {
+fn extract_peer_identity_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result<PeerIdentity> {
     let cert = certs
         .first()
         .context("missing end-entity peer certificate")?;
@@ -254,19 +257,27 @@ fn extract_node_id_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result<NodeI
         if let ParsedExtension::SubjectAlternativeName(san) = parsed_extension {
             for name in &san.general_names {
                 if let x509_parser::extensions::GeneralName::URI(uri) = name
-                    && let Some(node_id) = parse_node_id_from_san_uri(uri)
+                    && let Some(identity) = parse_peer_identity_from_san_uri(uri)
                 {
-                    return Ok(node_id);
+                    return Ok(identity);
                 }
             }
         }
     }
 
-    bail!("missing urn:ironmesh:node:<uuid> SAN URI in peer certificate")
+    bail!("missing urn:ironmesh:(node|device):<uuid> SAN URI in peer certificate")
 }
 
-fn parse_node_id_from_san_uri(uri: &str) -> Option<NodeId> {
-    let prefix = "urn:ironmesh:node:";
-    uri.strip_prefix(prefix)
-        .and_then(|rest| rest.trim().parse::<NodeId>().ok())
+fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
+    if let Some(rest) = uri.strip_prefix("urn:ironmesh:node:") {
+        return rest.trim().parse::<NodeId>().ok().map(PeerIdentity::Node);
+    }
+    if let Some(rest) = uri.strip_prefix("urn:ironmesh:device:") {
+        return rest
+            .trim()
+            .parse::<DeviceId>()
+            .ok()
+            .map(PeerIdentity::Device);
+    }
+    None
 }

@@ -352,9 +352,7 @@ impl IronMeshClient {
                         method: method.as_str().to_string(),
                         path_and_query: path_and_query(&url),
                         headers: auth_headers,
-                        body_base64: body
-                            .as_deref()
-                            .and_then(encode_optional_body_base64),
+                        body_base64: body.as_deref().and_then(encode_optional_body_base64),
                     })
                     .await
                     .with_context(|| format!("failed to relay {} {}", method, url))?;

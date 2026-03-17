@@ -1,7 +1,6 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{ClientIdentityMaterial, ConnectionBootstrap, normalize_server_base_url};
-use reqwest::Url;
 use serde_json::json;
 use std::path::PathBuf;
 use sync_agent_core::{
@@ -87,7 +86,9 @@ enum ConflictListFormat {
 }
 
 struct ResolvedStartupTarget {
-    base_url: Url,
+    connection_target: String,
+    server_base_url: Option<String>,
+    client_bootstrap_json: Option<String>,
     server_ca_pem: Option<String>,
 }
 
@@ -119,8 +120,7 @@ fn run_command(args: &Args, command: &Command) -> Result<()> {
 fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
     let scope = PathScope::new(args.prefix.clone());
     let target = resolve_startup_target(args)?;
-    let base_url = target.base_url;
-    let state_store = StartupStateStore::new(&args.root_dir, &scope, base_url.as_str());
+    let state_store = StartupStateStore::new(&args.root_dir, &scope, &target.connection_target);
     let client_identity_json =
         read_optional_client_identity_json(args.client_identity_file.as_deref())?;
 
@@ -178,7 +178,8 @@ fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
         } => {
             let result = resolve_conflict_action(
                 &args.root_dir,
-                base_url.as_str(),
+                target.server_base_url.as_deref(),
+                target.client_bootstrap_json.as_deref(),
                 target.server_ca_pem.as_deref(),
                 client_identity_json.as_deref(),
                 &scope,
@@ -226,7 +227,8 @@ fn run_agent(args: &Args) -> Result<()> {
     run_folder_agent(&FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
         local_tree_uri: None,
-        server_base_url: target.base_url.to_string(),
+        server_base_url: target.server_base_url,
+        client_bootstrap_json: target.client_bootstrap_json,
         server_ca_pem: target.server_ca_pem,
         client_identity_json: read_optional_client_identity_json(
             args.client_identity_file.as_deref(),
@@ -249,12 +251,11 @@ fn resolve_startup_target(args: &Args) -> Result<ResolvedStartupTarget> {
     let server_ca_override = read_optional_utf8_file(args.server_ca_pem_file.as_deref())?;
     if let Some(bootstrap_path) = args.bootstrap_file.as_deref() {
         let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
-        let resolved = bootstrap.resolve_direct_http_target_blocking()?;
         return Ok(ResolvedStartupTarget {
-            base_url: normalize_server_base_url(&resolved.server_base_url)?,
-            server_ca_pem: server_ca_override
-                .or(resolved.server_ca_pem)
-                .or(resolved.cluster_ca_pem),
+            connection_target: bootstrap.connection_target_label()?,
+            server_base_url: None,
+            client_bootstrap_json: Some(bootstrap.to_json_pretty()?),
+            server_ca_pem: server_ca_override,
         });
     }
 
@@ -262,8 +263,11 @@ fn resolve_startup_target(args: &Args) -> Result<ResolvedStartupTarget> {
         .server_base_url
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("set either --server-base-url or --bootstrap-file"))?;
+    let base_url = normalize_server_base_url(server_base_url)?;
     Ok(ResolvedStartupTarget {
-        base_url: normalize_server_base_url(server_base_url)?,
+        connection_target: base_url.to_string(),
+        server_base_url: Some(base_url.to_string()),
+        client_bootstrap_json: None,
         server_ca_pem: server_ca_override,
     })
 }

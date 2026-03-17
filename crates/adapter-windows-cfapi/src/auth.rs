@@ -32,6 +32,8 @@ pub struct DeviceAuthRecord {
     pub public_key_pem: String,
     pub private_key_pem: String,
     pub credential_pem: String,
+    #[serde(default)]
+    pub rendezvous_client_identity_pem: Option<String>,
 }
 
 impl DeviceAuthRecord {
@@ -51,6 +53,7 @@ impl DeviceAuthRecord {
             private_key_pem: self.private_key_pem.clone(),
             public_key_pem: self.public_key_pem.clone(),
             credential_pem: Some(self.credential_pem.clone()),
+            rendezvous_client_identity_pem: self.rendezvous_client_identity_pem.clone(),
             issued_at_unix: None,
             expires_at_unix: None,
         };
@@ -133,6 +136,7 @@ fn enroll_device(
         public_key_pem: identity.public_key_pem,
         private_key_pem: identity.private_key_pem,
         credential_pem: enrolled.credential_pem,
+        rendezvous_client_identity_pem: enrolled.rendezvous_client_identity_pem,
     })
 }
 

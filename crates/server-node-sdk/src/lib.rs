@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::FromRequestParts;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header;
@@ -345,6 +345,57 @@ fn generate_client_credential_pem(
     format!(
         "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\ncluster_id={cluster_id}\ndevice_id={device_id}\nissued_at_unix={issued_at_unix}\nexpires_at_unix={expires_at_unix}\npublic_key_fingerprint={public_key_fingerprint}\n-----END IRONMESH CLIENT CREDENTIAL-----\n"
     )
+}
+
+fn issue_client_rendezvous_identity_pem(
+    state: &ServerState,
+    device_id: &str,
+    expires_at_unix: Option<u64>,
+) -> Result<Option<String>> {
+    if !state.rendezvous_mtls_required {
+        return Ok(None);
+    }
+
+    let ca_cert_pem = state.cluster_ca_pem.as_deref().ok_or_else(|| {
+        anyhow!("rendezvous mTLS client identity issuance requires cluster_ca_pem")
+    })?;
+    let ca_key_pem = state.internal_ca_key_pem.as_deref().ok_or_else(|| {
+        anyhow!("rendezvous mTLS client identity issuance requires internal_ca_key_pem")
+    })?;
+
+    let issuer_key =
+        KeyPair::from_pem(ca_key_pem).context("failed to parse rendezvous client CA key PEM")?;
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, issuer_key)
+        .context("failed to build rendezvous client certificate issuer")?;
+
+    let issued_at_unix = unix_ts();
+    let not_after_unix = expires_at_unix
+        .filter(|value| *value > issued_at_unix)
+        .unwrap_or_else(|| issued_at_unix + (30 * 24 * 60 * 60));
+
+    let mut params =
+        CertificateParams::new(Vec::new()).context("failed to initialize client cert params")?;
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, format!("ironmesh-device-{device_id}"));
+    params.is_ca = IsCa::NoCa;
+    params.not_before = OffsetDateTime::from_unix_timestamp(issued_at_unix as i64)
+        .context("invalid rendezvous client cert not_before timestamp")?;
+    params.not_after = OffsetDateTime::from_unix_timestamp(not_after_unix as i64)
+        .context("invalid rendezvous client cert not_after timestamp")?;
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.subject_alt_names = vec![SanType::URI(
+        format!("urn:ironmesh:device:{device_id}")
+            .try_into()
+            .context("invalid rendezvous client SAN URI")?,
+    )];
+
+    let key_pair = KeyPair::generate().context("failed generating rendezvous client key")?;
+    let cert = params
+        .signed_by(&key_pair, &issuer)
+        .context("failed signing rendezvous client certificate")?;
+    Ok(Some(format!("{}{}", cert.pem(), key_pair.serialize_pem())))
 }
 
 #[derive(Clone)]
@@ -5402,6 +5453,8 @@ struct ClientDeviceEnrollResponse {
     label: Option<String>,
     public_key_pem: String,
     credential_pem: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendezvous_client_identity_pem: Option<String>,
     created_at_unix: u64,
     expires_at_unix: Option<u64>,
 }
@@ -6445,6 +6498,21 @@ async fn enroll_client_device(
         now,
         credential_expires_at_unix,
     );
+    let rendezvous_client_identity_pem = match issue_client_rendezvous_identity_pem(
+        &state,
+        device_id.as_str(),
+        credential_expires_at_unix,
+    ) {
+        Ok(identity) => identity,
+        Err(err) => {
+            warn!(
+                error = %err,
+                device_id = %device_id,
+                "failed to issue rendezvous client identity during device enrollment"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     let response = {
         let mut auth_state = state.client_auth.lock().await;
@@ -6490,6 +6558,7 @@ async fn enroll_client_device(
             label: final_label,
             public_key_pem: public_key_pem.to_string(),
             credential_pem,
+            rendezvous_client_identity_pem,
             created_at_unix: now,
             expires_at_unix: credential_expires_at_unix,
         }

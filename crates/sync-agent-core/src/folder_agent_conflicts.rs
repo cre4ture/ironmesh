@@ -51,7 +51,8 @@ pub fn validate_user_relative_path_input(path: &str) -> Result<String> {
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_conflict_action(
     root_dir: &Path,
-    server_base_url: &str,
+    server_base_url: Option<&str>,
+    client_bootstrap_json: Option<&str>,
     server_ca_pem: Option<&str>,
     client_identity_json: Option<&str>,
     scope: &PathScope,
@@ -106,6 +107,7 @@ pub fn resolve_conflict_action(
 
                     let client = build_configured_client(
                         server_base_url,
+                        client_bootstrap_json,
                         server_ca_pem,
                         client_identity_json,
                     )?;
@@ -162,6 +164,7 @@ pub fn resolve_conflict_action(
 
                     let client = build_configured_client(
                         server_base_url,
+                        client_bootstrap_json,
                         server_ca_pem,
                         client_identity_json,
                     )?;

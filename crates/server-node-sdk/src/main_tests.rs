@@ -544,6 +544,54 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
+async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem);
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.rendezvous_mtls_required = true;
+
+    let now = super::unix_ts();
+    {
+        let mut auth = state.client_auth.lock().await;
+        auth.pairing_tokens.push(super::PairingTokenRecord {
+            token_id: "pair-2".to_string(),
+            token_hash: super::hash_token("pair-secret-2"),
+            label: Some("Laptop".to_string()),
+            created_at_unix: now,
+            expires_at_unix: now + 300,
+            used_at_unix: None,
+            enrolled_device_id: None,
+        });
+    }
+
+    let response = super::enroll_client_device(
+        State(state.clone()),
+        Json(super::ClientDeviceEnrollRequest {
+            cluster_id: state.cluster_id,
+            pairing_token: "pair-secret-2".to_string(),
+            device_id: Some("device-b".to_string()),
+            label: Some("Laptop".to_string()),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
+                .to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let enrolled: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let rendezvous_identity_pem = enrolled["rendezvous_client_identity_pem"]
+        .as_str()
+        .expect("rendezvous client identity PEM should be present");
+    assert!(rendezvous_identity_pem.contains("BEGIN CERTIFICATE"));
+    assert!(rendezvous_identity_pem.contains("PRIVATE KEY"));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());

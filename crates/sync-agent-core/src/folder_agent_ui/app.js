@@ -155,7 +155,7 @@ async function loadInfo() {
 
   const items = [
     ["root_dir", data.root_dir],
-    ["server_base_url", data.server_base_url],
+    ["connection_target", data.connection_target],
     ["prefix", data.prefix === null ? "(none)" : data.prefix],
     ["state_db_path", data.state_db_path],
   ];
@@ -252,4 +252,3 @@ window.addEventListener("load", async () => {
   await loadConflicts();
   startAutoRefresh();
 });
-

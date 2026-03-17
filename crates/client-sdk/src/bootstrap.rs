@@ -13,7 +13,8 @@ use transport_sdk::{
 };
 
 use crate::connection::{
-    build_blocking_reqwest_client_from_pem, build_http_client_with_identity_from_planned_target,
+    build_blocking_reqwest_client_from_pem, build_http_client_from_pem,
+    build_http_client_with_identity_from_planned_target,
 };
 use crate::device_auth::{
     DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device_blocking_from_pem,
@@ -110,6 +111,8 @@ pub struct BootstrapEnrollmentResult {
     pub private_key_pem: String,
     pub credential_pem: String,
     #[serde(default)]
+    pub rendezvous_client_identity_pem: Option<String>,
+    #[serde(default)]
     pub created_at_unix: Option<u64>,
     #[serde(default)]
     pub expires_at_unix: Option<u64>,
@@ -127,6 +130,7 @@ impl BootstrapEnrollmentResult {
             private_key_pem: self.private_key_pem.clone(),
             public_key_pem: self.public_key_pem.clone(),
             credential_pem: Some(self.credential_pem.clone()),
+            rendezvous_client_identity_pem: self.rendezvous_client_identity_pem.clone(),
             issued_at_unix: self.created_at_unix,
             expires_at_unix: self.expires_at_unix,
         };
@@ -344,6 +348,91 @@ impl ConnectionBootstrap {
         }))
     }
 
+    pub fn build_client(&self) -> Result<IronMeshClient> {
+        self.validate()?;
+
+        let mut last_error = None;
+        let mut saw_relay_target = false;
+        for target in self.planned_targets()? {
+            let Some(server_base_url) = target.server_base_url.as_deref() else {
+                saw_relay_target = true;
+                continue;
+            };
+
+            match probe_direct_http_target_blocking(&target) {
+                Ok(true) => {
+                    return build_http_client_from_pem(
+                        target
+                            .server_ca_pem
+                            .as_deref()
+                            .or(target.cluster_ca_pem.as_deref()),
+                        server_base_url,
+                        &None,
+                    );
+                }
+                Ok(false) => continue,
+                Err(err) => {
+                    last_error = Some(err);
+                    continue;
+                }
+            }
+        }
+
+        if saw_relay_target {
+            bail!(
+                "bootstrap selected or permits a relay-backed client route via rendezvous, but building a relay-backed client requires enrolled client identity material"
+            );
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("bootstrap does not contain a reachable direct client transport target")
+        }))
+    }
+
+    pub fn connection_target_label(&self) -> Result<String> {
+        self.validate()?;
+
+        if self.relay_mode != RelayMode::Required
+            && let Some(endpoint) = self
+                .normalized_candidate_direct_endpoints()?
+                .into_iter()
+                .next()
+            {
+                return Ok(endpoint.url);
+            }
+
+        let relay_target = self
+            .planned_targets()?
+            .into_iter()
+            .find(|target| target.path_kind == TransportPathKind::RelayTunnel)
+            .ok_or_else(|| {
+                anyhow!("bootstrap does not contain any usable client transport targets")
+            })?;
+        let target_node_id = relay_target
+            .target_node_id
+            .ok_or_else(|| anyhow!("relay-backed bootstrap target is missing target_node_id"))?;
+        let rendezvous_hint = relay_target
+            .rendezvous_urls
+            .first()
+            .map(|url| match Url::parse(url) {
+                Ok(parsed) => parsed
+                    .host_str()
+                    .map(|host| match parsed.port() {
+                        Some(port) => format!("{host}:{port}"),
+                        None => host.to_string(),
+                    })
+                    .unwrap_or_else(|| url.trim().trim_end_matches('/').to_string()),
+                Err(_) => url.trim().trim_end_matches('/').to_string(),
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "rendezvous".to_string());
+
+        Ok(format!(
+            "relay://{target_node_id}@{rendezvous_hint}?cluster_id={}",
+            relay_target.cluster_id
+        ))
+    }
+
     pub fn resolve_direct_http_target_blocking(&self) -> Result<ResolvedConnectionBootstrap> {
         let planned_targets = self.planned_targets()?;
         let mut saw_relay_target = false;
@@ -375,7 +464,7 @@ impl ConnectionBootstrap {
 
         if saw_relay_target {
             bail!(
-                "bootstrap selected or permits a relay-backed client route via rendezvous, but client data-plane relay transport is not implemented yet"
+                "bootstrap selected or permits a relay-backed client route via rendezvous, but direct HTTP target resolution was requested; use a relay-capable client construction path instead"
             );
         }
 
@@ -436,6 +525,7 @@ impl ConnectionBootstrap {
             public_key_pem: identity.public_key_pem,
             private_key_pem: identity.private_key_pem,
             credential_pem: enrollment.credential_pem,
+            rendezvous_client_identity_pem: enrollment.rendezvous_client_identity_pem,
             created_at_unix: enrollment.created_at_unix,
             expires_at_unix: enrollment.expires_at_unix,
         })
@@ -513,6 +603,7 @@ impl From<&BootstrapEnrollmentResult> for DeviceEnrollmentResponse {
             label: value.label.clone(),
             public_key_pem: value.public_key_pem.clone(),
             credential_pem: value.credential_pem.clone(),
+            rendezvous_client_identity_pem: value.rendezvous_client_identity_pem.clone(),
             created_at_unix: value.created_at_unix,
             expires_at_unix: value.expires_at_unix,
         }
@@ -625,7 +716,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("client data-plane relay transport")
+                .contains("relay-capable client construction path")
         );
     }
 
@@ -663,6 +754,41 @@ mod tests {
             .err()
             .expect("mTLS-only rendezvous relay should be rejected for client devices");
 
-        assert!(error.to_string().contains("mTLS-only rendezvous"));
+        assert!(error.to_string().contains("rendezvous_client_identity_pem"));
+    }
+
+    #[test]
+    fn build_client_without_identity_rejects_relay_only_bootstrap() {
+        let mut bootstrap = sample_bootstrap();
+        bootstrap.relay_mode = RelayMode::Required;
+
+        let error = match bootstrap.build_client() {
+            Ok(_) => panic!("relay-only bootstrap without client identity should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires enrolled client identity material")
+        );
+    }
+
+    #[test]
+    fn connection_target_label_falls_back_to_relay_descriptor() {
+        let mut bootstrap = sample_bootstrap();
+        bootstrap.relay_mode = RelayMode::Required;
+        bootstrap.direct_endpoints = vec![BootstrapEndpoint {
+            url: "https://public.example".to_string(),
+            usage: Some(BootstrapEndpointUse::PublicApi),
+            node_id: Some(NodeId::new_v4()),
+        }];
+
+        let label = bootstrap
+            .connection_target_label()
+            .expect("relay label should build");
+
+        assert!(label.starts_with("relay://"));
+        assert!(label.contains("@rendezvous.example"));
     }
 }

@@ -24,7 +24,9 @@ pub struct FolderAgentUiState {
 
 struct FolderAgentUiStateInner {
     root_dir: PathBuf,
-    server_base_url: String,
+    connection_target: String,
+    server_base_url: Option<String>,
+    client_bootstrap_json: Option<String>,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
     scope: PathScope,
@@ -33,9 +35,12 @@ struct FolderAgentUiStateInner {
 }
 
 impl FolderAgentUiState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         root_dir: PathBuf,
-        server_base_url: String,
+        connection_target: String,
+        server_base_url: Option<String>,
+        client_bootstrap_json: Option<String>,
         server_ca_pem: Option<String>,
         client_identity_json: Option<String>,
         scope: PathScope,
@@ -44,7 +49,9 @@ impl FolderAgentUiState {
         Self {
             inner: Arc::new(FolderAgentUiStateInner {
                 root_dir,
+                connection_target,
                 server_base_url,
+                client_bootstrap_json,
                 server_ca_pem,
                 client_identity_json,
                 scope,
@@ -138,7 +145,7 @@ async fn app_js() -> impl IntoResponse {
 #[derive(Debug, Serialize)]
 struct InfoResponse {
     root_dir: String,
-    server_base_url: String,
+    connection_target: String,
     prefix: Option<String>,
     state_db_path: String,
 }
@@ -149,7 +156,7 @@ async fn info(State(state): State<FolderAgentUiState>) -> impl IntoResponse {
         StatusCode::OK,
         Json(InfoResponse {
             root_dir: inner.root_dir.display().to_string(),
-            server_base_url: inner.server_base_url.clone(),
+            connection_target: inner.connection_target.clone(),
             prefix: inner.scope.remote_prefix().map(ToString::to_string),
             state_db_path: inner.state_store.path.display().to_string(),
         }),
@@ -243,7 +250,8 @@ async fn resolve_conflict(
 
         resolve_conflict_action(
             &inner.root_dir,
-            inner.server_base_url.as_str(),
+            inner.server_base_url.as_deref(),
+            inner.client_bootstrap_json.as_deref(),
             inner.server_ca_pem.as_deref(),
             inner.client_identity_json.as_deref(),
             &inner.scope,

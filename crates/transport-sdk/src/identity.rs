@@ -46,6 +46,8 @@ pub struct ClientIdentityMaterial {
     #[serde(default)]
     pub credential_pem: Option<String>,
     #[serde(default)]
+    pub rendezvous_client_identity_pem: Option<String>,
+    #[serde(default)]
     pub issued_at_unix: Option<u64>,
     #[serde(default)]
     pub expires_at_unix: Option<u64>,
@@ -83,6 +85,7 @@ impl ClientIdentityMaterial {
             private_key_pem,
             public_key_pem,
             credential_pem: None,
+            rendezvous_client_identity_pem: None,
             issued_at_unix: None,
             expires_at_unix: None,
         })
@@ -191,6 +194,11 @@ impl ClientIdentityMaterial {
             && credential_pem.trim().is_empty()
         {
             bail!("client identity credential_pem must not be empty when provided");
+        }
+        if let Some(rendezvous_client_identity_pem) = self.rendezvous_client_identity_pem.as_deref()
+            && rendezvous_client_identity_pem.trim().is_empty()
+        {
+            bail!("client identity rendezvous_client_identity_pem must not be empty when provided");
         }
         if let Some(label) = self.label.as_deref()
             && label.trim().is_empty()
