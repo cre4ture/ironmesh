@@ -26,7 +26,7 @@ Use this section as the current source of truth for remaining work. The detailed
 2. Remove the legacy direct-upstream path from server-node. Status: completed.
    `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, `refresh_upstream_peer(...)`, and the old local-edge upstream helper flow are gone. Rendezvous-first discovery is now the supported peer discovery model, and Linux FUSE `--local-edge` no longer tries to smuggle a remote upstream URL through the local server-node path.
 3. Finish removing `base_url` plus `device_token`-shaped app models.
-   Remaining work: clean up the remaining compatibility surfaces in `client-sdk` and helper apps so persisted client state is identity-first rather than URL-plus-token-first. Android, Windows, and the iOS wrapper are now on bootstrap-aware connection inputs.
+   Remaining work: clean up the remaining compatibility surfaces in `client-sdk` and helper apps so persisted client state is identity-first rather than URL-plus-token-first. Android, Windows, and the iOS wrapper are now on bootstrap-aware connection inputs, and the client enrollment / direct-client path no longer carries `device_token` or bearer-token auth compatibility in the main Rust stack.
 4. Replace the old reachability model in cluster state. Status: completed.
    The in-memory cluster model now uses a structured reachability plus capability record under `NodeDescriptor`, peer planning/projection no longer depends on raw `public_url` / `internal_url` fields directly, and the admin registration surface plus system-test/local-cluster helpers now use the same nested `reachability` / `capabilities` payload shape.
 5. Refresh tests and operational docs to match the real implementation state.
@@ -74,13 +74,13 @@ In practice, this means the peer/client transport work should land before large 
 | `crates/client-sdk/src/bootstrap.rs` | `ResolvedConnectionBootstrap` | Remove; replace with dynamic session setup in `transport-sdk` | Resolution is now path selection plus session establishment, not one URL probe. |
 | `crates/client-sdk/src/bootstrap.rs` | `BootstrapEnrollmentResult` | `EnrolledClientIdentity` | Enrollment should return key-bound identity material, not a bearer token plus URL. |
 | `crates/client-sdk/src/device_auth.rs` | `DeviceEnrollmentRequest` / `DeviceEnrollmentResponse` | CSR or public-key enrollment request and signed credential response | Pairing remains enrollment-only. |
-| `crates/client-sdk/src/ironmesh_client.rs` | `IronMeshClient { http, server_base_url, bearer_token }` | `IronMeshClient { transport, target, client_identity }` | The client must choose direct or relay paths per session. |
+| `crates/client-sdk/src/ironmesh_client.rs` | `IronMeshClient { transport, auth }` | tighten target abstraction and eliminate remaining direct-helper seams | The client now chooses direct or relay paths per session; the remaining work is cleanup, not a bearer-token rewrite. |
 | `crates/client-sdk/src/client_node.rs` | `ClientNode::from_direct_base_url(server_base_url)` | `ClientNode::new(transport_handle, target)` | High-level API can stay, constructor contract changes. |
 | `crates/server-node-sdk/src/lib.rs` | `ServerNodeConfig` | `ServerNodeConfig` with rendezvous, relay, cluster, and node-identity settings | Static upstream URL is replaced by control-plane connectivity. |
 | `crates/server-node-sdk/src/lib.rs` | `ServerState::internal_http: reqwest::Client` | `ServerState::peer_transport: transport_sdk::peer::PeerTransportClient` | Peer traffic must run over direct or relayed sessions. |
 | `crates/server-node-sdk/src/cluster.rs` | `NodeDescriptor { public_url, internal_url, ... }` | `NodeRecord { identity, reachability, capabilities, labels, capacity }` | Reachability is dynamic and may include relay-only presence. |
 | `crates/server-node-sdk/src/lib.rs` | `BootstrapBundleIssueResponse` | `ClientBootstrap` issued directly from server-node | One bootstrap schema across the stack. |
-| `crates/server-node-sdk/src/storage.rs` | `DeviceAuthRecord { token_hash, ... }` | `ClientCredentialRecord { public_key or cert fingerprint, ... }` | Long-lived bearer tokens are no longer the main trust artifact. |
+| `crates/server-node-sdk/src/storage.rs` | `DeviceAuthRecord { public_key_pem, issued_credential_pem, ... }` | `ClientCredentialRecord { public key or cert fingerprint, ... }` | The live auth path is credential-based now, but the persisted naming/model can still be tightened. |
 | `crates/adapter-windows-cfapi/src/connection_config.rs` | direct base URL + pairing bootstrap resolution | bootstrap-driven transport config | Windows adapter should consume the same transport stack as other clients. |
 | `apps/android-app/src/lib.rs` | JNI functions taking `base_url`, `server_ca_pem`, `auth_token` | JNI functions taking bootstrap or persisted client identity handle | Mobile bindings should stop wiring direct URL and bearer token everywhere. |
 | `apps/cli-client/src/main.rs` | `--server-url` | `--bootstrap` or `--rendezvous-url` based startup | CLI should exercise the same connection model as real clients. |
@@ -171,8 +171,8 @@ Recommended responsibilities:
 
 - [ ] Replace `crates/client-sdk/src/bootstrap.rs` with a bootstrap schema that includes `cluster_id`, `rendezvous_urls`, direct endpoint hints, relay policy, and trust roots.
 - [x] Remove `resolve_blocking()` as the primary connection model.
-- [ ] Replace `crates/client-sdk/src/device_auth.rs` token enrollment with keypair-based enrollment.
-- [ ] Replace `BootstrapEnrollmentResult.device_token` with signed credential material or credential references.
+- [x] Replace `crates/client-sdk/src/device_auth.rs` token enrollment with keypair-based enrollment.
+- [x] Replace `BootstrapEnrollmentResult.device_token` with signed credential material or credential references.
 - [ ] Refactor `crates/client-sdk/src/connection.rs` so it creates transport-aware clients instead of direct `reqwest` clients from one base URL.
 - [ ] Refactor `crates/client-sdk/src/ironmesh_client.rs` to depend on a transport handle plus logical target, not `server_base_url` plus bearer token.
 - [ ] Refactor `crates/client-sdk/src/client_node.rs` constructors to take the new transport-aware client setup.
@@ -186,8 +186,8 @@ Recommended responsibilities:
 - [x] Replace `refresh_upstream_peer`, `spawn_upstream_peer_bootstrap`, and related direct-upstream refresh logic with persistent rendezvous presence and peer session management.
 - [x] Replace `RegisterNodeRequest` in `crates/server-node-sdk/src/lib.rs` so admin registration manages policy/labels, not direct reachability coordinates.
 - [ ] Replace `BootstrapBundleIssueResponse` with the final bootstrap schema emitted directly by `/auth/bootstrap-bundles/issue`.
-- [ ] Replace `ClientDeviceEnrollRequest` / `ClientDeviceEnrollResponse` with key-bound client enrollment.
-- [ ] Replace `require_client_auth()` so it verifies proof-of-possession credentials instead of matching a bearer token hash.
+- [x] Replace `ClientDeviceEnrollRequest` / `ClientDeviceEnrollResponse` with key-bound client enrollment.
+- [x] Replace `require_client_auth()` so it verifies proof-of-possession credentials instead of matching a bearer token hash.
 - [ ] Update peer heartbeat and replication callers to use the new peer transport layer instead of direct `reqwest`.
 
 ### `crates/server-node-sdk/src/cluster.rs`
@@ -281,7 +281,7 @@ This is implementation order, not product rollout order.
 ### Unit tests
 
 - [ ] Add unit tests in `crates/transport-sdk` for bootstrap parsing, identity enrollment payloads, candidate ranking, relay-ticket validation, and session failover.
-- [ ] Replace existing token-auth unit tests in `crates/server-node-sdk/src/main_tests.rs` with client key enrollment and proof-of-possession tests.
+- [x] Replace existing token-auth unit tests in `crates/server-node-sdk/src/main_tests.rs` with client key enrollment and proof-of-possession tests.
 
 ### Server-node integration tests
 

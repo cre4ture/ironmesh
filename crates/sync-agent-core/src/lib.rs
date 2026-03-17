@@ -93,7 +93,7 @@ pub fn build_configured_client(
             server_base_url,
             identity,
         ),
-        None => build_http_client_from_pem(server_ca_pem.as_deref(), server_base_url, &None),
+        None => build_http_client_from_pem(server_ca_pem.as_deref(), server_base_url),
     }
 }
 

@@ -238,7 +238,6 @@ pub struct PairingTokenRecord {
 pub struct DeviceAuthRecord {
     pub device_id: String,
     pub label: Option<String>,
-    pub token_hash: String,
     #[serde(default)]
     pub public_key_pem: Option<String>,
     #[serde(default)]

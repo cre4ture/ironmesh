@@ -47,7 +47,6 @@ impl IosStorageApp {
                 None => client_sdk::build_http_client_from_pem(
                     server_ca_pem.as_deref(),
                     &connection_input,
-                    &None,
                 )?,
             }
         };

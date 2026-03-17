@@ -423,7 +423,7 @@ fn build_configured_client(
         Some(identity) => {
             build_http_client_with_identity_from_pem(server_ca_pem, server_base_url, identity)
         }
-        None => build_http_client_from_pem(server_ca_pem, server_base_url, &None),
+        None => build_http_client_from_pem(server_ca_pem, server_base_url),
     }
 }
 

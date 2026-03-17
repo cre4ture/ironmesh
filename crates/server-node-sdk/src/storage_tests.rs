@@ -1409,7 +1409,6 @@ async fn client_auth_state_roundtrip_impl(backend: StorageTestBackend) {
         devices: vec![DeviceAuthRecord {
             device_id: "dev-1".to_string(),
             label: Some("Pixel".to_string()),
-            token_hash: "hash-1".to_string(),
             public_key_pem: None,
             issued_credential_pem: None,
             created_at_unix: 33,

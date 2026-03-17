@@ -104,7 +104,6 @@ pub struct BootstrapEnrollmentResult {
     #[serde(default)]
     pub server_ca_pem: Option<String>,
     pub device_id: String,
-    pub device_token: String,
     #[serde(default)]
     pub label: Option<String>,
     pub public_key_pem: String,
@@ -367,7 +366,6 @@ impl ConnectionBootstrap {
                             .as_deref()
                             .or(target.cluster_ca_pem.as_deref()),
                         server_base_url,
-                        &None,
                     );
                 }
                 Ok(false) => continue,
@@ -526,7 +524,6 @@ impl ConnectionBootstrap {
             server_base_url: resolved.server_base_url,
             server_ca_pem: resolved.server_ca_pem,
             device_id: enrollment.device_id,
-            device_token: enrollment.device_token,
             label: enrollment.label,
             public_key_pem: identity.public_key_pem,
             private_key_pem: identity.private_key_pem,
@@ -605,7 +602,6 @@ impl From<&BootstrapEnrollmentResult> for DeviceEnrollmentResponse {
         Self {
             cluster_id: value.cluster_id,
             device_id: value.device_id.clone(),
-            device_token: value.device_token.clone(),
             label: value.label.clone(),
             public_key_pem: value.public_key_pem.clone(),
             credential_pem: value.credential_pem.clone(),

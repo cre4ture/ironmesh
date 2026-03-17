@@ -106,12 +106,10 @@ pub fn router(config: WebUiConfig) -> Router {
                 .unwrap_or_else(|error| {
                     panic!("failed building web ui authenticated client: {error:#}")
                 }),
-                None => build_http_client_from_pem(
-                    config.server_ca_pem.as_deref(),
-                    server_url.as_str(),
-                    &None,
-                )
-                .unwrap_or_else(|error| panic!("failed building web ui client: {error:#}")),
+                None => {
+                    build_http_client_from_pem(config.server_ca_pem.as_deref(), server_url.as_str())
+                        .unwrap_or_else(|error| panic!("failed building web ui client: {error:#}"))
+                }
             }
         }
     };

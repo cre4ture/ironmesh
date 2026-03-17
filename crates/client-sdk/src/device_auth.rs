@@ -26,7 +26,6 @@ pub struct DeviceEnrollmentRequest {
 pub struct DeviceEnrollmentResponse {
     pub cluster_id: ClusterId,
     pub device_id: String,
-    pub device_token: String,
     pub label: Option<String>,
     pub public_key_pem: String,
     pub credential_pem: String,
@@ -130,7 +129,6 @@ fn parse_enrollment_response(status: StatusCode, body: String) -> Result<DeviceE
         .context("failed to parse /auth/device/enroll response")?;
     if enrolled.cluster_id.is_nil()
         || enrolled.device_id.trim().is_empty()
-        || enrolled.device_token.trim().is_empty()
         || enrolled.public_key_pem.trim().is_empty()
         || enrolled.credential_pem.trim().is_empty()
         || enrolled

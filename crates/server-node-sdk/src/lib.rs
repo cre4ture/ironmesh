@@ -326,14 +326,6 @@ fn generate_pairing_token() -> String {
     )
 }
 
-fn generate_device_token() -> String {
-    format!(
-        "im-dev-{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    )
-}
-
 fn generate_client_credential_pem(
     cluster_id: ClusterId,
     device_id: &str,
@@ -5262,7 +5254,6 @@ struct ClientDeviceEnrollRequest {
 struct ClientDeviceEnrollResponse {
     cluster_id: ClusterId,
     device_id: String,
-    device_token: String,
     label: Option<String>,
     public_key_pem: String,
     credential_pem: String,
@@ -6295,8 +6286,6 @@ async fn enroll_client_device(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string);
-    let device_token = generate_device_token();
-    let device_token_hash = hash_token(&device_token);
     let credential_pem = generate_client_credential_pem(
         state.cluster_id,
         device_id.as_str(),
@@ -6349,7 +6338,6 @@ async fn enroll_client_device(
         let device = DeviceAuthRecord {
             device_id: device_id.clone(),
             label: final_label.clone(),
-            token_hash: device_token_hash,
             public_key_pem: Some(public_key_pem.to_string()),
             issued_credential_pem: Some(credential_pem.clone()),
             created_at_unix: now,
@@ -6360,7 +6348,6 @@ async fn enroll_client_device(
         ClientDeviceEnrollResponse {
             cluster_id: state.cluster_id,
             device_id,
-            device_token,
             label: final_label,
             public_key_pem: public_key_pem.to_string(),
             credential_pem,

@@ -184,7 +184,7 @@ fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
             base_url.as_str(),
             identity,
         ),
-        None => build_http_client_from_pem(server_ca_override.as_deref(), base_url.as_str(), &None),
+        None => build_http_client_from_pem(server_ca_override.as_deref(), base_url.as_str()),
     }
 }
 

@@ -27,7 +27,7 @@ impl ServerNodeHydrator {
                 base_url.as_str(),
                 identity,
             )?,
-            None => build_http_client_from_pem(server_ca_pem, base_url.as_str(), &None)?,
+            None => build_http_client_from_pem(server_ca_pem, base_url.as_str())?,
         };
         Ok(Self::with_client(sdk))
     }

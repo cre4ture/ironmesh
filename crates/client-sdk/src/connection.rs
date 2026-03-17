@@ -49,17 +49,15 @@ pub fn build_blocking_reqwest_client_from_pem(
 pub fn build_http_client_from_pem(
     server_ca_pem: Option<&str>,
     base_url_str: &str,
-    bearer_token: &Option<String>,
 ) -> Result<IronMeshClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let http = build_reqwest_client_from_pem(server_ca_pem)?;
 
-    let client = IronMeshClient::from_direct_http_client(base_url.as_str(), http);
-    Ok(match bearer_token.as_ref() {
-        Some(token) => client.with_bearer_token(token.clone()),
-        None => client,
-    })
+    Ok(IronMeshClient::from_direct_http_client(
+        base_url.as_str(),
+        http,
+    ))
 }
 
 pub fn build_http_client_with_identity_from_pem(
@@ -122,7 +120,6 @@ pub fn build_http_client_with_identity_from_planned_target(
 pub fn build_http_client(
     server_ca_cert: Option<&Path>,
     base_url_str: &str,
-    bearer_token: &Option<String>,
 ) -> Result<IronMeshClient> {
     let server_ca_pem = server_ca_cert
         .map(|path| {
@@ -130,7 +127,7 @@ pub fn build_http_client(
                 .with_context(|| format!("failed to read server CA certificate {}", path.display()))
         })
         .transpose()?;
-    build_http_client_from_pem(server_ca_pem.as_deref(), base_url_str, bearer_token)
+    build_http_client_from_pem(server_ca_pem.as_deref(), base_url_str)
 }
 
 pub fn build_http_client_with_identity(

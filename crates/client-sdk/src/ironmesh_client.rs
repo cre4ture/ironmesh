@@ -30,7 +30,6 @@ pub struct IronMeshClient {
 #[derive(Clone)]
 enum ClientRequestAuth {
     None,
-    BearerToken(String),
     SignedIdentity(ClientIdentityMaterial),
 }
 
@@ -200,11 +199,6 @@ impl IronMeshClient {
         }
     }
 
-    pub fn with_bearer_token(mut self, bearer_token: impl Into<String>) -> Self {
-        self.auth = ClientRequestAuth::BearerToken(bearer_token.into());
-        self
-    }
-
     pub fn with_client_identity(mut self, identity: ClientIdentityMaterial) -> Self {
         self.auth = ClientRequestAuth::SignedIdentity(identity);
         self
@@ -229,10 +223,6 @@ impl IronMeshClient {
     fn request_auth_headers(&self, method: &Method, url: &Url) -> Result<Vec<RelayHttpHeader>> {
         match &self.auth {
             ClientRequestAuth::None => Ok(Vec::new()),
-            ClientRequestAuth::BearerToken(token) => Ok(vec![RelayHttpHeader {
-                name: "authorization".to_string(),
-                value: format!("Bearer {token}"),
-            }]),
             ClientRequestAuth::SignedIdentity(identity) => {
                 let path_and_query = path_and_query(url);
                 let signed_headers = build_signed_request_headers(
@@ -287,7 +277,7 @@ impl IronMeshClient {
             ClientRequestAuth::SignedIdentity(identity) => {
                 Ok(PeerIdentity::Device(identity.device_id))
             }
-            ClientRequestAuth::None | ClientRequestAuth::BearerToken(_) => {
+            ClientRequestAuth::None => {
                 bail!("relay-backed client transport requires signed client identity material")
             }
         }

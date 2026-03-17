@@ -523,12 +523,7 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let enrolled: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(enrolled["device_id"], "device-a");
-    assert!(
-        enrolled["device_token"]
-            .as_str()
-            .unwrap()
-            .starts_with("im-dev-")
-    );
+    assert!(enrolled["credential_pem"].as_str().is_some());
 
     let auth = state.client_auth.lock().await;
     assert_eq!(auth.devices.len(), 1);
@@ -2506,7 +2501,6 @@ async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
         auth.devices.push(super::DeviceAuthRecord {
             device_id: identity.device_id.to_string(),
             label: Some("Pixel".to_string()),
-            token_hash: super::hash_token("legacy-device-secret"),
             public_key_pem: Some(identity.public_key_pem.clone()),
             issued_credential_pem: Some(credential_pem),
             created_at_unix: super::unix_ts(),
@@ -2604,7 +2598,6 @@ async fn client_auth_middleware_rejects_replayed_nonce_impl(backend: MainTestBac
         auth.devices.push(super::DeviceAuthRecord {
             device_id: identity.device_id.to_string(),
             label: None,
-            token_hash: super::hash_token("legacy-device-secret"),
             public_key_pem: Some(identity.public_key_pem.clone()),
             issued_credential_pem: Some(credential_pem),
             created_at_unix: super::unix_ts(),
