@@ -38,6 +38,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use time::OffsetDateTime;
 use tokio::sync::{Mutex, watch};
 use tower::Service;
 use tracing::Subscriber;
@@ -48,7 +49,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial, BootstrapServerTlsFiles,
-    BootstrapTlsFiles, BootstrapTrustRoots, CandidateKind,
+    BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots, CandidateKind,
     ClientBootstrap as TransportClientBootstrap, ConnectionCandidate,
     NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
     PeerIdentity, PeerTransportClient, PeerTransportClientConfig, PresenceRegistration,
@@ -95,6 +96,10 @@ struct ServerState {
     public_ca_key_pem: Option<String>,
     cluster_ca_pem: Option<String>,
     internal_ca_key_pem: Option<String>,
+    public_tls_cert_path: Option<PathBuf>,
+    public_tls_metadata_path: Option<PathBuf>,
+    internal_tls_cert_path: Option<PathBuf>,
+    internal_tls_metadata_path: Option<PathBuf>,
     rendezvous_ca_pem: Option<String>,
     rendezvous_urls: Vec<String>,
     rendezvous_registration_enabled: bool,
@@ -528,12 +533,14 @@ pub struct InternalTlsConfig {
     pub ca_cert_path: PathBuf,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub metadata_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PublicTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    pub metadata_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -700,6 +707,249 @@ fn resolve_materialized_path(data_dir: &std::path::Path, raw_path: &str) -> Path
     }
 }
 
+fn tls_metadata_sidecar_path(cert_path: &std::path::Path) -> PathBuf {
+    let file_name = cert_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "certificate".to_string());
+    cert_path.with_file_name(format!("{file_name}.metadata.json"))
+}
+
+fn existing_tls_metadata_sidecar_path(cert_path: &std::path::Path) -> Option<PathBuf> {
+    let path = tls_metadata_sidecar_path(cert_path);
+    path.exists().then_some(path)
+}
+
+fn write_tls_material_metadata_sidecar(
+    cert_path: &std::path::Path,
+    metadata: &BootstrapTlsMaterialMetadata,
+) -> Result<()> {
+    let metadata_path = tls_metadata_sidecar_path(cert_path);
+    if let Some(parent) = metadata_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating {}", parent.display()))?;
+    }
+    let payload = serde_json::to_string_pretty(metadata)
+        .context("failed serializing TLS material metadata sidecar")?;
+    std::fs::write(&metadata_path, payload)
+        .with_context(|| format!("failed writing {}", metadata_path.display()))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedCertificateDetails {
+    not_before_unix: u64,
+    not_after_unix: u64,
+    certificate_fingerprint: String,
+}
+
+fn parse_certificate_details_from_pem(cert_pem: &str) -> Result<ParsedCertificateDetails> {
+    let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes())
+        .context("failed parsing certificate PEM")?;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der.as_ref())
+        .context("failed parsing certificate DER")?;
+    Ok(ParsedCertificateDetails {
+        not_before_unix: cert.validity().not_before.timestamp().max(0) as u64,
+        not_after_unix: cert.validity().not_after.timestamp().max(0) as u64,
+        certificate_fingerprint: blake3::hash(cert_der.as_ref()).to_hex().to_string(),
+    })
+}
+
+fn parse_certificate_details_from_path(
+    cert_path: &std::path::Path,
+) -> Result<ParsedCertificateDetails> {
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .with_context(|| format!("failed reading {}", cert_path.display()))?;
+    parse_certificate_details_from_pem(&cert_pem)
+}
+
+fn build_tls_issue_policy(
+    tls_validity_secs: Option<u64>,
+    tls_renewal_window_secs: Option<u64>,
+) -> std::result::Result<NodeTlsIssuePolicy, StatusCode> {
+    const MIN_VALIDITY_SECS: u64 = 60 * 60;
+    const MAX_VALIDITY_SECS: u64 = 365 * 24 * 60 * 60;
+    let issued_at_unix = unix_ts();
+    let validity_secs = tls_validity_secs.unwrap_or(30 * 24 * 60 * 60);
+    if !(MIN_VALIDITY_SECS..=MAX_VALIDITY_SECS).contains(&validity_secs) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let default_renewal_window_secs = (validity_secs / 5)
+        .max(15 * 60)
+        .min(validity_secs.saturating_sub(300));
+    let renewal_window_secs = tls_renewal_window_secs.unwrap_or(default_renewal_window_secs);
+    if renewal_window_secs < 300 || renewal_window_secs >= validity_secs {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let not_before_unix = issued_at_unix.saturating_sub(300);
+    let not_after_unix = issued_at_unix.saturating_add(validity_secs);
+    let renew_after_unix = not_after_unix.saturating_sub(renewal_window_secs);
+
+    Ok(NodeTlsIssuePolicy {
+        issued_at_unix,
+        not_before_unix,
+        not_after_unix,
+        renew_after_unix,
+    })
+}
+
+fn build_tls_material_metadata(
+    cert_pem: &str,
+    policy: NodeTlsIssuePolicy,
+) -> std::result::Result<BootstrapTlsMaterialMetadata, StatusCode> {
+    let parsed = parse_certificate_details_from_pem(cert_pem)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(BootstrapTlsMaterialMetadata {
+        issued_at_unix: policy.issued_at_unix,
+        not_before_unix: parsed.not_before_unix,
+        not_after_unix: parsed.not_after_unix,
+        renew_after_unix: policy.renew_after_unix,
+        certificate_fingerprint: parsed.certificate_fingerprint,
+    })
+}
+
+fn load_tls_material_metadata_sidecar(
+    metadata_path: Option<&std::path::Path>,
+) -> Option<BootstrapTlsMaterialMetadata> {
+    let path = metadata_path?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn default_renew_after_unix(not_before_unix: u64, not_after_unix: u64) -> u64 {
+    let lifetime = not_after_unix.saturating_sub(not_before_unix);
+    let renewal_window = (lifetime / 5).max(60 * 60);
+    not_after_unix.saturating_sub(renewal_window)
+}
+
+fn inspect_node_certificate(
+    name: &str,
+    cert_path: Option<&std::path::Path>,
+    metadata_path: Option<&std::path::Path>,
+) -> NodeCertificateStatusView {
+    let Some(cert_path) = cert_path else {
+        return NodeCertificateStatusView {
+            name: name.to_string(),
+            configured: false,
+            cert_path: None,
+            metadata_path: None,
+            issued_at_unix: None,
+            renew_after_unix: None,
+            expires_at_unix: None,
+            seconds_until_expiry: None,
+            certificate_fingerprint: None,
+            metadata_matches_certificate: None,
+            state: NodeCertificateLifecycleState::NotConfigured,
+        };
+    };
+
+    let metadata = load_tls_material_metadata_sidecar(metadata_path);
+    let parsed = match parse_certificate_details_from_path(cert_path) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return NodeCertificateStatusView {
+                name: name.to_string(),
+                configured: true,
+                cert_path: Some(cert_path.display().to_string()),
+                metadata_path: metadata_path.map(|path| path.display().to_string()),
+                issued_at_unix: metadata.as_ref().map(|entry| entry.issued_at_unix),
+                renew_after_unix: metadata.as_ref().map(|entry| entry.renew_after_unix),
+                expires_at_unix: metadata.as_ref().map(|entry| entry.not_after_unix),
+                seconds_until_expiry: None,
+                certificate_fingerprint: metadata
+                    .as_ref()
+                    .map(|entry| entry.certificate_fingerprint.clone()),
+                metadata_matches_certificate: None,
+                state: NodeCertificateLifecycleState::Missing,
+            };
+        }
+    };
+
+    let now = unix_ts();
+    let renew_after_unix = metadata
+        .as_ref()
+        .map(|entry| entry.renew_after_unix)
+        .unwrap_or_else(|| default_renew_after_unix(parsed.not_before_unix, parsed.not_after_unix));
+    let expires_at_unix = parsed.not_after_unix;
+    let seconds_until_expiry = expires_at_unix as i64 - now as i64;
+    let state = if expires_at_unix <= now {
+        NodeCertificateLifecycleState::Expired
+    } else if renew_after_unix <= now {
+        NodeCertificateLifecycleState::RenewalDue
+    } else {
+        NodeCertificateLifecycleState::Valid
+    };
+
+    NodeCertificateStatusView {
+        name: name.to_string(),
+        configured: true,
+        cert_path: Some(cert_path.display().to_string()),
+        metadata_path: metadata_path.map(|path| path.display().to_string()),
+        issued_at_unix: metadata
+            .as_ref()
+            .map(|entry| entry.issued_at_unix)
+            .or(Some(parsed.not_before_unix)),
+        renew_after_unix: Some(renew_after_unix),
+        expires_at_unix: Some(expires_at_unix),
+        seconds_until_expiry: Some(seconds_until_expiry),
+        certificate_fingerprint: Some(parsed.certificate_fingerprint.clone()),
+        metadata_matches_certificate: metadata
+            .as_ref()
+            .map(|entry| entry.certificate_fingerprint == parsed.certificate_fingerprint),
+        state,
+    }
+}
+
+fn collect_node_certificate_status(
+    public_cert_path: Option<&std::path::Path>,
+    public_metadata_path: Option<&std::path::Path>,
+    internal_cert_path: Option<&std::path::Path>,
+    internal_metadata_path: Option<&std::path::Path>,
+) -> NodeCertificateStatusResponse {
+    NodeCertificateStatusResponse {
+        public_tls: inspect_node_certificate("public_tls", public_cert_path, public_metadata_path),
+        internal_tls: inspect_node_certificate(
+            "internal_tls",
+            internal_cert_path,
+            internal_metadata_path,
+        ),
+    }
+}
+
+fn log_certificate_lifecycle_status(status: &NodeCertificateStatusResponse) {
+    for entry in [&status.public_tls, &status.internal_tls] {
+        match entry.state {
+            NodeCertificateLifecycleState::Expired => {
+                tracing::warn!(
+                    certificate = %entry.name,
+                    cert_path = ?entry.cert_path,
+                    expires_at_unix = entry.expires_at_unix,
+                    "configured node certificate is expired"
+                );
+            }
+            NodeCertificateLifecycleState::RenewalDue => {
+                tracing::warn!(
+                    certificate = %entry.name,
+                    cert_path = ?entry.cert_path,
+                    renew_after_unix = entry.renew_after_unix,
+                    expires_at_unix = entry.expires_at_unix,
+                    "configured node certificate is due for renewal"
+                );
+            }
+            NodeCertificateLifecycleState::Missing => {
+                tracing::warn!(
+                    certificate = %entry.name,
+                    cert_path = ?entry.cert_path,
+                    "configured node certificate could not be loaded"
+                );
+            }
+            NodeCertificateLifecycleState::NotConfigured | NodeCertificateLifecycleState::Valid => {
+            }
+        }
+    }
+}
+
 fn materialize_node_enrollment_package(
     package: NodeEnrollmentPackage,
 ) -> Result<TransportNodeBootstrap> {
@@ -729,6 +979,7 @@ fn materialize_node_enrollment_package(
             std::fs::write(path, contents)
                 .with_context(|| format!("failed writing {}", path.display()))?;
         }
+        write_tls_material_metadata_sidecar(&cert_path, &material.metadata)?;
 
         internal_tls.ca_cert_path = ca_path.to_string_lossy().into_owned();
         internal_tls.cert_path = cert_path.to_string_lossy().into_owned();
@@ -752,6 +1003,7 @@ fn materialize_node_enrollment_package(
             std::fs::write(path, contents)
                 .with_context(|| format!("failed writing {}", path.display()))?;
         }
+        write_tls_material_metadata_sidecar(&cert_path, &material.metadata)?;
 
         public_tls.cert_path = cert_path.to_string_lossy().into_owned();
         public_tls.key_path = key_path.to_string_lossy().into_owned();
@@ -811,19 +1063,28 @@ impl ServerNodeConfig {
                     .context("node bootstrap internal_tls requires internal_bind_addr")?
                     .parse()
                     .context("invalid node bootstrap internal_bind_addr")?;
+                let ca_cert_path = PathBuf::from(internal_tls.ca_cert_path);
+                let cert_path = PathBuf::from(internal_tls.cert_path);
+                let key_path = PathBuf::from(internal_tls.key_path);
                 Some(InternalTlsConfig {
                     bind_addr: internal_bind_addr,
                     internal_url: bootstrap.internal_url.clone(),
-                    ca_cert_path: PathBuf::from(internal_tls.ca_cert_path),
-                    cert_path: PathBuf::from(internal_tls.cert_path),
-                    key_path: PathBuf::from(internal_tls.key_path),
+                    metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
+                    ca_cert_path,
+                    cert_path,
+                    key_path,
                 })
             }
             None => None,
         };
-        let public_tls = bootstrap.public_tls.map(|public_tls| PublicTlsConfig {
-            cert_path: PathBuf::from(public_tls.cert_path),
-            key_path: PathBuf::from(public_tls.key_path),
+        let public_tls = bootstrap.public_tls.map(|public_tls| {
+            let cert_path = PathBuf::from(public_tls.cert_path);
+            let key_path = PathBuf::from(public_tls.key_path);
+            PublicTlsConfig {
+                metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
+                cert_path,
+                key_path,
+            }
         });
         let upstream_configured = bootstrap
             .upstream_public_url
@@ -1032,10 +1293,15 @@ impl ServerNodeConfig {
             std::env::var("IRONMESH_PUBLIC_TLS_CERT").ok(),
             std::env::var("IRONMESH_PUBLIC_TLS_KEY").ok(),
         ) {
-            (Some(cert), Some(key)) => Some(PublicTlsConfig {
-                cert_path: PathBuf::from(cert),
-                key_path: PathBuf::from(key),
-            }),
+            (Some(cert), Some(key)) => {
+                let cert_path = PathBuf::from(cert);
+                let key_path = PathBuf::from(key);
+                Some(PublicTlsConfig {
+                    metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
+                    cert_path,
+                    key_path,
+                })
+            }
             (None, None) => None,
             _ => {
                 bail!("IRONMESH_PUBLIC_TLS_CERT and IRONMESH_PUBLIC_TLS_KEY must be set together")
@@ -1085,23 +1351,27 @@ impl ServerNodeConfig {
                     .unwrap_or_else(|_| "127.0.0.1:18080".to_string())
                     .parse()
                     .context("invalid IRONMESH_INTERNAL_BIND")?;
+                let ca_cert_path = PathBuf::from(
+                    std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
+                        .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
+                );
+                let cert_path = PathBuf::from(
+                    std::env::var("IRONMESH_INTERNAL_TLS_CERT")
+                        .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
+                );
+                let key_path = PathBuf::from(
+                    std::env::var("IRONMESH_INTERNAL_TLS_KEY")
+                        .context("missing IRONMESH_INTERNAL_TLS_KEY")?,
+                );
                 Some(InternalTlsConfig {
                     bind_addr: internal_bind_addr,
                     internal_url: std::env::var("IRONMESH_INTERNAL_URL")
                         .ok()
                         .or_else(|| Some(format!("https://{internal_bind_addr}"))),
-                    ca_cert_path: PathBuf::from(
-                        std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
-                            .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
-                    ),
-                    cert_path: PathBuf::from(
-                        std::env::var("IRONMESH_INTERNAL_TLS_CERT")
-                            .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
-                    ),
-                    key_path: PathBuf::from(
-                        std::env::var("IRONMESH_INTERNAL_TLS_KEY")
-                            .context("missing IRONMESH_INTERNAL_TLS_KEY")?,
-                    ),
+                    metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
+                    ca_cert_path,
+                    cert_path,
+                    key_path,
                 })
             }
             ServerNodeMode::LocalEdge => None,
@@ -1569,6 +1839,26 @@ pub async fn run(config: ServerNodeConfig) -> Result<()> {
 
 async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let public_tls_cert_path = config.public_tls.as_ref().map(|tls| tls.cert_path.clone());
+    let public_tls_metadata_path = config
+        .public_tls
+        .as_ref()
+        .and_then(|tls| tls.metadata_path.clone());
+    let internal_tls_cert_path = config
+        .internal_tls
+        .as_ref()
+        .map(|tls| tls.cert_path.clone());
+    let internal_tls_metadata_path = config
+        .internal_tls
+        .as_ref()
+        .and_then(|tls| tls.metadata_path.clone());
+    let tls_status = collect_node_certificate_status(
+        public_tls_cert_path.as_deref(),
+        public_tls_metadata_path.as_deref(),
+        internal_tls_cert_path.as_deref(),
+        internal_tls_metadata_path.as_deref(),
+    );
+    log_certificate_lifecycle_status(&tls_status);
 
     let public_url = config.public_url.clone().unwrap_or_else(|| {
         let scheme = if config.public_tls.is_some() {
@@ -1771,6 +2061,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         public_ca_key_pem,
         cluster_ca_pem,
         internal_ca_key_pem,
+        public_tls_cert_path,
+        public_tls_metadata_path,
+        internal_tls_cert_path,
+        internal_tls_metadata_path,
         rendezvous_ca_pem,
         rendezvous_urls: config.rendezvous_urls.clone(),
         rendezvous_registration_enabled: config.rendezvous_registration_enabled,
@@ -1955,6 +2249,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         )
         .route("/auth/node-bootstraps/issue", post(issue_node_bootstrap))
         .route("/auth/node-enrollments/issue", post(issue_node_enrollment))
+        .route("/auth/node-enrollments/renew", post(renew_node_enrollment))
+        .route(
+            "/auth/node-certificates/status",
+            get(node_certificate_status),
+        )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
     let public_peer_api = Router::new()
@@ -3259,6 +3558,50 @@ async fn health(State(state): State<ServerState>) -> Json<HealthStatus> {
     })
 }
 
+async fn node_certificate_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/node-certificates/status";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "node_id": state.node_id }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let status = collect_node_certificate_status(
+        state.public_tls_cert_path.as_deref(),
+        state.public_tls_metadata_path.as_deref(),
+        state.internal_tls_cert_path.as_deref(),
+        state.internal_tls_metadata_path.as_deref(),
+    );
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "public_tls_state": status.public_tls.state,
+            "internal_tls_state": status.internal_tls.state,
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(status)).into_response()
+}
+
 async fn list_snapshots(State(state): State<ServerState>) -> impl IntoResponse {
     let store = state.store.lock().await;
     match store.list_snapshots().await {
@@ -4436,6 +4779,15 @@ struct NodeBootstrapIssueRequest {
     internal_url: Option<String>,
     internal_tls: Option<BootstrapTlsFiles>,
     upstream_public_url: Option<String>,
+    tls_validity_secs: Option<u64>,
+    tls_renewal_window_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeEnrollmentRenewRequest {
+    package: NodeEnrollmentPackage,
+    tls_validity_secs: Option<u64>,
+    tls_renewal_window_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4474,6 +4826,45 @@ struct ClientDeviceView {
     label: Option<String>,
     created_at_unix: u64,
     revoked_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NodeTlsIssuePolicy {
+    issued_at_unix: u64,
+    not_before_unix: u64,
+    not_after_unix: u64,
+    renew_after_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum NodeCertificateLifecycleState {
+    NotConfigured,
+    Missing,
+    Valid,
+    RenewalDue,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NodeCertificateStatusView {
+    name: String,
+    configured: bool,
+    cert_path: Option<String>,
+    metadata_path: Option<String>,
+    issued_at_unix: Option<u64>,
+    renew_after_unix: Option<u64>,
+    expires_at_unix: Option<u64>,
+    seconds_until_expiry: Option<i64>,
+    certificate_fingerprint: Option<String>,
+    metadata_matches_certificate: Option<bool>,
+    state: NodeCertificateLifecycleState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NodeCertificateStatusResponse {
+    public_tls: NodeCertificateStatusView,
+    internal_tls: NodeCertificateStatusView,
 }
 
 async fn persist_client_auth_state(state: &ServerState) -> Result<()> {
@@ -4726,6 +5117,7 @@ fn build_public_node_subject_alt_names(bootstrap: &TransportNodeBootstrap) -> Re
 fn issue_internal_node_tls_material(
     state: &ServerState,
     bootstrap: &TransportNodeBootstrap,
+    policy: NodeTlsIssuePolicy,
 ) -> std::result::Result<BootstrapMutualTlsMaterial, StatusCode> {
     if bootstrap.internal_tls.is_none() {
         return Err(StatusCode::BAD_REQUEST);
@@ -4752,6 +5144,10 @@ fn issue_internal_node_tls_material(
         format!("ironmesh-node-{}", bootstrap.node_id),
     );
     params.is_ca = IsCa::NoCa;
+    params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.extended_key_usages = vec![
         ExtendedKeyUsagePurpose::ClientAuth,
         ExtendedKeyUsagePurpose::ServerAuth,
@@ -4763,17 +5159,21 @@ fn issue_internal_node_tls_material(
     let cert = params
         .signed_by(&key_pair, &issuer)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cert_pem = cert.pem();
+    let metadata = build_tls_material_metadata(&cert_pem, policy)?;
 
     Ok(BootstrapMutualTlsMaterial {
         ca_cert_pem: ca_cert_pem.to_string(),
-        cert_pem: cert.pem(),
+        cert_pem,
         key_pem: key_pair.serialize_pem(),
+        metadata,
     })
 }
 
 fn issue_public_node_tls_material(
     state: &ServerState,
     bootstrap: &TransportNodeBootstrap,
+    policy: NodeTlsIssuePolicy,
 ) -> std::result::Result<Option<BootstrapMutualTlsMaterial>, StatusCode> {
     if bootstrap.public_tls.is_none() {
         return Ok(None);
@@ -4802,6 +5202,10 @@ fn issue_public_node_tls_material(
         format!("ironmesh-public-{}", bootstrap.node_id),
     );
     params.is_ca = IsCa::NoCa;
+    params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.subject_alt_names =
         build_public_node_subject_alt_names(bootstrap).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -4810,11 +5214,14 @@ fn issue_public_node_tls_material(
     let cert = params
         .signed_by(&key_pair, &issuer)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cert_pem = cert.pem();
+    let metadata = build_tls_material_metadata(&cert_pem, policy)?;
 
     Ok(Some(BootstrapMutualTlsMaterial {
         ca_cert_pem: ca_cert_pem.to_string(),
-        cert_pem: cert.pem(),
+        cert_pem,
         key_pem: key_pair.serialize_pem(),
+        metadata,
     }))
 }
 
@@ -4922,6 +5329,8 @@ async fn issue_node_bootstrap(
             "bind_addr": request.bind_addr,
             "public_url": request.public_url,
             "upstream_public_url": request.upstream_public_url,
+            "tls_validity_secs": request.tls_validity_secs,
+            "tls_renewal_window_secs": request.tls_renewal_window_secs,
         }),
     )
     .await
@@ -4988,6 +5397,8 @@ async fn issue_node_enrollment(
             "bind_addr": request.bind_addr,
             "public_url": request.public_url,
             "upstream_public_url": request.upstream_public_url,
+            "tls_validity_secs": request.tls_validity_secs,
+            "tls_renewal_window_secs": request.tls_renewal_window_secs,
         }),
     )
     .await
@@ -4996,6 +5407,8 @@ async fn issue_node_enrollment(
         Err(status) => return status.into_response(),
     };
 
+    let tls_validity_secs = request.tls_validity_secs;
+    let tls_renewal_window_secs = request.tls_renewal_window_secs;
     let bootstrap = match build_issued_node_bootstrap(&state, request) {
         Ok(bootstrap) => bootstrap,
         Err(status) => {
@@ -5015,8 +5428,30 @@ async fn issue_node_enrollment(
         }
     };
 
+    let issue_policy = match build_tls_issue_policy(tls_validity_secs, tls_renewal_window_secs) {
+        Ok(policy) => policy,
+        Err(status) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": "invalid TLS validity policy" }),
+            )
+            .await;
+            return (
+                status,
+                Json(json!({ "error": "invalid TLS validity policy" })),
+            )
+                .into_response();
+        }
+    };
+
     let internal_tls_material = if bootstrap.internal_tls.is_some() {
-        match issue_internal_node_tls_material(&state, &bootstrap) {
+        match issue_internal_node_tls_material(&state, &bootstrap, issue_policy) {
             Ok(material) => Some(material),
             Err(status) => {
                 append_admin_audit(
@@ -5040,7 +5475,8 @@ async fn issue_node_enrollment(
     } else {
         None
     };
-    let public_tls_material = match issue_public_node_tls_material(&state, &bootstrap) {
+    let public_tls_material = match issue_public_node_tls_material(&state, &bootstrap, issue_policy)
+    {
         Ok(material) => material,
         Err(status) => {
             append_admin_audit(
@@ -5099,6 +5535,192 @@ async fn issue_node_enrollment(
             "node_id": package.bootstrap.node_id,
             "mode": package.bootstrap.mode,
             "includes_public_tls_material": package.public_tls_material.is_some(),
+            "public_tls_expires_at_unix": package
+                .public_tls_material
+                .as_ref()
+                .map(|material| material.metadata.not_after_unix),
+            "internal_tls_expires_at_unix": package
+                .internal_tls_material
+                .as_ref()
+                .map(|material| material.metadata.not_after_unix),
+        }),
+    )
+    .await;
+
+    (StatusCode::CREATED, Json(package)).into_response()
+}
+
+async fn renew_node_enrollment(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NodeEnrollmentRenewRequest>,
+) -> impl IntoResponse {
+    let action = "auth/node-enrollments/renew";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "node_id": request.package.bootstrap.node_id,
+            "mode": request.package.bootstrap.mode,
+            "tls_validity_secs": request.tls_validity_secs,
+            "tls_renewal_window_secs": request.tls_renewal_window_secs,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    if let Err(err) = request.package.validate() {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    let issue_policy =
+        match build_tls_issue_policy(request.tls_validity_secs, request.tls_renewal_window_secs) {
+            Ok(policy) => policy,
+            Err(status) => {
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": "invalid TLS validity policy" }),
+                )
+                .await;
+                return (
+                    status,
+                    Json(json!({ "error": "invalid TLS validity policy" })),
+                )
+                    .into_response();
+            }
+        };
+
+    let previous_public_fingerprint = request
+        .package
+        .public_tls_material
+        .as_ref()
+        .map(|material| material.metadata.certificate_fingerprint.clone());
+    let previous_internal_fingerprint = request
+        .package
+        .internal_tls_material
+        .as_ref()
+        .map(|material| material.metadata.certificate_fingerprint.clone());
+
+    let bootstrap = request.package.bootstrap;
+    let internal_tls_material = if bootstrap.internal_tls.is_some() {
+        match issue_internal_node_tls_material(&state, &bootstrap, issue_policy) {
+            Ok(material) => Some(material),
+            Err(status) => {
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": "failed to renew internal node TLS material" }),
+                )
+                .await;
+                return (
+                    status,
+                    Json(json!({ "error": "failed to renew internal node TLS material" })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+    let public_tls_material = match issue_public_node_tls_material(&state, &bootstrap, issue_policy)
+    {
+        Ok(material) => material,
+        Err(status) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": "failed to renew public node TLS material" }),
+            )
+            .await;
+            return (
+                status,
+                Json(json!({ "error": "failed to renew public node TLS material" })),
+            )
+                .into_response();
+        }
+    };
+
+    let package = NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material,
+        internal_tls_material,
+    };
+    if let Err(err) = package.validate() {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "node_id": package.bootstrap.node_id,
+            "previous_public_certificate_fingerprint": previous_public_fingerprint,
+            "new_public_certificate_fingerprint": package
+                .public_tls_material
+                .as_ref()
+                .map(|material| material.metadata.certificate_fingerprint.clone()),
+            "previous_internal_certificate_fingerprint": previous_internal_fingerprint,
+            "new_internal_certificate_fingerprint": package
+                .internal_tls_material
+                .as_ref()
+                .map(|material| material.metadata.certificate_fingerprint.clone()),
         }),
     )
     .await;

@@ -90,13 +90,31 @@
     <input id="node-bootstrap-internal-tls-key" type="text" value="tls/internal.key" autocomplete="off" spellcheck="false" />
     <label for="node-bootstrap-upstream-public-url">Upstream public URL (local-edge only)</label>
     <input id="node-bootstrap-upstream-public-url" type="text" autocomplete="off" spellcheck="false" />
+    <label for="node-bootstrap-tls-validity-secs">TLS validity seconds</label>
+    <input id="node-bootstrap-tls-validity-secs" type="number" min="3600" value="2592000" />
+    <label for="node-bootstrap-tls-renewal-window-secs">TLS renewal window seconds</label>
+    <input id="node-bootstrap-tls-renewal-window-secs" type="number" min="300" value="518400" />
     <button id="issue-node-bootstrap" type="button">Issue node bootstrap</button>
     <button id="issue-node-enrollment" type="button">Issue node enrollment package</button>
     <pre id="node-bootstrap-json">provide the admin token and click the button to issue a node bootstrap artifact</pre>
     <p id="node-bootstrap-notes"></p>
-    <p>Node enrollment packages can generate internal mTLS material and, when public TLS paths are included, public HTTPS certificates too. They require <code>IRONMESH_INTERNAL_TLS_CA_KEY</code> for internal certs and <code>IRONMESH_PUBLIC_TLS_CA_KEY</code> for dedicated public certs. If both listener tiers use the same CA, the internal CA key is reused automatically.</p>
+    <p>Node enrollment packages can generate internal mTLS material and, when public TLS paths are included, public HTTPS certificates too. They require <code>IRONMESH_INTERNAL_TLS_CA_KEY</code> for internal certs and <code>IRONMESH_PUBLIC_TLS_CA_KEY</code> for dedicated public certs. If both listener tiers use the same CA, the internal CA key is reused automatically. Issued material now includes validity and renewal metadata so you can rotate before expiry.</p>
     <pre id="node-enrollment-json">click the enrollment button to issue a bootstrap plus generated TLS PEM material</pre>
     <p id="node-enrollment-notes"></p>
+
+    <h3>Node enrollment renewal</h3>
+    <p>Reissues TLS material for an existing enrollment via <code>POST /auth/node-enrollments/renew</code>. Paste the current node enrollment JSON to preserve the same bootstrap identity while rotating certs.</p>
+    <label for="node-renewal-package-json">Existing node enrollment JSON</label>
+    <textarea id="node-renewal-package-json" rows="10" spellcheck="false" placeholder='{"bootstrap": ...}'></textarea>
+    <button id="renew-node-enrollment" type="button">Renew node enrollment package</button>
+    <pre id="node-renewal-json">paste an existing node enrollment package and click the button to reissue TLS material</pre>
+    <p id="node-renewal-notes"></p>
+
+    <h3>Node certificate status</h3>
+    <p>Fetches the current lifecycle state for configured public and internal certificates via <code>GET /auth/node-certificates/status</code>.</p>
+    <button id="fetch-node-certificate-status" type="button">Fetch node certificate status</button>
+    <pre id="node-certificate-status-json">click the button to inspect current certificate expiry and renewal state</pre>
+    <p id="node-certificate-status-notes"></p>
 
     <h2>Server logs</h2>
     <p>Recent in-memory log lines from this node.</p>
@@ -129,6 +147,8 @@
       <li><code>POST /auth/bootstrap-bundles/issue</code> - issue a bootstrap JSON bundle for client enrollment (admin token required)</li>
       <li><code>POST /auth/node-bootstraps/issue</code> - issue a node bootstrap JSON artifact for provisioning a server node (admin token required)</li>
       <li><code>POST /auth/node-enrollments/issue</code> - issue a node enrollment package with generated internal mTLS material and optional public HTTPS certificates (admin token required, CA key material required)</li>
+      <li><code>POST /auth/node-enrollments/renew</code> - renew an existing node enrollment package with fresh TLS material for the same node identity (admin token required, CA key material required)</li>
+      <li><code>GET /auth/node-certificates/status</code> - inspect current public/internal certificate expiry and renewal state (admin token required)</li>
       <li><code>GET /cluster/replication/plan</code> - current replication gaps/overages</li>
       <li><code>POST /cluster/replication/audit</code> - manual audit trigger</li>
       <li><code>POST /cluster/replication/repair</code> - execute one-pass replica repair for missing placements</li>

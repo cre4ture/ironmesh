@@ -507,6 +507,7 @@ mod tests {
             ca_cert_path: source_tls.0.clone(),
             cert_path: source_tls.1.clone(),
             key_path: source_tls.2.clone(),
+            metadata_path: None,
         });
         source_config.rendezvous_urls = vec![rendezvous_public_url.clone()];
         source_config.rendezvous_registration_enabled = true;
@@ -543,6 +544,7 @@ mod tests {
             ca_cert_path: target_tls.0.clone(),
             cert_path: target_tls.1.clone(),
             key_path: target_tls.2.clone(),
+            metadata_path: None,
         });
         target_config.rendezvous_urls = vec![rendezvous_public_url.clone()];
         target_config.rendezvous_registration_enabled = true;

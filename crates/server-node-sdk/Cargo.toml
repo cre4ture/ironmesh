@@ -29,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-rustls = "0.26"
+time = "0.3"
 transport-sdk = { path = "../transport-sdk" }
 turso = { version = "0.6.0-pre.2", optional = true }
 tower = "0.5"

@@ -160,6 +160,30 @@ async function issueNodeBootstrap() {
   }
 }
 
+function parseOptionalPositiveInt(value, fallback = null) {
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function readNodeTlsPolicy() {
+  return {
+    tls_validity_secs: parseOptionalPositiveInt(
+      document.getElementById('node-bootstrap-tls-validity-secs').value.trim(),
+      null
+    ),
+    tls_renewal_window_secs: parseOptionalPositiveInt(
+      document.getElementById('node-bootstrap-tls-renewal-window-secs').value.trim(),
+      null
+    )
+  };
+}
+
 function buildNodeBootstrapRequest() {
   const mode = document.getElementById('node-bootstrap-mode').value;
   const bindAddr = document.getElementById('node-bootstrap-bind-addr').value.trim();
@@ -178,7 +202,8 @@ function buildNodeBootstrapRequest() {
     public_peer_api_enabled: document.getElementById('node-bootstrap-public-peer-api-enabled').checked,
     internal_bind_addr: document.getElementById('node-bootstrap-internal-bind-addr').value.trim() || null,
     internal_url: document.getElementById('node-bootstrap-internal-url').value.trim() || null,
-    upstream_public_url: document.getElementById('node-bootstrap-upstream-public-url').value.trim() || null
+    upstream_public_url: document.getElementById('node-bootstrap-upstream-public-url').value.trim() || null,
+    ...readNodeTlsPolicy()
   };
 
   if (publicTlsCert && publicTlsKey) {
@@ -241,6 +266,121 @@ async function issueNodeEnrollment() {
   }
 }
 
+async function renewNodeEnrollment() {
+  const output = document.getElementById('node-renewal-json');
+  const notes = document.getElementById('node-renewal-notes');
+  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
+  const packageRaw = document.getElementById('node-renewal-package-json').value.trim();
+  if (!adminToken) {
+    output.textContent = 'admin token is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!packageRaw) {
+    output.textContent = 'existing node enrollment JSON is required';
+    notes.textContent = '';
+    return;
+  }
+
+  let parsedPackage;
+  try {
+    parsedPackage = JSON.parse(packageRaw);
+  } catch (error) {
+    output.textContent = 'failed to parse existing node enrollment JSON: ' + error;
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'renewing node enrollment package...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/node-enrollments/renew', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+        'x-ironmesh-admin-token': adminToken
+      },
+      body: JSON.stringify({
+        package: parsedPackage,
+        ...readNodeTlsPolicy()
+      })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeNodeEnrollment(payload);
+  } catch (error) {
+    output.textContent = 'failed to renew node enrollment package: ' + error;
+    notes.textContent = '';
+  }
+}
+
+async function fetchNodeCertificateStatus() {
+  const output = document.getElementById('node-certificate-status-json');
+  const notes = document.getElementById('node-certificate-status-notes');
+  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
+  if (!adminToken) {
+    output.textContent = 'admin token is required';
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'loading...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/node-certificates/status', {
+      method: 'GET',
+      cache: 'no-store',
+      headers: {
+        'x-ironmesh-admin-token': adminToken
+      }
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeNodeCertificateStatus(payload);
+  } catch (error) {
+    output.textContent = 'failed to fetch node certificate status: ' + error;
+    notes.textContent = '';
+  }
+}
+
+function formatUnixTs(unixTs) {
+  const parsed = Number(unixTs);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 'unknown';
+  }
+  return new Date(parsed * 1000).toISOString();
+}
+
+function summarizeTlsMaterial(label, material) {
+  if (!material?.metadata) {
+    return `${label}: no issued metadata`;
+  }
+  return `${label}: renew after ${formatUnixTs(material.metadata.renew_after_unix)}, expires ${formatUnixTs(material.metadata.not_after_unix)}`;
+}
+
 function summarizeBootstrapBundle(payload) {
   const rendezvousUrls = Array.isArray(payload.rendezvous_urls) ? payload.rendezvous_urls.length : 0;
   const directEndpoints = Array.isArray(payload.direct_endpoints) ? payload.direct_endpoints.length : 0;
@@ -297,6 +437,18 @@ function summarizeNodeEnrollment(payload) {
   if (payload?.bootstrap) {
     notes.push(summarizeNodeBootstrap(payload.bootstrap));
   }
+  if (payload?.public_tls_material?.cert_pem) {
+    notes.push('includes generated public HTTPS certificate');
+  }
+  if (payload?.public_tls_material?.key_pem) {
+    notes.push('includes generated public HTTPS private key');
+  }
+  if (payload?.public_tls_material?.ca_cert_pem) {
+    notes.push('includes public API CA certificate');
+  }
+  if (payload?.public_tls_material?.metadata) {
+    notes.push(summarizeTlsMaterial('public TLS', payload.public_tls_material));
+  }
   if (payload?.internal_tls_material?.cert_pem) {
     notes.push('includes generated internal node certificate');
   }
@@ -306,8 +458,30 @@ function summarizeNodeEnrollment(payload) {
   if (payload?.internal_tls_material?.ca_cert_pem) {
     notes.push('includes cluster CA certificate');
   }
+  if (payload?.internal_tls_material?.metadata) {
+    notes.push(summarizeTlsMaterial('internal TLS', payload.internal_tls_material));
+  }
 
   return notes.join(' | ');
+}
+
+function summarizeNodeCertificateStatus(payload) {
+  const entries = [payload?.public_tls, payload?.internal_tls].filter(Boolean);
+  return entries
+    .map((entry) => {
+      let note = `${entry.name}: ${entry.state}`;
+      if (entry.expires_at_unix) {
+        note += `, expires ${formatUnixTs(entry.expires_at_unix)}`;
+      }
+      if (entry.renew_after_unix) {
+        note += `, renew after ${formatUnixTs(entry.renew_after_unix)}`;
+      }
+      if (entry.metadata_matches_certificate === false) {
+        note += ', metadata fingerprint mismatch';
+      }
+      return note;
+    })
+    .join(' | ');
 }
 
 function renderBootstrapQr(text) {
@@ -358,6 +532,14 @@ document
 document
   .getElementById('issue-node-enrollment')
   .addEventListener('click', issueNodeEnrollment);
+
+document
+  .getElementById('renew-node-enrollment')
+  .addEventListener('click', renewNodeEnrollment);
+
+document
+  .getElementById('fetch-node-certificate-status')
+  .addEventListener('click', fetchNodeCertificateStatus);
 
 refreshServerLogs();
 setInterval(refreshServerLogs, 2000);

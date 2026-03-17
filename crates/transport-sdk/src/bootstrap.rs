@@ -70,6 +70,16 @@ pub struct BootstrapMutualTlsMaterial {
     pub ca_cert_pem: String,
     pub cert_pem: String,
     pub key_pem: String,
+    pub metadata: BootstrapTlsMaterialMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapTlsMaterialMetadata {
+    pub issued_at_unix: u64,
+    pub not_before_unix: u64,
+    pub not_after_unix: u64,
+    pub renew_after_unix: u64,
+    pub certificate_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,6 +435,23 @@ fn validate_tls_material(field_name: &str, value: &BootstrapMutualTlsMaterial) -
     validate_required_non_empty(&format!("{field_name}.ca_cert_pem"), &value.ca_cert_pem)?;
     validate_required_non_empty(&format!("{field_name}.cert_pem"), &value.cert_pem)?;
     validate_required_non_empty(&format!("{field_name}.key_pem"), &value.key_pem)?;
+    validate_required_non_empty(
+        &format!("{field_name}.metadata.certificate_fingerprint"),
+        &value.metadata.certificate_fingerprint,
+    )?;
+    if value.metadata.not_before_unix > value.metadata.not_after_unix {
+        bail!("{field_name}.metadata not_before_unix must be <= not_after_unix");
+    }
+    if value.metadata.issued_at_unix < value.metadata.not_before_unix
+        || value.metadata.issued_at_unix > value.metadata.not_after_unix
+    {
+        bail!("{field_name}.metadata issued_at_unix must fall within cert validity");
+    }
+    if value.metadata.renew_after_unix < value.metadata.not_before_unix
+        || value.metadata.renew_after_unix > value.metadata.not_after_unix
+    {
+        bail!("{field_name}.metadata renew_after_unix must fall within cert validity");
+    }
     Ok(())
 }
 
@@ -447,6 +474,21 @@ fn dedup_urls<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<Vec<Url>>
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    fn sample_tls_material() -> BootstrapMutualTlsMaterial {
+        BootstrapMutualTlsMaterial {
+            ca_cert_pem: "ca".to_string(),
+            cert_pem: "cert".to_string(),
+            key_pem: "key".to_string(),
+            metadata: BootstrapTlsMaterialMetadata {
+                issued_at_unix: 200,
+                not_before_unix: 100,
+                not_after_unix: 300,
+                renew_after_unix: 250,
+                certificate_fingerprint: "fingerprint".to_string(),
+            },
+        }
+    }
 
     #[test]
     fn client_bootstrap_validates_rendezvous_and_cluster() {
@@ -609,6 +651,90 @@ mod tests {
                 upstream_public_url: None,
             },
             public_tls_material: None,
+            internal_tls_material: None,
+        };
+
+        assert!(package.validate().is_err());
+    }
+
+    #[test]
+    fn node_enrollment_package_accepts_tls_material_with_metadata() {
+        let package = NodeEnrollmentPackage {
+            bootstrap: NodeBootstrap {
+                version: CLIENT_BOOTSTRAP_VERSION,
+                cluster_id: Uuid::now_v7(),
+                node_id: Uuid::now_v7(),
+                mode: NodeBootstrapMode::Cluster,
+                data_dir: "./data/node-a".to_string(),
+                bind_addr: "127.0.0.1:8080".to_string(),
+                public_url: Some("https://node-a.example".to_string()),
+                labels: HashMap::new(),
+                public_tls: Some(BootstrapServerTlsFiles {
+                    cert_path: "tls/public.pem".to_string(),
+                    key_path: "tls/public.key".to_string(),
+                }),
+                public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+                public_peer_api_enabled: false,
+                internal_bind_addr: Some("127.0.0.1:18080".to_string()),
+                internal_url: Some("https://127.0.0.1:18080".to_string()),
+                internal_tls: Some(BootstrapTlsFiles {
+                    ca_cert_path: "tls/ca.pem".to_string(),
+                    cert_path: "tls/node.pem".to_string(),
+                    key_path: "tls/node.key".to_string(),
+                }),
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                direct_endpoints: Vec::new(),
+                relay_mode: RelayMode::Fallback,
+                trust_roots: BootstrapTrustRoots {
+                    cluster_ca_pem: Some("cluster-ca".to_string()),
+                    public_api_ca_pem: Some("public-ca".to_string()),
+                    rendezvous_ca_pem: None,
+                },
+                upstream_public_url: None,
+            },
+            public_tls_material: Some(sample_tls_material()),
+            internal_tls_material: Some(sample_tls_material()),
+        };
+
+        package.validate().unwrap();
+    }
+
+    #[test]
+    fn node_enrollment_package_rejects_invalid_tls_metadata_window() {
+        let mut invalid = sample_tls_material();
+        invalid.metadata.renew_after_unix = 99;
+        let package = NodeEnrollmentPackage {
+            bootstrap: NodeBootstrap {
+                version: CLIENT_BOOTSTRAP_VERSION,
+                cluster_id: Uuid::now_v7(),
+                node_id: Uuid::now_v7(),
+                mode: NodeBootstrapMode::LocalEdge,
+                data_dir: "./data/node-a".to_string(),
+                bind_addr: "127.0.0.1:8080".to_string(),
+                public_url: Some("https://node-a.example".to_string()),
+                labels: HashMap::new(),
+                public_tls: Some(BootstrapServerTlsFiles {
+                    cert_path: "tls/public.pem".to_string(),
+                    key_path: "tls/public.key".to_string(),
+                }),
+                public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+                public_peer_api_enabled: false,
+                internal_bind_addr: None,
+                internal_url: None,
+                internal_tls: None,
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                direct_endpoints: Vec::new(),
+                relay_mode: RelayMode::Fallback,
+                trust_roots: BootstrapTrustRoots {
+                    cluster_ca_pem: None,
+                    public_api_ca_pem: Some("public-ca".to_string()),
+                    rendezvous_ca_pem: None,
+                },
+                upstream_public_url: None,
+            },
+            public_tls_material: Some(invalid),
             internal_tls_material: None,
         };
 
