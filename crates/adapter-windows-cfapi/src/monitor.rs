@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::auth::is_internal_device_auth_relative_path;
+use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{path_is_placeholder, try_convert_materialized_file};
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::path_to_relative;
@@ -60,7 +60,7 @@ impl SyncRootMonitor {
         if rel_path.is_empty() {
             return;
         }
-        if is_internal_device_auth_relative_path(&rel_path)
+        if is_internal_client_identity_relative_path(&rel_path)
             || is_internal_connection_bootstrap_relative_path(&rel_path)
         {
             return;
@@ -136,7 +136,7 @@ impl SyncRootMonitor {
         deleted_paths.sort_by(|(left_path, _), (right_path, _)| right_path.cmp(left_path));
 
         for (path, entry) in deleted_paths {
-            if is_internal_device_auth_relative_path(path)
+            if is_internal_client_identity_relative_path(path)
                 || is_internal_connection_bootstrap_relative_path(path)
             {
                 continue;

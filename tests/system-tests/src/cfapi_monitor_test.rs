@@ -10,7 +10,7 @@ mod tests {
         start_cfapi_adapter, start_cfapi_adapter_with_bootstrap, start_cfapi_adapter_with_refresh,
     };
     use bytes::Bytes;
-    use client_sdk::IronMeshClient;
+    use client_sdk::{ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient};
     use reqwest::Client;
     use std::ffi::c_void;
     use std::fs::File;
@@ -570,6 +570,7 @@ mod tests {
         let server_data_dir = fresh_data_dir("cfapi-auth-server");
         let sync_root = fresh_data_dir("cfapi-auth-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let rendezvous_urls = base_url.clone();
 
         let mut server = start_server_with_public_https_env(
             bind,
@@ -579,6 +580,7 @@ mod tests {
             &[
                 ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
                 ("IRONMESH_ADMIN_TOKEN", admin_token),
+                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ],
         )
         .await
@@ -612,22 +614,19 @@ mod tests {
             )
             .await?;
 
-            let auth_file = sync_root.join(".ironmesh-device-auth.json");
-            wait_for_path(&auth_file, 120).await;
+            let client_identity_file = sync_root.join(".ironmesh-client-identity.json");
+            wait_for_path(&client_identity_file, 120).await;
 
-            let auth_payload = std::fs::read_to_string(&auth_file)
-                .expect("failed to read persisted device auth file");
-            let auth_json: serde_json::Value = serde_json::from_str(&auth_payload)
-                .expect("failed to parse persisted device auth file");
-            let device_token = auth_json
-                .get("device_token")
-                .and_then(|value| value.as_str())
-                .expect("device_token missing in persisted auth file")
-                .to_string();
-
-            let sdk_http = https_client_with_root_from_data_dir(&server_data_dir)?;
-            let sdk = IronMeshClient::with_http_client(&base_url, sdk_http)
-                .with_bearer_token(device_token);
+            let client_identity = ClientIdentityMaterial::from_path(&client_identity_file)
+                .expect("failed to load persisted client identity file");
+            let persisted_bootstrap = ConnectionBootstrap::from_path(&bootstrap_file)
+                .expect("failed to reload persisted bootstrap bundle");
+            let sdk = tokio::task::spawn_blocking(move || {
+                persisted_bootstrap.build_client_with_identity(&client_identity)
+            })
+            .await
+            .expect("bootstrap client builder task should join")
+            .expect("failed to build authenticated SDK client from bootstrap");
 
             let local_file = sync_root.join("authenticated-upload.txt");
             std::fs::write(&local_file, b"cfapi auth upload")
@@ -640,7 +639,7 @@ mod tests {
                 .expect("failed to inspect remote index after authenticated upload");
             assert!(
                 index.entries.iter().all(|entry| {
-                    entry.path != ".ironmesh-device-auth.json"
+                    entry.path != ".ironmesh-client-identity.json"
                         && entry.path != ".ironmesh-connection.json"
                 }),
                 "internal auth/bootstrap file leaked into remote namespace"

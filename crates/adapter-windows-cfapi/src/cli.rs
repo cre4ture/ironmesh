@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::adapter::WindowsCfapiAdapter;
-use crate::auth::{DeviceEnrollmentOptions, resolve_or_enroll_device_auth};
+use crate::auth::{ClientEnrollmentOptions, resolve_or_enroll_client_identity};
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
 use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
@@ -56,7 +56,7 @@ struct ServeArgs {
     #[arg(long)]
     device_label: Option<String>,
     #[arg(long)]
-    device_token_file: Option<PathBuf>,
+    client_identity_file: Option<PathBuf>,
     #[arg(long)]
     server_ca_cert: Option<PathBuf>,
     #[arg(long)]
@@ -102,35 +102,34 @@ pub fn cli_main() -> anyhow::Result<()> {
                 Duration::from_secs(25),
                 refresh_interval,
             );
-            let device_auth = resolve_or_enroll_device_auth(
+            let client_identity = resolve_or_enroll_client_identity(
                 connection.enrollment_base_url.as_ref(),
                 &registration.root_path,
-                &DeviceEnrollmentOptions {
+                &ClientEnrollmentOptions {
                     cluster_id: connection.cluster_id,
                     pairing_token: connection.pairing_token.clone(),
                     force_reenroll: connection.force_reenroll,
                     device_id: connection.device_id.clone(),
                     device_label: connection.device_label.clone(),
-                    device_token_file: args.device_token_file.clone(),
+                    client_identity_file: args.client_identity_file.clone(),
                     server_ca_pem: connection.server_ca_pem.clone(),
                 },
             )?;
-            if let Some(auth) = device_auth.as_ref() {
-                eprintln!("using enrolled device auth for {}", auth.device_id);
+            if let Some(identity) = client_identity.as_ref() {
+                eprintln!("using enrolled client identity for {}", identity.device_id);
             }
-            let client_identity = device_auth
-                .as_ref()
-                .map(|auth| auth.client_identity_material())
-                .transpose()?;
             let client = connection.build_client(client_identity.as_ref())?;
+            let persisted_device_id = client_identity
+                .as_ref()
+                .map(|identity| identity.device_id.to_string());
             persist_connection_config(
                 &connection.bootstrap_path,
                 &connection.bootstrap,
                 connection.server_ca_pem.as_deref(),
-                device_auth.as_ref().map(|auth| auth.device_id.as_str()),
-                device_auth
+                persisted_device_id.as_deref(),
+                client_identity
                     .as_ref()
-                    .and_then(|auth| auth.label.as_deref())
+                    .and_then(|identity| identity.label.as_deref())
                     .or(connection.device_label.as_deref()),
             )?;
 

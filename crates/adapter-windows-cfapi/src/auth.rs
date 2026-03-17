@@ -5,75 +5,35 @@ use client_sdk::{
     ClientIdentityMaterial, DeviceEnrollmentRequest, enroll_device_blocking_from_pem,
 };
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const DEFAULT_DEVICE_AUTH_FILE_NAME: &str = ".ironmesh-device-auth.json";
+const DEFAULT_CLIENT_IDENTITY_FILE_NAME: &str = ".ironmesh-client-identity.json";
 
 #[derive(Debug, Clone)]
-pub struct DeviceEnrollmentOptions {
+pub struct ClientEnrollmentOptions {
     pub cluster_id: Uuid,
     pub pairing_token: Option<String>,
     pub force_reenroll: bool,
     pub device_id: Option<String>,
     pub device_label: Option<String>,
-    pub device_token_file: Option<PathBuf>,
+    pub client_identity_file: Option<PathBuf>,
     pub server_ca_pem: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceAuthRecord {
-    pub cluster_id: String,
-    pub device_id: String,
-    pub device_token: String,
-    pub label: Option<String>,
-    pub public_key_pem: String,
-    pub private_key_pem: String,
-    pub credential_pem: String,
-    #[serde(default)]
-    pub rendezvous_client_identity_pem: Option<String>,
-}
-
-impl DeviceAuthRecord {
-    pub fn client_identity_material(&self) -> Result<ClientIdentityMaterial> {
-        let cluster_id = self
-            .cluster_id
-            .parse()
-            .with_context(|| format!("invalid cluster_id {}", self.cluster_id))?;
-        let device_id = self
-            .device_id
-            .parse()
-            .with_context(|| format!("invalid device_id {}", self.device_id))?;
-        let identity = ClientIdentityMaterial {
-            cluster_id,
-            device_id,
-            label: self.label.clone(),
-            private_key_pem: self.private_key_pem.clone(),
-            public_key_pem: self.public_key_pem.clone(),
-            credential_pem: Some(self.credential_pem.clone()),
-            rendezvous_client_identity_pem: self.rendezvous_client_identity_pem.clone(),
-            issued_at_unix: None,
-            expires_at_unix: None,
-        };
-        identity.validate()?;
-        Ok(identity)
-    }
-}
-
-pub fn resolve_or_enroll_device_auth(
+pub fn resolve_or_enroll_client_identity(
     base_url: Option<&Url>,
     sync_root_path: &Path,
-    options: &DeviceEnrollmentOptions,
-) -> Result<Option<DeviceAuthRecord>> {
-    let auth_file = options
-        .device_token_file
+    options: &ClientEnrollmentOptions,
+) -> Result<Option<ClientIdentityMaterial>> {
+    let identity_file = options
+        .client_identity_file
         .clone()
-        .unwrap_or_else(|| default_device_auth_path(sync_root_path));
+        .unwrap_or_else(|| default_client_identity_path(sync_root_path));
 
-    if auth_file.exists() && !options.force_reenroll {
-        return load_device_auth(&auth_file).map(Some);
+    if identity_file.exists() && !options.force_reenroll {
+        return load_client_identity(&identity_file).map(Some);
     }
 
     let pairing_token = options
@@ -90,26 +50,26 @@ pub fn resolve_or_enroll_device_auth(
             "device enrollment requires a reachable direct public API endpoint in the connection bootstrap"
         )
     })?;
-    let record = enroll_device(base_url, pairing_token, options)?;
-    persist_device_auth(&auth_file, &record)?;
-    Ok(Some(record))
+    let identity = enroll_client_identity(base_url, pairing_token, options)?;
+    persist_client_identity(&identity_file, &identity)?;
+    Ok(Some(identity))
 }
 
-pub fn default_device_auth_path(sync_root_path: &Path) -> PathBuf {
-    sync_root_path.join(DEFAULT_DEVICE_AUTH_FILE_NAME)
+pub fn default_client_identity_path(sync_root_path: &Path) -> PathBuf {
+    sync_root_path.join(DEFAULT_CLIENT_IDENTITY_FILE_NAME)
 }
 
-pub fn is_internal_device_auth_relative_path(path: &str) -> bool {
+pub fn is_internal_client_identity_relative_path(path: &str) -> bool {
     let normalized = path.trim().trim_matches(['/', '\\']).replace('\\', "/");
-    normalized == DEFAULT_DEVICE_AUTH_FILE_NAME
-        || normalized.ends_with(&format!("/{DEFAULT_DEVICE_AUTH_FILE_NAME}"))
+    normalized == DEFAULT_CLIENT_IDENTITY_FILE_NAME
+        || normalized.ends_with(&format!("/{DEFAULT_CLIENT_IDENTITY_FILE_NAME}"))
 }
 
-fn enroll_device(
+fn enroll_client_identity(
     base_url: &Url,
     pairing_token: &str,
-    options: &DeviceEnrollmentOptions,
-) -> Result<DeviceAuthRecord> {
+    options: &ClientEnrollmentOptions,
+) -> Result<ClientIdentityMaterial> {
     let requested_device_id = normalize_optional(options.device_id.as_deref())
         .map(|value| {
             value
@@ -120,6 +80,7 @@ fn enroll_device(
     let label = normalize_optional(options.device_label.as_deref());
     let mut identity =
         ClientIdentityMaterial::generate(options.cluster_id, requested_device_id, label.clone())?;
+    identity.public_key_pem = identity.public_key_pem.trim().to_string();
     let enrolled = enroll_device_blocking_from_pem(
         base_url,
         options.server_ca_pem.as_deref(),
@@ -132,17 +93,9 @@ fn enroll_device(
         },
     )?;
     identity.apply_issued_identity(&enrolled.issued_identity()?)?;
+    identity.rendezvous_client_identity_pem = enrolled.rendezvous_client_identity_pem;
 
-    Ok(DeviceAuthRecord {
-        cluster_id: options.cluster_id.to_string(),
-        device_id: enrolled.device_id,
-        device_token: enrolled.device_token,
-        label: enrolled.label,
-        public_key_pem: identity.public_key_pem,
-        private_key_pem: identity.private_key_pem,
-        credential_pem: enrolled.credential_pem,
-        rendezvous_client_identity_pem: enrolled.rendezvous_client_identity_pem,
-    })
+    Ok(identity)
 }
 
 fn normalize_optional(value: Option<&str>) -> Option<String> {
@@ -152,55 +105,43 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn load_device_auth(path: &Path) -> Result<DeviceAuthRecord> {
+fn load_client_identity(path: &Path) -> Result<ClientIdentityMaterial> {
     let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read device auth file {}", path.display()))?;
-    let record = serde_json::from_str::<DeviceAuthRecord>(&raw)
-        .with_context(|| format!("failed to parse device auth file {}", path.display()))?;
-    validate_device_auth(&record, path)?;
-    Ok(record)
+        .with_context(|| format!("failed to read client identity file {}", path.display()))?;
+    let identity = serde_json::from_str::<ClientIdentityMaterial>(&raw)
+        .with_context(|| format!("failed to parse client identity file {}", path.display()))?;
+    validate_client_identity(&identity, path)?;
+    Ok(identity)
 }
 
-fn persist_device_auth(path: &Path, record: &DeviceAuthRecord) -> Result<()> {
-    validate_device_auth(record, path)?;
+fn persist_client_identity(path: &Path, identity: &ClientIdentityMaterial) -> Result<()> {
+    validate_client_identity(identity, path)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create auth directory {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create client identity directory {}",
+                parent.display()
+            )
+        })?;
     }
-    let payload =
-        serde_json::to_string_pretty(record).context("failed to serialize device auth")?;
+    let payload = identity
+        .to_json_pretty()
+        .context("failed to serialize client identity")?;
     fs::write(path, payload)
-        .with_context(|| format!("failed to write device auth file {}", path.display()))
+        .with_context(|| format!("failed to write client identity file {}", path.display()))
 }
 
-fn validate_device_auth(record: &DeviceAuthRecord, path: &Path) -> Result<()> {
-    if record.cluster_id.trim().is_empty() {
-        bail!("device auth file {} is missing cluster_id", path.display());
-    }
-    if record.device_id.trim().is_empty() {
-        bail!("device auth file {} is missing device_id", path.display());
-    }
-    if record.device_token.trim().is_empty() {
+fn validate_client_identity(identity: &ClientIdentityMaterial, path: &Path) -> Result<()> {
+    identity
+        .validate()
+        .with_context(|| format!("invalid client identity file {}", path.display()))?;
+    if identity
+        .credential_pem
+        .as_deref()
+        .is_none_or(|credential| credential.trim().is_empty())
+    {
         bail!(
-            "device auth file {} is missing device_token",
-            path.display()
-        );
-    }
-    if record.public_key_pem.trim().is_empty() {
-        bail!(
-            "device auth file {} is missing public_key_pem",
-            path.display()
-        );
-    }
-    if record.private_key_pem.trim().is_empty() {
-        bail!(
-            "device auth file {} is missing private_key_pem",
-            path.display()
-        );
-    }
-    if record.credential_pem.trim().is_empty() {
-        bail!(
-            "device auth file {} is missing credential_pem",
+            "client identity file {} is missing credential_pem",
             path.display()
         );
     }
@@ -212,24 +153,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_device_auth_path_uses_sync_root() {
-        let path = default_device_auth_path(Path::new("C:\\sync-root"));
+    fn default_client_identity_path_uses_sync_root() {
+        let path = default_client_identity_path(Path::new("C:\\sync-root"));
         assert_eq!(
             path,
-            Path::new("C:\\sync-root").join(".ironmesh-device-auth.json")
+            Path::new("C:\\sync-root").join(".ironmesh-client-identity.json")
         );
     }
 
     #[test]
-    fn internal_device_auth_path_detection_matches_nested_and_root_relative_paths() {
-        assert!(is_internal_device_auth_relative_path(
-            ".ironmesh-device-auth.json"
+    fn internal_client_identity_path_detection_matches_nested_and_root_relative_paths() {
+        assert!(is_internal_client_identity_relative_path(
+            ".ironmesh-client-identity.json"
         ));
-        assert!(is_internal_device_auth_relative_path(
-            "nested/.ironmesh-device-auth.json"
+        assert!(is_internal_client_identity_relative_path(
+            "nested/.ironmesh-client-identity.json"
         ));
-        assert!(!is_internal_device_auth_relative_path(
-            "nested/not-auth.json"
+        assert!(!is_internal_client_identity_relative_path(
+            "nested/not-client-identity.json"
         ));
+    }
+
+    #[test]
+    fn persisted_client_identity_round_trips_without_legacy_token_field() {
+        let path =
+            std::env::temp_dir().join(format!("ironmesh-client-identity-{}.json", Uuid::now_v7()));
+        let mut identity = ClientIdentityMaterial::generate(
+            Uuid::now_v7(),
+            None,
+            Some("windows-adapter-test".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        identity.rendezvous_client_identity_pem = Some("rendezvous-client-identity".to_string());
+        identity.issued_at_unix = Some(123);
+        identity.expires_at_unix = Some(456);
+
+        persist_client_identity(&path, &identity).expect("identity should persist");
+
+        let raw = std::fs::read_to_string(&path).expect("identity file should exist");
+        assert!(
+            !raw.contains("device_token"),
+            "persisted identity should not contain legacy token field"
+        );
+
+        let reloaded = load_client_identity(&path).expect("identity should reload");
+        assert_eq!(reloaded, identity);
+
+        let _ = std::fs::remove_file(path);
     }
 }

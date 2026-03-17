@@ -26,7 +26,7 @@ Use this section as the current source of truth for remaining work. The detailed
 2. Remove the legacy direct-upstream path from server-node.
    Remaining work: retire `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, and `refresh_upstream_peer(...)` once rendezvous-first startup is the only supported peer discovery path.
 3. Finish removing `base_url` plus `device_token`-shaped app models.
-   Remaining work: clean up the remaining compatibility surfaces in `client-sdk`, Android, Windows CFAPI, iOS, and helper apps so persisted client state is identity-first rather than URL-plus-token-first.
+   Remaining work: clean up the remaining compatibility surfaces in `client-sdk`, Android, iOS, and helper apps so persisted client state is identity-first rather than URL-plus-token-first.
 4. Replace the old reachability model in cluster state.
    Remaining work: stop projecting everything into `NodeDescriptor { public_url, internal_url, ... }` and move to stable identity plus dynamic reachability/capability records.
 5. Refresh tests and operational docs to match the real implementation state.
@@ -219,9 +219,9 @@ Recommended responsibilities:
 
 ### `crates/adapter-windows-cfapi`
 
-- [ ] Replace `crates/adapter-windows-cfapi/src/connection_config.rs` so it resolves bootstrap into transport configuration rather than a single resolved URL.
-- [ ] Replace `crates/adapter-windows-cfapi/src/auth.rs` persisted `device_token` model with persisted client identity material.
-- [ ] Update `crates/adapter-windows-cfapi/src/cli.rs` and `crates/adapter-windows-cfapi/src/serve.rs` to stop threading `base_url + bearer_token`.
+- [x] Replace `crates/adapter-windows-cfapi/src/connection_config.rs` so it resolves bootstrap into transport configuration rather than a single resolved URL.
+- [x] Replace `crates/adapter-windows-cfapi/src/auth.rs` persisted `device_token` model with persisted client identity material.
+- [x] Update `crates/adapter-windows-cfapi/src/cli.rs` and `crates/adapter-windows-cfapi/src/serve.rs` to stop threading `base_url + bearer_token`.
 
 ### `apps/android-app`
 
@@ -294,7 +294,7 @@ This is implementation order, not product rollout order.
   - client can read/write through relay without any inbound port on the target node,
   - two server nodes can replicate through relay-only paths,
   - direct path is preferred when available and relay is used after forced failure.
-- [ ] Update Windows CFAPI tests that currently expect `.ironmesh-device-auth.json` with a `device_token`.
+- [x] Update Windows CFAPI tests so they consume the persisted client identity artifact instead of expecting a `device_token`.
 - [ ] Update Android-facing tests and helpers once the JNI and repository models change.
 
 ## 10. Current code that can be deleted after the replacement lands

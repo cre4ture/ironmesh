@@ -1,5 +1,5 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
-use crate::auth::is_internal_device_auth_relative_path;
+use crate::auth::is_internal_client_identity_relative_path;
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
 };
@@ -696,7 +696,7 @@ unsafe extern "system" fn callback_file_close_completion(
     }
 
     let relative_path = path_to_relative(&context.sync_root, &normalized_path);
-    if is_internal_device_auth_relative_path(&relative_path)
+    if is_internal_client_identity_relative_path(&relative_path)
         || is_internal_connection_bootstrap_relative_path(&relative_path)
     {
         eprintln!(
