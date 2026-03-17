@@ -1092,6 +1092,9 @@ async fn current_rendezvous_control(state: &ServerState) -> Option<RendezvousCon
 }
 
 fn current_bootstrap_trust_roots(state: &ServerState) -> Result<BootstrapTrustRoots> {
+    // Enrollment packages are the supported production lifecycle source for trust roots.
+    // Direct env/file CA wiring remains useful for development/testing or short-lived
+    // manually managed setups, where restart-after-change is acceptable.
     if let Some(path) = state.node_enrollment_path.as_ref() {
         return Ok(NodeEnrollmentPackage::from_path(path)?
             .bootstrap
@@ -6850,9 +6853,16 @@ struct CleanupCandidate {
     key: String,
     version_id: String,
     node_id: NodeId,
-    node_internal_url: String,
+    node: NodeDescriptor,
     size_bytes: u64,
     node_free_bytes: u64,
+}
+
+fn build_replication_drop_path(key: &str, version_id: &str) -> String {
+    let encoded_key = utf8_percent_encode(key, QUERY_COMPONENT_ENCODE_SET).to_string();
+    let encoded_version_id =
+        utf8_percent_encode(version_id, QUERY_COMPONENT_ENCODE_SET).to_string();
+    format!("/cluster/replication/drop?key={encoded_key}&version_id={encoded_version_id}")
 }
 
 async fn execute_replication_cleanup(
@@ -6919,7 +6929,7 @@ async fn execute_replication_cleanup(
                 key: key.clone(),
                 version_id: version_id.clone(),
                 node_id: *extra_node,
-                node_internal_url: node.internal_url.clone(),
+                node: node.clone(),
                 size_bytes,
                 node_free_bytes: node.free_bytes,
             });
@@ -6960,24 +6970,22 @@ async fn execute_replication_cleanup(
         successful_deletions = selected.len();
         reclaimed_bytes = selected_bytes;
     } else {
-        let http = current_internal_http(&state).await;
         for candidate in selected {
             attempted_deletions += 1;
 
-            let request = http
-                .post(format!(
-                    "{}/cluster/replication/drop",
-                    candidate.node_internal_url
-                ))
-                .query(&ReplicationDropQuery {
-                    key: candidate.key.clone(),
-                    version_id: Some(candidate.version_id.clone()),
-                });
-
-            let response = request.send().await;
+            let path_and_query = build_replication_drop_path(&candidate.key, &candidate.version_id);
+            let response = execute_peer_request(
+                &state,
+                &candidate.node,
+                reqwest::Method::POST,
+                &path_and_query,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
 
             match response {
-                Ok(resp) if resp.status().is_success() => {
+                Ok(resp) if (200..300).contains(&resp.status) => {
                     successful_deletions += 1;
                     reclaimed_bytes = reclaimed_bytes.saturating_add(candidate.size_bytes);
 

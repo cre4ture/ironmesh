@@ -31,7 +31,7 @@ use axum::body::to_bytes;
 use axum::extract::{Json, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
@@ -4351,6 +4351,207 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
         plan.candidate.as_ref().map(|candidate| candidate.kind),
         Some(transport_sdk::CandidateKind::Relay)
     );
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.relay_mode = super::RelayMode::Required;
+
+    let remote_node = {
+        let mut cluster = state.cluster.lock().await;
+        if let Some(node) = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id != state.node_id)
+        {
+            node
+        } else {
+            let node = cluster::NodeDescriptor {
+                node_id: NodeId::new_v4(),
+                public_url: "https://relay-cleanup-remote.example".to_string(),
+                internal_url: "https://relay-cleanup-remote-internal.example".to_string(),
+                labels: HashMap::new(),
+                capacity_bytes: 1_000_000,
+                free_bytes: 800_000,
+                last_heartbeat_unix: 0,
+                status: cluster::NodeStatus::Online,
+            };
+            cluster.register_node(node.clone());
+            node
+        }
+    };
+
+    let relay_bind_addr = free_bind_addr();
+    let relay_base_url = format!("http://{relay_bind_addr}");
+    state.rendezvous_urls = vec![relay_base_url.clone()];
+
+    let rendezvous_client = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![relay_base_url.clone()],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("rendezvous client should build");
+    *state.outbound_clients.write().await = super::OutboundClients {
+        internal_http: reqwest::Client::new(),
+        rendezvous_control: Some(rendezvous_client),
+    };
+
+    let observed_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+    let relay_paths = observed_paths.clone();
+    let expected_target = transport_sdk::PeerIdentity::Node(remote_node.node_id);
+    let relay_app = Router::new()
+        .route("/health", get(|| async { StatusCode::OK }))
+        .route(
+            "/control/relay/ticket",
+            post({
+                let relay_base_url = relay_base_url.clone();
+                let expected_target = expected_target.clone();
+                move |Json(request): Json<transport_sdk::RelayTicketRequest>| {
+                    let relay_base_url = relay_base_url.clone();
+                    let expected_target = expected_target.clone();
+                    async move {
+                        assert_eq!(request.target, expected_target);
+                        Json(transport_sdk::RelayTicket {
+                            cluster_id: request.cluster_id,
+                            session_id: "cleanup-relay-session".to_string(),
+                            source: request.source,
+                            target: request.target,
+                            relay_urls: vec![relay_base_url],
+                            issued_at_unix: 1,
+                            expires_at_unix: 301,
+                        })
+                    }
+                }
+            }),
+        )
+        .route(
+            "/relay/http/request",
+            post(
+                move |Json(request): Json<transport_sdk::RelayHttpRequest>| {
+                    let relay_paths = relay_paths.clone();
+                    async move {
+                        relay_paths
+                            .lock()
+                            .await
+                            .push(request.path_and_query.clone());
+                        Json(transport_sdk::RelayHttpResponse {
+                            cluster_id: request.ticket.cluster_id,
+                            session_id: request.ticket.session_id.clone(),
+                            request_id: request.request_id,
+                            responder: request.ticket.target,
+                            status: StatusCode::OK.as_u16(),
+                            headers: Vec::new(),
+                            body_base64: None,
+                        })
+                    }
+                },
+            ),
+        );
+    let relay_listener = tokio::net::TcpListener::bind(relay_bind_addr)
+        .await
+        .expect("relay stub listener should bind");
+    let relay_handle = tokio::spawn(async move {
+        axum::serve(relay_listener, relay_app)
+            .await
+            .expect("relay stub should serve");
+    });
+
+    wait_for_condition("relay stub health", Duration::from_secs(5), || {
+        let relay_base_url = relay_base_url.clone();
+        async move {
+            match reqwest::get(format!("{relay_base_url}/health")).await {
+                Ok(response) => response.status() == StatusCode::OK,
+                Err(_) => false,
+            }
+        }
+    })
+    .await;
+
+    let key = "relay-cleanup-subject";
+    let version_id = {
+        let cluster = state.cluster.lock().await;
+        (0..256)
+            .map(|attempt| format!("relay-cleanup-version-{attempt}"))
+            .find(|version_id| {
+                cluster
+                    .placement_for_key(&format!("{key}@{version_id}"))
+                    .selected_nodes
+                    .first()
+                    == Some(&state.node_id)
+            })
+            .expect("expected a version subject placed on the local node")
+    };
+
+    {
+        let mut store = state.store.lock().await;
+        store
+            .put_object_versioned(
+                key,
+                Bytes::from_static(b"relay-cleanup-payload"),
+                PutOptions {
+                    parent_version_ids: Vec::new(),
+                    state: VersionConsistencyState::Confirmed,
+                    inherit_preferred_parent: true,
+                    create_snapshot: true,
+                    explicit_version_id: Some(version_id.clone()),
+                },
+            )
+            .await
+            .expect("test object should store");
+    }
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        cluster.note_replica(key, state.node_id);
+        cluster.note_replica(format!("{key}@{version_id}"), state.node_id);
+        cluster.note_replica(key, remote_node.node_id);
+        cluster.note_replica(format!("{key}@{version_id}"), remote_node.node_id);
+    }
+
+    let response = super::execute_replication_cleanup(
+        State(state.clone()),
+        Query(super::ReplicationCleanupQuery {
+            dry_run: Some(false),
+            max_deletions: Some(1),
+            retained_overhead_bytes: Some(0),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("cleanup response body should read");
+    let report: serde_json::Value =
+        serde_json::from_slice(&body).expect("cleanup response should decode");
+    assert_eq!(report["successful_deletions"].as_u64(), Some(1));
+    assert_eq!(report["failed_deletions"].as_u64(), Some(0));
+
+    let observed_paths = observed_paths.lock().await.clone();
+    assert_eq!(observed_paths.len(), 1);
+    assert_eq!(
+        observed_paths[0],
+        super::build_replication_drop_path(key, &version_id)
+    );
+
+    let replicas = {
+        let cluster = state.cluster.lock().await;
+        cluster.export_replicas_by_key()
+    };
+    assert_eq!(
+        replicas.get(&format!("{key}@{version_id}")),
+        Some(&vec![state.node_id])
+    );
+
+    relay_handle.abort();
+    let _ = relay_handle.await;
     cleanup_test_state(&state).await;
 }
 
