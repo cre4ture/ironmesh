@@ -140,6 +140,15 @@ struct OutboundClients {
 }
 
 #[derive(Clone)]
+struct LiveTrustMaterial {
+    public_ca_pem: Option<String>,
+    public_ca_key_pem: Option<String>,
+    cluster_ca_pem: Option<String>,
+    internal_ca_key_pem: Option<String>,
+    rendezvous_ca_pem: Option<String>,
+}
+
+#[derive(Clone)]
 struct InternalTlsRuntime {
     config: RustlsConfig,
     ca_cert_path: PathBuf,
@@ -1082,7 +1091,70 @@ async fn current_rendezvous_control(state: &ServerState) -> Option<RendezvousCon
         .clone()
 }
 
+fn current_bootstrap_trust_roots(state: &ServerState) -> Result<BootstrapTrustRoots> {
+    if let Some(path) = state.node_enrollment_path.as_ref() {
+        return Ok(NodeEnrollmentPackage::from_path(path)?
+            .bootstrap
+            .trust_roots);
+    }
+
+    Ok(BootstrapTrustRoots {
+        cluster_ca_pem: state.cluster_ca_pem.clone(),
+        public_api_ca_pem: state.public_ca_pem.clone(),
+        rendezvous_ca_pem: state
+            .rendezvous_ca_pem
+            .clone()
+            .or_else(|| state.public_ca_pem.clone())
+            .or_else(|| state.cluster_ca_pem.clone()),
+    })
+}
+
+fn load_live_trust_material(state: &ServerState) -> Result<LiveTrustMaterial> {
+    let bootstrap_trust_roots = current_bootstrap_trust_roots(state)?;
+    let cluster_ca_pem = state
+        .internal_tls_runtime
+        .as_ref()
+        .map(|tls| {
+            std::fs::read_to_string(&tls.ca_cert_path).with_context(|| {
+                format!(
+                    "failed reading cluster CA certificate {}",
+                    tls.ca_cert_path.display()
+                )
+            })
+        })
+        .transpose()?
+        .or(bootstrap_trust_roots.cluster_ca_pem.clone())
+        .or(state.cluster_ca_pem.clone());
+    let public_ca_pem = bootstrap_trust_roots
+        .public_api_ca_pem
+        .clone()
+        .or(state.public_ca_pem.clone());
+    let internal_ca_key_pem = state.internal_ca_key_pem.clone();
+    let public_ca_key_pem = state.public_ca_key_pem.clone().or_else(|| {
+        if public_ca_pem.is_none() || public_ca_pem == cluster_ca_pem {
+            internal_ca_key_pem.clone()
+        } else {
+            None
+        }
+    });
+    let rendezvous_ca_pem = bootstrap_trust_roots
+        .rendezvous_ca_pem
+        .clone()
+        .or(state.rendezvous_ca_pem.clone())
+        .or_else(|| public_ca_pem.clone())
+        .or_else(|| cluster_ca_pem.clone());
+
+    Ok(LiveTrustMaterial {
+        public_ca_pem,
+        public_ca_key_pem,
+        cluster_ca_pem,
+        internal_ca_key_pem,
+        rendezvous_ca_pem,
+    })
+}
+
 fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
+    let trust_material = load_live_trust_material(state)?;
     let internal_http = if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
         build_internal_mtls_http_client(
             &internal_tls.ca_cert_path,
@@ -1105,11 +1177,11 @@ fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
                 rendezvous_urls: state.rendezvous_urls.clone(),
                 heartbeat_interval_secs: state.peer_heartbeat_config.interval_secs.max(5),
             },
-            state
+            trust_material
                 .rendezvous_ca_pem
                 .as_deref()
-                .or(state.public_ca_pem.as_deref())
-                .or(state.cluster_ca_pem.as_deref()),
+                .or(trust_material.public_ca_pem.as_deref())
+                .or(trust_material.cluster_ca_pem.as_deref()),
             rendezvous_client_identity_pem.as_deref(),
         )?)
     } else {
@@ -5447,16 +5519,21 @@ async fn issue_pairing_token(
     (StatusCode::CREATED, Json(response)).into_response()
 }
 
-fn bootstrap_trust_roots(state: &ServerState) -> BootstrapTrustRoots {
-    BootstrapTrustRoots {
-        cluster_ca_pem: state.cluster_ca_pem.clone(),
-        public_api_ca_pem: state.public_ca_pem.clone(),
-        rendezvous_ca_pem: state
+fn bootstrap_trust_roots(
+    state: &ServerState,
+) -> std::result::Result<BootstrapTrustRoots, StatusCode> {
+    let trust_material =
+        load_live_trust_material(state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cluster_ca_pem = trust_material.cluster_ca_pem.clone();
+    let public_api_ca_pem = trust_material.public_ca_pem.clone();
+    Ok(BootstrapTrustRoots {
+        cluster_ca_pem: cluster_ca_pem.clone(),
+        public_api_ca_pem: public_api_ca_pem.clone(),
+        rendezvous_ca_pem: trust_material
             .rendezvous_ca_pem
-            .clone()
-            .or_else(|| state.public_ca_pem.clone())
-            .or_else(|| state.cluster_ca_pem.clone()),
-    }
+            .or(public_api_ca_pem)
+            .or(cluster_ca_pem),
+    })
 }
 
 fn bootstrap_rendezvous_urls(state: &ServerState) -> std::result::Result<Vec<String>, StatusCode> {
@@ -5557,7 +5634,7 @@ fn build_issued_node_bootstrap(
             public_peer_api_enabled,
         ),
         relay_mode: state.relay_mode,
-        trust_roots: bootstrap_trust_roots(state),
+        trust_roots: bootstrap_trust_roots(state)?,
         upstream_public_url: request.upstream_public_url,
         enrollment_issuer_url,
     };
@@ -5648,13 +5725,17 @@ fn issue_internal_node_tls_material(
     if bootstrap.internal_tls.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let ca_cert_pem = state
+    let trust_material =
+        load_live_trust_material(state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let ca_cert_pem = trust_material
         .cluster_ca_pem
         .as_deref()
+        .or(state.cluster_ca_pem.as_deref())
         .ok_or(StatusCode::PRECONDITION_FAILED)?;
-    let ca_key_pem = state
+    let ca_key_pem = trust_material
         .internal_ca_key_pem
         .as_deref()
+        .or(state.internal_ca_key_pem.as_deref())
         .ok_or(StatusCode::PRECONDITION_FAILED)?;
 
     let issuer_key =
@@ -5704,14 +5785,20 @@ fn issue_public_node_tls_material(
     if bootstrap.public_tls.is_none() {
         return Ok(None);
     }
-    let ca_cert_pem = state
+    let trust_material =
+        load_live_trust_material(state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let ca_cert_pem = trust_material
         .public_ca_pem
         .as_deref()
+        .or(trust_material.cluster_ca_pem.as_deref())
+        .or(state.public_ca_pem.as_deref())
         .or(state.cluster_ca_pem.as_deref())
         .ok_or(StatusCode::PRECONDITION_FAILED)?;
-    let ca_key_pem = state
+    let ca_key_pem = trust_material
         .public_ca_key_pem
         .as_deref()
+        .or(trust_material.internal_ca_key_pem.as_deref())
+        .or(state.public_ca_key_pem.as_deref())
         .or(state.internal_ca_key_pem.as_deref())
         .ok_or(StatusCode::PRECONDITION_FAILED)?;
 
@@ -5827,7 +5914,10 @@ async fn issue_bootstrap_bundle(
             })
             .collect(),
         relay_mode: state.relay_mode,
-        trust_roots: bootstrap_trust_roots(&state),
+        trust_roots: match bootstrap_trust_roots(&state) {
+            Ok(trust_roots) => trust_roots,
+            Err(status) => return status.into_response(),
+        },
         pairing_token: Some(pairing_response.pairing_token),
         device_label: pairing_response.label,
         device_id: None,

@@ -349,6 +349,81 @@ fn spawn_mtls_client_fingerprint_capture_server(
     })
 }
 
+fn generate_test_https_ca_and_server_material(
+    bind_addr: SocketAddr,
+    label: &str,
+) -> (String, String, String, String) {
+    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name = rcgen::DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("ironmesh-{label}-ca"));
+    let ca_key_pair = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key_pair).unwrap();
+    let ca_cert_pem = ca_cert.pem();
+    let ca_key_pem = ca_key_pair.serialize_pem();
+
+    let issuer_key = rcgen::KeyPair::from_pem(&ca_key_pem).unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert_pem, issuer_key).unwrap();
+    let mut server_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    server_params.distinguished_name = rcgen::DistinguishedName::new();
+    server_params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        format!("ironmesh-{label}-server"),
+    );
+    server_params.is_ca = rcgen::IsCa::NoCa;
+    server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    server_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(bind_addr.ip()));
+    let server_key_pair = rcgen::KeyPair::generate().unwrap();
+    let server_cert = server_params.signed_by(&server_key_pair, &issuer).unwrap();
+
+    (
+        ca_cert_pem,
+        ca_key_pem,
+        server_cert.pem(),
+        server_key_pair.serialize_pem(),
+    )
+}
+
+async fn https_presence_register(
+    Json(registration): Json<transport_sdk::PresenceRegistration>,
+) -> Json<transport_sdk::RegisterPresenceResponse> {
+    let updated_at_unix = super::unix_ts();
+    Json(transport_sdk::RegisterPresenceResponse {
+        accepted: true,
+        updated_at_unix,
+        entry: transport_sdk::PresenceEntry {
+            registration,
+            updated_at_unix,
+        },
+    })
+}
+
+fn spawn_https_rendezvous_server(
+    bind_addr: SocketAddr,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> tokio::task::JoinHandle<()> {
+    let cert_path = cert_path.to_path_buf();
+    let key_path = key_path.to_path_buf();
+    tokio::spawn(async move {
+        let app = Router::new().route(
+            "/control/presence/register",
+            axum::routing::post(https_presence_register),
+        );
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .unwrap();
+        axum_server::bind_rustls(bind_addr, tls)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    })
+}
+
 #[test]
 fn token_matches_requires_exact_match() {
     assert!(!token_matches("secret", None));
@@ -1989,6 +2064,164 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     let _ = capture_handle.await;
     issuer_handle.abort();
     let _ = issuer_handle.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
+    let root = fresh_test_dir("rendezvous-trust-root-rotation");
+    let bind_addr = free_bind_addr();
+    let package_path = root.join("node-enrollment.json");
+    let rendezvous_dir = root.join("rendezvous");
+    std::fs::create_dir_all(&rendezvous_dir).unwrap();
+
+    let (ca1_pem, _, cert1_pem, key1_pem) =
+        generate_test_https_ca_and_server_material(bind_addr, "rendezvous-a");
+    let ca1_path = rendezvous_dir.join("ca1.pem");
+    let cert1_path = rendezvous_dir.join("cert1.pem");
+    let key1_path = rendezvous_dir.join("key1.pem");
+    std::fs::write(&ca1_path, &ca1_pem).unwrap();
+    std::fs::write(&cert1_path, &cert1_pem).unwrap();
+    std::fs::write(&key1_path, &key1_pem).unwrap();
+
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let rendezvous_url = format!("https://{bind_addr}");
+    state.rendezvous_urls = vec![rendezvous_url.clone()];
+    state.rendezvous_registration_enabled = true;
+
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap: transport_sdk::NodeBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id: state.cluster_id,
+            node_id: state.node_id,
+            mode: transport_sdk::NodeBootstrapMode::LocalEdge,
+            data_dir: root.join("node").to_string_lossy().into_owned(),
+            bind_addr: free_bind_addr().to_string(),
+            public_url: None,
+            labels: HashMap::new(),
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_peer_api_enabled: false,
+            internal_bind_addr: None,
+            internal_url: None,
+            internal_tls: None,
+            rendezvous_urls: vec![rendezvous_url.clone()],
+            rendezvous_mtls_required: false,
+            direct_endpoints: Vec::new(),
+            relay_mode: transport_sdk::RelayMode::Fallback,
+            trust_roots: transport_sdk::BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: Some(ca1_pem.clone()),
+            },
+            upstream_public_url: None,
+            enrollment_issuer_url: None,
+        },
+        public_tls_material: None,
+        internal_tls_material: None,
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+    state.node_enrollment_path = Some(package_path.clone());
+
+    let mut rendezvous_handle = spawn_https_rendezvous_server(bind_addr, &cert1_path, &key1_path);
+    wait_for_condition(
+        "first rendezvous server ready",
+        Duration::from_secs(5),
+        || {
+            let ca1_path = ca1_path.clone();
+            async move {
+                tokio::spawn(async move {
+                    observe_peer_certificate_fingerprint(bind_addr, &ca1_path, None).await
+                })
+                .await
+                .is_ok()
+            }
+        },
+    )
+    .await;
+
+    super::reload_live_outbound_clients(&state).await.unwrap();
+    let registration = transport_sdk::PresenceRegistration {
+        cluster_id: state.cluster_id,
+        identity: transport_sdk::PeerIdentity::Node(state.node_id),
+        public_api_url: None,
+        peer_api_url: None,
+        direct_candidates: Vec::new(),
+        labels: HashMap::new(),
+        capacity_bytes: None,
+        free_bytes: None,
+        capabilities: vec![transport_sdk::TransportCapability::RelayTunnel],
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        connected_at_unix: super::unix_ts(),
+    };
+    let old_client = super::current_rendezvous_control(&state).await.unwrap();
+    old_client.register_presence(&registration).await.unwrap();
+    assert_eq!(
+        super::bootstrap_trust_roots(&state)
+            .unwrap()
+            .rendezvous_ca_pem,
+        Some(ca1_pem.clone())
+    );
+
+    rendezvous_handle.abort();
+    let _ = rendezvous_handle.await;
+
+    let (ca2_pem, _, cert2_pem, key2_pem) =
+        generate_test_https_ca_and_server_material(bind_addr, "rendezvous-b");
+    let ca2_path = rendezvous_dir.join("ca2.pem");
+    let cert2_path = rendezvous_dir.join("cert2.pem");
+    let key2_path = rendezvous_dir.join("key2.pem");
+    std::fs::write(&ca2_path, &ca2_pem).unwrap();
+    std::fs::write(&cert2_path, &cert2_pem).unwrap();
+    std::fs::write(&key2_path, &key2_pem).unwrap();
+
+    let mut package = transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap();
+    package.bootstrap.trust_roots.rendezvous_ca_pem = Some(ca2_pem.clone());
+    package.write_to_path(&package_path).unwrap();
+
+    rendezvous_handle = spawn_https_rendezvous_server(bind_addr, &cert2_path, &key2_path);
+    wait_for_condition(
+        "second rendezvous server ready",
+        Duration::from_secs(5),
+        || {
+            let ca2_path = ca2_path.clone();
+            async move {
+                tokio::spawn(async move {
+                    observe_peer_certificate_fingerprint(bind_addr, &ca2_path, None).await
+                })
+                .await
+                .is_ok()
+            }
+        },
+    )
+    .await;
+
+    let stale_client = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![rendezvous_url.clone()],
+            heartbeat_interval_secs: 5,
+        },
+        Some(&ca1_pem),
+        None,
+    )
+    .unwrap();
+    assert!(stale_client.register_presence(&registration).await.is_err());
+
+    super::reload_live_outbound_clients(&state).await.unwrap();
+    let new_client = super::current_rendezvous_control(&state).await.unwrap();
+    new_client.register_presence(&registration).await.unwrap();
+    assert_eq!(
+        super::bootstrap_trust_roots(&state)
+            .unwrap()
+            .rendezvous_ca_pem,
+        Some(ca2_pem)
+    );
+
+    cleanup_test_state(&state).await;
+    rendezvous_handle.abort();
+    let _ = rendezvous_handle.await;
     let _ = std::fs::remove_dir_all(&root);
 }
 
