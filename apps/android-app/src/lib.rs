@@ -304,7 +304,6 @@ fn start_embedded_web_ui(
     let connection_input = normalized_connection_input_string(connection_input)?;
     let server_ca_pem = normalize_optional_string(server_ca_pem);
     let client_identity_json = normalize_optional_string(client_identity_json);
-    let client_identity = parse_client_identity_json(client_identity_json.clone())?;
     let mut state = web_ui_server_state()
         .lock()
         .map_err(|_| anyhow::anyhow!("web ui state lock poisoned"))?;
@@ -329,21 +328,13 @@ fn start_embedded_web_ui(
         .local_addr()
         .context("failed to read embedded web ui listener address")?;
     let local_url = format!("http://127.0.0.1:{}/", address.port());
-    let resolved_target =
-        resolve_direct_connection_target(&connection_input, server_ca_pem.clone()).context(
-            "embedded web ui currently requires a connection input that can resolve a direct public API endpoint",
-        )?;
-    let mut web_ui_config = web_ui_backend::WebUiConfig::new(resolved_target.server_base_url)
-        .with_service_name("ironmesh-android");
-    if let Some(resolved_server_ca_pem) = resolved_target.server_ca_pem {
-        web_ui_config = web_ui_config.with_server_ca_pem(resolved_server_ca_pem);
-    }
-    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-        web_ui_config = web_ui_config.with_server_ca_pem(server_ca_pem.clone());
-    }
-    if let Some(client_identity) = client_identity {
-        web_ui_config = web_ui_config.with_client_identity(client_identity);
-    }
+    let client = configured_sdk(
+        connection_input.clone(),
+        server_ca_pem.clone(),
+        client_identity_json.clone(),
+    )?;
+    let web_ui_config =
+        web_ui_backend::WebUiConfig::from_client(client).with_service_name("ironmesh-android");
     let app = web_ui_backend::router(web_ui_config);
 
     let task = rt.spawn(async move {

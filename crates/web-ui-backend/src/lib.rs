@@ -7,13 +7,11 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use client_sdk::{
-    ClientIdentityMaterial, ClientNode, UploadMode, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem, build_reqwest_client_from_pem,
-    build_signed_request_headers,
+    ClientIdentityMaterial, ClientNode, IronMeshClient, UploadMode, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem,
 };
-use reqwest::{Client, Method, RequestBuilder, Url};
+use reqwest::Url;
 use serde::Deserialize;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod assets {
     pub fn app_html() -> String {
@@ -33,12 +31,13 @@ pub mod assets {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebUiConfig {
     pub server_url: String,
     pub service_name: String,
     pub server_ca_pem: Option<String>,
     pub client_identity: Option<ClientIdentityMaterial>,
+    pub transport_client: Option<IronMeshClient>,
 }
 
 impl WebUiConfig {
@@ -48,6 +47,17 @@ impl WebUiConfig {
             service_name: "ironmesh-web".to_string(),
             server_ca_pem: None,
             client_identity: None,
+            transport_client: None,
+        }
+    }
+
+    pub fn from_client(client: IronMeshClient) -> Self {
+        Self {
+            server_url: String::new(),
+            service_name: "ironmesh-web".to_string(),
+            server_ca_pem: None,
+            client_identity: None,
+            transport_client: Some(client),
         }
     }
 
@@ -65,44 +75,50 @@ impl WebUiConfig {
         self.client_identity = Some(client_identity);
         self
     }
+
+    pub fn with_transport_client(mut self, client: IronMeshClient) -> Self {
+        self.transport_client = Some(client);
+        self
+    }
 }
 
 #[derive(Clone)]
 struct WebState {
-    server_url: Url,
     service_name: String,
-    http: Client,
+    sdk: IronMeshClient,
     client: ClientNode,
-    client_identity: Option<ClientIdentityMaterial>,
 }
 
 pub fn router(config: WebUiConfig) -> Router {
-    let server_url = Url::parse(config.server_url.trim_end_matches('/'))
-        .unwrap_or_else(|error| panic!("invalid web ui server url {}: {error}", config.server_url));
-    let http = build_reqwest_client_from_pem(config.server_ca_pem.as_deref())
-        .unwrap_or_else(|error| panic!("failed building web ui http client: {error:#}"));
-    let client = match config.client_identity.as_ref() {
-        Some(identity) => ClientNode::with_client(
-            build_http_client_with_identity_from_pem(
-                config.server_ca_pem.as_deref(),
-                server_url.as_str(),
-                identity,
-            )
-            .unwrap_or_else(|error| {
-                panic!("failed building web ui authenticated client: {error:#}")
-            }),
-        ),
-        None => ClientNode::with_client(
-            build_http_client_from_pem(config.server_ca_pem.as_deref(), server_url.as_str(), &None)
+    let sdk = match config.transport_client {
+        Some(client) => client,
+        None => {
+            let server_url =
+                Url::parse(config.server_url.trim_end_matches('/')).unwrap_or_else(|error| {
+                    panic!("invalid web ui server url {}: {error}", config.server_url)
+                });
+            match config.client_identity.as_ref() {
+                Some(identity) => build_http_client_with_identity_from_pem(
+                    config.server_ca_pem.as_deref(),
+                    server_url.as_str(),
+                    identity,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("failed building web ui authenticated client: {error:#}")
+                }),
+                None => build_http_client_from_pem(
+                    config.server_ca_pem.as_deref(),
+                    server_url.as_str(),
+                    &None,
+                )
                 .unwrap_or_else(|error| panic!("failed building web ui client: {error:#}")),
-        ),
+            }
+        }
     };
     let state = WebState {
-        server_url,
         service_name: config.service_name,
-        http,
-        client,
-        client_identity: config.client_identity,
+        sdk: sdk.clone(),
+        client: ClientNode::with_client(sdk),
     };
 
     Router::new()
@@ -171,66 +187,38 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> axum::respo
 }
 
 async fn fetch_server_json(state: &WebState, path: &str) -> Result<serde_json::Value> {
-    let url = build_joined_url(&state.server_url, path)?;
-    let value = send_request(state, Method::GET, url)
-        .await?
-        .error_for_status()
-        .context("server returned error status")?
-        .json::<serde_json::Value>()
-        .await
-        .context("failed to decode server response")?;
-    Ok(value)
+    state.sdk.get_json_path(path).await
 }
 
-async fn send_request(state: &WebState, method: Method, url: Url) -> Result<reqwest::Response> {
-    let request = apply_optional_request_auth(
-        state.http.request(method.clone(), url.clone()),
-        method,
-        &url,
-        state.client_identity.as_ref(),
-    )?;
-    request.send().await.context("failed to contact server")
-}
-
-fn build_server_object_url(server_url: &Url, key: &str) -> Result<Url> {
-    let mut url = server_url.clone();
-
-    let mut segments = url
-        .path_segments_mut()
-        .map_err(|_| anyhow!("server URL cannot be a base"))?;
-    segments.push("store");
-    segments.push(key);
-    drop(segments);
-
-    Ok(url)
-}
-
-fn build_server_versions_url(server_url: &Url, key: &str) -> Result<Url> {
-    let mut url = server_url.clone();
-
-    let mut segments = url
-        .path_segments_mut()
-        .map_err(|_| anyhow!("server URL cannot be a base"))?;
-    segments.push("versions");
-    segments.push(key);
-    drop(segments);
-
-    Ok(url)
-}
-
-fn build_server_store_delete_url(server_url: &Url, key: &str) -> Result<Url> {
-    let mut url = server_url.clone();
-
+fn build_relative_path(segments: &[&str], query: &[(&str, &str)]) -> Result<String> {
+    let mut url = Url::parse("https://web-ui.invalid/")
+        .context("failed to create placeholder URL for relative path building")?;
     {
-        let mut segments = url
+        let mut path_segments = url
             .path_segments_mut()
-            .map_err(|_| anyhow!("server URL cannot be a base"))?;
-        segments.push("store");
-        segments.push("delete");
+            .map_err(|_| anyhow!("placeholder URL cannot be a base"))?;
+        path_segments.clear();
+        for segment in segments {
+            path_segments.push(segment);
+        }
     }
-    url.query_pairs_mut().append_pair("key", key);
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
 
-    Ok(url)
+    let mut path = url.path().to_string();
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    Ok(path)
+}
+
+fn build_versions_request_path(key: &str) -> Result<String> {
+    build_relative_path(&["versions", key], &[])
 }
 
 fn content_type_for(path: &str) -> &'static str {
@@ -243,46 +231,6 @@ fn content_type_for(path: &str) -> &'static str {
     } else {
         "text/html; charset=utf-8"
     }
-}
-
-fn build_joined_url(base_url: &Url, path: &str) -> Result<Url> {
-    base_url
-        .join(path.trim_start_matches('/'))
-        .with_context(|| format!("failed to build endpoint URL from {base_url} and {path}"))
-}
-
-fn apply_optional_request_auth(
-    request: RequestBuilder,
-    method: Method,
-    url: &Url,
-    client_identity: Option<&ClientIdentityMaterial>,
-) -> Result<RequestBuilder> {
-    let Some(client_identity) = client_identity else {
-        return Ok(request);
-    };
-
-    let signed_headers = build_signed_request_headers(
-        client_identity,
-        method.as_str(),
-        &url_path_and_query(url),
-        unix_ts(),
-        None,
-    )?;
-    Ok(signed_headers.apply_to_reqwest(request))
-}
-
-fn url_path_and_query(url: &Url) -> String {
-    match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    }
-}
-
-fn unix_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 async fn web_static_index() -> Response {
@@ -353,19 +301,13 @@ async fn web_versions(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
-    let versions_url = match build_server_versions_url(&state.server_url, &query.key) {
-        Ok(url) => url,
+    let versions_path = match build_versions_request_path(&query.key) {
+        Ok(path) => path,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
     };
 
-    match send_request(&state, Method::GET, versions_url).await {
-        Ok(response) => match response.error_for_status() {
-            Ok(ok) => match ok.json::<serde_json::Value>().await {
-                Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-                Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-            },
-            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-        },
+    match state.sdk.get_json_path(&versions_path).await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -395,31 +337,16 @@ async fn web_store_list(
     State(state): State<WebState>,
     Query(query): Query<WebStoreListQuery>,
 ) -> impl IntoResponse {
-    let list_url = match build_joined_url(&state.server_url, "/store/index") {
-        Ok(mut url) => {
-            {
-                let mut pairs = url.query_pairs_mut();
-                pairs.append_pair("depth", &query.depth.unwrap_or(1).max(1).to_string());
-                if let Some(prefix) = &query.prefix {
-                    pairs.append_pair("prefix", prefix);
-                }
-                if let Some(snapshot) = &query.snapshot {
-                    pairs.append_pair("snapshot", snapshot);
-                }
-            }
-            url
-        }
-        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
-    };
-
-    match send_request(&state, Method::GET, list_url).await {
-        Ok(response) => match response.error_for_status() {
-            Ok(ok) => match ok.json::<serde_json::Value>().await {
-                Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-                Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-            },
-            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-        },
+    match state
+        .sdk
+        .store_index(
+            query.prefix.as_deref(),
+            query.depth.unwrap_or(1).max(1),
+            query.snapshot.as_deref(),
+        )
+        .await
+    {
+        Ok(value) => (StatusCode::OK, Json(serde_json::json!(value))).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -491,65 +418,18 @@ async fn web_store_delete(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
-    let delete_url = match build_server_store_delete_url(&state.server_url, &query.key) {
-        Ok(url) => url,
-        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
-    };
-
-    let primary_result = send_request(&state, Method::POST, delete_url).await;
-    let fallback_to_legacy_delete = match primary_result {
-        Ok(response) if response.status().is_success() => false,
-        Ok(response)
-            if response.status() == StatusCode::METHOD_NOT_ALLOWED
-                || response.status() == StatusCode::NOT_FOUND =>
-        {
-            true
+    match state.client.delete_path(&query.key).await {
+        Ok(()) => {
+            let _ = state.client.remove_cached(&query.key).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "key": query.key,
+                    "deleted": true
+                })),
+            )
+                .into_response()
         }
-        Ok(response) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "delete endpoint rejected request: HTTP {} ({})",
-                    response.status(),
-                    response.url()
-                ),
-            );
-        }
-        Err(_) => true,
-    };
-
-    if !fallback_to_legacy_delete {
-        let _ = state.client.remove_cached(&query.key).await;
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "key": query.key,
-                "deleted": true
-            })),
-        )
-            .into_response();
-    }
-
-    let object_url = match build_server_object_url(&state.server_url, &query.key) {
-        Ok(url) => url,
-        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
-    };
-
-    match send_request(&state, Method::DELETE, object_url).await {
-        Ok(response) => match response.error_for_status() {
-            Ok(_) => {
-                let _ = state.client.remove_cached(&query.key).await;
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "key": query.key,
-                        "deleted": true
-                    })),
-                )
-                    .into_response()
-            }
-            Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-        },
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -598,38 +478,17 @@ async fn web_store_get_binary(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
-    let payload = if query.snapshot.is_none() && query.version.is_none() {
-        match state.client.get_cached_or_fetch(&query.key).await {
-            Ok(bytes) => bytes,
-            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-        }
-    } else {
-        let object_url = match build_server_object_url(&state.server_url, &query.key) {
-            Ok(mut url) => {
-                {
-                    let mut pairs = url.query_pairs_mut();
-                    if let Some(snapshot) = query.snapshot.as_deref() {
-                        pairs.append_pair("snapshot", snapshot);
-                    }
-                    if let Some(version) = query.version.as_deref() {
-                        pairs.append_pair("version", version);
-                    }
-                }
-                url
-            }
-            Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
-        };
-
-        match send_request(&state, Method::GET, object_url).await {
-            Ok(response) => match response.error_for_status() {
-                Ok(ok) => match ok.bytes().await {
-                    Ok(bytes) => bytes,
-                    Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-                },
-                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-            },
-            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
-        }
+    let payload = match state
+        .client
+        .get_with_selector(
+            &query.key,
+            query.snapshot.as_deref(),
+            query.version.as_deref(),
+        )
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     };
 
     let fallback_name = query

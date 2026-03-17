@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use client_sdk::{
@@ -6,7 +6,6 @@ use client_sdk::{
     build_http_client_from_pem, build_http_client_with_identity_from_pem,
     normalize_server_base_url,
 };
-use reqwest::Url;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use web_ui_backend::WebUiConfig;
@@ -59,13 +58,6 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8081")]
         bind: String,
     },
-}
-
-#[derive(Clone)]
-struct ResolvedCliTarget {
-    base_url: Url,
-    server_ca_pem: Option<String>,
-    client_identity: Option<ClientIdentityMaterial>,
 }
 
 #[tokio::main]
@@ -125,16 +117,10 @@ async fn main() -> Result<()> {
             print_json_endpoint(&client, "/cluster/replication/plan").await
         }
         Commands::ServeWeb { bind } => {
-            let target = resolve_direct_target(&cli)?;
+            let client = build_authenticated_sdk_from_cli(&cli)?;
             let bind_addr: SocketAddr = bind.parse()?;
-            let mut web_ui_config = WebUiConfig::new(target.base_url.as_str().to_string())
-                .with_service_name("cli-client-web");
-            if let Some(server_ca_pem) = target.server_ca_pem.as_ref() {
-                web_ui_config = web_ui_config.with_server_ca_pem(server_ca_pem.clone());
-            }
-            if let Some(client_identity) = target.client_identity.clone() {
-                web_ui_config = web_ui_config.with_client_identity(client_identity);
-            }
+            let web_ui_config =
+                WebUiConfig::from_client(client).with_service_name("cli-client-web");
             let app = web_ui_backend::router(web_ui_config);
 
             println!("web interface at http://{bind_addr}");
@@ -173,40 +159,6 @@ fn enroll_from_bootstrap(
     println!("server {}", enrolled.server_base_url);
     println!("identity {}", output_path.display());
     Ok(())
-}
-
-fn resolve_direct_target(cli: &Cli) -> Result<ResolvedCliTarget> {
-    if cli.bootstrap_file.is_some() && cli.server_url.is_some() {
-        bail!("use either --bootstrap-file or --server-url, not both");
-    }
-
-    let server_ca_override = read_server_ca_override_from_cli(cli)?;
-    let client_identity = read_client_identity_from_cli(cli)?;
-
-    if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
-        let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
-        let resolved = bootstrap.resolve_direct_http_target_blocking()?;
-        let base_url = Url::parse(&resolved.server_base_url)
-            .with_context(|| format!("invalid resolved server URL {}", resolved.server_base_url))?;
-        let server_ca_pem = server_ca_override
-            .or(resolved.server_ca_pem)
-            .or(resolved.cluster_ca_pem);
-        return Ok(ResolvedCliTarget {
-            base_url,
-            server_ca_pem,
-            client_identity,
-        });
-    }
-
-    let server_url = cli
-        .server_url
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("set either --bootstrap-file or --server-url"))?;
-    Ok(ResolvedCliTarget {
-        base_url: normalize_server_base_url(server_url)?,
-        server_ca_pem: server_ca_override,
-        client_identity,
-    })
 }
 
 fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
