@@ -71,14 +71,14 @@ impl ContentAddressedClientCache {
         Self::with_client(client, storage_path)
     }
 
-    pub fn new(
+    pub fn from_direct_base_url(
         server_base_url: impl Into<String>,
         storage_path: impl Into<PathBuf>,
     ) -> Result<Self> {
         Self::with_client(IronMeshClient::new(server_base_url), storage_path)
     }
 
-    pub fn with_http_client(
+    pub fn from_direct_http_client(
         server_base_url: impl Into<String>,
         storage_path: impl Into<PathBuf>,
         http: reqwest::Client,

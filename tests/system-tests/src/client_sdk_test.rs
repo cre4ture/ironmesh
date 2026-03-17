@@ -35,7 +35,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mut server = start_server(bind).await?;
 
-        let client = ClientNode::new(&base_url);
+        let client = ClientNode::from_direct_base_url(&base_url);
         let key = "sdk-roundtrip";
         let value = Bytes::from_static(b"hello-from-sdk");
 
@@ -53,7 +53,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mut server = start_server(bind).await?;
 
-        let client = ClientNode::new(&base_url);
+        let client = ClientNode::from_direct_base_url(&base_url);
         let key = "cache-key";
         let payload = Bytes::from_static(b"cached-value");
 
@@ -92,7 +92,7 @@ mod tests {
         let base_url = format!("http://{bind}");
         let mut server = start_server(bind).await?;
 
-        let client = ClientNode::new(&base_url);
+        let client = ClientNode::from_direct_base_url(&base_url);
         let http = reqwest::Client::new();
 
         let result = async {
@@ -493,7 +493,7 @@ mod tests {
         let cache_dir = fresh_data_dir("content-addressed-client-cache");
 
         let result = async {
-            let client = ContentAddressedClientCache::new(&base_url, &cache_dir)?;
+            let client = ContentAddressedClientCache::from_direct_base_url(&base_url, &cache_dir)?;
             let payload = Bytes::from(vec![b'Z'; CHUNK_UPLOAD_THRESHOLD_BYTES + 4096]);
 
             client.put("cached/a", payload.clone()).await?;
@@ -509,7 +509,8 @@ mod tests {
             client.rename_path("cached/b", "cached/c", false).await?;
             client.delete_path("cached/a").await?;
 
-            let persisted_client = ContentAddressedClientCache::new(&base_url, &cache_dir)?;
+            let persisted_client =
+                ContentAddressedClientCache::from_direct_base_url(&base_url, &cache_dir)?;
             let cached = persisted_client.get_cached_or_fetch("cached/c").await?;
             assert_eq!(cached, payload);
 

@@ -137,7 +137,7 @@ impl RemoteSnapshotFetcher {
         Ok(Self::new(client, scope))
     }
 
-    pub fn from_base_url(
+    pub fn from_direct_base_url(
         base_url: impl Into<String>,
         prefix: Option<String>,
         depth: usize,

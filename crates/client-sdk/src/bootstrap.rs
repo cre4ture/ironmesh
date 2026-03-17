@@ -481,10 +481,6 @@ impl ConnectionBootstrap {
         bail!("failed to resolve any bootstrap endpoint");
     }
 
-    pub fn resolve_blocking(&self) -> Result<ResolvedConnectionBootstrap> {
-        self.resolve_direct_http_target_blocking()
-    }
-
     pub fn enroll_blocking(
         &self,
         device_id_override: Option<&str>,
