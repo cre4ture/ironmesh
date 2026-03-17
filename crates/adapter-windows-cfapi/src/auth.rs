@@ -63,7 +63,7 @@ impl DeviceAuthRecord {
 }
 
 pub fn resolve_or_enroll_device_auth(
-    base_url: &Url,
+    base_url: Option<&Url>,
     sync_root_path: &Path,
     options: &DeviceEnrollmentOptions,
 ) -> Result<Option<DeviceAuthRecord>> {
@@ -85,6 +85,11 @@ pub fn resolve_or_enroll_device_auth(
         return Ok(None);
     };
 
+    let base_url = base_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "device enrollment requires a reachable direct public API endpoint in the connection bootstrap"
+        )
+    })?;
     let record = enroll_device(base_url, pairing_token, options)?;
     persist_device_auth(&auth_file, &record)?;
     Ok(Some(record))

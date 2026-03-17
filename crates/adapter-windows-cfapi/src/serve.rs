@@ -3,13 +3,10 @@
 use crate::adapter::WindowsCfapiAdapter;
 use crate::auth::{DeviceEnrollmentOptions, resolve_or_enroll_device_auth};
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
-use crate::live::{ServerNodeHydrator, normalize_base_url};
+use crate::live::ServerNodeHydrator;
 use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root};
 use clap::Parser;
-use client_sdk::{
-    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem,
-};
+use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,9 +60,9 @@ pub fn serve_main() -> anyhow::Result<()> {
         args.device_id.as_deref(),
         args.device_label.as_deref(),
     )?;
-    let base_url = normalize_base_url(connection.base_url.as_str())?;
+    eprintln!("using connection target {}", connection.connection_target);
     let device_auth = resolve_or_enroll_device_auth(
-        &base_url,
+        connection.enrollment_base_url.as_ref(),
         &registration.root_path,
         &DeviceEnrollmentOptions {
             cluster_id: connection.cluster_id,
@@ -80,22 +77,14 @@ pub fn serve_main() -> anyhow::Result<()> {
     if let Some(auth) = device_auth.as_ref() {
         eprintln!("using enrolled device auth for {}", auth.device_id);
     }
-    let client = match device_auth.as_ref() {
-        Some(auth) => build_http_client_with_identity_from_pem(
-            connection.server_ca_pem.as_deref(),
-            base_url.as_str(),
-            &auth.client_identity_material()?,
-        )?,
-        None => build_http_client_from_pem(
-            connection.server_ca_pem.as_deref(),
-            base_url.as_str(),
-            &None,
-        )?,
-    };
+    let client_identity = device_auth
+        .as_ref()
+        .map(|auth| auth.client_identity_material())
+        .transpose()?;
+    let client = connection.build_client(client_identity.as_ref())?;
     persist_connection_config(
         &connection.bootstrap_path,
-        connection.cluster_id,
-        &base_url,
+        &connection.bootstrap,
         connection.server_ca_pem.as_deref(),
         device_auth.as_ref().map(|auth| auth.device_id.as_str()),
         device_auth
@@ -106,7 +95,7 @@ pub fn serve_main() -> anyhow::Result<()> {
 
     let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
     let fetcher = RemoteSnapshotFetcher::new(
-        client,
+        client.clone(),
         RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
     );
     let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
@@ -116,20 +105,8 @@ pub fn serve_main() -> anyhow::Result<()> {
         RemoteSnapshotPoller::server_notifications(Duration::from_secs(25), refresh_interval);
 
     let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
-    let client_identity = device_auth
-        .as_ref()
-        .map(|auth| auth.client_identity_material())
-        .transpose()?;
-    let hydrator = Box::new(ServerNodeHydrator::new(
-        base_url.clone(),
-        client_identity.clone(),
-        connection.server_ca_pem.as_deref(),
-    )?);
-    let uploader = Arc::new(ServerNodeHydrator::new(
-        base_url,
-        client_identity,
-        connection.server_ca_pem.as_deref(),
-    )?);
+    let hydrator = Box::new(ServerNodeHydrator::with_client(client.clone()));
+    let uploader = Arc::new(ServerNodeHydrator::with_client(client.clone()));
     let _connection = connect_sync_root(&registration, runtime.clone(), hydrator, uploader)?;
 
     apply_action_plan(&registration.root_path, &action_plan)?;

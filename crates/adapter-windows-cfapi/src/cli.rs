@@ -1,10 +1,7 @@
 #![cfg(windows)]
 
 use clap::{Parser, Subcommand};
-use client_sdk::{
-    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem,
-};
+use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +11,7 @@ use std::time::Duration;
 use crate::adapter::WindowsCfapiAdapter;
 use crate::auth::{DeviceEnrollmentOptions, resolve_or_enroll_device_auth};
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
-use crate::live::{ServerNodeHydrator, normalize_base_url};
+use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root, register_sync_root,
@@ -99,14 +96,14 @@ pub fn cli_main() -> anyhow::Result<()> {
                 args.device_id.as_deref(),
                 args.device_label.as_deref(),
             )?;
-            let base_url = normalize_base_url(connection.base_url.as_str())?;
+            eprintln!("using connection target {}", connection.connection_target);
             let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
             let refresh_poller = RemoteSnapshotPoller::server_notifications(
                 Duration::from_secs(25),
                 refresh_interval,
             );
             let device_auth = resolve_or_enroll_device_auth(
-                &base_url,
+                connection.enrollment_base_url.as_ref(),
                 &registration.root_path,
                 &DeviceEnrollmentOptions {
                     cluster_id: connection.cluster_id,
@@ -121,22 +118,14 @@ pub fn cli_main() -> anyhow::Result<()> {
             if let Some(auth) = device_auth.as_ref() {
                 eprintln!("using enrolled device auth for {}", auth.device_id);
             }
-            let client = match device_auth.as_ref() {
-                Some(auth) => build_http_client_with_identity_from_pem(
-                    connection.server_ca_pem.as_deref(),
-                    base_url.as_str(),
-                    &auth.client_identity_material()?,
-                )?,
-                None => build_http_client_from_pem(
-                    connection.server_ca_pem.as_deref(),
-                    base_url.as_str(),
-                    &None,
-                )?,
-            };
+            let client_identity = device_auth
+                .as_ref()
+                .map(|auth| auth.client_identity_material())
+                .transpose()?;
+            let client = connection.build_client(client_identity.as_ref())?;
             persist_connection_config(
                 &connection.bootstrap_path,
-                connection.cluster_id,
-                &base_url,
+                &connection.bootstrap,
                 connection.server_ca_pem.as_deref(),
                 device_auth.as_ref().map(|auth| auth.device_id.as_str()),
                 device_auth
@@ -147,27 +136,15 @@ pub fn cli_main() -> anyhow::Result<()> {
 
             let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
             let fetcher = RemoteSnapshotFetcher::new(
-                client,
+                client.clone(),
                 RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
             );
             let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
             let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
 
             let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
-            let client_identity = device_auth
-                .as_ref()
-                .map(|auth| auth.client_identity_material())
-                .transpose()?;
-            let hydrator = Box::new(ServerNodeHydrator::new(
-                base_url.clone(),
-                client_identity.clone(),
-                connection.server_ca_pem.as_deref(),
-            )?);
-            let uploader = Arc::new(ServerNodeHydrator::new(
-                base_url,
-                client_identity,
-                connection.server_ca_pem.as_deref(),
-            )?);
+            let hydrator = Box::new(ServerNodeHydrator::with_client(client.clone()));
+            let uploader = Arc::new(ServerNodeHydrator::with_client(client.clone()));
             let _connection =
                 connect_sync_root(&registration, runtime.clone(), hydrator, uploader.clone())?;
 

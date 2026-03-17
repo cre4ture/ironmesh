@@ -397,9 +397,9 @@ impl ConnectionBootstrap {
                 .normalized_candidate_direct_endpoints()?
                 .into_iter()
                 .next()
-            {
-                return Ok(endpoint.url);
-            }
+        {
+            return Ok(endpoint.url);
+        }
 
         let relay_target = self
             .planned_targets()?

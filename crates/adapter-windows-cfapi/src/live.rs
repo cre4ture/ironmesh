@@ -12,6 +12,10 @@ pub struct ServerNodeHydrator {
 }
 
 impl ServerNodeHydrator {
+    pub fn with_client(sdk: IronMeshClient) -> Self {
+        Self { sdk }
+    }
+
     pub fn new(
         base_url: Url,
         client_identity: Option<ClientIdentityMaterial>,
@@ -25,7 +29,7 @@ impl ServerNodeHydrator {
             )?,
             None => build_http_client_from_pem(server_ca_pem, base_url.as_str(), &None)?,
         };
-        Ok(Self { sdk })
+        Ok(Self::with_client(sdk))
     }
 }
 
