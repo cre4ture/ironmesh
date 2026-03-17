@@ -9,9 +9,9 @@ pub mod request_auth;
 pub mod session;
 
 pub use bootstrap::{
-    BootstrapEndpoint, BootstrapEndpointUse, BootstrapServerTlsFiles, BootstrapTlsFiles,
-    BootstrapTrustRoots, CLIENT_BOOTSTRAP_VERSION, ClientBootstrap, NodeBootstrap,
-    NodeBootstrapMode, RelayMode,
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial, BootstrapServerTlsFiles,
+    BootstrapTlsFiles, BootstrapTrustRoots, CLIENT_BOOTSTRAP_VERSION, ClientBootstrap,
+    NodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage, RelayMode,
 };
 pub use candidates::{CandidateKind, ConnectionCandidate, rank_candidates};
 pub use http_connector::{HttpRouteKind, TransportHttpClientConfig, TransportHttpRequestTarget};

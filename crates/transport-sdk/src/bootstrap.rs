@@ -66,6 +66,13 @@ pub struct BootstrapServerTlsFiles {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapMutualTlsMaterial {
+    pub ca_cert_pem: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientBootstrap {
     pub version: u32,
     pub cluster_id: ClusterId,
@@ -120,6 +127,13 @@ pub struct NodeBootstrap {
     pub trust_roots: BootstrapTrustRoots,
     #[serde(default)]
     pub upstream_public_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeEnrollmentPackage {
+    pub bootstrap: NodeBootstrap,
+    #[serde(default)]
+    pub internal_tls_material: Option<BootstrapMutualTlsMaterial>,
 }
 
 impl ClientBootstrap {
@@ -223,6 +237,52 @@ impl NodeBootstrap {
         validate_endpoint_list(&self.direct_endpoints)?;
         validate_trust_roots(&self.trust_roots)?;
         Ok(())
+    }
+}
+
+impl NodeEnrollmentPackage {
+    pub fn from_json_str(raw: &str) -> Result<Self> {
+        let package =
+            serde_json::from_str::<Self>(raw).context("failed to parse node enrollment JSON")?;
+        package.validate()?;
+        Ok(package)
+    }
+
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read node enrollment {}", path.display()))?;
+        Self::from_json_str(&raw)
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).context("failed to serialize node enrollment JSON")
+    }
+
+    pub fn write_to_path(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        fs::write(path, self.to_json_pretty()?)
+            .with_context(|| format!("failed to write node enrollment {}", path.display()))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.bootstrap.validate()?;
+        match (
+            self.bootstrap.internal_tls.as_ref(),
+            self.internal_tls_material.as_ref(),
+        ) {
+            (Some(_), Some(material)) => validate_tls_material(material),
+            (Some(_), None) => bail!("node enrollment package must include internal_tls_material"),
+            (None, Some(_)) => {
+                bail!(
+                    "node enrollment package internal_tls_material requires bootstrap.internal_tls"
+                )
+            }
+            (None, None) => Ok(()),
+        }
     }
 }
 
@@ -348,6 +408,13 @@ fn validate_optional_server_tls_files(
     Ok(())
 }
 
+fn validate_tls_material(value: &BootstrapMutualTlsMaterial) -> Result<()> {
+    validate_required_non_empty("internal_tls_material.ca_cert_pem", &value.ca_cert_pem)?;
+    validate_required_non_empty("internal_tls_material.cert_pem", &value.cert_pem)?;
+    validate_required_non_empty("internal_tls_material.key_pem", &value.key_pem)?;
+    Ok(())
+}
+
 fn dedup_urls<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<Vec<Url>> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
@@ -454,5 +521,44 @@ mod tests {
         bootstrap
             .validate()
             .expect("node bootstrap should validate");
+    }
+
+    #[test]
+    fn node_enrollment_package_requires_internal_tls_material_for_cluster_bootstrap() {
+        let package = NodeEnrollmentPackage {
+            bootstrap: NodeBootstrap {
+                version: CLIENT_BOOTSTRAP_VERSION,
+                cluster_id: Uuid::now_v7(),
+                node_id: Uuid::now_v7(),
+                mode: NodeBootstrapMode::Cluster,
+                data_dir: "./data/node-a".to_string(),
+                bind_addr: "127.0.0.1:8080".to_string(),
+                public_url: Some("https://node-a.example".to_string()),
+                labels: HashMap::new(),
+                public_tls: None,
+                public_ca_cert_path: None,
+                public_peer_api_enabled: false,
+                internal_bind_addr: Some("127.0.0.1:18080".to_string()),
+                internal_url: Some("https://127.0.0.1:18080".to_string()),
+                internal_tls: Some(BootstrapTlsFiles {
+                    ca_cert_path: "tls/ca.pem".to_string(),
+                    cert_path: "tls/node.pem".to_string(),
+                    key_path: "tls/node.key".to_string(),
+                }),
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                direct_endpoints: Vec::new(),
+                relay_mode: RelayMode::Fallback,
+                trust_roots: BootstrapTrustRoots {
+                    cluster_ca_pem: Some("cluster-ca".to_string()),
+                    public_api_ca_pem: None,
+                    rendezvous_ca_pem: None,
+                },
+                upstream_public_url: None,
+            },
+            internal_tls_material: None,
+        };
+
+        assert!(package.validate().is_err());
     }
 }

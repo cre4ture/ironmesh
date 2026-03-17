@@ -127,6 +127,40 @@ async function issueNodeBootstrap() {
     return;
   }
 
+  const body = buildNodeBootstrapRequest();
+  output.textContent = 'issuing node bootstrap...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/node-bootstraps/issue', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+        'x-ironmesh-admin-token': adminToken
+      },
+      body: JSON.stringify(body)
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeNodeBootstrap(payload);
+  } catch (error) {
+    output.textContent = 'failed to issue node bootstrap: ' + error;
+    notes.textContent = '';
+  }
+}
+
+function buildNodeBootstrapRequest() {
   const mode = document.getElementById('node-bootstrap-mode').value;
   const bindAddr = document.getElementById('node-bootstrap-bind-addr').value.trim();
   const publicTlsCert = document.getElementById('node-bootstrap-public-tls-cert').value.trim();
@@ -162,17 +196,30 @@ async function issueNodeBootstrap() {
     };
   }
 
-  output.textContent = 'issuing node bootstrap...';
+  return body;
+}
+
+async function issueNodeEnrollment() {
+  const output = document.getElementById('node-enrollment-json');
+  const notes = document.getElementById('node-enrollment-notes');
+  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
+  if (!adminToken) {
+    output.textContent = 'admin token is required';
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'issuing node enrollment package...';
   notes.textContent = '';
   try {
-    const response = await fetch('/auth/node-bootstraps/issue', {
+    const response = await fetch('/auth/node-enrollments/issue', {
       method: 'POST',
       cache: 'no-store',
       headers: {
         'content-type': 'application/json',
         'x-ironmesh-admin-token': adminToken
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(buildNodeBootstrapRequest())
     });
 
     let payload;
@@ -187,9 +234,9 @@ async function issueNodeBootstrap() {
     }
 
     output.textContent = JSON.stringify(payload, null, 2);
-    notes.textContent = summarizeNodeBootstrap(payload);
+    notes.textContent = summarizeNodeEnrollment(payload);
   } catch (error) {
-    output.textContent = 'failed to issue node bootstrap: ' + error;
+    output.textContent = 'failed to issue node enrollment package: ' + error;
     notes.textContent = '';
   }
 }
@@ -245,6 +292,24 @@ function summarizeNodeBootstrap(payload) {
   return notes.join(' | ');
 }
 
+function summarizeNodeEnrollment(payload) {
+  const notes = [];
+  if (payload?.bootstrap) {
+    notes.push(summarizeNodeBootstrap(payload.bootstrap));
+  }
+  if (payload?.internal_tls_material?.cert_pem) {
+    notes.push('includes generated internal node certificate');
+  }
+  if (payload?.internal_tls_material?.key_pem) {
+    notes.push('includes generated internal node private key');
+  }
+  if (payload?.internal_tls_material?.ca_cert_pem) {
+    notes.push('includes cluster CA certificate');
+  }
+
+  return notes.join(' | ');
+}
+
 function renderBootstrapQr(text) {
   const container = document.getElementById('bootstrap-bundle-qr-container');
   const target = document.getElementById('bootstrap-bundle-qr');
@@ -289,6 +354,10 @@ document
 document
   .getElementById('issue-node-bootstrap')
   .addEventListener('click', issueNodeBootstrap);
+
+document
+  .getElementById('issue-node-enrollment')
+  .addEventListener('click', issueNodeEnrollment);
 
 refreshServerLogs();
 setInterval(refreshServerLogs, 2000);

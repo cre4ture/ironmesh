@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -27,6 +28,10 @@ use axum_server::tls_rustls::RustlsConfig;
 use bytes::Bytes;
 use common::{ClusterId, HealthStatus, NodeId};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    SanType,
+};
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -42,13 +47,14 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
-    BootstrapEndpoint, BootstrapEndpointUse, BootstrapServerTlsFiles, BootstrapTlsFiles,
-    BootstrapTrustRoots, CandidateKind, ClientBootstrap as TransportClientBootstrap,
-    ConnectionCandidate, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, PeerIdentity,
-    PeerTransportClient, PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader,
-    RelayHttpPollRequest, RelayHttpRequest, RelayHttpResponse, RelayMode, RelayTicketRequest,
-    RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders, TransportCapability,
-    TransportPathKind, credential_fingerprint, encode_optional_body_base64,
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial, BootstrapServerTlsFiles,
+    BootstrapTlsFiles, BootstrapTrustRoots, CandidateKind,
+    ClientBootstrap as TransportClientBootstrap, ConnectionCandidate,
+    NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
+    PeerIdentity, PeerTransportClient, PeerTransportClientConfig, PresenceRegistration,
+    RelayHttpHeader, RelayHttpPollRequest, RelayHttpRequest, RelayHttpResponse, RelayMode,
+    RelayTicketRequest, RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders,
+    TransportCapability, TransportPathKind, credential_fingerprint, encode_optional_body_base64,
     verify_signed_request_headers,
 };
 use uuid::Uuid;
@@ -87,6 +93,7 @@ struct ServerState {
     client_auth: Arc<Mutex<ClientAuthState>>,
     public_ca_pem: Option<String>,
     cluster_ca_pem: Option<String>,
+    internal_ca_key_pem: Option<String>,
     rendezvous_ca_pem: Option<String>,
     rendezvous_urls: Vec<String>,
     rendezvous_registration_enabled: bool,
@@ -543,6 +550,7 @@ pub struct ServerNodeConfig {
     bootstrap_trust_roots: Option<BootstrapTrustRoots>,
     pub public_peer_api_enabled: bool,
     pub internal_tls: Option<InternalTlsConfig>,
+    pub internal_ca_key_path: Option<PathBuf>,
     pub rendezvous_ca_cert_path: Option<PathBuf>,
     pub rendezvous_urls: Vec<String>,
     pub rendezvous_registration_enabled: bool,
@@ -681,7 +689,76 @@ fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
     }
 }
 
+fn resolve_materialized_path(data_dir: &std::path::Path, raw_path: &str) -> PathBuf {
+    let candidate = PathBuf::from(raw_path);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        data_dir.join(candidate)
+    }
+}
+
+fn materialize_node_enrollment_package(
+    package: NodeEnrollmentPackage,
+) -> Result<TransportNodeBootstrap> {
+    package.validate()?;
+    let mut bootstrap = package.bootstrap;
+    let data_dir = PathBuf::from(&bootstrap.data_dir);
+
+    if let (Some(internal_tls), Some(material)) = (
+        bootstrap.internal_tls.as_mut(),
+        package.internal_tls_material.as_ref(),
+    ) {
+        let ca_path = resolve_materialized_path(&data_dir, &internal_tls.ca_cert_path);
+        let cert_path = resolve_materialized_path(&data_dir, &internal_tls.cert_path);
+        let key_path = resolve_materialized_path(&data_dir, &internal_tls.key_path);
+
+        for (path, contents) in [
+            (&ca_path, material.ca_cert_pem.as_str()),
+            (&cert_path, material.cert_pem.as_str()),
+            (&key_path, material.key_pem.as_str()),
+        ] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed creating {}", parent.display()))?;
+            }
+            std::fs::write(path, contents)
+                .with_context(|| format!("failed writing {}", path.display()))?;
+        }
+
+        internal_tls.ca_cert_path = ca_path.to_string_lossy().into_owned();
+        internal_tls.cert_path = cert_path.to_string_lossy().into_owned();
+        internal_tls.key_path = key_path.to_string_lossy().into_owned();
+    }
+
+    if let (Some(public_ca_cert_path), Some(public_ca_pem)) = (
+        bootstrap.public_ca_cert_path.as_mut(),
+        bootstrap.trust_roots.public_api_ca_pem.as_ref(),
+    ) {
+        let public_ca_path = resolve_materialized_path(&data_dir, public_ca_cert_path);
+        if let Some(parent) = public_ca_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
+        std::fs::write(&public_ca_path, public_ca_pem)
+            .with_context(|| format!("failed writing {}", public_ca_path.display()))?;
+        *public_ca_cert_path = public_ca_path.to_string_lossy().into_owned();
+    }
+
+    Ok(bootstrap)
+}
+
 impl ServerNodeConfig {
+    pub fn from_enrollment_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let package = NodeEnrollmentPackage::from_path(path.as_ref())?;
+        Self::from_enrollment(package)
+    }
+
+    pub fn from_enrollment(package: NodeEnrollmentPackage) -> Result<Self> {
+        let bootstrap = materialize_node_enrollment_package(package)?;
+        Self::from_bootstrap(bootstrap)
+    }
+
     pub fn from_bootstrap_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let bootstrap = TransportNodeBootstrap::from_path(path.as_ref())?;
         Self::from_bootstrap(bootstrap)
@@ -744,6 +821,7 @@ impl ServerNodeConfig {
             bootstrap_trust_roots: Some(bootstrap.trust_roots),
             public_peer_api_enabled: bootstrap.public_peer_api_enabled,
             internal_tls,
+            internal_ca_key_path: None,
             rendezvous_ca_cert_path: None,
             rendezvous_urls: bootstrap.rendezvous_urls,
             rendezvous_registration_enabled: true,
@@ -879,6 +957,14 @@ impl ServerNodeConfig {
     }
 
     pub fn from_env() -> Result<Self> {
+        if let Some(path) = std::env::var("IRONMESH_NODE_ENROLLMENT_FILE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Self::from_enrollment_path(path);
+        }
+
         if let Some(path) = std::env::var("IRONMESH_NODE_BOOTSTRAP_FILE")
             .ok()
             .map(|value| value.trim().to_string())
@@ -1062,6 +1148,9 @@ impl ServerNodeConfig {
             bootstrap_trust_roots: None,
             public_peer_api_enabled,
             internal_tls,
+            internal_ca_key_path: std::env::var("IRONMESH_INTERNAL_TLS_CA_KEY")
+                .ok()
+                .map(PathBuf::from),
             rendezvous_ca_cert_path,
             rendezvous_urls,
             rendezvous_registration_enabled,
@@ -1200,6 +1289,7 @@ impl ServerNodeConfig {
             bootstrap_trust_roots: None,
             public_peer_api_enabled: false,
             internal_tls: None,
+            internal_ca_key_path: None,
             rendezvous_ca_cert_path: None,
             rendezvous_urls: vec![format!("http://{bind_addr}")],
             rendezvous_registration_enabled: false,
@@ -1545,6 +1635,16 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 rendezvous_ca_pem: None,
             });
 
+    let internal_ca_key_pem = config
+        .internal_ca_key_path
+        .clone()
+        .map(|path| {
+            std::fs::read_to_string(&path).with_context(|| {
+                format!("failed reading internal CA private key {}", path.display())
+            })
+        })
+        .transpose()?;
+
     let public_ca_pem = config
         .public_ca_cert_path
         .clone()
@@ -1621,6 +1721,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         client_auth: Arc::new(Mutex::new(persisted_client_auth)),
         public_ca_pem,
         cluster_ca_pem,
+        internal_ca_key_pem,
         rendezvous_ca_pem,
         rendezvous_urls: config.rendezvous_urls.clone(),
         rendezvous_registration_enabled: config.rendezvous_registration_enabled,
@@ -1804,6 +1905,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             post(issue_bootstrap_bundle),
         )
         .route("/auth/node-bootstraps/issue", post(issue_node_bootstrap))
+        .route("/auth/node-enrollments/issue", post(issue_node_enrollment))
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
     let public_peer_api = Router::new()
@@ -4438,6 +4540,155 @@ fn default_internal_url(bind_addr: &str) -> String {
     format!("https://{bind_addr}")
 }
 
+fn build_issued_node_bootstrap(
+    state: &ServerState,
+    request: NodeBootstrapIssueRequest,
+) -> std::result::Result<TransportNodeBootstrap, StatusCode> {
+    let rendezvous_urls = bootstrap_rendezvous_urls(state)?;
+    let mode = request.mode.unwrap_or(NodeBootstrapMode::Cluster);
+    let bind_addr = request
+        .bind_addr
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let public_url = request
+        .public_url
+        .or_else(|| Some(default_public_url(&bind_addr, request.public_tls.is_some())));
+    let internal_bind_addr = request.internal_bind_addr.or_else(|| match mode {
+        NodeBootstrapMode::Cluster => Some("127.0.0.1:18080".to_string()),
+        NodeBootstrapMode::LocalEdge => None,
+    });
+    let internal_url = request
+        .internal_url
+        .or_else(|| internal_bind_addr.as_deref().map(default_internal_url));
+    let public_peer_api_enabled = request.public_peer_api_enabled.unwrap_or(
+        mode == NodeBootstrapMode::LocalEdge
+            && request
+                .upstream_public_url
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+    );
+    let bootstrap = TransportNodeBootstrap {
+        version: 1,
+        cluster_id: state.cluster_id,
+        node_id: request.node_id.unwrap_or_else(NodeId::new_v4),
+        mode,
+        data_dir: request
+            .data_dir
+            .unwrap_or_else(|| "./data/server-node".to_string()),
+        bind_addr,
+        public_url: public_url.clone(),
+        labels: request.labels.unwrap_or_default(),
+        public_tls: request.public_tls,
+        public_ca_cert_path: request.public_ca_cert_path,
+        public_peer_api_enabled,
+        internal_bind_addr: internal_bind_addr.clone(),
+        internal_url: internal_url.clone(),
+        internal_tls: request.internal_tls,
+        rendezvous_urls,
+        rendezvous_mtls_required: state.rendezvous_mtls_required,
+        direct_endpoints: build_bootstrap_direct_endpoints(
+            public_url.as_deref(),
+            internal_url.as_deref(),
+            public_peer_api_enabled,
+        ),
+        relay_mode: state.relay_mode,
+        trust_roots: bootstrap_trust_roots(state),
+        upstream_public_url: request.upstream_public_url,
+    };
+
+    bootstrap.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(bootstrap)
+}
+
+fn build_internal_node_subject_alt_names(
+    bootstrap: &TransportNodeBootstrap,
+) -> Result<Vec<SanType>> {
+    let mut subject_alt_names = Vec::new();
+    let mut seen_dns = HashSet::new();
+    let mut seen_ips = HashSet::new();
+
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:node:{}", bootstrap.node_id)
+            .try_into()
+            .context("invalid node identity URI SAN")?,
+    ));
+
+    if let Some(internal_url) = bootstrap.internal_url.as_deref() {
+        let parsed =
+            reqwest::Url::parse(internal_url).with_context(|| format!("invalid {internal_url}"))?;
+        if let Some(host) = parsed.host_str() {
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if seen_ips.insert(ip) {
+                    subject_alt_names.push(SanType::IpAddress(ip));
+                }
+            } else if seen_dns.insert(host.to_string()) {
+                subject_alt_names.push(SanType::DnsName(
+                    host.try_into().context("invalid internal DNS SAN")?,
+                ));
+            }
+        }
+    }
+
+    if let Some(bind_addr) = bootstrap.internal_bind_addr.as_deref()
+        && let Ok(socket_addr) = bind_addr.parse::<SocketAddr>()
+    {
+        let ip = socket_addr.ip();
+        if !ip.is_unspecified() && seen_ips.insert(ip) {
+            subject_alt_names.push(SanType::IpAddress(ip));
+        }
+    }
+
+    Ok(subject_alt_names)
+}
+
+fn issue_internal_node_tls_material(
+    state: &ServerState,
+    bootstrap: &TransportNodeBootstrap,
+) -> std::result::Result<BootstrapMutualTlsMaterial, StatusCode> {
+    if bootstrap.internal_tls.is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let ca_cert_pem = state
+        .cluster_ca_pem
+        .as_deref()
+        .ok_or(StatusCode::PRECONDITION_FAILED)?;
+    let ca_key_pem = state
+        .internal_ca_key_pem
+        .as_deref()
+        .ok_or(StatusCode::PRECONDITION_FAILED)?;
+
+    let issuer_key =
+        KeyPair::from_pem(ca_key_pem).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, issuer_key)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut params =
+        CertificateParams::new(Vec::new()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(
+        DnType::CommonName,
+        format!("ironmesh-node-{}", bootstrap.node_id),
+    );
+    params.is_ca = IsCa::NoCa;
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ClientAuth,
+        ExtendedKeyUsagePurpose::ServerAuth,
+    ];
+    params.subject_alt_names =
+        build_internal_node_subject_alt_names(bootstrap).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let key_pair = KeyPair::generate().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cert = params
+        .signed_by(&key_pair, &issuer)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(BootstrapMutualTlsMaterial {
+        ca_cert_pem: ca_cert_pem.to_string(),
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+    })
+}
+
 async fn issue_bootstrap_bundle(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -4550,63 +4801,119 @@ async fn issue_node_bootstrap(
         Err(status) => return status.into_response(),
     };
 
-    let rendezvous_urls = match bootstrap_rendezvous_urls(&state) {
-        Ok(urls) => urls,
+    let bootstrap = match build_issued_node_bootstrap(&state, request) {
+        Ok(bootstrap) => bootstrap,
+        Err(status) => {
+            let err = "invalid node bootstrap request";
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err }),
+            )
+            .await;
+            return (status, Json(json!({ "error": err }))).into_response();
+        }
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "node_id": bootstrap.node_id,
+            "mode": bootstrap.mode,
+            "direct_endpoint_count": bootstrap.direct_endpoints.len(),
+            "rendezvous_url_count": bootstrap.rendezvous_urls.len(),
+        }),
+    )
+    .await;
+
+    (StatusCode::CREATED, Json(bootstrap)).into_response()
+}
+
+async fn issue_node_enrollment(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NodeBootstrapIssueRequest>,
+) -> impl IntoResponse {
+    let action = "auth/node-enrollments/issue";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "node_id": request.node_id,
+            "mode": request.mode,
+            "data_dir": request.data_dir,
+            "bind_addr": request.bind_addr,
+            "public_url": request.public_url,
+            "upstream_public_url": request.upstream_public_url,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
         Err(status) => return status.into_response(),
     };
 
-    let mode = request.mode.unwrap_or(NodeBootstrapMode::Cluster);
-    let bind_addr = request
-        .bind_addr
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let public_url = request
-        .public_url
-        .or_else(|| Some(default_public_url(&bind_addr, request.public_tls.is_some())));
-    let internal_bind_addr = request.internal_bind_addr.or_else(|| match mode {
-        NodeBootstrapMode::Cluster => Some("127.0.0.1:18080".to_string()),
-        NodeBootstrapMode::LocalEdge => None,
-    });
-    let internal_url = request
-        .internal_url
-        .or_else(|| internal_bind_addr.as_deref().map(default_internal_url));
-    let public_peer_api_enabled = request.public_peer_api_enabled.unwrap_or(
-        mode == NodeBootstrapMode::LocalEdge
-            && request
-                .upstream_public_url
-                .as_deref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false),
-    );
-    let bootstrap = TransportNodeBootstrap {
-        version: 1,
-        cluster_id: state.cluster_id,
-        node_id: request.node_id.unwrap_or_else(NodeId::new_v4),
-        mode,
-        data_dir: request
-            .data_dir
-            .unwrap_or_else(|| "./data/server-node".to_string()),
-        bind_addr,
-        public_url: public_url.clone(),
-        labels: request.labels.unwrap_or_default(),
-        public_tls: request.public_tls,
-        public_ca_cert_path: request.public_ca_cert_path,
-        public_peer_api_enabled,
-        internal_bind_addr: internal_bind_addr.clone(),
-        internal_url: internal_url.clone(),
-        internal_tls: request.internal_tls,
-        rendezvous_urls,
-        rendezvous_mtls_required: state.rendezvous_mtls_required,
-        direct_endpoints: build_bootstrap_direct_endpoints(
-            public_url.as_deref(),
-            internal_url.as_deref(),
-            public_peer_api_enabled,
-        ),
-        relay_mode: state.relay_mode,
-        trust_roots: bootstrap_trust_roots(&state),
-        upstream_public_url: request.upstream_public_url,
+    let bootstrap = match build_issued_node_bootstrap(&state, request) {
+        Ok(bootstrap) => bootstrap,
+        Err(status) => {
+            let err = "invalid node enrollment request";
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err }),
+            )
+            .await;
+            return (status, Json(json!({ "error": err }))).into_response();
+        }
     };
 
-    if let Err(err) = bootstrap.validate() {
+    let internal_tls_material = match issue_internal_node_tls_material(&state, &bootstrap) {
+        Ok(material) => material,
+        Err(status) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": "failed to issue internal node TLS material" }),
+            )
+            .await;
+            return (
+                status,
+                Json(json!({ "error": "failed to issue internal node TLS material" })),
+            )
+                .into_response();
+        }
+    };
+
+    let package = NodeEnrollmentPackage {
+        bootstrap,
+        internal_tls_material: Some(internal_tls_material),
+    };
+
+    if let Err(err) = package.validate() {
         append_admin_audit(
             &state,
             action,
@@ -4634,15 +4941,13 @@ async fn issue_node_bootstrap(
         true,
         "success",
         json!({
-            "node_id": bootstrap.node_id,
-            "mode": bootstrap.mode,
-            "direct_endpoint_count": bootstrap.direct_endpoints.len(),
-            "rendezvous_url_count": bootstrap.rendezvous_urls.len(),
+            "node_id": package.bootstrap.node_id,
+            "mode": package.bootstrap.mode,
         }),
     )
     .await;
 
-    (StatusCode::CREATED, Json(bootstrap)).into_response()
+    (StatusCode::CREATED, Json(package)).into_response()
 }
 
 async fn issue_pairing_token_impl(

@@ -91,8 +91,12 @@
     <label for="node-bootstrap-upstream-public-url">Upstream public URL (local-edge only)</label>
     <input id="node-bootstrap-upstream-public-url" type="text" autocomplete="off" spellcheck="false" />
     <button id="issue-node-bootstrap" type="button">Issue node bootstrap</button>
+    <button id="issue-node-enrollment" type="button">Issue node enrollment package</button>
     <pre id="node-bootstrap-json">provide the admin token and click the button to issue a node bootstrap artifact</pre>
     <p id="node-bootstrap-notes"></p>
+    <p>Node enrollment packages also generate internal mTLS material. They require <code>IRONMESH_INTERNAL_TLS_CA_KEY</code> on the issuing node.</p>
+    <pre id="node-enrollment-json">click the enrollment button to issue a bootstrap plus generated internal TLS PEM material</pre>
+    <p id="node-enrollment-notes"></p>
 
     <h2>Server logs</h2>
     <p>Recent in-memory log lines from this node.</p>
@@ -124,6 +128,7 @@
       <li><code>GET /cluster/placement/{key}</code> - deterministic placement decision</li>
       <li><code>POST /auth/bootstrap-bundles/issue</code> - issue a bootstrap JSON bundle for client enrollment (admin token required)</li>
       <li><code>POST /auth/node-bootstraps/issue</code> - issue a node bootstrap JSON artifact for provisioning a server node (admin token required)</li>
+      <li><code>POST /auth/node-enrollments/issue</code> - issue a node enrollment package with generated internal mTLS material (admin token required, internal CA key required)</li>
       <li><code>GET /cluster/replication/plan</code> - current replication gaps/overages</li>
       <li><code>POST /cluster/replication/audit</code> - manual audit trigger</li>
       <li><code>POST /cluster/replication/repair</code> - execute one-pass replica repair for missing placements</li>

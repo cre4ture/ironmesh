@@ -21,6 +21,7 @@ exif = { package = "kamadak-exif", version = "0.6" }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 percent-encoding = "2"
 reqwest.workspace = true
+rcgen = { version = "0.14", features = ["crypto", "pem", "ring", "x509-parser"] }
 rusqlite.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }

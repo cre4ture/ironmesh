@@ -125,6 +125,18 @@ fn free_bind_addr() -> SocketAddr {
     addr
 }
 
+fn generate_test_internal_ca() -> (String, String) {
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ironmesh-test-cluster-ca");
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    (cert.pem(), key_pair.serialize_pem())
+}
+
 #[test]
 fn token_matches_requires_exact_match() {
     assert!(!token_matches("secret", None));
@@ -487,6 +499,141 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
 }
 
 #[tokio::test]
+async fn issue_node_enrollment_includes_internal_tls_material() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+    state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
+    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    state.rendezvous_registration_enabled = true;
+    state.rendezvous_mtls_required = true;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_node_enrollment(
+        State(state.clone()),
+        headers,
+        Json(super::NodeBootstrapIssueRequest {
+            node_id: Some(NodeId::new_v4()),
+            mode: Some(transport_sdk::NodeBootstrapMode::Cluster),
+            data_dir: Some("./data/node-b".to_string()),
+            bind_addr: Some("127.0.0.1:28080".to_string()),
+            public_url: Some("http://127.0.0.1:28080".to_string()),
+            labels: None,
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_peer_api_enabled: Some(false),
+            internal_bind_addr: Some("127.0.0.1:38080".to_string()),
+            internal_url: Some("https://127.0.0.1:38080".to_string()),
+            internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+                ca_cert_path: "tls/cluster-ca.pem".to_string(),
+                cert_path: "tls/internal.pem".to_string(),
+                key_path: "tls/internal.key".to_string(),
+            }),
+            upstream_public_url: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let package: transport_sdk::NodeEnrollmentPackage = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        package
+            .internal_tls_material
+            .as_ref()
+            .map(|material| material.ca_cert_pem.as_str()),
+        Some(cluster_ca_pem.as_str())
+    );
+    assert!(
+        package
+            .internal_tls_material
+            .as_ref()
+            .unwrap()
+            .cert_pem
+            .contains("BEGIN CERTIFICATE")
+    );
+    assert!(
+        package
+            .internal_tls_material
+            .as_ref()
+            .unwrap()
+            .key_pem
+            .contains("PRIVATE KEY")
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn server_node_config_loads_from_node_enrollment_file_and_materializes_internal_tls() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem);
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+
+    let root = fresh_test_dir("node-enrollment-config");
+    let package_path = root.join("node-enrollment.json");
+    let internal_bind_addr = free_bind_addr();
+    let bootstrap = transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: state.cluster_id,
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: root.join("data").to_string_lossy().into_owned(),
+        bind_addr: free_bind_addr().to_string(),
+        public_url: Some("http://127.0.0.1:28080".to_string()),
+        labels: HashMap::new(),
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_peer_api_enabled: false,
+        internal_bind_addr: Some(internal_bind_addr.to_string()),
+        internal_url: Some(format!("https://127.0.0.1:{}", internal_bind_addr.port())),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/cluster-ca.pem".to_string(),
+            cert_path: "tls/internal.pem".to_string(),
+            key_path: "tls/internal.key".to_string(),
+        }),
+        rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+        rendezvous_mtls_required: false,
+        direct_endpoints: Vec::new(),
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: state.cluster_ca_pem.clone(),
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: None,
+        },
+        upstream_public_url: None,
+    };
+    let material = super::issue_internal_node_tls_material(&state, &bootstrap).unwrap();
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        internal_tls_material: Some(material.clone()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+
+    let config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    let internal_tls = config.internal_tls.as_ref().unwrap();
+
+    assert!(internal_tls.ca_cert_path.exists());
+    assert!(internal_tls.cert_path.exists());
+    assert!(internal_tls.key_path.exists());
+    assert_eq!(
+        std::fs::read_to_string(&internal_tls.ca_cert_path).unwrap(),
+        material.ca_cert_pem
+    );
+
+    cleanup_test_state(&state).await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn node_bootstrap_file_can_start_local_edge_node() {
     let root = fresh_test_dir("node-bootstrap-startup");
     let bootstrap_path = root.join("node-bootstrap.json");
@@ -532,6 +679,92 @@ async fn node_bootstrap_file_can_start_local_edge_node() {
     wait_for_http_status(
         &http,
         &format!("{public_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    handle.abort();
+    let _ = handle.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn node_enrollment_file_can_start_cluster_node_with_internal_mtls() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem);
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+
+    let root = fresh_test_dir("node-enrollment-startup");
+    let package_path = root.join("node-enrollment.json");
+    let bind_addr = free_bind_addr();
+    let internal_bind_addr = free_bind_addr();
+    let public_url = format!("http://{bind_addr}");
+    let internal_url = format!("https://127.0.0.1:{}", internal_bind_addr.port());
+    let bootstrap = transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: state.cluster_id,
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: root.join("data").to_string_lossy().into_owned(),
+        bind_addr: bind_addr.to_string(),
+        public_url: Some(public_url.clone()),
+        labels: HashMap::new(),
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_peer_api_enabled: false,
+        internal_bind_addr: Some(internal_bind_addr.to_string()),
+        internal_url: Some(internal_url.clone()),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/cluster-ca.pem".to_string(),
+            cert_path: "tls/internal.pem".to_string(),
+            key_path: "tls/internal.key".to_string(),
+        }),
+        rendezvous_urls: vec!["http://127.0.0.1:9".to_string()],
+        rendezvous_mtls_required: false,
+        direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
+            url: public_url.clone(),
+            usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+        }],
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: state.cluster_ca_pem.clone(),
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: None,
+        },
+        upstream_public_url: None,
+    };
+    let material = super::issue_internal_node_tls_material(&state, &bootstrap).unwrap();
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        internal_tls_material: Some(material),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+    cleanup_test_state(&state).await;
+
+    let config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    let internal_tls = config.internal_tls.clone().unwrap();
+    let internal_http = super::build_internal_mtls_http_client(
+        &internal_tls.ca_cert_path,
+        &internal_tls.cert_path,
+        &internal_tls.key_path,
+    )
+    .unwrap();
+    let handle = tokio::spawn(async move { super::run(config).await });
+
+    let http = reqwest::Client::new();
+    wait_for_http_status(
+        &http,
+        &format!("{public_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_http_status(
+        &internal_http,
+        &format!("{internal_url}/health"),
         StatusCode::OK,
         Duration::from_secs(5),
     )
@@ -2255,6 +2488,7 @@ async fn build_test_state(
         client_auth: Arc::new(Mutex::new(super::storage::ClientAuthState::default())),
         public_ca_pem: None,
         cluster_ca_pem: None,
+        internal_ca_key_pem: None,
         rendezvous_ca_pem: None,
         rendezvous_urls: vec!["http://127.0.0.1:39080".to_string()],
         rendezvous_registration_enabled: false,
