@@ -1,13 +1,15 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Certificate;
 use reqwest::Client;
 use reqwest::Url;
 use reqwest::blocking::Client as BlockingClient;
 use std::fs;
 use std::path::Path;
-use transport_sdk::ClientIdentityMaterial;
+use transport_sdk::{ClientIdentityMaterial, RendezvousClientConfig};
 
-use crate::IronMeshClient;
+use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
+
+const RELAY_REQUEST_BASE_URL: &str = "https://relay.invalid/";
 
 pub fn load_root_certificate(path: &Path) -> Result<Certificate> {
     let pem = fs::read(path)
@@ -70,6 +72,49 @@ pub fn build_http_client_with_identity_from_pem(
     let http = build_reqwest_client_from_pem(server_ca_pem)?;
     Ok(IronMeshClient::with_http_client(base_url.as_str(), http)
         .with_client_identity(identity.clone()))
+}
+
+pub fn build_http_client_with_identity_from_planned_target(
+    target: &PlannedConnectionBootstrapTarget,
+    identity: &ClientIdentityMaterial,
+) -> Result<IronMeshClient> {
+    if let Some(server_base_url) = target.server_base_url.as_deref() {
+        return build_http_client_with_identity_from_pem(
+            target
+                .server_ca_pem
+                .as_deref()
+                .or(target.cluster_ca_pem.as_deref()),
+            server_base_url,
+            identity,
+        );
+    }
+
+    if target.rendezvous_mtls_required {
+        bail!(
+            "relay-backed client transport does not support an mTLS-only rendezvous control plane yet"
+        );
+    }
+
+    let target_node_id = target
+        .target_node_id
+        .ok_or_else(|| anyhow!("relay-backed client transport target is missing target_node_id"))?;
+    let rendezvous = transport_sdk::RendezvousControlClient::new(
+        RendezvousClientConfig {
+            cluster_id: target.cluster_id,
+            rendezvous_urls: target.rendezvous_urls.clone(),
+            heartbeat_interval_secs: 15,
+        },
+        target
+            .rendezvous_ca_pem
+            .as_deref()
+            .or(target.cluster_ca_pem.as_deref()),
+        None,
+    )?;
+
+    Ok(
+        IronMeshClient::with_relay_transport(RELAY_REQUEST_BASE_URL, rendezvous, target_node_id)
+            .with_client_identity(identity.clone()),
+    )
 }
 
 pub fn build_http_client(

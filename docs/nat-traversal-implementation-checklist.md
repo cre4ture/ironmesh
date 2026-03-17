@@ -21,8 +21,8 @@ Status: Concrete repo-mapped implementation plan for the target architecture
 Use this section as the current source of truth for remaining work. The detailed checklist below still contains older task wording and should be reconciled over time.
 
 1. Client transport target model and relay-capable client sessions. Status: in progress.
-   The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, and issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs.
-   Remaining work: implement a real client-side transport/session connector so relay-planned targets are usable for normal client data-plane traffic, not just surfaced explicitly as the current gap.
+   The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs, and `IronMeshClient` can now execute relay-backed requests through rendezvous for the non-mTLS client path.
+   Remaining work: extend the rendezvous control-plane authentication model so enrolled client devices can use relay against an mTLS-required rendezvous service too, then roll the bootstrap-driven relay-capable client construction through the remaining app entry points.
 2. Remove the legacy direct-upstream path from server-node.
    Remaining work: retire `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, and `refresh_upstream_peer(...)` once rendezvous-first startup is the only supported peer discovery path.
 3. Finish removing `base_url` plus `device_token`-shaped app models.

@@ -12,11 +12,13 @@ use transport_sdk::{
     TransportPathKind,
 };
 
-use crate::connection::build_blocking_reqwest_client_from_pem;
+use crate::connection::{
+    build_blocking_reqwest_client_from_pem, build_http_client_with_identity_from_planned_target,
+};
 use crate::device_auth::{
     DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device_blocking_from_pem,
 };
-use crate::ironmesh_client::normalize_server_base_url;
+use crate::ironmesh_client::{IronMeshClient, normalize_server_base_url};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionBootstrap {
@@ -297,19 +299,53 @@ impl ConnectionBootstrap {
         Ok(planned)
     }
 
+    pub fn build_client_with_identity(
+        &self,
+        identity: &ClientIdentityMaterial,
+    ) -> Result<IronMeshClient> {
+        self.validate()?;
+        identity.validate()?;
+        if identity.cluster_id != self.cluster_id {
+            bail!(
+                "client identity cluster_id {} does not match bootstrap cluster_id {}",
+                identity.cluster_id,
+                self.cluster_id
+            );
+        }
+
+        let mut last_error = None;
+        for target in self.planned_targets()? {
+            if target.server_base_url.is_some() {
+                match probe_direct_http_target_blocking(&target) {
+                    Ok(true) => {
+                        return build_http_client_with_identity_from_planned_target(
+                            &target, identity,
+                        );
+                    }
+                    Ok(false) => continue,
+                    Err(err) => {
+                        last_error = Some(err);
+                        continue;
+                    }
+                }
+            }
+
+            match build_http_client_with_identity_from_planned_target(&target, identity) {
+                Ok(client) => return Ok(client),
+                Err(err) if target.relay_mode != RelayMode::Required => {
+                    last_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("bootstrap does not contain a reachable client transport target")
+        }))
+    }
+
     pub fn resolve_direct_http_target_blocking(&self) -> Result<ResolvedConnectionBootstrap> {
         let planned_targets = self.planned_targets()?;
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .build()
-            .context("failed building bootstrap probe client")?;
-        let server_ca_pem = self
-            .trust_roots
-            .public_api_ca_pem
-            .as_deref()
-            .or(self.trust_roots.cluster_ca_pem.as_deref());
-        let trusted = build_blocking_reqwest_client_from_pem(server_ca_pem)
-            .context("failed building bootstrap trusted client")?;
         let mut saw_relay_target = false;
 
         for target in planned_targets {
@@ -317,19 +353,9 @@ impl ConnectionBootstrap {
                 saw_relay_target = true;
                 continue;
             };
-            let endpoint = Url::parse(server_base_url)
-                .with_context(|| format!("invalid planned bootstrap URL {server_base_url}"))?;
-            let health_url = endpoint
-                .join("health")
-                .with_context(|| format!("failed to build health URL from {endpoint}"))?;
-            let probe_client = if endpoint.scheme() == "https" {
-                &trusted
-            } else {
-                &client
-            };
-            if let Ok(response) = probe_client.get(health_url).send()
-                && response.status().is_success()
-            {
+            if probe_direct_http_target_blocking(&target)? {
+                let endpoint = Url::parse(server_base_url)
+                    .with_context(|| format!("invalid planned bootstrap URL {server_base_url}"))?;
                 return Ok(ResolvedConnectionBootstrap {
                     cluster_id: target.cluster_id,
                     rendezvous_urls: target.rendezvous_urls,
@@ -436,6 +462,38 @@ impl ConnectionBootstrap {
                 .transpose()?,
             device_label: self.device_label.clone(),
         })
+    }
+}
+
+fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) -> Result<bool> {
+    let server_base_url = target
+        .server_base_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("direct bootstrap target is missing server_base_url"))?;
+    let endpoint = Url::parse(server_base_url)
+        .with_context(|| format!("invalid planned bootstrap URL {server_base_url}"))?;
+    let health_url = endpoint
+        .join("health")
+        .with_context(|| format!("failed to build health URL from {endpoint}"))?;
+
+    let probe_client = if endpoint.scheme() == "https" {
+        build_blocking_reqwest_client_from_pem(
+            target
+                .server_ca_pem
+                .as_deref()
+                .or(target.cluster_ca_pem.as_deref()),
+        )
+        .context("failed building bootstrap trusted client")?
+    } else {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .context("failed building bootstrap probe client")?
+    };
+
+    match probe_client.get(health_url).send() {
+        Ok(response) => Ok(response.status().is_success()),
+        Err(_) => Ok(false),
     }
 }
 
@@ -584,5 +642,27 @@ mod tests {
             .expect_err("relay-only bootstrap without endpoint node ids should fail");
 
         assert!(error.to_string().contains("target node_id"));
+    }
+
+    #[test]
+    fn build_client_with_identity_rejects_mtls_only_rendezvous_relay() {
+        let mut bootstrap = sample_bootstrap();
+        bootstrap.relay_mode = RelayMode::Required;
+        bootstrap.rendezvous_mtls_required = true;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            bootstrap.cluster_id,
+            None,
+            Some("desktop".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+
+        let error = bootstrap
+            .build_client_with_identity(&identity)
+            .err()
+            .expect("mTLS-only rendezvous relay should be rejected for client devices");
+
+        assert!(error.to_string().contains("mTLS-only rendezvous"));
     }
 }

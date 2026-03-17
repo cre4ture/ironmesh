@@ -86,30 +86,26 @@ async fn main() -> Result<()> {
             label.as_deref(),
         ),
         Commands::CacheList => {
-            let target = resolve_target(&cli)?;
-            let client = build_client_node(&target)?;
+            let client = build_client_node_from_cli(&cli)?;
             for entry in client.cache_entries().await {
                 println!("{} ({} bytes)", entry.key, entry.size_bytes);
             }
             Ok(())
         }
         Commands::Put { key, value } => {
-            let target = resolve_target(&cli)?;
-            let client = build_client_node(&target)?;
+            let client = build_client_node_from_cli(&cli)?;
             let object = client.put(key.clone(), Bytes::from(value.clone())).await?;
             println!("stored '{}' ({} bytes)", object.key, object.size_bytes);
             Ok(())
         }
         Commands::Get { key } => {
-            let target = resolve_target(&cli)?;
-            let client = build_client_node(&target)?;
+            let client = build_client_node_from_cli(&cli)?;
             let payload = client.get_cached_or_fetch(key).await?;
             println!("{}", String::from_utf8_lossy(&payload));
             Ok(())
         }
         Commands::List { prefix, depth } => {
-            let target = resolve_target(&cli)?;
-            let sdk = build_authenticated_sdk(&target)?;
+            let sdk = build_authenticated_sdk_from_cli(&cli)?;
             let value = sdk.store_index_blocking(prefix.as_deref(), (*depth).max(1), None)?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -234,8 +230,28 @@ fn build_authenticated_sdk(target: &ResolvedCliTarget) -> Result<IronMeshClient>
     }
 }
 
-fn build_client_node(target: &ResolvedCliTarget) -> Result<ClientNode> {
-    Ok(ClientNode::with_client(build_authenticated_sdk(target)?))
+fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
+    let client_identity = cli
+        .client_identity_file
+        .as_deref()
+        .map(ClientIdentityMaterial::from_path)
+        .transpose()?;
+
+    if let Some(bootstrap_path) = cli.bootstrap_file.as_deref()
+        && let Some(identity) = client_identity.as_ref()
+    {
+        let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
+        return bootstrap.build_client_with_identity(identity);
+    }
+
+    let target = resolve_target(cli)?;
+    build_authenticated_sdk(&target)
+}
+
+fn build_client_node_from_cli(cli: &Cli) -> Result<ClientNode> {
+    Ok(ClientNode::with_client(build_authenticated_sdk_from_cli(
+        cli,
+    )?))
 }
 
 async fn print_json_endpoint(target: &ResolvedCliTarget, path: &str) -> Result<()> {

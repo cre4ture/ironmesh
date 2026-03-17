@@ -1,25 +1,29 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use common::StorageObjectMeta;
+use common::{NodeId, StorageObjectMeta};
 use reqwest::Client as HttpClient;
 use reqwest::Method;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use reqwest::Url;
+use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
-use transport_sdk::{ClientIdentityMaterial, build_signed_request_headers};
+use transport_sdk::{
+    ClientIdentityMaterial, PeerIdentity, RelayHttpHeader, RelayHttpRequest, RelayHttpResponse,
+    RelayTicketRequest, RendezvousControlClient, build_signed_request_headers,
+    encode_optional_body_base64,
+};
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct IronMeshClient {
-    http: HttpClient,
-    server_base_url: String,
+    transport: ClientTransport,
     auth: ClientRequestAuth,
 }
 
@@ -28,6 +32,29 @@ enum ClientRequestAuth {
     None,
     BearerToken(String),
     SignedIdentity(ClientIdentityMaterial),
+}
+
+#[derive(Clone)]
+enum ClientTransport {
+    Direct {
+        http: HttpClient,
+        server_base_url: String,
+    },
+    Relay(ClientRelayTransport),
+}
+
+#[derive(Clone)]
+struct ClientRelayTransport {
+    rendezvous: RendezvousControlClient,
+    request_base_url: String,
+    target_node_id: NodeId,
+}
+
+#[derive(Debug)]
+struct BufferedTransportResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,8 +177,25 @@ impl IronMeshClient {
 
     pub fn with_http_client(server_base_url: impl Into<String>, http: HttpClient) -> Self {
         Self {
-            http,
-            server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
+            transport: ClientTransport::Direct {
+                http,
+                server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
+            },
+            auth: ClientRequestAuth::None,
+        }
+    }
+
+    pub fn with_relay_transport(
+        request_base_url: impl Into<String>,
+        rendezvous: RendezvousControlClient,
+        target_node_id: NodeId,
+    ) -> Self {
+        Self {
+            transport: ClientTransport::Relay(ClientRelayTransport {
+                rendezvous,
+                request_base_url: request_base_url.into().trim_end_matches('/').to_string(),
+                target_node_id,
+            }),
             auth: ClientRequestAuth::None,
         }
     }
@@ -166,15 +210,29 @@ impl IronMeshClient {
         self
     }
 
-    fn apply_auth(
-        &self,
-        method: Method,
-        url: &Url,
-        request: RequestBuilder,
-    ) -> Result<RequestBuilder> {
+    fn server_base_url(&self) -> &str {
+        match &self.transport {
+            ClientTransport::Direct {
+                server_base_url, ..
+            } => server_base_url.as_str(),
+            ClientTransport::Relay(relay) => relay.request_base_url.as_str(),
+        }
+    }
+
+    fn direct_http(&self) -> Option<&HttpClient> {
+        match &self.transport {
+            ClientTransport::Direct { http, .. } => Some(http),
+            ClientTransport::Relay(_) => None,
+        }
+    }
+
+    fn request_auth_headers(&self, method: &Method, url: &Url) -> Result<Vec<RelayHttpHeader>> {
         match &self.auth {
-            ClientRequestAuth::None => Ok(request),
-            ClientRequestAuth::BearerToken(token) => Ok(request.bearer_auth(token)),
+            ClientRequestAuth::None => Ok(Vec::new()),
+            ClientRequestAuth::BearerToken(token) => Ok(vec![RelayHttpHeader {
+                name: "authorization".to_string(),
+                value: format!("Bearer {token}"),
+            }]),
             ClientRequestAuth::SignedIdentity(identity) => {
                 let path_and_query = path_and_query(url);
                 let signed_headers = build_signed_request_headers(
@@ -184,7 +242,123 @@ impl IronMeshClient {
                     unix_ts(),
                     None,
                 )?;
-                Ok(signed_headers.apply_to_reqwest(request))
+                Ok(vec![
+                    RelayHttpHeader {
+                        name: transport_sdk::HEADER_CLUSTER_ID.to_string(),
+                        value: signed_headers.cluster_id.to_string(),
+                    },
+                    RelayHttpHeader {
+                        name: transport_sdk::HEADER_DEVICE_ID.to_string(),
+                        value: signed_headers.device_id,
+                    },
+                    RelayHttpHeader {
+                        name: transport_sdk::HEADER_CREDENTIAL_FINGERPRINT.to_string(),
+                        value: signed_headers.credential_fingerprint,
+                    },
+                    RelayHttpHeader {
+                        name: transport_sdk::HEADER_AUTH_TIMESTAMP.to_string(),
+                        value: signed_headers.timestamp_unix.to_string(),
+                    },
+                    RelayHttpHeader {
+                        name: transport_sdk::HEADER_AUTH_NONCE.to_string(),
+                        value: signed_headers.nonce,
+                    },
+                    RelayHttpHeader {
+                        name: transport_sdk::HEADER_AUTH_SIGNATURE.to_string(),
+                        value: signed_headers.signature_base64,
+                    },
+                ])
+            }
+        }
+    }
+
+    fn apply_headers_to_request(
+        &self,
+        request: RequestBuilder,
+        headers: &[RelayHttpHeader],
+    ) -> RequestBuilder {
+        headers.iter().fold(request, |request, header| {
+            request.header(header.name.as_str(), header.value.as_str())
+        })
+    }
+
+    fn relay_source_identity(&self) -> Result<PeerIdentity> {
+        match &self.auth {
+            ClientRequestAuth::SignedIdentity(identity) => {
+                Ok(PeerIdentity::Device(identity.device_id))
+            }
+            ClientRequestAuth::None | ClientRequestAuth::BearerToken(_) => {
+                bail!("relay-backed client transport requires signed client identity material")
+            }
+        }
+    }
+
+    async fn execute_buffered_request(
+        &self,
+        method: Method,
+        url: Url,
+        mut headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+    ) -> Result<BufferedTransportResponse> {
+        let mut auth_headers = self.request_auth_headers(&method, &url)?;
+        auth_headers.append(&mut headers);
+
+        match &self.transport {
+            ClientTransport::Direct { http, .. } => {
+                let mut request = self.apply_headers_to_request(
+                    http.request(method.clone(), url.clone()),
+                    &auth_headers,
+                );
+                if let Some(body) = body {
+                    request = request.body(body);
+                }
+                let response = request
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to execute {} {}", method, url))?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.bytes().await.with_context(|| {
+                    format!("failed to read response body for {} {}", method, url)
+                })?;
+                Ok(BufferedTransportResponse {
+                    status,
+                    headers,
+                    body,
+                })
+            }
+            ClientTransport::Relay(relay) => {
+                let source = self.relay_source_identity()?;
+                let ticket = relay
+                    .rendezvous
+                    .issue_relay_ticket(&RelayTicketRequest {
+                        cluster_id: relay.rendezvous.config().cluster_id,
+                        source,
+                        target: PeerIdentity::Node(relay.target_node_id),
+                        requested_expires_in_secs: Some(30),
+                    })
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed issuing relay ticket for client target node {}",
+                            relay.target_node_id
+                        )
+                    })?;
+                let response = relay
+                    .rendezvous
+                    .submit_relay_http_request(&RelayHttpRequest {
+                        ticket,
+                        request_id: uuid::Uuid::now_v7().to_string(),
+                        method: method.as_str().to_string(),
+                        path_and_query: path_and_query(&url),
+                        headers: auth_headers,
+                        body_base64: body
+                            .as_deref()
+                            .and_then(encode_optional_body_base64),
+                    })
+                    .await
+                    .with_context(|| format!("failed to relay {} {}", method, url))?;
+                buffered_response_from_relay(response)
             }
         }
     }
@@ -193,13 +367,13 @@ impl IronMeshClient {
         let key = key.into();
         let url = self.store_key_url(&key)?;
 
-        self.apply_auth(Method::PUT, &url, self.http.put(url.clone()))?
-            .body(data.clone())
-            .send()
+        let response = self
+            .execute_buffered_request(Method::PUT, url, Vec::new(), Some(data.to_vec()))
             .await
-            .with_context(|| format!("failed to PUT object key={key}"))?
-            .error_for_status()
-            .with_context(|| format!("server rejected PUT for key={key}"))?;
+            .with_context(|| format!("failed to PUT object key={key}"))?;
+        if !response.status.is_success() {
+            bail!("server rejected PUT for key={key}: {}", response.status);
+        }
 
         Ok(StorageObjectMeta {
             key,
@@ -222,15 +396,17 @@ impl IronMeshClient {
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
 
-        self.apply_auth(Method::GET, &url, self.http.get(url.clone()))?
-            .send()
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
             .await
-            .with_context(|| format!("failed to GET object key={key}"))?
-            .error_for_status()
-            .with_context(|| format!("object not found or inaccessible key={key}"))?
-            .bytes()
-            .await
-            .with_context(|| format!("failed to read payload for key={key}"))
+            .with_context(|| format!("failed to GET object key={key}"))?;
+        if !response.status.is_success() {
+            bail!(
+                "object not found or inaccessible key={key}: {}",
+                response.status
+            );
+        }
+        Ok(response.body)
     }
 
     pub async fn rename_path(
@@ -242,19 +418,24 @@ impl IronMeshClient {
         let from_path = from_path.into();
         let to_path = to_path.into();
         let url = self.store_rename_url()?;
+        let payload = serde_json::to_vec(&PathMutationRequest {
+            from_path: from_path.clone(),
+            to_path: to_path.clone(),
+            overwrite,
+        })
+        .context("failed to encode rename request")?;
 
         let response = self
-            .apply_auth(Method::POST, &url, self.http.post(url.clone()))?
-            .json(&PathMutationRequest {
-                from_path: from_path.clone(),
-                to_path: to_path.clone(),
-                overwrite,
-            })
-            .send()
+            .execute_buffered_request(
+                Method::POST,
+                url,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
             .await
             .with_context(|| format!("failed to rename {from_path} -> {to_path}"))?;
 
-        match response.status() {
+        match response.status {
             StatusCode::NO_CONTENT => Ok(()),
             StatusCode::NOT_FOUND => bail!("rename source path not found: {from_path}"),
             StatusCode::CONFLICT => bail!("rename target path already exists: {to_path}"),
@@ -273,19 +454,24 @@ impl IronMeshClient {
         let from_path = from_path.into();
         let to_path = to_path.into();
         let url = self.store_copy_url()?;
+        let payload = serde_json::to_vec(&PathMutationRequest {
+            from_path: from_path.clone(),
+            to_path: to_path.clone(),
+            overwrite,
+        })
+        .context("failed to encode copy request")?;
 
         let response = self
-            .apply_auth(Method::POST, &url, self.http.post(url.clone()))?
-            .json(&PathMutationRequest {
-                from_path: from_path.clone(),
-                to_path: to_path.clone(),
-                overwrite,
-            })
-            .send()
+            .execute_buffered_request(
+                Method::POST,
+                url,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
             .await
             .with_context(|| format!("failed to copy {from_path} -> {to_path}"))?;
 
-        match response.status() {
+        match response.status {
             StatusCode::NO_CONTENT => Ok(()),
             StatusCode::NOT_FOUND => bail!("copy source path not found: {from_path}"),
             StatusCode::CONFLICT => bail!("copy target path already exists: {to_path}"),
@@ -304,12 +490,11 @@ impl IronMeshClient {
         }
 
         let response = self
-            .apply_auth(Method::POST, &url, self.http.post(url.clone()))?
-            .send()
+            .execute_buffered_request(Method::POST, url, Vec::new(), None)
             .await
             .with_context(|| format!("failed to delete path {key}"))?;
 
-        match response.status() {
+        match response.status {
             StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(()),
             status => Err(anyhow!("delete failed for {key}: {status}")),
         }
@@ -327,15 +512,18 @@ impl IronMeshClient {
         append_optional_query(&mut url, "prefix", prefix);
         append_optional_query(&mut url, "snapshot", snapshot);
 
-        let mut result = self
-            .apply_auth(Method::GET, &url, self.http.get(url.clone()))?
-            .send()
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
             .await
-            .context("failed to request /store/index")?
-            .error_for_status()
-            .context("/store/index returned non-success status")?
-            .json::<StoreIndexResponse>()
-            .await
+            .context("failed to request /store/index")?;
+        if !response.status.is_success() {
+            bail!(
+                "/store/index returned non-success status: {}",
+                response.status
+            );
+        }
+
+        let mut result = serde_json::from_slice::<StoreIndexResponse>(&response.body)
             .context("failed to parse /store/index response");
 
         if let Ok(ref mut response) = result {
@@ -369,14 +557,17 @@ impl IronMeshClient {
             .append_pair("since", &since.to_string())
             .append_pair("timeout_ms", &timeout_ms.max(250).to_string());
 
-        self.apply_auth(Method::GET, &url, self.http.get(url.clone()))?
-            .send()
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
             .await
-            .context("failed to request /store/index/changes/wait")?
-            .error_for_status()
-            .context("/store/index/changes/wait returned non-success status")?
-            .json::<StoreIndexChangeWaitResponse>()
-            .await
+            .context("failed to request /store/index/changes/wait")?;
+        if !response.status.is_success() {
+            bail!(
+                "/store/index/changes/wait returned non-success status: {}",
+                response.status
+            );
+        }
+        serde_json::from_slice::<StoreIndexChangeWaitResponse>(&response.body)
             .context("failed to parse /store/index/changes/wait response")
     }
 
@@ -470,21 +661,19 @@ impl IronMeshClient {
                 .context("uploaded byte count overflow")?;
 
             let response = self
-                .apply_auth(
+                .execute_buffered_request(
                     Method::POST,
-                    &chunk_upload_url,
-                    self.http.post(chunk_upload_url.clone()),
-                )?
-                .body(chunk.to_vec())
-                .send()
+                    chunk_upload_url.clone(),
+                    Vec::new(),
+                    Some(chunk.to_vec()),
+                )
                 .await
-                .with_context(|| format!("failed to upload chunk for key={key}"))?
-                .error_for_status()
-                .with_context(|| format!("chunk upload rejected for key={key}"))?;
+                .with_context(|| format!("failed to upload chunk for key={key}"))?;
+            if !response.status.is_success() {
+                bail!("chunk upload rejected for key={key}: {}", response.status);
+            }
 
-            let uploaded = response
-                .json::<StoreChunkUploadResponse>()
-                .await
+            let uploaded = serde_json::from_slice::<StoreChunkUploadResponse>(&response.body)
                 .with_context(|| format!("failed to parse chunk upload response for {key}"))?;
 
             chunk_refs.push(CompleteStoreUploadChunkRef {
@@ -498,17 +687,24 @@ impl IronMeshClient {
             chunks: chunk_refs,
         };
 
-        self.apply_auth(
-            Method::POST,
-            &complete_url,
-            self.http.post(complete_url.clone()),
-        )?
-        .json(&complete_payload)
-        .send()
-        .await
-        .with_context(|| format!("failed to finalize chunked upload for key={key}"))?
-        .error_for_status()
-        .with_context(|| format!("chunked finalize rejected for key={key}"))?;
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                complete_url,
+                vec![json_content_type_header()],
+                Some(
+                    serde_json::to_vec(&complete_payload)
+                        .context("failed to encode chunked upload completion payload")?,
+                ),
+            )
+            .await
+            .with_context(|| format!("failed to finalize chunked upload for key={key}"))?;
+        if !response.status.is_success() {
+            bail!(
+                "chunked finalize rejected for key={key}: {}",
+                response.status
+            );
+        }
 
         Ok(UploadResult {
             meta: StorageObjectMeta {
@@ -590,21 +786,18 @@ impl IronMeshClient {
                 .context("uploaded byte count overflow")?;
 
             let response = runtime
-                .block_on(
-                    self.apply_auth(
-                        Method::POST,
-                        &chunk_upload_url,
-                        self.http.post(chunk_upload_url.clone()),
-                    )?
-                    .body(chunk[..read_bytes].to_vec())
-                    .send(),
-                )
-                .with_context(|| format!("failed to upload chunk for key={key}"))?
-                .error_for_status()
-                .with_context(|| format!("chunk upload rejected for key={key}"))?;
+                .block_on(self.execute_buffered_request(
+                    Method::POST,
+                    chunk_upload_url.clone(),
+                    Vec::new(),
+                    Some(chunk[..read_bytes].to_vec()),
+                ))
+                .with_context(|| format!("failed to upload chunk for key={key}"))?;
+            if !response.status.is_success() {
+                bail!("chunk upload rejected for key={key}: {}", response.status);
+            }
 
-            let uploaded = runtime
-                .block_on(response.json::<StoreChunkUploadResponse>())
+            let uploaded = serde_json::from_slice::<StoreChunkUploadResponse>(&response.body)
                 .with_context(|| format!("failed to parse chunk upload response for {key}"))?;
 
             chunk_refs.push(CompleteStoreUploadChunkRef {
@@ -628,19 +821,25 @@ impl IronMeshClient {
             chunks: chunk_refs,
         };
 
-        runtime
+        let response = runtime
             .block_on(
-                self.apply_auth(
+                self.execute_buffered_request(
                     Method::POST,
-                    &complete_url,
-                    self.http.post(complete_url.clone()),
-                )?
-                .json(&complete_payload)
-                .send(),
+                    complete_url,
+                    vec![json_content_type_header()],
+                    Some(
+                        serde_json::to_vec(&complete_payload)
+                            .context("failed to encode chunked upload completion payload")?,
+                    ),
+                ),
             )
-            .with_context(|| format!("failed to finalize chunked upload for key={key}"))?
-            .error_for_status()
-            .with_context(|| format!("chunked finalize rejected for key={key}"))?;
+            .with_context(|| format!("failed to finalize chunked upload for key={key}"))?;
+        if !response.status.is_success() {
+            bail!(
+                "chunked finalize rejected for key={key}: {}",
+                response.status
+            );
+        }
 
         Ok(UploadResult {
             meta: StorageObjectMeta {
@@ -670,9 +869,26 @@ impl IronMeshClient {
             .build()
             .context("failed to create runtime for download")?;
 
+        if matches!(self.transport, ClientTransport::Relay(_)) {
+            let payload = runtime
+                .block_on(self.get_with_selector(key, snapshot, version))
+                .with_context(|| format!("failed to GET object key={key}"))?;
+            writer
+                .write_all(payload.as_ref())
+                .with_context(|| format!("failed to write payload chunk for key={key}"))?;
+            writer
+                .flush()
+                .with_context(|| format!("failed to flush output for key={key}"))?;
+            return Ok(());
+        }
+
+        let direct_http = self
+            .direct_http()
+            .ok_or_else(|| anyhow!("direct HTTP transport is unavailable"))?;
+        let request_headers = self.request_auth_headers(&Method::GET, &url)?;
         let mut response = runtime
             .block_on(
-                self.apply_auth(Method::GET, &url, self.http.get(url.clone()))?
+                self.apply_headers_to_request(direct_http.get(url.clone()), &request_headers)
                     .send(),
             )
             .with_context(|| format!("failed to GET object key={key}"))?
@@ -710,21 +926,23 @@ impl IronMeshClient {
         append_optional_query(&mut url, "version", version);
 
         let response = self
-            .apply_auth(Method::HEAD, &url, self.http.head(url.clone()))?
-            .send()
+            .execute_buffered_request(Method::HEAD, url, Vec::new(), None)
             .await
             .with_context(|| format!("failed to HEAD object key={key}"))?;
 
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        if response.status == StatusCode::METHOD_NOT_ALLOWED {
             let bytes = self.get_with_selector(key, snapshot, version).await?;
             return Ok(bytes.len() as u64);
         }
 
-        let response = response
-            .error_for_status()
-            .with_context(|| format!("object not found or inaccessible key={key}"))?;
+        if !response.status.is_success() {
+            bail!(
+                "object not found or inaccessible key={key}: {}",
+                response.status
+            );
+        }
 
-        if let Some(content_length) = response.content_length()
+        if let Some(content_length) = buffered_content_length(&response)
             && content_length > 0
         {
             return Ok(content_length);
@@ -752,8 +970,8 @@ impl IronMeshClient {
     }
 
     fn store_key_url(&self, key: &str) -> Result<Url> {
-        let mut url = reqwest::Url::parse(&self.server_base_url)
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
         let mut segments = url
             .path_segments_mut()
@@ -766,8 +984,8 @@ impl IronMeshClient {
     }
 
     fn store_index_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(&self.server_base_url)
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
         {
             let mut segments = url
@@ -781,8 +999,8 @@ impl IronMeshClient {
     }
 
     fn store_index_change_wait_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(&self.server_base_url)
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
         {
             let mut segments = url
@@ -798,8 +1016,8 @@ impl IronMeshClient {
     }
 
     fn store_chunk_upload_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(&self.server_base_url)
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
         {
             let mut segments = url
@@ -813,8 +1031,8 @@ impl IronMeshClient {
     }
 
     fn store_rename_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(&self.server_base_url)
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
         {
             let mut segments = url
@@ -828,8 +1046,8 @@ impl IronMeshClient {
     }
 
     fn store_copy_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(&self.server_base_url)
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
         {
             let mut segments = url
@@ -843,8 +1061,8 @@ impl IronMeshClient {
     }
 
     fn store_delete_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(&self.server_base_url)
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
         {
             let mut segments = url
@@ -858,8 +1076,8 @@ impl IronMeshClient {
     }
 
     fn store_complete_url(&self, key: &str) -> Result<Url> {
-        let mut url = reqwest::Url::parse(&self.server_base_url)
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url))?;
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
         {
             let mut segments = url
@@ -871,6 +1089,41 @@ impl IronMeshClient {
         url.query_pairs_mut().append_pair("complete", "");
 
         Ok(url)
+    }
+}
+
+fn buffered_response_from_relay(response: RelayHttpResponse) -> Result<BufferedTransportResponse> {
+    let status = StatusCode::from_u16(response.status)
+        .with_context(|| format!("invalid relayed HTTP status {}", response.status))?;
+    let body = Bytes::from(response.body_bytes()?);
+    let mut headers = HeaderMap::new();
+    for header in response.headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .with_context(|| format!("invalid relayed header name {}", header.name))?;
+        let value = HeaderValue::from_str(&header.value)
+            .with_context(|| format!("invalid relayed header value for {}", header.name))?;
+        headers.append(name, value);
+    }
+    Ok(BufferedTransportResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn buffered_content_length(response: &BufferedTransportResponse) -> Option<u64> {
+    response
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(Some(response.body.len() as u64))
+}
+
+fn json_content_type_header() -> RelayHttpHeader {
+    RelayHttpHeader {
+        name: "content-type".to_string(),
+        value: "application/json".to_string(),
     }
 }
 
@@ -995,6 +1248,12 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use transport_sdk::{
+        RelayTicket, RelayTicketRequest, RendezvousClientConfig, RendezvousControlClient,
+    };
 
     #[test]
     fn object_url_builder_escapes_segments() {
@@ -1109,5 +1368,136 @@ mod tests {
         let client = IronMeshClient::new("http://127.0.0.1:18080/");
         let url = client.store_delete_url().expect("delete url should build");
         assert_eq!(url.as_str(), "http://127.0.0.1:18080/store/delete");
+    }
+
+    #[derive(Clone)]
+    struct RelayTestState {
+        captured_request: Arc<Mutex<Option<RelayHttpRequest>>>,
+    }
+
+    #[tokio::test]
+    async fn relay_transport_executes_store_index_request_with_signed_device_identity() {
+        async fn issue_ticket(Json(request): Json<RelayTicketRequest>) -> Json<RelayTicket> {
+            Json(RelayTicket {
+                cluster_id: request.cluster_id,
+                session_id: "relay-session-1".to_string(),
+                source: request.source,
+                target: request.target,
+                relay_urls: vec!["http://127.0.0.1:1".to_string()],
+                issued_at_unix: 1,
+                expires_at_unix: 61,
+            })
+        }
+
+        async fn relay_request(
+            State(state): State<RelayTestState>,
+            Json(request): Json<RelayHttpRequest>,
+        ) -> Json<RelayHttpResponse> {
+            *state.captured_request.lock().await = Some(request.clone());
+            Json(RelayHttpResponse {
+                cluster_id: request.ticket.cluster_id,
+                session_id: request.ticket.session_id.clone(),
+                request_id: request.request_id.clone(),
+                responder: request.ticket.target.clone(),
+                status: 200,
+                headers: vec![RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                }],
+                body_base64: encode_optional_body_base64(
+                    serde_json::to_string(&StoreIndexResponse {
+                        prefix: String::new(),
+                        depth: 1,
+                        entry_count: 1,
+                        entries: vec![StoreIndexEntry {
+                            path: "docs/readme.txt".to_string(),
+                            entry_type: "key".to_string(),
+                            version: Some("v1".to_string()),
+                            content_hash: Some("hash-1".to_string()),
+                            size_bytes: Some(42),
+                            content_fingerprint: None,
+                            media: None,
+                        }],
+                    })
+                    .expect("store index response should serialize")
+                    .as_bytes(),
+                ),
+            })
+        }
+
+        let relay_state = RelayTestState {
+            captured_request: Arc::new(Mutex::new(None)),
+        };
+        let router = Router::new()
+            .route("/control/relay/ticket", post(issue_ticket))
+            .route("/relay/http/request", post(relay_request))
+            .with_state(relay_state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("relay test server should run");
+        });
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("relay-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let target_node_id = NodeId::new_v4();
+        let rendezvous = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec![format!("http://{addr}")],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let client = IronMeshClient::with_relay_transport(
+            "https://relay.invalid/",
+            rendezvous,
+            target_node_id,
+        )
+        .with_client_identity(identity.clone());
+
+        let response = client
+            .store_index(None, 1, None)
+            .await
+            .expect("store index over relay should succeed");
+
+        assert_eq!(response.entry_count, 2);
+        assert_eq!(response.entries[0].path, "docs/");
+        assert_eq!(response.entries[1].path, "docs/readme.txt");
+
+        let captured = relay_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("relay request should be captured");
+        assert_eq!(
+            captured.ticket.source,
+            PeerIdentity::Device(identity.device_id)
+        );
+        assert_eq!(captured.ticket.target, PeerIdentity::Node(target_node_id));
+        assert_eq!(captured.path_and_query, "/store/index?depth=1");
+        assert!(
+            captured
+                .headers
+                .iter()
+                .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID
+                    && header.value == identity.device_id.to_string())
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 }
