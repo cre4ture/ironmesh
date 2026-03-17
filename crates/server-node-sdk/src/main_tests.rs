@@ -8,10 +8,16 @@ use super::{
     token_matches,
 };
 use common::NodeId;
+use rustls::RootCertStore;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tokio_rustls::TlsConnector;
 
 use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
 use axum::Router;
@@ -139,6 +145,58 @@ fn generate_test_internal_ca() -> (String, String) {
 
 fn default_tls_issue_policy() -> super::NodeTlsIssuePolicy {
     super::build_tls_issue_policy(None, None).unwrap()
+}
+
+fn load_root_store_from_pem_file(path: &std::path::Path) -> RootCertStore {
+    let mut reader = BufReader::new(File::open(path).unwrap());
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_reader_iter(&mut reader) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    roots
+}
+
+fn load_client_identity_from_pem_files(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let mut cert_reader = BufReader::new(File::open(cert_path).unwrap());
+    let cert_chain = CertificateDer::pem_reader_iter(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    let mut key_reader = BufReader::new(File::open(key_path).unwrap());
+    let key = PrivateKeyDer::from_pem_reader(&mut key_reader).unwrap();
+    (cert_chain, key)
+}
+
+async fn observe_peer_certificate_fingerprint(
+    addr: SocketAddr,
+    ca_cert_path: &std::path::Path,
+    client_identity: Option<(&std::path::Path, &std::path::Path)>,
+) -> String {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let roots = load_root_store_from_pem_file(ca_cert_path);
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let config = match client_identity {
+        Some((cert_path, key_path)) => {
+            let (cert_chain, key) = load_client_identity_from_pem_files(cert_path, key_path);
+            builder.with_client_auth_cert(cert_chain, key).unwrap()
+        }
+        None => builder.with_no_client_auth(),
+    };
+
+    let connector = TlsConnector::from(Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let server_name: ServerName<'static> = ServerName::from(addr.ip()).to_owned();
+    let tls = connector.connect(server_name, stream).await.unwrap();
+    let peer_cert = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .cloned()
+        .unwrap();
+    blake3::hash(peer_cert.as_ref()).to_hex().to_string()
 }
 
 #[test]
@@ -1278,6 +1336,247 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     );
 
     cleanup_test_state(&state).await;
+    issuer_handle.abort();
+    let _ = issuer_handle.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_certificates() {
+    let root = fresh_test_dir("node-auto-renew-served-certs");
+    let issuer_dir = root.join("issuer");
+    let issuer_bind_addr = free_bind_addr();
+    let issuer_public_url = format!("http://{issuer_bind_addr}");
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    let cluster_ca_path = issuer_dir.join("cluster-ca.pem");
+    let cluster_ca_key_path = issuer_dir.join("cluster-ca.key");
+    std::fs::create_dir_all(&issuer_dir).unwrap();
+    std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
+    std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
+
+    let mut issuer_config = super::ServerNodeConfig::local_edge(&issuer_dir, issuer_bind_addr);
+    issuer_config.admin_token = Some("admin-secret".to_string());
+    issuer_config.public_url = Some(issuer_public_url.clone());
+    issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
+    issuer_config.internal_ca_key_path = Some(cluster_ca_key_path.clone());
+    let issuer_handle = tokio::spawn(async move { super::run(issuer_config).await });
+    let issuer_http = reqwest::Client::new();
+    wait_for_http_status(
+        &issuer_http,
+        &format!("{issuer_public_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+
+    let package_path = root.join("node-enrollment.json");
+    let bind_addr = free_bind_addr();
+    let internal_bind_addr = free_bind_addr();
+    let bootstrap = transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: state.cluster_id,
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: root.join("node").to_string_lossy().into_owned(),
+        bind_addr: bind_addr.to_string(),
+        public_url: Some(format!("https://{bind_addr}")),
+        labels: HashMap::new(),
+        public_tls: Some(transport_sdk::BootstrapServerTlsFiles {
+            cert_path: "tls/public.pem".to_string(),
+            key_path: "tls/public.key".to_string(),
+        }),
+        public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+        public_peer_api_enabled: false,
+        internal_bind_addr: Some(internal_bind_addr.to_string()),
+        internal_url: Some(format!("https://{internal_bind_addr}")),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/cluster-ca.pem".to_string(),
+            cert_path: "tls/internal.pem".to_string(),
+            key_path: "tls/internal.key".to_string(),
+        }),
+        rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+        rendezvous_mtls_required: false,
+        direct_endpoints: Vec::new(),
+        relay_mode: transport_sdk::RelayMode::Fallback,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: Some(cluster_ca_pem.clone()),
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: None,
+        },
+        upstream_public_url: None,
+        enrollment_issuer_url: Some(issuer_public_url.clone()),
+    };
+    let issue_policy = default_tls_issue_policy();
+    let mut internal_material =
+        super::issue_internal_node_tls_material(&state, &bootstrap, issue_policy).unwrap();
+    let mut public_material =
+        super::issue_public_node_tls_material(&state, &bootstrap, issue_policy)
+            .unwrap()
+            .unwrap();
+    let renew_after_unix = super::unix_ts().saturating_add(5);
+    internal_material.metadata.renew_after_unix = renew_after_unix;
+    public_material.metadata.renew_after_unix = renew_after_unix;
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: Some(public_material.clone()),
+        internal_tls_material: Some(internal_material.clone()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+
+    let mut config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    config.enrollment_issuer_url = Some(issuer_public_url.clone());
+    config.node_enrollment_auto_renew_enabled = true;
+    config.node_enrollment_auto_renew_check_secs = 1;
+    config.node_enrollment_renewal_admin_token = Some("admin-secret".to_string());
+    let public_ca_cert_path = config.public_ca_cert_path.clone().unwrap();
+    let internal_tls = config.internal_tls.clone().unwrap();
+    let public_health_url = format!("https://{bind_addr}/health");
+    let internal_health_url = format!("https://{internal_bind_addr}/health");
+    let node_handle = tokio::spawn(async move { super::run(config).await });
+
+    let public_http = reqwest::Client::builder()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(&std::fs::read(&public_ca_cert_path).unwrap()).unwrap(),
+        )
+        .build()
+        .unwrap();
+    let internal_http = super::build_internal_mtls_http_client(
+        &internal_tls.ca_cert_path,
+        &internal_tls.cert_path,
+        &internal_tls.key_path,
+    )
+    .unwrap();
+
+    wait_for_http_status(
+        &public_http,
+        &public_health_url,
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_http_status(
+        &internal_http,
+        &internal_health_url,
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let initial_public_fingerprint =
+        observe_peer_certificate_fingerprint(bind_addr, &public_ca_cert_path, None).await;
+    let initial_internal_fingerprint = observe_peer_certificate_fingerprint(
+        internal_bind_addr,
+        &internal_tls.ca_cert_path,
+        Some((&internal_tls.cert_path, &internal_tls.key_path)),
+    )
+    .await;
+    assert_eq!(
+        initial_public_fingerprint,
+        public_material.metadata.certificate_fingerprint
+    );
+    assert_eq!(
+        initial_internal_fingerprint,
+        internal_material.metadata.certificate_fingerprint
+    );
+
+    wait_for_condition(
+        "served certificate rotation",
+        Duration::from_secs(20),
+        || {
+            let package_path = package_path.clone();
+            let public_ca_cert_path = public_ca_cert_path.clone();
+            let internal_ca_cert_path = internal_tls.ca_cert_path.clone();
+            let internal_cert_path = internal_tls.cert_path.clone();
+            let internal_key_path = internal_tls.key_path.clone();
+            let initial_public_fingerprint = initial_public_fingerprint.clone();
+            let initial_internal_fingerprint = initial_internal_fingerprint.clone();
+            async move {
+                let package = match transport_sdk::NodeEnrollmentPackage::from_path(&package_path) {
+                    Ok(package) => package,
+                    Err(_) => return false,
+                };
+                let expected_public = match package.public_tls_material.as_ref() {
+                    Some(material) => material.metadata.certificate_fingerprint.clone(),
+                    None => return false,
+                };
+                let expected_internal = match package.internal_tls_material.as_ref() {
+                    Some(material) => material.metadata.certificate_fingerprint.clone(),
+                    None => return false,
+                };
+                if expected_public == initial_public_fingerprint
+                    || expected_internal == initial_internal_fingerprint
+                {
+                    return false;
+                }
+
+                let observed_public =
+                    observe_peer_certificate_fingerprint(bind_addr, &public_ca_cert_path, None)
+                        .await;
+                let observed_internal = observe_peer_certificate_fingerprint(
+                    internal_bind_addr,
+                    &internal_ca_cert_path,
+                    Some((&internal_cert_path, &internal_key_path)),
+                )
+                .await;
+                observed_public == expected_public && observed_internal == expected_internal
+            }
+        },
+    )
+    .await;
+
+    let renewed_package = transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap();
+    let served_public_fingerprint =
+        observe_peer_certificate_fingerprint(bind_addr, &public_ca_cert_path, None).await;
+    let served_internal_fingerprint = observe_peer_certificate_fingerprint(
+        internal_bind_addr,
+        &internal_tls.ca_cert_path,
+        Some((&internal_tls.cert_path, &internal_tls.key_path)),
+    )
+    .await;
+    assert_ne!(served_public_fingerprint, initial_public_fingerprint);
+    assert_ne!(served_internal_fingerprint, initial_internal_fingerprint);
+    assert_eq!(
+        served_public_fingerprint,
+        renewed_package
+            .public_tls_material
+            .as_ref()
+            .unwrap()
+            .metadata
+            .certificate_fingerprint
+    );
+    assert_eq!(
+        served_internal_fingerprint,
+        renewed_package
+            .internal_tls_material
+            .as_ref()
+            .unwrap()
+            .metadata
+            .certificate_fingerprint
+    );
+
+    wait_for_http_status(
+        &public_http,
+        &public_health_url,
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_http_status(
+        &internal_http,
+        &internal_health_url,
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    cleanup_test_state(&state).await;
+    node_handle.abort();
+    let _ = node_handle.await;
     issuer_handle.abort();
     let _ = issuer_handle.await;
     let _ = std::fs::remove_dir_all(&root);

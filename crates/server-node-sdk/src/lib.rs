@@ -3600,7 +3600,9 @@ fn spawn_node_enrollment_auto_renew(
     interval_secs: u64,
 ) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(30)));
+        let mut ticker = tokio::time::interval(Duration::from_secs(
+            node_enrollment_auto_renew_interval_secs(interval_secs),
+        ));
 
         loop {
             ticker.tick().await;
@@ -3641,6 +3643,18 @@ fn spawn_node_enrollment_auto_renew(
             }
         }
     });
+}
+
+fn node_enrollment_auto_renew_interval_secs(interval_secs: u64) -> u64 {
+    #[cfg(test)]
+    {
+        interval_secs.max(1)
+    }
+
+    #[cfg(not(test))]
+    {
+        interval_secs.max(30)
+    }
 }
 
 fn spawn_upstream_peer_bootstrap(
