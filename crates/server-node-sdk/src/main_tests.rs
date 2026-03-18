@@ -2504,7 +2504,9 @@ async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
             device_id: identity.device_id.to_string(),
             label: Some("Pixel".to_string()),
             public_key_pem: Some(identity.public_key_pem.clone()),
+            public_key_fingerprint: None,
             issued_credential_pem: Some(credential_pem),
+            credential_fingerprint: None,
             created_at_unix: super::unix_ts(),
             revoked_at_unix: None,
         });
@@ -2601,7 +2603,9 @@ async fn client_auth_middleware_rejects_replayed_nonce_impl(backend: MainTestBac
             device_id: identity.device_id.to_string(),
             label: None,
             public_key_pem: Some(identity.public_key_pem.clone()),
+            public_key_fingerprint: None,
             issued_credential_pem: Some(credential_pem),
+            credential_fingerprint: None,
             created_at_unix: super::unix_ts(),
             revoked_at_unix: None,
         });
@@ -2667,6 +2671,53 @@ run_on_main_metadata_backends!(
     client_auth_middleware_rejects_replayed_nonce_impl,
     client_auth_middleware_rejects_replayed_nonce,
     client_auth_middleware_rejects_replayed_nonce_turso
+);
+
+async fn list_client_credentials_returns_fingerprint_metadata_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    {
+        let mut auth = state.client_credentials.lock().await;
+        auth.credentials.push(super::ClientCredentialRecord {
+            device_id: "device-list".to_string(),
+            label: Some("Surface".to_string()),
+            public_key_pem: Some(
+                "-----BEGIN PUBLIC KEY-----\nlist-test\n-----END PUBLIC KEY-----".to_string(),
+            ),
+            public_key_fingerprint: Some("pub-fingerprint".to_string()),
+            issued_credential_pem: Some(
+                "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\nlist-test\n-----END IRONMESH CLIENT CREDENTIAL-----\n"
+                    .to_string(),
+            ),
+            credential_fingerprint: Some("cred-fingerprint".to_string()),
+            created_at_unix: 123,
+            revoked_at_unix: None,
+        });
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::list_client_credentials(State(state.clone()), headers)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listed[0]["device_id"], "device-list");
+    assert_eq!(listed[0]["label"], "Surface");
+    assert_eq!(listed[0]["public_key_fingerprint"], "pub-fingerprint");
+    assert_eq!(listed[0]["credential_fingerprint"], "cred-fingerprint");
+    assert_eq!(listed[0]["created_at_unix"], 123);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_client_credentials_returns_fingerprint_metadata_impl,
+    list_client_credentials_returns_fingerprint_metadata,
+    list_client_credentials_returns_fingerprint_metadata_turso
 );
 
 async fn store_index_change_wait_unblocks_after_put_impl(backend: MainTestBackend) {

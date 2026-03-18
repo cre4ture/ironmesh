@@ -290,16 +290,17 @@ Notes:
 
 - Public client auth can be enabled with:
 	- `IRONMESH_REQUIRE_CLIENT_AUTH=true`
-- Admin can issue one-time pairing tokens:
+- Admin can issue one-time pairing authorizations:
 	- `POST /auth/pairing-tokens/issue`
 	- header: `x-ironmesh-admin-token: <admin token>`
-- Devices enroll with a pairing token and receive a bearer token:
+- Clients enroll with a pairing token and receive issued credential material:
 	- `POST /auth/device/enroll`
-- Admin can inspect and revoke enrolled devices:
-	- `GET /auth/devices`
-	- `DELETE /auth/devices/{device_id}`
+- Admin can inspect and revoke enrolled client credentials:
+	- `GET /auth/client-credentials`
+	- `DELETE /auth/client-credentials/{device_id}`
 - When client auth is enabled, data-plane routes require:
-	- `Authorization: Bearer <device token>`
+	- signed proof-of-possession request headers derived from the enrolled client identity
+	- the issued credential fingerprint bound to that identity
 
 - Historical token lifecycle bullets:
 	- `GET /cluster/internal-auth/tokens` — list configured node ids

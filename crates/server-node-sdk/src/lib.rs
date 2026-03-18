@@ -287,11 +287,15 @@ async fn require_client_auth(
         let Some(public_key_pem) = device.public_key_pem.clone() else {
             return Err(StatusCode::UNAUTHORIZED);
         };
-        let Some(issued_credential_pem) = device.issued_credential_pem.as_deref() else {
-            return Err(StatusCode::UNAUTHORIZED);
+        let stored_credential_fingerprint = match (
+            device.credential_fingerprint.as_deref(),
+            device.issued_credential_pem.as_deref(),
+        ) {
+            (Some(fingerprint), _) if !fingerprint.trim().is_empty() => fingerprint.to_string(),
+            (_, Some(issued_credential_pem)) => credential_fingerprint(issued_credential_pem)
+                .map_err(|_| StatusCode::UNAUTHORIZED)?,
+            _ => return Err(StatusCode::UNAUTHORIZED),
         };
-        let stored_credential_fingerprint =
-            credential_fingerprint(issued_credential_pem).map_err(|_| StatusCode::UNAUTHORIZED)?;
         (public_key_pem, stored_credential_fingerprint)
     };
 
@@ -341,6 +345,10 @@ fn generate_client_credential_pem(
     format!(
         "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\ncluster_id={cluster_id}\ndevice_id={device_id}\nissued_at_unix={issued_at_unix}\nexpires_at_unix={expires_at_unix}\npublic_key_fingerprint={public_key_fingerprint}\n-----END IRONMESH CLIENT CREDENTIAL-----\n"
     )
+}
+
+fn text_fingerprint(value: &str) -> String {
+    blake3::hash(value.trim().as_bytes()).to_hex().to_string()
 }
 
 fn issue_client_rendezvous_identity_pem(
@@ -2687,10 +2695,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         ));
 
     let public_admin_api = Router::new()
-        .route("/auth/devices", get(list_client_devices))
+        .route("/auth/client-credentials", get(list_client_credentials))
         .route(
-            "/auth/devices/{device_id}",
-            axum::routing::delete(revoke_client_device),
+            "/auth/client-credentials/{device_id}",
+            axum::routing::delete(revoke_client_credential),
         )
         .route(
             "/auth/bootstrap-bundles/issue",
@@ -5268,9 +5276,11 @@ struct ClientDeviceEnrollResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct ClientDeviceView {
+struct ClientCredentialView {
     device_id: String,
     label: Option<String>,
+    public_key_fingerprint: Option<String>,
+    credential_fingerprint: Option<String>,
     created_at_unix: u64,
     revoked_at_unix: Option<u64>,
 }
@@ -6345,11 +6355,18 @@ async fn enroll_client_device(
         pairing_auth.consumed_by_device_id = Some(device_id.clone());
 
         let final_label = label.or_else(|| pairing_auth.label.clone());
+        let public_key_fingerprint = text_fingerprint(public_key_pem);
+        let credential_fingerprint = match credential_fingerprint(&credential_pem) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
         let device = ClientCredentialRecord {
             device_id: device_id.clone(),
             label: final_label.clone(),
             public_key_pem: Some(public_key_pem.to_string()),
+            public_key_fingerprint: Some(public_key_fingerprint),
             issued_credential_pem: Some(credential_pem.clone()),
+            credential_fingerprint: Some(credential_fingerprint),
             created_at_unix: now,
             revoked_at_unix: None,
         };
@@ -6378,27 +6395,37 @@ async fn enroll_client_device(
     (StatusCode::CREATED, Json(response)).into_response()
 }
 
-async fn list_client_devices(
+async fn list_client_credentials(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let action = "auth/devices/list";
+    let action = "auth/client-credentials/list";
     let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
     {
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
 
-    let devices = {
+    let credentials = {
         let auth_state = state.client_credentials.lock().await;
         auth_state
             .credentials
             .iter()
-            .map(|device| ClientDeviceView {
-                device_id: device.device_id.clone(),
-                label: device.label.clone(),
-                created_at_unix: device.created_at_unix,
-                revoked_at_unix: device.revoked_at_unix,
+            .map(|credential| ClientCredentialView {
+                device_id: credential.device_id.clone(),
+                label: credential.label.clone(),
+                public_key_fingerprint: credential
+                    .public_key_fingerprint
+                    .clone()
+                    .or_else(|| credential.public_key_pem.as_deref().map(text_fingerprint)),
+                credential_fingerprint: credential.credential_fingerprint.clone().or_else(|| {
+                    credential
+                        .issued_credential_pem
+                        .as_deref()
+                        .and_then(|pem| credential_fingerprint(pem).ok())
+                }),
+                created_at_unix: credential.created_at_unix,
+                revoked_at_unix: credential.revoked_at_unix,
             })
             .collect::<Vec<_>>()
     };
@@ -6411,19 +6438,19 @@ async fn list_client_devices(
         true,
         true,
         "success",
-        json!({ "devices": devices.len() }),
+        json!({ "credentials": credentials.len() }),
     )
     .await;
 
-    (StatusCode::OK, Json(devices)).into_response()
+    (StatusCode::OK, Json(credentials)).into_response()
 }
 
-async fn revoke_client_device(
+async fn revoke_client_credential(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> impl IntoResponse {
-    let action = "auth/devices/revoke";
+    let action = "auth/client-credentials/revoke";
     let authz = match authorize_admin_request(
         &state,
         &headers,
@@ -6455,7 +6482,7 @@ async fn revoke_client_device(
     if revoked && let Err(err) = persist_client_credential_state(&state).await {
         warn!(
             error = %err,
-            "failed to persist client credential state after device revocation"
+            "failed to persist client credential state after client credential revocation"
         );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }

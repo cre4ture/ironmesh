@@ -241,7 +241,11 @@ pub struct ClientCredentialRecord {
     #[serde(default)]
     pub public_key_pem: Option<String>,
     #[serde(default)]
+    pub public_key_fingerprint: Option<String>,
+    #[serde(default)]
     pub issued_credential_pem: Option<String>,
+    #[serde(default)]
+    pub credential_fingerprint: Option<String>,
     pub created_at_unix: u64,
     pub revoked_at_unix: Option<u64>,
 }

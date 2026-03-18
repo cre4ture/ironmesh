@@ -144,6 +144,8 @@
       <li><code>POST /cluster/nodes/{node_id}/heartbeat</code> - refresh node liveness</li>
       <li><code>GET /cluster/placement/{key}</code> - deterministic placement decision</li>
       <li><code>POST /auth/bootstrap-bundles/issue</code> - issue a bootstrap JSON bundle for client enrollment (admin token required)</li>
+      <li><code>GET /auth/client-credentials</code> - inspect enrolled client credential metadata including fingerprints and revocation state (admin token required)</li>
+      <li><code>DELETE /auth/client-credentials/{device_id}</code> - revoke an enrolled client credential (admin token required)</li>
       <li><code>POST /auth/node-bootstraps/issue</code> - issue a node bootstrap JSON artifact for provisioning a server node (admin token required)</li>
       <li><code>POST /auth/node-enrollments/issue</code> - issue a node enrollment package with generated internal mTLS material and optional public HTTPS certificates (admin token required, CA key material required)</li>
       <li><code>POST /auth/node-enrollments/renew</code> - renew an existing node enrollment package with fresh TLS material for the same node identity (admin token required, CA key material required)</li>
