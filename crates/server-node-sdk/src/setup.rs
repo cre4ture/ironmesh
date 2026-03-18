@@ -34,20 +34,6 @@ enum SetupLifecycleState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SetupJoinRequest {
-    version: u32,
-    requested_at_unix: u64,
-    node_id: NodeId,
-    data_dir: String,
-    bind_addr: String,
-    public_url: String,
-    internal_bind_addr: String,
-    internal_url: String,
-    labels: HashMap<String, String>,
-    public_peer_api_enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagedSetupState {
     version: u32,
     state: SetupLifecycleState,
@@ -56,7 +42,7 @@ struct ManagedSetupState {
     node_id: Option<NodeId>,
     runtime_node_enrollment_path: Option<String>,
     admin_token: Option<String>,
-    pending_join_request: Option<SetupJoinRequest>,
+    pending_join_request: Option<NodeJoinRequest>,
 }
 
 impl Default for ManagedSetupState {
@@ -95,7 +81,7 @@ struct SetupStatusResponse {
     bootstrap_tls_fingerprint: Option<String>,
     cluster_id: Option<ClusterId>,
     node_id: Option<NodeId>,
-    pending_join_request: Option<SetupJoinRequest>,
+    pending_join_request: Option<NodeJoinRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,15 +118,15 @@ pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
     let config = default_setup_bootstrap_config()?;
     if let Some(managed_state) = read_managed_setup_state(&config.state_path)?
         && managed_state.state == SetupLifecycleState::Online
-            && let Some(enrollment_path) = managed_state.runtime_node_enrollment_path.as_deref()
-        {
-            let resolved_path = resolve_materialized_path(&config.data_dir, enrollment_path);
-            if resolved_path.exists() {
-                let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path)?;
-                runtime.admin_token = managed_state.admin_token.clone();
-                return Ok(StartupMode::Runtime(runtime));
-            }
+        && let Some(enrollment_path) = managed_state.runtime_node_enrollment_path.as_deref()
+    {
+        let resolved_path = resolve_materialized_path(&config.data_dir, enrollment_path);
+        if resolved_path.exists() {
+            let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path)?;
+            runtime.admin_token = managed_state.admin_token.clone();
+            return Ok(StartupMode::Runtime(runtime));
         }
+    }
 
     Ok(StartupMode::Setup(config))
 }
@@ -438,26 +424,38 @@ async fn generate_join_request(
     }
     let node_id = managed.node_id.unwrap_or_else(NodeId::new_v4);
     let internal_bind_addr = default_internal_bind_addr(state.config.bind_addr);
-    let join_request = SetupJoinRequest {
+    let join_request = NodeJoinRequest {
         version: SETUP_STATE_VERSION,
-        requested_at_unix: unix_ts(),
         node_id,
+        mode: NodeBootstrapMode::Cluster,
         data_dir: state.config.data_dir.display().to_string(),
         bind_addr: state.config.bind_addr.to_string(),
-        public_url: origin_to_string(&public_origin),
-        internal_bind_addr: internal_bind_addr.to_string(),
-        internal_url: match derive_internal_url(&public_origin, internal_bind_addr.port()) {
-            Ok(url) => url,
-            Err(err) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": err.to_string() })),
-                )
-                    .into_response();
-            }
-        },
+        public_url: Some(origin_to_string(&public_origin)),
         labels: default_setup_labels(),
+        public_tls: Some(BootstrapServerTlsFiles {
+            cert_path: "managed/runtime/public/public.pem".to_string(),
+            key_path: "managed/runtime/public/public.key".to_string(),
+        }),
+        public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
         public_peer_api_enabled: false,
+        internal_bind_addr: Some(internal_bind_addr.to_string()),
+        internal_url: Some(
+            match derive_internal_url(&public_origin, internal_bind_addr.port()) {
+                Ok(url) => url,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            },
+        ),
+        internal_tls: Some(BootstrapTlsFiles {
+            ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
+            cert_path: "managed/runtime/internal/node.pem".to_string(),
+            key_path: "managed/runtime/internal/node.key".to_string(),
+        }),
     };
     managed.state = SetupLifecycleState::PendingJoin;
     managed.updated_at_unix = unix_ts();
@@ -960,17 +958,27 @@ mod tests {
             node_id: Some(NodeId::new_v4()),
             runtime_node_enrollment_path: Some("managed/runtime/node-enrollment.json".to_string()),
             admin_token: Some("super-secret-token".to_string()),
-            pending_join_request: Some(SetupJoinRequest {
+            pending_join_request: Some(NodeJoinRequest {
                 version: SETUP_STATE_VERSION,
-                requested_at_unix: 456,
                 node_id: NodeId::new_v4(),
+                mode: NodeBootstrapMode::Cluster,
                 data_dir: dir.display().to_string(),
                 bind_addr: "0.0.0.0:8443".to_string(),
-                public_url: "https://node-a.local:8443".to_string(),
-                internal_bind_addr: "0.0.0.0:18443".to_string(),
-                internal_url: "https://node-a.local:18443".to_string(),
+                public_url: Some("https://node-a.local:8443".to_string()),
                 labels: default_setup_labels(),
+                public_tls: Some(BootstrapServerTlsFiles {
+                    cert_path: "managed/runtime/public/public.pem".to_string(),
+                    key_path: "managed/runtime/public/public.key".to_string(),
+                }),
+                public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
                 public_peer_api_enabled: false,
+                internal_bind_addr: Some("0.0.0.0:18443".to_string()),
+                internal_url: Some("https://node-a.local:18443".to_string()),
+                internal_tls: Some(BootstrapTlsFiles {
+                    ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
+                    cert_path: "managed/runtime/internal/node.pem".to_string(),
+                    key_path: "managed/runtime/internal/node.key".to_string(),
+                }),
             }),
         };
         write_managed_setup_state(&path, &state).unwrap();
@@ -981,7 +989,7 @@ mod tests {
             restored
                 .pending_join_request
                 .as_ref()
-                .map(|request| request.public_url.as_str()),
+                .and_then(|request| request.public_url.as_deref()),
             Some("https://node-a.local:8443")
         );
     }

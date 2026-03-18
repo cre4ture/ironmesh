@@ -1079,6 +1079,69 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
 }
 
 #[tokio::test]
+async fn issue_node_enrollment_from_join_request_returns_enrollment_package() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.public_ca_pem = Some(cluster_ca_pem);
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    let join_request = transport_sdk::NodeJoinRequest {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: "./data/node-join".to_string(),
+        bind_addr: "127.0.0.1:28080".to_string(),
+        public_url: Some("https://node-join.example".to_string()),
+        labels: HashMap::from([("rack".to_string(), "rack-join".to_string())]),
+        public_tls: Some(transport_sdk::BootstrapServerTlsFiles {
+            cert_path: "managed/runtime/public/public.pem".to_string(),
+            key_path: "managed/runtime/public/public.key".to_string(),
+        }),
+        public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
+        public_peer_api_enabled: false,
+        internal_bind_addr: Some("127.0.0.1:38080".to_string()),
+        internal_url: Some("https://node-join.example:38080".to_string()),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
+            cert_path: "managed/runtime/internal/node.pem".to_string(),
+            key_path: "managed/runtime/internal/node.key".to_string(),
+        }),
+    };
+
+    let response = super::issue_node_enrollment_from_join_request(
+        State(state.clone()),
+        headers,
+        Json(super::NodeJoinEnrollmentIssueRequest {
+            join_request: join_request.clone(),
+            tls_validity_secs: None,
+            tls_renewal_window_secs: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let package: transport_sdk::NodeEnrollmentPackage = serde_json::from_slice(&body).unwrap();
+    assert_eq!(package.bootstrap.node_id, join_request.node_id);
+    assert_eq!(package.bootstrap.bind_addr, join_request.bind_addr);
+    assert_eq!(package.bootstrap.public_url, join_request.public_url);
+    assert_eq!(package.bootstrap.internal_url, join_request.internal_url);
+    assert_eq!(
+        package.bootstrap.labels.get("rack").map(String::as_str),
+        Some("rack-join")
+    );
+    assert!(package.public_tls_material.is_some());
+    assert!(package.internal_tls_material.is_some());
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn issue_node_enrollment_allows_local_edge_with_public_tls_only() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());

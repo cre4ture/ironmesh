@@ -142,6 +142,32 @@ pub struct NodeBootstrap {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeJoinRequest {
+    pub version: u32,
+    pub node_id: NodeId,
+    #[serde(default)]
+    pub mode: NodeBootstrapMode,
+    pub data_dir: String,
+    pub bind_addr: String,
+    #[serde(default)]
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub public_tls: Option<BootstrapServerTlsFiles>,
+    #[serde(default)]
+    pub public_ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub public_peer_api_enabled: bool,
+    #[serde(default)]
+    pub internal_bind_addr: Option<String>,
+    #[serde(default)]
+    pub internal_url: Option<String>,
+    #[serde(default)]
+    pub internal_tls: Option<BootstrapTlsFiles>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeEnrollmentPackage {
     pub bootstrap: NodeBootstrap,
     #[serde(default)]
@@ -253,6 +279,57 @@ impl NodeBootstrap {
         validate_url_list("rendezvous_urls", &self.rendezvous_urls)?;
         validate_endpoint_list(&self.direct_endpoints)?;
         validate_trust_roots(&self.trust_roots)?;
+        Ok(())
+    }
+}
+
+impl NodeJoinRequest {
+    pub fn from_json_str(raw: &str) -> Result<Self> {
+        let request =
+            serde_json::from_str::<Self>(raw).context("failed to parse node join request JSON")?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read node join request {}", path.display()))?;
+        Self::from_json_str(&raw)
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).context("failed to serialize node join request JSON")
+    }
+
+    pub fn write_to_path(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        fs::write(path, self.to_json_pretty()?)
+            .with_context(|| format!("failed to write node join request {}", path.display()))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_version(self.version)?;
+        if self.node_id.is_nil() {
+            bail!("node join request must include a non-nil node_id");
+        }
+        validate_required_non_empty("data_dir", &self.data_dir)?;
+        validate_socket_addr("bind_addr", &self.bind_addr)?;
+        validate_optional_url("public_url", self.public_url.as_deref())?;
+        validate_optional_non_empty("public_ca_cert_path", self.public_ca_cert_path.as_deref())?;
+        validate_optional_socket_addr("internal_bind_addr", self.internal_bind_addr.as_deref())?;
+        validate_optional_url("internal_url", self.internal_url.as_deref())?;
+        validate_optional_server_tls_files("public_tls", self.public_tls.as_ref())?;
+        validate_optional_tls_files("internal_tls", self.internal_tls.as_ref())?;
+        if self.mode == NodeBootstrapMode::Cluster && self.internal_tls.is_none() {
+            bail!("cluster node join request must include internal_tls");
+        }
+        if self.internal_tls.is_some() && self.internal_bind_addr.is_none() {
+            bail!("node join request internal_tls requires internal_bind_addr");
+        }
         Ok(())
     }
 }
@@ -586,6 +663,36 @@ mod tests {
         bootstrap
             .validate()
             .expect("node bootstrap should validate");
+    }
+
+    #[test]
+    fn node_join_request_validates_cluster_runtime_shape() {
+        let request = NodeJoinRequest {
+            version: CLIENT_BOOTSTRAP_VERSION,
+            node_id: Uuid::now_v7(),
+            mode: NodeBootstrapMode::Cluster,
+            data_dir: "./data/node-a".to_string(),
+            bind_addr: "127.0.0.1:8080".to_string(),
+            public_url: Some("https://node-a.example".to_string()),
+            labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
+            public_tls: Some(BootstrapServerTlsFiles {
+                cert_path: "managed/runtime/public/public.pem".to_string(),
+                key_path: "managed/runtime/public/public.key".to_string(),
+            }),
+            public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
+            public_peer_api_enabled: false,
+            internal_bind_addr: Some("127.0.0.1:18080".to_string()),
+            internal_url: Some("https://127.0.0.1:18080".to_string()),
+            internal_tls: Some(BootstrapTlsFiles {
+                ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
+                cert_path: "managed/runtime/internal/node.pem".to_string(),
+                key_path: "managed/runtime/internal/node.key".to_string(),
+            }),
+        };
+
+        request
+            .validate()
+            .expect("node join request should validate");
     }
 
     #[test]

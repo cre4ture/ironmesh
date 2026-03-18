@@ -101,6 +101,14 @@
     <pre id="node-enrollment-json">click the enrollment button to issue a bootstrap plus generated TLS PEM material</pre>
     <p id="node-enrollment-notes"></p>
 
+    <h3>Issue Enrollment From Join Request</h3>
+    <p>Imports a joining node's request blob and issues a node enrollment package via <code>POST /auth/node-join-requests/issue-enrollment</code>. This is the cluster-side companion to the first-run bootstrap join flow.</p>
+    <label for="node-join-request-json">Node join request JSON</label>
+    <textarea id="node-join-request-json" rows="10" spellcheck="false" placeholder='{"version":1,"node_id":"..."}'></textarea>
+    <button id="issue-node-enrollment-from-join-request" type="button">Issue enrollment from join request</button>
+    <pre id="node-join-request-enrollment-json">paste a node join request and click the button to issue an enrollment package for that node</pre>
+    <p id="node-join-request-enrollment-notes"></p>
+
     <h3>Node enrollment renewal</h3>
     <p>Reissues TLS material for an existing enrollment via <code>POST /auth/node-enrollments/renew</code>. Paste the current node enrollment JSON to preserve the same bootstrap identity while rotating certs.</p>
     <label for="node-renewal-package-json">Existing node enrollment JSON</label>
@@ -148,6 +156,7 @@
       <li><code>DELETE /auth/client-credentials/{device_id}?reason=&lt;text&gt;</code> - revoke an enrolled client credential and optionally record a revocation reason (admin token required)</li>
       <li><code>POST /auth/node-bootstraps/issue</code> - issue a node bootstrap JSON artifact for provisioning a server node (admin token required)</li>
       <li><code>POST /auth/node-enrollments/issue</code> - issue a node enrollment package with generated internal mTLS material and optional public HTTPS certificates (admin token required, CA key material required)</li>
+      <li><code>POST /auth/node-join-requests/issue-enrollment</code> - issue a node enrollment package from a joining node's request blob (admin token required, CA key material required)</li>
       <li><code>POST /auth/node-enrollments/renew</code> - renew an existing node enrollment package with fresh TLS material for the same node identity (admin token required, CA key material required)</li>
       <li><code>GET /auth/node-certificates/status</code> - inspect current public/internal certificate expiry and renewal state (admin token required)</li>
       <li><code>GET /cluster/replication/plan</code> - current replication gaps/overages</li>

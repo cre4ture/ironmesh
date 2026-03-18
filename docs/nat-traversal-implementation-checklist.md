@@ -30,8 +30,8 @@ Status: Concrete repo-mapped implementation plan for the target architecture
   - bootstrap mode generates and persists a temporary self-signed HTTPS identity automatically,
   - bootstrap mode persists managed node setup state under the node data directory,
   - `Start a new cluster` now creates a self-managed cluster CA plus a local node enrollment package automatically and transitions the process into the normal runtime path without requiring env vars,
-  - `Join an existing cluster` now supports generating a transportable join-request blob on the joining node and importing an issued node enrollment package to transition into the normal runtime path,
-  - the current first slice still maps the bootstrap-created admin password onto the existing admin-token authentication model for the normal runtime UI/API, and the existing-cluster side still needs the follow-up UI/API work for importing a join request directly instead of using the already-existing manual node-enrollment issuance flow.
+  - `Join an existing cluster` now supports generating a transportable join-request blob on the joining node, issuing a node enrollment package from that join request on an existing cluster node, and importing the issued enrollment package on the joining node to transition into the normal runtime path,
+  - the current first slice still maps the bootstrap-created admin password onto the existing admin-token authentication model for the normal runtime UI/API rather than a fuller login/session model.
 
 ## 1c. Current priority order
 

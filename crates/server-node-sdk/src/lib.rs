@@ -52,11 +52,11 @@ use transport_sdk::{
     BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots, CandidateKind,
     ClientBootstrap as TransportClientBootstrap, ConnectionCandidate,
     NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
-    PeerIdentity, PeerTransportClient, PeerTransportClientConfig, PresenceRegistration,
-    RelayHttpHeader, RelayHttpPollRequest, RelayHttpRequest, RelayHttpResponse, RelayMode,
-    RelayTicketRequest, RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders,
-    TransportCapability, TransportPathKind, credential_fingerprint, encode_optional_body_base64,
-    verify_signed_request_headers,
+    NodeJoinRequest, PeerIdentity, PeerTransportClient, PeerTransportClientConfig,
+    PresenceRegistration, RelayHttpHeader, RelayHttpPollRequest, RelayHttpRequest,
+    RelayHttpResponse, RelayMode, RelayTicketRequest, RendezvousClientConfig,
+    RendezvousControlClient, SignedRequestHeaders, TransportCapability, TransportPathKind,
+    credential_fingerprint, encode_optional_body_base64, verify_signed_request_headers,
 };
 use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
@@ -2710,6 +2710,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         )
         .route("/auth/node-bootstraps/issue", post(issue_node_bootstrap))
         .route("/auth/node-enrollments/issue", post(issue_node_enrollment))
+        .route(
+            "/auth/node-join-requests/issue-enrollment",
+            post(issue_node_enrollment_from_join_request),
+        )
         .route("/auth/node-enrollments/renew", post(renew_node_enrollment))
         .route(
             "/auth/node-certificates/status",
@@ -5241,6 +5245,13 @@ struct NodeEnrollmentRenewRequest {
     tls_renewal_window_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NodeJoinEnrollmentIssueRequest {
+    join_request: NodeJoinRequest,
+    tls_validity_secs: Option<u64>,
+    tls_renewal_window_secs: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct OutboundNodeEnrollmentRenewRequest {
     package: NodeEnrollmentPackage,
@@ -5423,10 +5434,11 @@ fn bootstrap_trust_roots(
 }
 
 fn bootstrap_rendezvous_urls(state: &ServerState) -> std::result::Result<Vec<String>, StatusCode> {
-    if !state.rendezvous_registration_enabled {
-        return Err(StatusCode::PRECONDITION_FAILED);
-    }
-    Ok(state.rendezvous_urls.clone())
+    Ok(if state.rendezvous_registration_enabled {
+        state.rendezvous_urls.clone()
+    } else {
+        Vec::new()
+    })
 }
 
 fn build_bootstrap_direct_endpoints(
@@ -5468,6 +5480,28 @@ fn default_public_url(bind_addr: &str, tls_enabled: bool) -> String {
 
 fn default_internal_url(bind_addr: &str) -> String {
     format!("https://{bind_addr}")
+}
+
+fn node_bootstrap_issue_request_from_join_request(
+    join_request: NodeJoinRequest,
+) -> NodeBootstrapIssueRequest {
+    NodeBootstrapIssueRequest {
+        node_id: Some(join_request.node_id),
+        mode: Some(join_request.mode),
+        data_dir: Some(join_request.data_dir),
+        bind_addr: Some(join_request.bind_addr),
+        public_url: join_request.public_url,
+        labels: Some(join_request.labels),
+        public_tls: join_request.public_tls,
+        public_ca_cert_path: join_request.public_ca_cert_path,
+        public_peer_api_enabled: Some(join_request.public_peer_api_enabled),
+        internal_bind_addr: join_request.internal_bind_addr,
+        internal_url: join_request.internal_url,
+        internal_tls: join_request.internal_tls,
+        enrollment_issuer_url: None,
+        tls_validity_secs: None,
+        tls_renewal_window_secs: None,
+    }
 }
 
 fn build_issued_node_bootstrap(
@@ -5939,6 +5973,203 @@ async fn issue_node_enrollment(
             return (status, Json(json!({ "error": err }))).into_response();
         }
     };
+
+    let issue_policy = match build_tls_issue_policy(tls_validity_secs, tls_renewal_window_secs) {
+        Ok(policy) => policy,
+        Err(status) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": "invalid TLS validity policy" }),
+            )
+            .await;
+            return (
+                status,
+                Json(json!({ "error": "invalid TLS validity policy" })),
+            )
+                .into_response();
+        }
+    };
+
+    let internal_tls_material = if bootstrap.internal_tls.is_some() {
+        match issue_internal_node_tls_material(&state, &bootstrap, issue_policy) {
+            Ok(material) => Some(material),
+            Err(status) => {
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": "failed to issue internal node TLS material" }),
+                )
+                .await;
+                return (
+                    status,
+                    Json(json!({ "error": "failed to issue internal node TLS material" })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+    let public_tls_material = match issue_public_node_tls_material(&state, &bootstrap, issue_policy)
+    {
+        Ok(material) => material,
+        Err(status) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": "failed to issue public node TLS material" }),
+            )
+            .await;
+            return (
+                status,
+                Json(json!({ "error": "failed to issue public node TLS material" })),
+            )
+                .into_response();
+        }
+    };
+
+    let package = NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material,
+        internal_tls_material,
+    };
+
+    if let Err(err) = package.validate() {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "node_id": package.bootstrap.node_id,
+            "mode": package.bootstrap.mode,
+            "includes_public_tls_material": package.public_tls_material.is_some(),
+            "public_tls_expires_at_unix": package
+                .public_tls_material
+                .as_ref()
+                .map(|material| material.metadata.not_after_unix),
+            "internal_tls_expires_at_unix": package
+                .internal_tls_material
+                .as_ref()
+                .map(|material| material.metadata.not_after_unix),
+        }),
+    )
+    .await;
+
+    (StatusCode::CREATED, Json(package)).into_response()
+}
+
+async fn issue_node_enrollment_from_join_request(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NodeJoinEnrollmentIssueRequest>,
+) -> impl IntoResponse {
+    let action = "auth/node-join-requests/issue-enrollment";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "node_id": request.join_request.node_id,
+            "mode": request.join_request.mode,
+            "data_dir": request.join_request.data_dir,
+            "bind_addr": request.join_request.bind_addr,
+            "public_url": request.join_request.public_url,
+            "tls_validity_secs": request.tls_validity_secs,
+            "tls_renewal_window_secs": request.tls_renewal_window_secs,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    if let Err(err) = request.join_request.validate() {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    let mut bootstrap_request =
+        node_bootstrap_issue_request_from_join_request(request.join_request);
+    bootstrap_request.tls_validity_secs = request.tls_validity_secs;
+    bootstrap_request.tls_renewal_window_secs = request.tls_renewal_window_secs;
+
+    let tls_validity_secs = bootstrap_request.tls_validity_secs;
+    let tls_renewal_window_secs = bootstrap_request.tls_renewal_window_secs;
+    let enrollment_issuer_url = local_public_enrollment_issuer_url(&state).await;
+    let bootstrap =
+        match build_issued_node_bootstrap(&state, bootstrap_request, enrollment_issuer_url) {
+            Ok(bootstrap) => bootstrap,
+            Err(status) => {
+                let err = "invalid node join request";
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": err }),
+                )
+                .await;
+                return (status, Json(json!({ "error": err }))).into_response();
+            }
+        };
 
     let issue_policy = match build_tls_issue_policy(tls_validity_secs, tls_renewal_window_secs) {
         Ok(policy) => policy,

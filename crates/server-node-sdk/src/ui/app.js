@@ -284,6 +284,66 @@ async function issueNodeEnrollment() {
   }
 }
 
+async function issueNodeEnrollmentFromJoinRequest() {
+  const output = document.getElementById('node-join-request-enrollment-json');
+  const notes = document.getElementById('node-join-request-enrollment-notes');
+  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
+  const joinRequestRaw = document.getElementById('node-join-request-json').value.trim();
+  if (!adminToken) {
+    output.textContent = 'admin token is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!joinRequestRaw) {
+    output.textContent = 'node join request JSON is required';
+    notes.textContent = '';
+    return;
+  }
+
+  let joinRequest;
+  try {
+    joinRequest = JSON.parse(joinRequestRaw);
+  } catch (error) {
+    output.textContent = 'failed to parse node join request JSON: ' + error;
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'issuing node enrollment package from join request...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/node-join-requests/issue-enrollment', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+        'x-ironmesh-admin-token': adminToken
+      },
+      body: JSON.stringify({
+        join_request: joinRequest,
+        ...readNodeTlsPolicy()
+      })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeNodeEnrollment(payload);
+  } catch (error) {
+    output.textContent = 'failed to issue node enrollment package from join request: ' + error;
+    notes.textContent = '';
+  }
+}
+
 async function renewNodeEnrollment() {
   const output = document.getElementById('node-renewal-json');
   const notes = document.getElementById('node-renewal-notes');
@@ -571,6 +631,10 @@ document
 document
   .getElementById('issue-node-enrollment')
   .addEventListener('click', issueNodeEnrollment);
+
+document
+  .getElementById('issue-node-enrollment-from-join-request')
+  .addEventListener('click', issueNodeEnrollmentFromJoinRequest);
 
 document
   .getElementById('renew-node-enrollment')
