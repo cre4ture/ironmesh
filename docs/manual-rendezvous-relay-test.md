@@ -1,6 +1,6 @@
 # Manual Secure Rendezvous Relay Test
 
-This is a concrete manual test for the current pre-release stack using:
+This is the recommended manual relay test for the current pre-release stack using:
 
 - `rendezvous-service`
 - 2 `server-node` processes
@@ -12,35 +12,48 @@ It validates the secure path that matters for the new architecture:
 - node authentication at the rendezvous control plane
 - relay-required node-to-node traffic
 - client bootstrap plus enrollment
-- bootstrap trust roots for secure rendezvous
 - enrolled client relay traffic using issued rendezvous client identity
 - end-to-end object replication across two nodes
 
-To keep the setup manageable on one machine, this recipe leaves the public node API on plain HTTP. The secure part under test here is the rendezvous control plane plus internal node identity. For a production deployment, you would normally secure the public listener too.
+## What changed
+
+This guide is much simpler than the older version:
+
+- `node B` now uses the first-run HTTPS setup UI and the zero-touch join flow
+- regular runtime admin actions can use password login plus an HTTP-only session cookie
+- only the rendezvous service and the first cluster node still use the advanced env-driven path
+
+Why the first node is still special:
+
+- the current first-run setup UI does not yet ask for rendezvous URLs or secure rendezvous settings
+- for that reason, the first cluster node in this relay recipe still needs explicit rendezvous configuration
+
+So the current best manual flow is:
+
+1. start secure `rendezvous-service`
+2. start `node A` with explicit rendezvous config
+3. start `node B` with only minimal same-machine overrides and let it use the setup UI
+4. use the existing cluster UI on `node A` to approve `node B`
+5. use CLI bootstrap/enrollment and normal relay traffic from there
 
 ## What this proves
 
 At the end of this test you will have verified that:
 
 - both nodes join the same cluster through an mTLS-protected rendezvous service
-- peer traffic can work with relay required
+- peer traffic works with relay required
 - a client can enroll from a bootstrap bundle
 - enrollment returns the extra rendezvous client identity needed for secure relay
 - the client can write through node A
-- the same client identity can read the replicated object through node B using a second bootstrap bundle
-
-## Current limitation
-
-This flow is manual on purpose. The local cluster helper in [README.md](../README.md) does not yet start `rendezvous-service` for you, so relay-focused testing still needs a separate rendezvous process.
+- the same client identity can read the replicated object through node B
 
 ## Prerequisites
 
-- PowerShell
-- or Bash on Linux
+- PowerShell or Bash
 - Rust toolchain
 - `cargo`
 - `openssl`
-- `curl`
+- a browser
 
 Build the binaries once:
 
@@ -54,63 +67,42 @@ cargo build -p rendezvous-service -p server-node -p cli-client
 
 ## Test values
 
-Use one fixed cluster ID and two fixed node IDs so logs are easier to compare.
-
 ```powershell
 $Root = Join-Path $PWD "data/manual-relay-test"
-$ClusterId = "11111111-1111-7111-8111-111111111111"
-$NodeA = "00000000-0000-0000-0000-00000000a101"
-$NodeB = "00000000-0000-0000-0000-00000000a102"
 $AdminToken = "admin-secret"
-$RendezvousUrl = "https://127.0.0.1:19090"
 $NodeAUrl = "http://127.0.0.1:18081"
-$NodeBUrl = "http://127.0.0.1:18082"
-$NodeAInternalUrl = "https://127.0.0.1:18181"
-$NodeBInternalUrl = "https://127.0.0.1:18182"
-
+$NodeBSetupUrl = "https://127.0.0.1:18482"
+$RendezvousUrl = "https://127.0.0.1:19090"
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
 ```
 
 ```bash
 ROOT="$PWD/data/manual-relay-test"
-CLUSTER_ID="11111111-1111-7111-8111-111111111111"
-NODE_A="00000000-0000-0000-0000-00000000a101"
-NODE_B="00000000-0000-0000-0000-00000000a102"
 ADMIN_TOKEN="admin-secret"
-RENDEZVOUS_URL="https://127.0.0.1:19090"
 NODE_A_URL="http://127.0.0.1:18081"
-NODE_B_URL="http://127.0.0.1:18082"
-NODE_A_INTERNAL_URL="https://127.0.0.1:18181"
-NODE_B_INTERNAL_URL="https://127.0.0.1:18182"
-
+NODE_B_SETUP_URL="https://127.0.0.1:18482"
+RENDEZVOUS_URL="https://127.0.0.1:19090"
 mkdir -p "$ROOT"
 ```
 
-## 1. Generate TLS material
+## 1. Generate minimal TLS material
 
-For this local test we use one shared CA for:
+For this updated guide, only these manual certificates are needed:
 
-- rendezvous server TLS
-- node internal mTLS
-- issued client rendezvous identities
+- one shared CA
+- one rendezvous server certificate
+- one internal mTLS certificate for `node A`
 
-That keeps the recipe small. It also means both nodes get access to the CA private key so they can issue rendezvous client identities during enrollment. That is acceptable for this local manual test only, not as a production pattern.
+`node B` no longer needs manually created TLS files. It will receive them through the join enrollment package.
 
 PowerShell:
 
 ```powershell
-Set-Location c:\path\to\ironmesh
-$Root = Join-Path $PWD "data/manual-relay-test"
-$ClusterId = "11111111-1111-7111-8111-111111111111"
-$NodeA = "00000000-0000-0000-0000-00000000a101"
-$NodeB = "00000000-0000-0000-0000-00000000a102"
-
 $TlsRoot = Join-Path $Root "tls"
 $CaDir = Join-Path $TlsRoot "ca"
 $RendezvousDir = Join-Path $TlsRoot "rendezvous"
 $NodeADir = Join-Path $TlsRoot "node-a"
-$NodeBDir = Join-Path $TlsRoot "node-b"
-New-Item -ItemType Directory -Force -Path $CaDir, $RendezvousDir, $NodeADir, $NodeBDir | Out-Null
+New-Item -ItemType Directory -Force -Path $CaDir, $RendezvousDir, $NodeADir | Out-Null
 
 @"
 basicConstraints=CA:FALSE
@@ -123,15 +115,8 @@ subjectAltName=IP:127.0.0.1
 basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=IP:127.0.0.1,URI:urn:ironmesh:node:$NodeA
+subjectAltName=IP:127.0.0.1,URI:urn:ironmesh:node:node-a
 "@ | Set-Content (Join-Path $TlsRoot "node-a.ext")
-
-@"
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=IP:127.0.0.1,URI:urn:ironmesh:node:$NodeB
-"@ | Set-Content (Join-Path $TlsRoot "node-b.ext")
 
 openssl genrsa -out (Join-Path $CaDir "cluster-ca.key") 2048
 openssl req -x509 -new -key (Join-Path $CaDir "cluster-ca.key") -sha256 -days 365 -out (Join-Path $CaDir "cluster-ca.pem") -subj "/CN=ironmesh-manual-ca"
@@ -143,26 +128,16 @@ openssl x509 -req -in (Join-Path $RendezvousDir "rendezvous.csr") -CA (Join-Path
 openssl genrsa -out (Join-Path $NodeADir "node.key") 2048
 openssl req -new -key (Join-Path $NodeADir "node.key") -out (Join-Path $NodeADir "node.csr") -subj "/CN=ironmesh-node-a"
 openssl x509 -req -in (Join-Path $NodeADir "node.csr") -CA (Join-Path $CaDir "cluster-ca.pem") -CAkey (Join-Path $CaDir "cluster-ca.key") -CAcreateserial -out (Join-Path $NodeADir "node.pem") -days 365 -sha256 -extfile (Join-Path $TlsRoot "node-a.ext")
-
-openssl genrsa -out (Join-Path $NodeBDir "node.key") 2048
-openssl req -new -key (Join-Path $NodeBDir "node.key") -out (Join-Path $NodeBDir "node.csr") -subj "/CN=ironmesh-node-b"
-openssl x509 -req -in (Join-Path $NodeBDir "node.csr") -CA (Join-Path $CaDir "cluster-ca.pem") -CAkey (Join-Path $CaDir "cluster-ca.key") -CAcreateserial -out (Join-Path $NodeBDir "node.pem") -days 365 -sha256 -extfile (Join-Path $TlsRoot "node-b.ext")
 ```
 
-Bash/Linux:
+Bash:
 
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-NODE_A="00000000-0000-0000-0000-00000000a101"
-NODE_B="00000000-0000-0000-0000-00000000a102"
-
 TLS_ROOT="$ROOT/tls"
 CA_DIR="$TLS_ROOT/ca"
 RENDEZVOUS_DIR="$TLS_ROOT/rendezvous"
 NODE_A_DIR="$TLS_ROOT/node-a"
-NODE_B_DIR="$TLS_ROOT/node-b"
-mkdir -p "$CA_DIR" "$RENDEZVOUS_DIR" "$NODE_A_DIR" "$NODE_B_DIR"
+mkdir -p "$CA_DIR" "$RENDEZVOUS_DIR" "$NODE_A_DIR"
 
 cat > "$TLS_ROOT/rendezvous.ext" <<EOF
 basicConstraints=CA:FALSE
@@ -175,14 +150,7 @@ cat > "$TLS_ROOT/node-a.ext" <<EOF
 basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=IP:127.0.0.1,URI:urn:ironmesh:node:$NODE_A
-EOF
-
-cat > "$TLS_ROOT/node-b.ext" <<EOF
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=IP:127.0.0.1,URI:urn:ironmesh:node:$NODE_B
+subjectAltName=IP:127.0.0.1,URI:urn:ironmesh:node:node-a
 EOF
 
 openssl genrsa -out "$CA_DIR/cluster-ca.key" 2048
@@ -195,72 +163,45 @@ openssl x509 -req -in "$RENDEZVOUS_DIR/rendezvous.csr" -CA "$CA_DIR/cluster-ca.p
 openssl genrsa -out "$NODE_A_DIR/node.key" 2048
 openssl req -new -key "$NODE_A_DIR/node.key" -out "$NODE_A_DIR/node.csr" -subj "/CN=ironmesh-node-a"
 openssl x509 -req -in "$NODE_A_DIR/node.csr" -CA "$CA_DIR/cluster-ca.pem" -CAkey "$CA_DIR/cluster-ca.key" -CAcreateserial -out "$NODE_A_DIR/node.pem" -days 365 -sha256 -extfile "$TLS_ROOT/node-a.ext"
-
-openssl genrsa -out "$NODE_B_DIR/node.key" 2048
-openssl req -new -key "$NODE_B_DIR/node.key" -out "$NODE_B_DIR/node.csr" -subj "/CN=ironmesh-node-b"
-openssl x509 -req -in "$NODE_B_DIR/node.csr" -CA "$CA_DIR/cluster-ca.pem" -CAkey "$CA_DIR/cluster-ca.key" -CAcreateserial -out "$NODE_B_DIR/node.pem" -days 365 -sha256 -extfile "$TLS_ROOT/node-b.ext"
 ```
 
 ## 2. Start secure rendezvous-service
 
-Open PowerShell window 1:
+PowerShell:
 
 ```powershell
-Set-Location c:\path\to\ironmesh
-$Root = Join-Path $PWD "data/manual-relay-test"
-$CaPem = Join-Path $Root "tls\ca\cluster-ca.pem"
-$RendezvousCert = Join-Path $Root "tls\rendezvous\rendezvous.pem"
-$RendezvousKey = Join-Path $Root "tls\rendezvous\rendezvous.key"
-
 $env:IRONMESH_RENDEZVOUS_BIND = "127.0.0.1:19090"
 $env:IRONMESH_RENDEZVOUS_PUBLIC_URL = "https://127.0.0.1:19090"
-$env:IRONMESH_RENDEZVOUS_CLIENT_CA_CERT = $CaPem
-$env:IRONMESH_RENDEZVOUS_TLS_CERT = $RendezvousCert
-$env:IRONMESH_RENDEZVOUS_TLS_KEY = $RendezvousKey
+$env:IRONMESH_RENDEZVOUS_CLIENT_CA_CERT = (Join-Path $Root "tls\ca\cluster-ca.pem")
+$env:IRONMESH_RENDEZVOUS_TLS_CERT = (Join-Path $Root "tls\rendezvous\rendezvous.pem")
+$env:IRONMESH_RENDEZVOUS_TLS_KEY = (Join-Path $Root "tls\rendezvous\rendezvous.key")
 cargo run -p rendezvous-service
 ```
 
-Leave that window running.
-
-Alternative on Linux/bash:
-
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-CA_PEM="$ROOT/tls/ca/cluster-ca.pem"
-RENDEZVOUS_CERT="$ROOT/tls/rendezvous/rendezvous.pem"
-RENDEZVOUS_KEY="$ROOT/tls/rendezvous/rendezvous.key"
-
 export IRONMESH_RENDEZVOUS_BIND="127.0.0.1:19090"
 export IRONMESH_RENDEZVOUS_PUBLIC_URL="https://127.0.0.1:19090"
-export IRONMESH_RENDEZVOUS_CLIENT_CA_CERT="$CA_PEM"
-export IRONMESH_RENDEZVOUS_TLS_CERT="$RENDEZVOUS_CERT"
-export IRONMESH_RENDEZVOUS_TLS_KEY="$RENDEZVOUS_KEY"
+export IRONMESH_RENDEZVOUS_CLIENT_CA_CERT="$ROOT/tls/ca/cluster-ca.pem"
+export IRONMESH_RENDEZVOUS_TLS_CERT="$ROOT/tls/rendezvous/rendezvous.pem"
+export IRONMESH_RENDEZVOUS_TLS_KEY="$ROOT/tls/rendezvous/rendezvous.key"
 cargo run -p rendezvous-service
 ```
 
-Optional health check from a shell where `$Root` is already set:
+Leave that terminal running.
+
+## 3. Start node A with explicit rendezvous config
+
+This is the one remaining advanced node in this guide.
+
+Why:
+
+- the first-run setup UI does not yet ask for rendezvous configuration
+- node A needs to seed the cluster with secure rendezvous settings and signer material
+
+PowerShell:
 
 ```powershell
-curl.exe --silent --cacert "$Root\tls\ca\cluster-ca.pem" https://127.0.0.1:19090/health
-```
-
-```bash
-curl --silent --cacert "$ROOT/tls/ca/cluster-ca.pem" https://127.0.0.1:19090/health
-```
-
-## 3. Start node A
-
-Use `cluster` mode here, not `local-edge`, so the node has an internal mTLS identity it can reuse for rendezvous authentication.
-
-Open PowerShell window 2:
-
-```powershell
-Set-Location c:\path\to\ironmesh
-$Root = Join-Path $PWD "data/manual-relay-test"
 $env:IRONMESH_NODE_MODE = "cluster"
-$env:IRONMESH_CLUSTER_ID = "11111111-1111-7111-8111-111111111111"
-$env:IRONMESH_NODE_ID = "00000000-0000-0000-0000-00000000a101"
 $env:IRONMESH_DATA_DIR = (Join-Path $Root "node-a")
 $env:IRONMESH_SERVER_BIND = "127.0.0.1:18081"
 $env:IRONMESH_PUBLIC_URL = "http://127.0.0.1:18081"
@@ -279,20 +220,14 @@ $env:IRONMESH_REPLICATION_FACTOR = "2"
 $env:IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS = "5"
 $env:IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS = "5"
 $env:IRONMESH_STARTUP_REPAIR_DELAY_SECS = "1"
-$env:IRONMESH_ADMIN_TOKEN = "admin-secret"
+$env:IRONMESH_ADMIN_TOKEN = $AdminToken
 $env:IRONMESH_REQUIRE_CLIENT_AUTH = "true"
 cargo run -p server-node
 ```
 
-Alternative on Linux/bash:
-
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
 export IRONMESH_NODE_MODE="cluster"
-export IRONMESH_CLUSTER_ID="11111111-1111-7111-8111-111111111111"
-export IRONMESH_NODE_ID="00000000-0000-0000-0000-00000000a101"
-export IRONMESH_DATA_DIR="$PWD/data/manual-relay-test/node-a"
+export IRONMESH_DATA_DIR="$ROOT/node-a"
 export IRONMESH_SERVER_BIND="127.0.0.1:18081"
 export IRONMESH_PUBLIC_URL="http://127.0.0.1:18081"
 export IRONMESH_INTERNAL_BIND="127.0.0.1:18181"
@@ -310,133 +245,98 @@ export IRONMESH_REPLICATION_FACTOR="2"
 export IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS="5"
 export IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS="5"
 export IRONMESH_STARTUP_REPAIR_DELAY_SECS="1"
-export IRONMESH_ADMIN_TOKEN="admin-secret"
+export IRONMESH_ADMIN_TOKEN="$ADMIN_TOKEN"
 export IRONMESH_REQUIRE_CLIENT_AUTH="true"
 cargo run -p server-node
 ```
 
-## 4. Start node B
+Open `http://127.0.0.1:18081/` in a browser. The admin sections work there, but because this node came from the advanced env path you should use the `Admin token override (optional)` fields with `admin-secret`.
 
-Open PowerShell window 3:
+## 4. Start node B in zero-touch setup mode
+
+On a real second machine you would usually need no overrides at all. For this same-machine test, give node B only:
+
+- its own data directory
+- its own bind port
+
+PowerShell:
 
 ```powershell
-Set-Location c:\path\to\ironmesh
-$Root = Join-Path $PWD "data/manual-relay-test"
-$env:IRONMESH_NODE_MODE = "cluster"
-$env:IRONMESH_CLUSTER_ID = "11111111-1111-7111-8111-111111111111"
-$env:IRONMESH_NODE_ID = "00000000-0000-0000-0000-00000000a102"
 $env:IRONMESH_DATA_DIR = (Join-Path $Root "node-b")
-$env:IRONMESH_SERVER_BIND = "127.0.0.1:18082"
-$env:IRONMESH_PUBLIC_URL = "http://127.0.0.1:18082"
-$env:IRONMESH_INTERNAL_BIND = "127.0.0.1:18182"
-$env:IRONMESH_INTERNAL_URL = "https://127.0.0.1:18182"
-$env:IRONMESH_INTERNAL_TLS_CA_CERT = (Join-Path $Root "tls\ca\cluster-ca.pem")
-$env:IRONMESH_INTERNAL_TLS_CA_KEY = (Join-Path $Root "tls\ca\cluster-ca.key")
-$env:IRONMESH_INTERNAL_TLS_CERT = (Join-Path $Root "tls\node-b\node.pem")
-$env:IRONMESH_INTERNAL_TLS_KEY = (Join-Path $Root "tls\node-b\node.key")
-$env:IRONMESH_RENDEZVOUS_URLS = "https://127.0.0.1:19090"
-$env:IRONMESH_RENDEZVOUS_CA_CERT = (Join-Path $Root "tls\ca\cluster-ca.pem")
-$env:IRONMESH_RENDEZVOUS_MTLS_REQUIRED = "true"
-$env:IRONMESH_RELAY_MODE = "required"
-$env:IRONMESH_PUBLIC_PEER_API_ENABLED = "false"
-$env:IRONMESH_REPLICATION_FACTOR = "2"
-$env:IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS = "5"
-$env:IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS = "5"
-$env:IRONMESH_STARTUP_REPAIR_DELAY_SECS = "1"
-$env:IRONMESH_ADMIN_TOKEN = "admin-secret"
-$env:IRONMESH_REQUIRE_CLIENT_AUTH = "true"
+$env:IRONMESH_SERVER_BIND = "127.0.0.1:18482"
 cargo run -p server-node
 ```
-
-Alternative on Linux/bash:
 
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-export IRONMESH_NODE_MODE="cluster"
-export IRONMESH_CLUSTER_ID="11111111-1111-7111-8111-111111111111"
-export IRONMESH_NODE_ID="00000000-0000-0000-0000-00000000a102"
-export IRONMESH_DATA_DIR="$PWD/data/manual-relay-test/node-b"
-export IRONMESH_SERVER_BIND="127.0.0.1:18082"
-export IRONMESH_PUBLIC_URL="http://127.0.0.1:18082"
-export IRONMESH_INTERNAL_BIND="127.0.0.1:18182"
-export IRONMESH_INTERNAL_URL="https://127.0.0.1:18182"
-export IRONMESH_INTERNAL_TLS_CA_CERT="$ROOT/tls/ca/cluster-ca.pem"
-export IRONMESH_INTERNAL_TLS_CA_KEY="$ROOT/tls/ca/cluster-ca.key"
-export IRONMESH_INTERNAL_TLS_CERT="$ROOT/tls/node-b/node.pem"
-export IRONMESH_INTERNAL_TLS_KEY="$ROOT/tls/node-b/node.key"
-export IRONMESH_RENDEZVOUS_URLS="https://127.0.0.1:19090"
-export IRONMESH_RENDEZVOUS_CA_CERT="$ROOT/tls/ca/cluster-ca.pem"
-export IRONMESH_RENDEZVOUS_MTLS_REQUIRED="true"
-export IRONMESH_RELAY_MODE="required"
-export IRONMESH_PUBLIC_PEER_API_ENABLED="false"
-export IRONMESH_REPLICATION_FACTOR="2"
-export IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS="5"
-export IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS="5"
-export IRONMESH_STARTUP_REPAIR_DELAY_SECS="1"
-export IRONMESH_ADMIN_TOKEN="admin-secret"
-export IRONMESH_REQUIRE_CLIENT_AUTH="true"
+export IRONMESH_DATA_DIR="$ROOT/node-b"
+export IRONMESH_SERVER_BIND="127.0.0.1:18482"
 cargo run -p server-node
 ```
 
-## 5. Check cluster formation
+Open `https://127.0.0.1:18482/` in a browser and accept the temporary self-signed certificate warning. You should see the first-run setup UI.
 
-Open PowerShell window 4 for the client/admin steps:
+## 5. Generate a join request on node B
+
+In the node B setup UI:
+
+1. click `Generate join request`
+2. copy the emitted JSON blob
+
+This request already includes node B’s desired public/internal runtime addresses based on the setup UI origin.
+
+## 6. Issue node B enrollment from node A
+
+In the node A runtime UI:
+
+1. go to `Issue Enrollment From Join Request`
+2. paste node B’s join-request JSON
+3. enter `admin-secret` in the token override field if it is not already there
+4. click `Issue enrollment from join request`
+5. copy the emitted node enrollment package JSON
+
+## 7. Import the enrollment package on node B
+
+Back in the node B setup UI:
+
+1. paste the node enrollment package JSON
+2. choose a local admin password for node B
+3. click `Import node enrollment package`
+
+The node will transition into normal runtime. The setup page now automatically logs the browser into node B’s runtime admin session using that password.
+
+## 8. Check cluster formation
+
+You can use either node’s UI, or use a shell:
 
 ```powershell
-Set-Location c:\path\to\ironmesh
-$Root = Join-Path $PWD "data/manual-relay-test"
-$ClusterId = "11111111-1111-7111-8111-111111111111"
 Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:18081/cluster/nodes" | ConvertTo-Json -Depth 8
 ```
 
-Alternative on Linux/bash:
-
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-CLUSTER_ID="11111111-1111-7111-8111-111111111111"
 curl -s "http://127.0.0.1:18081/cluster/nodes"
 ```
 
-Wait until you can see both node IDs in the response.
+Wait until both nodes appear.
 
-Because both nodes use `IRONMESH_RELAY_MODE=required`, peer traffic is forced through rendezvous relay even though all processes are on localhost.
+Because node A is running with `IRONMESH_RELAY_MODE=required`, the peer traffic for this recipe is forced through rendezvous relay.
 
-## 6. Issue a bootstrap bundle from node A
+## 9. Issue a client bootstrap bundle from node A
+
+For now, the easiest exact path is:
+
+- use node A’s runtime UI
+- in `Bootstrap bundle`, provide the admin token override `admin-secret`
+- click `Issue bootstrap bundle`
+- paste the resulting JSON into `$Root/client-bootstrap-node-a.json`
+
+The bootstrap should include secure rendezvous trust metadata and `rendezvous_mtls_required=true`.
+
+## 10. Enroll one client identity
+
+PowerShell:
 
 ```powershell
 $BootstrapAPath = Join-Path $Root "client-bootstrap-node-a.json"
-$BootstrapA = Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://127.0.0.1:18081/auth/bootstrap-bundles/issue" `
-  -Headers @{ "x-ironmesh-admin-token" = "admin-secret" } `
-  -ContentType "application/json" `
-  -Body '{"label":"manual-cli","expires_in_secs":3600}'
-
-$BootstrapA | ConvertTo-Json -Depth 16 | Set-Content $BootstrapAPath
-```
-
-Alternative on Linux/bash:
-
-```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-BOOTSTRAP_A_PATH="$ROOT/client-bootstrap-node-a.json"
-curl -s \
-  -X POST \
-  -H "x-ironmesh-admin-token: admin-secret" \
-  -H "content-type: application/json" \
-  -d '{"label":"manual-cli","expires_in_secs":3600}' \
-  "http://127.0.0.1:18081/auth/bootstrap-bundles/issue" \
-  > "$BOOTSTRAP_A_PATH"
-```
-
-This bootstrap should now include secure rendezvous trust metadata and `rendezvous_mtls_required=true`.
-
-## 7. Enroll one client identity
-
-```powershell
 $ClientIdentityPath = Join-Path $Root "client-identity.json"
 
 cargo run -p cli-client -- `
@@ -446,11 +346,7 @@ cargo run -p cli-client -- `
   --label manual-cli
 ```
 
-Alternative on Linux/bash:
-
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
 BOOTSTRAP_A_PATH="$ROOT/client-bootstrap-node-a.json"
 CLIENT_IDENTITY_PATH="$ROOT/client-identity.json"
 
@@ -461,9 +357,9 @@ cargo run -p cli-client -- \
   --label manual-cli
 ```
 
-This writes one persisted client identity. Because rendezvous mTLS is required, the enrolled identity should also contain `rendezvous_client_identity_pem`. Keep it. We will reuse the same identity against node B later.
+Keep the resulting client identity file. It should contain the extra rendezvous client identity needed for secure relay.
 
-## 8. Write through node A
+## 11. Write through node A
 
 ```powershell
 cargo run -p cli-client -- `
@@ -472,21 +368,14 @@ cargo run -p cli-client -- `
   put notes/hello.txt "hello through secure rendezvous relay"
 ```
 
-Alternative on Linux/bash:
-
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-BOOTSTRAP_A_PATH="$ROOT/client-bootstrap-node-a.json"
-CLIENT_IDENTITY_PATH="$ROOT/client-identity.json"
-
 cargo run -p cli-client -- \
   --bootstrap-file "$BOOTSTRAP_A_PATH" \
   --client-identity-file "$CLIENT_IDENTITY_PATH" \
   put notes/hello.txt "hello through secure rendezvous relay"
 ```
 
-Optional check:
+Optional immediate read-back through node A:
 
 ```powershell
 cargo run -p cli-client -- `
@@ -496,20 +385,13 @@ cargo run -p cli-client -- `
 ```
 
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-BOOTSTRAP_A_PATH="$ROOT/client-bootstrap-node-a.json"
-CLIENT_IDENTITY_PATH="$ROOT/client-identity.json"
-
 cargo run -p cli-client -- \
   --bootstrap-file "$BOOTSTRAP_A_PATH" \
   --client-identity-file "$CLIENT_IDENTITY_PATH" \
   get notes/hello.txt
 ```
 
-## 9. Wait for replication
-
-Give the background repair/audit loop a few seconds:
+## 12. Wait for replication
 
 ```powershell
 Start-Sleep -Seconds 8
@@ -519,7 +401,7 @@ Start-Sleep -Seconds 8
 sleep 8
 ```
 
-You can also inspect the plan:
+Optional plan check:
 
 ```powershell
 Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:18081/cluster/replication/plan" | ConvertTo-Json -Depth 8
@@ -529,53 +411,32 @@ Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:18081/cluster/replication/p
 curl -s "http://127.0.0.1:18081/cluster/replication/plan"
 ```
 
-## 10. Issue a second bootstrap bundle from node B
+## 13. Issue a second bootstrap bundle from node B
 
-The client identity is cluster-wide, but bootstrap is still the transport seed. To read through node B, ask node B for its own bootstrap bundle and reuse the same client identity.
+This is now easier than before because node B is on the zero-touch path:
+
+1. open node B runtime UI at its normal address after setup transition
+2. you should already have a local admin session from the setup import step
+3. in `Bootstrap bundle`, click `Issue bootstrap bundle`
+4. paste the resulting JSON into `$Root/client-bootstrap-node-b.json`
+
+If your session is gone, use the `Admin Access` section on node B and sign in with the password you chose during step 7.
+
+## 14. Read the replicated object through node B
+
+PowerShell:
 
 ```powershell
 $BootstrapBPath = Join-Path $Root "client-bootstrap-node-b.json"
-$BootstrapB = Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://127.0.0.1:18082/auth/bootstrap-bundles/issue" `
-  -Headers @{ "x-ironmesh-admin-token" = "admin-secret" } `
-  -ContentType "application/json" `
-  -Body '{"label":"manual-cli","expires_in_secs":3600}'
 
-$BootstrapB | ConvertTo-Json -Depth 16 | Set-Content $BootstrapBPath
-```
-
-Alternative on Linux/bash:
-
-```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-BOOTSTRAP_B_PATH="$ROOT/client-bootstrap-node-b.json"
-curl -s \
-  -X POST \
-  -H "x-ironmesh-admin-token: admin-secret" \
-  -H "content-type: application/json" \
-  -d '{"label":"manual-cli","expires_in_secs":3600}' \
-  "http://127.0.0.1:18082/auth/bootstrap-bundles/issue" \
-  > "$BOOTSTRAP_B_PATH"
-```
-
-## 11. Read the replicated object through node B
-
-```powershell
 cargo run -p cli-client -- `
   --bootstrap-file $BootstrapBPath `
   --client-identity-file $ClientIdentityPath `
   get notes/hello.txt
 ```
 
-Alternative on Linux/bash:
-
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
 BOOTSTRAP_B_PATH="$ROOT/client-bootstrap-node-b.json"
-CLIENT_IDENTITY_PATH="$ROOT/client-identity.json"
 
 cargo run -p cli-client -- \
   --bootstrap-file "$BOOTSTRAP_B_PATH" \
@@ -589,11 +450,11 @@ Expected output:
 hello through secure rendezvous relay
 ```
 
-If that succeeds, the secure manual relay test is working end to end.
+If that succeeds, the secure relay path is working end to end.
 
 ## Useful extra checks
 
-List nodes from either side:
+List nodes through the transport-aware client:
 
 ```powershell
 cargo run -p cli-client -- `
@@ -603,11 +464,6 @@ cargo run -p cli-client -- `
 ```
 
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-BOOTSTRAP_A_PATH="$ROOT/client-bootstrap-node-a.json"
-CLIENT_IDENTITY_PATH="$ROOT/client-identity.json"
-
 cargo run -p cli-client -- \
   --bootstrap-file "$BOOTSTRAP_A_PATH" \
   --client-identity-file "$CLIENT_IDENTITY_PATH" \
@@ -625,11 +481,6 @@ cargo run -p cli-client -- `
 ```
 
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
-BOOTSTRAP_A_PATH="$ROOT/client-bootstrap-node-a.json"
-CLIENT_IDENTITY_PATH="$ROOT/client-identity.json"
-
 cargo run -p cli-client -- \
   --bootstrap-file "$BOOTSTRAP_A_PATH" \
   --client-identity-file "$CLIENT_IDENTITY_PATH" \
@@ -637,7 +488,7 @@ cargo run -p cli-client -- \
   --bind 127.0.0.1:8081
 ```
 
-Inspect rendezvous presence directly. This endpoint is node-only under rendezvous mTLS, so use a node certificate, not the enrolled client identity:
+Inspect rendezvous presence directly. This endpoint is node-only under rendezvous mTLS, so use node A’s certificate:
 
 ```powershell
 curl.exe --silent `
@@ -648,8 +499,6 @@ curl.exe --silent `
 ```
 
 ```bash
-cd /path/to/ironmesh
-ROOT="$PWD/data/manual-relay-test"
 curl --silent \
   --cacert "$ROOT/tls/ca/cluster-ca.pem" \
   --cert "$ROOT/tls/node-a/node.pem" \
@@ -657,29 +506,21 @@ curl --silent \
   https://127.0.0.1:19090/control/presence
 ```
 
-## Shorter secure variant
+## Current zero-touch limitation
 
-If you only want a faster secure smoke test first:
+This guide is already much friendlier than the old one, but one limitation remains important:
 
-- still do step 1 and step 2 so rendezvous is mTLS-protected
-- start only node A
-- do step 6 through step 8
-- stop after `put` and `get` through node A succeed
+- the first cluster node still needs explicit rendezvous configuration through env vars because the first-run setup UI does not yet collect secure rendezvous settings
 
-That already proves:
-
-- secure rendezvous startup
-- secure rendezvous client enrollment path
-- relay-capable client access with issued rendezvous client identity
-
-The full recipe above is the better validation because it also proves node-to-node discovery and replication through secure relay.
+Once the setup UI grows rendezvous configuration for the first node, this guide can get shorter again.
 
 ## Cleanup
 
-- stop the four PowerShell windows with `Ctrl+C`
+- stop all terminals with `Ctrl+C`
 - remove `data/manual-relay-test`
 
 On Linux/bash:
 
-- stop the four terminal windows with `Ctrl+C`
-- run `rm -rf data/manual-relay-test`
+```bash
+rm -rf data/manual-relay-test
+```

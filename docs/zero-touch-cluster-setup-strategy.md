@@ -1,6 +1,6 @@
 # Zero-Touch Cluster Setup Strategy
 
-Status: Proposed product-direction document for the regular Ironmesh setup UX
+Status: In progress as the regular Ironmesh setup UX target
 
 Related documents:
 
@@ -16,6 +16,7 @@ The preferred setup model is:
 - managed internal CA behind UI approval,
 - no routine requirement for CLI flags or environment variables in the regular setup path,
 - first-run node boot into a local HTTPS setup UI,
+- first cluster node also becomes the initial managed secure rendezvous host in the regular path,
 - two primary first-run choices:
   - `Start a new cluster`
   - `Join an existing cluster`
@@ -125,7 +126,8 @@ Target operator flow:
    - initial cluster-local signing/enrollment state.
 4. The bootstrap flow immediately requires the operator to set the first strong admin password.
 5. Node becomes the first approved cluster member and the initial signer/controller.
-6. UI presents:
+6. The same first node also becomes the initial secure rendezvous host for the cluster.
+7. UI presents:
    - cluster status,
    - a `Join another node` flow,
    - client bootstrap / pairing flows,
@@ -134,6 +136,7 @@ Target operator flow:
 Important product property:
 
 - the first cluster node becomes the initial signer/controller for the managed internal CA path,
+- the first cluster node also becomes the initial managed rendezvous host for the regular path,
 - but the operator should not need to see raw CA files in the normal flow.
 
 ## 7. `Join an Existing Cluster` Flow
@@ -376,7 +379,8 @@ The recommended next implementation/design sequence is:
 5. Implement `Join an existing cluster` using join-request import/export and enrollment-package import/export.
 6. Move routine startup configuration into persisted node-managed state/config.
 7. Add managed CA backup export/import for signer transfer and recovery.
-8. Leave later hardening for follow-up phases:
+8. Make the first node the initial embedded managed rendezvous host with auto-issued rendezvous TLS material.
+9. Leave later hardening for follow-up phases:
    - optional `localhost`-only bootstrap mode,
    - optional bootstrap confirmation code/fingerprint UX,
    - encrypt-at-rest for signer material,
@@ -390,13 +394,17 @@ The first implementation slice is now in place:
 - bootstrap mode serves a dedicated HTTPS setup UI using an automatically generated temporary self-signed certificate stored under the node data directory,
 - bootstrap mode persists managed setup state under the node data directory so the node can later restart into the normal runtime path without env vars,
 - `Start a new cluster` already generates a managed cluster CA, persists the managed signer material locally, issues this node's initial enrollment package automatically, persists that package locally, and transitions the process into the normal runtime path,
+- `Start a new cluster` now also derives an initial rendezvous URL automatically, issues managed rendezvous server TLS material from the same managed cluster CA, persists that material locally, and starts an embedded mTLS-protected rendezvous listener on the first node,
 - `Join an existing cluster` already supports generating a transportable join-request blob on the joining node, importing that join request on an existing cluster node to issue a node enrollment package, and importing the issued node enrollment package on the joining node to transition into the normal runtime path.
 - the runtime admin UI/API can now export an encrypted managed signer backup and import that backup onto another approved node, with restart-required activation semantics for the imported signer material.
 - the regular runtime UI/API now supports password-backed local admin login with an HTTP-only session cookie, while the old admin-token header remains available only as an advanced override.
+- the regular zero-touch rendezvous direction is now embedded managed rendezvous on the first node; standalone `rendezvous-service` remains the advanced/operator deployment path.
 
 Important current limitations of this first slice:
 
 - signer transfer still requires manual backup export/import plus restart rather than a smoother guided handoff flow,
+- managed rendezvous role transfer or promotion to another node is not implemented yet,
+- fully zero-touch standalone/external rendezvous provisioning is still follow-up work,
 - encrypt-at-rest for persisted signer material and richer multi-admin auth are still follow-up work.
 
 ## 13. Summary
@@ -410,6 +418,7 @@ The chosen strategy is:
 - no-password bootstrap mode only while the node is uninitialized,
 - forced creation of the first strong admin password during `Start a new cluster`,
 - first node as initial signer/controller with transferable signer role,
+- first node as the initial embedded secure rendezvous host for the regular path,
 - encrypted managed-CA backup export/import for recovery and signer transfer,
 - request/import plus enrollment/import as the first join transport,
 - minimal reliance on CLI flags or environment variables for the normal path.

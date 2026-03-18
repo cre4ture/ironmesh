@@ -54,6 +54,8 @@ struct ManagedSetupState {
     node_id: Option<NodeId>,
     runtime_node_enrollment_path: Option<String>,
     admin_password_hash: Option<String>,
+    managed_rendezvous_bind_addr: Option<String>,
+    managed_rendezvous_public_url: Option<String>,
     pending_join_request: Option<NodeJoinRequest>,
 }
 
@@ -67,6 +69,8 @@ impl Default for ManagedSetupState {
             node_id: None,
             runtime_node_enrollment_path: None,
             admin_password_hash: None,
+            managed_rendezvous_bind_addr: None,
+            managed_rendezvous_public_url: None,
             pending_join_request: None,
         }
     }
@@ -163,6 +167,7 @@ pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
         if resolved_path.exists() {
             let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path)?;
             apply_managed_signer_paths(&config.data_dir, &mut runtime);
+            apply_managed_rendezvous_config(&config.data_dir, &managed_state, &mut runtime);
             runtime.admin_password_hash = managed_state.admin_password_hash.clone();
             return Ok(StartupMode::Runtime(runtime));
         }
@@ -309,6 +314,7 @@ async fn start_new_cluster(
     let labels = default_setup_labels();
     let bind_addr = state.config.bind_addr;
     let internal_bind_addr = default_internal_bind_addr(bind_addr);
+    let managed_rendezvous_bind_addr = default_managed_rendezvous_bind_addr(bind_addr);
     let public_url = origin_to_string(&public_origin);
     let internal_url = match derive_internal_url(&public_origin, internal_bind_addr.port()) {
         Ok(url) => url,
@@ -320,6 +326,17 @@ async fn start_new_cluster(
                 .into_response();
         }
     };
+    let managed_rendezvous_public_url =
+        match derive_managed_rendezvous_url(&public_origin, managed_rendezvous_bind_addr.port()) {
+            Ok(url) => url,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        };
 
     let bootstrap = TransportNodeBootstrap {
         version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
@@ -343,8 +360,8 @@ async fn start_new_cluster(
             cert_path: "managed/runtime/internal/node.pem".to_string(),
             key_path: "managed/runtime/internal/node.key".to_string(),
         }),
-        rendezvous_urls: Vec::new(),
-        rendezvous_mtls_required: false,
+        rendezvous_urls: vec![managed_rendezvous_public_url.clone()],
+        rendezvous_mtls_required: true,
         direct_endpoints: vec![
             BootstrapEndpoint {
                 url: public_url.clone(),
@@ -395,6 +412,33 @@ async fn start_new_cluster(
         )
             .into_response();
     }
+    let (managed_rendezvous_cert_pem, managed_rendezvous_key_pem) =
+        match issue_managed_rendezvous_tls_identity_from_ca(
+            cluster_id,
+            &managed_rendezvous_public_url,
+            &artifacts.ca_cert_pem,
+            &artifacts.ca_key_pem,
+        ) {
+            Ok(material) => material,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+    if let Err(err) = write_managed_rendezvous_material(
+        &state.config.data_dir,
+        &managed_rendezvous_cert_pem,
+        &managed_rendezvous_key_pem,
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
 
     let mut managed = state.managed_state.lock().await;
     managed.state = SetupLifecycleState::Online;
@@ -403,6 +447,8 @@ async fn start_new_cluster(
     managed.node_id = Some(node_id);
     managed.runtime_node_enrollment_path = Some(runtime_enrollment_path.display().to_string());
     managed.admin_password_hash = Some(hash_token(&request.admin_password));
+    managed.managed_rendezvous_bind_addr = Some(managed_rendezvous_bind_addr.to_string());
+    managed.managed_rendezvous_public_url = Some(managed_rendezvous_public_url.clone());
     managed.pending_join_request = None;
     if let Err(err) = write_managed_setup_state(&state.config.state_path, &managed) {
         return (
@@ -411,6 +457,7 @@ async fn start_new_cluster(
         )
             .into_response();
     }
+    let managed_snapshot = managed.clone();
     drop(managed);
 
     let mut config = match ServerNodeConfig::from_enrollment_path(&runtime_enrollment_path) {
@@ -424,6 +471,7 @@ async fn start_new_cluster(
         }
     };
     apply_managed_signer_paths(&state.config.data_dir, &mut config);
+    apply_managed_rendezvous_config(&state.config.data_dir, &managed_snapshot, &mut config);
     config.admin_password_hash = Some(hash_token(&request.admin_password));
     if state
         .completion_tx
@@ -570,6 +618,8 @@ async fn import_node_enrollment_package(
     managed.node_id = Some(package.bootstrap.node_id);
     managed.runtime_node_enrollment_path = Some(runtime_enrollment_path.display().to_string());
     managed.admin_password_hash = Some(hash_token(&request.admin_password));
+    managed.managed_rendezvous_bind_addr = None;
+    managed.managed_rendezvous_public_url = None;
     managed.pending_join_request = None;
     if let Err(err) = write_managed_setup_state(&state.config.state_path, &managed) {
         return (
@@ -578,6 +628,7 @@ async fn import_node_enrollment_package(
         )
             .into_response();
     }
+    let managed_snapshot = managed.clone();
     drop(managed);
 
     let mut config = match ServerNodeConfig::from_enrollment_path(&runtime_enrollment_path) {
@@ -591,6 +642,7 @@ async fn import_node_enrollment_package(
         }
     };
     apply_managed_signer_paths(&state.config.data_dir, &mut config);
+    apply_managed_rendezvous_config(&state.config.data_dir, &managed_snapshot, &mut config);
     config.admin_password_hash = Some(hash_token(&request.admin_password));
     if state
         .completion_tx
@@ -706,6 +758,25 @@ pub(crate) fn managed_signer_ca_key_path(data_dir: &std::path::Path) -> PathBuf 
     managed_signer_dir(data_dir).join("cluster-ca.key")
 }
 
+fn managed_runtime_internal_ca_cert_path(data_dir: &std::path::Path) -> PathBuf {
+    managed_setup_dir(data_dir)
+        .join("runtime")
+        .join("internal")
+        .join("cluster-ca.pem")
+}
+
+fn managed_rendezvous_dir(data_dir: &std::path::Path) -> PathBuf {
+    managed_setup_dir(data_dir).join("rendezvous")
+}
+
+fn managed_rendezvous_cert_path(data_dir: &std::path::Path) -> PathBuf {
+    managed_rendezvous_dir(data_dir).join("rendezvous.pem")
+}
+
+fn managed_rendezvous_key_path(data_dir: &std::path::Path) -> PathBuf {
+    managed_rendezvous_dir(data_dir).join("rendezvous.key")
+}
+
 fn ensure_managed_setup_state(path: &std::path::Path) -> Result<ManagedSetupState> {
     if let Some(existing) = read_managed_setup_state(path)? {
         return Ok(existing);
@@ -765,6 +836,67 @@ pub(crate) fn apply_managed_signer_paths(
         config.internal_ca_key_path = Some(key_path.clone());
         config.public_ca_key_path = Some(key_path);
     }
+}
+
+fn write_managed_rendezvous_material(
+    data_dir: &std::path::Path,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<()> {
+    let rendezvous_dir = managed_rendezvous_dir(data_dir);
+    std::fs::create_dir_all(&rendezvous_dir)
+        .with_context(|| format!("failed creating {}", rendezvous_dir.display()))?;
+    let cert_path = managed_rendezvous_cert_path(data_dir);
+    let key_path = managed_rendezvous_key_path(data_dir);
+    std::fs::write(&cert_path, cert_pem)
+        .with_context(|| format!("failed writing {}", cert_path.display()))?;
+    std::fs::write(&key_path, key_pem)
+        .with_context(|| format!("failed writing {}", key_path.display()))?;
+    Ok(())
+}
+
+fn apply_managed_rendezvous_config(
+    data_dir: &std::path::Path,
+    managed_state: &ManagedSetupState,
+    config: &mut ServerNodeConfig,
+) {
+    let Some(bind_addr) = managed_state
+        .managed_rendezvous_bind_addr
+        .as_deref()
+        .and_then(|raw| raw.parse::<SocketAddr>().ok())
+    else {
+        return;
+    };
+    let Some(public_url) = managed_state.managed_rendezvous_public_url.clone() else {
+        return;
+    };
+
+    let client_ca_cert_path = managed_runtime_internal_ca_cert_path(data_dir);
+    let cert_path = managed_rendezvous_cert_path(data_dir);
+    let key_path = managed_rendezvous_key_path(data_dir);
+    if !client_ca_cert_path.exists() || !cert_path.exists() || !key_path.exists() {
+        return;
+    }
+
+    if config
+        .rendezvous_urls
+        .iter()
+        .all(|existing| existing != &public_url)
+    {
+        config.rendezvous_urls.push(public_url.clone());
+    }
+    config.rendezvous_registration_enabled = true;
+    config.rendezvous_mtls_required = true;
+    if config.rendezvous_ca_cert_path.is_none() {
+        config.rendezvous_ca_cert_path = Some(client_ca_cert_path.clone());
+    }
+    config.managed_rendezvous = Some(ManagedRendezvousConfig {
+        bind_addr,
+        public_url,
+        client_ca_cert_path,
+        cert_path,
+        key_path,
+    });
 }
 
 fn validate_backup_passphrase(passphrase: &str) -> std::result::Result<(), &'static str> {
@@ -971,7 +1103,9 @@ fn issue_self_managed_cluster_artifacts(
     bootstrap.trust_roots = BootstrapTrustRoots {
         cluster_ca_pem: Some(ca_cert_pem.clone()),
         public_api_ca_pem: Some(ca_cert_pem.clone()),
-        rendezvous_ca_pem: None,
+        rendezvous_ca_pem: bootstrap
+            .rendezvous_mtls_required
+            .then(|| ca_cert_pem.clone()),
     };
 
     let internal_tls_material =
@@ -1114,6 +1248,18 @@ fn default_internal_bind_addr(public_bind_addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(public_bind_addr.ip(), internal_port)
 }
 
+fn default_managed_rendezvous_bind_addr(public_bind_addr: SocketAddr) -> SocketAddr {
+    let public_port = public_bind_addr.port();
+    let rendezvous_port = if public_port <= u16::MAX - 1_000 {
+        public_port + 1_000
+    } else if public_port < u16::MAX {
+        public_port + 1
+    } else {
+        9_443
+    };
+    SocketAddr::new(public_bind_addr.ip(), rendezvous_port)
+}
+
 fn validate_admin_password(password: &str) -> std::result::Result<(), &'static str> {
     if password.trim().len() < 12 {
         return Err("admin password must be at least 12 characters long");
@@ -1141,6 +1287,62 @@ fn derive_internal_url(public_origin: &reqwest::Url, port: u16) -> Result<String
     url.set_port(Some(port))
         .map_err(|_| anyhow!("failed deriving internal URL port"))?;
     Ok(origin_to_string(&url))
+}
+
+fn derive_managed_rendezvous_url(public_origin: &reqwest::Url, port: u16) -> Result<String> {
+    let mut url = public_origin.clone();
+    url.set_port(Some(port))
+        .map_err(|_| anyhow!("failed deriving managed rendezvous URL port"))?;
+    Ok(origin_to_string(&url))
+}
+
+fn issue_managed_rendezvous_tls_identity_from_ca(
+    cluster_id: ClusterId,
+    public_url: &str,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) -> Result<(String, String)> {
+    let url = reqwest::Url::parse(public_url)
+        .with_context(|| format!("invalid rendezvous URL {public_url:?}"))?;
+    let host = url
+        .host_str()
+        .context("managed rendezvous URL must include a host")?;
+
+    let issuer_key = KeyPair::from_pem(ca_key_pem).context("failed parsing cluster CA keypair")?;
+    let issuer =
+        Issuer::from_ca_cert_pem(ca_cert_pem, issuer_key).context("failed building CA issuer")?;
+    let mut params =
+        CertificateParams::new(Vec::new()).context("failed creating rendezvous TLS params")?;
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(
+        DnType::CommonName,
+        format!("ironmesh-rendezvous-{cluster_id}"),
+    );
+    params.is_ca = IsCa::NoCa;
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = OffsetDateTime::from_unix_timestamp(unix_ts().saturating_sub(300) as i64)
+        .context("failed setting managed rendezvous TLS not_before")?;
+    params.not_after =
+        OffsetDateTime::from_unix_timestamp(unix_ts().saturating_add(3650 * 24 * 60 * 60) as i64)
+            .context("failed setting managed rendezvous TLS not_after")?;
+    if let Ok(ip_addr) = host.parse::<std::net::IpAddr>() {
+        params.subject_alt_names.push(SanType::IpAddress(ip_addr));
+    } else {
+        params.subject_alt_names.push(SanType::DnsName(
+            host.try_into()
+                .context("invalid managed rendezvous DNS SAN")?,
+        ));
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress(Ipv4Addr::LOCALHOST.into()));
+    }
+    let key_pair = KeyPair::generate().context("failed generating managed rendezvous keypair")?;
+    let cert = params
+        .signed_by(&key_pair, &issuer)
+        .context("failed signing managed rendezvous certificate")?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
 fn origin_to_string(url: &reqwest::Url) -> String {
@@ -1171,6 +1373,8 @@ mod tests {
             node_id: Some(NodeId::new_v4()),
             runtime_node_enrollment_path: Some("managed/runtime/node-enrollment.json".to_string()),
             admin_password_hash: Some(hash_token("super-secret-password")),
+            managed_rendezvous_bind_addr: Some("0.0.0.0:9443".to_string()),
+            managed_rendezvous_public_url: Some("https://node-a.local:9443".to_string()),
             pending_join_request: Some(NodeJoinRequest {
                 version: SETUP_STATE_VERSION,
                 node_id: NodeId::new_v4(),
@@ -1208,6 +1412,10 @@ mod tests {
                 .and_then(|request| request.public_url.as_deref()),
             Some("https://node-a.local:8443")
         );
+        assert_eq!(
+            restored.managed_rendezvous_public_url.as_deref(),
+            Some("https://node-a.local:9443")
+        );
     }
 
     #[test]
@@ -1237,8 +1445,8 @@ mod tests {
                 cert_path: "managed/runtime/internal/node.pem".to_string(),
                 key_path: "managed/runtime/internal/node.key".to_string(),
             }),
-            rendezvous_urls: Vec::new(),
-            rendezvous_mtls_required: false,
+            rendezvous_urls: vec!["https://node-a.local:9443".to_string()],
+            rendezvous_mtls_required: true,
             direct_endpoints: vec![
                 BootstrapEndpoint {
                     url: "https://node-a.local:8443".to_string(),
@@ -1267,6 +1475,52 @@ mod tests {
         assert!(package.public_tls_material.is_some());
         assert!(package.internal_tls_material.is_some());
         assert!(package.bootstrap.trust_roots.cluster_ca_pem.is_some());
+        assert_eq!(
+            package.bootstrap.rendezvous_urls,
+            vec!["https://node-a.local:9443".to_string()]
+        );
+        assert!(package.bootstrap.trust_roots.rendezvous_ca_pem.is_some());
+    }
+
+    #[test]
+    fn apply_managed_rendezvous_config_enables_embedded_listener() {
+        let dir = temp_dir("managed-rendezvous-config");
+        let runtime_internal_dir = managed_setup_dir(&dir).join("runtime").join("internal");
+        std::fs::create_dir_all(&runtime_internal_dir).unwrap();
+        std::fs::write(runtime_internal_dir.join("cluster-ca.pem"), "cluster-ca").unwrap();
+        let rendezvous_dir = managed_rendezvous_dir(&dir);
+        std::fs::create_dir_all(&rendezvous_dir).unwrap();
+        std::fs::write(rendezvous_dir.join("rendezvous.pem"), "cert").unwrap();
+        std::fs::write(rendezvous_dir.join("rendezvous.key"), "key").unwrap();
+
+        let managed_state = ManagedSetupState {
+            managed_rendezvous_bind_addr: Some("0.0.0.0:9443".to_string()),
+            managed_rendezvous_public_url: Some("https://node-a.local:9443".to_string()),
+            ..ManagedSetupState::default()
+        };
+        let mut config = ServerNodeConfig::local_edge(
+            dir.join("data"),
+            "127.0.0.1:28080".parse::<SocketAddr>().unwrap(),
+        );
+
+        apply_managed_rendezvous_config(&dir, &managed_state, &mut config);
+
+        assert_eq!(
+            config.rendezvous_urls,
+            vec![
+                format!("http://{}", config.bind_addr),
+                "https://node-a.local:9443".to_string()
+            ]
+        );
+        assert!(config.rendezvous_registration_enabled);
+        assert!(config.rendezvous_mtls_required);
+        assert_eq!(
+            config
+                .managed_rendezvous
+                .as_ref()
+                .map(|cfg| cfg.public_url.as_str()),
+            Some("https://node-a.local:9443")
+        );
     }
 
     #[test]

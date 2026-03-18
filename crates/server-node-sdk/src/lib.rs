@@ -63,6 +63,7 @@ use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
 mod cluster;
+mod embedded_rendezvous;
 mod replication;
 mod setup;
 mod storage;
@@ -678,6 +679,15 @@ pub struct PublicTlsConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct ManagedRendezvousConfig {
+    pub bind_addr: SocketAddr,
+    pub public_url: String,
+    pub client_ca_cert_path: PathBuf,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct ServerNodeConfig {
     pub mode: ServerNodeMode,
     pub cluster_id: ClusterId,
@@ -698,6 +708,7 @@ pub struct ServerNodeConfig {
     pub rendezvous_urls: Vec<String>,
     pub rendezvous_registration_enabled: bool,
     pub rendezvous_mtls_required: bool,
+    pub managed_rendezvous: Option<ManagedRendezvousConfig>,
     pub relay_mode: RelayMode,
     pub enrollment_issuer_url: Option<String>,
     pub node_enrollment_path: Option<PathBuf>,
@@ -1616,6 +1627,7 @@ impl ServerNodeConfig {
             rendezvous_urls: bootstrap.rendezvous_urls,
             rendezvous_registration_enabled: rendezvous_configured,
             rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
+            managed_rendezvous: None,
             relay_mode: bootstrap.relay_mode,
             enrollment_issuer_url: bootstrap.enrollment_issuer_url,
             node_enrollment_path: None,
@@ -1932,6 +1944,7 @@ impl ServerNodeConfig {
             rendezvous_urls,
             rendezvous_registration_enabled,
             rendezvous_mtls_required,
+            managed_rendezvous: None,
             relay_mode,
             enrollment_issuer_url: None,
             node_enrollment_path: None,
@@ -2077,6 +2090,7 @@ impl ServerNodeConfig {
             rendezvous_urls: vec![format!("http://{bind_addr}")],
             rendezvous_registration_enabled: false,
             rendezvous_mtls_required: false,
+            managed_rendezvous: None,
             relay_mode: RelayMode::Fallback,
             enrollment_issuer_url: None,
             node_enrollment_path: None,
@@ -2951,6 +2965,31 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
                 .await
             {
                 warn!(error = %err, "internal server listener stopped");
+            }
+        });
+    }
+
+    if let Some(managed_rendezvous) = config.managed_rendezvous.clone() {
+        let rendezvous_state = state.clone();
+        tokio::spawn(async move {
+            info!(
+                bind_addr = %managed_rendezvous.bind_addr,
+                public_url = %managed_rendezvous.public_url,
+                node_id = %rendezvous_state.node_id,
+                "server node embedded managed rendezvous listener"
+            );
+
+            if let Err(err) =
+                embedded_rendezvous::run_listener(embedded_rendezvous::EmbeddedRendezvousConfig {
+                    bind_addr: managed_rendezvous.bind_addr,
+                    public_url: managed_rendezvous.public_url,
+                    client_ca_cert_path: managed_rendezvous.client_ca_cert_path,
+                    cert_path: managed_rendezvous.cert_path,
+                    key_path: managed_rendezvous.key_path,
+                })
+                .await
+            {
+                warn!(error = %err, "embedded managed rendezvous listener stopped");
             }
         });
     }
