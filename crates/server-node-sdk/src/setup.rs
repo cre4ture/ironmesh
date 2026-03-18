@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 const SETUP_STATE_VERSION: u32 = 1;
 const MANAGED_SIGNER_BACKUP_VERSION: u32 = 1;
+const MANAGED_RENDEZVOUS_FAILOVER_VERSION: u32 = 1;
 const MANAGED_SIGNER_BACKUP_SALT_LEN: usize = 16;
 const MANAGED_SIGNER_BACKUP_NONCE_LEN: usize = 12;
 const MANAGED_SIGNER_BACKUP_KEY_LEN: usize = 32;
@@ -113,6 +114,31 @@ struct ManagedSignerBackupPlaintext {
     exported_at_unix: u64,
     ca_cert_pem: String,
     ca_key_pem: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ManagedRendezvousFailoverPackage {
+    pub version: u32,
+    pub cluster_id: ClusterId,
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub exported_at_unix: u64,
+    pub public_url: String,
+    pub pbkdf2_rounds: u32,
+    pub salt_b64: String,
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManagedRendezvousFailoverPlaintext {
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    target_node_id: NodeId,
+    exported_at_unix: u64,
+    public_url: String,
+    cert_pem: String,
+    key_pem: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -769,11 +795,11 @@ fn managed_rendezvous_dir(data_dir: &std::path::Path) -> PathBuf {
     managed_setup_dir(data_dir).join("rendezvous")
 }
 
-fn managed_rendezvous_cert_path(data_dir: &std::path::Path) -> PathBuf {
+pub(crate) fn managed_rendezvous_cert_path(data_dir: &std::path::Path) -> PathBuf {
     managed_rendezvous_dir(data_dir).join("rendezvous.pem")
 }
 
-fn managed_rendezvous_key_path(data_dir: &std::path::Path) -> PathBuf {
+pub(crate) fn managed_rendezvous_key_path(data_dir: &std::path::Path) -> PathBuf {
     managed_rendezvous_dir(data_dir).join("rendezvous.key")
 }
 
@@ -838,7 +864,7 @@ pub(crate) fn apply_managed_signer_paths(
     }
 }
 
-fn write_managed_rendezvous_material(
+pub(crate) fn write_managed_rendezvous_material(
     data_dir: &std::path::Path,
     cert_pem: &str,
     key_pem: &str,
@@ -1013,6 +1039,139 @@ pub(crate) fn import_managed_signer_backup(
     }
 
     write_managed_signer_material(data_dir, &plaintext.ca_cert_pem, &plaintext.ca_key_pem)
+}
+
+pub(crate) fn export_managed_rendezvous_failover_package(
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    target_node_id: NodeId,
+    public_url: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    passphrase: &str,
+) -> Result<ManagedRendezvousFailoverPackage> {
+    validate_backup_passphrase(passphrase).map_err(anyhow::Error::msg)?;
+    let exported_at_unix = unix_ts();
+    let plaintext = ManagedRendezvousFailoverPlaintext {
+        cluster_id,
+        source_node_id,
+        target_node_id,
+        exported_at_unix,
+        public_url: public_url.to_string(),
+        cert_pem: cert_pem.to_string(),
+        key_pem: key_pem.to_string(),
+    };
+    let plaintext_json = serde_json::to_vec(&plaintext)
+        .context("failed serializing managed rendezvous failover package")?;
+
+    let mut salt = [0u8; MANAGED_SIGNER_BACKUP_SALT_LEN];
+    let mut nonce = [0u8; MANAGED_SIGNER_BACKUP_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let key =
+        derive_managed_signer_backup_key(passphrase, &salt, MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS);
+    let cipher = Aes256GcmSiv::new_from_slice(&key)
+        .context("failed initializing managed rendezvous failover cipher")?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext_json.as_ref())
+        .map_err(|_| anyhow!("failed encrypting managed rendezvous failover package"))?;
+
+    Ok(ManagedRendezvousFailoverPackage {
+        version: MANAGED_RENDEZVOUS_FAILOVER_VERSION,
+        cluster_id,
+        source_node_id,
+        target_node_id,
+        exported_at_unix,
+        public_url: public_url.to_string(),
+        pbkdf2_rounds: MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS,
+        salt_b64: BASE64_STANDARD.encode(salt),
+        nonce_b64: BASE64_STANDARD.encode(nonce),
+        ciphertext_b64: BASE64_STANDARD.encode(ciphertext),
+    })
+}
+
+pub(crate) fn import_managed_rendezvous_failover_package(
+    data_dir: &std::path::Path,
+    package: &ManagedRendezvousFailoverPackage,
+    passphrase: &str,
+    bind_addr: SocketAddr,
+    expected_cluster_id: Option<ClusterId>,
+    expected_node_id: Option<NodeId>,
+) -> Result<()> {
+    if package.version != MANAGED_RENDEZVOUS_FAILOVER_VERSION {
+        bail!(
+            "unsupported managed rendezvous failover package version {}",
+            package.version
+        );
+    }
+
+    let salt = BASE64_STANDARD
+        .decode(package.salt_b64.as_bytes())
+        .context("failed decoding managed rendezvous failover salt")?;
+    if salt.len() != MANAGED_SIGNER_BACKUP_SALT_LEN {
+        bail!("invalid managed rendezvous failover salt length");
+    }
+    let nonce = BASE64_STANDARD
+        .decode(package.nonce_b64.as_bytes())
+        .context("failed decoding managed rendezvous failover nonce")?;
+    if nonce.len() != MANAGED_SIGNER_BACKUP_NONCE_LEN {
+        bail!("invalid managed rendezvous failover nonce length");
+    }
+    let ciphertext = BASE64_STANDARD
+        .decode(package.ciphertext_b64.as_bytes())
+        .context("failed decoding managed rendezvous failover ciphertext")?;
+    let key = derive_managed_signer_backup_key(passphrase, &salt, package.pbkdf2_rounds);
+    let cipher = Aes256GcmSiv::new_from_slice(&key)
+        .context("failed initializing managed rendezvous failover cipher")?;
+    let plaintext_json = cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|_| anyhow!("failed decrypting managed rendezvous failover package"))?;
+    let plaintext = serde_json::from_slice::<ManagedRendezvousFailoverPlaintext>(&plaintext_json)
+        .context("failed parsing managed rendezvous failover payload")?;
+
+    if plaintext.cluster_id != package.cluster_id {
+        bail!("managed rendezvous failover cluster ID mismatch");
+    }
+    if plaintext.source_node_id != package.source_node_id {
+        bail!("managed rendezvous failover source node ID mismatch");
+    }
+    if plaintext.target_node_id != package.target_node_id {
+        bail!("managed rendezvous failover target node ID mismatch");
+    }
+    if plaintext.public_url != package.public_url {
+        bail!("managed rendezvous failover public URL mismatch");
+    }
+    if let Some(expected_cluster_id) = expected_cluster_id
+        && plaintext.cluster_id != expected_cluster_id
+    {
+        bail!(
+            "managed rendezvous failover belongs to cluster {} but this node is in cluster {}",
+            plaintext.cluster_id,
+            expected_cluster_id
+        );
+    }
+    if let Some(expected_node_id) = expected_node_id
+        && plaintext.target_node_id != expected_node_id
+    {
+        bail!(
+            "managed rendezvous failover targets node {} but this node is {}",
+            plaintext.target_node_id,
+            expected_node_id
+        );
+    }
+
+    write_managed_rendezvous_material(data_dir, &plaintext.cert_pem, &plaintext.key_pem)?;
+
+    let state_path = managed_setup_state_path(data_dir);
+    let mut managed_state = ensure_managed_setup_state(&state_path)?;
+    managed_state.updated_at_unix = unix_ts();
+    managed_state.cluster_id.get_or_insert(plaintext.cluster_id);
+    managed_state
+        .node_id
+        .get_or_insert(plaintext.target_node_id);
+    managed_state.managed_rendezvous_bind_addr = Some(bind_addr.to_string());
+    managed_state.managed_rendezvous_public_url = Some(plaintext.public_url);
+    write_managed_setup_state(&state_path, &managed_state)
 }
 
 async fn ensure_bootstrap_tls_config(config: &SetupBootstrapConfig) -> Result<RustlsConfig> {
@@ -1248,7 +1407,7 @@ fn default_internal_bind_addr(public_bind_addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(public_bind_addr.ip(), internal_port)
 }
 
-fn default_managed_rendezvous_bind_addr(public_bind_addr: SocketAddr) -> SocketAddr {
+pub(crate) fn default_managed_rendezvous_bind_addr(public_bind_addr: SocketAddr) -> SocketAddr {
     let public_port = public_bind_addr.port();
     let rendezvous_port = if public_port <= u16::MAX - 1_000 {
         public_port + 1_000
@@ -1296,7 +1455,7 @@ fn derive_managed_rendezvous_url(public_origin: &reqwest::Url, port: u16) -> Res
     Ok(origin_to_string(&url))
 }
 
-fn issue_managed_rendezvous_tls_identity_from_ca(
+pub(crate) fn issue_managed_rendezvous_tls_identity_from_ca(
     cluster_id: ClusterId,
     public_url: &str,
     ca_cert_pem: &str,
@@ -1607,6 +1766,88 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("failed decrypting managed signer backup")
+        );
+    }
+
+    #[test]
+    fn managed_rendezvous_failover_roundtrip_restores_material_and_state() {
+        let dir = temp_dir("managed-rendezvous-failover");
+        let cluster_id = ClusterId::new_v4();
+        let source_node_id = NodeId::new_v4();
+        let target_node_id = NodeId::new_v4();
+        let package = export_managed_rendezvous_failover_package(
+            cluster_id,
+            source_node_id,
+            target_node_id,
+            "https://rendezvous.example:9443",
+            "rendezvous-cert",
+            "rendezvous-key",
+            "correct horse battery staple",
+        )
+        .unwrap();
+
+        import_managed_rendezvous_failover_package(
+            &dir,
+            &package,
+            "correct horse battery staple",
+            "0.0.0.0:9443".parse::<SocketAddr>().unwrap(),
+            Some(cluster_id),
+            Some(target_node_id),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(managed_rendezvous_cert_path(&dir)).unwrap(),
+            "rendezvous-cert"
+        );
+        assert_eq!(
+            std::fs::read_to_string(managed_rendezvous_key_path(&dir)).unwrap(),
+            "rendezvous-key"
+        );
+
+        let restored = read_managed_setup_state(&managed_setup_state_path(&dir))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.managed_rendezvous_public_url.as_deref(),
+            Some("https://rendezvous.example:9443")
+        );
+        assert_eq!(
+            restored.managed_rendezvous_bind_addr.as_deref(),
+            Some("0.0.0.0:9443")
+        );
+        assert_eq!(restored.cluster_id, Some(cluster_id));
+        assert_eq!(restored.node_id, Some(target_node_id));
+    }
+
+    #[test]
+    fn managed_rendezvous_failover_rejects_wrong_target_node() {
+        let dir = temp_dir("managed-rendezvous-failover-target");
+        let cluster_id = ClusterId::new_v4();
+        let package = export_managed_rendezvous_failover_package(
+            cluster_id,
+            NodeId::new_v4(),
+            NodeId::new_v4(),
+            "https://rendezvous.example:9443",
+            "rendezvous-cert",
+            "rendezvous-key",
+            "correct horse battery staple",
+        )
+        .unwrap();
+
+        let err = import_managed_rendezvous_failover_package(
+            &dir,
+            &package,
+            "correct horse battery staple",
+            "0.0.0.0:9443".parse::<SocketAddr>().unwrap(),
+            Some(cluster_id),
+            Some(NodeId::new_v4()),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("managed rendezvous failover targets node")
         );
     }
 }

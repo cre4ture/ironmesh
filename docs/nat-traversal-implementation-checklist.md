@@ -32,10 +32,11 @@ Status: Concrete repo-mapped implementation plan for the target architecture
   - bootstrap mode persists managed node setup state under the node data directory,
   - `Start a new cluster` now creates a self-managed cluster CA, persists the managed signer material, creates a local node enrollment package automatically, and transitions the process into the normal runtime path without requiring env vars,
   - `Start a new cluster` now also derives an initial rendezvous URL automatically, issues managed rendezvous server TLS material from the same managed cluster CA, persists that material locally, and starts an embedded mTLS-protected rendezvous listener on the first node,
+  - the runtime admin UI/API can now export a passphrase-protected managed rendezvous failover package for a promoted node and import that package on the target node, with restart-required activation semantics on the target,
   - `Join an existing cluster` now supports generating a transportable join-request blob on the joining node, issuing a node enrollment package from that join request on an existing cluster node, and importing the issued enrollment package on the joining node to transition into the normal runtime path,
   - the runtime admin UI/API can now export an encrypted managed signer backup and import that backup onto another approved node for recovery or signer transfer, with restart-required activation semantics after import,
   - the regular runtime UI/API now supports password-backed local admin login with an HTTP-only session cookie, while the old admin-token header remains available as an advanced override for env-driven and automation-oriented setups.
-  - standalone `rendezvous-service` remains the advanced/operator deployment path; the regular zero-touch path now targets embedded managed rendezvous on the first node.
+  - standalone `rendezvous-service` remains the advanced/operator deployment path; the regular zero-touch path now targets embedded managed rendezvous on the first node, with manual failover packages for promoting another node when the public rendezvous hostname or VIP can be moved.
 
 ## 1c. Current priority order
 
@@ -51,7 +52,7 @@ Use this section as the current source of truth for remaining work. The detailed
 4. Replace the old reachability model in cluster state. Status: completed.
    The in-memory cluster model now uses a structured reachability plus capability record under `NodeDescriptor`, peer planning/projection no longer depends on raw `public_url` / `internal_url` fields directly, and the admin registration surface plus system-test/local-cluster helpers now use the same nested `reachability` / `capabilities` payload shape.
 5. Refresh tests and operational docs to match the real implementation state.
-   Remaining work: reconcile this checklist with completed work, expand the new rendezvous-backed system coverage into more outbound-only and failure/reconnect scenarios, keep platform-facing docs aligned with the new enrollment and transport model, and document later signer/rendezvous-role transfer flows now that the first-node embedded rendezvous path is live.
+   Remaining work: reconcile this checklist with completed work, expand the new rendezvous-backed system coverage into more outbound-only and failure/reconnect scenarios, keep platform-facing docs aligned with the new enrollment and transport model, and eventually add a smoother guided rendezvous-role handoff beyond the current export/import plus restart flow.
 
 ## 2. Target workspace shape
 

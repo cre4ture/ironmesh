@@ -395,6 +395,7 @@ The first implementation slice is now in place:
 - bootstrap mode persists managed setup state under the node data directory so the node can later restart into the normal runtime path without env vars,
 - `Start a new cluster` already generates a managed cluster CA, persists the managed signer material locally, issues this node's initial enrollment package automatically, persists that package locally, and transitions the process into the normal runtime path,
 - `Start a new cluster` now also derives an initial rendezvous URL automatically, issues managed rendezvous server TLS material from the same managed cluster CA, persists that material locally, and starts an embedded mTLS-protected rendezvous listener on the first node,
+- the runtime admin UI/API can now export a passphrase-protected managed rendezvous failover package for a promoted node and import that package on the target node, with restart-required activation semantics on the target,
 - `Join an existing cluster` already supports generating a transportable join-request blob on the joining node, importing that join request on an existing cluster node to issue a node enrollment package, and importing the issued node enrollment package on the joining node to transition into the normal runtime path.
 - the runtime admin UI/API can now export an encrypted managed signer backup and import that backup onto another approved node, with restart-required activation semantics for the imported signer material.
 - the regular runtime UI/API now supports password-backed local admin login with an HTTP-only session cookie, while the old admin-token header remains available only as an advanced override.
@@ -403,7 +404,7 @@ The first implementation slice is now in place:
 Important current limitations of this first slice:
 
 - signer transfer still requires manual backup export/import plus restart rather than a smoother guided handoff flow,
-- managed rendezvous role transfer or promotion to another node is not implemented yet,
+- managed rendezvous failover currently assumes a stable public rendezvous hostname or VIP can be moved to the promoted node; live multi-rendezvous shared-state clustering is still follow-up work,
 - fully zero-touch standalone/external rendezvous provisioning is still follow-up work,
 - encrypt-at-rest for persisted signer material and richer multi-admin auth are still follow-up work.
 
@@ -419,6 +420,7 @@ The chosen strategy is:
 - forced creation of the first strong admin password during `Start a new cluster`,
 - first node as initial signer/controller with transferable signer role,
 - first node as the initial embedded secure rendezvous host for the regular path,
+- passphrase-protected managed rendezvous failover packages for promoting another approved node while keeping the same public rendezvous hostname/VIP,
 - encrypted managed-CA backup export/import for recovery and signer transfer,
 - request/import plus enrollment/import as the first join transport,
 - minimal reliance on CLI flags or environment variables for the normal path.

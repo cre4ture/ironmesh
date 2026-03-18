@@ -565,6 +565,119 @@ async function importManagedSignerBackup() {
   }
 }
 
+async function exportManagedRendezvousFailover() {
+  const output = document.getElementById('managed-rendezvous-failover-json');
+  const notes = document.getElementById('managed-rendezvous-failover-notes');
+  const passphrase = document.getElementById('managed-rendezvous-failover-passphrase').value;
+  const targetNodeId = document.getElementById('managed-rendezvous-failover-target-node-id').value.trim();
+  const publicUrl = document.getElementById('managed-rendezvous-failover-public-url').value.trim();
+  if (!passphrase.trim()) {
+    output.textContent = 'failover passphrase is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!targetNodeId) {
+    output.textContent = 'target node ID is required';
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'exporting managed rendezvous failover package...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/managed-rendezvous/failover/export', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
+      body: JSON.stringify({
+        passphrase,
+        target_node_id: targetNodeId,
+        public_url: publicUrl || null
+      })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeManagedRendezvousFailoverPackage(payload);
+  } catch (error) {
+    output.textContent = 'failed to export managed rendezvous failover package: ' + error;
+    notes.textContent = '';
+  }
+}
+
+async function importManagedRendezvousFailover() {
+  const output = document.getElementById('managed-rendezvous-import-json-output');
+  const notes = document.getElementById('managed-rendezvous-import-notes');
+  const passphrase = document.getElementById('managed-rendezvous-import-passphrase').value;
+  const packageRaw = document.getElementById('managed-rendezvous-import-json').value.trim();
+  const bindAddr = document.getElementById('managed-rendezvous-import-bind-addr').value.trim();
+  if (!packageRaw) {
+    output.textContent = 'managed rendezvous failover package JSON is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!passphrase.trim()) {
+    output.textContent = 'import passphrase is required';
+    notes.textContent = '';
+    return;
+  }
+
+  let failoverPackage;
+  try {
+    failoverPackage = JSON.parse(packageRaw);
+  } catch (error) {
+    output.textContent = 'failed to parse managed rendezvous failover package JSON: ' + error;
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'importing managed rendezvous failover package...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/managed-rendezvous/failover/import', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
+      body: JSON.stringify({
+        passphrase,
+        package: failoverPackage,
+        bind_addr: bindAddr || null
+      })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeManagedRendezvousFailoverImport(payload);
+  } catch (error) {
+    output.textContent = 'failed to import managed rendezvous failover package: ' + error;
+    notes.textContent = '';
+  }
+}
+
 function formatUnixTs(unixTs) {
   const parsed = Number(unixTs);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -725,6 +838,30 @@ function summarizeManagedSignerImport(payload) {
   return notes.join(' | ');
 }
 
+function summarizeManagedRendezvousFailoverPackage(payload) {
+  return [
+    `cluster: ${payload?.cluster_id || 'unknown'}`,
+    `source node: ${payload?.source_node_id || 'unknown'}`,
+    `target node: ${payload?.target_node_id || 'unknown'}`,
+    `public URL: ${payload?.public_url || 'unknown'}`,
+    `exported: ${formatUnixTs(payload?.exported_at_unix)}`
+  ].join(' | ');
+}
+
+function summarizeManagedRendezvousFailoverImport(payload) {
+  const notes = [
+    `cluster: ${payload?.cluster_id || 'unknown'}`,
+    `source node: ${payload?.source_node_id || 'unknown'}`,
+    `target node: ${payload?.target_node_id || 'unknown'}`,
+    `public URL: ${payload?.public_url || 'unknown'}`,
+    `cert path: ${payload?.cert_path || 'unknown'}`
+  ];
+  if (payload?.restart_required) {
+    notes.push('restart required before embedded rendezvous becomes active on this node');
+  }
+  return notes.join(' | ');
+}
+
 function renderBootstrapQr(text) {
   const container = document.getElementById('bootstrap-bundle-qr-container');
   const target = document.getElementById('bootstrap-bundle-qr');
@@ -801,6 +938,14 @@ document
 document
   .getElementById('import-managed-signer-backup')
   .addEventListener('click', importManagedSignerBackup);
+
+document
+  .getElementById('export-managed-rendezvous-failover')
+  .addEventListener('click', exportManagedRendezvousFailover);
+
+document
+  .getElementById('import-managed-rendezvous-failover')
+  .addEventListener('click', importManagedRendezvousFailover);
 
 refreshAdminSessionStatus();
 refreshServerLogs();

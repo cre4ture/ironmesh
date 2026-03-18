@@ -147,6 +147,28 @@
     <pre id="managed-signer-import-json-output">paste an encrypted managed signer backup and click the button to import it on this node</pre>
     <p id="managed-signer-import-notes"></p>
 
+    <h3>Managed rendezvous failover</h3>
+    <p>Exports or imports a passphrase-protected managed rendezvous failover package for the zero-touch embedded rendezvous path. The intended seamless failover model is to keep the same public rendezvous hostname or VIP and move that routing to the promoted node after import. Export returns encrypted rendezvous server TLS material via <code>POST /auth/managed-rendezvous/failover/export</code>. Import persists the promoted rendezvous identity on the target node via <code>POST /auth/managed-rendezvous/failover/import</code> and requires a restart before the embedded rendezvous listener becomes active there.</p>
+    <label for="managed-rendezvous-failover-passphrase">Failover passphrase</label>
+    <input id="managed-rendezvous-failover-passphrase" type="password" autocomplete="off" spellcheck="false" />
+    <label for="managed-rendezvous-failover-target-node-id">Target node ID</label>
+    <input id="managed-rendezvous-failover-target-node-id" type="text" autocomplete="off" spellcheck="false" placeholder="00000000-0000-0000-0000-000000000000" />
+    <label for="managed-rendezvous-failover-public-url">Public rendezvous URL override (optional)</label>
+    <input id="managed-rendezvous-failover-public-url" type="text" autocomplete="off" spellcheck="false" placeholder="https://rendezvous.example:9443" />
+    <button id="export-managed-rendezvous-failover" type="button">Export managed rendezvous failover package</button>
+    <pre id="managed-rendezvous-failover-json">provide a passphrase and target node ID to export an encrypted managed rendezvous failover package</pre>
+    <p id="managed-rendezvous-failover-notes"></p>
+
+    <label for="managed-rendezvous-import-json">Managed rendezvous failover package JSON</label>
+    <textarea id="managed-rendezvous-import-json" rows="10" spellcheck="false" placeholder='{"version":1,"cluster_id":"..."}'></textarea>
+    <label for="managed-rendezvous-import-passphrase">Import passphrase</label>
+    <input id="managed-rendezvous-import-passphrase" type="password" autocomplete="off" spellcheck="false" />
+    <label for="managed-rendezvous-import-bind-addr">Bind address override (optional)</label>
+    <input id="managed-rendezvous-import-bind-addr" type="text" autocomplete="off" spellcheck="false" placeholder="0.0.0.0:9443" />
+    <button id="import-managed-rendezvous-failover" type="button">Import managed rendezvous failover package</button>
+    <pre id="managed-rendezvous-import-json-output">paste an encrypted managed rendezvous failover package and click the button to import it on this node</pre>
+    <p id="managed-rendezvous-import-notes"></p>
+
     <h2>Server logs</h2>
     <p>Recent in-memory log lines from this node.</p>
     <pre id="server-logs">loading...</pre>
@@ -185,6 +207,8 @@
       <li><code>POST /auth/node-enrollments/issue</code> - issue a node enrollment package with generated internal mTLS material and optional public HTTPS certificates (admin session or token required, CA key material required)</li>
       <li><code>POST /auth/managed-signer/backup/export</code> - export an encrypted managed signer backup for recovery or signer transfer (admin session or token required, signer CA material required)</li>
       <li><code>POST /auth/managed-signer/backup/import</code> - import an encrypted managed signer backup onto this node; restart required before it becomes the active signer (admin session or token required)</li>
+      <li><code>POST /auth/managed-rendezvous/failover/export</code> - export an encrypted managed rendezvous failover package for a promoted node while keeping the same public rendezvous hostname/VIP (admin session or token required, signer CA material required)</li>
+      <li><code>POST /auth/managed-rendezvous/failover/import</code> - import an encrypted managed rendezvous failover package onto the promoted node; restart required before the embedded rendezvous listener becomes active there (admin session or token required)</li>
       <li><code>POST /auth/node-join-requests/issue-enrollment</code> - issue a node enrollment package from a joining node's request blob (admin session or token required, CA key material required)</li>
       <li><code>POST /auth/node-enrollments/renew</code> - renew an existing node enrollment package with fresh TLS material for the same node identity (admin session or token required, CA key material required)</li>
       <li><code>GET /auth/node-certificates/status</code> - inspect current public/internal certificate expiry and renewal state (admin session or token required)</li>
