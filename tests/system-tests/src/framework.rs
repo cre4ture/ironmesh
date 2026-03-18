@@ -608,6 +608,7 @@ pub async fn start_rendezvous_service_with_env(
     command
         .env("IRONMESH_RENDEZVOUS_BIND", bind)
         .env("IRONMESH_RENDEZVOUS_PUBLIC_URL", &public_url)
+        .env("IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP", "true")
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 

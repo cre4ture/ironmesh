@@ -60,6 +60,7 @@ fn build_router(state: AppState) -> Router {
 }
 
 async fn run_with_state(state: AppState) -> Result<()> {
+    state.config.validate_startup_security()?;
     let bind_addr = state.config.bind_addr;
     let app = build_router(state.clone());
 
@@ -259,6 +260,7 @@ mod tests {
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
             mtls: None,
+            allow_insecure_http: true,
         });
         let rendezvous_state_for_server = rendezvous_state.clone();
         let rendezvous_handle = tokio::spawn(async move {
@@ -466,6 +468,7 @@ mod tests {
                 cert_path: rendezvous_cert_path,
                 key_path: rendezvous_key_path,
             }),
+            allow_insecure_http: false,
         });
 
         let source_dir = fresh_test_dir("relay-required-source-mtls");
@@ -722,6 +725,7 @@ mod tests {
                 cert_path: rendezvous_cert_path,
                 key_path: rendezvous_key_path,
             }),
+            allow_insecure_http: false,
         });
 
         let target_node_id = Uuid::now_v7();

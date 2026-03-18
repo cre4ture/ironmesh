@@ -16,6 +16,8 @@ It is designed to validate the path that matters most for the new architecture:
 
 This recipe uses plain HTTP rendezvous and `local-edge` nodes on one machine to keep the setup small. It intentionally forces relay for both peer and client traffic by setting `IRONMESH_RELAY_MODE=required`.
 
+Because plain HTTP rendezvous is insecure, the service now refuses to start that way unless you explicitly opt in with `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true`. Use that override only for local development/testing.
+
 ## What this proves
 
 At the end of this test you will have verified that:
@@ -86,6 +88,7 @@ Open PowerShell window 1:
 Set-Location c:\Users\hornu\dev-rust\ironmesh
 $env:IRONMESH_RENDEZVOUS_BIND = "127.0.0.1:19090"
 $env:IRONMESH_RENDEZVOUS_PUBLIC_URL = "http://127.0.0.1:19090"
+$env:IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP = "true"
 cargo run -p rendezvous-service
 ```
 
@@ -97,6 +100,7 @@ Alternative on Linux/bash:
 cd /path/to/ironmesh
 export IRONMESH_RENDEZVOUS_BIND="127.0.0.1:19090"
 export IRONMESH_RENDEZVOUS_PUBLIC_URL="http://127.0.0.1:19090"
+export IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP="true"
 cargo run -p rendezvous-service
 ```
 

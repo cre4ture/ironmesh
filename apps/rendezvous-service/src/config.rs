@@ -16,6 +16,7 @@ pub struct RendezvousServiceConfig {
     pub public_url: String,
     pub relay_public_urls: Vec<String>,
     pub mtls: Option<RendezvousMtlsConfig>,
+    pub allow_insecure_http: bool,
 }
 
 impl RendezvousServiceConfig {
@@ -61,11 +62,65 @@ impl RendezvousServiceConfig {
             }
         };
 
-        Ok(Self {
+        let allow_insecure_http = std::env::var("IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP")
+            .ok()
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+
+        let config = Self {
             bind_addr,
             public_url,
             relay_public_urls,
             mtls,
-        })
+            allow_insecure_http,
+        };
+        config.validate_startup_security()?;
+        Ok(config)
+    }
+
+    pub fn validate_startup_security(&self) -> Result<()> {
+        if self.mtls.is_some() || self.allow_insecure_http {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "rendezvous-service refuses insecure HTTP startup without mTLS; configure IRONMESH_RENDEZVOUS_CLIENT_CA_CERT, IRONMESH_RENDEZVOUS_TLS_CERT, and IRONMESH_RENDEZVOUS_TLS_KEY, or set IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true for local development/testing only"
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_startup_security_rejects_plain_http_by_default() {
+        let config = RendezvousServiceConfig {
+            bind_addr: "127.0.0.1:19090".parse().expect("bind addr should parse"),
+            public_url: "http://127.0.0.1:19090".to_string(),
+            relay_public_urls: vec!["http://127.0.0.1:19090".to_string()],
+            mtls: None,
+            allow_insecure_http: false,
+        };
+
+        let error = config
+            .validate_startup_security()
+            .expect_err("plain HTTP rendezvous should be rejected by default");
+        assert!(error.to_string().contains("ALLOW_INSECURE_HTTP"));
+    }
+
+    #[test]
+    fn validate_startup_security_allows_explicit_insecure_http() {
+        let config = RendezvousServiceConfig {
+            bind_addr: "127.0.0.1:19090".parse().expect("bind addr should parse"),
+            public_url: "http://127.0.0.1:19090".to_string(),
+            relay_public_urls: vec!["http://127.0.0.1:19090".to_string()],
+            mtls: None,
+            allow_insecure_http: true,
+        };
+
+        config
+            .validate_startup_security()
+            .expect("explicit dev/test insecure HTTP should be allowed");
     }
 }
