@@ -2354,6 +2354,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_required_nodes_reconnect_after_rendezvous_restart_and_replicate() -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19139";
+        let bind_a = "127.0.0.1:19140";
+        let bind_b = "127.0.0.1:19141";
+        let cluster_id = "11111111-1111-7111-8111-111111111114";
+        let node_id_a = "00000000-0000-0000-0000-0000000008c1";
+        let node_id_b = "00000000-0000-0000-0000-0000000008c2";
+        let admin_token = "admin-secret";
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+
+        let data_a = fresh_data_dir("relay-restart-repl-node-a");
+        let data_b = fresh_data_dir("relay-restart-repl-node-b");
+
+        let node_env = [
+            ("IRONMESH_NODE_MODE", "local-edge"),
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "required"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 2, &node_env).await?;
+        let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 2, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            let wait_for_known_nodes = |base_url: String, expected_nodes: usize| {
+                let http = http.clone();
+                async move {
+                    for _ in 0..120 {
+                        if let Ok(response) =
+                            http.get(format!("{base_url}/cluster/nodes")).send().await
+                            && let Ok(response) = response.error_for_status()
+                            && let Ok(nodes) = response.json::<serde_json::Value>().await
+                            && let Some(entries) = nodes.as_array()
+                            && entries.len() == expected_nodes
+                        {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        sleep(Duration::from_millis(250)).await;
+                    }
+                    bail!("cluster did not converge to {expected_nodes} known nodes at {base_url}");
+                }
+            };
+
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 2, 120).await?;
+            wait_for_known_nodes(base_a.clone(), 2).await?;
+            wait_for_known_nodes(base_b.clone(), 2).await?;
+
+            stop_server(&mut rendezvous).await;
+            rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 2, 120).await?;
+            wait_for_known_nodes(base_a.clone(), 2).await?;
+            wait_for_known_nodes(base_b.clone(), 2).await?;
+
+            http.put(format!("{base_a}/store/restart-relay-key"))
+                .body("payload-after-rendezvous-restart")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let repair_report: serde_json::Value = http
+                .post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let successful = repair_report
+                .get("successful_transfers")
+                .and_then(|v| v.as_u64())
+                .context("missing successful_transfers after relay-required repair")?;
+            assert!(
+                successful >= 1,
+                "expected at least one successful relay-required transfer, report={repair_report:?}"
+            );
+
+            wait_for_object_payload(
+                &http,
+                &base_b,
+                "restart-relay-key",
+                "payload-after-rendezvous-restart",
+                120,
+            )
+            .await?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
     async fn maintenance_cleanup_removes_orphans_and_keeps_live_data() -> Result<()> {
         let bind = "127.0.0.1:19102";
         let data_dir = fresh_data_dir("maintenance-cleanup");
