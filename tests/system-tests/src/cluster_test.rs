@@ -136,6 +136,194 @@ mod tests {
         Ok(())
     }
 
+    fn parse_session_cookie(response: &reqwest::Response) -> Result<String> {
+        let raw = response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .context("admin login response missing Set-Cookie header")?;
+        raw.split(';')
+            .next()
+            .map(ToString::to_string)
+            .context("failed to parse admin session cookie")
+    }
+
+    async fn setup_start_cluster(
+        http: &reqwest::Client,
+        bind: &str,
+        admin_password: &str,
+    ) -> Result<serde_json::Value> {
+        http.post(format!("https://{bind}/setup/start-cluster"))
+            .json(&serde_json::json!({
+                "admin_password": admin_password,
+                "public_origin": format!("https://{bind}"),
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("failed decoding setup start-cluster response")
+    }
+
+    async fn setup_generate_join_request(
+        http: &reqwest::Client,
+        bind: &str,
+    ) -> Result<serde_json::Value> {
+        http.post(format!("https://{bind}/setup/join/request"))
+            .json(&serde_json::json!({
+                "public_origin": format!("https://{bind}"),
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("failed decoding setup join request response")
+    }
+
+    async fn setup_import_node_enrollment(
+        http: &reqwest::Client,
+        bind: &str,
+        admin_password: &str,
+        package: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        http.post(format!("https://{bind}/setup/join/import"))
+            .json(&serde_json::json!({
+                "admin_password": admin_password,
+                "package_json": serde_json::to_string(package)?,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("failed decoding setup join import response")
+    }
+
+    async fn wait_for_runtime_admin_surface(http: &reqwest::Client, bind: &str) -> Result<()> {
+        for _ in 0..120 {
+            if let Ok(response) = http
+                .get(format!("https://{bind}/auth/admin/session"))
+                .send()
+                .await
+                && response.status() == StatusCode::OK
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+        bail!("runtime admin surface did not become ready on https://{bind}");
+    }
+
+    async fn admin_login_cookie(
+        http: &reqwest::Client,
+        bind: &str,
+        admin_password: &str,
+    ) -> Result<String> {
+        let response = http
+            .post(format!("https://{bind}/auth/admin/login"))
+            .json(&serde_json::json!({
+                "password": admin_password,
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        parse_session_cookie(&response)
+    }
+
+    async fn issue_node_enrollment_from_join_request_with_cookie(
+        http: &reqwest::Client,
+        bind: &str,
+        session_cookie: &str,
+        join_request: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        http.post(format!(
+            "https://{bind}/auth/node-join-requests/issue-enrollment"
+        ))
+        .header(reqwest::header::COOKIE, session_cookie)
+        .json(&serde_json::json!({
+            "join_request": join_request,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .context("failed decoding node enrollment from join request response")
+    }
+
+    async fn issue_bootstrap_bundle_with_cookie(
+        http: &reqwest::Client,
+        bind: &str,
+        session_cookie: &str,
+        label: Option<&str>,
+        expires_in_secs: Option<u64>,
+    ) -> Result<client_sdk::ConnectionBootstrap> {
+        http.post(format!("https://{bind}/auth/bootstrap-bundles/issue"))
+            .header(reqwest::header::COOKIE, session_cookie)
+            .json(&serde_json::json!({
+                "label": label,
+                "expires_in_secs": expires_in_secs,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<client_sdk::ConnectionBootstrap>()
+            .await
+            .context("failed decoding bootstrap bundle response")
+    }
+
+    async fn export_managed_control_plane_promotion_with_cookie(
+        http: &reqwest::Client,
+        bind: &str,
+        session_cookie: &str,
+        passphrase: &str,
+        target_node_id: &str,
+        public_url: &str,
+    ) -> Result<serde_json::Value> {
+        http.post(format!(
+            "https://{bind}/auth/managed-control-plane/promotion/export"
+        ))
+        .header(reqwest::header::COOKIE, session_cookie)
+        .json(&serde_json::json!({
+            "passphrase": passphrase,
+            "target_node_id": target_node_id,
+            "public_url": public_url,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .context("failed decoding managed control-plane promotion export response")
+    }
+
+    async fn import_managed_control_plane_promotion_with_cookie(
+        http: &reqwest::Client,
+        bind: &str,
+        session_cookie: &str,
+        passphrase: &str,
+        package: &serde_json::Value,
+        bind_addr: &str,
+    ) -> Result<serde_json::Value> {
+        http.post(format!(
+            "https://{bind}/auth/managed-control-plane/promotion/import"
+        ))
+        .header(reqwest::header::COOKIE, session_cookie)
+        .json(&serde_json::json!({
+            "passphrase": passphrase,
+            "package": package,
+            "bind_addr": bind_addr,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .context("failed decoding managed control-plane promotion import response")
+    }
+
     #[tokio::test]
     async fn server_store_put_get_payload_small() -> Result<()> {
         run_server_store_put_get_payload_case("127.0.0.1:19123", "server-small-payload", 1024).await
@@ -2459,6 +2647,179 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn zero_touch_managed_rendezvous_failover_promotes_second_node_and_keeps_relay_clients_working()
+    -> Result<()> {
+        let bind_a = "127.0.0.1:19150";
+        let bind_b = "127.0.0.1:19151";
+        let rendezvous_bind = "127.0.0.1:20150";
+        let rendezvous_url = format!("https://{rendezvous_bind}");
+        let admin_password = "correct horse battery staple";
+        let failover_passphrase = "managed rendezvous failover secret";
+
+        let data_a = fresh_data_dir("zero-touch-rendezvous-failover-a");
+        let data_b = fresh_data_dir("zero-touch-rendezvous-failover-b");
+        let client_dir = fresh_data_dir("zero-touch-rendezvous-failover-client");
+
+        let insecure_http = insecure_https_client()?;
+        let mut node_a = start_zero_touch_server(bind_a, &data_a).await?;
+        let mut node_b = start_zero_touch_server(bind_b, &data_b).await?;
+
+        let result = async {
+            setup_start_cluster(&insecure_http, bind_a, admin_password).await?;
+            wait_for_runtime_admin_surface(&insecure_http, bind_a).await?;
+            let admin_cookie_a = admin_login_cookie(&insecure_http, bind_a, admin_password).await?;
+
+            let join_request = setup_generate_join_request(&insecure_http, bind_b).await?;
+            let target_node_id = join_request
+                .get("node_id")
+                .and_then(|value| value.as_str())
+                .context("join request missing node_id")?
+                .to_string();
+
+            let enrollment_package = issue_node_enrollment_from_join_request_with_cookie(
+                &insecure_http,
+                bind_a,
+                &admin_cookie_a,
+                &join_request,
+            )
+            .await?;
+            setup_import_node_enrollment(
+                &insecure_http,
+                bind_b,
+                admin_password,
+                &enrollment_package,
+            )
+            .await?;
+            wait_for_runtime_admin_surface(&insecure_http, bind_b).await?;
+            let admin_cookie_b = admin_login_cookie(&insecure_http, bind_b, admin_password).await?;
+
+            let promotion_package = export_managed_control_plane_promotion_with_cookie(
+                &insecure_http,
+                bind_a,
+                &admin_cookie_a,
+                failover_passphrase,
+                &target_node_id,
+                &rendezvous_url,
+            )
+            .await?;
+            let import_report = import_managed_control_plane_promotion_with_cookie(
+                &insecure_http,
+                bind_b,
+                &admin_cookie_b,
+                failover_passphrase,
+                &promotion_package,
+                rendezvous_bind,
+            )
+            .await?;
+            assert_eq!(
+                import_report
+                    .get("restart_required")
+                    .and_then(|value| value.as_bool()),
+                Some(true)
+            );
+
+            stop_server(&mut node_a).await;
+            stop_server(&mut node_b).await;
+            node_b = start_zero_touch_server(bind_b, &data_b).await?;
+
+            wait_for_runtime_admin_surface(&insecure_http, bind_b).await?;
+            let managed_rendezvous_http = managed_runtime_mtls_client_from_data_dir(&data_b)?;
+            wait_for_url_status_with_client(
+                &managed_rendezvous_http,
+                &format!("{rendezvous_url}/health"),
+                StatusCode::OK,
+                120,
+            )
+            .await?;
+            let admin_cookie_b = admin_login_cookie(&insecure_http, bind_b, admin_password).await?;
+
+            let bootstrap = issue_bootstrap_bundle_with_cookie(
+                &insecure_http,
+                bind_b,
+                &admin_cookie_b,
+                Some("relay-after-failover"),
+                Some(3600),
+            )
+            .await?;
+            let bootstrap_path = client_dir.join("relay-after-failover.bootstrap.json");
+            bootstrap.write_to_path(&bootstrap_path)?;
+            let bootstrap_arg = bootstrap_path.to_string_lossy().into_owned();
+
+            let client_identity_path = client_dir.join("relay-after-failover.identity.json");
+            let client_identity_arg = client_identity_path.to_string_lossy().into_owned();
+
+            let enroll_output = run_cli(&[
+                "--bootstrap-file",
+                bootstrap_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "enroll",
+                "--label",
+                "relay-after-failover",
+            ])
+            .await?;
+            assert!(
+                enroll_output.contains("enrolled device"),
+                "unexpected enroll output: {enroll_output}"
+            );
+
+            let mut relay_only_bootstrap = bootstrap.clone();
+            for endpoint in &mut relay_only_bootstrap.direct_endpoints {
+                if endpoint.usage == Some(client_sdk::BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+            let relay_only_bootstrap_path =
+                client_dir.join("relay-only-after-failover.bootstrap.json");
+            relay_only_bootstrap.write_to_path(&relay_only_bootstrap_path)?;
+            let relay_only_bootstrap_arg = relay_only_bootstrap_path.to_string_lossy().into_owned();
+
+            let put_output = run_cli(&[
+                "--bootstrap-file",
+                relay_only_bootstrap_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "put",
+                "relay-failover-key",
+                "payload-via-promoted-rendezvous",
+            ])
+            .await?;
+            assert!(
+                put_output.contains("stored 'relay-failover-key'"),
+                "unexpected put output after failover: {put_output}"
+            );
+
+            for _ in 0..120 {
+                if let Ok(output) = run_cli(&[
+                    "--bootstrap-file",
+                    relay_only_bootstrap_arg.as_str(),
+                    "--client-identity-file",
+                    client_identity_arg.as_str(),
+                    "get",
+                    "relay-failover-key",
+                ])
+                .await
+                    && output.trim() == "payload-via-promoted-rendezvous"
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(250)).await;
+            }
+
+            bail!("relay-only client did not recover through the promoted managed rendezvous host");
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_dir);
 
         result
     }

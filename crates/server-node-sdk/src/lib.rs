@@ -2795,6 +2795,14 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             post(import_managed_rendezvous_failover_handler),
         )
         .route(
+            "/auth/managed-control-plane/promotion/export",
+            post(export_managed_control_plane_promotion_handler),
+        )
+        .route(
+            "/auth/managed-control-plane/promotion/import",
+            post(import_managed_control_plane_promotion_handler),
+        )
+        .route(
             "/auth/node-join-requests/issue-enrollment",
             post(issue_node_enrollment_from_join_request),
         )
@@ -5387,6 +5395,26 @@ struct ManagedRendezvousFailoverImportRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct ManagedControlPlanePromotionPackage {
+    signer_backup: ManagedSignerBackup,
+    rendezvous_failover: ManagedRendezvousFailoverPackage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedControlPlanePromotionExportRequest {
+    passphrase: String,
+    target_node_id: NodeId,
+    public_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedControlPlanePromotionImportRequest {
+    passphrase: String,
+    package: ManagedControlPlanePromotionPackage,
+    bind_addr: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ManagedSignerBackupImportResponse {
     status: String,
     cluster_id: ClusterId,
@@ -5405,6 +5433,19 @@ struct ManagedRendezvousFailoverImportResponse {
     restart_required: bool,
     cert_path: String,
     key_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManagedControlPlanePromotionImportResponse {
+    status: String,
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    target_node_id: NodeId,
+    public_url: String,
+    restart_required: bool,
+    signer_ca_cert_path: String,
+    rendezvous_cert_path: String,
+    rendezvous_key_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7019,6 +7060,421 @@ async fn import_managed_rendezvous_failover_handler(
                 .display()
                 .to_string(),
             key_path: managed_rendezvous_key_path(&state.data_dir)
+                .display()
+                .to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn export_managed_control_plane_promotion_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagedControlPlanePromotionExportRequest>,
+) -> impl IntoResponse {
+    let action = "auth/managed-control-plane/promotion/export";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "target_node_id": request.target_node_id,
+            "public_url": request.public_url,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let public_url = request
+        .public_url
+        .clone()
+        .or_else(|| state.rendezvous_urls.first().cloned());
+    let Some(public_url) = public_url else {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "no managed rendezvous URL is configured on this node" }),
+        )
+        .await;
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": "no managed rendezvous URL is configured on this node" })),
+        )
+            .into_response();
+    };
+
+    let trust_material =
+        match load_live_trust_material(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR) {
+            Ok(material) => material,
+            Err(status) => return status.into_response(),
+        };
+    let Some(ca_cert_pem) = trust_material
+        .cluster_ca_pem
+        .as_deref()
+        .or(state.cluster_ca_pem.as_deref())
+        .or(trust_material.public_ca_pem.as_deref())
+        .or(state.public_ca_pem.as_deref())
+    else {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed signer CA certificate is not available on this node" }),
+        )
+        .await;
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": "managed signer CA certificate is not available on this node" })),
+        )
+            .into_response();
+    };
+    let Some(ca_key_pem) = trust_material
+        .internal_ca_key_pem
+        .as_deref()
+        .or(state.internal_ca_key_pem.as_deref())
+        .or(trust_material.public_ca_key_pem.as_deref())
+        .or(state.public_ca_key_pem.as_deref())
+    else {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed signer CA private key is not available on this node" }),
+        )
+        .await;
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": "managed signer CA private key is not available on this node" })),
+        )
+            .into_response();
+    };
+
+    let signer_backup = match export_managed_signer_backup(
+        state.cluster_id,
+        state.node_id,
+        ca_cert_pem,
+        ca_key_pem,
+        &request.passphrase,
+    ) {
+        Ok(backup) => backup,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let (cert_pem, key_pem) = match issue_managed_rendezvous_tls_identity_from_ca(
+        state.cluster_id,
+        &public_url,
+        ca_cert_pem,
+        ca_key_pem,
+    ) {
+        Ok(material) => material,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let rendezvous_failover = match export_managed_rendezvous_failover_package(
+        state.cluster_id,
+        state.node_id,
+        request.target_node_id,
+        &public_url,
+        &cert_pem,
+        &key_pem,
+        &request.passphrase,
+    ) {
+        Ok(package) => package,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let package = ManagedControlPlanePromotionPackage {
+        signer_backup,
+        rendezvous_failover,
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "target_node_id": package.rendezvous_failover.target_node_id,
+            "public_url": package.rendezvous_failover.public_url,
+            "exported_at_unix": package.rendezvous_failover.exported_at_unix,
+        }),
+    )
+    .await;
+
+    (StatusCode::CREATED, Json(package)).into_response()
+}
+
+async fn import_managed_control_plane_promotion_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagedControlPlanePromotionImportRequest>,
+) -> impl IntoResponse {
+    let action = "auth/managed-control-plane/promotion/import";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "cluster_id": request.package.rendezvous_failover.cluster_id,
+            "source_node_id": request.package.rendezvous_failover.source_node_id,
+            "target_node_id": request.package.rendezvous_failover.target_node_id,
+            "public_url": request.package.rendezvous_failover.public_url,
+            "bind_addr": request.bind_addr,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    if request.package.signer_backup.cluster_id != state.cluster_id
+        || request.package.rendezvous_failover.cluster_id != state.cluster_id
+    {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed control-plane promotion package belongs to a different cluster" }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "managed control-plane promotion package belongs to a different cluster" })),
+        )
+            .into_response();
+    }
+    if request.package.rendezvous_failover.target_node_id != state.node_id {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed control-plane promotion package targets a different node" }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "managed control-plane promotion package targets a different node" })),
+        )
+            .into_response();
+    }
+
+    let bind_addr = match request.bind_addr.as_deref() {
+        Some(raw) => match raw.parse::<SocketAddr>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": "invalid managed rendezvous bind_addr" }),
+                )
+                .await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid managed rendezvous bind_addr" })),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            let port = match reqwest::Url::parse(&request.package.rendezvous_failover.public_url)
+                .ok()
+                .and_then(|url| url.port_or_known_default())
+            {
+                Some(port) => port,
+                None => {
+                    append_admin_audit(
+                        &state,
+                        action,
+                        &authz,
+                        true,
+                        true,
+                        true,
+                        "error",
+                        json!({ "error": "managed rendezvous public URL must include a valid port" }),
+                    )
+                    .await;
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "managed rendezvous public URL must include a valid port" })),
+                    )
+                        .into_response();
+                }
+            };
+            SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port)
+        }
+    };
+
+    if let Err(err) = import_managed_signer_backup(
+        &state.data_dir,
+        &request.package.signer_backup,
+        &request.passphrase,
+        Some(state.cluster_id),
+    ) {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    if let Err(err) = import_managed_rendezvous_failover_package(
+        &state.data_dir,
+        &request.package.rendezvous_failover,
+        &request.passphrase,
+        bind_addr,
+        Some(state.cluster_id),
+        Some(state.node_id),
+    ) {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "source_node_id": request.package.rendezvous_failover.source_node_id,
+            "target_node_id": request.package.rendezvous_failover.target_node_id,
+            "public_url": request.package.rendezvous_failover.public_url,
+            "restart_required": true,
+        }),
+    )
+    .await;
+
+    (
+        StatusCode::CREATED,
+        Json(ManagedControlPlanePromotionImportResponse {
+            status: "imported".to_string(),
+            cluster_id: state.cluster_id,
+            source_node_id: request.package.rendezvous_failover.source_node_id,
+            target_node_id: request.package.rendezvous_failover.target_node_id,
+            public_url: request.package.rendezvous_failover.public_url.clone(),
+            restart_required: true,
+            signer_ca_cert_path: managed_signer_ca_cert_path(&state.data_dir)
+                .display()
+                .to_string(),
+            rendezvous_cert_path: managed_rendezvous_cert_path(&state.data_dir)
+                .display()
+                .to_string(),
+            rendezvous_key_path: managed_rendezvous_key_path(&state.data_dir)
                 .display()
                 .to_string(),
         }),

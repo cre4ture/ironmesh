@@ -169,6 +169,28 @@
     <pre id="managed-rendezvous-import-json-output">paste an encrypted managed rendezvous failover package and click the button to import it on this node</pre>
     <p id="managed-rendezvous-import-notes"></p>
 
+    <h3>Managed control-plane promotion</h3>
+    <p>Exports or imports one passphrase-protected package that moves both the managed signer and the embedded managed rendezvous role together. This is the recommended failover path when the promoted node must keep onboarding clients and nodes after restart. Export returns encrypted signer and rendezvous material via <code>POST /auth/managed-control-plane/promotion/export</code>. Import persists both roles on the target node via <code>POST /auth/managed-control-plane/promotion/import</code> and requires a restart before the promoted control plane becomes active there.</p>
+    <label for="managed-control-plane-promotion-passphrase">Promotion passphrase</label>
+    <input id="managed-control-plane-promotion-passphrase" type="password" autocomplete="off" spellcheck="false" />
+    <label for="managed-control-plane-promotion-target-node-id">Target node ID</label>
+    <input id="managed-control-plane-promotion-target-node-id" type="text" autocomplete="off" spellcheck="false" placeholder="00000000-0000-0000-0000-000000000000" />
+    <label for="managed-control-plane-promotion-public-url">Public rendezvous URL override (optional)</label>
+    <input id="managed-control-plane-promotion-public-url" type="text" autocomplete="off" spellcheck="false" placeholder="https://rendezvous.example:9443" />
+    <button id="export-managed-control-plane-promotion" type="button">Export managed control-plane promotion package</button>
+    <pre id="managed-control-plane-promotion-json">provide a passphrase and target node ID to export a combined signer plus rendezvous promotion package</pre>
+    <p id="managed-control-plane-promotion-notes"></p>
+
+    <label for="managed-control-plane-promotion-import-json">Managed control-plane promotion package JSON</label>
+    <textarea id="managed-control-plane-promotion-import-json" rows="12" spellcheck="false" placeholder='{"signer_backup":{"version":1,"cluster_id":"..."},"rendezvous_failover":{"version":1,"cluster_id":"..."}}'></textarea>
+    <label for="managed-control-plane-promotion-import-passphrase">Import passphrase</label>
+    <input id="managed-control-plane-promotion-import-passphrase" type="password" autocomplete="off" spellcheck="false" />
+    <label for="managed-control-plane-promotion-import-bind-addr">Bind address override (optional)</label>
+    <input id="managed-control-plane-promotion-import-bind-addr" type="text" autocomplete="off" spellcheck="false" placeholder="0.0.0.0:9443" />
+    <button id="import-managed-control-plane-promotion" type="button">Import managed control-plane promotion package</button>
+    <pre id="managed-control-plane-promotion-import-json-output">paste a combined signer plus rendezvous promotion package and click the button to import it on this node</pre>
+    <p id="managed-control-plane-promotion-import-notes"></p>
+
     <h2>Server logs</h2>
     <p>Recent in-memory log lines from this node.</p>
     <pre id="server-logs">loading...</pre>
@@ -209,6 +231,8 @@
       <li><code>POST /auth/managed-signer/backup/import</code> - import an encrypted managed signer backup onto this node; restart required before it becomes the active signer (admin session or token required)</li>
       <li><code>POST /auth/managed-rendezvous/failover/export</code> - export an encrypted managed rendezvous failover package for a promoted node while keeping the same public rendezvous hostname/VIP (admin session or token required, signer CA material required)</li>
       <li><code>POST /auth/managed-rendezvous/failover/import</code> - import an encrypted managed rendezvous failover package onto the promoted node; restart required before the embedded rendezvous listener becomes active there (admin session or token required)</li>
+      <li><code>POST /auth/managed-control-plane/promotion/export</code> - export one encrypted package that moves both the managed signer and the embedded rendezvous role together to a promoted node (admin session or token required, signer CA material required)</li>
+      <li><code>POST /auth/managed-control-plane/promotion/import</code> - import one encrypted combined control-plane promotion package onto the promoted node; restart required before signer and embedded rendezvous become active there (admin session or token required)</li>
       <li><code>POST /auth/node-join-requests/issue-enrollment</code> - issue a node enrollment package from a joining node's request blob (admin session or token required, CA key material required)</li>
       <li><code>POST /auth/node-enrollments/renew</code> - renew an existing node enrollment package with fresh TLS material for the same node identity (admin session or token required, CA key material required)</li>
       <li><code>GET /auth/node-certificates/status</code> - inspect current public/internal certificate expiry and renewal state (admin session or token required)</li>

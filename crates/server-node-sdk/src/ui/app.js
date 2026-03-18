@@ -678,6 +678,119 @@ async function importManagedRendezvousFailover() {
   }
 }
 
+async function exportManagedControlPlanePromotion() {
+  const output = document.getElementById('managed-control-plane-promotion-json');
+  const notes = document.getElementById('managed-control-plane-promotion-notes');
+  const passphrase = document.getElementById('managed-control-plane-promotion-passphrase').value;
+  const targetNodeId = document.getElementById('managed-control-plane-promotion-target-node-id').value.trim();
+  const publicUrl = document.getElementById('managed-control-plane-promotion-public-url').value.trim();
+  if (!passphrase.trim()) {
+    output.textContent = 'promotion passphrase is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!targetNodeId) {
+    output.textContent = 'target node ID is required';
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'exporting managed control-plane promotion package...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/managed-control-plane/promotion/export', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
+      body: JSON.stringify({
+        passphrase,
+        target_node_id: targetNodeId,
+        public_url: publicUrl || null
+      })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeManagedControlPlanePromotionPackage(payload);
+  } catch (error) {
+    output.textContent = 'failed to export managed control-plane promotion package: ' + error;
+    notes.textContent = '';
+  }
+}
+
+async function importManagedControlPlanePromotion() {
+  const output = document.getElementById('managed-control-plane-promotion-import-json-output');
+  const notes = document.getElementById('managed-control-plane-promotion-import-notes');
+  const passphrase = document.getElementById('managed-control-plane-promotion-import-passphrase').value;
+  const packageRaw = document.getElementById('managed-control-plane-promotion-import-json').value.trim();
+  const bindAddr = document.getElementById('managed-control-plane-promotion-import-bind-addr').value.trim();
+  if (!packageRaw) {
+    output.textContent = 'managed control-plane promotion package JSON is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!passphrase.trim()) {
+    output.textContent = 'import passphrase is required';
+    notes.textContent = '';
+    return;
+  }
+
+  let promotionPackage;
+  try {
+    promotionPackage = JSON.parse(packageRaw);
+  } catch (error) {
+    output.textContent = 'failed to parse managed control-plane promotion package JSON: ' + error;
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'importing managed control-plane promotion package...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/managed-control-plane/promotion/import', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
+      body: JSON.stringify({
+        passphrase,
+        package: promotionPackage,
+        bind_addr: bindAddr || null
+      })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeManagedControlPlanePromotionImport(payload);
+  } catch (error) {
+    output.textContent = 'failed to import managed control-plane promotion package: ' + error;
+    notes.textContent = '';
+  }
+}
+
 function formatUnixTs(unixTs) {
   const parsed = Number(unixTs);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -862,6 +975,33 @@ function summarizeManagedRendezvousFailoverImport(payload) {
   return notes.join(' | ');
 }
 
+function summarizeManagedControlPlanePromotionPackage(payload) {
+  const signer = payload?.signer_backup || {};
+  const rendezvous = payload?.rendezvous_failover || {};
+  return [
+    `cluster: ${rendezvous.cluster_id || signer.cluster_id || 'unknown'}`,
+    `source node: ${rendezvous.source_node_id || signer.source_node_id || 'unknown'}`,
+    `target node: ${rendezvous.target_node_id || 'unknown'}`,
+    `public URL: ${rendezvous.public_url || 'unknown'}`,
+    `exported: ${formatUnixTs(rendezvous.exported_at_unix || signer.exported_at_unix)}`
+  ].join(' | ');
+}
+
+function summarizeManagedControlPlanePromotionImport(payload) {
+  const notes = [
+    `cluster: ${payload?.cluster_id || 'unknown'}`,
+    `source node: ${payload?.source_node_id || 'unknown'}`,
+    `target node: ${payload?.target_node_id || 'unknown'}`,
+    `public URL: ${payload?.public_url || 'unknown'}`,
+    `signer CA path: ${payload?.signer_ca_cert_path || 'unknown'}`,
+    `rendezvous cert path: ${payload?.rendezvous_cert_path || 'unknown'}`
+  ];
+  if (payload?.restart_required) {
+    notes.push('restart required before signer and embedded rendezvous become active on this node');
+  }
+  return notes.join(' | ');
+}
+
 function renderBootstrapQr(text) {
   const container = document.getElementById('bootstrap-bundle-qr-container');
   const target = document.getElementById('bootstrap-bundle-qr');
@@ -946,6 +1086,14 @@ document
 document
   .getElementById('import-managed-rendezvous-failover')
   .addEventListener('click', importManagedRendezvousFailover);
+
+document
+  .getElementById('export-managed-control-plane-promotion')
+  .addEventListener('click', exportManagedControlPlanePromotion);
+
+document
+  .getElementById('import-managed-control-plane-promotion')
+  .addEventListener('click', importManagedControlPlanePromotion);
 
 refreshAdminSessionStatus();
 refreshServerLogs();

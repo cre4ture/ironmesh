@@ -398,12 +398,13 @@ The first implementation slice is now in place:
 - the runtime admin UI/API can now export a passphrase-protected managed rendezvous failover package for a promoted node and import that package on the target node, with restart-required activation semantics on the target,
 - `Join an existing cluster` already supports generating a transportable join-request blob on the joining node, importing that join request on an existing cluster node to issue a node enrollment package, and importing the issued node enrollment package on the joining node to transition into the normal runtime path.
 - the runtime admin UI/API can now export an encrypted managed signer backup and import that backup onto another approved node, with restart-required activation semantics for the imported signer material.
+- the runtime admin UI/API can now also export and import one combined managed control-plane promotion package that moves both the signer and the embedded rendezvous role together, so a promoted node can continue onboarding and relay duties after restart.
 - the regular runtime UI/API now supports password-backed local admin login with an HTTP-only session cookie, while the old admin-token header remains available only as an advanced override.
 - the regular zero-touch rendezvous direction is now embedded managed rendezvous on the first node; standalone `rendezvous-service` remains the advanced/operator deployment path.
 
 Important current limitations of this first slice:
 
-- signer transfer still requires manual backup export/import plus restart rather than a smoother guided handoff flow,
+- the combined control-plane promotion flow still assumes explicit export/import plus restart rather than automatic quorum- or lease-based role movement,
 - managed rendezvous failover currently assumes a stable public rendezvous hostname or VIP can be moved to the promoted node; live multi-rendezvous shared-state clustering is still follow-up work,
 - fully zero-touch standalone/external rendezvous provisioning is still follow-up work,
 - encrypt-at-rest for persisted signer material and richer multi-admin auth are still follow-up work.
@@ -420,6 +421,7 @@ The chosen strategy is:
 - forced creation of the first strong admin password during `Start a new cluster`,
 - first node as initial signer/controller with transferable signer role,
 - first node as the initial embedded secure rendezvous host for the regular path,
+- combined managed control-plane promotion packages for moving signer plus embedded rendezvous together to another approved node,
 - passphrase-protected managed rendezvous failover packages for promoting another approved node while keeping the same public rendezvous hostname/VIP,
 - encrypted managed-CA backup export/import for recovery and signer transfer,
 - request/import plus enrollment/import as the first join transport,

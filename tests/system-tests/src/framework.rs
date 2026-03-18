@@ -124,6 +124,30 @@ pub fn mtls_client_from_data_dir(data_dir: &Path) -> Result<reqwest::Client> {
         .context("failed building mtls client")
 }
 
+pub fn managed_runtime_mtls_client_from_data_dir(data_dir: &Path) -> Result<reqwest::Client> {
+    let tls_dir = data_dir.join("managed").join("runtime").join("internal");
+    let ca_pem = fs::read(tls_dir.join("cluster-ca.pem"))
+        .context("failed reading managed cluster-ca.pem")?;
+    let cert_pem = fs::read(tls_dir.join("node.pem")).context("failed reading managed node.pem")?;
+    let key_pem = fs::read(tls_dir.join("node.key")).context("failed reading managed node.key")?;
+
+    let ca_cert =
+        reqwest::Certificate::from_pem(&ca_pem).context("failed parsing managed CA pem")?;
+
+    let mut identity_pem = Vec::new();
+    identity_pem.extend_from_slice(&cert_pem);
+    identity_pem.extend_from_slice(b"\n");
+    identity_pem.extend_from_slice(&key_pem);
+    let identity = reqwest::Identity::from_pem(&identity_pem)
+        .context("failed parsing managed node identity pem")?;
+
+    reqwest::Client::builder()
+        .add_root_certificate(ca_cert)
+        .identity(identity)
+        .build()
+        .context("failed building managed runtime mtls client")
+}
+
 pub fn https_client_with_root_from_data_dir(data_dir: &Path) -> Result<reqwest::Client> {
     let tls_dir = data_dir.join("tls");
     let ca_pem = fs::read(tls_dir.join("ca.pem")).context("failed reading ca.pem")?;
@@ -152,6 +176,13 @@ pub fn mtls_client_for_node_id(node_id: &str) -> Result<reqwest::Client> {
         .identity(identity)
         .build()
         .context("failed building mtls client for node id")
+}
+
+pub fn insecure_https_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("failed building insecure https client")
 }
 
 pub struct ChildGuard {
@@ -187,6 +218,68 @@ impl Drop for ChildGuard {
 pub async fn start_server(bind: &str) -> Result<ChildGuard> {
     let data_dir = fresh_data_dir("default-server");
     start_server_with_data_dir(bind, &data_dir).await
+}
+
+pub async fn start_zero_touch_server(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
+    let server_bin = binary_path("server-node")?;
+    fs::create_dir_all(data_dir).context("failed creating zero-touch data dir")?;
+
+    let stdout_log = data_dir.join("server-node.setup.stdout.log");
+    let stderr_log = data_dir.join("server-node.setup.stderr.log");
+    let stdout_file =
+        std::fs::File::create(&stdout_log).context("failed creating setup stdout log")?;
+    let stderr_file =
+        std::fs::File::create(&stderr_log).context("failed creating setup stderr log")?;
+
+    let mut command = Command::new(server_bin);
+    command
+        .env("IRONMESH_SERVER_BIND", bind)
+        .env("IRONMESH_DATA_DIR", data_dir)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+
+    let mut child = command
+        .spawn()
+        .context("failed to spawn zero-touch server-node")?;
+
+    let insecure_http = insecure_https_client()?;
+    let health_url = format!("https://{bind}/health");
+    if let Err(err) =
+        wait_for_url_status_with_client(&insecure_http, &health_url, StatusCode::OK, 60).await
+    {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to query zero-touch server-node process state")?
+        {
+            let stderr_tail = std::fs::read_to_string(&stderr_log)
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "zero-touch server-node exited early on {bind} with status {status}: {err}\n--- stderr (tail) ---\n{stderr_tail}"
+            );
+        }
+        bail!(
+            "zero-touch server-node did not become healthy on {bind}: {err} (logs at {} and {})",
+            stdout_log.display(),
+            stderr_log.display()
+        );
+    }
+
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to query zero-touch server-node process state")?
+    {
+        bail!("zero-touch server-node exited early on {bind} with status {status}");
+    }
+
+    Ok(ChildGuard::new(child))
 }
 
 pub async fn start_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
