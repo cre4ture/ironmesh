@@ -29,6 +29,21 @@ ci-stable:
     cargo +stable clippy --workspace --all-targets -- -D warnings
     cargo +stable test --workspace
 
+web-install:
+    cd web && pnpm install
+
+web-dev-admin:
+    cd web && pnpm --filter @ironmesh/server-admin dev
+
+web-dev-client:
+    cd web && pnpm --filter @ironmesh/client-ui dev
+
+web-build:
+    cd web && pnpm build
+
+web-typecheck:
+    cd web && pnpm typecheck
+
 context-refresh:
     @test -f docs/agent-context.md
     @echo "==> Context refresh helper"

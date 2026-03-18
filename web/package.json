@@ -1,0 +1,16 @@
+{
+  "name": "@ironmesh/web-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.6.0",
+  "scripts": {
+    "dev:server-admin": "pnpm --filter @ironmesh/server-admin dev",
+    "dev:client-ui": "pnpm --filter @ironmesh/client-ui dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.1"
+  }
+}

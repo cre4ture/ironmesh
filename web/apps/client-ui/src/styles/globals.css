@@ -1,0 +1,10 @@
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at top right, rgba(18, 184, 134, 0.1), transparent 30%),
+    linear-gradient(180deg, #f8fafb 0%, #eef3f5 100%);
+}
+
+#root {
+  min-height: 100vh;
+}
