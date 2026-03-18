@@ -1393,10 +1393,10 @@ run_on_all_metadata_backends!(
     persist_and_load_cluster_replicas_roundtrip_turso
 );
 
-async fn client_auth_state_roundtrip_impl(backend: StorageTestBackend) {
-    let (root, store) = backend.init_store("client-auth-roundtrip").await;
+async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("client-credential-roundtrip").await;
 
-    let state = ClientAuthState {
+    let state = ClientCredentialState {
         pairing_tokens: vec![PairingTokenRecord {
             token_id: "tok-1".to_string(),
             token_hash: "hash-1".to_string(),
@@ -1406,7 +1406,7 @@ async fn client_auth_state_roundtrip_impl(backend: StorageTestBackend) {
             used_at_unix: None,
             enrolled_device_id: None,
         }],
-        devices: vec![DeviceAuthRecord {
+        credentials: vec![ClientCredentialRecord {
             device_id: "dev-1".to_string(),
             label: Some("Pixel".to_string()),
             public_key_pem: None,
@@ -1416,23 +1416,23 @@ async fn client_auth_state_roundtrip_impl(backend: StorageTestBackend) {
         }],
     };
 
-    store.persist_client_auth_state(&state).await.unwrap();
-    let loaded = store.load_client_auth_state().await.unwrap();
+    store.persist_client_credential_state(&state).await.unwrap();
+    let loaded = store.load_client_credential_state().await.unwrap();
 
     assert_eq!(loaded.pairing_tokens.len(), 1);
     assert_eq!(loaded.pairing_tokens[0].token_id, "tok-1");
     assert_eq!(loaded.pairing_tokens[0].label.as_deref(), Some("laptop"));
-    assert_eq!(loaded.devices.len(), 1);
-    assert_eq!(loaded.devices[0].device_id, "dev-1");
-    assert_eq!(loaded.devices[0].label.as_deref(), Some("Pixel"));
+    assert_eq!(loaded.credentials.len(), 1);
+    assert_eq!(loaded.credentials[0].device_id, "dev-1");
+    assert_eq!(loaded.credentials[0].label.as_deref(), Some("Pixel"));
 
     let _ = fs::remove_dir_all(root).await;
 }
 
 run_on_all_metadata_backends!(
-    client_auth_state_roundtrip_impl,
-    client_auth_state_roundtrip,
-    client_auth_state_roundtrip_turso
+    client_credential_state_roundtrip_impl,
+    client_credential_state_roundtrip,
+    client_credential_state_roundtrip_turso
 );
 
 async fn ensure_media_cache_generates_thumbnail_and_dimensions_for_png_impl(

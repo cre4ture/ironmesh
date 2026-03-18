@@ -7,7 +7,7 @@ use common::NodeId;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    AdminAuditEvent, CachedMediaMetadata, ClientAuthState, CurrentState, FileVersionIndex,
+    AdminAuditEvent, CachedMediaMetadata, ClientCredentialState, CurrentState, FileVersionIndex,
     MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo, SnapshotManifest,
 };
 
@@ -146,28 +146,28 @@ impl MetadataStore for SqliteMetadataStore {
         })
     }
 
-    async fn load_client_auth_state(&self) -> Result<ClientAuthState> {
+    async fn load_client_credential_state(&self) -> Result<ClientCredentialState> {
         let db = self.metadata_conn()?;
         let payload = db
             .query_row(
-                "SELECT state_json FROM client_auth_state WHERE singleton = 1",
+                "SELECT state_json FROM client_credential_state WHERE singleton = 1",
                 [],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()?;
 
         match payload {
-            Some(payload) => serde_json::from_slice::<ClientAuthState>(&payload)
-                .context("invalid client auth state in sqlite"),
-            None => Ok(ClientAuthState::default()),
+            Some(payload) => serde_json::from_slice::<ClientCredentialState>(&payload)
+                .context("invalid client credential state in sqlite"),
+            None => Ok(ClientCredentialState::default()),
         }
     }
 
-    async fn persist_client_auth_state(&self, state: &ClientAuthState) -> Result<()> {
+    async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()> {
         let payload = serde_json::to_vec_pretty(state)?;
         let db = self.metadata_conn()?;
         db.execute(
-            "INSERT INTO client_auth_state (singleton, state_json)
+            "INSERT INTO client_credential_state (singleton, state_json)
              VALUES (1, ?1)
              ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
             params![payload],
@@ -495,7 +495,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             PRIMARY KEY(subject, node_id)
         );
 
-        CREATE TABLE IF NOT EXISTS client_auth_state (
+        CREATE TABLE IF NOT EXISTS client_credential_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             state_json BLOB NOT NULL
         );

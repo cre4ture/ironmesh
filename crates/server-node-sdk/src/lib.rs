@@ -82,8 +82,8 @@ use cluster::{
     ReplicationPolicy,
 };
 use storage::{
-    AdminAuditEvent, ClientAuthState, DeviceAuthRecord, MediaCacheLookup, MediaCacheStatus,
-    MediaGpsCoordinates, MetadataBackendKind, ObjectReadMode, PairingTokenRecord,
+    AdminAuditEvent, ClientCredentialRecord, ClientCredentialState, MediaCacheLookup,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, ObjectReadMode, PairingTokenRecord,
     PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
     StoreReadError, UploadChunkRef, VersionConsistencyState,
 };
@@ -94,7 +94,7 @@ struct ServerState {
     node_id: NodeId,
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
-    client_auth: Arc<Mutex<ClientAuthState>>,
+    client_credentials: Arc<Mutex<ClientCredentialState>>,
     public_ca_pem: Option<String>,
     public_ca_key_pem: Option<String>,
     cluster_ca_pem: Option<String>,
@@ -277,8 +277,8 @@ async fn require_client_auth(
     }
 
     let (public_key_pem, stored_credential_fingerprint) = {
-        let auth_state = state.client_auth.lock().await;
-        let Some(device) = auth_state.devices.iter().find(|device| {
+        let auth_state = state.client_credentials.lock().await;
+        let Some(device) = auth_state.credentials.iter().find(|device| {
             device.revoked_at_unix.is_none() && device.device_id == signed_headers.device_id
         }) else {
             return Err(StatusCode::UNAUTHORIZED);
@@ -2406,13 +2406,16 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     };
     cluster.import_replicas_by_key(persisted_cluster_replicas);
 
-    let persisted_client_auth = {
+    let persisted_client_credentials = {
         let store_guard = store.lock().await;
-        match store_guard.load_client_auth_state().await {
+        match store_guard.load_client_credential_state().await {
             Ok(state) => state,
             Err(err) => {
-                warn!(error = %err, "failed to load client auth state; starting empty");
-                ClientAuthState::default()
+                warn!(
+                    error = %err,
+                    "failed to load client credential state; starting empty"
+                );
+                ClientCredentialState::default()
             }
         }
     };
@@ -2525,7 +2528,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         node_id: config.node_id,
         store,
         cluster: Arc::new(Mutex::new(cluster)),
-        client_auth: Arc::new(Mutex::new(persisted_client_auth)),
+        client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
         public_ca_pem,
         public_ca_key_pem,
         cluster_ca_pem,
@@ -5323,13 +5326,13 @@ struct NodeCertificateAutoRenewStatusView {
     restart_required: bool,
 }
 
-async fn persist_client_auth_state(state: &ServerState) -> Result<()> {
+async fn persist_client_credential_state(state: &ServerState) -> Result<()> {
     let snapshot = {
-        let auth = state.client_auth.lock().await;
+        let auth = state.client_credentials.lock().await;
         auth.clone()
     };
     let store = state.store.lock().await;
-    store.persist_client_auth_state(&snapshot).await
+    store.persist_client_credential_state(&snapshot).await
 }
 
 async fn issue_pairing_token(
@@ -6235,15 +6238,18 @@ async fn issue_pairing_token_impl(
     };
 
     {
-        let mut auth_state = state.client_auth.lock().await;
+        let mut auth_state = state.client_credentials.lock().await;
         auth_state
             .pairing_tokens
             .retain(|token| token.used_at_unix.is_none() && token.expires_at_unix > now);
         auth_state.pairing_tokens.push(record.clone());
     }
 
-    if let Err(err) = persist_client_auth_state(state).await {
-        warn!(error = %err, "failed to persist client auth state after pairing token issue");
+    if let Err(err) = persist_client_credential_state(state).await {
+        warn!(
+            error = %err,
+            "failed to persist client credential state after pairing token issue"
+        );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -6310,13 +6316,13 @@ async fn enroll_client_device(
     };
 
     let response = {
-        let mut auth_state = state.client_auth.lock().await;
+        let mut auth_state = state.client_credentials.lock().await;
         auth_state
             .pairing_tokens
             .retain(|token| token.used_at_unix.is_none() && token.expires_at_unix > now);
 
         if auth_state
-            .devices
+            .credentials
             .iter()
             .any(|device| device.device_id == device_id && device.revoked_at_unix.is_none())
         {
@@ -6335,7 +6341,7 @@ async fn enroll_client_device(
         token_record.enrolled_device_id = Some(device_id.clone());
 
         let final_label = label.or_else(|| token_record.label.clone());
-        let device = DeviceAuthRecord {
+        let device = ClientCredentialRecord {
             device_id: device_id.clone(),
             label: final_label.clone(),
             public_key_pem: Some(public_key_pem.to_string()),
@@ -6343,7 +6349,7 @@ async fn enroll_client_device(
             created_at_unix: now,
             revoked_at_unix: None,
         };
-        auth_state.devices.push(device);
+        auth_state.credentials.push(device);
 
         ClientDeviceEnrollResponse {
             cluster_id: state.cluster_id,
@@ -6357,8 +6363,11 @@ async fn enroll_client_device(
         }
     };
 
-    if let Err(err) = persist_client_auth_state(&state).await {
-        warn!(error = %err, "failed to persist client auth state after enrollment");
+    if let Err(err) = persist_client_credential_state(&state).await {
+        warn!(
+            error = %err,
+            "failed to persist client credential state after enrollment"
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -6377,9 +6386,9 @@ async fn list_client_devices(
     };
 
     let devices = {
-        let auth_state = state.client_auth.lock().await;
+        let auth_state = state.client_credentials.lock().await;
         auth_state
-            .devices
+            .credentials
             .iter()
             .map(|device| ClientDeviceView {
                 device_id: device.device_id.clone(),
@@ -6427,9 +6436,9 @@ async fn revoke_client_device(
 
     let now = unix_ts();
     let revoked = {
-        let mut auth_state = state.client_auth.lock().await;
+        let mut auth_state = state.client_credentials.lock().await;
         let Some(device) = auth_state
-            .devices
+            .credentials
             .iter_mut()
             .find(|device| device.device_id == device_id && device.revoked_at_unix.is_none())
         else {
@@ -6439,8 +6448,11 @@ async fn revoke_client_device(
         true
     };
 
-    if revoked && let Err(err) = persist_client_auth_state(&state).await {
-        warn!(error = %err, "failed to persist client auth state after device revocation");
+    if revoked && let Err(err) = persist_client_credential_state(&state).await {
+        warn!(
+            error = %err,
+            "failed to persist client credential state after device revocation"
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use common::NodeId;
 
 use super::{
-    AdminAuditEvent, CachedMediaMetadata, ClientAuthState, CurrentState, FileVersionIndex,
+    AdminAuditEvent, CachedMediaMetadata, ClientCredentialState, CurrentState, FileVersionIndex,
     MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo, SnapshotManifest,
 };
 
@@ -205,26 +205,26 @@ impl MetadataStore for TursoMetadataStore {
         result
     }
 
-    async fn load_client_auth_state(&self) -> Result<ClientAuthState> {
+    async fn load_client_credential_state(&self) -> Result<ClientCredentialState> {
         let mut rows = self
             .connection
             .query(
-                "SELECT state_json FROM client_auth_state WHERE singleton = 1",
+                "SELECT state_json FROM client_credential_state WHERE singleton = 1",
                 (),
             )
             .await?;
         let Some(row) = rows.next().await? else {
-            return Ok(ClientAuthState::default());
+            return Ok(ClientCredentialState::default());
         };
-        let payload = row_blob(&row, 0, "client_auth_state.state_json")?;
-        self.decode_json::<ClientAuthState>(payload, "client auth state")
+        let payload = row_blob(&row, 0, "client_credential_state.state_json")?;
+        self.decode_json::<ClientCredentialState>(payload, "client credential state")
     }
 
-    async fn persist_client_auth_state(&self, state: &ClientAuthState) -> Result<()> {
+    async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()> {
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
-                "INSERT INTO client_auth_state (singleton, state_json)
+                "INSERT INTO client_credential_state (singleton, state_json)
                  VALUES (1, ?1)
                  ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
                 (payload,),
@@ -581,7 +581,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 PRIMARY KEY(subject, node_id)
             );
 
-            CREATE TABLE IF NOT EXISTS client_auth_state (
+            CREATE TABLE IF NOT EXISTS client_credential_state (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 state_json BLOB NOT NULL
             );

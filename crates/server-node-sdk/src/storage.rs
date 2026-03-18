@@ -216,11 +216,11 @@ pub struct AdminAuditEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ClientAuthState {
+pub struct ClientCredentialState {
     #[serde(default)]
     pub pairing_tokens: Vec<PairingTokenRecord>,
     #[serde(default)]
-    pub devices: Vec<DeviceAuthRecord>,
+    pub credentials: Vec<ClientCredentialRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,7 +235,7 @@ pub struct PairingTokenRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceAuthRecord {
+pub struct ClientCredentialRecord {
     pub device_id: String,
     pub label: Option<String>,
     #[serde(default)]
@@ -438,8 +438,8 @@ trait MetadataStore: Send + Sync {
     async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>>;
     async fn persist_cluster_replicas(&self, replicas: &HashMap<String, Vec<NodeId>>)
     -> Result<()>;
-    async fn load_client_auth_state(&self) -> Result<ClientAuthState>;
-    async fn persist_client_auth_state(&self, state: &ClientAuthState) -> Result<()>;
+    async fn load_client_credential_state(&self) -> Result<ClientCredentialState>;
+    async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()>;
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>>;
     async fn load_cached_media_metadata(
         &self,
@@ -553,12 +553,17 @@ impl PersistentStore {
         self.metadata_store.persist_cluster_replicas(replicas).await
     }
 
-    pub async fn load_client_auth_state(&self) -> Result<ClientAuthState> {
-        self.metadata_store.load_client_auth_state().await
+    pub async fn load_client_credential_state(&self) -> Result<ClientCredentialState> {
+        self.metadata_store.load_client_credential_state().await
     }
 
-    pub async fn persist_client_auth_state(&self, state: &ClientAuthState) -> Result<()> {
-        self.metadata_store.persist_client_auth_state(state).await
+    pub async fn persist_client_credential_state(
+        &self,
+        state: &ClientCredentialState,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_client_credential_state(state)
+            .await
     }
 
     pub fn root_dir(&self) -> &Path {

@@ -202,7 +202,9 @@ Recommended responsibilities:
 
 ### `crates/server-node-sdk/src/storage.rs`
 
-- [ ] Replace `ClientAuthState`, `PairingTokenRecord`, and `DeviceAuthRecord` with:
+- [ ] Finish tightening the persisted server-node credential model:
+- [x] Rename `ClientAuthState` / `DeviceAuthRecord` toward credential-centered naming.
+- [ ] Replace `PairingTokenRecord` and the remaining persisted state shape with:
   - pairing records for one-time enrollment authorization,
   - persisted client credential records bound to public keys or certificate fingerprints,
   - revocation metadata for client identities.

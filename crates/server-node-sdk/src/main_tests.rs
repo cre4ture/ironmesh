@@ -493,7 +493,7 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     let state = build_test_state(1, false, backend).await;
     let now = super::unix_ts();
     {
-        let mut auth = state.client_auth.lock().await;
+        let mut auth = state.client_credentials.lock().await;
         auth.pairing_tokens.push(super::PairingTokenRecord {
             token_id: "pair-1".to_string(),
             token_hash: super::hash_token("pair-secret"),
@@ -525,9 +525,9 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     assert_eq!(enrolled["device_id"], "device-a");
     assert!(enrolled["credential_pem"].as_str().is_some());
 
-    let auth = state.client_auth.lock().await;
-    assert_eq!(auth.devices.len(), 1);
-    assert_eq!(auth.devices[0].device_id, "device-a");
+    let auth = state.client_credentials.lock().await;
+    assert_eq!(auth.credentials.len(), 1);
+    assert_eq!(auth.credentials[0].device_id, "device-a");
     assert!(auth.pairing_tokens[0].used_at_unix.is_some());
     cleanup_test_state(&state).await;
 }
@@ -548,7 +548,7 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
 
     let now = super::unix_ts();
     {
-        let mut auth = state.client_auth.lock().await;
+        let mut auth = state.client_credentials.lock().await;
         auth.pairing_tokens.push(super::PairingTokenRecord {
             token_id: "pair-2".to_string(),
             token_hash: super::hash_token("pair-secret-2"),
@@ -2497,8 +2497,8 @@ async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
     );
     identity.credential_pem = Some(credential_pem.clone());
     {
-        let mut auth = state.client_auth.lock().await;
-        auth.devices.push(super::DeviceAuthRecord {
+        let mut auth = state.client_credentials.lock().await;
+        auth.credentials.push(super::ClientCredentialRecord {
             device_id: identity.device_id.to_string(),
             label: Some("Pixel".to_string()),
             public_key_pem: Some(identity.public_key_pem.clone()),
@@ -2594,8 +2594,8 @@ async fn client_auth_middleware_rejects_replayed_nonce_impl(backend: MainTestBac
     );
     identity.credential_pem = Some(credential_pem.clone());
     {
-        let mut auth = state.client_auth.lock().await;
-        auth.devices.push(super::DeviceAuthRecord {
+        let mut auth = state.client_credentials.lock().await;
+        auth.credentials.push(super::ClientCredentialRecord {
             device_id: identity.device_id.to_string(),
             label: None,
             public_key_pem: Some(identity.public_key_pem.clone()),
@@ -3329,7 +3329,7 @@ async fn build_test_state(
         node_id: local_node_id,
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
-        client_auth: Arc::new(Mutex::new(super::storage::ClientAuthState::default())),
+        client_credentials: Arc::new(Mutex::new(super::storage::ClientCredentialState::default())),
         public_ca_pem: None,
         public_ca_key_pem: None,
         cluster_ca_pem: None,
