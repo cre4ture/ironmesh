@@ -16,6 +16,14 @@
     <p>Cluster nodes online/total: <code>__CLUSTER_ONLINE__/__CLUSTER_TOTAL__</code></p>
     <p>Replication factor target: <code>__REPLICATION_FACTOR__</code></p>
 
+    <h2>Admin Access</h2>
+    <p>For the regular zero-touch path, sign in with the local admin password. The admin token fields below remain available as an advanced override for env-driven or automation-oriented setups.</p>
+    <label for="admin-login-password">Admin password</label>
+    <input id="admin-login-password" type="password" autocomplete="current-password" spellcheck="false" />
+    <button id="admin-login" type="button">Sign in</button>
+    <button id="admin-logout" type="button">Sign out</button>
+    <pre id="admin-session-status">loading admin session status...</pre>
+
     <h2>Background work</h2>
     <ul>
       <li><strong>Autonomous post-write replication</strong>: <code>__AUTONOMOUS_REPLICATION_ON_PUT__</code></li>
@@ -37,15 +45,15 @@
     <pre id="replication-repair-json">click the button to trigger manual replication repair</pre>
 
     <h2>Bootstrap bundle</h2>
-    <p>Issues a client bootstrap bundle via <code>POST /auth/bootstrap-bundles/issue</code>. Requires the admin token.</p>
-    <label for="bootstrap-admin-token">Admin token</label>
+    <p>Issues a client bootstrap bundle via <code>POST /auth/bootstrap-bundles/issue</code>. Requires an admin session or token.</p>
+    <label for="bootstrap-admin-token">Admin token override (optional)</label>
     <input id="bootstrap-admin-token" type="password" autocomplete="off" spellcheck="false" />
     <label for="bootstrap-device-label">Device label</label>
     <input id="bootstrap-device-label" type="text" value="desktop-client" autocomplete="off" spellcheck="false" />
     <label for="bootstrap-expiry-secs">Expires in seconds</label>
     <input id="bootstrap-expiry-secs" type="number" min="60" max="86400" value="3600" />
     <button id="issue-bootstrap-bundle" type="button">Issue bootstrap bundle</button>
-    <pre id="bootstrap-bundle-json">provide the admin token and click the button to issue a bootstrap bundle</pre>
+    <pre id="bootstrap-bundle-json">sign in or provide an admin token override, then click the button to issue a bootstrap bundle</pre>
     <p id="bootstrap-bundle-notes"></p>
     <p id="bootstrap-bundle-qr-status"></p>
     <div id="bootstrap-bundle-qr-container" style="display:none; margin-top: 1rem;">
@@ -56,7 +64,7 @@
     <h2>Node bootstrap</h2>
     <p>Issues a node bootstrap artifact via <code>POST /auth/node-bootstraps/issue</code>. Use it with <code>IRONMESH_NODE_BOOTSTRAP_FILE</code> on the joining node.</p>
     <p><strong>Lifecycle note:</strong> For long-lived production nodes, prefer a node enrollment package. A plain node bootstrap plus direct cert/CA file paths is mainly for development/testing, externally managed certificates, or other short-lived/manual setups.</p>
-    <label for="node-bootstrap-admin-token">Admin token</label>
+    <label for="node-bootstrap-admin-token">Admin token override (optional)</label>
     <input id="node-bootstrap-admin-token" type="password" autocomplete="off" spellcheck="false" />
     <label for="node-bootstrap-node-id">Node ID (optional)</label>
     <input id="node-bootstrap-node-id" type="text" placeholder="auto-generate when omitted" autocomplete="off" spellcheck="false" />
@@ -95,7 +103,7 @@
     <input id="node-bootstrap-tls-renewal-window-secs" type="number" min="300" value="518400" />
     <button id="issue-node-bootstrap" type="button">Issue node bootstrap</button>
     <button id="issue-node-enrollment" type="button">Issue node enrollment package</button>
-    <pre id="node-bootstrap-json">provide the admin token and click the button to issue a node bootstrap artifact</pre>
+    <pre id="node-bootstrap-json">sign in or provide an admin token override, then click the button to issue a node bootstrap artifact</pre>
     <p id="node-bootstrap-notes"></p>
     <p>Node enrollment packages can generate internal mTLS material and, when public TLS paths are included, public HTTPS certificates too. They require <code>IRONMESH_INTERNAL_TLS_CA_KEY</code> for internal certs and <code>IRONMESH_PUBLIC_TLS_CA_KEY</code> for dedicated public certs. If both listener tiers use the same CA, the internal CA key is reused automatically. Issued material now includes validity and renewal metadata so you can rotate before expiry, and the bootstrap carries an enrollment issuer URL for node-side automatic renewal. This enrollment path is the supported production lifecycle path for node trust and certificate management.</p>
     <pre id="node-enrollment-json">click the enrollment button to issue a bootstrap plus generated TLS PEM material</pre>
@@ -167,16 +175,19 @@
       <li><code>DELETE /cluster/nodes/{node_id}</code> - remove node from cluster membership</li>
       <li><code>POST /cluster/nodes/{node_id}/heartbeat</code> - refresh node liveness</li>
       <li><code>GET /cluster/placement/{key}</code> - deterministic placement decision</li>
-      <li><code>POST /auth/bootstrap-bundles/issue</code> - issue a bootstrap JSON bundle for client enrollment (admin token required)</li>
-      <li><code>GET /auth/client-credentials</code> - inspect enrolled client credential metadata including fingerprints and revocation state (admin token required)</li>
-      <li><code>DELETE /auth/client-credentials/{device_id}?reason=&lt;text&gt;</code> - revoke an enrolled client credential and optionally record a revocation reason (admin token required)</li>
-      <li><code>POST /auth/node-bootstraps/issue</code> - issue a node bootstrap JSON artifact for provisioning a server node (admin token required)</li>
-      <li><code>POST /auth/node-enrollments/issue</code> - issue a node enrollment package with generated internal mTLS material and optional public HTTPS certificates (admin token required, CA key material required)</li>
-      <li><code>POST /auth/managed-signer/backup/export</code> - export an encrypted managed signer backup for recovery or signer transfer (admin token required, signer CA material required)</li>
-      <li><code>POST /auth/managed-signer/backup/import</code> - import an encrypted managed signer backup onto this node; restart required before it becomes the active signer (admin token required)</li>
-      <li><code>POST /auth/node-join-requests/issue-enrollment</code> - issue a node enrollment package from a joining node's request blob (admin token required, CA key material required)</li>
-      <li><code>POST /auth/node-enrollments/renew</code> - renew an existing node enrollment package with fresh TLS material for the same node identity (admin token required, CA key material required)</li>
-      <li><code>GET /auth/node-certificates/status</code> - inspect current public/internal certificate expiry and renewal state (admin token required)</li>
+      <li><code>GET /auth/admin/session</code> - inspect current admin session/login status</li>
+      <li><code>POST /auth/admin/login</code> - create a local admin session from the regular zero-touch admin password</li>
+      <li><code>POST /auth/admin/logout</code> - clear the current local admin session cookie</li>
+      <li><code>POST /auth/bootstrap-bundles/issue</code> - issue a bootstrap JSON bundle for client enrollment (admin session or token required)</li>
+      <li><code>GET /auth/client-credentials</code> - inspect enrolled client credential metadata including fingerprints and revocation state (admin session or token required)</li>
+      <li><code>DELETE /auth/client-credentials/{device_id}?reason=&lt;text&gt;</code> - revoke an enrolled client credential and optionally record a revocation reason (admin session or token required)</li>
+      <li><code>POST /auth/node-bootstraps/issue</code> - issue a node bootstrap JSON artifact for provisioning a server node (admin session or token required)</li>
+      <li><code>POST /auth/node-enrollments/issue</code> - issue a node enrollment package with generated internal mTLS material and optional public HTTPS certificates (admin session or token required, CA key material required)</li>
+      <li><code>POST /auth/managed-signer/backup/export</code> - export an encrypted managed signer backup for recovery or signer transfer (admin session or token required, signer CA material required)</li>
+      <li><code>POST /auth/managed-signer/backup/import</code> - import an encrypted managed signer backup onto this node; restart required before it becomes the active signer (admin session or token required)</li>
+      <li><code>POST /auth/node-join-requests/issue-enrollment</code> - issue a node enrollment package from a joining node's request blob (admin session or token required, CA key material required)</li>
+      <li><code>POST /auth/node-enrollments/renew</code> - renew an existing node enrollment package with fresh TLS material for the same node identity (admin session or token required, CA key material required)</li>
+      <li><code>GET /auth/node-certificates/status</code> - inspect current public/internal certificate expiry and renewal state (admin session or token required)</li>
       <li><code>GET /cluster/replication/plan</code> - current replication gaps/overages</li>
       <li><code>POST /cluster/replication/audit</code> - manual audit trigger</li>
       <li><code>POST /cluster/replication/repair</code> - execute one-pass replica repair for missing placements</li>

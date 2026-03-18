@@ -53,7 +53,7 @@ struct ManagedSetupState {
     cluster_id: Option<ClusterId>,
     node_id: Option<NodeId>,
     runtime_node_enrollment_path: Option<String>,
-    admin_token: Option<String>,
+    admin_password_hash: Option<String>,
     pending_join_request: Option<NodeJoinRequest>,
 }
 
@@ -66,7 +66,7 @@ impl Default for ManagedSetupState {
             cluster_id: None,
             node_id: None,
             runtime_node_enrollment_path: None,
-            admin_token: None,
+            admin_password_hash: None,
             pending_join_request: None,
         }
     }
@@ -163,7 +163,7 @@ pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
         if resolved_path.exists() {
             let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path)?;
             apply_managed_signer_paths(&config.data_dir, &mut runtime);
-            runtime.admin_token = managed_state.admin_token.clone();
+            runtime.admin_password_hash = managed_state.admin_password_hash.clone();
             return Ok(StartupMode::Runtime(runtime));
         }
     }
@@ -402,7 +402,7 @@ async fn start_new_cluster(
     managed.cluster_id = Some(cluster_id);
     managed.node_id = Some(node_id);
     managed.runtime_node_enrollment_path = Some(runtime_enrollment_path.display().to_string());
-    managed.admin_token = Some(request.admin_password.clone());
+    managed.admin_password_hash = Some(hash_token(&request.admin_password));
     managed.pending_join_request = None;
     if let Err(err) = write_managed_setup_state(&state.config.state_path, &managed) {
         return (
@@ -424,7 +424,7 @@ async fn start_new_cluster(
         }
     };
     apply_managed_signer_paths(&state.config.data_dir, &mut config);
-    config.admin_token = Some(request.admin_password.clone());
+    config.admin_password_hash = Some(hash_token(&request.admin_password));
     if state
         .completion_tx
         .send(SetupCompletion { config })
@@ -569,7 +569,7 @@ async fn import_node_enrollment_package(
     managed.cluster_id = Some(package.bootstrap.cluster_id);
     managed.node_id = Some(package.bootstrap.node_id);
     managed.runtime_node_enrollment_path = Some(runtime_enrollment_path.display().to_string());
-    managed.admin_token = Some(request.admin_password.clone());
+    managed.admin_password_hash = Some(hash_token(&request.admin_password));
     managed.pending_join_request = None;
     if let Err(err) = write_managed_setup_state(&state.config.state_path, &managed) {
         return (
@@ -591,7 +591,7 @@ async fn import_node_enrollment_package(
         }
     };
     apply_managed_signer_paths(&state.config.data_dir, &mut config);
-    config.admin_token = Some(request.admin_password.clone());
+    config.admin_password_hash = Some(hash_token(&request.admin_password));
     if state
         .completion_tx
         .send(SetupCompletion { config })
@@ -1170,7 +1170,7 @@ mod tests {
             cluster_id: Some(Uuid::now_v7()),
             node_id: Some(NodeId::new_v4()),
             runtime_node_enrollment_path: Some("managed/runtime/node-enrollment.json".to_string()),
-            admin_token: Some("super-secret-token".to_string()),
+            admin_password_hash: Some(hash_token("super-secret-password")),
             pending_join_request: Some(NodeJoinRequest {
                 version: SETUP_STATE_VERSION,
                 node_id: NodeId::new_v4(),
@@ -1197,7 +1197,10 @@ mod tests {
         write_managed_setup_state(&path, &state).unwrap();
         let restored = read_managed_setup_state(&path).unwrap().unwrap();
         assert_eq!(restored.state, SetupLifecycleState::PendingJoin);
-        assert_eq!(restored.admin_token.as_deref(), Some("super-secret-token"));
+        assert_eq!(
+            restored.admin_password_hash.as_deref(),
+            Some(hash_token("super-secret-password").as_str())
+        );
         assert_eq!(
             restored
                 .pending_join_request

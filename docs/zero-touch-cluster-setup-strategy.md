@@ -392,10 +392,10 @@ The first implementation slice is now in place:
 - `Start a new cluster` already generates a managed cluster CA, persists the managed signer material locally, issues this node's initial enrollment package automatically, persists that package locally, and transitions the process into the normal runtime path,
 - `Join an existing cluster` already supports generating a transportable join-request blob on the joining node, importing that join request on an existing cluster node to issue a node enrollment package, and importing the issued node enrollment package on the joining node to transition into the normal runtime path.
 - the runtime admin UI/API can now export an encrypted managed signer backup and import that backup onto another approved node, with restart-required activation semantics for the imported signer material.
+- the regular runtime UI/API now supports password-backed local admin login with an HTTP-only session cookie, while the old admin-token header remains available only as an advanced override.
 
 Important current limitations of this first slice:
 
-- the bootstrap-created admin password is currently mapped onto the existing admin-token model used by the normal runtime UI and admin API; a fuller password/login UX is still a follow-up step,
 - signer transfer still requires manual backup export/import plus restart rather than a smoother guided handoff flow,
 - encrypt-at-rest for persisted signer material and richer multi-admin auth are still follow-up work.
 

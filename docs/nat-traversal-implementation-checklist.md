@@ -32,7 +32,7 @@ Status: Concrete repo-mapped implementation plan for the target architecture
   - `Start a new cluster` now creates a self-managed cluster CA, persists the managed signer material, creates a local node enrollment package automatically, and transitions the process into the normal runtime path without requiring env vars,
   - `Join an existing cluster` now supports generating a transportable join-request blob on the joining node, issuing a node enrollment package from that join request on an existing cluster node, and importing the issued enrollment package on the joining node to transition into the normal runtime path,
   - the runtime admin UI/API can now export an encrypted managed signer backup and import that backup onto another approved node for recovery or signer transfer, with restart-required activation semantics after import,
-  - the current first slice still maps the bootstrap-created admin password onto the existing admin-token authentication model for the normal runtime UI/API rather than a fuller login/session model.
+  - the regular runtime UI/API now supports password-backed local admin login with an HTTP-only session cookie, while the old admin-token header remains available as an advanced override for env-driven and automation-oriented setups.
 
 ## 1c. Current priority order
 

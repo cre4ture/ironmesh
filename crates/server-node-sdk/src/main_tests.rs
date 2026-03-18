@@ -1174,6 +1174,67 @@ async fn export_managed_signer_backup_returns_encrypted_backup() {
 }
 
 #[tokio::test]
+async fn admin_password_login_creates_session_cookie() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
+
+    let response = super::login_admin_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "super-secret-password".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let set_cookie = response
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.contains("ironmesh_admin_session="));
+    assert!(set_cookie.contains("HttpOnly"));
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn admin_session_cookie_authorizes_admin_request() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
+
+    let login_response = super::login_admin_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "super-secret-password".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let set_cookie = login_response
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let cookie_header = set_cookie.split(';').next().unwrap().to_string();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::COOKIE, cookie_header.parse().unwrap());
+    let response = super::list_client_credentials(State(state.clone()), headers)
+        .await
+        .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn import_managed_signer_backup_persists_signer_material_and_requires_restart() {
     let mut exporter = build_test_state(1, false, MainTestBackend::Sqlite).await;
     exporter.admin_control.admin_token = Some("admin-secret".to_string());
@@ -3664,6 +3725,7 @@ async fn build_test_state(
         namespace_change_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         namespace_change_tx,
         admin_control: AdminControl::default(),
+        admin_sessions: Arc::new(Mutex::new(super::AdminSessionStore::default())),
         client_auth_control: super::ClientAuthControl::default(),
         client_auth_replay_cache: Arc::new(Mutex::new(super::ClientAuthReplayCache::default())),
     };

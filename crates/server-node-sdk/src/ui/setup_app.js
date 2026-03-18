@@ -12,18 +12,22 @@ async function refreshSetupStatus() {
   }
 }
 
-function saveBootstrapAdminToken(token) {
-  if (!token) {
-    return;
-  }
-  try {
-    sessionStorage.setItem('ironmeshAdminToken', token);
-  } catch {
-    // Ignore sessionStorage failures and let the operator re-enter the token after transition.
+async function loginRuntimeAdminSession(password) {
+  const response = await fetch('/auth/admin/login', {
+    method: 'POST',
+    cache: 'no-store',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({ password })
+  });
+  const payload = await response.json().catch(() => ({ status: response.status }));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
   }
 }
 
-async function waitForRuntimeTransition() {
+async function waitForRuntimeTransition(password) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     try {
@@ -33,6 +37,9 @@ async function waitForRuntimeTransition() {
       }
       const html = await response.text();
       if (!html.includes('ironmesh First-Run Setup')) {
+        if (password) {
+          await loginRuntimeAdminSession(password);
+        }
         window.location.href = '/';
         return;
       }
@@ -70,9 +77,8 @@ async function startNewCluster() {
       throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
     }
 
-    saveBootstrapAdminToken(adminPassword);
     output.textContent = JSON.stringify(payload, null, 2) + '\n\ntransitioning to normal runtime...';
-    await waitForRuntimeTransition();
+    await waitForRuntimeTransition(adminPassword);
   } catch (error) {
     output.textContent = 'failed to start cluster: ' + error;
   }
@@ -138,9 +144,8 @@ async function importEnrollmentPackage() {
       throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
     }
 
-    saveBootstrapAdminToken(adminPassword);
     output.textContent = JSON.stringify(payload, null, 2) + '\n\ntransitioning to normal runtime...';
-    await waitForRuntimeTransition();
+    await waitForRuntimeTransition(adminPassword);
   } catch (error) {
     output.textContent = 'failed to import node enrollment package: ' + error;
   }

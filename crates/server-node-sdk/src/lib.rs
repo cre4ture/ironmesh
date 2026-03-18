@@ -131,6 +131,7 @@ struct ServerState {
     namespace_change_sequence: Arc<AtomicU64>,
     namespace_change_tx: watch::Sender<u64>,
     admin_control: AdminControl,
+    admin_sessions: Arc<Mutex<AdminSessionStore>>,
     client_auth_control: ClientAuthControl,
     client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
 }
@@ -214,7 +215,36 @@ impl ClientAuthReplayCache {
     }
 }
 
+impl AdminSessionStore {
+    fn create_session(&mut self, now: u64) -> (String, u64) {
+        self.prune(now);
+        let session_id = format!(
+            "im-admin-{}-{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
+        let expires_at_unix = now.saturating_add(ADMIN_SESSION_TTL_SECS);
+        self.sessions.insert(session_id.clone(), expires_at_unix);
+        (session_id, expires_at_unix)
+    }
+
+    fn is_valid(&mut self, session_id: &str, now: u64) -> Option<u64> {
+        self.prune(now);
+        self.sessions.get(session_id).copied()
+    }
+
+    fn revoke(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+    }
+
+    fn prune(&mut self, now: u64) {
+        self.sessions
+            .retain(|_, expires_at_unix| *expires_at_unix > now);
+    }
+}
+
 const CLIENT_AUTH_MAX_CLOCK_SKEW_SECS: u64 = 300;
+const ADMIN_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 
 impl<S> FromRequestParts<S> for InternalCaller
 where
@@ -693,6 +723,7 @@ pub struct ServerNodeConfig {
     pub peer_heartbeat_enabled: bool,
     pub peer_heartbeat_interval_secs: u64,
     pub admin_token: Option<String>,
+    pub admin_password_hash: Option<String>,
     pub require_client_auth: bool,
 }
 
@@ -724,6 +755,12 @@ struct PeerHeartbeatConfig {
 #[derive(Debug, Clone, Default)]
 struct AdminControl {
     admin_token: Option<String>,
+    admin_password_hash: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AdminSessionStore {
+    sessions: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1696,6 +1733,7 @@ impl ServerNodeConfig {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            admin_password_hash: None,
             require_client_auth: std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
@@ -2005,6 +2043,7 @@ impl ServerNodeConfig {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            admin_password_hash: None,
             require_client_auth: std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
@@ -2063,6 +2102,7 @@ impl ServerNodeConfig {
             peer_heartbeat_enabled: false,
             peer_heartbeat_interval_secs: 15,
             admin_token: None,
+            admin_password_hash: None,
             require_client_auth: false,
         }
     }
@@ -2095,6 +2135,7 @@ impl ServerNodeConfig {
     fn admin_control(&self) -> AdminControl {
         AdminControl {
             admin_token: self.admin_token.clone(),
+            admin_password_hash: self.admin_password_hash.clone(),
         }
     }
 
@@ -2587,6 +2628,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         namespace_change_sequence: Arc::new(AtomicU64::new(0)),
         namespace_change_tx: watch::channel(0).0,
         admin_control,
+        admin_sessions: Arc::new(Mutex::new(AdminSessionStore::default())),
         client_auth_control,
         client_auth_replay_cache: Arc::new(Mutex::new(ClientAuthReplayCache::default())),
     };
@@ -2705,6 +2747,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         ));
 
     let public_admin_api = Router::new()
+        .route("/auth/admin/session", get(get_admin_session_status))
+        .route("/auth/admin/login", post(login_admin_session))
+        .route("/auth/admin/logout", post(logout_admin_session))
         .route("/auth/client-credentials", get(list_client_credentials))
         .route(
             "/auth/client-credentials/{device_id}",
@@ -5286,6 +5331,19 @@ struct ManagedSignerBackupImportResponse {
     signer_ca_cert_path: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AdminLoginRequest {
+    password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdminSessionStatusResponse {
+    login_required: bool,
+    authenticated: bool,
+    session_expires_at_unix: Option<u64>,
+    token_override_enabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct OutboundNodeEnrollmentRenewRequest {
     package: NodeEnrollmentPackage,
@@ -7778,6 +7836,7 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
 const ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
 const ADMIN_ACTOR_HEADER: &str = "x-ironmesh-admin-actor";
 const ADMIN_SOURCE_NODE_HEADER: &str = "x-ironmesh-node-id";
+const ADMIN_SESSION_COOKIE: &str = "ironmesh_admin_session";
 
 #[derive(Debug, Clone)]
 struct AdminRequestMetadata {
@@ -7799,6 +7858,55 @@ fn admin_request_metadata(headers: &HeaderMap) -> AdminRequestMetadata {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
     AdminRequestMetadata { actor, source_node }
+}
+
+fn parse_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| {
+            raw.split(';').find_map(|entry| {
+                let (cookie_name, cookie_value) = entry.trim().split_once('=')?;
+                if cookie_name.trim() == name {
+                    Some(cookie_value.trim().to_string())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+async fn current_admin_session_expiry(state: &ServerState, headers: &HeaderMap) -> Option<u64> {
+    let session_id = parse_cookie_value(headers, ADMIN_SESSION_COOKIE)?;
+    let mut sessions = state.admin_sessions.lock().await;
+    sessions.is_valid(&session_id, unix_ts())
+}
+
+fn password_hash_matches(expected_hash: &str, password: &str) -> bool {
+    let provided_hash = hash_token(password);
+    constant_time_eq(expected_hash.as_bytes(), provided_hash.as_bytes())
+}
+
+fn build_admin_session_cookie(
+    session_id: &str,
+    secure: bool,
+    max_age_secs: u64,
+) -> Result<HeaderValue> {
+    let mut cookie = format!(
+        "{ADMIN_SESSION_COOKIE}={session_id}; Path=/; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    HeaderValue::from_str(&cookie).context("failed building admin session cookie header")
+}
+
+fn clear_admin_session_cookie(secure: bool) -> Result<HeaderValue> {
+    let mut cookie = format!("{ADMIN_SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    HeaderValue::from_str(&cookie).context("failed building admin session clear-cookie header")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7830,6 +7938,183 @@ async fn append_admin_audit(
     }
 }
 
+async fn get_admin_session_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token_valid = state
+        .admin_control
+        .admin_token
+        .as_deref()
+        .map(|expected| {
+            token_matches(
+                expected,
+                headers
+                    .get(ADMIN_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+            )
+        })
+        .unwrap_or(false);
+    let session_expires_at_unix = current_admin_session_expiry(&state, &headers).await;
+    let auth_configured = state.admin_control.admin_password_hash.is_some()
+        || state.admin_control.admin_token.is_some();
+    let authenticated = if auth_configured {
+        token_valid || session_expires_at_unix.is_some()
+    } else {
+        true
+    };
+
+    (
+        StatusCode::OK,
+        Json(AdminSessionStatusResponse {
+            login_required: auth_configured,
+            authenticated,
+            session_expires_at_unix,
+            token_override_enabled: state.admin_control.admin_token.is_some(),
+        }),
+    )
+}
+
+async fn login_admin_session(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<AdminLoginRequest>,
+) -> impl IntoResponse {
+    let action = "auth/admin/login";
+    let request_meta = admin_request_metadata(&headers);
+    let Some(expected_hash) = state.admin_control.admin_password_hash.as_deref() else {
+        append_admin_audit(
+            &state,
+            action,
+            &request_meta,
+            false,
+            true,
+            true,
+            "denied_unconfigured",
+            json!({ "error": "password-backed admin login is not enabled on this node" }),
+        )
+        .await;
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": "password-backed admin login is not enabled on this node" })),
+        )
+            .into_response();
+    };
+
+    if !password_hash_matches(expected_hash, &request.password) {
+        append_admin_audit(
+            &state,
+            action,
+            &request_meta,
+            false,
+            true,
+            true,
+            "denied_auth",
+            json!({ "error": "invalid admin password" }),
+        )
+        .await;
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid admin password" })),
+        )
+            .into_response();
+    }
+
+    let (session_id, session_expires_at_unix) = {
+        let mut sessions = state.admin_sessions.lock().await;
+        sessions.create_session(unix_ts())
+    };
+    let cookie = match build_admin_session_cookie(
+        &session_id,
+        state.public_tls_runtime.is_some(),
+        ADMIN_SESSION_TTL_SECS,
+    ) {
+        Ok(cookie) => cookie,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request_meta,
+                false,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &AdminRequestMetadata {
+            actor: Some("local-admin".to_string()),
+            source_node: request_meta.source_node.clone(),
+        },
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "session_expires_at_unix": session_expires_at_unix,
+        }),
+    )
+    .await;
+
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(AdminSessionStatusResponse {
+            login_required: true,
+            authenticated: true,
+            session_expires_at_unix: Some(session_expires_at_unix),
+            token_override_enabled: state.admin_control.admin_token.is_some(),
+        }),
+    )
+        .into_response()
+}
+
+async fn logout_admin_session(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session_id = parse_cookie_value(&headers, ADMIN_SESSION_COOKIE);
+    if let Some(session_id) = session_id.as_deref() {
+        let mut sessions = state.admin_sessions.lock().await;
+        sessions.revoke(session_id);
+    }
+
+    let cookie = match clear_admin_session_cookie(state.public_tls_runtime.is_some()) {
+        Ok(cookie) => cookie,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(AdminSessionStatusResponse {
+            login_required: state.admin_control.admin_password_hash.is_some()
+                || state.admin_control.admin_token.is_some(),
+            authenticated: false,
+            session_expires_at_unix: None,
+            token_override_enabled: state.admin_control.admin_token.is_some(),
+        }),
+    )
+        .into_response()
+}
+
 async fn authorize_admin_request(
     state: &ServerState,
     headers: &HeaderMap,
@@ -7838,26 +8123,40 @@ async fn authorize_admin_request(
     approve: bool,
     details: serde_json::Value,
 ) -> std::result::Result<AdminRequestMetadata, StatusCode> {
-    let request = admin_request_metadata(headers);
-
-    if let Some(expected) = state.admin_control.admin_token.as_deref() {
-        let provided = headers
-            .get(ADMIN_TOKEN_HEADER)
-            .and_then(|value| value.to_str().ok());
-        if !token_matches(expected, provided) {
-            append_admin_audit(
-                state,
-                action,
-                &request,
-                false,
-                dry_run,
-                approve,
-                "denied_auth",
-                details,
+    let mut request = admin_request_metadata(headers);
+    let token_valid = state
+        .admin_control
+        .admin_token
+        .as_deref()
+        .map(|expected| {
+            token_matches(
+                expected,
+                headers
+                    .get(ADMIN_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok()),
             )
-            .await;
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+        })
+        .unwrap_or(false);
+    let session_expires_at_unix = current_admin_session_expiry(state, headers).await;
+
+    let requires_admin_auth = state.admin_control.admin_token.is_some()
+        || state.admin_control.admin_password_hash.is_some();
+    if requires_admin_auth && !token_valid && session_expires_at_unix.is_none() {
+        append_admin_audit(
+            state,
+            action,
+            &request,
+            false,
+            dry_run,
+            approve,
+            "denied_auth",
+            details,
+        )
+        .await;
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if request.actor.is_none() && session_expires_at_unix.is_some() {
+        request.actor = Some("local-admin".to_string());
     }
 
     if !dry_run && !approve {

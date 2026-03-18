@@ -13,23 +13,91 @@ async function refreshServerLogs() {
   }
 }
 
-function prefillAdminTokenFromSession() {
-  let stored = '';
-  try {
-    stored = sessionStorage.getItem('ironmeshAdminToken') || '';
-  } catch {
-    stored = '';
+function currentAdminTokenOverride() {
+  for (const id of ['bootstrap-admin-token', 'node-bootstrap-admin-token']) {
+    const input = document.getElementById(id);
+    const value = input?.value?.trim();
+    if (value) {
+      return value;
+    }
   }
-  if (!stored) {
+  return '';
+}
+
+function buildAdminHeaders(extraHeaders = {}) {
+  const headers = { ...extraHeaders };
+  const adminToken = currentAdminTokenOverride();
+  if (adminToken) {
+    headers['x-ironmesh-admin-token'] = adminToken;
+  }
+  return headers;
+}
+
+async function refreshAdminSessionStatus() {
+  const output = document.getElementById('admin-session-status');
+  try {
+    const response = await fetch('/auth/admin/session', {
+      cache: 'no-store',
+      headers: buildAdminHeaders()
+    });
+    if (!response.ok) {
+      throw new Error('HTTP ' + response.status);
+    }
+    const payload = await response.json();
+    output.textContent = JSON.stringify(payload, null, 2);
+  } catch (error) {
+    output.textContent = 'failed to load admin session status: ' + error;
+  }
+}
+
+async function loginAdminSession() {
+  const output = document.getElementById('admin-session-status');
+  const password = document.getElementById('admin-login-password').value;
+  if (!password.trim()) {
+    output.textContent = 'admin password is required';
     return;
   }
 
-  ['bootstrap-admin-token', 'node-bootstrap-admin-token'].forEach((id) => {
-    const input = document.getElementById(id);
-    if (input && !input.value) {
-      input.value = stored;
+  output.textContent = 'signing in...';
+  try {
+    const response = await fetch('/auth/admin/login', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ password })
+    });
+    const payload = await response.json().catch(() => ({ status: response.status }));
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
     }
-  });
+    document.getElementById('admin-login-password').value = '';
+    output.textContent = JSON.stringify(payload, null, 2);
+    await refreshAdminSessionStatus();
+  } catch (error) {
+    output.textContent = 'failed to sign in: ' + error;
+  }
+}
+
+async function logoutAdminSession() {
+  const output = document.getElementById('admin-session-status');
+  output.textContent = 'signing out...';
+  try {
+    const response = await fetch('/auth/admin/logout', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: buildAdminHeaders()
+    });
+    const payload = await response.json().catch(() => ({ status: response.status }));
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+    output.textContent = JSON.stringify(payload, null, 2);
+    await refreshAdminSessionStatus();
+  } catch (error) {
+    output.textContent = 'failed to sign out: ' + error;
+  }
 }
 
 async function fetchReplicationPlan() {
@@ -77,15 +145,8 @@ async function issueBootstrapBundle() {
   const output = document.getElementById('bootstrap-bundle-json');
   const notes = document.getElementById('bootstrap-bundle-notes');
   const qrStatus = document.getElementById('bootstrap-bundle-qr-status');
-  const adminToken = document.getElementById('bootstrap-admin-token').value.trim();
   const deviceLabel = document.getElementById('bootstrap-device-label').value.trim();
   const expiryRaw = document.getElementById('bootstrap-expiry-secs').value.trim();
-
-  if (!adminToken) {
-    output.textContent = 'admin token is required';
-    notes.textContent = '';
-    return;
-  }
 
   let expiresInSecs = Number.parseInt(expiryRaw, 10);
   if (!Number.isFinite(expiresInSecs)) {
@@ -100,10 +161,9 @@ async function issueBootstrapBundle() {
     const response = await fetch('/auth/bootstrap-bundles/issue', {
       method: 'POST',
       cache: 'no-store',
-      headers: {
-        'content-type': 'application/json',
-        'x-ironmesh-admin-token': adminToken
-      },
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
       body: JSON.stringify({
         label: deviceLabel || null,
         expires_in_secs: expiresInSecs
@@ -139,13 +199,6 @@ async function issueBootstrapBundle() {
 async function issueNodeBootstrap() {
   const output = document.getElementById('node-bootstrap-json');
   const notes = document.getElementById('node-bootstrap-notes');
-  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
-  if (!adminToken) {
-    output.textContent = 'admin token is required';
-    notes.textContent = '';
-    return;
-  }
-
   const body = buildNodeBootstrapRequest();
   output.textContent = 'issuing node bootstrap...';
   notes.textContent = '';
@@ -153,10 +206,9 @@ async function issueNodeBootstrap() {
     const response = await fetch('/auth/node-bootstraps/issue', {
       method: 'POST',
       cache: 'no-store',
-      headers: {
-        'content-type': 'application/json',
-        'x-ironmesh-admin-token': adminToken
-      },
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
       body: JSON.stringify(body)
     });
 
@@ -245,23 +297,15 @@ function buildNodeBootstrapRequest() {
 async function issueNodeEnrollment() {
   const output = document.getElementById('node-enrollment-json');
   const notes = document.getElementById('node-enrollment-notes');
-  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
-  if (!adminToken) {
-    output.textContent = 'admin token is required';
-    notes.textContent = '';
-    return;
-  }
-
   output.textContent = 'issuing node enrollment package...';
   notes.textContent = '';
   try {
     const response = await fetch('/auth/node-enrollments/issue', {
       method: 'POST',
       cache: 'no-store',
-      headers: {
-        'content-type': 'application/json',
-        'x-ironmesh-admin-token': adminToken
-      },
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
       body: JSON.stringify(buildNodeBootstrapRequest())
     });
 
@@ -287,13 +331,7 @@ async function issueNodeEnrollment() {
 async function issueNodeEnrollmentFromJoinRequest() {
   const output = document.getElementById('node-join-request-enrollment-json');
   const notes = document.getElementById('node-join-request-enrollment-notes');
-  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
   const joinRequestRaw = document.getElementById('node-join-request-json').value.trim();
-  if (!adminToken) {
-    output.textContent = 'admin token is required';
-    notes.textContent = '';
-    return;
-  }
   if (!joinRequestRaw) {
     output.textContent = 'node join request JSON is required';
     notes.textContent = '';
@@ -315,10 +353,9 @@ async function issueNodeEnrollmentFromJoinRequest() {
     const response = await fetch('/auth/node-join-requests/issue-enrollment', {
       method: 'POST',
       cache: 'no-store',
-      headers: {
-        'content-type': 'application/json',
-        'x-ironmesh-admin-token': adminToken
-      },
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
       body: JSON.stringify({
         join_request: joinRequest,
         ...readNodeTlsPolicy()
@@ -347,13 +384,7 @@ async function issueNodeEnrollmentFromJoinRequest() {
 async function renewNodeEnrollment() {
   const output = document.getElementById('node-renewal-json');
   const notes = document.getElementById('node-renewal-notes');
-  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
   const packageRaw = document.getElementById('node-renewal-package-json').value.trim();
-  if (!adminToken) {
-    output.textContent = 'admin token is required';
-    notes.textContent = '';
-    return;
-  }
   if (!packageRaw) {
     output.textContent = 'existing node enrollment JSON is required';
     notes.textContent = '';
@@ -375,10 +406,9 @@ async function renewNodeEnrollment() {
     const response = await fetch('/auth/node-enrollments/renew', {
       method: 'POST',
       cache: 'no-store',
-      headers: {
-        'content-type': 'application/json',
-        'x-ironmesh-admin-token': adminToken
-      },
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
       body: JSON.stringify({
         package: parsedPackage,
         ...readNodeTlsPolicy()
@@ -407,22 +437,13 @@ async function renewNodeEnrollment() {
 async function fetchNodeCertificateStatus() {
   const output = document.getElementById('node-certificate-status-json');
   const notes = document.getElementById('node-certificate-status-notes');
-  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
-  if (!adminToken) {
-    output.textContent = 'admin token is required';
-    notes.textContent = '';
-    return;
-  }
-
   output.textContent = 'loading...';
   notes.textContent = '';
   try {
     const response = await fetch('/auth/node-certificates/status', {
       method: 'GET',
       cache: 'no-store',
-      headers: {
-        'x-ironmesh-admin-token': adminToken
-      }
+      headers: buildAdminHeaders()
     });
 
     let payload;
@@ -447,13 +468,7 @@ async function fetchNodeCertificateStatus() {
 async function exportManagedSignerBackup() {
   const output = document.getElementById('managed-signer-backup-json');
   const notes = document.getElementById('managed-signer-backup-notes');
-  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
   const passphrase = document.getElementById('managed-signer-backup-passphrase').value;
-  if (!adminToken) {
-    output.textContent = 'admin token is required';
-    notes.textContent = '';
-    return;
-  }
   if (!passphrase.trim()) {
     output.textContent = 'backup passphrase is required';
     notes.textContent = '';
@@ -466,10 +481,9 @@ async function exportManagedSignerBackup() {
     const response = await fetch('/auth/managed-signer/backup/export', {
       method: 'POST',
       cache: 'no-store',
-      headers: {
-        'content-type': 'application/json',
-        'x-ironmesh-admin-token': adminToken
-      },
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
       body: JSON.stringify({ passphrase })
     });
 
@@ -495,14 +509,8 @@ async function exportManagedSignerBackup() {
 async function importManagedSignerBackup() {
   const output = document.getElementById('managed-signer-import-json-output');
   const notes = document.getElementById('managed-signer-import-notes');
-  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
   const passphrase = document.getElementById('managed-signer-import-passphrase').value;
   const backupRaw = document.getElementById('managed-signer-import-json').value.trim();
-  if (!adminToken) {
-    output.textContent = 'admin token is required';
-    notes.textContent = '';
-    return;
-  }
   if (!backupRaw) {
     output.textContent = 'managed signer backup JSON is required';
     notes.textContent = '';
@@ -529,10 +537,9 @@ async function importManagedSignerBackup() {
     const response = await fetch('/auth/managed-signer/backup/import', {
       method: 'POST',
       cache: 'no-store',
-      headers: {
-        'content-type': 'application/json',
-        'x-ironmesh-admin-token': adminToken
-      },
+      headers: buildAdminHeaders({
+        'content-type': 'application/json'
+      }),
       body: JSON.stringify({
         passphrase,
         backup
@@ -748,6 +755,14 @@ function hideBootstrapQr() {
 }
 
 document
+  .getElementById('admin-login')
+  .addEventListener('click', loginAdminSession);
+
+document
+  .getElementById('admin-logout')
+  .addEventListener('click', logoutAdminSession);
+
+document
   .getElementById('fetch-replication-plan')
   .addEventListener('click', fetchReplicationPlan);
 
@@ -787,6 +802,6 @@ document
   .getElementById('import-managed-signer-backup')
   .addEventListener('click', importManagedSignerBackup);
 
-prefillAdminTokenFromSession();
+refreshAdminSessionStatus();
 refreshServerLogs();
 setInterval(refreshServerLogs, 2000);
