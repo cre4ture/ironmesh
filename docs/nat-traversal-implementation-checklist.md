@@ -16,7 +16,17 @@ Status: Concrete repo-mapped implementation plan for the target architecture
 - Direct env/file CA wiring is still useful for development, testing, externally managed certificates, or other short-lived/manual setups.
 - When trust roots change in that direct env/file path, a node restart is acceptable and may be required; live trust-root reload is not a primary design goal there.
 
-## 1b. Current priority order
+## 1b. Zero-Touch Setup Direction
+
+- The intended regular product setup flow is documented in `docs/zero-touch-cluster-setup-strategy.md`.
+- Directionally, the normal UX should be:
+  - first-run local HTTPS setup UI,
+  - `Start a new cluster` or `Join an existing cluster`,
+  - managed internal CA behind UI approval,
+  - no routine requirement for heavy env/CLI configuration in the regular path.
+- Environment-variable-heavy startup remains important for testing, automation, and advanced/operator-managed deployments, but it should not define the primary end-user setup model.
+
+## 1c. Current priority order
 
 Use this section as the current source of truth for remaining work. The detailed checklist below still contains older task wording and should be reconciled over time.
 
