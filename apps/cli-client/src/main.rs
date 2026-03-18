@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use web_ui_backend::WebUiConfig;
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
 #[command(about = "CLI client for ironmesh distributed storage")]
 struct Cli {
@@ -26,7 +26,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum Commands {
     Enroll {
         #[arg(long)]
@@ -79,48 +79,48 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::CacheList => {
-            let client = build_client_node_from_cli(&cli)?;
+            let client = build_client_node_from_cli(&cli).await?;
             for entry in client.cache_entries().await {
                 println!("{} ({} bytes)", entry.key, entry.size_bytes);
             }
             Ok(())
         }
         Commands::Put { key, value } => {
-            let client = build_client_node_from_cli(&cli)?;
+            let client = build_client_node_from_cli(&cli).await?;
             let object = client.put(key.clone(), Bytes::from(value.clone())).await?;
             println!("stored '{}' ({} bytes)", object.key, object.size_bytes);
             Ok(())
         }
         Commands::Get { key } => {
-            let client = build_client_node_from_cli(&cli)?;
+            let client = build_client_node_from_cli(&cli).await?;
             let payload = client.get_cached_or_fetch(key).await?;
             println!("{}", String::from_utf8_lossy(&payload));
             Ok(())
         }
         Commands::List { prefix, depth } => {
-            let sdk = build_authenticated_sdk_from_cli(&cli)?;
+            let sdk = build_authenticated_sdk_from_cli(&cli).await?;
             let value = sdk.store_index_blocking(prefix.as_deref(), (*depth).max(1), None)?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         Commands::Health => {
-            let client = build_authenticated_sdk_from_cli(&cli)?;
+            let client = build_authenticated_sdk_from_cli(&cli).await?;
             print_json_endpoint(&client, "/health").await
         }
         Commands::ClusterStatus => {
-            let client = build_authenticated_sdk_from_cli(&cli)?;
+            let client = build_authenticated_sdk_from_cli(&cli).await?;
             print_json_endpoint(&client, "/cluster/status").await
         }
         Commands::Nodes => {
-            let client = build_authenticated_sdk_from_cli(&cli)?;
+            let client = build_authenticated_sdk_from_cli(&cli).await?;
             print_json_endpoint(&client, "/cluster/nodes").await
         }
         Commands::ReplicationPlan => {
-            let client = build_authenticated_sdk_from_cli(&cli)?;
+            let client = build_authenticated_sdk_from_cli(&cli).await?;
             print_json_endpoint(&client, "/cluster/replication/plan").await
         }
         Commands::ServeWeb { bind } => {
-            let client = build_authenticated_sdk_from_cli(&cli)?;
+            let client = build_authenticated_sdk_from_cli(&cli).await?;
             let bind_addr: SocketAddr = bind.parse()?;
             let web_ui_config =
                 WebUiConfig::from_client(client).with_service_name("cli-client-web");
@@ -174,7 +174,7 @@ async fn enroll_from_bootstrap(
     Ok(())
 }
 
-fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
+fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient> {
     let client_identity = read_client_identity_from_cli(cli)?;
     let server_ca_override = read_server_ca_override_from_cli(cli)?;
 
@@ -201,10 +201,17 @@ fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
     }
 }
 
-fn build_client_node_from_cli(cli: &Cli) -> Result<ClientNode> {
-    Ok(ClientNode::with_client(build_authenticated_sdk_from_cli(
-        cli,
-    )?))
+async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
+    let cli = cli.clone();
+    tokio::task::spawn_blocking(move || build_authenticated_sdk_from_cli_blocking(&cli))
+        .await
+        .context("client construction task panicked")?
+}
+
+async fn build_client_node_from_cli(cli: &Cli) -> Result<ClientNode> {
+    Ok(ClientNode::with_client(
+        build_authenticated_sdk_from_cli(cli).await?,
+    ))
 }
 
 async fn print_json_endpoint(client: &IronMeshClient, path: &str) -> Result<()> {

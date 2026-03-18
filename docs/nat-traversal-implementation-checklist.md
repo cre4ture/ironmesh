@@ -301,9 +301,9 @@ This is implementation order, not product rollout order.
 - [ ] Replace helper functions that issue or consume old direct-only bootstrap bundles.
 - [ ] Add outbound-only connectivity scenarios:
   - one relay-required rendezvous-backed cluster/client bootstrap-enrollment-replication scenario now exists end to end
-  - client can read/write through relay without any inbound port on the target node,
+  - client can read/write through relay when the direct endpoint is unusable
   - two server nodes can replicate through relay-only paths,
-  - direct path is preferred when available and relay is used after forced failure.
+  - direct path is preferred when available and relay is used after forced failure and rendezvous restart.
 - [x] Update Windows CFAPI tests so they consume the persisted client identity artifact instead of expecting a `device_token`.
 - [ ] Update Android-facing tests and helpers to cover bootstrap-aware app/runtime flows and relay-capable connection inputs.
 

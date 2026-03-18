@@ -720,6 +720,40 @@ pub async fn wait_for_online_nodes(
     );
 }
 
+pub async fn wait_for_rendezvous_registered_endpoints(
+    base_url: &str,
+    expected_registered_endpoints: u64,
+    retries: usize,
+) -> Result<()> {
+    let http = reqwest::Client::new();
+
+    for _ in 0..retries {
+        if let Ok(resp) = http
+            .get(format!("{base_url}/control/presence"))
+            .send()
+            .await
+            && let Ok(ok_resp) = resp.error_for_status()
+            && let Ok(payload) = ok_resp.json::<serde_json::Value>().await
+        {
+            let registered_endpoints = payload
+                .get("registered_endpoints")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            if registered_endpoints == expected_registered_endpoints {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    bail!(
+        "rendezvous did not report registered_endpoints={} at {base_url}/control/presence",
+        expected_registered_endpoints
+    );
+}
+
 pub async fn wait_for_object_payload(
     http: &reqwest::Client,
     base_url: &str,

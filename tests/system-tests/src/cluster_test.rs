@@ -2133,6 +2133,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_client_uses_relay_when_direct_endpoint_is_unreachable() -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19135";
+        let bind = "127.0.0.1:19136";
+        let cluster_id = "11111111-1111-7111-8111-111111111112";
+        let node_id = "00000000-0000-0000-0000-0000000008a1";
+        let admin_token = "admin-secret";
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_url = format!("http://{bind}");
+        let data_dir = fresh_data_dir("relay-client-unreachable-direct-node");
+        let client_dir = fresh_data_dir("relay-client-unreachable-direct-client");
+
+        let node_env = [
+            ("IRONMESH_NODE_MODE", "local-edge"),
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut node = start_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                admin_token,
+                Some("relay-cli"),
+                Some(3600),
+            )
+            .await?;
+            let bootstrap_path = client_dir.join("bootstrap.json");
+            bootstrap.write_to_path(&bootstrap_path)?;
+
+            let client_identity_path = client_dir.join("client-identity.json");
+            let bootstrap_arg = bootstrap_path.to_string_lossy().into_owned();
+            let client_identity_arg = client_identity_path.to_string_lossy().into_owned();
+
+            run_cli(&[
+                "--bootstrap-file",
+                bootstrap_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "enroll",
+                "--label",
+                "relay-cli",
+            ])
+            .await?;
+
+            let mut relay_only_bootstrap = bootstrap.clone();
+            for endpoint in &mut relay_only_bootstrap.direct_endpoints {
+                if endpoint.usage == Some(client_sdk::BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+            let relay_only_bootstrap_path = client_dir.join("relay-only.bootstrap.json");
+            relay_only_bootstrap.write_to_path(&relay_only_bootstrap_path)?;
+            let relay_only_bootstrap_arg = relay_only_bootstrap_path.to_string_lossy().into_owned();
+
+            let put_output = run_cli(&[
+                "--bootstrap-file",
+                relay_only_bootstrap_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "put",
+                "relay-only-key",
+                "payload-via-relay-only-client",
+            ])
+            .await?;
+            assert!(
+                put_output.contains("stored 'relay-only-key'"),
+                "unexpected put output: {put_output}"
+            );
+
+            let get_output = run_cli(&[
+                "--bootstrap-file",
+                relay_only_bootstrap_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "get",
+                "relay-only-key",
+            ])
+            .await?;
+            assert_eq!(get_output.trim(), "payload-via-relay-only-client");
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut node).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn bootstrap_client_prefers_direct_and_uses_relay_after_rendezvous_restart_and_forced_direct_failure()
+    -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19137";
+        let bind = "127.0.0.1:19138";
+        let cluster_id = "11111111-1111-7111-8111-111111111113";
+        let node_id = "00000000-0000-0000-0000-0000000008b2";
+        let admin_token = "admin-secret";
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_url = format!("http://{bind}");
+        let data_dir = fresh_data_dir("relay-client-direct-then-relay-node");
+        let client_dir = fresh_data_dir("relay-client-direct-then-relay-client");
+
+        let node_env = [
+            ("IRONMESH_NODE_MODE", "local-edge"),
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut node = start_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                admin_token,
+                Some("relay-cli"),
+                Some(3600),
+            )
+            .await?;
+            let bootstrap_path = client_dir.join("bootstrap.json");
+            bootstrap.write_to_path(&bootstrap_path)?;
+
+            let client_identity_path = client_dir.join("client-identity.json");
+            let bootstrap_arg = bootstrap_path.to_string_lossy().into_owned();
+            let client_identity_arg = client_identity_path.to_string_lossy().into_owned();
+
+            run_cli(&[
+                "--bootstrap-file",
+                bootstrap_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "enroll",
+                "--label",
+                "relay-cli",
+            ])
+            .await?;
+
+            stop_server(&mut rendezvous).await;
+
+            let direct_output = run_cli(&[
+                "--bootstrap-file",
+                bootstrap_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "put",
+                "direct-first-key",
+                "payload-written-while-rendezvous-down",
+            ])
+            .await?;
+            assert!(
+                direct_output.contains("stored 'direct-first-key'"),
+                "unexpected direct-path put output: {direct_output}"
+            );
+
+            rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let mut relay_fallback_bootstrap = bootstrap.clone();
+            for endpoint in &mut relay_fallback_bootstrap.direct_endpoints {
+                if endpoint.usage == Some(client_sdk::BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+            let relay_fallback_bootstrap_path = client_dir.join("relay-fallback.bootstrap.json");
+            relay_fallback_bootstrap.write_to_path(&relay_fallback_bootstrap_path)?;
+            let relay_fallback_bootstrap_arg =
+                relay_fallback_bootstrap_path.to_string_lossy().into_owned();
+
+            let relay_output = run_cli(&[
+                "--bootstrap-file",
+                relay_fallback_bootstrap_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "get",
+                "direct-first-key",
+            ])
+            .await?;
+            assert_eq!(relay_output.trim(), "payload-written-while-rendezvous-down");
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut node).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
+
+        result
+    }
+
+    #[tokio::test]
     async fn maintenance_cleanup_removes_orphans_and_keeps_live_data() -> Result<()> {
         let bind = "127.0.0.1:19102";
         let data_dir = fresh_data_dir("maintenance-cleanup");
