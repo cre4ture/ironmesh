@@ -83,6 +83,8 @@ Defaults:
 - Base port: `18080` (nodes on `18080..18083`)
 - Data + logs + pid files: `data/local-cluster/`
 
+For the newer rendezvous-plus-relay architecture, use the dedicated manual recipe in [docs/manual-rendezvous-relay-test.md](docs/manual-rendezvous-relay-test.md). The helper script does not yet start `rendezvous-service`.
+
 Optional overrides:
 
 - `IRONMESH_LOCAL_CLUSTER_BASE_PORT`
