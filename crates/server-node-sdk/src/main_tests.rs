@@ -494,15 +494,16 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     let now = super::unix_ts();
     {
         let mut auth = state.client_credentials.lock().await;
-        auth.pairing_tokens.push(super::PairingTokenRecord {
-            token_id: "pair-1".to_string(),
-            token_hash: super::hash_token("pair-secret"),
-            label: Some("Pixel".to_string()),
-            created_at_unix: now,
-            expires_at_unix: now + 300,
-            used_at_unix: None,
-            enrolled_device_id: None,
-        });
+        auth.pairing_authorizations
+            .push(super::PairingAuthorizationRecord {
+                token_id: "pair-1".to_string(),
+                pairing_secret_hash: super::hash_token("pair-secret"),
+                label: Some("Pixel".to_string()),
+                created_at_unix: now,
+                expires_at_unix: now + 300,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
     }
 
     let response = super::enroll_client_device(
@@ -528,7 +529,7 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     let auth = state.client_credentials.lock().await;
     assert_eq!(auth.credentials.len(), 1);
     assert_eq!(auth.credentials[0].device_id, "device-a");
-    assert!(auth.pairing_tokens[0].used_at_unix.is_some());
+    assert!(auth.pairing_authorizations[0].used_at_unix.is_some());
     cleanup_test_state(&state).await;
 }
 
@@ -549,15 +550,16 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     let now = super::unix_ts();
     {
         let mut auth = state.client_credentials.lock().await;
-        auth.pairing_tokens.push(super::PairingTokenRecord {
-            token_id: "pair-2".to_string(),
-            token_hash: super::hash_token("pair-secret-2"),
-            label: Some("Laptop".to_string()),
-            created_at_unix: now,
-            expires_at_unix: now + 300,
-            used_at_unix: None,
-            enrolled_device_id: None,
-        });
+        auth.pairing_authorizations
+            .push(super::PairingAuthorizationRecord {
+                token_id: "pair-2".to_string(),
+                pairing_secret_hash: super::hash_token("pair-secret-2"),
+                label: Some("Laptop".to_string()),
+                created_at_unix: now,
+                expires_at_unix: now + 300,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
     }
 
     let response = super::enroll_client_device(

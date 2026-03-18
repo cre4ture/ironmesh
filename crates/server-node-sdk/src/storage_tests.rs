@@ -1397,14 +1397,14 @@ async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
     let (root, store) = backend.init_store("client-credential-roundtrip").await;
 
     let state = ClientCredentialState {
-        pairing_tokens: vec![PairingTokenRecord {
+        pairing_authorizations: vec![PairingAuthorizationRecord {
             token_id: "tok-1".to_string(),
-            token_hash: "hash-1".to_string(),
+            pairing_secret_hash: "hash-1".to_string(),
             label: Some("laptop".to_string()),
             created_at_unix: 11,
             expires_at_unix: 22,
             used_at_unix: None,
-            enrolled_device_id: None,
+            consumed_by_device_id: None,
         }],
         credentials: vec![ClientCredentialRecord {
             device_id: "dev-1".to_string(),
@@ -1419,9 +1419,12 @@ async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
     store.persist_client_credential_state(&state).await.unwrap();
     let loaded = store.load_client_credential_state().await.unwrap();
 
-    assert_eq!(loaded.pairing_tokens.len(), 1);
-    assert_eq!(loaded.pairing_tokens[0].token_id, "tok-1");
-    assert_eq!(loaded.pairing_tokens[0].label.as_deref(), Some("laptop"));
+    assert_eq!(loaded.pairing_authorizations.len(), 1);
+    assert_eq!(loaded.pairing_authorizations[0].token_id, "tok-1");
+    assert_eq!(
+        loaded.pairing_authorizations[0].label.as_deref(),
+        Some("laptop")
+    );
     assert_eq!(loaded.credentials.len(), 1);
     assert_eq!(loaded.credentials[0].device_id, "dev-1");
     assert_eq!(loaded.credentials[0].label.as_deref(), Some("Pixel"));

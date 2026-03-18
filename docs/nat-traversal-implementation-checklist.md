@@ -204,7 +204,8 @@ Recommended responsibilities:
 
 - [ ] Finish tightening the persisted server-node credential model:
 - [x] Rename `ClientAuthState` / `DeviceAuthRecord` toward credential-centered naming.
-- [ ] Replace `PairingTokenRecord` and the remaining persisted state shape with:
+- [x] Rename `PairingTokenRecord` toward pairing-authorization naming.
+- [ ] Replace the remaining persisted state shape with:
   - pairing records for one-time enrollment authorization,
   - persisted client credential records bound to public keys or certificate fingerprints,
   - revocation metadata for client identities.

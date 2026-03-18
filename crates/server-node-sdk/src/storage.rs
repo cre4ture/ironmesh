@@ -218,20 +218,20 @@ pub struct AdminAuditEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientCredentialState {
     #[serde(default)]
-    pub pairing_tokens: Vec<PairingTokenRecord>,
+    pub pairing_authorizations: Vec<PairingAuthorizationRecord>,
     #[serde(default)]
     pub credentials: Vec<ClientCredentialRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairingTokenRecord {
+pub struct PairingAuthorizationRecord {
     pub token_id: String,
-    pub token_hash: String,
+    pub pairing_secret_hash: String,
     pub label: Option<String>,
     pub created_at_unix: u64,
     pub expires_at_unix: u64,
     pub used_at_unix: Option<u64>,
-    pub enrolled_device_id: Option<String>,
+    pub consumed_by_device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

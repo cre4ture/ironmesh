@@ -83,9 +83,10 @@ use cluster::{
 };
 use storage::{
     AdminAuditEvent, ClientCredentialRecord, ClientCredentialState, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, ObjectReadMode, PairingTokenRecord,
-    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    StoreReadError, UploadChunkRef, VersionConsistencyState,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, ObjectReadMode,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
+    ReconcileVersionEntry, RepairAttemptRecord, StoreReadError, UploadChunkRef,
+    VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -6227,22 +6228,22 @@ async fn issue_pairing_token_impl(
         .unwrap_or(15 * 60)
         .clamp(60, 24 * 60 * 60);
     let pairing_token = generate_pairing_token();
-    let record = PairingTokenRecord {
+    let record = PairingAuthorizationRecord {
         token_id: Uuid::now_v7().to_string(),
-        token_hash: hash_token(&pairing_token),
+        pairing_secret_hash: hash_token(&pairing_token),
         label: request.label.clone(),
         created_at_unix: now,
         expires_at_unix: now + expires_in_secs,
         used_at_unix: None,
-        enrolled_device_id: None,
+        consumed_by_device_id: None,
     };
 
     {
         let mut auth_state = state.client_credentials.lock().await;
         auth_state
-            .pairing_tokens
+            .pairing_authorizations
             .retain(|token| token.used_at_unix.is_none() && token.expires_at_unix > now);
-        auth_state.pairing_tokens.push(record.clone());
+        auth_state.pairing_authorizations.push(record.clone());
     }
 
     if let Err(err) = persist_client_credential_state(state).await {
@@ -6318,7 +6319,7 @@ async fn enroll_client_device(
     let response = {
         let mut auth_state = state.client_credentials.lock().await;
         auth_state
-            .pairing_tokens
+            .pairing_authorizations
             .retain(|token| token.used_at_unix.is_none() && token.expires_at_unix > now);
 
         if auth_state
@@ -6329,18 +6330,21 @@ async fn enroll_client_device(
             return StatusCode::CONFLICT.into_response();
         }
 
-        let Some(token_record) = auth_state.pairing_tokens.iter_mut().find(|token| {
+        let Some(pairing_auth) = auth_state.pairing_authorizations.iter_mut().find(|token| {
             token.used_at_unix.is_none()
                 && token.expires_at_unix > now
-                && token_matches(token.token_hash.as_str(), Some(provided_hash.as_str()))
+                && token_matches(
+                    token.pairing_secret_hash.as_str(),
+                    Some(provided_hash.as_str()),
+                )
         }) else {
             return StatusCode::UNAUTHORIZED.into_response();
         };
 
-        token_record.used_at_unix = Some(now);
-        token_record.enrolled_device_id = Some(device_id.clone());
+        pairing_auth.used_at_unix = Some(now);
+        pairing_auth.consumed_by_device_id = Some(device_id.clone());
 
-        let final_label = label.or_else(|| token_record.label.clone());
+        let final_label = label.or_else(|| pairing_auth.label.clone());
         let device = ClientCredentialRecord {
             device_id: device_id.clone(),
             label: final_label.clone(),
