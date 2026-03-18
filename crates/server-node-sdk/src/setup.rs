@@ -1,11 +1,23 @@
 use super::*;
+use aes_gcm_siv::aead::Aead;
+use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use axum::http::header::{CONTENT_TYPE, HeaderValue};
 use axum::response::Html;
 use axum_server::Handle;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use pbkdf2::pbkdf2_hmac;
+use rand::RngCore;
 use rcgen::BasicConstraints;
+use sha2::Sha256;
 use tokio::sync::mpsc;
 
 const SETUP_STATE_VERSION: u32 = 1;
+const MANAGED_SIGNER_BACKUP_VERSION: u32 = 1;
+const MANAGED_SIGNER_BACKUP_SALT_LEN: usize = 16;
+const MANAGED_SIGNER_BACKUP_NONCE_LEN: usize = 12;
+const MANAGED_SIGNER_BACKUP_KEY_LEN: usize = 32;
+const MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS: u32 = 600_000;
 const SETUP_STATUS_HTML: &str = include_str!("ui/setup_index.html");
 const SETUP_APP_JS: &str = include_str!("ui/setup_app.js");
 
@@ -72,6 +84,33 @@ struct SetupCompletion {
     config: ServerNodeConfig,
 }
 
+struct SelfManagedClusterArtifacts {
+    package: NodeEnrollmentPackage,
+    ca_cert_pem: String,
+    ca_key_pem: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ManagedSignerBackup {
+    pub version: u32,
+    pub cluster_id: ClusterId,
+    pub source_node_id: NodeId,
+    pub exported_at_unix: u64,
+    pub pbkdf2_rounds: u32,
+    pub salt_b64: String,
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManagedSignerBackupPlaintext {
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    exported_at_unix: u64,
+    ca_cert_pem: String,
+    ca_key_pem: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SetupStatusResponse {
     state: SetupLifecycleState,
@@ -123,6 +162,7 @@ pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
         let resolved_path = resolve_materialized_path(&config.data_dir, enrollment_path);
         if resolved_path.exists() {
             let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path)?;
+            apply_managed_signer_paths(&config.data_dir, &mut runtime);
             runtime.admin_token = managed_state.admin_token.clone();
             return Ok(StartupMode::Runtime(runtime));
         }
@@ -326,8 +366,8 @@ async fn start_new_cluster(
         enrollment_issuer_url: Some(public_url.clone()),
     };
 
-    let package = match issue_self_managed_cluster_node_enrollment(bootstrap) {
-        Ok(package) => package,
+    let artifacts = match issue_self_managed_cluster_artifacts(bootstrap) {
+        Ok(artifacts) => artifacts,
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -337,7 +377,18 @@ async fn start_new_cluster(
         }
     };
 
-    if let Err(err) = package.write_to_path(&runtime_enrollment_path) {
+    if let Err(err) = artifacts.package.write_to_path(&runtime_enrollment_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+    if let Err(err) = write_managed_signer_material(
+        &state.config.data_dir,
+        &artifacts.ca_cert_pem,
+        &artifacts.ca_key_pem,
+    ) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err.to_string() })),
@@ -372,6 +423,7 @@ async fn start_new_cluster(
                 .into_response();
         }
     };
+    apply_managed_signer_paths(&state.config.data_dir, &mut config);
     config.admin_token = Some(request.admin_password.clone());
     if state
         .completion_tx
@@ -538,6 +590,7 @@ async fn import_node_enrollment_package(
                 .into_response();
         }
     };
+    apply_managed_signer_paths(&state.config.data_dir, &mut config);
     config.admin_token = Some(request.admin_password.clone());
     if state
         .completion_tx
@@ -641,6 +694,18 @@ fn runtime_node_enrollment_path(data_dir: &std::path::Path) -> PathBuf {
         .join("node-enrollment.json")
 }
 
+pub(crate) fn managed_signer_dir(data_dir: &std::path::Path) -> PathBuf {
+    managed_setup_dir(data_dir).join("signer")
+}
+
+pub(crate) fn managed_signer_ca_cert_path(data_dir: &std::path::Path) -> PathBuf {
+    managed_signer_dir(data_dir).join("cluster-ca.pem")
+}
+
+pub(crate) fn managed_signer_ca_key_path(data_dir: &std::path::Path) -> PathBuf {
+    managed_signer_dir(data_dir).join("cluster-ca.key")
+}
+
 fn ensure_managed_setup_state(path: &std::path::Path) -> Result<ManagedSetupState> {
     if let Some(existing) = read_managed_setup_state(path)? {
         return Ok(existing);
@@ -672,6 +737,150 @@ fn write_managed_setup_state(path: &std::path::Path, state: &ManagedSetupState) 
     let payload =
         serde_json::to_string_pretty(state).context("failed serializing managed setup state")?;
     std::fs::write(path, payload).with_context(|| format!("failed writing {}", path.display()))
+}
+
+pub(crate) fn write_managed_signer_material(
+    data_dir: &std::path::Path,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) -> Result<()> {
+    let signer_dir = managed_signer_dir(data_dir);
+    std::fs::create_dir_all(&signer_dir)
+        .with_context(|| format!("failed creating {}", signer_dir.display()))?;
+    let cert_path = managed_signer_ca_cert_path(data_dir);
+    let key_path = managed_signer_ca_key_path(data_dir);
+    std::fs::write(&cert_path, ca_cert_pem)
+        .with_context(|| format!("failed writing {}", cert_path.display()))?;
+    std::fs::write(&key_path, ca_key_pem)
+        .with_context(|| format!("failed writing {}", key_path.display()))?;
+    Ok(())
+}
+
+pub(crate) fn apply_managed_signer_paths(
+    data_dir: &std::path::Path,
+    config: &mut ServerNodeConfig,
+) {
+    let key_path = managed_signer_ca_key_path(data_dir);
+    if key_path.exists() {
+        config.internal_ca_key_path = Some(key_path.clone());
+        config.public_ca_key_path = Some(key_path);
+    }
+}
+
+fn validate_backup_passphrase(passphrase: &str) -> std::result::Result<(), &'static str> {
+    if passphrase.trim().len() < 12 {
+        return Err("backup passphrase must be at least 12 characters long");
+    }
+    Ok(())
+}
+
+fn derive_managed_signer_backup_key(
+    passphrase: &str,
+    salt: &[u8],
+    rounds: u32,
+) -> [u8; MANAGED_SIGNER_BACKUP_KEY_LEN] {
+    let mut key = [0u8; MANAGED_SIGNER_BACKUP_KEY_LEN];
+    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, rounds, &mut key);
+    key
+}
+
+pub(crate) fn export_managed_signer_backup(
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+    passphrase: &str,
+) -> Result<ManagedSignerBackup> {
+    validate_backup_passphrase(passphrase).map_err(anyhow::Error::msg)?;
+    let exported_at_unix = unix_ts();
+    let plaintext = ManagedSignerBackupPlaintext {
+        cluster_id,
+        source_node_id,
+        exported_at_unix,
+        ca_cert_pem: ca_cert_pem.to_string(),
+        ca_key_pem: ca_key_pem.to_string(),
+    };
+    let plaintext_json =
+        serde_json::to_vec(&plaintext).context("failed serializing managed signer backup")?;
+
+    let mut salt = [0u8; MANAGED_SIGNER_BACKUP_SALT_LEN];
+    let mut nonce = [0u8; MANAGED_SIGNER_BACKUP_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let key =
+        derive_managed_signer_backup_key(passphrase, &salt, MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS);
+    let cipher = Aes256GcmSiv::new_from_slice(&key)
+        .context("failed initializing managed signer backup cipher")?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext_json.as_ref())
+        .map_err(|_| anyhow!("failed encrypting managed signer backup"))?;
+
+    Ok(ManagedSignerBackup {
+        version: MANAGED_SIGNER_BACKUP_VERSION,
+        cluster_id,
+        source_node_id,
+        exported_at_unix,
+        pbkdf2_rounds: MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS,
+        salt_b64: BASE64_STANDARD.encode(salt),
+        nonce_b64: BASE64_STANDARD.encode(nonce),
+        ciphertext_b64: BASE64_STANDARD.encode(ciphertext),
+    })
+}
+
+pub(crate) fn import_managed_signer_backup(
+    data_dir: &std::path::Path,
+    backup: &ManagedSignerBackup,
+    passphrase: &str,
+    expected_cluster_id: Option<ClusterId>,
+) -> Result<()> {
+    if backup.version != MANAGED_SIGNER_BACKUP_VERSION {
+        bail!(
+            "unsupported managed signer backup version {}",
+            backup.version
+        );
+    }
+
+    let salt = BASE64_STANDARD
+        .decode(backup.salt_b64.as_bytes())
+        .context("failed decoding managed signer backup salt")?;
+    if salt.len() != MANAGED_SIGNER_BACKUP_SALT_LEN {
+        bail!("invalid managed signer backup salt length");
+    }
+    let nonce = BASE64_STANDARD
+        .decode(backup.nonce_b64.as_bytes())
+        .context("failed decoding managed signer backup nonce")?;
+    if nonce.len() != MANAGED_SIGNER_BACKUP_NONCE_LEN {
+        bail!("invalid managed signer backup nonce length");
+    }
+    let ciphertext = BASE64_STANDARD
+        .decode(backup.ciphertext_b64.as_bytes())
+        .context("failed decoding managed signer backup ciphertext")?;
+    let key = derive_managed_signer_backup_key(passphrase, &salt, backup.pbkdf2_rounds);
+    let cipher = Aes256GcmSiv::new_from_slice(&key)
+        .context("failed initializing managed signer backup cipher")?;
+    let plaintext_json = cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|_| anyhow!("failed decrypting managed signer backup"))?;
+    let plaintext = serde_json::from_slice::<ManagedSignerBackupPlaintext>(&plaintext_json)
+        .context("failed parsing managed signer backup payload")?;
+
+    if plaintext.cluster_id != backup.cluster_id {
+        bail!("managed signer backup cluster ID mismatch");
+    }
+    if plaintext.source_node_id != backup.source_node_id {
+        bail!("managed signer backup source node ID mismatch");
+    }
+    if let Some(expected_cluster_id) = expected_cluster_id
+        && plaintext.cluster_id != expected_cluster_id
+    {
+        bail!(
+            "managed signer backup belongs to cluster {} but this node is in cluster {}",
+            plaintext.cluster_id,
+            expected_cluster_id
+        );
+    }
+
+    write_managed_signer_material(data_dir, &plaintext.ca_cert_pem, &plaintext.ca_key_pem)
 }
 
 async fn ensure_bootstrap_tls_config(config: &SetupBootstrapConfig) -> Result<RustlsConfig> {
@@ -752,9 +961,9 @@ fn generate_bootstrap_tls_identity(bind_addr: SocketAddr) -> Result<(String, Str
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
-fn issue_self_managed_cluster_node_enrollment(
+fn issue_self_managed_cluster_artifacts(
     mut bootstrap: TransportNodeBootstrap,
-) -> Result<NodeEnrollmentPackage> {
+) -> Result<SelfManagedClusterArtifacts> {
     bootstrap.validate()?;
     let policy = build_tls_issue_policy(None, None)
         .map_err(|status| anyhow!("invalid TLS policy: {status}"))?;
@@ -776,7 +985,11 @@ fn issue_self_managed_cluster_node_enrollment(
         internal_tls_material: Some(internal_tls_material),
     };
     package.validate()?;
-    Ok(package)
+    Ok(SelfManagedClusterArtifacts {
+        package,
+        ca_cert_pem,
+        ca_key_pem,
+    })
 }
 
 fn generate_cluster_ca(cluster_id: ClusterId) -> Result<(String, String)> {
@@ -1044,10 +1257,99 @@ mod tests {
             enrollment_issuer_url: Some("https://node-a.local:8443".to_string()),
         };
 
-        let package = issue_self_managed_cluster_node_enrollment(bootstrap).unwrap();
+        let package = issue_self_managed_cluster_artifacts(bootstrap)
+            .unwrap()
+            .package;
         package.validate().unwrap();
         assert!(package.public_tls_material.is_some());
         assert!(package.internal_tls_material.is_some());
         assert!(package.bootstrap.trust_roots.cluster_ca_pem.is_some());
+    }
+
+    #[test]
+    fn apply_managed_signer_paths_sets_runtime_ca_key_paths() {
+        let dir = temp_dir("managed-signer");
+        write_managed_signer_material(&dir, "ca-cert", "ca-key").unwrap();
+        let mut config = ServerNodeConfig::local_edge(
+            dir.join("data"),
+            "127.0.0.1:28080".parse::<SocketAddr>().unwrap(),
+        );
+
+        apply_managed_signer_paths(&dir, &mut config);
+
+        assert_eq!(
+            config.internal_ca_key_path.as_ref().map(|path| path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()),
+            Some("cluster-ca.key".to_string())
+        );
+        assert_eq!(
+            config.public_ca_key_path.as_ref().map(|path| path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()),
+            Some("cluster-ca.key".to_string())
+        );
+    }
+
+    #[test]
+    fn managed_signer_backup_roundtrip_restores_signer_material() {
+        let dir = temp_dir("managed-signer-backup");
+        let cluster_id = ClusterId::new_v4();
+        let source_node_id = NodeId::new_v4();
+        let backup = export_managed_signer_backup(
+            cluster_id,
+            source_node_id,
+            "cluster-ca-cert",
+            "cluster-ca-key",
+            "correct horse battery staple",
+        )
+        .unwrap();
+
+        import_managed_signer_backup(
+            &dir,
+            &backup,
+            "correct horse battery staple",
+            Some(cluster_id),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(managed_signer_ca_cert_path(&dir)).unwrap(),
+            "cluster-ca-cert"
+        );
+        assert_eq!(
+            std::fs::read_to_string(managed_signer_ca_key_path(&dir)).unwrap(),
+            "cluster-ca-key"
+        );
+    }
+
+    #[test]
+    fn managed_signer_backup_rejects_wrong_passphrase() {
+        let dir = temp_dir("managed-signer-backup-passphrase");
+        let backup = export_managed_signer_backup(
+            ClusterId::new_v4(),
+            NodeId::new_v4(),
+            "cluster-ca-cert",
+            "cluster-ca-key",
+            "correct horse battery staple",
+        )
+        .unwrap();
+
+        let err = import_managed_signer_backup(
+            &dir,
+            &backup,
+            "wrong passphrase",
+            Some(backup.cluster_id),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("failed decrypting managed signer backup")
+        );
     }
 }

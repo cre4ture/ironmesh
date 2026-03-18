@@ -82,6 +82,10 @@ use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, ReplicationPlan,
     ReplicationPolicy,
 };
+use setup::{
+    ManagedSignerBackup, export_managed_signer_backup, import_managed_signer_backup,
+    managed_signer_ca_cert_path,
+};
 use storage::{
     AdminAuditEvent, ClientCredentialRecord, ClientCredentialState, MediaCacheLookup,
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, ObjectReadMode,
@@ -92,6 +96,7 @@ use storage::{
 
 #[derive(Clone)]
 struct ServerState {
+    data_dir: PathBuf,
     cluster_id: ClusterId,
     node_id: NodeId,
     store: Arc<Mutex<PersistentStore>>,
@@ -2537,6 +2542,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     };
 
     let state = ServerState {
+        data_dir: config.data_dir.clone(),
         cluster_id: config.cluster_id,
         node_id: config.node_id,
         store,
@@ -2710,6 +2716,14 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         )
         .route("/auth/node-bootstraps/issue", post(issue_node_bootstrap))
         .route("/auth/node-enrollments/issue", post(issue_node_enrollment))
+        .route(
+            "/auth/managed-signer/backup/export",
+            post(export_managed_signer_backup_handler),
+        )
+        .route(
+            "/auth/managed-signer/backup/import",
+            post(import_managed_signer_backup_handler),
+        )
         .route(
             "/auth/node-join-requests/issue-enrollment",
             post(issue_node_enrollment_from_join_request),
@@ -5252,6 +5266,26 @@ struct NodeJoinEnrollmentIssueRequest {
     tls_renewal_window_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ManagedSignerBackupExportRequest {
+    passphrase: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedSignerBackupImportRequest {
+    passphrase: String,
+    backup: ManagedSignerBackup,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManagedSignerBackupImportResponse {
+    status: String,
+    cluster_id: ClusterId,
+    source_node_id: NodeId,
+    restart_required: bool,
+    signer_ca_cert_path: String,
+}
+
 #[derive(Debug, Serialize)]
 struct OutboundNodeEnrollmentRenewRequest {
     package: NodeEnrollmentPackage,
@@ -6291,6 +6325,216 @@ async fn issue_node_enrollment_from_join_request(
     .await;
 
     (StatusCode::CREATED, Json(package)).into_response()
+}
+
+async fn export_managed_signer_backup_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagedSignerBackupExportRequest>,
+) -> impl IntoResponse {
+    let action = "auth/managed-signer/backup/export";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let trust_material =
+        match load_live_trust_material(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR) {
+            Ok(material) => material,
+            Err(status) => return status.into_response(),
+        };
+    let Some(ca_cert_pem) = trust_material
+        .cluster_ca_pem
+        .as_deref()
+        .or(state.cluster_ca_pem.as_deref())
+        .or(trust_material.public_ca_pem.as_deref())
+        .or(state.public_ca_pem.as_deref())
+    else {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed signer CA certificate is not available on this node" }),
+        )
+        .await;
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": "managed signer CA certificate is not available on this node" })),
+        )
+            .into_response();
+    };
+    let Some(ca_key_pem) = trust_material
+        .internal_ca_key_pem
+        .as_deref()
+        .or(state.internal_ca_key_pem.as_deref())
+        .or(trust_material.public_ca_key_pem.as_deref())
+        .or(state.public_ca_key_pem.as_deref())
+    else {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed signer CA private key is not available on this node" }),
+        )
+        .await;
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": "managed signer CA private key is not available on this node" })),
+        )
+            .into_response();
+    };
+
+    let backup = match export_managed_signer_backup(
+        state.cluster_id,
+        state.node_id,
+        ca_cert_pem,
+        ca_key_pem,
+        &request.passphrase,
+    ) {
+        Ok(backup) => backup,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "cluster_id": backup.cluster_id,
+            "source_node_id": backup.source_node_id,
+            "exported_at_unix": backup.exported_at_unix,
+        }),
+    )
+    .await;
+
+    (StatusCode::CREATED, Json(backup)).into_response()
+}
+
+async fn import_managed_signer_backup_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagedSignerBackupImportRequest>,
+) -> impl IntoResponse {
+    let action = "auth/managed-signer/backup/import";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "cluster_id": request.backup.cluster_id,
+            "source_node_id": request.backup.source_node_id,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    if request.backup.cluster_id != state.cluster_id {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": "managed signer backup belongs to a different cluster" }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "managed signer backup belongs to a different cluster" })),
+        )
+            .into_response();
+    }
+
+    if let Err(err) = import_managed_signer_backup(
+        &state.data_dir,
+        &request.backup,
+        &request.passphrase,
+        Some(state.cluster_id),
+    ) {
+        append_admin_audit(
+            &state,
+            action,
+            &authz,
+            true,
+            true,
+            true,
+            "error",
+            json!({ "error": err.to_string() }),
+        )
+        .await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "cluster_id": request.backup.cluster_id,
+            "source_node_id": request.backup.source_node_id,
+            "restart_required": true,
+        }),
+    )
+    .await;
+
+    (
+        StatusCode::CREATED,
+        Json(ManagedSignerBackupImportResponse {
+            status: "imported".to_string(),
+            cluster_id: state.cluster_id,
+            source_node_id: request.backup.source_node_id,
+            restart_required: true,
+            signer_ca_cert_path: managed_signer_ca_cert_path(&state.data_dir)
+                .display()
+                .to_string(),
+        }),
+    )
+        .into_response()
 }
 
 async fn renew_node_enrollment(

@@ -123,6 +123,22 @@
     <pre id="node-certificate-status-json">click the button to inspect current certificate expiry and renewal state</pre>
     <p id="node-certificate-status-notes"></p>
 
+    <h3>Managed signer backup</h3>
+    <p>Exports or imports the managed signer CA used by the zero-touch setup path. Export returns an encrypted JSON backup via <code>POST /auth/managed-signer/backup/export</code>. Import persists the backup on this node via <code>POST /auth/managed-signer/backup/import</code> and requires a restart before the imported signer material is active for issuance.</p>
+    <label for="managed-signer-backup-passphrase">Backup passphrase</label>
+    <input id="managed-signer-backup-passphrase" type="password" autocomplete="off" spellcheck="false" />
+    <button id="export-managed-signer-backup" type="button">Export managed signer backup</button>
+    <pre id="managed-signer-backup-json">provide a backup passphrase and click the button to export an encrypted managed signer backup</pre>
+    <p id="managed-signer-backup-notes"></p>
+
+    <label for="managed-signer-import-json">Managed signer backup JSON</label>
+    <textarea id="managed-signer-import-json" rows="10" spellcheck="false" placeholder='{"version":1,"cluster_id":"..."}'></textarea>
+    <label for="managed-signer-import-passphrase">Import passphrase</label>
+    <input id="managed-signer-import-passphrase" type="password" autocomplete="off" spellcheck="false" />
+    <button id="import-managed-signer-backup" type="button">Import managed signer backup</button>
+    <pre id="managed-signer-import-json-output">paste an encrypted managed signer backup and click the button to import it on this node</pre>
+    <p id="managed-signer-import-notes"></p>
+
     <h2>Server logs</h2>
     <p>Recent in-memory log lines from this node.</p>
     <pre id="server-logs">loading...</pre>
@@ -156,6 +172,8 @@
       <li><code>DELETE /auth/client-credentials/{device_id}?reason=&lt;text&gt;</code> - revoke an enrolled client credential and optionally record a revocation reason (admin token required)</li>
       <li><code>POST /auth/node-bootstraps/issue</code> - issue a node bootstrap JSON artifact for provisioning a server node (admin token required)</li>
       <li><code>POST /auth/node-enrollments/issue</code> - issue a node enrollment package with generated internal mTLS material and optional public HTTPS certificates (admin token required, CA key material required)</li>
+      <li><code>POST /auth/managed-signer/backup/export</code> - export an encrypted managed signer backup for recovery or signer transfer (admin token required, signer CA material required)</li>
+      <li><code>POST /auth/managed-signer/backup/import</code> - import an encrypted managed signer backup onto this node; restart required before it becomes the active signer (admin token required)</li>
       <li><code>POST /auth/node-join-requests/issue-enrollment</code> - issue a node enrollment package from a joining node's request blob (admin token required, CA key material required)</li>
       <li><code>POST /auth/node-enrollments/renew</code> - renew an existing node enrollment package with fresh TLS material for the same node identity (admin token required, CA key material required)</li>
       <li><code>GET /auth/node-certificates/status</code> - inspect current public/internal certificate expiry and renewal state (admin token required)</li>

@@ -444,6 +444,120 @@ async function fetchNodeCertificateStatus() {
   }
 }
 
+async function exportManagedSignerBackup() {
+  const output = document.getElementById('managed-signer-backup-json');
+  const notes = document.getElementById('managed-signer-backup-notes');
+  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
+  const passphrase = document.getElementById('managed-signer-backup-passphrase').value;
+  if (!adminToken) {
+    output.textContent = 'admin token is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!passphrase.trim()) {
+    output.textContent = 'backup passphrase is required';
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'exporting managed signer backup...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/managed-signer/backup/export', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+        'x-ironmesh-admin-token': adminToken
+      },
+      body: JSON.stringify({ passphrase })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeManagedSignerBackup(payload);
+  } catch (error) {
+    output.textContent = 'failed to export managed signer backup: ' + error;
+    notes.textContent = '';
+  }
+}
+
+async function importManagedSignerBackup() {
+  const output = document.getElementById('managed-signer-import-json-output');
+  const notes = document.getElementById('managed-signer-import-notes');
+  const adminToken = document.getElementById('node-bootstrap-admin-token').value.trim();
+  const passphrase = document.getElementById('managed-signer-import-passphrase').value;
+  const backupRaw = document.getElementById('managed-signer-import-json').value.trim();
+  if (!adminToken) {
+    output.textContent = 'admin token is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!backupRaw) {
+    output.textContent = 'managed signer backup JSON is required';
+    notes.textContent = '';
+    return;
+  }
+  if (!passphrase.trim()) {
+    output.textContent = 'import passphrase is required';
+    notes.textContent = '';
+    return;
+  }
+
+  let backup;
+  try {
+    backup = JSON.parse(backupRaw);
+  } catch (error) {
+    output.textContent = 'failed to parse managed signer backup JSON: ' + error;
+    notes.textContent = '';
+    return;
+  }
+
+  output.textContent = 'importing managed signer backup...';
+  notes.textContent = '';
+  try {
+    const response = await fetch('/auth/managed-signer/backup/import', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+        'x-ironmesh-admin-token': adminToken
+      },
+      body: JSON.stringify({
+        passphrase,
+        backup
+      })
+    });
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { status: response.status, message: 'no JSON body returned' };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    }
+
+    output.textContent = JSON.stringify(payload, null, 2);
+    notes.textContent = summarizeManagedSignerImport(payload);
+  } catch (error) {
+    output.textContent = 'failed to import managed signer backup: ' + error;
+    notes.textContent = '';
+  }
+}
+
 function formatUnixTs(unixTs) {
   const parsed = Number(unixTs);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -583,6 +697,27 @@ function summarizeNodeCertificateStatus(payload) {
   return notes.join(' | ');
 }
 
+function summarizeManagedSignerBackup(payload) {
+  return [
+    `cluster: ${payload?.cluster_id || 'unknown'}`,
+    `source node: ${payload?.source_node_id || 'unknown'}`,
+    `exported: ${formatUnixTs(payload?.exported_at_unix)}`,
+    `PBKDF2 rounds: ${payload?.pbkdf2_rounds || 'unknown'}`
+  ].join(' | ');
+}
+
+function summarizeManagedSignerImport(payload) {
+  const notes = [
+    `cluster: ${payload?.cluster_id || 'unknown'}`,
+    `source node: ${payload?.source_node_id || 'unknown'}`,
+    `signer CA path: ${payload?.signer_ca_cert_path || 'unknown'}`
+  ];
+  if (payload?.restart_required) {
+    notes.push('restart required before imported signer material becomes active');
+  }
+  return notes.join(' | ');
+}
+
 function renderBootstrapQr(text) {
   const container = document.getElementById('bootstrap-bundle-qr-container');
   const target = document.getElementById('bootstrap-bundle-qr');
@@ -643,6 +778,14 @@ document
 document
   .getElementById('fetch-node-certificate-status')
   .addEventListener('click', fetchNodeCertificateStatus);
+
+document
+  .getElementById('export-managed-signer-backup')
+  .addEventListener('click', exportManagedSignerBackup);
+
+document
+  .getElementById('import-managed-signer-backup')
+  .addEventListener('click', importManagedSignerBackup);
 
 prefillAdminTokenFromSession();
 refreshServerLogs();

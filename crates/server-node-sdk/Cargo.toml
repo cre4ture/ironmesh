@@ -10,16 +10,21 @@ default = []
 turso-metadata = ["dep:turso"]
 
 [dependencies]
+aead = "0.5"
+aes-gcm-siv = "0.11"
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+base64 = "0.22"
 blake3.workspace = true
 bytes.workspace = true
 common = { path = "../common" }
 exif = { package = "kamadak-exif", version = "0.6" }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 percent-encoding = "2"
+pbkdf2 = "0.12"
+rand = "0.8"
 reqwest.workspace = true
 rcgen = { version = "0.14", features = ["crypto", "pem", "ring", "x509-parser"] }
 rusqlite.workspace = true
@@ -27,6 +32,7 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tokio.workspace = true
 tokio-rustls = "0.26"
 time = "0.3"

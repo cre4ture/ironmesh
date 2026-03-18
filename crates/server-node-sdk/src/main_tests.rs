@@ -1142,6 +1142,101 @@ async fn issue_node_enrollment_from_join_request_returns_enrollment_package() {
 }
 
 #[tokio::test]
+async fn export_managed_signer_backup_returns_encrypted_backup() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem);
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    let response = super::export_managed_signer_backup_handler(
+        State(state.clone()),
+        headers,
+        Json(super::ManagedSignerBackupExportRequest {
+            passphrase: "correct horse battery staple".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let backup: super::ManagedSignerBackup = serde_json::from_slice(&body).unwrap();
+    assert_eq!(backup.cluster_id, state.cluster_id);
+    assert_eq!(backup.source_node_id, state.node_id);
+    assert!(!backup.ciphertext_b64.is_empty());
+    assert!(!backup.salt_b64.is_empty());
+    assert!(!backup.nonce_b64.is_empty());
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn import_managed_signer_backup_persists_signer_material_and_requires_restart() {
+    let mut exporter = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    exporter.admin_control.admin_token = Some("admin-secret".to_string());
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    exporter.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    exporter.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+    let backup = super::setup::export_managed_signer_backup(
+        exporter.cluster_id,
+        exporter.node_id,
+        &cluster_ca_pem,
+        &internal_ca_key_pem,
+        "correct horse battery staple",
+    )
+    .unwrap();
+
+    let mut importer = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    importer.cluster_id = exporter.cluster_id;
+    importer.admin_control.admin_token = Some("admin-secret".to_string());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    let response = super::import_managed_signer_backup_handler(
+        State(importer.clone()),
+        headers,
+        Json(super::ManagedSignerBackupImportRequest {
+            passphrase: "correct horse battery staple".to_string(),
+            backup,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: super::ManagedSignerBackupImportResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.cluster_id, importer.cluster_id);
+    assert_eq!(payload.source_node_id, exporter.node_id);
+    assert!(payload.restart_required);
+
+    let signer_cert_path = importer
+        .data_dir
+        .join("managed")
+        .join("signer")
+        .join("cluster-ca.pem");
+    let signer_key_path = importer
+        .data_dir
+        .join("managed")
+        .join("signer")
+        .join("cluster-ca.key");
+    assert_eq!(
+        std::fs::read_to_string(signer_cert_path).unwrap(),
+        cluster_ca_pem
+    );
+    assert_eq!(
+        std::fs::read_to_string(signer_key_path).unwrap(),
+        internal_ca_key_pem
+    );
+
+    cleanup_test_state(&exporter).await;
+    cleanup_test_state(&importer).await;
+}
+
+#[tokio::test]
 async fn issue_node_enrollment_allows_local_edge_with_public_tls_only() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
@@ -3516,6 +3611,7 @@ async fn build_test_state(
 
     let (namespace_change_tx, _) = tokio::sync::watch::channel(0);
     let state = ServerState {
+        data_dir: root.clone(),
         cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
         store: store.clone(),
