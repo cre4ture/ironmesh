@@ -57,6 +57,10 @@ pub fn next_device_id() -> DeviceId {
     Uuid::now_v7()
 }
 
+fn normalize_pem_text(value: &str) -> String {
+    value.replace("\r\n", "\n").trim().to_string()
+}
+
 impl ClientIdentityMaterial {
     pub fn generate(
         cluster_id: ClusterId,
@@ -99,7 +103,7 @@ impl ClientIdentityMaterial {
         if self.device_id != issued.device_id {
             bail!("issued identity device_id does not match local client identity");
         }
-        if self.public_key_pem != issued.public_key_pem {
+        if normalize_pem_text(&self.public_key_pem) != normalize_pem_text(&issued.public_key_pem) {
             bail!("issued identity public_key_pem does not match local client identity");
         }
 

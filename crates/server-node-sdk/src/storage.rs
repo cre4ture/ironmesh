@@ -247,6 +247,12 @@ pub struct ClientCredentialRecord {
     #[serde(default)]
     pub credential_fingerprint: Option<String>,
     pub created_at_unix: u64,
+    #[serde(default)]
+    pub revocation_reason: Option<String>,
+    #[serde(default)]
+    pub revoked_by_actor: Option<String>,
+    #[serde(default)]
+    pub revoked_by_source_node: Option<String>,
     pub revoked_at_unix: Option<u64>,
 }
 

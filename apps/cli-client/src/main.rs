@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use client_sdk::{
@@ -69,12 +69,15 @@ async fn main() -> Result<()> {
             output,
             device_id,
             label,
-        } => enroll_from_bootstrap(
-            &cli,
-            output.as_ref(),
-            device_id.as_deref(),
-            label.as_deref(),
-        ),
+        } => {
+            enroll_from_bootstrap(
+                &cli,
+                output.as_ref(),
+                device_id.as_deref(),
+                label.as_deref(),
+            )
+            .await
+        }
         Commands::CacheList => {
             let client = build_client_node_from_cli(&cli)?;
             for entry in client.cache_entries().await {
@@ -131,7 +134,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn enroll_from_bootstrap(
+async fn enroll_from_bootstrap(
     cli: &Cli,
     output: Option<&PathBuf>,
     device_id: Option<&str>,
@@ -143,21 +146,31 @@ fn enroll_from_bootstrap(
 
     let bootstrap_path = cli
         .bootstrap_file
-        .as_deref()
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("enroll requires --bootstrap-file"))?;
-    let bootstrap = ConnectionBootstrap::from_path(bootstrap_path)?;
-    let enrolled = bootstrap.enroll_blocking(device_id, label)?;
-    let identity = enrolled.client_identity_material()?;
     let output_path = output
         .cloned()
         .or_else(|| cli.client_identity_file.clone())
-        .unwrap_or_else(|| default_client_identity_path(bootstrap_path));
-    identity.write_to_path(&output_path)?;
+        .unwrap_or_else(|| default_client_identity_path(&bootstrap_path));
+    let output_path_for_print = output_path.clone();
+    let device_id = device_id.map(ToString::to_string);
+    let label = label.map(ToString::to_string);
 
-    println!("enrolled device {}", identity.device_id);
-    println!("cluster {}", identity.cluster_id);
-    println!("server {}", enrolled.server_base_url);
-    println!("identity {}", output_path.display());
+    let enrolled =
+        tokio::task::spawn_blocking(move || -> Result<(ClientIdentityMaterial, String)> {
+            let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)?;
+            let enrolled = bootstrap.enroll_blocking(device_id.as_deref(), label.as_deref())?;
+            let identity = enrolled.client_identity_material()?;
+            identity.write_to_path(&output_path)?;
+            Ok((identity, enrolled.server_base_url))
+        })
+        .await
+        .context("enroll task panicked")??;
+
+    println!("enrolled device {}", enrolled.0.device_id);
+    println!("cluster {}", enrolled.0.cluster_id);
+    println!("server {}", enrolled.1);
+    println!("identity {}", output_path_for_print.display());
     Ok(())
 }
 

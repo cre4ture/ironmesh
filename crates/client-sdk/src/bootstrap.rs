@@ -215,25 +215,7 @@ impl ConnectionBootstrap {
     pub fn planned_targets(&self) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
         self.validate()?;
 
-        let direct_targets = self
-            .normalized_candidate_direct_endpoints()?
-            .into_iter()
-            .map(|endpoint| PlannedConnectionBootstrapTarget {
-                cluster_id: self.cluster_id,
-                rendezvous_urls: self.rendezvous_urls.clone(),
-                rendezvous_mtls_required: self.rendezvous_mtls_required,
-                relay_mode: self.relay_mode,
-                path_kind: TransportPathKind::DirectHttps,
-                server_base_url: Some(endpoint.url),
-                target_node_id: endpoint.node_id,
-                server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
-                cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
-                rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
-                pairing_token: self.pairing_token.clone(),
-                device_label: self.device_label.clone(),
-                device_id: self.device_id.clone(),
-            })
-            .collect::<Vec<_>>();
+        let direct_targets = self.direct_https_targets()?.into_iter().collect::<Vec<_>>();
 
         let relay_targets = if self.relay_mode != RelayMode::Disabled {
             if self.rendezvous_urls.is_empty() {
@@ -300,6 +282,28 @@ impl ConnectionBootstrap {
         }
 
         Ok(planned)
+    }
+
+    fn direct_https_targets(&self) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
+        Ok(self
+            .normalized_candidate_direct_endpoints()?
+            .into_iter()
+            .map(|endpoint| PlannedConnectionBootstrapTarget {
+                cluster_id: self.cluster_id,
+                rendezvous_urls: self.rendezvous_urls.clone(),
+                rendezvous_mtls_required: self.rendezvous_mtls_required,
+                relay_mode: self.relay_mode,
+                path_kind: TransportPathKind::DirectHttps,
+                server_base_url: Some(endpoint.url),
+                target_node_id: endpoint.node_id,
+                server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
+                cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
+                rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
+                pairing_token: self.pairing_token.clone(),
+                device_label: self.device_label.clone(),
+                device_id: self.device_id.clone(),
+            })
+            .collect::<Vec<_>>())
     }
 
     pub fn build_client_with_identity(
@@ -479,12 +483,40 @@ impl ConnectionBootstrap {
         bail!("failed to resolve any bootstrap endpoint");
     }
 
+    fn resolve_direct_enrollment_target_blocking(&self) -> Result<ResolvedConnectionBootstrap> {
+        for target in self.direct_https_targets()? {
+            let Some(server_base_url) = target.server_base_url.as_deref() else {
+                continue;
+            };
+            if probe_direct_http_target_blocking(&target)? {
+                let endpoint = Url::parse(server_base_url)
+                    .with_context(|| format!("invalid planned bootstrap URL {server_base_url}"))?;
+                return Ok(ResolvedConnectionBootstrap {
+                    cluster_id: target.cluster_id,
+                    rendezvous_urls: target.rendezvous_urls,
+                    rendezvous_mtls_required: target.rendezvous_mtls_required,
+                    relay_mode: target.relay_mode,
+                    server_base_url: endpoint.to_string(),
+                    target_node_id: target.target_node_id,
+                    server_ca_pem: target.server_ca_pem,
+                    cluster_ca_pem: target.cluster_ca_pem,
+                    rendezvous_ca_pem: target.rendezvous_ca_pem,
+                    pairing_token: target.pairing_token,
+                    device_label: target.device_label,
+                    device_id: target.device_id,
+                });
+            }
+        }
+
+        bail!("failed to resolve any direct bootstrap endpoint for enrollment");
+    }
+
     pub fn enroll_blocking(
         &self,
         device_id_override: Option<&str>,
         device_label_override: Option<&str>,
     ) -> Result<BootstrapEnrollmentResult> {
-        let resolved = self.resolve_direct_http_target_blocking()?;
+        let resolved = self.resolve_direct_enrollment_target_blocking()?;
         let pairing_token = resolved
             .pairing_token
             .as_deref()

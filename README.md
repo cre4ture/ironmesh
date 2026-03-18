@@ -299,7 +299,7 @@ Notes:
 	- `POST /auth/device/enroll`
 - Admin can inspect and revoke enrolled client credentials:
 	- `GET /auth/client-credentials`
-	- `DELETE /auth/client-credentials/{device_id}`
+	- `DELETE /auth/client-credentials/{device_id}?reason=<text>`
 - When client auth is enabled, data-plane routes require:
 	- signed proof-of-possession request headers derived from the enrolled client identity
 	- the issued credential fingerprint bound to that identity

@@ -2508,6 +2508,9 @@ async fn client_auth_middleware_requires_valid_signature_when_enabled_impl(
             issued_credential_pem: Some(credential_pem),
             credential_fingerprint: None,
             created_at_unix: super::unix_ts(),
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
             revoked_at_unix: None,
         });
     }
@@ -2607,6 +2610,9 @@ async fn client_auth_middleware_rejects_replayed_nonce_impl(backend: MainTestBac
             issued_credential_pem: Some(credential_pem),
             credential_fingerprint: None,
             created_at_unix: super::unix_ts(),
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
             revoked_at_unix: None,
         });
     }
@@ -2691,7 +2697,10 @@ async fn list_client_credentials_returns_fingerprint_metadata_impl(backend: Main
             ),
             credential_fingerprint: Some("cred-fingerprint".to_string()),
             created_at_unix: 123,
-            revoked_at_unix: None,
+            revocation_reason: Some("rotated".to_string()),
+            revoked_by_actor: Some("qa-operator".to_string()),
+            revoked_by_source_node: Some("node-admin".to_string()),
+            revoked_at_unix: Some(456),
         });
     }
 
@@ -2710,6 +2719,10 @@ async fn list_client_credentials_returns_fingerprint_metadata_impl(backend: Main
     assert_eq!(listed[0]["public_key_fingerprint"], "pub-fingerprint");
     assert_eq!(listed[0]["credential_fingerprint"], "cred-fingerprint");
     assert_eq!(listed[0]["created_at_unix"], 123);
+    assert_eq!(listed[0]["revocation_reason"], "rotated");
+    assert_eq!(listed[0]["revoked_by_actor"], "qa-operator");
+    assert_eq!(listed[0]["revoked_by_source_node"], "node-admin");
+    assert_eq!(listed[0]["revoked_at_unix"], 456);
 
     cleanup_test_state(&state).await;
 }
@@ -2718,6 +2731,68 @@ run_on_main_metadata_backends!(
     list_client_credentials_returns_fingerprint_metadata_impl,
     list_client_credentials_returns_fingerprint_metadata,
     list_client_credentials_returns_fingerprint_metadata_turso
+);
+
+async fn revoke_client_credential_persists_reason_and_admin_metadata_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    {
+        let mut auth = state.client_credentials.lock().await;
+        auth.credentials.push(super::ClientCredentialRecord {
+            device_id: "device-revoke".to_string(),
+            label: Some("Laptop".to_string()),
+            public_key_pem: None,
+            public_key_fingerprint: Some("pub-1".to_string()),
+            issued_credential_pem: None,
+            credential_fingerprint: Some("cred-1".to_string()),
+            created_at_unix: 456,
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
+            revoked_at_unix: None,
+        });
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-ironmesh-admin-actor", "qa-operator".parse().unwrap());
+    headers.insert("x-ironmesh-node-id", "node-admin".parse().unwrap());
+
+    let response = super::revoke_client_credential(
+        State(state.clone()),
+        headers,
+        Path("device-revoke".to_string()),
+        Query(super::RevokeClientCredentialQuery {
+            reason: Some("device retired".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let auth = state.client_credentials.lock().await;
+    let revoked = auth
+        .credentials
+        .iter()
+        .find(|credential| credential.device_id == "device-revoke")
+        .expect("credential should still exist after revocation");
+    assert_eq!(revoked.revocation_reason.as_deref(), Some("device retired"));
+    assert_eq!(revoked.revoked_by_actor.as_deref(), Some("qa-operator"));
+    assert_eq!(
+        revoked.revoked_by_source_node.as_deref(),
+        Some("node-admin")
+    );
+    assert!(revoked.revoked_at_unix.is_some());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    revoke_client_credential_persists_reason_and_admin_metadata_impl,
+    revoke_client_credential_persists_reason_and_admin_metadata,
+    revoke_client_credential_persists_reason_and_admin_metadata_turso
 );
 
 async fn store_index_change_wait_unblocks_after_put_impl(backend: MainTestBackend) {

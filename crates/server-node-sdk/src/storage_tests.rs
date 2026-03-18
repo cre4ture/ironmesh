@@ -1414,7 +1414,10 @@ async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
             issued_credential_pem: None,
             credential_fingerprint: None,
             created_at_unix: 33,
-            revoked_at_unix: None,
+            revocation_reason: Some("retired".to_string()),
+            revoked_by_actor: Some("qa-operator".to_string()),
+            revoked_by_source_node: Some("node-admin".to_string()),
+            revoked_at_unix: Some(44),
         }],
     };
 
@@ -1430,6 +1433,19 @@ async fn client_credential_state_roundtrip_impl(backend: StorageTestBackend) {
     assert_eq!(loaded.credentials.len(), 1);
     assert_eq!(loaded.credentials[0].device_id, "dev-1");
     assert_eq!(loaded.credentials[0].label.as_deref(), Some("Pixel"));
+    assert_eq!(
+        loaded.credentials[0].revocation_reason.as_deref(),
+        Some("retired")
+    );
+    assert_eq!(
+        loaded.credentials[0].revoked_by_actor.as_deref(),
+        Some("qa-operator")
+    );
+    assert_eq!(
+        loaded.credentials[0].revoked_by_source_node.as_deref(),
+        Some("node-admin")
+    );
+    assert_eq!(loaded.credentials[0].revoked_at_unix, Some(44));
 
     let _ = fs::remove_dir_all(root).await;
 }

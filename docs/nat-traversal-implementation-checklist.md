@@ -30,7 +30,7 @@ Use this section as the current source of truth for remaining work. The detailed
 4. Replace the old reachability model in cluster state. Status: completed.
    The in-memory cluster model now uses a structured reachability plus capability record under `NodeDescriptor`, peer planning/projection no longer depends on raw `public_url` / `internal_url` fields directly, and the admin registration surface plus system-test/local-cluster helpers now use the same nested `reachability` / `capabilities` payload shape.
 5. Refresh tests and operational docs to match the real implementation state.
-   Remaining work: reconcile this checklist with completed work, add outbound-only system scenarios, and keep platform-facing docs aligned with the new enrollment and transport model.
+   Remaining work: reconcile this checklist with completed work, expand the new rendezvous-backed system coverage into more outbound-only and failure/reconnect scenarios, and keep platform-facing docs aligned with the new enrollment and transport model.
 
 ## 2. Target workspace shape
 
@@ -202,10 +202,10 @@ Recommended responsibilities:
 
 ### `crates/server-node-sdk/src/storage.rs`
 
-- [ ] Finish tightening the persisted server-node credential model:
+- [x] Finish tightening the persisted server-node credential model:
 - [x] Rename `ClientAuthState` / `DeviceAuthRecord` toward credential-centered naming.
 - [x] Rename `PairingTokenRecord` toward pairing-authorization naming.
-- [ ] Replace the remaining persisted state shape with:
+- [x] Replace the remaining persisted state shape with:
   - pairing records for one-time enrollment authorization,
   - persisted client credential records bound to public keys or certificate fingerprints,
   - revocation metadata for client identities.
@@ -297,9 +297,10 @@ This is implementation order, not product rollout order.
 
 ### System tests
 
-- [ ] Extend `tests/system-tests/src/framework.rs` to start `rendezvous-service`.
+- [x] Extend `tests/system-tests/src/framework.rs` to start `rendezvous-service`.
 - [ ] Replace helper functions that issue or consume old direct-only bootstrap bundles.
 - [ ] Add outbound-only connectivity scenarios:
+  - one relay-required rendezvous-backed cluster/client bootstrap-enrollment-replication scenario now exists end to end
   - client can read/write through relay without any inbound port on the target node,
   - two server nodes can replicate through relay-only paths,
   - direct path is preferred when available and relay is used after forced failure.

@@ -1986,6 +1986,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_required_rendezvous_cluster_supports_bootstrap_enrollment_and_replication()
+    -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19126";
+        let bind_a = "127.0.0.1:19127";
+        let bind_b = "127.0.0.1:19128";
+        let cluster_id = "11111111-1111-7111-8111-111111111111";
+        let node_id_a = "00000000-0000-0000-0000-0000000007a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000007b2";
+        let admin_token = "admin-secret";
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+
+        let data_a = fresh_data_dir("relay-rendezvous-node-a");
+        let data_b = fresh_data_dir("relay-rendezvous-node-b");
+        let client_dir = fresh_data_dir("relay-rendezvous-client");
+
+        let node_env = [
+            ("IRONMESH_NODE_MODE", "local-edge"),
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "required"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 2, &node_env).await?;
+        let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 2, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            let wait_for_known_nodes = |base_url: String, expected_nodes: usize| {
+                let http = http.clone();
+                async move {
+                    for _ in 0..120 {
+                        if let Ok(response) =
+                            http.get(format!("{base_url}/cluster/nodes")).send().await
+                            && let Ok(response) = response.error_for_status()
+                            && let Ok(nodes) = response.json::<serde_json::Value>().await
+                            && let Some(entries) = nodes.as_array()
+                            && entries.len() == expected_nodes
+                        {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        sleep(Duration::from_millis(250)).await;
+                    }
+                    bail!("cluster did not converge to {expected_nodes} known nodes at {base_url}");
+                }
+            };
+
+            wait_for_known_nodes(base_a.clone(), 2).await?;
+            wait_for_known_nodes(base_b.clone(), 2).await?;
+
+            let bootstrap_a =
+                issue_bootstrap_bundle(&http, &base_a, admin_token, Some("relay-cli"), Some(3600))
+                    .await?;
+            let bootstrap_a_path = client_dir.join("node-a.bootstrap.json");
+            bootstrap_a.write_to_path(&bootstrap_a_path)?;
+
+            let client_identity_path = client_dir.join("client-identity.json");
+            let bootstrap_a_arg = bootstrap_a_path.to_string_lossy().into_owned();
+            let client_identity_arg = client_identity_path.to_string_lossy().into_owned();
+
+            let enroll_output = run_cli(&[
+                "--bootstrap-file",
+                bootstrap_a_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "enroll",
+                "--label",
+                "relay-cli",
+            ])
+            .await?;
+            assert!(
+                enroll_output.contains("enrolled device"),
+                "unexpected enroll output: {enroll_output}"
+            );
+            assert!(
+                client_identity_path.exists(),
+                "expected client identity file to be written"
+            );
+
+            let put_output = run_cli(&[
+                "--bootstrap-file",
+                bootstrap_a_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "put",
+                "relay-key",
+                "payload-over-rendezvous-relay",
+            ])
+            .await?;
+            assert!(
+                put_output.contains("stored 'relay-key'"),
+                "unexpected put output: {put_output}"
+            );
+
+            http.post(format!("{base_a}/cluster/replication/repair"))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let bootstrap_b =
+                issue_bootstrap_bundle(&http, &base_b, admin_token, Some("relay-cli"), Some(3600))
+                    .await?;
+            let bootstrap_b_path = client_dir.join("node-b.bootstrap.json");
+            bootstrap_b.write_to_path(&bootstrap_b_path)?;
+            let bootstrap_b_arg = bootstrap_b_path.to_string_lossy().into_owned();
+
+            for _ in 0..120 {
+                if let Ok(output) = run_cli(&[
+                    "--bootstrap-file",
+                    bootstrap_b_arg.as_str(),
+                    "--client-identity-file",
+                    client_identity_arg.as_str(),
+                    "get",
+                    "relay-key",
+                ])
+                .await
+                    && output.contains("payload-over-rendezvous-relay")
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(250)).await;
+            }
+
+            bail!("replicated payload was not readable through node B via bootstrap-aware client");
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_dir);
+
+        result
+    }
+
+    #[tokio::test]
     async fn maintenance_cleanup_removes_orphans_and_keeps_live_data() -> Result<()> {
         let bind = "127.0.0.1:19102";
         let data_dir = fresh_data_dir("maintenance-cleanup");

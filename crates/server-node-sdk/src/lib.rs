@@ -5282,7 +5282,15 @@ struct ClientCredentialView {
     public_key_fingerprint: Option<String>,
     credential_fingerprint: Option<String>,
     created_at_unix: u64,
+    revocation_reason: Option<String>,
+    revoked_by_actor: Option<String>,
+    revoked_by_source_node: Option<String>,
     revoked_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RevokeClientCredentialQuery {
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6368,6 +6376,9 @@ async fn enroll_client_device(
             issued_credential_pem: Some(credential_pem.clone()),
             credential_fingerprint: Some(credential_fingerprint),
             created_at_unix: now,
+            revocation_reason: None,
+            revoked_by_actor: None,
+            revoked_by_source_node: None,
             revoked_at_unix: None,
         };
         auth_state.credentials.push(device);
@@ -6425,6 +6436,9 @@ async fn list_client_credentials(
                         .and_then(|pem| credential_fingerprint(pem).ok())
                 }),
                 created_at_unix: credential.created_at_unix,
+                revocation_reason: credential.revocation_reason.clone(),
+                revoked_by_actor: credential.revoked_by_actor.clone(),
+                revoked_by_source_node: credential.revoked_by_source_node.clone(),
                 revoked_at_unix: credential.revoked_at_unix,
             })
             .collect::<Vec<_>>()
@@ -6449,7 +6463,18 @@ async fn revoke_client_credential(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(device_id): Path<String>,
+    Query(query): Query<RevokeClientCredentialQuery>,
 ) -> impl IntoResponse {
+    let reason = match query
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(reason) if reason.len() > 256 => return StatusCode::BAD_REQUEST.into_response(),
+        Some(reason) => Some(reason.to_string()),
+        None => None,
+    };
     let action = "auth/client-credentials/revoke";
     let authz = match authorize_admin_request(
         &state,
@@ -6457,7 +6482,7 @@ async fn revoke_client_credential(
         action,
         true,
         true,
-        json!({ "device_id": device_id }),
+        json!({ "device_id": device_id, "reason": reason }),
     )
     .await
     {
@@ -6476,6 +6501,9 @@ async fn revoke_client_credential(
             return StatusCode::NOT_FOUND.into_response();
         };
         device.revoked_at_unix = Some(now);
+        device.revocation_reason = reason.clone();
+        device.revoked_by_actor = authz.actor.clone();
+        device.revoked_by_source_node = authz.source_node.clone();
         true
     };
 
@@ -6495,7 +6523,7 @@ async fn revoke_client_credential(
         true,
         true,
         "success",
-        json!({ "device_id": device_id }),
+        json!({ "device_id": device_id, "reason": reason }),
     )
     .await;
 

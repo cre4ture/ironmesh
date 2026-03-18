@@ -584,6 +584,78 @@ pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {
     Ok(ChildGuard::new(child))
 }
 
+pub async fn start_rendezvous_service(bind: &str) -> Result<ChildGuard> {
+    start_rendezvous_service_with_env(bind, &[]).await
+}
+
+pub async fn start_rendezvous_service_with_env(
+    bind: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<ChildGuard> {
+    let rendezvous_bin = binary_path("rendezvous-service")?;
+    let log_dir = fresh_data_dir("rendezvous-service");
+    fs::create_dir_all(&log_dir).context("failed creating rendezvous log dir")?;
+
+    let stdout_log = log_dir.join("rendezvous.stdout.log");
+    let stderr_log = log_dir.join("rendezvous.stderr.log");
+    let stdout_file =
+        std::fs::File::create(&stdout_log).context("failed creating rendezvous stdout log")?;
+    let stderr_file =
+        std::fs::File::create(&stderr_log).context("failed creating rendezvous stderr log")?;
+
+    let public_url = format!("http://{bind}");
+    let mut command = Command::new(rendezvous_bin);
+    command
+        .env("IRONMESH_RENDEZVOUS_BIND", bind)
+        .env("IRONMESH_RENDEZVOUS_PUBLIC_URL", &public_url)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    let mut child = command
+        .spawn()
+        .context("failed to spawn rendezvous-service")?;
+
+    if let Err(err) = wait_for_url_status(&format!("{public_url}/health"), StatusCode::OK, 40).await
+    {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to query rendezvous-service process state")?
+        {
+            let stderr_tail = std::fs::read_to_string(&stderr_log)
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "rendezvous-service exited early on {bind} with status {status}: {err}\n--- stderr (tail) ---\n{stderr_tail}"
+            );
+        }
+        bail!(
+            "rendezvous-service did not become healthy on {bind}: {err} (logs at {} and {})",
+            stdout_log.display(),
+            stderr_log.display()
+        );
+    }
+
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to query rendezvous-service process state")?
+    {
+        bail!("rendezvous-service exited early on {bind} with status {status}");
+    }
+
+    Ok(ChildGuard::new(child))
+}
+
 pub async fn wait_for_server(bind: &str, retries: usize) -> Result<()> {
     let health_url = format!("http://{bind}/health");
     wait_for_url_status(&health_url, StatusCode::OK, retries).await
@@ -710,6 +782,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
         "cli-client" => "IRONMESH_CLI_BIN",
         "os-integration" => "IRONMESH_OS_INTEGRATION_BIN",
         "ironmesh-folder-agent" => "IRONMESH_FOLDER_AGENT_BIN",
+        "rendezvous-service" => "IRONMESH_RENDEZVOUS_BIN",
         _ => "",
     };
 
@@ -733,6 +806,9 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
         "ironmesh-folder-agent" => {
             option_env!("CARGO_BIN_FILE_IRONMESH_FOLDER_AGENT_ironmesh-folder-agent")
         }
+        "rendezvous-service" => {
+            option_env!("CARGO_BIN_FILE_RENDEZVOUS_SERVICE_rendezvous-service")
+        }
         _ => None,
     };
 
@@ -745,12 +821,13 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
 
     if !path.exists() {
         bail!(
-            "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{}/{}/{} overrides)",
+            "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{}/{}/{}/{} overrides)",
             path.display(),
             "IRONMESH_SERVER_BIN",
             "IRONMESH_CLI_BIN",
             "IRONMESH_OS_INTEGRATION_BIN",
-            "IRONMESH_FOLDER_AGENT_BIN"
+            "IRONMESH_FOLDER_AGENT_BIN",
+            "IRONMESH_RENDEZVOUS_BIN"
         );
     }
 
