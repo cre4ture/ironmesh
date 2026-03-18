@@ -382,6 +382,22 @@ The recommended next implementation/design sequence is:
    - encrypt-at-rest for signer material,
    - richer multi-admin and audit models.
 
+## 12a. Current Implementation Snapshot
+
+The first implementation slice is now in place:
+
+- `server-node` can automatically enter a first-run bootstrap mode when it starts without explicit node bootstrap, node enrollment, or advanced env-driven runtime configuration,
+- bootstrap mode serves a dedicated HTTPS setup UI using an automatically generated temporary self-signed certificate stored under the node data directory,
+- bootstrap mode persists managed setup state under the node data directory so the node can later restart into the normal runtime path without env vars,
+- `Start a new cluster` already generates a managed cluster CA, issues this node's initial enrollment package automatically, persists that package locally, and transitions the process into the normal runtime path,
+- `Join an existing cluster` already supports generating a transportable join-request blob on the joining node and importing an issued node enrollment package on that joining node to transition into the normal runtime path.
+
+Important current limitations of this first slice:
+
+- the bootstrap-created admin password is currently mapped onto the existing admin-token model used by the normal runtime UI and admin API; a fuller password/login UX is still a follow-up step,
+- the joining-node side of the request/import flow exists, but the existing-cluster admin UI still needs a dedicated follow-up import/approve surface for those join-request blobs,
+- managed CA backup/export, signer transfer, encrypt-at-rest for signer material, and richer multi-admin auth are still follow-up work.
+
 ## 13. Summary
 
 The chosen strategy is:

@@ -13,6 +13,25 @@ async function refreshServerLogs() {
   }
 }
 
+function prefillAdminTokenFromSession() {
+  let stored = '';
+  try {
+    stored = sessionStorage.getItem('ironmeshAdminToken') || '';
+  } catch {
+    stored = '';
+  }
+  if (!stored) {
+    return;
+  }
+
+  ['bootstrap-admin-token', 'node-bootstrap-admin-token'].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input && !input.value) {
+      input.value = stored;
+    }
+  });
+}
+
 async function fetchReplicationPlan() {
   const output = document.getElementById('replication-plan-json');
   output.textContent = 'loading...';
@@ -561,5 +580,6 @@ document
   .getElementById('fetch-node-certificate-status')
   .addEventListener('click', fetchNodeCertificateStatus);
 
+prefillAdminTokenFromSession();
 refreshServerLogs();
 setInterval(refreshServerLogs, 2000);

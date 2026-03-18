@@ -360,10 +360,6 @@ fn validate_trust_roots(trust_roots: &BootstrapTrustRoots) -> Result<()> {
 }
 
 fn validate_url_list(field_name: &str, values: &[String]) -> Result<()> {
-    if values.is_empty() {
-        bail!("bootstrap must include at least one {field_name}");
-    }
-
     let mut seen = HashSet::new();
     for value in values {
         let trimmed = value.trim();
@@ -527,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn client_bootstrap_rejects_empty_rendezvous_urls() {
+    fn client_bootstrap_allows_empty_rendezvous_urls() {
         let bootstrap = ClientBootstrap {
             version: CLIENT_BOOTSTRAP_VERSION,
             cluster_id: Uuid::now_v7(),
@@ -545,7 +541,9 @@ mod tests {
             device_label: None,
         };
 
-        assert!(bootstrap.validate().is_err());
+        bootstrap
+            .validate()
+            .expect("bootstrap without rendezvous should validate");
     }
 
     #[test]

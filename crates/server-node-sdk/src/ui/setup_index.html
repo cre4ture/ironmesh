@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ironmesh First-Run Setup</title>
+  <link rel="stylesheet" href="/ui/app.css" />
+</head>
+<body>
+  <main>
+    <h1>ironmesh First-Run Setup</h1>
+    <p>This node has not been initialized yet. Setup mode is served over a temporary self-signed HTTPS certificate.</p>
+
+    <h2>Current status</h2>
+    <pre id="setup-status-json">loading...</pre>
+
+    <h2>Start a new cluster</h2>
+    <p>Creates a new managed cluster CA, enrolls this node as the first cluster member, and switches into normal runtime.</p>
+    <label for="setup-start-admin-password">Initial admin password</label>
+    <input id="setup-start-admin-password" type="password" autocomplete="new-password" spellcheck="false" />
+    <button id="setup-start-cluster" type="button">Start a new cluster</button>
+    <pre id="setup-start-output">enter a strong admin password and click the button to create a new cluster</pre>
+
+    <h2>Join an existing cluster</h2>
+    <p>First generate a join request you can copy into an existing cluster admin flow. Then import the issued node enrollment package on this node.</p>
+    <button id="setup-generate-join-request" type="button">Generate join request</button>
+    <pre id="setup-join-request-output">click the button to generate a join request for this node</pre>
+
+    <label for="setup-join-admin-password">Cluster admin password</label>
+    <input id="setup-join-admin-password" type="password" autocomplete="new-password" spellcheck="false" />
+    <label for="setup-enrollment-json">Issued node enrollment package JSON</label>
+    <textarea id="setup-enrollment-json" rows="16" spellcheck="false" placeholder='{"bootstrap": ...}'></textarea>
+    <button id="setup-import-enrollment" type="button">Import node enrollment package</button>
+    <pre id="setup-import-output">paste the issued node enrollment package here to join this node to an existing cluster</pre>
+  </main>
+  <script src="/ui/app.js"></script>
+</body>
+</html>

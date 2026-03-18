@@ -64,6 +64,7 @@ use x509_parser::prelude::FromDer;
 
 mod cluster;
 mod replication;
+mod setup;
 mod storage;
 mod ui;
 
@@ -2236,7 +2237,10 @@ pub async fn run_from_env() -> Result<()> {
     // providers are enabled via transitive features (e.g. reqwest brings `ring`, axum-server may
     // bring `aws-lc-rs`). Installing once avoids startup panics.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    run_inner(ServerNodeConfig::from_env()?, Some(log_buffer)).await
+    match setup::load_startup_mode_from_env()? {
+        setup::StartupMode::Runtime(config) => run_inner(config, Some(log_buffer)).await,
+        setup::StartupMode::Setup(config) => setup::run_setup_mode(config, log_buffer).await,
+    }
 }
 
 pub async fn run(config: ServerNodeConfig) -> Result<()> {

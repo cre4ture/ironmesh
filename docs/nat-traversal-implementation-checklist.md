@@ -25,6 +25,13 @@ Status: Concrete repo-mapped implementation plan for the target architecture
   - managed internal CA behind UI approval,
   - no routine requirement for heavy env/CLI configuration in the regular path.
 - Environment-variable-heavy startup remains important for testing, automation, and advanced/operator-managed deployments, but it should not define the primary end-user setup model.
+- First implementation slice now in place:
+  - `server-node` startup can enter a dedicated first-run bootstrap mode automatically when no explicit runtime bootstrap, enrollment, or advanced env-driven node configuration is present,
+  - bootstrap mode generates and persists a temporary self-signed HTTPS identity automatically,
+  - bootstrap mode persists managed node setup state under the node data directory,
+  - `Start a new cluster` now creates a self-managed cluster CA plus a local node enrollment package automatically and transitions the process into the normal runtime path without requiring env vars,
+  - `Join an existing cluster` now supports generating a transportable join-request blob on the joining node and importing an issued node enrollment package to transition into the normal runtime path,
+  - the current first slice still maps the bootstrap-created admin password onto the existing admin-token authentication model for the normal runtime UI/API, and the existing-cluster side still needs the follow-up UI/API work for importing a join request directly instead of using the already-existing manual node-enrollment issuance flow.
 
 ## 1c. Current priority order
 
