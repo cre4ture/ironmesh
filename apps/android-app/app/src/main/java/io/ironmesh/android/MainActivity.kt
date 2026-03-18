@@ -382,9 +382,9 @@ private fun ServerControls(
         singleLine = true,
     )
 
-    Text("Device Auth", style = MaterialTheme.typography.titleMedium)
+    Text("Device Identity", style = MaterialTheme.typography.titleMedium)
 
-    if (state.deviceAuthState.hasToken()) {
+    if (state.deviceAuthState.hasClientIdentity()) {
         Text("Enrolled device: ${state.deviceAuthState.deviceId}")
         if (!state.deviceAuthState.label.isNullOrBlank()) {
             Text("Label: ${state.deviceAuthState.label}")
@@ -412,7 +412,7 @@ private fun ServerControls(
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Button(onClick = vm::enrollDevice) { Text("Enroll Device") }
         OutlinedButton(onClick = onScanQr) { Text("Scan QR") }
-        OutlinedButton(onClick = vm::clearDeviceEnrollment) { Text("Clear Device Auth") }
+        OutlinedButton(onClick = vm::clearDeviceEnrollment) { Text("Clear Device Identity") }
     }
 
     OutlinedTextField(

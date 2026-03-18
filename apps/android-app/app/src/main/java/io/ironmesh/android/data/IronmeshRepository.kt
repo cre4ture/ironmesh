@@ -62,7 +62,7 @@ class IronmeshRepository {
             deviceId = enrolled.device_id,
             label = enrolled.label,
             connectionBootstrapJson = bootstrapJson.trim(),
-            serverBaseUrl = enrolled.server_base_url.orEmpty(),
+            directServerBaseUrl = enrolled.server_base_url.orEmpty(),
             serverCaPem = enrolled.server_ca_pem,
             publicKeyPem = enrolled.public_key_pem,
             privateKeyPem = enrolled.private_key_pem,

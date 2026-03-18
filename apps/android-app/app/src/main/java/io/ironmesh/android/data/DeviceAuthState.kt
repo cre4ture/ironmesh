@@ -1,5 +1,6 @@
 package io.ironmesh.android.data
 
+import com.squareup.moshi.Json
 import org.json.JSONObject
 
 data class DeviceAuthState(
@@ -7,7 +8,8 @@ data class DeviceAuthState(
     val deviceId: String = "",
     val label: String? = null,
     val connectionBootstrapJson: String = "",
-    val serverBaseUrl: String = "",
+    @Json(name = "serverBaseUrl")
+    val directServerBaseUrl: String = "",
     val serverCaPem: String? = null,
     val publicKeyPem: String? = null,
     val privateKeyPem: String? = null,
@@ -21,15 +23,13 @@ data class DeviceAuthState(
             !privateKeyPem.isNullOrBlank() &&
             !credentialPem.isNullOrBlank()
 
-    fun hasToken(): Boolean = hasClientIdentity()
-
     fun preferredConnectionInput(fallbackBaseUrl: String? = null): String {
         val bootstrapJson = connectionBootstrapJson.trim()
         if (bootstrapJson.isNotEmpty()) {
             return bootstrapJson
         }
 
-        val directBaseUrl = serverBaseUrl.trim()
+        val directBaseUrl = directServerBaseUrl.trim()
         if (directBaseUrl.isNotEmpty()) {
             return directBaseUrl
         }
