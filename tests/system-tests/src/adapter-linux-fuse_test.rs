@@ -3,14 +3,16 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        ChildGuard, binary_path, fresh_data_dir, register_node, start_server,
-        start_server_with_env, stop_server, wait_for_online_nodes, wait_for_store_index_entry,
+        ChildGuard, binary_path, fresh_data_dir, register_node, start_rendezvous_service,
+        start_server, start_server_with_env, stop_server, wait_for_online_nodes,
+        wait_for_rendezvous_registered_endpoints, wait_for_store_index_entry, wait_for_url_status,
     };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
+    use reqwest::StatusCode;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::process::Command;
@@ -52,32 +54,147 @@ mod tests {
         Ok(ChildGuard::new(child))
     }
 
-    async fn start_linux_fuse_adapter_with_local_edge(
-        server_base_url: &str,
-        local_edge_base_url_file: &Path,
-        mountpoint: &Path,
-        remote_refresh_interval_ms: u64,
+    struct LocalEdgeClusterFixture {
+        rendezvous: ChildGuard,
+        upstream: ChildGuard,
+        local_edge: ChildGuard,
+        rendezvous_url: String,
+        upstream_bind: String,
+        upstream_base_url: String,
+        upstream_data_dir: PathBuf,
+        upstream_node_id: String,
+        cluster_id: String,
+        local_edge_base_url: String,
+    }
+
+    impl LocalEdgeClusterFixture {
+        async fn restart_upstream(&mut self) -> Result<()> {
+            stop_server(&mut self.upstream).await;
+            self.upstream = start_cluster_node(
+                &self.upstream_bind,
+                &self.upstream_data_dir,
+                &self.upstream_node_id,
+                &self.cluster_id,
+                &self.rendezvous_url,
+            )
+            .await?;
+            self.wait_until_ready(2).await
+        }
+
+        async fn stop(&mut self) {
+            stop_server(&mut self.local_edge).await;
+            stop_server(&mut self.upstream).await;
+            stop_server(&mut self.rendezvous).await;
+        }
+
+        async fn wait_until_ready(&self, expected_online_nodes: u64) -> Result<()> {
+            let http = reqwest::Client::new();
+            wait_for_rendezvous_registered_endpoints(
+                &self.rendezvous_url,
+                expected_online_nodes,
+                120,
+            )
+            .await?;
+            wait_for_online_nodes(&http, &self.upstream_base_url, expected_online_nodes, 120)
+                .await?;
+            wait_for_online_nodes(&http, &self.local_edge_base_url, expected_online_nodes, 120)
+                .await
+        }
+    }
+
+    async fn start_cluster_node(
+        bind: &str,
+        data_dir: &Path,
+        node_id: &str,
+        cluster_id: &str,
+        rendezvous_url: &str,
     ) -> Result<ChildGuard> {
-        let os_integration_bin = binary_path("os-integration")?;
-        let mountpoint_arg = mountpoint.to_string_lossy().to_string();
-        let local_edge_base_url_file_arg = local_edge_base_url_file.to_string_lossy().to_string();
+        let cluster_env = [
+            ("IRONMESH_NODE_MODE", "local-edge"),
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+        ];
+        start_server_with_env(bind, data_dir, node_id, 2, &cluster_env).await
+    }
 
-        let child = Command::new(os_integration_bin)
-            .arg("--server-base-url")
-            .arg(server_base_url)
-            .arg("--local-edge")
-            .arg("--local-edge-base-url-file")
-            .arg(&local_edge_base_url_file_arg)
-            .arg("--mountpoint")
-            .arg(&mountpoint_arg)
-            .arg("--remote-refresh-interval-ms")
-            .arg(remote_refresh_interval_ms.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn linux fuse adapter via os-integration in local-edge mode")?;
+    async fn start_local_edge_node(
+        bind: &str,
+        data_dir: &Path,
+        node_id: &str,
+        cluster_id: &str,
+        rendezvous_url: &str,
+    ) -> Result<ChildGuard> {
+        let cluster_env = [
+            ("IRONMESH_NODE_MODE", "local-edge"),
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+        ];
+        start_server_with_env(bind, data_dir, node_id, 2, &cluster_env).await
+    }
 
-        Ok(ChildGuard::new(child))
+    #[allow(clippy::too_many_arguments)]
+    async fn start_local_edge_cluster_fixture(
+        rendezvous_bind: &str,
+        upstream_bind: &str,
+        local_edge_bind: &str,
+        upstream_data_dir: &Path,
+        local_edge_data_dir: &Path,
+        cluster_id: &str,
+        upstream_node_id: &str,
+        local_edge_node_id: &str,
+    ) -> Result<LocalEdgeClusterFixture> {
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let upstream_base_url = format!("http://{upstream_bind}");
+        let local_edge_base_url = format!("http://{local_edge_bind}");
+
+        let rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        wait_for_url_status(
+            &format!("{rendezvous_url}/control/presence"),
+            StatusCode::OK,
+            40,
+        )
+        .await?;
+        let upstream = start_cluster_node(
+            upstream_bind,
+            upstream_data_dir,
+            upstream_node_id,
+            cluster_id,
+            &rendezvous_url,
+        )
+        .await?;
+        let local_edge = start_local_edge_node(
+            local_edge_bind,
+            local_edge_data_dir,
+            local_edge_node_id,
+            cluster_id,
+            &rendezvous_url,
+        )
+        .await?;
+
+        let fixture = LocalEdgeClusterFixture {
+            rendezvous,
+            upstream,
+            local_edge,
+            rendezvous_url,
+            upstream_bind: upstream_bind.to_string(),
+            upstream_base_url,
+            upstream_data_dir: upstream_data_dir.to_path_buf(),
+            upstream_node_id: upstream_node_id.to_string(),
+            cluster_id: cluster_id.to_string(),
+            local_edge_base_url,
+        };
+        fixture.wait_until_ready(2).await?;
+        Ok(fixture)
     }
 
     async fn wait_for_file(path: &Path, retries: usize) -> Result<()> {
@@ -204,20 +321,6 @@ mod tests {
         }
 
         bail!("mountpoint did not become active: {}", path.display());
-    }
-
-    async fn wait_for_file_text(path: &Path, retries: usize) -> Result<String> {
-        for _ in 0..retries {
-            if let Ok(contents) = fs::read_to_string(path) {
-                let trimmed = contents.trim().to_string();
-                if !trimmed.is_empty() {
-                    return Ok(trimmed);
-                }
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        bail!("expected file {} to contain text", path.display());
     }
 
     fn mounted_path_absent(path: &Path) -> bool {
@@ -800,31 +903,39 @@ mod tests {
             return Ok(());
         }
 
+        let local_edge_bind = "127.0.0.1:19472";
+        let rendezvous_bind = "127.0.0.1:19572";
+        let cluster_id = "11111111-1111-7111-8111-111111111372";
+        let upstream_node_id = "00000000-0000-0000-0000-000000001372";
+        let local_edge_node_id = "00000000-0000-0000-0000-000000011372";
         let base_url = format!("http://{bind}");
+        let local_edge_base_url = format!("http://{local_edge_bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-refresh-local-edge");
-        let control_dir = fresh_data_dir("linux-fuse-remote-refresh-local-edge-control");
         let upstream_data_dir = fresh_data_dir("linux-fuse-remote-refresh-local-edge-upstream");
-        let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
-        let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
-        let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
+        let local_edge_data_dir = fresh_data_dir("linux-fuse-remote-refresh-local-edge-node");
+        let mut cluster = start_local_edge_cluster_fixture(
+            rendezvous_bind,
+            bind,
+            local_edge_bind,
+            &upstream_data_dir,
+            &local_edge_data_dir,
+            cluster_id,
+            upstream_node_id,
+            local_edge_node_id,
+        )
+        .await?;
         let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
             sdk.put_large_aware("seed-refresh.txt", Bytes::from_static(b"seed-refresh"))
                 .await?;
 
-            let mut adapter = start_linux_fuse_adapter_with_local_edge(
-                &base_url,
-                &local_edge_base_url_file,
-                &mountpoint,
-                250,
-            )
-            .await?;
+            let mut adapter =
+                start_linux_fuse_adapter_with_refresh(&local_edge_base_url, &mountpoint, 250)
+                    .await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-refresh.txt");
                 wait_for_mount_active(&mountpoint, 150).await?;
-                let local_edge_base_url =
-                    wait_for_file_text(&local_edge_base_url_file, 150).await?;
                 for _ in 0..220 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
                     if seed_path.is_file() {
@@ -873,10 +984,10 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        cluster.stop().await;
         let _ = fs::remove_dir_all(&mountpoint);
-        let _ = fs::remove_dir_all(&control_dir);
         let _ = fs::remove_dir_all(&upstream_data_dir);
+        let _ = fs::remove_dir_all(&local_edge_data_dir);
         result
     }
 
@@ -886,13 +997,27 @@ mod tests {
             return Ok(());
         }
 
+        let local_edge_bind = "127.0.0.1:19473";
+        let rendezvous_bind = "127.0.0.1:19573";
+        let cluster_id = "11111111-1111-7111-8111-111111111373";
+        let upstream_node_id = "00000000-0000-0000-0000-000000001373";
+        let local_edge_node_id = "00000000-0000-0000-0000-000000011373";
         let base_url = format!("http://{bind}");
+        let local_edge_base_url = format!("http://{local_edge_bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-delete-local-edge");
-        let control_dir = fresh_data_dir("linux-fuse-remote-delete-local-edge-control");
         let upstream_data_dir = fresh_data_dir("linux-fuse-remote-delete-local-edge-upstream");
-        let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
-        let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
-        let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
+        let local_edge_data_dir = fresh_data_dir("linux-fuse-remote-delete-local-edge-node");
+        let mut cluster = start_local_edge_cluster_fixture(
+            rendezvous_bind,
+            bind,
+            local_edge_bind,
+            &upstream_data_dir,
+            &local_edge_data_dir,
+            cluster_id,
+            upstream_node_id,
+            local_edge_node_id,
+        )
+        .await?;
         let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
@@ -902,18 +1027,12 @@ mod tests {
             )
             .await?;
 
-            let mut adapter = start_linux_fuse_adapter_with_local_edge(
-                &base_url,
-                &local_edge_base_url_file,
-                &mountpoint,
-                250,
-            )
-            .await?;
+            let mut adapter =
+                start_linux_fuse_adapter_with_refresh(&local_edge_base_url, &mountpoint, 250)
+                    .await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-remote-delete-local-edge.txt");
                 wait_for_mount_active(&mountpoint, 150).await?;
-                let local_edge_base_url =
-                    wait_for_file_text(&local_edge_base_url_file, 150).await?;
                 for _ in 0..220 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
                     if seed_path.is_file() {
@@ -967,10 +1086,10 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        cluster.stop().await;
         let _ = fs::remove_dir_all(&mountpoint);
-        let _ = fs::remove_dir_all(&control_dir);
         let _ = fs::remove_dir_all(&upstream_data_dir);
+        let _ = fs::remove_dir_all(&local_edge_data_dir);
         result
     }
 
@@ -1323,13 +1442,27 @@ mod tests {
             return Ok(());
         }
 
+        let local_edge_bind = "127.0.0.1:19474";
+        let rendezvous_bind = "127.0.0.1:19574";
+        let cluster_id = "11111111-1111-7111-8111-111111111374";
+        let upstream_node_id = "00000000-0000-0000-0000-000000001374";
+        let local_edge_node_id = "00000000-0000-0000-0000-000000011374";
         let base_url = format!("http://{bind}");
+        let local_edge_base_url = format!("http://{local_edge_bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-rename-move-local-edge");
-        let control_dir = fresh_data_dir("linux-fuse-remote-rename-move-local-edge-control");
         let upstream_data_dir = fresh_data_dir("linux-fuse-remote-rename-move-local-edge-upstream");
-        let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
-        let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
-        let mut server = start_server_with_env(bind, &upstream_data_dir, "", 1, &extra_env).await?;
+        let local_edge_data_dir = fresh_data_dir("linux-fuse-remote-rename-move-local-edge-node");
+        let mut cluster = start_local_edge_cluster_fixture(
+            rendezvous_bind,
+            bind,
+            local_edge_bind,
+            &upstream_data_dir,
+            &local_edge_data_dir,
+            cluster_id,
+            upstream_node_id,
+            local_edge_node_id,
+        )
+        .await?;
         let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
@@ -1339,18 +1472,12 @@ mod tests {
             )
             .await?;
 
-            let mut adapter = start_linux_fuse_adapter_with_local_edge(
-                &base_url,
-                &local_edge_base_url_file,
-                &mountpoint,
-                250,
-            )
-            .await?;
+            let mut adapter =
+                start_linux_fuse_adapter_with_refresh(&local_edge_base_url, &mountpoint, 250)
+                    .await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-remote-rename-local-edge.txt");
                 wait_for_mount_active(&mountpoint, 150).await?;
-                let local_edge_base_url =
-                    wait_for_file_text(&local_edge_base_url_file, 150).await?;
                 let local_edge_sdk = IronMeshClient::from_direct_base_url(&local_edge_base_url);
                 for _ in 0..220 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
@@ -1419,10 +1546,10 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        cluster.stop().await;
         let _ = fs::remove_dir_all(&mountpoint);
-        let _ = fs::remove_dir_all(&control_dir);
         let _ = fs::remove_dir_all(&upstream_data_dir);
+        let _ = fs::remove_dir_all(&local_edge_data_dir);
         result
     }
 
@@ -1432,29 +1559,38 @@ mod tests {
             return Ok(());
         }
 
+        let local_edge_bind = "127.0.0.1:19471";
+        let rendezvous_bind = "127.0.0.1:19571";
+        let cluster_id = "11111111-1111-7111-8111-111111111371";
         let upstream_data_dir = fresh_data_dir("linux-fuse-local-edge-upstream-node");
+        let local_edge_data_dir = fresh_data_dir("linux-fuse-local-edge-node");
         let mountpoint = fresh_data_dir("linux-fuse-local-edge-mount");
-        let control_dir = fresh_data_dir("linux-fuse-local-edge-control");
-        let local_edge_base_url_file = control_dir.join("local-edge-base-url.txt");
-        let node_id = "4a764850-f4e2-4bb7-ae22-9fe19e17ba40";
-        let extra_env = [("IRONMESH_PUBLIC_PEER_API_ENABLED", "1")];
-        let mut upstream =
-            start_server_with_env(bind, &upstream_data_dir, node_id, 1, &extra_env).await?;
-
         let base_url = format!("http://{bind}");
+        let upstream_node_id = "4a764850-f4e2-4bb7-ae22-9fe19e17ba40";
+        let local_edge_node_id = "73df8d52-b894-4e95-aaba-905a1fd39371";
+        let mut cluster = start_local_edge_cluster_fixture(
+            rendezvous_bind,
+            bind,
+            local_edge_bind,
+            &upstream_data_dir,
+            &local_edge_data_dir,
+            cluster_id,
+            upstream_node_id,
+            local_edge_node_id,
+        )
+        .await?;
         let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
-            let mut adapter = start_linux_fuse_adapter_with_local_edge(
-                &base_url,
-                &local_edge_base_url_file,
+            let mut adapter = start_linux_fuse_adapter_with_refresh(
+                &cluster.local_edge_base_url,
                 &mountpoint,
                 250,
             )
             .await?;
 
             wait_for_mount_active(&mountpoint, 150).await?;
-            let local_edge_base_url = wait_for_file_text(&local_edge_base_url_file, 150).await?;
+            let local_edge_base_url = cluster.local_edge_base_url.clone();
 
             let online_key = "online-edge-write.txt";
             let online_payload = b"written-while-upstream-online".to_vec();
@@ -1465,9 +1601,16 @@ mod tests {
                     mounted_online.display()
                 )
             })?;
-            wait_for_object_bytes(&sdk, online_key, &online_payload, 300).await?;
+            wait_for_remote_sync_via_local_edge(
+                &local_edge_base_url,
+                &sdk,
+                online_key,
+                &online_payload,
+                300,
+            )
+            .await?;
 
-            stop_server(&mut upstream).await;
+            stop_server(&mut cluster.upstream).await;
 
             let offline_key = "offline-edge-write.txt";
             let offline_payload = b"written-while-upstream-offline".to_vec();
@@ -1479,8 +1622,7 @@ mod tests {
                 )
             })?;
 
-            upstream =
-                start_server_with_env(bind, &upstream_data_dir, node_id, 1, &extra_env).await?;
+            cluster.restart_upstream().await?;
             wait_for_remote_sync_via_local_edge(
                 &local_edge_base_url,
                 &sdk,
@@ -1495,10 +1637,10 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut upstream).await;
+        cluster.stop().await;
         let _ = fs::remove_dir_all(&mountpoint);
-        let _ = fs::remove_dir_all(&control_dir);
         let _ = fs::remove_dir_all(&upstream_data_dir);
+        let _ = fs::remove_dir_all(&local_edge_data_dir);
         result
     }
 
