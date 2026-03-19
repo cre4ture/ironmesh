@@ -123,6 +123,7 @@ Likely touch points:
 - [x] `pnpm install` in `web/`
 - [x] `pnpm typecheck`
 - [x] `pnpm build`
+- [x] `pnpm test:e2e:server-admin`
 - [ ] server-node serves built admin assets
 - [ ] setup flow still works end to end
 - [ ] runtime admin flow still works end to end
@@ -136,3 +137,4 @@ Likely touch points:
 - Use `packages/ui` and `packages/api` for shared code, not one giant combined app.
 - Current Phase 2 slice covers the high-value runtime admin flows first; setup parity and a dedicated logs page are still pending.
 - Current Phase 3 slice uses a `build.rs` handoff: when `web/apps/server-admin/dist` exists, runtime admin routes serve that built app through the existing `/`, `/ui/app.css`, and `/ui/app.js` paths; otherwise the crate falls back to the handwritten runtime UI.
+- The current Playwright smoke test runs against the built `server-admin` app through `vite preview` with mocked runtime APIs. A Rust-served browser smoke test is still a separate remaining step.

@@ -11,3 +11,5 @@ web/node_modules
 web/**/node_modules
 web/**/dist
 web/.turbo
+web/playwright-report
+web/test-results

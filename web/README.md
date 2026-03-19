@@ -19,6 +19,7 @@ pnpm dev:server-admin
 pnpm dev:client-ui
 pnpm typecheck
 pnpm build
+pnpm test:e2e:server-admin
 ```
 
 ## Current scope
