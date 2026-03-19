@@ -69,18 +69,18 @@ Current Rust sources to replace:
 
 ## Phase 3: Rust embed path for server-admin
 
-- [ ] Decide on asset handoff strategy:
+- [x] Decide on asset handoff strategy:
   - build output copied into crate-owned generated assets
   - or Rust reads from `web/apps/server-admin/dist` during a pre-build step
-- [ ] Replace `include_str!`-based hand-written admin asset serving with built static assets.
-- [ ] Keep the route shape stable where practical.
+- [x] Replace `include_str!`-based hand-written admin asset serving with built static assets.
+- [x] Keep the route shape stable where practical.
 - [ ] Add one smoke test that server-admin assets are served.
 
 Rust integration points:
 
-- [ ] [crates/server-node-sdk/src/ui.rs](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/ui.rs)
+- [x] [crates/server-node-sdk/src/ui.rs](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/ui.rs)
 - [ ] [crates/server-node-sdk/src/lib.rs](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/lib.rs)
-- [ ] [crates/server-node-sdk/src/setup.rs](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/setup.rs)
+- [x] [crates/server-node-sdk/src/setup.rs](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/setup.rs)
 
 ## Phase 4: Shared packages hardening
 
@@ -135,3 +135,4 @@ Likely touch points:
 - Keep `server-admin` and `client-ui` as separate apps.
 - Use `packages/ui` and `packages/api` for shared code, not one giant combined app.
 - Current Phase 2 slice covers the high-value runtime admin flows first; setup parity and a dedicated logs page are still pending.
+- Current Phase 3 slice uses a `build.rs` handoff: when `web/apps/server-admin/dist` exists, runtime admin routes serve that built app through the existing `/`, `/ui/app.css`, and `/ui/app.js` paths; otherwise the crate falls back to the handwritten runtime UI.

@@ -3,12 +3,17 @@ use axum::http::header::{CONTENT_TYPE, HeaderValue};
 use axum::response::Html;
 use storage::SnapshotInfo;
 
-const INDEX_HTML_TEMPLATE: &str = include_str!("ui/index.html");
-const INDEX_CSS: &str = include_str!("ui/app.css");
-const INDEX_JS: &str = include_str!("ui/app.js");
+const INDEX_HTML_TEMPLATE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/server_admin_index.html"));
+const INDEX_CSS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.css"));
+const INDEX_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.js"));
 const INDEX_QRCODE_JS: &str = include_str!("ui/qrcode.min.js");
 
 pub(crate) async fn index(State(state): State<ServerState>) -> Html<String> {
+    if server_admin_ui_is_built() {
+        return Html(INDEX_HTML_TEMPLATE.to_string());
+    }
+
     let (storage_dir, object_count, snapshots) = {
         let store = state.store.lock().await;
         let snapshots = store
@@ -180,4 +185,8 @@ pub(crate) async fn qrcode_js() -> impl IntoResponse {
         )],
         INDEX_QRCODE_JS,
     )
+}
+
+fn server_admin_ui_is_built() -> bool {
+    option_env!("IRONMESH_SERVER_ADMIN_UI_MODE").unwrap_or("fallback") == "built"
 }

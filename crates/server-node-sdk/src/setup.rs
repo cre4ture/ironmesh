@@ -20,6 +20,7 @@ const MANAGED_SIGNER_BACKUP_NONCE_LEN: usize = 12;
 const MANAGED_SIGNER_BACKUP_KEY_LEN: usize = 32;
 const MANAGED_SIGNER_BACKUP_PBKDF2_ROUNDS: u32 = 600_000;
 const SETUP_STATUS_HTML: &str = include_str!("ui/setup_index.html");
+const SETUP_APP_CSS: &str = include_str!("ui/app.css");
 const SETUP_APP_JS: &str = include_str!("ui/setup_app.js");
 
 #[allow(clippy::large_enum_variant)]
@@ -219,7 +220,7 @@ pub(crate) async fn run_setup_mode(
     let app = Router::new()
         .route("/", get(setup_index))
         .route("/health", get(setup_health))
-        .route("/ui/app.css", get(ui::app_css))
+        .route("/ui/app.css", get(setup_app_css))
         .route("/ui/app.js", get(setup_app_js))
         .route("/setup/status", get(get_setup_status))
         .route("/setup/start-cluster", post(start_new_cluster))
@@ -281,6 +282,17 @@ async fn setup_app_js() -> impl IntoResponse {
             HeaderValue::from_static("application/javascript; charset=utf-8"),
         )],
         SETUP_APP_JS,
+    )
+}
+
+async fn setup_app_css() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/css; charset=utf-8"),
+        )],
+        SETUP_APP_CSS,
     )
 }
 
