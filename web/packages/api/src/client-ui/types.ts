@@ -11,6 +11,30 @@ export type ClientUiRuntimeInfo = {
   service_name?: string;
 };
 
+export type ClientRendezvousEndpointStatus = {
+  url: string;
+  status: "unknown" | "connected" | "disconnected";
+  last_attempt_unix: number | null;
+  last_success_unix: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
+  active: boolean;
+};
+
+export type ClientRendezvousView = {
+  available: boolean;
+  editable: boolean;
+  transport_mode: "direct" | "relay";
+  relay_mode: "disabled" | "fallback" | "preferred" | "required" | null;
+  configured_urls: string[];
+  active_url: string | null;
+  active_target_node_id: string | null;
+  mtls_required: boolean;
+  persistence_source: "runtime_only" | "unavailable";
+  last_probe_error: string | null;
+  endpoint_statuses: ClientRendezvousEndpointStatus[];
+};
+
 export type StorePutResponse = {
   key: string;
   size_bytes: number;

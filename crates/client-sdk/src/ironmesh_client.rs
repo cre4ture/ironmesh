@@ -204,6 +204,24 @@ impl IronMeshClient {
         self
     }
 
+    pub fn uses_relay_transport(&self) -> bool {
+        matches!(self.transport, ClientTransport::Relay(_))
+    }
+
+    pub fn relay_target_node_id(&self) -> Option<NodeId> {
+        match &self.transport {
+            ClientTransport::Direct { .. } => None,
+            ClientTransport::Relay(relay) => Some(relay.target_node_id),
+        }
+    }
+
+    pub fn rendezvous_client(&self) -> Option<RendezvousControlClient> {
+        match &self.transport {
+            ClientTransport::Direct { .. } => None,
+            ClientTransport::Relay(relay) => Some(relay.rendezvous.clone()),
+        }
+    }
+
     fn server_base_url(&self) -> &str {
         match &self.transport {
             ClientTransport::Direct {

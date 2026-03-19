@@ -123,7 +123,17 @@ async fn main() -> Result<()> {
             let bind_addr: SocketAddr = bind.parse()?;
             let web_ui_config = if cli.server_url.is_some() || cli.bootstrap_file.is_some() {
                 let client = build_authenticated_sdk_from_cli(&cli).await?;
-                WebUiConfig::from_client(client)
+                let mut web_ui_config = WebUiConfig::from_client(client);
+                if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
+                    let server_ca_override = read_server_ca_override_from_cli(&cli)?;
+                    let bootstrap =
+                        load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
+                    web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
+                }
+                if let Some(identity) = read_client_identity_from_cli(&cli)? {
+                    web_ui_config = web_ui_config.with_client_identity(identity);
+                }
+                web_ui_config
             } else {
                 WebUiConfig::new("http://127.0.0.1:9")
             }

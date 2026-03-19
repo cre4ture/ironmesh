@@ -47,6 +47,9 @@ import {
   listStoreEntries,
   putBinaryObject,
   putStoreValue,
+  refreshClientRendezvous,
+  updateClientRendezvous,
+  type ClientRendezvousView,
   type ClientUiPingResponse,
   type JsonObject,
   type SnapshotSummary,
@@ -54,9 +57,9 @@ import {
   type StoreListResponse,
   type VersionGraphResponse
 } from "@ironmesh/api";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-type PageId = "overview" | "store" | "explorer" | "cluster";
+type PageId = "overview" | "rendezvous" | "store" | "explorer" | "cluster";
 
 const pages = [
   {
@@ -64,6 +67,12 @@ const pages = [
     label: "Overview",
     icon: IconPlugConnected,
     description: "Connection health, service metadata, and quick cluster summary."
+  },
+  {
+    id: "rendezvous" as const,
+    label: "Rendezvous",
+    icon: IconPlugConnected,
+    description: "Inspect relay endpoint status, active URL selection, and editable bootstrap rendezvous URLs."
   },
   {
     id: "store" as const,
@@ -190,6 +199,8 @@ export function ClientShell() {
               />
             ) : null}
 
+            {activePageId === "rendezvous" ? <RendezvousPage /> : null}
+
             {activePageId === "store" ? <StorePage /> : null}
 
             {activePageId === "explorer" ? <ExplorerPage /> : null}
@@ -286,6 +297,270 @@ function OverviewPage({ ping, health, clusterStatus, loading, error, onRefresh }
             <Stack gap="sm">
               <Text fw={700}>Cluster status payload</Text>
               <JsonBlock value={clusterStatus ?? { status: "loading" }} />
+            </Stack>
+          </Card>
+        </Grid.Col>
+      </Grid>
+    </>
+  );
+}
+
+function RendezvousPage() {
+  const [rendezvous, setRendezvous] = useState<ClientRendezvousView | null>(null);
+  const [editableUrlsText, setEditableUrlsText] = useState("");
+  const [urlsDirty, setUrlsDirty] = useState(false);
+  const urlsDirtyRef = useRef(false);
+  const [loading, setLoading] = useState(true);
+  const [pendingAction, setPendingAction] = useState<"refresh" | "save" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    urlsDirtyRef.current = urlsDirty;
+  }, [urlsDirty]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadStatus(showLoading: boolean, preserveDraft: boolean) {
+      if (showLoading) {
+        setLoading(true);
+      }
+      try {
+        const payload = await refreshClientRendezvous();
+        if (cancelled) {
+          return;
+        }
+        setRendezvous(payload);
+        if (!preserveDraft || !urlsDirtyRef.current) {
+          setEditableUrlsText(payload.configured_urls.join("\n"));
+          setUrlsDirty(false);
+        }
+      } catch (nextError) {
+        if (!cancelled) {
+          setError(nextError instanceof Error ? nextError.message : "Failed loading rendezvous status");
+        }
+      } finally {
+        if (!cancelled && showLoading) {
+          setLoading(false);
+        }
+      }
+    }
+
+    void loadStatus(true, false);
+    const refreshInterval = window.setInterval(() => {
+      void loadStatus(false, true);
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(refreshInterval);
+    };
+  }, []);
+
+  async function handleManualRefresh() {
+    setPendingAction("refresh");
+    setError(null);
+    try {
+      const payload = await refreshClientRendezvous();
+      setRendezvous(payload);
+      if (!urlsDirtyRef.current) {
+        setEditableUrlsText(payload.configured_urls.join("\n"));
+        setUrlsDirty(false);
+      }
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed refreshing rendezvous status");
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  async function handleSave() {
+    setPendingAction("save");
+    setError(null);
+    try {
+      const rendezvous_urls = editableUrlsText
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const payload = await updateClientRendezvous({ rendezvous_urls });
+      setRendezvous(payload);
+      setEditableUrlsText(payload.configured_urls.join("\n"));
+      setUrlsDirty(false);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed updating rendezvous URLs");
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  const endpointStatuses = rendezvous?.endpoint_statuses ?? [];
+  const connectedEndpoints = endpointStatuses.filter((endpoint) => endpoint.status === "connected").length;
+
+  return (
+    <>
+      <PageHeader
+        title="Rendezvous"
+        description="Shared relay endpoint status and bootstrap rendezvous URL controls for Android and CLI-backed web sessions."
+        actions={
+          <Button
+            leftSection={<IconRefresh size={16} />}
+            loading={loading || pendingAction === "refresh"}
+            onClick={() => void handleManualRefresh()}
+          >
+            Refresh
+          </Button>
+        }
+      />
+
+      {error ? <Alert color="red">{error}</Alert> : null}
+      {rendezvous?.last_probe_error ? (
+        <Alert color="yellow" title="Probe warning">
+          {rendezvous.last_probe_error}
+        </Alert>
+      ) : null}
+      {!loading && rendezvous && !rendezvous.available ? (
+        <Alert color="blue" title="Bootstrap-backed rendezvous config unavailable">
+          This session was started without bootstrap metadata, so the shared web UI cannot edit or probe rendezvous URLs.
+          Start the Android or CLI client from bootstrap configuration to manage them here.
+        </Alert>
+      ) : null}
+      {rendezvous?.editable ? (
+        <Alert color="yellow" title="Runtime-only change scope">
+          Rendezvous URL edits apply to the current embedded client runtime now, but they are not persisted back into the
+          original Android or CLI bootstrap source automatically.
+        </Alert>
+      ) : null}
+
+      <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }}>
+        <StatCard label="Transport" value={rendezvous?.transport_mode ?? "Loading..."} hint="Current client transport mode." />
+        <StatCard label="Relay policy" value={rendezvous?.relay_mode ?? "Unknown"} hint="Relay preference from the bootstrap, when available." />
+        <StatCard label="Configured URLs" value={rendezvous?.configured_urls.length ?? 0} hint="Operator-managed rendezvous URLs currently loaded into this runtime." />
+        <StatCard
+          label="Active URL"
+          value={rendezvous?.active_url ? summarizeUrl(rendezvous.active_url) : "None"}
+          hint="Last successful rendezvous endpoint used by the active relay transport."
+        />
+      </SimpleGrid>
+
+      <Grid>
+        <Grid.Col span={{ base: 12, xl: 6 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Group justify="space-between">
+                <Text fw={700}>Rendezvous URL list</Text>
+                <Badge variant="light">{rendezvous?.editable ? "editable" : "read-only"}</Badge>
+              </Group>
+              <Text c="dimmed" size="sm">
+                One URL per line. The shared web UI updates the in-memory bootstrap runtime used for future relay connection trials.
+              </Text>
+              <Textarea
+                label="Configured rendezvous URLs"
+                minRows={8}
+                autosize
+                value={editableUrlsText}
+                disabled={!rendezvous?.editable}
+                onChange={(event) => {
+                  setEditableUrlsText(event.currentTarget.value);
+                  setUrlsDirty(true);
+                }}
+                placeholder={"https://rendezvous-a.example:9443\nhttps://rendezvous-b.example:9443"}
+              />
+              <Group>
+                <Button
+                  loading={pendingAction === "save"}
+                  disabled={!rendezvous?.editable}
+                  onClick={() => void handleSave()}
+                >
+                  Save rendezvous URLs
+                </Button>
+              </Group>
+            </Stack>
+          </Card>
+        </Grid.Col>
+
+        <Grid.Col span={{ base: 12, xl: 6 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>Connection summary</Text>
+              <Group gap="sm">
+                <Badge color={connectedEndpoints > 0 ? "green" : "gray"} variant="light">
+                  {endpointStatuses.length === 0 ? "no probes yet" : `${connectedEndpoints}/${endpointStatuses.length} connected`}
+                </Badge>
+                <Badge color={rendezvous?.mtls_required ? "blue" : "gray"} variant="light">
+                  {rendezvous?.mtls_required ? "mTLS required" : "mTLS optional"}
+                </Badge>
+                <Badge color={rendezvous?.transport_mode === "relay" ? "teal" : "gray"} variant="light">
+                  {rendezvous?.transport_mode === "relay" ? "relay active" : "direct active"}
+                </Badge>
+              </Group>
+              <Text size="sm" c="dimmed">
+                Active target node: {rendezvous?.active_target_node_id ?? "none"}
+              </Text>
+              <Text size="sm" c="dimmed">
+                Persistence source: {rendezvous?.persistence_source ?? "unknown"}
+              </Text>
+              <JsonBlock
+                value={
+                  rendezvous ?? {
+                    status: loading ? "loading" : "unavailable"
+                  }
+                }
+              />
+            </Stack>
+          </Card>
+        </Grid.Col>
+
+        <Grid.Col span={12}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Group justify="space-between">
+                <Text fw={700}>Endpoint status</Text>
+                <Badge color={connectedEndpoints === endpointStatuses.length && endpointStatuses.length > 0 ? "green" : "yellow"} variant="light">
+                  {endpointStatuses.length === 0 ? "no endpoints" : `${connectedEndpoints}/${endpointStatuses.length} connected`}
+                </Badge>
+              </Group>
+              <Text c="dimmed" size="sm">
+                The active URL comes from the live relay transport. Other rows show the latest shared-web probe result for each configured rendezvous service.
+              </Text>
+              <Table.ScrollContainer minWidth={820}>
+                <Table striped highlightOnHover withTableBorder>
+                  <Table.Thead>
+                    <Table.Tr>
+                      <Table.Th>URL</Table.Th>
+                      <Table.Th>Status</Table.Th>
+                      <Table.Th>Last attempt</Table.Th>
+                      <Table.Th>Last success</Table.Th>
+                      <Table.Th>Failures</Table.Th>
+                      <Table.Th>Last error</Table.Th>
+                    </Table.Tr>
+                  </Table.Thead>
+                  <Table.Tbody>
+                    {endpointStatuses.map((endpoint) => (
+                      <Table.Tr key={endpoint.url}>
+                        <Table.Td>
+                          <Group gap="xs">
+                            <Code>{endpoint.url}</Code>
+                            {endpoint.active ? (
+                              <Badge color="teal" variant="filled">
+                                active
+                              </Badge>
+                            ) : null}
+                          </Group>
+                        </Table.Td>
+                        <Table.Td>
+                          <Badge color={rendezvousStatusColor(endpoint.status)} variant="light">
+                            {endpoint.status}
+                          </Badge>
+                        </Table.Td>
+                        <Table.Td>{formatUnixTimestamp(endpoint.last_attempt_unix)}</Table.Td>
+                        <Table.Td>{formatUnixTimestamp(endpoint.last_success_unix)}</Table.Td>
+                        <Table.Td>{endpoint.consecutive_failures}</Table.Td>
+                        <Table.Td>{endpoint.last_error ?? "none"}</Table.Td>
+                      </Table.Tr>
+                    ))}
+                  </Table.Tbody>
+                </Table>
+              </Table.ScrollContainer>
             </Stack>
           </Card>
         </Grid.Col>
@@ -833,6 +1108,33 @@ function ClusterPage({ health, clusterStatus, overviewLoading, onRefreshOverview
       </Grid>
     </>
   );
+}
+
+function formatUnixTimestamp(value: number | null): string {
+  if (!value) {
+    return "never";
+  }
+
+  return new Date(value * 1000).toLocaleString();
+}
+
+function rendezvousStatusColor(status: "unknown" | "connected" | "disconnected"): string {
+  if (status === "connected") {
+    return "green";
+  }
+  if (status === "disconnected") {
+    return "red";
+  }
+  return "gray";
+}
+
+function summarizeUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    return parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+  } catch {
+    return value;
+  }
 }
 
 function getNumber(value: JsonObject | null, key: string): number | null {

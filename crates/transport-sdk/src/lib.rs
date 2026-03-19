@@ -27,7 +27,8 @@ pub use relay::{
 };
 pub use rendezvous::{
     PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
-    RendezvousClientConfig, RendezvousControlClient, TransportCapability,
+    RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
+    RendezvousEndpointStatus, RendezvousRuntimeState, TransportCapability,
 };
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,

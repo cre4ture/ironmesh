@@ -3,6 +3,8 @@ use common::ClusterId;
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bootstrap::RelayMode;
 use crate::candidates::ConnectionCandidate;
@@ -70,10 +72,49 @@ pub struct PresenceListResponse {
     pub entries: Vec<PresenceEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RendezvousEndpointConnectionState {
+    Unknown,
+    Connected,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RendezvousEndpointStatus {
+    pub url: String,
+    pub status: RendezvousEndpointConnectionState,
+    #[serde(default)]
+    pub last_attempt_unix: Option<u64>,
+    #[serde(default)]
+    pub last_success_unix: Option<u64>,
+    #[serde(default)]
+    pub consecutive_failures: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RendezvousRuntimeState {
+    #[serde(default)]
+    pub active_url: Option<String>,
+    #[serde(default)]
+    pub endpoint_statuses: Vec<RendezvousEndpointStatus>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RendezvousControlClient {
     config: RendezvousClientConfig,
     http: Client,
+    runtime_state: Arc<Mutex<TrackedRendezvousRuntimeState>>,
+}
+
+#[derive(Debug, Default)]
+struct TrackedRendezvousRuntimeState {
+    active_url: Option<String>,
+    endpoints: HashMap<String, RendezvousEndpointStatus>,
 }
 
 impl RendezvousClientConfig {
@@ -137,11 +178,42 @@ impl RendezvousControlClient {
         let http = builder
             .build()
             .context("failed building rendezvous control HTTP client")?;
-        Ok(Self { config, http })
+        Ok(Self {
+            runtime_state: Arc::new(Mutex::new(TrackedRendezvousRuntimeState::new(
+                &config.rendezvous_urls,
+            ))),
+            config,
+            http,
+        })
     }
 
     pub fn config(&self) -> &RendezvousClientConfig {
         &self.config
+    }
+
+    pub fn runtime_state(&self) -> RendezvousRuntimeState {
+        self.runtime_state
+            .lock()
+            .expect("rendezvous runtime state lock poisoned")
+            .snapshot(&self.config.rendezvous_urls)
+    }
+
+    pub async fn probe_endpoints(&self) -> Result<RendezvousRuntimeState> {
+        for base_url in &self.config.rendezvous_urls {
+            let url = control_url(base_url, "/control/presence")?;
+            let result = match self.http.get(url.clone()).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(format!("rendezvous endpoint {url} returned error: {err}")),
+                },
+                Err(err) => Err(format!(
+                    "failed contacting rendezvous endpoint {url}: {err}"
+                )),
+            };
+            self.record_endpoint_result(base_url, result, false);
+        }
+
+        Ok(self.runtime_state())
     }
 
     pub async fn register_presence(
@@ -221,20 +293,28 @@ impl RendezvousControlClient {
             let url = control_url(base_url, path)?;
             match self.http.get(url.clone()).send().await {
                 Ok(response) => match response.error_for_status() {
-                    Ok(ok_response) => {
-                        return ok_response.json::<T>().await.with_context(|| {
-                            format!("failed decoding rendezvous response from {url}")
-                        });
-                    }
+                    Ok(ok_response) => match ok_response.json::<T>().await {
+                        Ok(payload) => {
+                            self.record_endpoint_result(base_url, Ok(()), true);
+                            return Ok(payload);
+                        }
+                        Err(err) => {
+                            let message =
+                                format!("failed decoding rendezvous response from {url}: {err}");
+                            self.record_endpoint_result(base_url, Err(message.clone()), true);
+                            return Err(anyhow!(message));
+                        }
+                    },
                     Err(err) => {
-                        last_error =
-                            Some(anyhow!("rendezvous endpoint {url} returned error: {err}"));
+                        let message = format!("rendezvous endpoint {url} returned error: {err}");
+                        self.record_endpoint_result(base_url, Err(message.clone()), true);
+                        last_error = Some(anyhow!(message));
                     }
                 },
                 Err(err) => {
-                    last_error = Some(anyhow!(
-                        "failed contacting rendezvous endpoint {url}: {err}"
-                    ));
+                    let message = format!("failed contacting rendezvous endpoint {url}: {err}");
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
                 }
             }
         }
@@ -252,30 +332,161 @@ impl RendezvousControlClient {
             let url = control_url(base_url, path)?;
             match self.http.post(url.clone()).json(body).send().await {
                 Ok(response) => match response.error_for_status() {
-                    Ok(ok_response) => {
-                        return ok_response.json::<T>().await.with_context(|| {
-                            format!("failed decoding rendezvous response from {url}")
-                        });
-                    }
+                    Ok(ok_response) => match ok_response.json::<T>().await {
+                        Ok(payload) => {
+                            self.record_endpoint_result(base_url, Ok(()), true);
+                            return Ok(payload);
+                        }
+                        Err(err) => {
+                            let message =
+                                format!("failed decoding rendezvous response from {url}: {err}");
+                            self.record_endpoint_result(base_url, Err(message.clone()), true);
+                            return Err(anyhow!(message));
+                        }
+                    },
                     Err(err) => {
-                        last_error =
-                            Some(anyhow!("rendezvous endpoint {url} returned error: {err}"));
+                        let message = format!("rendezvous endpoint {url} returned error: {err}");
+                        self.record_endpoint_result(base_url, Err(message.clone()), true);
+                        last_error = Some(anyhow!(message));
                     }
                 },
                 Err(err) => {
-                    last_error = Some(anyhow!(
-                        "failed contacting rendezvous endpoint {url}: {err}"
-                    ));
+                    let message = format!("failed contacting rendezvous endpoint {url}: {err}");
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
                 }
             }
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
     }
+
+    fn record_endpoint_result(
+        &self,
+        base_url: &str,
+        result: std::result::Result<(), String>,
+        mark_active: bool,
+    ) {
+        self.runtime_state
+            .lock()
+            .expect("rendezvous runtime state lock poisoned")
+            .record_result(base_url, result, mark_active);
+    }
+}
+
+impl TrackedRendezvousRuntimeState {
+    fn new(urls: &[String]) -> Self {
+        let mut state = Self::default();
+        state.ensure_urls(urls);
+        state
+    }
+
+    fn ensure_urls(&mut self, urls: &[String]) {
+        for url in urls {
+            let normalized = normalized_endpoint_url(url);
+            self.endpoints
+                .entry(normalized.clone())
+                .or_insert_with(|| RendezvousEndpointStatus {
+                    url: normalized,
+                    status: RendezvousEndpointConnectionState::Unknown,
+                    last_attempt_unix: None,
+                    last_success_unix: None,
+                    consecutive_failures: 0,
+                    last_error: None,
+                    active: false,
+                });
+        }
+    }
+
+    fn record_result(
+        &mut self,
+        base_url: &str,
+        result: std::result::Result<(), String>,
+        mark_active: bool,
+    ) {
+        let now = unix_timestamp();
+        let normalized = normalized_endpoint_url(base_url);
+        let endpoint =
+            self.endpoints
+                .entry(normalized.clone())
+                .or_insert_with(|| RendezvousEndpointStatus {
+                    url: normalized.clone(),
+                    status: RendezvousEndpointConnectionState::Unknown,
+                    last_attempt_unix: None,
+                    last_success_unix: None,
+                    consecutive_failures: 0,
+                    last_error: None,
+                    active: false,
+                });
+        endpoint.last_attempt_unix = Some(now);
+
+        match result {
+            Ok(()) => {
+                endpoint.status = RendezvousEndpointConnectionState::Connected;
+                endpoint.last_success_unix = Some(now);
+                endpoint.consecutive_failures = 0;
+                endpoint.last_error = None;
+                if mark_active {
+                    self.active_url = Some(endpoint.url.clone());
+                }
+            }
+            Err(error) => {
+                endpoint.status = RendezvousEndpointConnectionState::Disconnected;
+                endpoint.consecutive_failures = endpoint.consecutive_failures.saturating_add(1);
+                endpoint.last_error = Some(error);
+                if mark_active && self.active_url.as_deref() == Some(endpoint.url.as_str()) {
+                    self.active_url = None;
+                }
+            }
+        }
+    }
+
+    fn snapshot(&self, urls: &[String]) -> RendezvousRuntimeState {
+        let mut endpoint_statuses = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for url in urls {
+            let normalized = normalized_endpoint_url(url);
+            if !seen.insert(normalized.clone()) {
+                continue;
+            }
+            if let Some(endpoint) = self.endpoints.get(&normalized) {
+                let mut endpoint = endpoint.clone();
+                endpoint.active = self.active_url.as_deref() == Some(endpoint.url.as_str());
+                endpoint_statuses.push(endpoint);
+            } else {
+                endpoint_statuses.push(RendezvousEndpointStatus {
+                    url: normalized.clone(),
+                    status: RendezvousEndpointConnectionState::Unknown,
+                    last_attempt_unix: None,
+                    last_success_unix: None,
+                    consecutive_failures: 0,
+                    last_error: None,
+                    active: self.active_url.as_deref() == Some(normalized.as_str()),
+                });
+            }
+        }
+
+        RendezvousRuntimeState {
+            active_url: self.active_url.clone(),
+            endpoint_statuses,
+        }
+    }
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
     15
+}
+
+fn normalized_endpoint_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
 }
 
 fn control_url(base_url: &str, path: &str) -> Result<Url> {
@@ -293,4 +504,88 @@ fn validate_optional_url(field_name: &str, value: Option<&str>) -> Result<()> {
     };
     Url::parse(value).with_context(|| format!("invalid {field_name} URL {value}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, routing::get};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn runtime_state_tracks_failed_and_active_rendezvous_endpoints() {
+        let cluster_id = Uuid::now_v7();
+        let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("unused listener should bind");
+        let unused_addr = unused_listener
+            .local_addr()
+            .expect("unused listener should expose addr");
+        drop(unused_listener);
+
+        let router = Router::new().route(
+            "/control/presence",
+            get(|| async {
+                Json(PresenceListResponse {
+                    registered_endpoints: 0,
+                    entries: Vec::new(),
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test rendezvous server should run");
+        });
+
+        let healthy_url = format!("http://{addr}");
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![format!("http://{unused_addr}"), healthy_url.clone()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        client
+            .list_presence()
+            .await
+            .expect("list presence should succeed");
+
+        let runtime_state = client.runtime_state();
+        assert_eq!(
+            runtime_state.active_url.as_deref(),
+            Some(healthy_url.as_str())
+        );
+        assert_eq!(runtime_state.endpoint_statuses.len(), 2);
+        assert_eq!(
+            runtime_state.endpoint_statuses[0].status,
+            RendezvousEndpointConnectionState::Disconnected
+        );
+        assert_eq!(
+            runtime_state.endpoint_statuses[1].status,
+            RendezvousEndpointConnectionState::Connected
+        );
+        assert!(runtime_state.endpoint_statuses[1].active);
+
+        let probed_state = client
+            .probe_endpoints()
+            .await
+            .expect("probing endpoints should succeed");
+        assert_eq!(
+            probed_state.active_url.as_deref(),
+            Some(healthy_url.as_str())
+        );
+        assert!(probed_state.endpoint_statuses[1].active);
+
+        server.abort();
+        let _ = server.await;
+    }
 }

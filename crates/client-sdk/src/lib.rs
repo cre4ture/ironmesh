@@ -32,5 +32,6 @@ pub use remote_sync::{
 };
 pub use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
-    RelayMode, build_signed_request_headers,
+    RelayMode, RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
+    RendezvousEndpointStatus, RendezvousRuntimeState, build_signed_request_headers,
 };

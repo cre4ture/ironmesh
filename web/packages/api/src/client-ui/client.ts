@@ -1,5 +1,6 @@
 import { fetchJson } from "../shared/http";
 import type {
+  ClientRendezvousView,
   ClientUiPingResponse,
   JsonObject,
   SnapshotSummary,
@@ -25,6 +26,28 @@ export async function getClientHealth(): Promise<JsonObject> {
 
 export async function getClientClusterStatus(): Promise<JsonObject> {
   return fetchJson<JsonObject>("/api/cluster/status");
+}
+
+export async function getClientRendezvous(): Promise<ClientRendezvousView> {
+  return fetchJson<ClientRendezvousView>("/api/rendezvous");
+}
+
+export async function refreshClientRendezvous(): Promise<ClientRendezvousView> {
+  return fetchJson<ClientRendezvousView>("/api/rendezvous/refresh", {
+    method: "POST"
+  });
+}
+
+export async function updateClientRendezvous(request: {
+  rendezvous_urls: string[];
+}): Promise<ClientRendezvousView> {
+  return fetchJson<ClientRendezvousView>("/api/rendezvous", {
+    method: "PUT",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(request)
+  });
 }
 
 export async function getClientClusterNodes(): Promise<unknown[]> {

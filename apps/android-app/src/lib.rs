@@ -333,8 +333,20 @@ fn start_embedded_web_ui(
         server_ca_pem.clone(),
         client_identity_json.clone(),
     )?;
-    let web_ui_config =
+    let mut web_ui_config =
         web_ui_backend::WebUiConfig::from_client(client).with_service_name("ironmesh-android");
+    let (_, client_bootstrap_json) = split_connection_input(connection_input.clone())?;
+    if let Some(raw_bootstrap) = client_bootstrap_json {
+        let mut bootstrap = ConnectionBootstrap::from_json_str(&raw_bootstrap)
+            .context("failed to parse android bootstrap for embedded web ui")?;
+        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
+        }
+        web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
+    }
+    if let Some(identity) = parse_client_identity_json(client_identity_json.clone())? {
+        web_ui_config = web_ui_config.with_client_identity(identity);
+    }
     let app = web_ui_backend::router(web_ui_config);
 
     let task = rt.spawn(async move {
