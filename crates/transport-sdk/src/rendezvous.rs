@@ -199,8 +199,16 @@ impl RendezvousControlClient {
     }
 
     pub async fn probe_endpoints(&self) -> Result<RendezvousRuntimeState> {
+        self.probe_endpoints_with_path("/control/presence").await
+    }
+
+    pub async fn probe_health_endpoints(&self) -> Result<RendezvousRuntimeState> {
+        self.probe_endpoints_with_path("/health").await
+    }
+
+    async fn probe_endpoints_with_path(&self, path: &str) -> Result<RendezvousRuntimeState> {
         for base_url in &self.config.rendezvous_urls {
-            let url = control_url(base_url, "/control/presence")?;
+            let url = control_url(base_url, path)?;
             let result = match self.http.get(url.clone()).send().await {
                 Ok(response) => match response.error_for_status() {
                     Ok(_) => Ok(()),
@@ -509,6 +517,7 @@ fn validate_optional_url(field_name: &str, value: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use axum::{Json, Router, routing::get};
     use uuid::Uuid;
 
@@ -584,6 +593,71 @@ mod tests {
             Some(healthy_url.as_str())
         );
         assert!(probed_state.endpoint_statuses[1].active);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn health_probe_succeeds_when_presence_endpoint_is_unauthorized() {
+        let cluster_id = Uuid::now_v7();
+        let router = Router::new()
+            .route(
+                "/health",
+                get(|| async { Json(serde_json::json!({ "status": "ok" })) }),
+            )
+            .route(
+                "/control/presence",
+                get(|| async { (StatusCode::UNAUTHORIZED, "node certificate required") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test rendezvous server should run");
+        });
+
+        let healthy_url = format!("http://{addr}");
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![healthy_url.clone()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        let presence_probe = client
+            .probe_endpoints()
+            .await
+            .expect("probe should complete");
+        assert_eq!(
+            presence_probe.endpoint_statuses[0].status,
+            RendezvousEndpointConnectionState::Disconnected
+        );
+        assert!(
+            presence_probe.endpoint_statuses[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("401"))
+        );
+
+        let health_probe = client
+            .probe_health_endpoints()
+            .await
+            .expect("health probe should succeed");
+        assert_eq!(health_probe.active_url, None);
+        assert_eq!(
+            health_probe.endpoint_statuses[0].status,
+            RendezvousEndpointConnectionState::Connected
+        );
+        assert!(!health_probe.endpoint_statuses[0].active);
+        assert_eq!(health_probe.endpoint_statuses[0].url, healthy_url);
 
         server.abort();
         let _ = server.await;

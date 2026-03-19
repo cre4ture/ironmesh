@@ -410,10 +410,10 @@ async fn probe_rendezvous_and_build_view(state: &WebState) -> WebClientRendezvou
     };
 
     let probe_result = if let Some(relay_client) = relay_client {
-        relay_client.probe_endpoints().await
+        relay_client.probe_health_endpoints().await
     } else if let Some(rendezvous_config) = rendezvous_config {
         match build_rendezvous_probe_client(&rendezvous_config) {
-            Ok(Some(client)) => client.probe_endpoints().await,
+            Ok(Some(client)) => client.probe_health_endpoints().await,
             Ok(None) => Ok(client_sdk::RendezvousRuntimeState {
                 active_url: None,
                 endpoint_statuses: Vec::new(),
