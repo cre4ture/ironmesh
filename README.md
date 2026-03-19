@@ -14,10 +14,13 @@ Rust workspace for a distributed file storage platform with server, client SDK, 
 ## Quick start
 
 ```bash
+cd web && pnpm install
 cargo check --workspace
 cargo run -p server-node
 cargo run -p cli-client -- --help
 ```
+
+The Rust `server-node` build triggers `pnpm build` inside `web/`, so the frontend dependencies must be installed in [`web/package.json`](/home/uli/rust-dev/ironmesh/web/package.json) first. If you accidentally run `pnpm` or `npm` from the repo root, you'll create an unused top-level `node_modules/` that this workspace does not use.
 
 ## Justfile commands
 
