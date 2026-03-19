@@ -5,6 +5,127 @@ export type AdminSessionStatus = {
   token_override_enabled: boolean;
 };
 
+export type ClusterSummary = {
+  local_node_id: string;
+  total_nodes: number;
+  online_nodes: number;
+  offline_nodes: number;
+  policy: {
+    replication_factor: number;
+    min_distinct_labels: Record<string, number>;
+    accepted_over_replication_items: number;
+  };
+};
+
+export type NodeDescriptor = {
+  node_id: string;
+  reachability: {
+    public_api_url?: string | null;
+    peer_api_url?: string | null;
+    relay_required: boolean;
+  };
+  capabilities: {
+    public_api: boolean;
+    peer_api: boolean;
+    relay_tunnel: boolean;
+  };
+  labels: Record<string, string>;
+  capacity_bytes: number;
+  free_bytes: number;
+  last_heartbeat_unix: number;
+  status: "online" | "offline";
+};
+
+export type ReplicationPlan = {
+  generated_at_unix: number;
+  under_replicated: number;
+  over_replicated: number;
+  cleanup_deferred_items: number;
+  cleanup_deferred_extra_nodes: number;
+  items: Array<{
+    key: string;
+    desired_nodes: string[];
+    current_nodes: string[];
+    missing_nodes: string[];
+    extra_nodes: string[];
+    cleanup_option: string;
+    deferred_extra_nodes: number;
+  }>;
+};
+
+export type LogsResponse = {
+  entries: string[];
+};
+
+export type BootstrapBundle = Record<string, unknown> & {
+  cluster_id?: string;
+  relay_mode?: string;
+  rendezvous_mtls_required?: boolean;
+  rendezvous_urls?: string[];
+  direct_endpoints?: Array<{
+    url: string;
+    usage?: string | null;
+    node_id?: string | null;
+  }>;
+  trust_roots?: {
+    cluster_ca_pem?: string | null;
+    public_api_ca_pem?: string | null;
+    rendezvous_ca_pem?: string | null;
+  };
+};
+
+export type NodeEnrollmentPackage = Record<string, unknown> & {
+  bootstrap?: Record<string, unknown>;
+  public_tls_material?: Record<string, unknown> | null;
+  internal_tls_material?: Record<string, unknown> | null;
+};
+
+export type ClientCredentialView = {
+  device_id: string;
+  label: string | null;
+  public_key_fingerprint: string | null;
+  credential_fingerprint: string | null;
+  created_at_unix: number;
+  revocation_reason: string | null;
+  revoked_by_actor: string | null;
+  revoked_by_source_node: string | null;
+  revoked_at_unix: number | null;
+};
+
+export type NodeCertificateStatus = {
+  name: string;
+  configured: boolean;
+  cert_path: string | null;
+  metadata_path: string | null;
+  issued_at_unix: number | null;
+  renew_after_unix: number | null;
+  expires_at_unix: number | null;
+  seconds_until_expiry: number | null;
+  certificate_fingerprint: string | null;
+  metadata_matches_certificate: boolean | null;
+  state: string;
+};
+
+export type NodeCertificateStatusResponse = {
+  public_tls: NodeCertificateStatus;
+  internal_tls: NodeCertificateStatus;
+  auto_renew: {
+    enabled: boolean;
+    enrollment_path: string | null;
+    issuer_url: string | null;
+    check_interval_secs: number | null;
+    last_attempt_unix: number | null;
+    last_success_unix: number | null;
+    last_error: string | null;
+    restart_required: boolean;
+  };
+};
+
+export type ManagedControlPlanePromotionPackage = {
+  signer_backup: Record<string, unknown>;
+  rendezvous_failover: Record<string, unknown>;
+};
+
 export type ControlPlanePromotionImportResponse = {
   status: string;
   cluster_id: string;

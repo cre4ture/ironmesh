@@ -42,22 +42,22 @@ Files:
 
 - [ ] Build page parity for the current admin runtime UI.
 - [ ] Build page parity for the current setup UI.
-- [ ] Add shared app shell, page header, status cards, JSON/debug panels.
-- [ ] Move current admin/session flow into typed API helpers.
-- [ ] Move current control-plane actions into typed API helpers.
+- [x] Add shared app shell, page header, status cards, JSON/debug panels.
+- [x] Move current admin/session flow into typed API helpers.
+- [x] Move current control-plane actions into typed API helpers.
 
 Pages to reach parity:
 
-- [ ] Dashboard
+- [x] Dashboard
 - [ ] Setup
-- [ ] Admin login/session
-- [ ] Bootstrap bundles
-- [ ] Node enrollment
-- [ ] Client credentials
-- [ ] Certificates
-- [ ] Replication
+- [x] Admin login/session
+- [x] Bootstrap bundles
+- [x] Node enrollment
+- [x] Client credentials
+- [x] Certificates
+- [x] Replication
 - [ ] Logs
-- [ ] Control plane promotion
+- [x] Control plane promotion
 
 Current Rust sources to replace:
 
@@ -120,9 +120,9 @@ Likely touch points:
 
 ## Verification checklist
 
-- [ ] `pnpm install` in `web/`
-- [ ] `pnpm typecheck`
-- [ ] `pnpm build`
+- [x] `pnpm install` in `web/`
+- [x] `pnpm typecheck`
+- [x] `pnpm build`
 - [ ] server-node serves built admin assets
 - [ ] setup flow still works end to end
 - [ ] runtime admin flow still works end to end
@@ -134,3 +134,4 @@ Likely touch points:
 - Prefer static assets over SSR frameworks.
 - Keep `server-admin` and `client-ui` as separate apps.
 - Use `packages/ui` and `packages/api` for shared code, not one giant combined app.
+- Current Phase 2 slice covers the high-value runtime admin flows first; setup parity and a dedicated logs page are still pending.
