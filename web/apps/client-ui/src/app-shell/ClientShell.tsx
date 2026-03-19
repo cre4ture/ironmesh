@@ -118,81 +118,95 @@ export function ClientShell() {
   }
 
   return (
-    <AppShell
-      className="shell-root"
-      header={{ height: 68 }}
-      navbar={{ width: 280, breakpoint: "sm", collapsed: { mobile: !opened } }}
-      padding={{ base: "xs", sm: "md", lg: "lg" }}
-    >
-      <AppShell.Header className="shell-header">
-        <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
-          <Group gap="sm">
-            <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-            <Stack gap={0}>
-              <Text fw={800} tt="uppercase" size="sm" c="teal">
-                ironmesh
-              </Text>
-              <Text fw={700}>Client UI</Text>
-            </Stack>
+    <>
+      <AppShell
+        className="shell-root"
+        header={{ height: 68 }}
+        navbar={{ width: 280, breakpoint: "sm", collapsed: { mobile: !opened } }}
+        padding={{ base: "xs", sm: "md", lg: "lg" }}
+        styles={{
+          header: {
+            background: "linear-gradient(180deg, #f9fbfc 0%, #f2f6f8 100%)"
+          },
+          navbar: {
+            background: "linear-gradient(180deg, #f9fbfc 0%, #f0f5f7 100%)"
+          },
+          main: {
+            background: "transparent"
+          }
+        }}
+      >
+        <AppShell.Header className="shell-header">
+          <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
+            <Group gap="sm">
+              <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
+              <Stack gap={0}>
+                <Text fw={800} tt="uppercase" size="sm" c="teal">
+                  ironmesh
+                </Text>
+                <Text fw={700}>Client UI</Text>
+              </Stack>
+            </Group>
+            <Group gap="sm">
+              {ping ? <Badge variant="light">{ping.service}</Badge> : null}
+              <Badge color="teal" variant="filled">
+                Transport-aware
+              </Badge>
+            </Group>
           </Group>
-          <Group gap="sm">
-            {ping ? <Badge variant="light">{ping.service}</Badge> : null}
-            <Badge color="teal" variant="filled">
-              Transport-aware
-            </Badge>
-          </Group>
-        </Group>
-      </AppShell.Header>
+        </AppShell.Header>
 
-      <AppShell.Navbar className="shell-navbar" p="sm">
-        <Stack gap="xs">
-          {pages.map((page) => {
-            const Icon = page.icon;
-            return (
-              <NavLink
-                key={page.id}
-                active={page.id === activePageId}
-                label={page.label}
-                description={page.description}
-                leftSection={<Icon size={16} />}
-                onClick={() => {
-                  setActivePageId(page.id);
-                  close();
-                }}
+        <AppShell.Navbar className="shell-navbar" p="sm">
+          <Stack gap="xs">
+            {pages.map((page) => {
+              const Icon = page.icon;
+              return (
+                <NavLink
+                  key={page.id}
+                  active={page.id === activePageId}
+                  label={page.label}
+                  description={page.description}
+                  leftSection={<Icon size={16} />}
+                  onClick={() => {
+                    setActivePageId(page.id);
+                    close();
+                  }}
+                />
+              );
+            })}
+          </Stack>
+        </AppShell.Navbar>
+
+        <AppShell.Main className="shell-main">
+          <Stack className="shell-content" gap="lg">
+            {activePageId === "overview" ? (
+              <OverviewPage
+                ping={ping}
+                health={health}
+                clusterStatus={clusterStatus}
+                loading={overviewLoading}
+                error={overviewError}
+                onRefresh={refreshOverview}
               />
-            );
-          })}
-        </Stack>
-      </AppShell.Navbar>
+            ) : null}
 
-      <AppShell.Main className="shell-main">
-        <Stack className="shell-content" gap="lg">
-          {activePageId === "overview" ? (
-            <OverviewPage
-              ping={ping}
-              health={health}
-              clusterStatus={clusterStatus}
-              loading={overviewLoading}
-              error={overviewError}
-              onRefresh={refreshOverview}
-            />
-          ) : null}
+            {activePageId === "store" ? <StorePage /> : null}
 
-          {activePageId === "store" ? <StorePage /> : null}
+            {activePageId === "explorer" ? <ExplorerPage /> : null}
 
-          {activePageId === "explorer" ? <ExplorerPage /> : null}
-
-          {activePageId === "cluster" ? (
-            <ClusterPage
-              health={health}
-              clusterStatus={clusterStatus}
-              overviewLoading={overviewLoading}
-              onRefreshOverview={refreshOverview}
-            />
-          ) : null}
-        </Stack>
-      </AppShell.Main>
-    </AppShell>
+            {activePageId === "cluster" ? (
+              <ClusterPage
+                health={health}
+                clusterStatus={clusterStatus}
+                overviewLoading={overviewLoading}
+                onRefreshOverview={refreshOverview}
+              />
+            ) : null}
+          </Stack>
+        </AppShell.Main>
+      </AppShell>
+      {opened ? <div className="shell-backdrop" onClick={close} /> : null}
+    </>
   );
 }
 

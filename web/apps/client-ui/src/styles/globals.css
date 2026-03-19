@@ -50,7 +50,19 @@ body {
   min-height: 100%;
 }
 
+.shell-backdrop {
+  display: none;
+}
+
 @media (max-width: 48em) {
+  .shell-backdrop {
+    display: block;
+    position: fixed;
+    inset: 68px 0 0 0;
+    background: rgba(29, 42, 49, 0.4);
+    z-index: 100;
+  }
+
   .shell-header-bar {
     padding-left: max(0.75rem, env(safe-area-inset-left));
     padding-right: max(0.75rem, env(safe-area-inset-right));

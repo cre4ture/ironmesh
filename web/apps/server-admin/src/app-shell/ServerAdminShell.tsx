@@ -65,6 +65,17 @@ export function ServerAdminShell() {
         header={{ height: 68 }}
         navbar={{ width: 280, breakpoint: "sm", collapsed: { mobile: !opened } }}
         padding={{ base: "xs", sm: "md", lg: "lg" }}
+        styles={{
+          header: {
+            background: "linear-gradient(180deg, #f8fbf9 0%, #f1f6f3 100%)"
+          },
+          navbar: {
+            background: "linear-gradient(180deg, #f8fbf9 0%, #eff5f2 100%)"
+          },
+          main: {
+            background: "transparent"
+          }
+        }}
       >
         <AppShell.Header className="shell-header">
           <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
@@ -143,6 +154,7 @@ export function ServerAdminShell() {
           </Stack>
         </AppShell.Main>
       </AppShell>
+      {opened ? <div className="shell-backdrop" onClick={close} /> : null}
       <AdminAccessDrawer opened={accessOpened} onClose={accessControls.close} />
     </>
   );
