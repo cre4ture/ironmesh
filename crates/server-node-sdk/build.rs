@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
     let legacy_ui_dir = manifest_dir.join("src").join("ui");
     let server_admin_dist_dir = manifest_dir
@@ -24,12 +25,21 @@ fn main() {
     let built_index_path = server_admin_dist_dir.join("index.html");
     if built_index_path.exists() {
         println!("cargo:rerun-if-changed={}", built_index_path.display());
-        let index_html = fs::read_to_string(&built_index_path)
-            .unwrap_or_else(|error| panic!("failed reading {}: {error}", built_index_path.display()));
-        let script_path = extract_attr(&index_html, "src")
-            .unwrap_or_else(|| panic!("failed locating script src in {}", built_index_path.display()));
-        let stylesheet_path = extract_attr(&index_html, "href")
-            .unwrap_or_else(|| panic!("failed locating stylesheet href in {}", built_index_path.display()));
+        let index_html = fs::read_to_string(&built_index_path).unwrap_or_else(|error| {
+            panic!("failed reading {}: {error}", built_index_path.display())
+        });
+        let script_path = extract_attr(&index_html, "src").unwrap_or_else(|| {
+            panic!(
+                "failed locating script src in {}",
+                built_index_path.display()
+            )
+        });
+        let stylesheet_path = extract_attr(&index_html, "href").unwrap_or_else(|| {
+            panic!(
+                "failed locating stylesheet href in {}",
+                built_index_path.display()
+            )
+        });
 
         let script_file = resolve_dist_asset(&server_admin_dist_dir, &script_path);
         let stylesheet_file = resolve_dist_asset(&server_admin_dist_dir, &stylesheet_path);
@@ -38,14 +48,16 @@ fn main() {
 
         let script = fs::read_to_string(&script_file)
             .unwrap_or_else(|error| panic!("failed reading {}: {error}", script_file.display()));
-        let stylesheet = fs::read_to_string(&stylesheet_file)
-            .unwrap_or_else(|error| panic!("failed reading {}: {error}", stylesheet_file.display()));
+        let stylesheet = fs::read_to_string(&stylesheet_file).unwrap_or_else(|error| {
+            panic!("failed reading {}: {error}", stylesheet_file.display())
+        });
         let rewritten_index = index_html
             .replace(&script_path, "/ui/app.js")
             .replace(&stylesheet_path, "/ui/app.css");
 
-        fs::write(&generated_index, rewritten_index)
-            .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_index.display()));
+        fs::write(&generated_index, rewritten_index).unwrap_or_else(|error| {
+            panic!("failed writing {}: {error}", generated_index.display())
+        });
         fs::write(&generated_css, stylesheet)
             .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_css.display()));
         fs::write(&generated_js, script)
