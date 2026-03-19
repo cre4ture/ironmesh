@@ -55,8 +55,8 @@ cargo build -p server-node -p cli-client
 
 ```powershell
 $Root = Join-Path $PWD "data/manual-relay-test"
-$NodeABind = "127.0.0.1:18481"
-$NodeBBind = "127.0.0.1:18482"
+$NodeABind = "0.0.0.0:18481"
+$NodeBBind = "0.0.0.0:18482"
 $NodeAUrl = "https://$NodeABind"
 $NodeBUrl = "https://$NodeBBind"
 $AdminPassword = "correct horse battery staple"
@@ -65,8 +65,8 @@ New-Item -ItemType Directory -Force -Path $Root | Out-Null
 
 ```bash
 ROOT="$PWD/data/manual-relay-test"
-NODE_A_BIND="127.0.0.1:18481"
-NODE_B_BIND="127.0.0.1:18482"
+NODE_A_BIND="0.0.0.0:18481"
+NODE_B_BIND="0.0.0.0:18482"
 NODE_A_URL="https://$NODE_A_BIND"
 NODE_B_URL="https://$NODE_B_BIND"
 ADMIN_PASSWORD="correct horse battery staple"
