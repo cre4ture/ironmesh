@@ -153,3 +153,137 @@ pub fn build_blocking_http_client(server_ca_cert: Option<&Path>) -> Result<Block
         .transpose()?;
     build_blocking_reqwest_client_from_pem(server_ca_pem.as_deref())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::NodeId;
+    use transport_sdk::RelayMode;
+    use transport_sdk::TransportPathKind;
+    use uuid::Uuid;
+
+    fn sample_identity() -> ClientIdentityMaterial {
+        let mut identity =
+            ClientIdentityMaterial::generate(Uuid::now_v7(), None, Some("test-device".to_string()))
+                .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        identity
+    }
+
+    #[test]
+    fn load_root_certificate_reports_missing_file() {
+        let missing_path =
+            std::env::temp_dir().join(format!("ironmesh-missing-{}.pem", Uuid::now_v7()));
+        let error =
+            load_root_certificate(&missing_path).expect_err("missing certificate file should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read server CA certificate")
+        );
+    }
+
+    #[test]
+    fn build_http_client_from_pem_rejects_invalid_base_url() {
+        let error = match build_http_client_from_pem(None, "://bad-url") {
+            Ok(_) => panic!("invalid URL should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse server base URL")
+        );
+    }
+
+    #[test]
+    fn build_http_client_with_identity_from_planned_target_uses_direct_transport() {
+        let identity = sample_identity();
+        let client = build_http_client_with_identity_from_planned_target(
+            &PlannedConnectionBootstrapTarget {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                relay_mode: RelayMode::Fallback,
+                path_kind: TransportPathKind::DirectHttps,
+                server_base_url: Some("https://node-a.example".to_string()),
+                target_node_id: Some(NodeId::new_v4()),
+                server_ca_pem: None,
+                cluster_ca_pem: None,
+                rendezvous_ca_pem: None,
+                pairing_token: None,
+                device_label: None,
+                device_id: None,
+            },
+            &identity,
+        )
+        .expect("direct client should build");
+
+        assert!(!client.uses_relay_transport());
+        assert!(client.rendezvous_client().is_none());
+    }
+
+    #[test]
+    fn build_http_client_with_identity_from_planned_target_requires_relay_target_node_id() {
+        let identity = sample_identity();
+        let error = match build_http_client_with_identity_from_planned_target(
+            &PlannedConnectionBootstrapTarget {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: false,
+                relay_mode: RelayMode::Required,
+                path_kind: TransportPathKind::RelayTunnel,
+                server_base_url: None,
+                target_node_id: None,
+                server_ca_pem: None,
+                cluster_ca_pem: None,
+                rendezvous_ca_pem: None,
+                pairing_token: None,
+                device_label: None,
+                device_id: None,
+            },
+            &identity,
+        ) {
+            Ok(_) => panic!("missing relay node id should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("relay-backed client transport target is missing target_node_id")
+        );
+    }
+
+    #[test]
+    fn build_http_client_with_identity_from_planned_target_requires_rendezvous_identity_for_mtls() {
+        let identity = sample_identity();
+        let error = match build_http_client_with_identity_from_planned_target(
+            &PlannedConnectionBootstrapTarget {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+                rendezvous_mtls_required: true,
+                relay_mode: RelayMode::Required,
+                path_kind: TransportPathKind::RelayTunnel,
+                server_base_url: None,
+                target_node_id: Some(NodeId::new_v4()),
+                server_ca_pem: None,
+                cluster_ca_pem: None,
+                rendezvous_ca_pem: None,
+                pairing_token: None,
+                device_label: None,
+                device_id: None,
+            },
+            &identity,
+        ) {
+            Ok(_) => panic!("missing rendezvous identity should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires rendezvous_client_identity_pem")
+        );
+    }
+}

@@ -80,3 +80,112 @@ fn candidate_path_kind(kind: CandidateKind) -> TransportPathKind {
         CandidateKind::Relay => TransportPathKind::RelayTunnel,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn request(prefer_direct: bool, allow_relay: bool) -> TransportSessionRequest {
+        TransportSessionRequest {
+            cluster_id: Uuid::now_v7(),
+            target: PeerIdentity::Node(Uuid::now_v7()),
+            preference: SessionPreference {
+                prefer_direct,
+                allow_relay,
+            },
+        }
+    }
+
+    #[test]
+    fn session_preference_defaults_to_direct_with_relay_allowed() {
+        let preference = SessionPreference::default();
+        assert!(preference.prefer_direct);
+        assert!(preference.allow_relay);
+    }
+
+    #[test]
+    fn select_session_plan_prefers_direct_candidates_by_default() {
+        let request = request(true, true);
+        let plan = select_session_plan(
+            &request,
+            &[
+                ConnectionCandidate {
+                    kind: CandidateKind::Relay,
+                    endpoint: "https://relay.example".to_string(),
+                    rtt_ms: Some(30),
+                },
+                ConnectionCandidate {
+                    kind: CandidateKind::DirectHttps,
+                    endpoint: "https://node.example".to_string(),
+                    rtt_ms: Some(10),
+                },
+            ],
+        )
+        .expect("a direct session plan should be selected");
+
+        assert_eq!(plan.path_kind, TransportPathKind::DirectHttps);
+        assert_eq!(
+            plan.candidate.expect("candidate should be present").kind,
+            CandidateKind::DirectHttps
+        );
+    }
+
+    #[test]
+    fn select_session_plan_prefers_relay_when_direct_is_disabled() {
+        let request = request(false, true);
+        let plan = select_session_plan(
+            &request,
+            &[
+                ConnectionCandidate {
+                    kind: CandidateKind::DirectQuic,
+                    endpoint: "https://node.example:4433".to_string(),
+                    rtt_ms: Some(10),
+                },
+                ConnectionCandidate {
+                    kind: CandidateKind::Relay,
+                    endpoint: "https://relay.example".to_string(),
+                    rtt_ms: Some(20),
+                },
+            ],
+        )
+        .expect("a relay session plan should be selected");
+
+        assert_eq!(plan.path_kind, TransportPathKind::RelayTunnel);
+        assert_eq!(
+            plan.candidate.expect("candidate should be present").kind,
+            CandidateKind::Relay
+        );
+    }
+
+    #[test]
+    fn select_session_plan_skips_relay_candidates_when_relay_is_disabled() {
+        let request = request(true, false);
+        let plan = select_session_plan(
+            &request,
+            &[ConnectionCandidate {
+                kind: CandidateKind::Relay,
+                endpoint: "https://relay.example".to_string(),
+                rtt_ms: Some(10),
+            }],
+        );
+
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn select_session_plan_maps_quic_candidates_to_direct_quic_path() {
+        let request = request(true, true);
+        let plan = select_session_plan(
+            &request,
+            &[ConnectionCandidate {
+                kind: CandidateKind::ServerReflexiveQuic,
+                endpoint: "https://reflexive.example:4433".to_string(),
+                rtt_ms: Some(10),
+            }],
+        )
+        .expect("a quic session plan should be selected");
+
+        assert_eq!(plan.path_kind, TransportPathKind::DirectQuic);
+    }
+}

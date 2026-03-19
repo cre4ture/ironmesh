@@ -380,6 +380,7 @@ mod tests {
     use super::*;
     use axum::{Json, Router, routing::get};
     use common::ClusterId;
+    use std::sync::mpsc;
     use sync_core::{NamespaceEntry, SyncSnapshot};
     use transport_sdk::{BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, RelayMode};
 
@@ -461,6 +462,120 @@ mod tests {
         let changed = changed_paths_between(&previous, &current);
 
         assert_eq!(changed, vec!["docs/readme.md".to_string()]);
+    }
+
+    #[test]
+    fn remote_sync_strategy_polling_enforces_minimum_interval() {
+        let strategy = RemoteSyncStrategy::polling(Duration::from_millis(10));
+
+        match strategy.mode {
+            RemoteSyncMode::Polling { interval } => {
+                assert_eq!(interval, Duration::from_millis(250));
+            }
+            RemoteSyncMode::ServerNotifications { .. } => {
+                panic!("polling strategy should stay in polling mode");
+            }
+        }
+
+        let scheduler = RemoteSyncScheduler::new(strategy);
+        assert_eq!(scheduler.fallback_interval(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn remote_sync_strategy_server_notifications_enforces_minimum_intervals() {
+        let strategy =
+            RemoteSyncStrategy::server_notifications(Duration::from_millis(1), Duration::ZERO);
+
+        match strategy.mode {
+            RemoteSyncMode::Polling { .. } => {
+                panic!("server notification strategy should not switch to polling mode");
+            }
+            RemoteSyncMode::ServerNotifications {
+                wait_timeout,
+                retry_interval,
+            } => {
+                assert_eq!(wait_timeout, Duration::from_millis(250));
+                assert_eq!(retry_interval, Duration::from_millis(250));
+            }
+        }
+
+        let scheduler = RemoteSyncScheduler::new(strategy);
+        assert_eq!(scheduler.fallback_interval(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn remote_sync_strategy_default_uses_three_second_polling() {
+        match RemoteSyncStrategy::default().mode {
+            RemoteSyncMode::Polling { interval } => {
+                assert_eq!(interval, Duration::from_secs(3));
+            }
+            RemoteSyncMode::ServerNotifications { .. } => {
+                panic!("default strategy should poll");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_snapshot_scope_and_direct_fetcher_normalize_defaults() {
+        let fetcher = RemoteSnapshotFetcher::from_direct_base_url(
+            "http://127.0.0.1:1",
+            Some("docs".to_string()),
+            0,
+            Some("snap-1".to_string()),
+        );
+
+        assert_eq!(fetcher.scope.prefix.as_deref(), Some("docs"));
+        assert_eq!(fetcher.scope.depth, 1);
+        assert_eq!(fetcher.scope.snapshot.as_deref(), Some("snap-1"));
+    }
+
+    #[test]
+    fn sleep_until_or_stop_respects_zero_duration_and_stopped_state() {
+        let running = AtomicBool::new(true);
+        assert!(sleep_until_or_stop(Duration::ZERO, &running));
+
+        running.store(false, Ordering::SeqCst);
+        assert!(!sleep_until_or_stop(Duration::from_millis(1), &running));
+    }
+
+    #[test]
+    fn polling_loop_emits_changed_paths_updates() {
+        let poller = RemoteSnapshotPoller::polling(Duration::from_millis(1));
+        let running = Arc::new(AtomicBool::new(true));
+        let initial_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+        };
+        let next_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                NamespaceEntry::file("docs/readme.md", "v2", "h2"),
+                NamespaceEntry::file("docs/new.txt", "v1", "h-new"),
+            ],
+        };
+        let (tx, rx) = mpsc::channel();
+        let running_for_callback = Arc::clone(&running);
+
+        let handle = poller.spawn_changed_paths_loop(
+            Arc::clone(&running),
+            Some(initial_snapshot),
+            move || Ok(next_snapshot.clone()),
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update).expect("update should send");
+            },
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("changed snapshot should produce an update");
+        handle.join().expect("polling loop should stop cleanly");
+
+        assert_eq!(
+            update.changed_paths,
+            vec!["docs/new.txt".to_string(), "docs/readme.md".to_string(),],
+        );
+        assert_eq!(update.snapshot.remote.len(), 2);
     }
 
     #[test]

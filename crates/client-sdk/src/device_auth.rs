@@ -142,3 +142,84 @@ fn parse_enrollment_response(status: StatusCode, body: String) -> Result<DeviceE
     }
     Ok(enrolled)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn sample_response() -> DeviceEnrollmentResponse {
+        DeviceEnrollmentResponse {
+            cluster_id: Uuid::now_v7(),
+            device_id: Uuid::now_v7().to_string(),
+            label: Some("phone".to_string()),
+            public_key_pem: "public-key".to_string(),
+            credential_pem: "credential".to_string(),
+            rendezvous_client_identity_pem: Some("rendezvous-identity".to_string()),
+            created_at_unix: Some(11),
+            expires_at_unix: Some(22),
+        }
+    }
+
+    #[test]
+    fn issued_identity_rejects_invalid_device_id() {
+        let mut response = sample_response();
+        response.device_id = "not-a-uuid".to_string();
+
+        let error = response
+            .issued_identity()
+            .expect_err("invalid device_id should fail");
+        assert!(error.to_string().contains("invalid device_id"));
+    }
+
+    #[test]
+    fn parse_enrollment_response_accepts_complete_success_payload() {
+        let response = sample_response();
+        let body = serde_json::to_string(&response).expect("response should serialize");
+
+        let parsed = parse_enrollment_response(StatusCode::CREATED, body)
+            .expect("complete success payload should parse");
+        assert_eq!(parsed.device_id, response.device_id);
+        assert_eq!(
+            parsed.rendezvous_client_identity_pem,
+            response.rendezvous_client_identity_pem
+        );
+    }
+
+    #[test]
+    fn parse_enrollment_response_rejects_http_errors() {
+        let error = parse_enrollment_response(StatusCode::FORBIDDEN, "denied".to_string())
+            .expect_err("HTTP errors should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("device enrollment failed with HTTP 403 Forbidden: denied")
+        );
+    }
+
+    #[test]
+    fn parse_enrollment_response_rejects_invalid_json() {
+        let error = parse_enrollment_response(StatusCode::OK, "{".to_string())
+            .expect_err("invalid JSON should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse /auth/device/enroll response")
+        );
+    }
+
+    #[test]
+    fn parse_enrollment_response_rejects_incomplete_credentials() {
+        let mut response = sample_response();
+        response.credential_pem.clear();
+        let body = serde_json::to_string(&response).expect("response should serialize");
+
+        let error = parse_enrollment_response(StatusCode::OK, body)
+            .expect_err("incomplete credential should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("device enrollment returned an incomplete credential")
+        );
+    }
+}

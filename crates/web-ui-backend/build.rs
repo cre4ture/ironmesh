@@ -9,10 +9,7 @@ fn main() {
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
     let web_workspace_dir = manifest_dir.join("..").join("..").join("web");
-    let client_ui_dist_dir = web_workspace_dir
-        .join("apps")
-        .join("client-ui")
-        .join("dist");
+    let client_ui_dist_candidates = client_ui_dist_candidates(&web_workspace_dir);
 
     println!("cargo:rerun-if-changed=build.rs");
     println!(
@@ -158,6 +155,12 @@ fn main() {
     let generated_js = out_dir.join("client_ui_app.js");
     run_frontend_build(&web_workspace_dir);
 
+    let client_ui_dist_dir = locate_dist_dir(&client_ui_dist_candidates).unwrap_or_else(|| {
+        panic!(
+            "failed locating built client-ui dist after `pnpm --filter @ironmesh/client-ui build`; checked: {}",
+            format_path_list(&client_ui_dist_candidates)
+        )
+    });
     let built_index_path = client_ui_dist_dir.join("index.html");
     let index_html = fs::read_to_string(&built_index_path).unwrap_or_else(|error| {
         panic!(
@@ -205,6 +208,31 @@ fn extract_attr(html: &str, attr: &str) -> Option<String> {
 
 fn resolve_dist_asset(dist_dir: &Path, asset_path: &str) -> PathBuf {
     dist_dir.join(asset_path.trim_start_matches('/'))
+}
+
+fn client_ui_dist_candidates(web_workspace_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        web_workspace_dir
+            .join("apps")
+            .join("client-ui")
+            .join("dist"),
+        web_workspace_dir.join("dist"),
+    ]
+}
+
+fn locate_dist_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.join("index.html").is_file())
+        .cloned()
+}
+
+fn format_path_list(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn run_frontend_build(web_workspace_dir: &Path) {
