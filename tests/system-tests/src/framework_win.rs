@@ -3,6 +3,8 @@
 use crate::framework::{ChildGuard, binary_path};
 use anyhow::Context;
 use anyhow::{Result, bail};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -120,12 +122,9 @@ async fn start_cfapi_adapter_with_resolved_inputs(
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
     let unique_sync_root_id = {
-        let suffix = root_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("sync-root");
-        format!("{sync_root_id}.{suffix}")
+        let mut hasher = DefaultHasher::new();
+        root_path_arg.hash(&mut hasher);
+        format!("{sync_root_id}.{:016x}", hasher.finish())
     };
 
     let register_output = Command::new(&os_integration_bin)
