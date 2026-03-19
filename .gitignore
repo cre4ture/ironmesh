@@ -13,3 +13,4 @@ web/**/dist
 web/.turbo
 web/playwright-report
 web/test-results
+!.vscode/extensions.json
