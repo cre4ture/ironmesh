@@ -42,7 +42,36 @@ pub struct WebUiConfig {
     pub server_ca_pem: Option<String>,
     pub client_identity: Option<ClientIdentityMaterial>,
     pub connection_bootstrap: Option<ConnectionBootstrap>,
+    pub connection_bootstrap_persistence: Option<WebUiBootstrapPersistence>,
     pub transport_client: Option<IronMeshClient>,
+}
+
+type PersistBootstrapFn = dyn Fn(&ConnectionBootstrap) -> Result<()> + Send + Sync;
+
+#[derive(Clone)]
+pub struct WebUiBootstrapPersistence {
+    source: &'static str,
+    persist: Arc<PersistBootstrapFn>,
+}
+
+impl WebUiBootstrapPersistence {
+    pub fn new<F>(source: &'static str, persist: F) -> Self
+    where
+        F: Fn(&ConnectionBootstrap) -> Result<()> + Send + Sync + 'static,
+    {
+        Self {
+            source,
+            persist: Arc::new(persist),
+        }
+    }
+
+    fn persist(&self, bootstrap: &ConnectionBootstrap) -> Result<()> {
+        (self.persist)(bootstrap)
+    }
+
+    fn source(&self) -> &'static str {
+        self.source
+    }
 }
 
 impl WebUiConfig {
@@ -53,6 +82,7 @@ impl WebUiConfig {
             server_ca_pem: None,
             client_identity: None,
             connection_bootstrap: None,
+            connection_bootstrap_persistence: None,
             transport_client: None,
         }
     }
@@ -64,6 +94,7 @@ impl WebUiConfig {
             server_ca_pem: None,
             client_identity: None,
             connection_bootstrap: None,
+            connection_bootstrap_persistence: None,
             transport_client: Some(client),
         }
     }
@@ -85,6 +116,14 @@ impl WebUiConfig {
 
     pub fn with_connection_bootstrap(mut self, bootstrap: ConnectionBootstrap) -> Self {
         self.connection_bootstrap = Some(bootstrap);
+        self
+    }
+
+    pub fn with_connection_bootstrap_persistence(
+        mut self,
+        persistence: WebUiBootstrapPersistence,
+    ) -> Self {
+        self.connection_bootstrap_persistence = Some(persistence);
         self
     }
 
@@ -112,6 +151,7 @@ struct WebRuntime {
 struct WebRendezvousRuntimeConfig {
     bootstrap: ConnectionBootstrap,
     client_identity: Option<ClientIdentityMaterial>,
+    persistence: Option<WebUiBootstrapPersistence>,
 }
 
 pub fn router(config: WebUiConfig) -> Router {
@@ -154,6 +194,7 @@ pub fn router(config: WebUiConfig) -> Router {
                 .map(|bootstrap| WebRendezvousRuntimeConfig {
                     bootstrap,
                     client_identity: config.client_identity,
+                    persistence: config.connection_bootstrap_persistence,
                 }),
             last_rendezvous_probe_error: None,
             last_rendezvous_probe_statuses: Vec::new(),
@@ -393,11 +434,22 @@ async fn build_rendezvous_view(state: &WebState) -> WebClientRendezvousView {
             .as_ref()
             .map(|config| config.bootstrap.rendezvous_mtls_required)
             .unwrap_or(false),
-        persistence_source: if runtime.rendezvous.is_some() {
-            "runtime_only"
-        } else {
-            "unavailable"
-        },
+        persistence_source: runtime
+            .rendezvous
+            .as_ref()
+            .and_then(|config| {
+                config
+                    .persistence
+                    .as_ref()
+                    .map(WebUiBootstrapPersistence::source)
+            })
+            .unwrap_or_else(|| {
+                if runtime.rendezvous.is_some() {
+                    "runtime_only"
+                } else {
+                    "unavailable"
+                }
+            }),
         last_probe_error: runtime.last_rendezvous_probe_error.clone(),
         endpoint_statuses,
     }
@@ -443,25 +495,20 @@ async fn probe_rendezvous_and_build_view(state: &WebState) -> WebClientRendezvou
     build_rendezvous_view(state).await
 }
 
-async fn rebuild_runtime_client(
+async fn apply_runtime_client(
     state: &WebState,
+    sdk: IronMeshClient,
     bootstrap: ConnectionBootstrap,
     client_identity: Option<ClientIdentityMaterial>,
+    persistence: Option<WebUiBootstrapPersistence>,
 ) -> Result<()> {
-    let build_bootstrap = bootstrap.clone();
-    let build_identity = client_identity.clone();
-    let sdk = tokio::task::spawn_blocking(move || {
-        build_bootstrap.build_client_with_optional_identity(build_identity.as_ref())
-    })
-    .await
-    .context("client rebuild task panicked")??;
-
     let mut runtime = state.runtime.write().await;
     runtime.sdk = sdk.clone();
     runtime.client = ClientNode::with_client(sdk);
     runtime.rendezvous = Some(WebRendezvousRuntimeConfig {
         bootstrap,
         client_identity,
+        persistence,
     });
     runtime.last_rendezvous_probe_error = None;
     runtime.last_rendezvous_probe_statuses = Vec::new();
@@ -840,7 +887,38 @@ async fn web_update_rendezvous(
         return error_response(StatusCode::BAD_REQUEST, error.to_string());
     }
 
-    if let Err(error) = rebuild_runtime_client(&state, bootstrap, existing.client_identity).await {
+    let build_bootstrap = bootstrap.clone();
+    let build_identity = existing.client_identity.clone();
+    let sdk_result = tokio::task::spawn_blocking(move || {
+        build_bootstrap.build_client_with_optional_identity(build_identity.as_ref())
+    })
+    .await;
+    let sdk = match sdk_result {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("client rebuild task panicked: {error}"),
+            );
+        }
+    };
+
+    if let Some(persistence) = existing.persistence.as_ref()
+        && let Err(error) = persistence.persist(&bootstrap)
+    {
+        return error_response(StatusCode::BAD_GATEWAY, error.to_string());
+    }
+
+    if let Err(error) = apply_runtime_client(
+        &state,
+        sdk,
+        bootstrap,
+        existing.client_identity,
+        existing.persistence,
+    )
+    .await
+    {
         return error_response(StatusCode::BAD_GATEWAY, error.to_string());
     }
 

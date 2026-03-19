@@ -424,10 +424,20 @@ function RendezvousPage() {
           Start the Android or CLI client from bootstrap configuration to manage them here.
         </Alert>
       ) : null}
-      {rendezvous?.editable ? (
+      {rendezvous?.editable && rendezvous.persistence_source === "runtime_only" ? (
         <Alert color="yellow" title="Runtime-only change scope">
           Rendezvous URL edits apply to the current embedded client runtime now, but they are not persisted back into the
           original Android or CLI bootstrap source automatically.
+        </Alert>
+      ) : null}
+      {rendezvous?.editable && rendezvous.persistence_source === "android_preferences" ? (
+        <Alert color="teal" title="Persisted to Android preferences">
+          Rendezvous URL edits are written back into the Android app's persisted bootstrap state and will be reused after restart.
+        </Alert>
+      ) : null}
+      {rendezvous?.editable && rendezvous.persistence_source === "bootstrap_file" ? (
+        <Alert color="teal" title="Persisted to bootstrap file">
+          Rendezvous URL edits are written back into the bootstrap file that launched this web session.
         </Alert>
       ) : null}
 
@@ -451,7 +461,7 @@ function RendezvousPage() {
                 <Badge variant="light">{rendezvous?.editable ? "editable" : "read-only"}</Badge>
               </Group>
               <Text c="dimmed" size="sm">
-                One URL per line. The shared web UI updates the in-memory bootstrap runtime used for future relay connection trials.
+                One URL per line. The shared web UI updates the bootstrap-backed rendezvous configuration used for future relay connection trials.
               </Text>
               <Textarea
                 label="Configured rendezvous URLs"

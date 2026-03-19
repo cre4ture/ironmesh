@@ -8,7 +8,7 @@ use client_sdk::{
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use web_ui_backend::WebUiConfig;
+use web_ui_backend::{WebUiBootstrapPersistence, WebUiConfig};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
@@ -128,7 +128,13 @@ async fn main() -> Result<()> {
                     let server_ca_override = read_server_ca_override_from_cli(&cli)?;
                     let bootstrap =
                         load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
-                    web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
+                    let persistence_path = bootstrap_path.to_path_buf();
+                    web_ui_config = web_ui_config
+                        .with_connection_bootstrap(bootstrap)
+                        .with_connection_bootstrap_persistence(WebUiBootstrapPersistence::new(
+                            "bootstrap_file",
+                            move |bootstrap| bootstrap.write_to_path(&persistence_path),
+                        ));
                 }
                 if let Some(identity) = read_client_identity_from_cli(&cli)? {
                     web_ui_config = web_ui_config.with_client_identity(identity);

@@ -30,7 +30,7 @@ export type ClientRendezvousView = {
   active_url: string | null;
   active_target_node_id: string | null;
   mtls_required: boolean;
-  persistence_source: "runtime_only" | "unavailable";
+  persistence_source: "runtime_only" | "bootstrap_file" | "android_preferences" | "unavailable";
   last_probe_error: string | null;
   endpoint_statuses: ClientRendezvousEndpointStatus[];
 };

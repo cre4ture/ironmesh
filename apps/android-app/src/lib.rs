@@ -7,7 +7,8 @@ use client_sdk::{
     IronMeshClient, build_reqwest_client_from_pem, build_signed_request_headers,
 };
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
+use jni::JavaVM;
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyte, jbyteArray, jint, jstring};
 use reqwest::Method;
 use reqwest::Url;
@@ -54,6 +55,71 @@ struct WebUiServer {
 fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
     static STATE: OnceLock<Mutex<Option<WebUiServer>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(None))
+}
+
+struct AndroidPreferencesBridgeState {
+    vm: JavaVM,
+    class: GlobalRef,
+}
+
+fn android_preferences_bridge_state() -> &'static OnceLock<AndroidPreferencesBridgeState> {
+    static STATE: OnceLock<AndroidPreferencesBridgeState> = OnceLock::new();
+    &STATE
+}
+
+fn initialize_android_preferences_bridge(env: &mut JNIEnv) -> Result<()> {
+    if android_preferences_bridge_state().get().is_some() {
+        return Ok(());
+    }
+
+    let vm = env
+        .get_java_vm()
+        .context("failed to capture Java VM for preferences bridge")?;
+    let class = env
+        .find_class("io/ironmesh/android/data/RustPreferencesBridge")
+        .context("failed to find RustPreferencesBridge class")?;
+    let global = env
+        .new_global_ref(class)
+        .context("failed to globalize RustPreferencesBridge class")?;
+    let _ =
+        android_preferences_bridge_state().set(AndroidPreferencesBridgeState { vm, class: global });
+    Ok(())
+}
+
+fn with_android_preferences_env<T>(
+    f: impl for<'local> FnOnce(&mut JNIEnv<'local>, JClass<'local>) -> Result<T>,
+) -> Result<T> {
+    let state = android_preferences_bridge_state()
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("android preferences bridge has not been initialized"))?;
+    let mut env = state
+        .vm
+        .attach_current_thread()
+        .context("failed to attach web UI thread to JVM")?;
+    let class_ref = env
+        .new_local_ref(state.class.as_obj())
+        .context("failed to create local RustPreferencesBridge class ref")?;
+    let class = JClass::from(class_ref);
+    f(&mut env, class)
+}
+
+fn persist_android_connection_bootstrap(bootstrap: &ConnectionBootstrap) -> Result<()> {
+    let json = bootstrap
+        .to_json_pretty()
+        .context("failed to serialize android bootstrap for persistence")?;
+    with_android_preferences_env(|env, class| {
+        let bootstrap_json = env
+            .new_string(&json)
+            .context("failed to allocate bootstrap JSON string")?;
+        env.call_static_method(
+            &class,
+            "updateDeviceAuthBootstrapJson",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(bootstrap_json.as_ref())],
+        )
+        .context("failed to persist updated bootstrap JSON to Android preferences")?;
+        Ok(())
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -342,7 +408,12 @@ fn start_embedded_web_ui(
         if let Some(server_ca_pem) = server_ca_pem.as_ref() {
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
-        web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
+        web_ui_config = web_ui_config
+            .with_connection_bootstrap(bootstrap)
+            .with_connection_bootstrap_persistence(web_ui_backend::WebUiBootstrapPersistence::new(
+                "android_preferences",
+                persist_android_connection_bootstrap,
+            ));
     }
     if let Some(identity) = parse_client_identity_json(client_identity_json.clone())? {
         web_ui_config = web_ui_config.with_client_identity(identity);
@@ -693,6 +764,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         let connection_input: String = env.get_string(&connection_input)?.into();
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
         start_embedded_web_ui(connection_input, server_ca_pem, client_identity_json)
     })();
 

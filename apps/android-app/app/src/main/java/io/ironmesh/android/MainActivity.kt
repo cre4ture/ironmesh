@@ -93,6 +93,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.data.RustSafBridge
+import io.ironmesh.android.data.RustPreferencesBridge
 import io.ironmesh.android.ui.GalleryViewMode
 import io.ironmesh.android.ui.GalleryImageItem
 import io.ironmesh.android.ui.GallerySortOption
@@ -110,6 +111,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         RustSafBridge.initialize(applicationContext)
+        RustPreferencesBridge.initialize(applicationContext)
         enableEdgeToEdge()
 
         setContent {
