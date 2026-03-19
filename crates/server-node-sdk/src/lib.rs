@@ -113,9 +113,10 @@ struct ServerState {
     public_tls_runtime: Option<PublicTlsRuntime>,
     internal_tls_runtime: Option<InternalTlsRuntime>,
     rendezvous_ca_pem: Option<String>,
-    rendezvous_urls: Vec<String>,
+    rendezvous_urls: Arc<StdMutex<Vec<String>>>,
     rendezvous_registration_enabled: bool,
     rendezvous_mtls_required: bool,
+    managed_rendezvous_public_url: Option<String>,
     relay_mode: RelayMode,
     enrollment_issuer_url: Option<String>,
     node_enrollment_path: Option<PathBuf>,
@@ -151,6 +152,13 @@ struct PublicTlsRuntime {
 struct OutboundClients {
     internal_http: reqwest::Client,
     rendezvous_control: Option<RendezvousControlClient>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RendezvousConfigPersistenceSource {
+    NodeEnrollment,
+    RuntimeOnly,
 }
 
 #[derive(Clone)]
@@ -1191,6 +1199,29 @@ async fn current_rendezvous_control(state: &ServerState) -> Option<RendezvousCon
         .clone()
 }
 
+fn current_rendezvous_urls(state: &ServerState) -> Vec<String> {
+    state
+        .rendezvous_urls
+        .lock()
+        .expect("rendezvous URL mutex poisoned")
+        .clone()
+}
+
+fn replace_rendezvous_urls(state: &ServerState, urls: Vec<String>) {
+    *state
+        .rendezvous_urls
+        .lock()
+        .expect("rendezvous URL mutex poisoned") = urls;
+}
+
+fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
+    let urls = current_rendezvous_urls(state);
+    match state.managed_rendezvous_public_url.as_deref() {
+        Some(managed_url) => urls.into_iter().filter(|url| url != managed_url).collect(),
+        None => urls,
+    }
+}
+
 fn current_bootstrap_trust_roots(state: &ServerState) -> Result<BootstrapTrustRoots> {
     // Enrollment packages are the supported production lifecycle source for trust roots.
     // Direct env/file CA wiring remains useful for development/testing or short-lived
@@ -1256,7 +1287,10 @@ fn load_live_trust_material(state: &ServerState) -> Result<LiveTrustMaterial> {
     })
 }
 
-fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
+fn build_outbound_clients_with_urls(
+    state: &ServerState,
+    rendezvous_urls: &[String],
+) -> Result<OutboundClients> {
     let trust_material = load_live_trust_material(state)?;
     let internal_http = if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
         build_internal_mtls_http_client(
@@ -1268,7 +1302,8 @@ fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
         reqwest::Client::new()
     };
 
-    let rendezvous_control = if state.rendezvous_registration_enabled {
+    let rendezvous_control = if state.rendezvous_registration_enabled && !rendezvous_urls.is_empty()
+    {
         let rendezvous_client_identity_pem = state
             .internal_tls_runtime
             .as_ref()
@@ -1277,7 +1312,7 @@ fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
         Some(RendezvousControlClient::new(
             RendezvousClientConfig {
                 cluster_id: state.cluster_id,
-                rendezvous_urls: state.rendezvous_urls.clone(),
+                rendezvous_urls: rendezvous_urls.to_vec(),
                 heartbeat_interval_secs: state.peer_heartbeat_config.interval_secs.max(5),
             },
             trust_material
@@ -1295,6 +1330,11 @@ fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
         internal_http,
         rendezvous_control,
     })
+}
+
+fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
+    let rendezvous_urls = current_rendezvous_urls(state);
+    build_outbound_clients_with_urls(state, &rendezvous_urls)
 }
 
 async fn reload_live_outbound_clients(state: &ServerState) -> Result<()> {
@@ -2602,9 +2642,13 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         public_tls_runtime,
         internal_tls_runtime,
         rendezvous_ca_pem,
-        rendezvous_urls: config.rendezvous_urls.clone(),
+        rendezvous_urls: Arc::new(StdMutex::new(config.rendezvous_urls.clone())),
         rendezvous_registration_enabled: config.rendezvous_registration_enabled,
         rendezvous_mtls_required: config.rendezvous_mtls_required,
+        managed_rendezvous_public_url: config
+            .managed_rendezvous
+            .as_ref()
+            .map(|managed| managed.public_url.clone()),
         relay_mode: config.relay_mode,
         enrollment_issuer_url: config.enrollment_issuer_url.clone(),
         node_enrollment_path: config.node_enrollment_path.clone(),
@@ -2755,6 +2799,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/admin/session", get(get_admin_session_status))
         .route("/auth/admin/login", post(login_admin_session))
         .route("/auth/admin/logout", post(logout_admin_session))
+        .route(
+            "/auth/rendezvous-config",
+            get(get_rendezvous_config).put(update_rendezvous_config),
+        )
         .route("/auth/client-credentials", get(list_client_credentials))
         .route(
             "/auth/client-credentials/{device_id}",
@@ -3314,7 +3362,7 @@ fn peer_connection_candidates(
         );
     }
     if state.relay_mode != RelayMode::Disabled && node.relay_capable() {
-        for relay_url in &state.rendezvous_urls {
+        for relay_url in current_rendezvous_urls(state) {
             let Some(endpoint) = normalize_optional_url(Some(relay_url.as_str())) else {
                 continue;
             };
@@ -5436,6 +5484,22 @@ struct ManagedControlPlanePromotionImportResponse {
     rendezvous_key_path: String,
 }
 
+#[derive(Debug, Serialize)]
+struct RendezvousConfigView {
+    effective_urls: Vec<String>,
+    editable_urls: Vec<String>,
+    managed_embedded_url: Option<String>,
+    registration_enabled: bool,
+    mtls_required: bool,
+    persistence_source: RendezvousConfigPersistenceSource,
+    persisted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateRendezvousConfigRequest {
+    editable_urls: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AdminLoginRequest {
     password: String,
@@ -5632,7 +5696,7 @@ fn bootstrap_trust_roots(
 
 fn bootstrap_rendezvous_urls(state: &ServerState) -> std::result::Result<Vec<String>, StatusCode> {
     Ok(if state.rendezvous_registration_enabled {
-        state.rendezvous_urls.clone()
+        current_rendezvous_urls(state)
     } else {
         Vec::new()
     })
@@ -6726,7 +6790,7 @@ async fn export_managed_rendezvous_failover_handler(
     let public_url = request
         .public_url
         .clone()
-        .or_else(|| state.rendezvous_urls.first().cloned());
+        .or_else(|| current_rendezvous_urls(&state).first().cloned());
     let Some(public_url) = public_url else {
         append_admin_audit(
             &state,
@@ -7081,7 +7145,7 @@ async fn export_managed_control_plane_promotion_handler(
     let public_url = request
         .public_url
         .clone()
-        .or_else(|| state.rendezvous_urls.first().cloned());
+        .or_else(|| current_rendezvous_urls(&state).first().cloned());
     let Some(public_url) = public_url else {
         append_admin_audit(
             &state,
@@ -7869,6 +7933,225 @@ async fn list_client_credentials(
     .await;
 
     (StatusCode::OK, Json(credentials)).into_response()
+}
+
+fn rendezvous_config_persistence_source(state: &ServerState) -> RendezvousConfigPersistenceSource {
+    if state.node_enrollment_path.is_some() {
+        RendezvousConfigPersistenceSource::NodeEnrollment
+    } else {
+        RendezvousConfigPersistenceSource::RuntimeOnly
+    }
+}
+
+fn build_rendezvous_config_view(state: &ServerState, persisted: bool) -> RendezvousConfigView {
+    RendezvousConfigView {
+        effective_urls: current_rendezvous_urls(state),
+        editable_urls: current_editable_rendezvous_urls(state),
+        managed_embedded_url: state.managed_rendezvous_public_url.clone(),
+        registration_enabled: state.rendezvous_registration_enabled,
+        mtls_required: state.rendezvous_mtls_required,
+        persistence_source: rendezvous_config_persistence_source(state),
+        persisted,
+    }
+}
+
+fn normalize_rendezvous_url_list(values: &[String]) -> Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed = reqwest::Url::parse(trimmed)
+            .with_context(|| format!("invalid rendezvous URL {trimmed:?}"))?;
+        let canonical = parsed.to_string();
+        if seen.insert(canonical.clone()) {
+            normalized.push(canonical);
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn build_effective_rendezvous_urls(
+    state: &ServerState,
+    editable_urls: &[String],
+) -> Result<Vec<String>> {
+    let mut effective_urls = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(managed_url) = state.managed_rendezvous_public_url.as_deref() {
+        let parsed = reqwest::Url::parse(managed_url)
+            .with_context(|| format!("invalid managed rendezvous URL {managed_url:?}"))?;
+        let canonical = parsed.to_string();
+        seen.insert(canonical.clone());
+        effective_urls.push(canonical);
+    }
+
+    for url in normalize_rendezvous_url_list(editable_urls)? {
+        if seen.insert(url.clone()) {
+            effective_urls.push(url);
+        }
+    }
+
+    Ok(effective_urls)
+}
+
+fn persist_rendezvous_urls_if_possible(
+    state: &ServerState,
+    effective_urls: &[String],
+) -> Result<bool> {
+    let Some(path) = state.node_enrollment_path.as_ref() else {
+        return Ok(false);
+    };
+
+    let mut package = NodeEnrollmentPackage::from_path(path)?;
+    package.bootstrap.rendezvous_urls = effective_urls.to_vec();
+    package.write_to_path(path)?;
+    Ok(true)
+}
+
+async fn get_rendezvous_config(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/rendezvous-config/get";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let view = build_rendezvous_config_view(&state, state.node_enrollment_path.is_some());
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "effective_urls": view.effective_urls.len(),
+            "editable_urls": view.editable_urls.len(),
+            "persistence_source": view.persistence_source,
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(view)).into_response()
+}
+
+async fn update_rendezvous_config(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateRendezvousConfigRequest>,
+) -> impl IntoResponse {
+    let action = "auth/rendezvous-config/update";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "editable_urls": request.editable_urls }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let effective_urls = match build_effective_rendezvous_urls(&state, &request.editable_urls) {
+        Ok(urls) => urls,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let outbound_clients = match build_outbound_clients_with_urls(&state, &effective_urls) {
+        Ok(clients) => clients,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let persisted = match persist_rendezvous_urls_if_possible(&state, &effective_urls) {
+        Ok(persisted) => persisted,
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    replace_rendezvous_urls(&state, effective_urls);
+    *state.outbound_clients.write().await = outbound_clients;
+    let view = build_rendezvous_config_view(&state, persisted);
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "effective_urls": view.effective_urls,
+            "editable_urls": view.editable_urls,
+            "persistence_source": view.persistence_source,
+            "persisted": view.persisted,
+        }),
+    )
+    .await;
+
+    (StatusCode::OK, Json(view)).into_response()
 }
 
 async fn revoke_client_credential(

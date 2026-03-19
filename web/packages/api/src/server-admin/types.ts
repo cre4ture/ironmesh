@@ -140,6 +140,16 @@ export type NodeCertificateStatusResponse = {
   };
 };
 
+export type RendezvousConfigView = {
+  effective_urls: string[];
+  editable_urls: string[];
+  managed_embedded_url: string | null;
+  registration_enabled: boolean;
+  mtls_required: boolean;
+  persistence_source: "node_enrollment" | "runtime_only";
+  persisted: boolean;
+};
+
 export type ManagedControlPlanePromotionPackage = {
   signer_backup: Record<string, unknown>;
   rendezvous_failover: Record<string, unknown>;

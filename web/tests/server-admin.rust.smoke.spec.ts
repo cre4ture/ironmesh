@@ -25,6 +25,12 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("Auto renew", { exact: true })).toBeVisible();
 
   await page.getByText("Control Plane", { exact: true }).click();
+  await expect(page.getByText("Rendezvous service URLs")).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "Editable operator-managed URLs" })
+    .fill("https://rendezvous.example:9443");
+  await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
+  await expect(page.locator("pre").filter({ hasText: "rendezvous.example:9443" }).first()).toBeVisible();
   await expect(page.getByText("Export rendezvous-only failover package")).toBeVisible();
   await expect(page.getByText("Dedicated standalone rendezvous-service")).toBeVisible();
 

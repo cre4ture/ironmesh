@@ -595,7 +595,7 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     state.public_ca_pem = Some("public-ca".to_string());
     state.cluster_ca_pem = Some("cluster-ca".to_string());
     state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
-    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
 
@@ -818,7 +818,7 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
     state.public_ca_pem = Some("public-ca".to_string());
     state.cluster_ca_pem = Some("cluster-ca".to_string());
     state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
-    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
     state.relay_mode = transport_sdk::RelayMode::Required;
@@ -926,7 +926,7 @@ async fn issue_local_edge_bootstrap_defaults_public_peer_api_when_rendezvous_is_
     state.public_ca_pem = Some("public-ca".to_string());
     state.cluster_ca_pem = Some("cluster-ca".to_string());
     state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
-    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.rendezvous_registration_enabled = true;
     state.relay_mode = transport_sdk::RelayMode::Fallback;
 
@@ -986,7 +986,7 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
     state.public_ca_pem = Some(public_ca_pem.clone());
     state.public_ca_key_pem = Some(public_ca_key_pem);
     state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
-    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
 
@@ -1304,7 +1304,7 @@ async fn issue_node_enrollment_allows_local_edge_with_public_tls_only() {
     let (public_ca_pem, public_ca_key_pem) = generate_test_internal_ca();
     state.public_ca_pem = Some(public_ca_pem);
     state.public_ca_key_pem = Some(public_ca_key_pem);
-    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.rendezvous_registration_enabled = true;
 
     let mut headers = HeaderMap::new();
@@ -1609,7 +1609,7 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
     state.internal_ca_key_pem = Some(internal_ca_key_pem);
     state.public_ca_pem = Some(public_ca_pem);
     state.public_ca_key_pem = Some(public_ca_key_pem);
-    state.rendezvous_urls = vec!["https://rendezvous.example".to_string()];
+    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.rendezvous_registration_enabled = true;
 
     let mut headers = HeaderMap::new();
@@ -2356,7 +2356,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
 
     state.enrollment_issuer_url = config.enrollment_issuer_url.clone();
     state.node_enrollment_path = Some(package_path.clone());
-    state.rendezvous_urls = vec![format!("https://{capture_bind_addr}")];
+    *state.rendezvous_urls.lock().unwrap() = vec![format!("https://{capture_bind_addr}")];
     state.rendezvous_registration_enabled = true;
     state.internal_tls_runtime = Some(super::InternalTlsRuntime {
         config: super::build_internal_mtls_rustls_config(
@@ -2475,7 +2475,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
 
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let rendezvous_url = format!("https://{bind_addr}");
-    state.rendezvous_urls = vec![rendezvous_url.clone()];
+    *state.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
     state.rendezvous_registration_enabled = true;
 
     transport_sdk::NodeEnrollmentPackage {
@@ -3685,9 +3685,12 @@ async fn build_test_state(
         public_tls_runtime: None,
         internal_tls_runtime: None,
         rendezvous_ca_pem: None,
-        rendezvous_urls: vec!["http://127.0.0.1:39080".to_string()],
+        rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
+            "http://127.0.0.1:39080".to_string(),
+        ])),
         rendezvous_registration_enabled: false,
         rendezvous_mtls_required: false,
+        managed_rendezvous_public_url: None,
         relay_mode: super::RelayMode::Fallback,
         enrollment_issuer_url: None,
         node_enrollment_path: None,
@@ -4118,7 +4121,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
 
     let relay_bind_addr = free_bind_addr();
     let relay_base_url = format!("http://{relay_bind_addr}");
-    state.rendezvous_urls = vec![relay_base_url.clone()];
+    *state.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
 
     let rendezvous_client = transport_sdk::RendezvousControlClient::new(
         transport_sdk::RendezvousClientConfig {

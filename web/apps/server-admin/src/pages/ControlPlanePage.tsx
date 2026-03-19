@@ -1,12 +1,15 @@
 import {
   exportManagedControlPlanePromotion,
   exportManagedRendezvousFailover,
+  getRendezvousConfig,
   importManagedControlPlanePromotion,
   importManagedRendezvousFailover,
   type ControlPlanePromotionImportResponse,
   type ManagedControlPlanePromotionPackage,
   type ManagedRendezvousFailoverImportResponse,
-  type ManagedRendezvousFailoverPackage
+  type ManagedRendezvousFailoverPackage,
+  type RendezvousConfigView,
+  updateRendezvousConfig
 } from "@ironmesh/api";
 import { JsonBlock } from "@ironmesh/ui";
 import {
@@ -22,11 +25,14 @@ import {
   TextInput,
   Textarea
 } from "@mantine/core";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 
 export function ControlPlanePage() {
   const { adminTokenOverride } = useAdminAccess();
+  const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
+  const [editableRendezvousUrlsText, setEditableRendezvousUrlsText] = useState("");
+  const [rendezvousConfigLoading, setRendezvousConfigLoading] = useState(true);
   const [rendezvousPassphrase, setRendezvousPassphrase] = useState("");
   const [rendezvousTargetNodeId, setRendezvousTargetNodeId] = useState("");
   const [rendezvousPublicUrl, setRendezvousPublicUrl] = useState("");
@@ -45,8 +51,57 @@ export function ControlPlanePage() {
   const [promotionImportResult, setPromotionImportResult] = useState<ControlPlanePromotionImportResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<
-    "rendezvous-export" | "rendezvous-import" | "promotion-export" | "promotion-import" | null
+    "rendezvous-config-save" | "rendezvous-export" | "rendezvous-import" | "promotion-export" | "promotion-import" | null
   >(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function refreshRendezvousConfig() {
+      setRendezvousConfigLoading(true);
+      try {
+        const payload = await getRendezvousConfig(adminTokenOverride);
+        if (cancelled) {
+          return;
+        }
+        setRendezvousConfig(payload);
+        setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
+      } catch (actionError) {
+        if (cancelled) {
+          return;
+        }
+        setError(actionError instanceof Error ? actionError.message : String(actionError));
+      } finally {
+        if (!cancelled) {
+          setRendezvousConfigLoading(false);
+        }
+      }
+    }
+
+    void refreshRendezvousConfig();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [adminTokenOverride]);
+
+  async function handleSaveRendezvousConfig() {
+    setPendingAction("rendezvous-config-save");
+    setError(null);
+    try {
+      const editable_urls = editableRendezvousUrlsText
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const payload = await updateRendezvousConfig({ editable_urls }, adminTokenOverride);
+      setRendezvousConfig(payload);
+      setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : String(actionError));
+    } finally {
+      setPendingAction(null);
+    }
+  }
 
   async function handleExportRendezvousFailover() {
     setPendingAction("rendezvous-export");
@@ -137,6 +192,73 @@ export function ControlPlanePage() {
         The new admin surface now exposes both supported transfer paths: move the embedded rendezvous role by itself,
         or move the full control plane together. Both are deliberate failover workflows, not active-active clustering.
       </Text>
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="md">
+          <Group justify="space-between">
+            <Text fw={700}>Rendezvous service URLs</Text>
+            <Badge variant="light">
+              {rendezvousConfig ? `${rendezvousConfig.effective_urls.length} effective` : "loading"}
+            </Badge>
+          </Group>
+          <Text c="dimmed">
+            Review the currently configured rendezvous services for this node, and edit the operator-managed URLs that
+            should be used for registration, relay, and issued bootstraps. The node’s own embedded managed rendezvous
+            URL stays separate and read-only here.
+          </Text>
+          {rendezvousConfig?.persistence_source === "runtime_only" ? (
+            <Alert color="yellow" title="Runtime-only persistence">
+              This node does not currently have a persisted node enrollment package, so rendezvous URL edits apply live
+              now but will be lost after restart unless the underlying startup config is updated too.
+            </Alert>
+          ) : null}
+          {!rendezvousConfig?.registration_enabled && !rendezvousConfigLoading ? (
+            <Alert color="blue" title="Rendezvous registration is disabled">
+              This node currently has rendezvous registration disabled. URL edits are still stored, but they will not
+              be used for active registration until rendezvous participation is enabled by the node’s runtime mode.
+            </Alert>
+          ) : null}
+          <Grid>
+            <Grid.Col span={{ base: 12, xl: 6 }}>
+              <Stack gap="sm">
+                <Text fw={600}>Current effective configuration</Text>
+                <JsonBlock
+                  value={
+                    rendezvousConfig ?? {
+                      status: rendezvousConfigLoading ? "loading" : "unavailable"
+                    }
+                  }
+                />
+              </Stack>
+            </Grid.Col>
+            <Grid.Col span={{ base: 12, xl: 6 }}>
+              <Stack gap="sm">
+                <Text fw={600}>Editable operator-managed URLs</Text>
+                <Textarea
+                  label="Editable operator-managed URLs"
+                  minRows={10}
+                  autosize
+                  value={editableRendezvousUrlsText}
+                  onChange={(event) => setEditableRendezvousUrlsText(event.currentTarget.value)}
+                  placeholder={"https://rendezvous-a.example:9443\nhttps://rendezvous-b.example:9443"}
+                />
+                <Text size="sm" c="dimmed">
+                  One URL per line. These are merged with the embedded managed rendezvous URL when that role is active
+                  on this node.
+                </Text>
+                <Group>
+                  <Button
+                    onClick={() => void handleSaveRendezvousConfig()}
+                    loading={pendingAction === "rendezvous-config-save"}
+                  >
+                    Save rendezvous URLs
+                  </Button>
+                </Group>
+              </Stack>
+            </Grid.Col>
+          </Grid>
+        </Stack>
+      </Card>
 
       <Grid>
         <Grid.Col span={{ base: 12, xl: 6 }}>
@@ -339,8 +461,8 @@ export function ControlPlanePage() {
           <Text size="sm" c="dimmed">2. Move signer plus embedded rendezvous together with the full control-plane promotion package.</Text>
           <Text size="sm" c="dimmed">
             For a dedicated standalone service, keep the same stable public rendezvous URL or VIP, provision the
-            service separately with the right TLS and trust material, and treat cutover as a manual operator step for
-            now.
+            service separately with the right TLS and trust material, add its URL in the editor above on the
+            participating server nodes, and treat signer/cert material cutover as a manual operator step for now.
           </Text>
         </Stack>
       </Card>

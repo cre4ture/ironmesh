@@ -12,6 +12,7 @@ import type {
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
+  RendezvousConfigView,
   ReplicationPlan,
   SetupStatus,
   SetupTransitionResponse
@@ -200,6 +201,25 @@ export async function getNodeCertificateStatus(
 ): Promise<NodeCertificateStatusResponse> {
   return fetchAdminJson<NodeCertificateStatusResponse>("/auth/node-certificates/status", {
     adminTokenOverride
+  });
+}
+
+export async function getRendezvousConfig(
+  adminTokenOverride?: string
+): Promise<RendezvousConfigView> {
+  return fetchAdminJson<RendezvousConfigView>("/auth/rendezvous-config", {
+    adminTokenOverride
+  });
+}
+
+export async function updateRendezvousConfig(
+  request: { editable_urls: string[] },
+  adminTokenOverride?: string
+): Promise<RendezvousConfigView> {
+  return fetchAdminJson<RendezvousConfigView>("/auth/rendezvous-config", {
+    method: "PUT",
+    adminTokenOverride,
+    body: request
   });
 }
 

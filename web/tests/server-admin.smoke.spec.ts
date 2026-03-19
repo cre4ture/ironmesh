@@ -47,6 +47,13 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
 
   await page.getByText("Control Plane", { exact: true }).click();
+  await expect(page.getByText("embedded-rendezvous.local:9443")).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "Editable operator-managed URLs" })
+    .fill("https://rendezvous-a.local:9443\nhttps://rendezvous-b.local:9443");
+  await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
+  await expect(page.locator("pre").filter({ hasText: "rendezvous-b.local:9443" }).first()).toBeVisible();
+
   await page.getByRole("textbox", { name: "Target node ID" }).first().fill("node-beta");
   await page.getByLabel("Passphrase").first().fill("rendezvous-passphrase");
   await page.getByRole("button", { name: "Export rendezvous failover package" }).click();
@@ -82,6 +89,15 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 async function installServerAdminMocks(page: Page, options?: { setupMode?: boolean }) {
   let authenticated = false;
   const revokedDeviceIds = new Set<string>();
+  let rendezvousConfig = {
+    effective_urls: ["https://embedded-rendezvous.local:9443", "https://rendezvous-a.local:9443"],
+    editable_urls: ["https://rendezvous-a.local:9443"],
+    managed_embedded_url: "https://embedded-rendezvous.local:9443",
+    registration_enabled: true,
+    mtls_required: true,
+    persistence_source: "node_enrollment",
+    persisted: true
+  };
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -292,6 +308,23 @@ async function installServerAdminMocks(page: Page, options?: { setupMode?: boole
 
     if (pathname === "/auth/client-credentials" && method === "GET") {
       return json(route, buildCredentialList(revokedDeviceIds));
+    }
+
+    if (pathname === "/auth/rendezvous-config" && method === "GET") {
+      return json(route, rendezvousConfig);
+    }
+
+    if (pathname === "/auth/rendezvous-config" && method === "PUT") {
+      const body = route.request().postDataJSON() as { editable_urls?: string[] };
+      rendezvousConfig = {
+        ...rendezvousConfig,
+        editable_urls: body.editable_urls ?? [],
+        effective_urls: [
+          "https://embedded-rendezvous.local:9443",
+          ...(body.editable_urls ?? [])
+        ]
+      };
+      return json(route, rendezvousConfig);
     }
 
     if (pathname.startsWith("/auth/client-credentials/") && method === "DELETE") {
