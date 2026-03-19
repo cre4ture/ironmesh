@@ -11,7 +11,7 @@ import { useAdminAccess } from "../lib/admin-access";
 type SurfaceMode = "probing" | "runtime" | "setup";
 
 export function ServerAdminShell() {
-  const [opened, { toggle }] = useDisclosure();
+  const [opened, { toggle, close }] = useDisclosure();
   const [accessOpened, accessControls] = useDisclosure(false);
   const [surfaceMode, setSurfaceMode] = useState<SurfaceMode>("probing");
   const [surfaceError, setSurfaceError] = useState<string | null>(null);
@@ -61,12 +61,13 @@ export function ServerAdminShell() {
   return (
     <>
       <AppShell
-        header={{ height: 72 }}
+        className="shell-root"
+        header={{ height: 68 }}
         navbar={{ width: 280, breakpoint: "sm", collapsed: { mobile: !opened } }}
-        padding="lg"
+        padding={{ base: "xs", sm: "md", lg: "lg" }}
       >
-        <AppShell.Header>
-          <Group h="100%" px="md" justify="space-between">
+        <AppShell.Header className="shell-header">
+          <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
             <Group gap="sm">
               <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
               <Stack gap={0}>
@@ -91,7 +92,7 @@ export function ServerAdminShell() {
           </Group>
         </AppShell.Header>
 
-        <AppShell.Navbar p="sm">
+        <AppShell.Navbar className="shell-navbar" p="sm">
           <AppShell.Section grow component={ScrollArea}>
             <Stack gap="xs">
               {visibleRoutes.map((route) => {
@@ -102,7 +103,10 @@ export function ServerAdminShell() {
                     active={route.id === activeRouteId}
                     label={route.label}
                     leftSection={<Icon size={16} />}
-                    onClick={() => setActiveRouteId(route.id)}
+                    onClick={() => {
+                      setActiveRouteId(route.id);
+                      close();
+                    }}
                   />
                 );
               })}
@@ -110,8 +114,8 @@ export function ServerAdminShell() {
           </AppShell.Section>
         </AppShell.Navbar>
 
-        <AppShell.Main>
-          <Stack gap="xl">
+        <AppShell.Main className="shell-main">
+          <Stack className="shell-content" gap="xl">
             {surfaceMode === "probing" ? (
               <>
                 <PageHeader

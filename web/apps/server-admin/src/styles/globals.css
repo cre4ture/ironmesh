@@ -1,10 +1,80 @@
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
 body {
   margin: 0;
+  min-height: 100dvh;
+  overflow-x: hidden;
   background:
     radial-gradient(circle at top left, rgba(18, 184, 134, 0.12), transparent 35%),
     linear-gradient(180deg, #f7faf9 0%, #eef5f2 100%);
 }
 
 #root {
-  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.shell-root {
+  min-height: 100dvh;
+}
+
+.shell-header {
+  background: rgba(248, 251, 249, 0.94);
+  backdrop-filter: blur(18px);
+  border-bottom: 1px solid rgba(24, 39, 34, 0.08);
+}
+
+.shell-header-bar {
+  min-height: 100%;
+}
+
+.shell-navbar {
+  background:
+    linear-gradient(180deg, rgba(248, 251, 249, 0.98) 0%, rgba(241, 247, 244, 0.98) 100%);
+  backdrop-filter: blur(18px);
+  border-inline-end: 1px solid rgba(24, 39, 34, 0.08);
+  box-shadow: 0 18px 40px rgba(34, 62, 51, 0.08);
+}
+
+.shell-main {
+  background: transparent;
+}
+
+.shell-content {
+  min-height: 100%;
+}
+
+@media (max-width: 48em) {
+  .shell-header-bar {
+    padding-left: max(0.75rem, env(safe-area-inset-left));
+    padding-right: max(0.75rem, env(safe-area-inset-right));
+  }
+
+  .shell-navbar {
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+    max-width: min(86vw, 300px);
+  }
+
+  .shell-main {
+    padding-left: max(0.5rem, env(safe-area-inset-left)) !important;
+    padding-right: max(0.5rem, env(safe-area-inset-right)) !important;
+    padding-top: 0.6rem !important;
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom)) !important;
+  }
+
+  .shell-content {
+    gap: 0.9rem !important;
+  }
+
+  .shell-content .mantine-Card-root {
+    padding: 0.9rem !important;
+    border-radius: 0.9rem;
+  }
+
+  .shell-content .mantine-Title-root {
+    font-size: clamp(1.5rem, 7vw, 2rem);
+  }
 }

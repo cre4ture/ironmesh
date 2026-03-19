@@ -86,7 +86,7 @@ const pages = [
 ];
 
 export function ClientShell() {
-  const [opened, { toggle }] = useDisclosure();
+  const [opened, { toggle, close }] = useDisclosure();
   const [activePageId, setActivePageId] = useState<PageId>("overview");
   const [ping, setPing] = useState<ClientUiPingResponse | null>(null);
   const [health, setHealth] = useState<JsonObject | null>(null);
@@ -119,12 +119,13 @@ export function ClientShell() {
 
   return (
     <AppShell
-      header={{ height: 72 }}
+      className="shell-root"
+      header={{ height: 68 }}
       navbar={{ width: 280, breakpoint: "sm", collapsed: { mobile: !opened } }}
-      padding="lg"
+      padding={{ base: "xs", sm: "md", lg: "lg" }}
     >
-      <AppShell.Header>
-        <Group h="100%" px="md" justify="space-between">
+      <AppShell.Header className="shell-header">
+        <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
           <Group gap="sm">
             <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
             <Stack gap={0}>
@@ -143,7 +144,7 @@ export function ClientShell() {
         </Group>
       </AppShell.Header>
 
-      <AppShell.Navbar p="sm">
+      <AppShell.Navbar className="shell-navbar" p="sm">
         <Stack gap="xs">
           {pages.map((page) => {
             const Icon = page.icon;
@@ -154,15 +155,18 @@ export function ClientShell() {
                 label={page.label}
                 description={page.description}
                 leftSection={<Icon size={16} />}
-                onClick={() => setActivePageId(page.id)}
+                onClick={() => {
+                  setActivePageId(page.id);
+                  close();
+                }}
               />
             );
           })}
         </Stack>
       </AppShell.Navbar>
 
-      <AppShell.Main>
-        <Stack gap="lg">
+      <AppShell.Main className="shell-main">
+        <Stack className="shell-content" gap="lg">
           {activePageId === "overview" ? (
             <OverviewPage
               ping={ping}
