@@ -8,6 +8,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
+  "devDependencies": {
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4"
+  },
   "dependencies": {
     "@mantine/core": "^7.17.1",
     "@mantine/hooks": "^7.17.1",

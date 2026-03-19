@@ -7,7 +7,9 @@ import { serverAdminRoutes } from "./routes";
 
 export function ServerAdminShell() {
   const [opened, { toggle }] = useDisclosure();
-  const [activeRouteId, setActiveRouteId] = useState(serverAdminRoutes[0].id);
+  const [activeRouteId, setActiveRouteId] = useState<(typeof serverAdminRoutes)[number]["id"]>(
+    serverAdminRoutes[0].id
+  );
   const activeRoute = serverAdminRoutes.find((route) => route.id === activeRouteId) ?? serverAdminRoutes[0];
 
   return (

@@ -12,7 +12,7 @@ const pages = [
 
 export function ClientShell() {
   const [opened, { toggle }] = useDisclosure();
-  const [activePageId, setActivePageId] = useState(pages[0].id);
+  const [activePageId, setActivePageId] = useState<(typeof pages)[number]["id"]>(pages[0].id);
   const activePage = pages.find((page) => page.id === activePageId) ?? pages[0];
 
   return (
