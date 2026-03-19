@@ -19,6 +19,7 @@ pnpm dev:server-admin
 pnpm dev:client-ui
 pnpm typecheck
 pnpm build
+pnpm test:e2e:client-ui
 pnpm test:e2e:server-admin
 pnpm test:e2e:server-admin-rust
 pnpm test:e2e:server-admin-setup-rust
@@ -26,7 +27,13 @@ pnpm test:e2e:server-admin-setup-rust
 
 ## Current scope
 
-This is the scaffold for the planned migration away from the handwritten embedded HTML/JS UIs in the Rust crates.
+This workspace now owns the built frontend bundles for:
+
+- the `server-node` admin/setup UI
+- the `web-ui-backend` client UI used by `serve-web`
+- the shared design system and API helpers used by both
+
+The Rust crates still own the embedding/serving path, but the handwritten embedded HTML/JS assets are being retired in favor of the React apps here.
 
 The source-of-truth migration checklist is:
 

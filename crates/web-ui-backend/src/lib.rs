@@ -15,19 +15,19 @@ use serde::Deserialize;
 
 pub mod assets {
     pub fn app_html() -> String {
-        include_str!("../static/index.html").to_string()
+        include_str!(concat!(env!("OUT_DIR"), "/client_ui_index.html")).to_string()
     }
 
     pub(crate) fn index_html() -> &'static str {
-        include_str!("../static/index.html")
+        include_str!(concat!(env!("OUT_DIR"), "/client_ui_index.html"))
     }
 
     pub(crate) fn app_js() -> &'static str {
-        include_str!("../static/app.js")
+        include_str!(concat!(env!("OUT_DIR"), "/client_ui_app.js"))
     }
 
     pub(crate) fn app_css() -> &'static str {
-        include_str!("../static/app.css")
+        include_str!(concat!(env!("OUT_DIR"), "/client_ui_app.css"))
     }
 }
 

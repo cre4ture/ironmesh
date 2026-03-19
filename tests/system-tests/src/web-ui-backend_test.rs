@@ -31,6 +31,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ui_backend_serves_react_client_ui_assets() -> Result<()> {
+        let server_bind = "127.0.0.1:19378";
+        let web_bind = "127.0.0.1:19379";
+        let server_base = format!("http://{server_bind}");
+        let web_base = format!("http://{web_bind}");
+        let client = reqwest::Client::new();
+
+        let mut server = start_server(server_bind).await?;
+        let mut web = start_web_backend(web_bind, &server_base).await?;
+
+        let result = async {
+            let html = client
+                .get(format!("{web_base}/"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert!(html.contains("Client UI"));
+            assert!(html.contains("/app.js"));
+            assert!(html.contains("/app.css"));
+
+            let js = client
+                .get(format!("{web_base}/app.js"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert!(js.contains("Transport-aware"));
+
+            let css = client
+                .get(format!("{web_base}/app.css"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            assert!(css.contains("radial-gradient"));
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
     async fn web_ui_backend_text_store_roundtrip() -> Result<()> {
         let server_bind = "127.0.0.1:19380";
         let web_bind = "127.0.0.1:19381";

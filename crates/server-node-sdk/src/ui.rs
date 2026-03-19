@@ -6,7 +6,6 @@ const INDEX_HTML_TEMPLATE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/server_admin_index.html"));
 const INDEX_CSS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.css"));
 const INDEX_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.js"));
-const INDEX_QRCODE_JS: &str = include_str!("ui/qrcode.min.js");
 
 pub(crate) async fn index() -> Html<&'static str> {
     Html(INDEX_HTML_TEMPLATE)
@@ -55,16 +54,5 @@ pub(crate) async fn app_js() -> impl IntoResponse {
             HeaderValue::from_static("application/javascript; charset=utf-8"),
         )],
         INDEX_JS,
-    )
-}
-
-pub(crate) async fn qrcode_js() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/javascript; charset=utf-8"),
-        )],
-        INDEX_QRCODE_JS,
     )
 }
