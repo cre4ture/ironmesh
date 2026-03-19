@@ -4,6 +4,7 @@ import android.content.Context
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Types
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import io.ironmesh.android.ui.GalleryViewMode
 
 object IronmeshPreferences {
     const val DEFAULT_BASE_URL = "http://10.0.2.2:18080"
@@ -11,6 +12,7 @@ object IronmeshPreferences {
     private const val PREF_BASE_URL = "base_url"
     private const val PREF_SYNC_CONFIGS = "folder_sync_configs"
     private const val PREF_DEVICE_AUTH_STATE = "device_auth_state"
+    private const val PREF_GALLERY_VIEW_MODE = "gallery_view_mode"
 
     private val moshi: Moshi by lazy {
         Moshi.Builder()
@@ -62,5 +64,15 @@ object IronmeshPreferences {
 
     fun clearDeviceAuthState(context: Context) {
         prefs(context).edit().remove(PREF_DEVICE_AUTH_STATE).apply()
+    }
+
+    fun getGalleryViewMode(context: Context): GalleryViewMode {
+        val raw = prefs(context).getString(PREF_GALLERY_VIEW_MODE, null)
+        return runCatching { raw?.let(GalleryViewMode::valueOf) ?: GalleryViewMode.FLATTENED_ALL_IMAGES }
+            .getOrDefault(GalleryViewMode.FLATTENED_ALL_IMAGES)
+    }
+
+    fun setGalleryViewMode(context: Context, mode: GalleryViewMode) {
+        prefs(context).edit().putString(PREF_GALLERY_VIEW_MODE, mode.name).apply()
     }
 }

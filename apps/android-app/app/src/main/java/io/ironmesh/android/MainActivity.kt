@@ -93,6 +93,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.data.RustSafBridge
+import io.ironmesh.android.ui.GalleryViewMode
 import io.ironmesh.android.ui.GalleryImageItem
 import io.ironmesh.android.ui.GallerySortOption
 import io.ironmesh.android.ui.MainSection
@@ -574,7 +575,9 @@ private fun GallerySection(
     state: MainUiState,
     vm: MainViewModel,
 ) {
-    var fullscreenIndex by remember(state.galleryItems) { mutableStateOf<Int?>(null) }
+    var fullscreenIndex by remember(state.galleryItems, state.galleryCurrentDirectoryPath) {
+        mutableStateOf<Int?>(null)
+    }
 
     Text("Gallery", style = MaterialTheme.typography.titleMedium)
 
@@ -587,6 +590,16 @@ private fun GallerySection(
             Text("Refresh Gallery")
         }
         FilterChip(
+            selected = state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES,
+            onClick = { vm.updateGalleryViewMode(GalleryViewMode.FLATTENED_ALL_IMAGES) },
+            label = { Text("All Images") },
+        )
+        FilterChip(
+            selected = state.galleryMode == GalleryViewMode.CURRENT_DIRECTORY,
+            onClick = { vm.updateGalleryViewMode(GalleryViewMode.CURRENT_DIRECTORY) },
+            label = { Text("Current Folder") },
+        )
+        FilterChip(
             selected = state.gallerySort == GallerySortOption.CREATION_TIME,
             onClick = { vm.updateGallerySort(GallerySortOption.CREATION_TIME) },
             label = { Text("Creation Time") },
@@ -598,17 +611,90 @@ private fun GallerySection(
         )
     }
 
+    if (state.galleryMode == GalleryViewMode.CURRENT_DIRECTORY) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            tonalElevation = 2.dp,
+            shape = RoundedCornerShape(18.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "Current folder: ${state.galleryCurrentDirectoryPath}",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = vm::navigateGalleryToRoot) {
+                        Text("Root")
+                    }
+                    OutlinedButton(
+                        onClick = vm::navigateGalleryUp,
+                        enabled = state.galleryBreadcrumbs.isNotEmpty(),
+                    ) {
+                        Text("Up")
+                    }
+                }
+                if (state.galleryBreadcrumbs.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(onClick = vm::navigateGalleryToRoot) {
+                            Text("/")
+                        }
+                        state.galleryBreadcrumbs.forEachIndexed { index, breadcrumb ->
+                            OutlinedButton(
+                                onClick = { vm.navigateGalleryToBreadcrumb(index) },
+                            ) {
+                                Text(breadcrumb.label)
+                            }
+                        }
+                    }
+                }
+                if (state.galleryDirectories.isNotEmpty()) {
+                    Text("Folders", style = MaterialTheme.typography.titleSmall)
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        state.galleryDirectories.forEach { directory ->
+                            OutlinedButton(onClick = { vm.openGalleryDirectory(directory) }) {
+                                Text(directory.displayName)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (state.galleryLoading) {
         CircularProgressIndicator()
+    } else if (state.galleryItems.isEmpty() && state.galleryDirectories.isEmpty()) {
+        Text(
+            if (state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
+                "No images loaded from the document provider."
+            } else {
+                "No images or nested folders found in the current directory."
+            },
+        )
     } else if (state.galleryItems.isEmpty()) {
-        Text("No images loaded from the document provider.")
+        Text("No images in the current directory. Open a folder above or go up a level.")
     } else {
         GalleryGrid(
             items = state.galleryItems,
             onItemClick = { index -> fullscreenIndex = index },
         )
         Text(
-            text = "Pinch the gallery to change thumbnail size.",
+            text = if (state.galleryMode == GalleryViewMode.FLATTENED_ALL_IMAGES) {
+                "Pinch the gallery to change thumbnail size."
+            } else {
+                "Pinch the gallery to change thumbnail size. The fullscreen viewer only follows the current folder image list."
+            },
             style = MaterialTheme.typography.bodySmall,
         )
     }
