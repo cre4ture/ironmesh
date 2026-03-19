@@ -8,8 +8,9 @@ fn main() {
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
-    let web_workspace_dir = manifest_dir.join("..").join("..").join("web");
-    let client_ui_dist_candidates = client_ui_dist_candidates(&web_workspace_dir);
+    let web_workspace_dir =
+        canonicalize_or_fallback(manifest_dir.join("..").join("..").join("web"));
+    let mut client_ui_dist_candidates = client_ui_dist_candidates(&web_workspace_dir);
 
     println!("cargo:rerun-if-changed=build.rs");
     println!(
@@ -155,6 +156,9 @@ fn main() {
     let generated_js = out_dir.join("client_ui_app.js");
     run_frontend_build(&web_workspace_dir);
 
+    client_ui_dist_candidates.extend(discover_dist_dirs(&web_workspace_dir));
+    client_ui_dist_candidates.sort();
+    client_ui_dist_candidates.dedup();
     let client_ui_dist_dir = locate_dist_dir(&client_ui_dist_candidates).unwrap_or_else(|| {
         panic!(
             "failed locating built client-ui dist after `pnpm --filter @ironmesh/client-ui build`; checked: {}",
@@ -220,11 +224,53 @@ fn client_ui_dist_candidates(web_workspace_dir: &Path) -> Vec<PathBuf> {
     ]
 }
 
+fn canonicalize_or_fallback(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
+}
+
 fn locate_dist_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates
         .iter()
         .find(|candidate| candidate.join("index.html").is_file())
         .cloned()
+}
+
+fn discover_dist_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    discover_dist_dirs_recursive(root, 0, 4, &mut matches);
+    matches
+}
+
+fn discover_dist_dirs_recursive(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    matches: &mut Vec<PathBuf>,
+) {
+    if depth > max_depth {
+        return;
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        if path.file_name().is_some_and(|segment| segment == "dist")
+            && path.join("index.html").is_file()
+        {
+            matches.push(path);
+            continue;
+        }
+
+        discover_dist_dirs_recursive(&path, depth + 1, max_depth, matches);
+    }
 }
 
 fn format_path_list(paths: &[PathBuf]) -> String {
