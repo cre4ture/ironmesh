@@ -22,8 +22,7 @@ body {
 }
 
 .shell-header {
-  background: rgba(249, 251, 252, 0.94);
-  backdrop-filter: blur(18px);
+  background: linear-gradient(180deg, #f9fbfc 0%, #f2f6f8 100%);
   border-bottom: 1px solid rgba(23, 39, 49, 0.08);
 }
 
@@ -32,11 +31,15 @@ body {
 }
 
 .shell-navbar {
-  background:
-    linear-gradient(180deg, rgba(249, 251, 252, 0.98) 0%, rgba(242, 247, 249, 0.98) 100%);
-  backdrop-filter: blur(18px);
+  background: linear-gradient(180deg, #f9fbfc 0%, #f0f5f7 100%);
   border-inline-end: 1px solid rgba(23, 39, 49, 0.08);
   box-shadow: 0 18px 40px rgba(31, 60, 71, 0.08);
+}
+
+.shell-navbar .mantine-ScrollArea-root,
+.shell-navbar .mantine-ScrollArea-viewport,
+.shell-navbar .mantine-ScrollArea-content {
+  background: transparent;
 }
 
 .shell-main {
