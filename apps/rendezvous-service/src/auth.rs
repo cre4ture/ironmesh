@@ -16,6 +16,8 @@ use transport_sdk::peer::PeerIdentity;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
+use crate::config::{RendezvousMtlsConfig, RendezvousServerTlsIdentity};
+
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPeer {
     pub identity: PeerIdentity,
@@ -193,9 +195,7 @@ pub fn authenticated_peer_from_tls_stream<T>(
 }
 
 pub fn build_mtls_rustls_config(
-    client_ca_cert_path: &std::path::PathBuf,
-    cert_path: &std::path::PathBuf,
-    key_path: &std::path::PathBuf,
+    mtls: &RendezvousMtlsConfig,
 ) -> Result<axum_server::tls_rustls::RustlsConfig> {
     use std::fs::File;
     use std::io::BufReader;
@@ -203,8 +203,8 @@ pub fn build_mtls_rustls_config(
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut ca_reader = BufReader::new(
-        File::open(client_ca_cert_path)
-            .with_context(|| format!("failed reading {}", client_ca_cert_path.display()))?,
+        File::open(&mtls.client_ca_cert_path)
+            .with_context(|| format!("failed reading {}", mtls.client_ca_cert_path.display()))?,
     );
     let mut roots = RootCertStore::empty();
     for cert in CertificateDer::pem_reader_iter(&mut ca_reader) {
@@ -214,19 +214,41 @@ pub fn build_mtls_rustls_config(
             .context("failed adding rendezvous client CA certificate to trust store")?;
     }
 
-    let mut cert_reader = BufReader::new(
-        File::open(cert_path).with_context(|| format!("failed reading {}", cert_path.display()))?,
-    );
-    let cert_chain: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_reader_iter(&mut cert_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed parsing rendezvous TLS certificate chain")?;
+    let (cert_chain, key) = match &mtls.server_identity {
+        RendezvousServerTlsIdentity::Files {
+            cert_path,
+            key_path,
+        } => {
+            let mut cert_reader = BufReader::new(
+                File::open(cert_path)
+                    .with_context(|| format!("failed reading {}", cert_path.display()))?,
+            );
+            let cert_chain: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_reader_iter(&mut cert_reader)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .context("failed parsing rendezvous TLS certificate chain")?;
 
-    let mut key_reader = BufReader::new(
-        File::open(key_path).with_context(|| format!("failed reading {}", key_path.display()))?,
-    );
-    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(&mut key_reader)
-        .context("failed parsing rendezvous TLS private key")?;
+            let mut key_reader = BufReader::new(
+                File::open(key_path)
+                    .with_context(|| format!("failed reading {}", key_path.display()))?,
+            );
+            let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(&mut key_reader)
+                .context("failed parsing rendezvous TLS private key")?;
+            (cert_chain, key)
+        }
+        RendezvousServerTlsIdentity::InlinePem { cert_pem, key_pem } => {
+            let mut cert_reader = BufReader::new(cert_pem.as_bytes());
+            let cert_chain: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_reader_iter(&mut cert_reader)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .context("failed parsing rendezvous TLS certificate chain")?;
+
+            let mut key_reader = BufReader::new(key_pem.as_bytes());
+            let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(&mut key_reader)
+                .context("failed parsing rendezvous TLS private key")?;
+            (cert_chain, key)
+        }
+    };
 
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
         .build()

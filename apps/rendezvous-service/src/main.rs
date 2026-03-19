@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod control;
+mod failover;
 mod presence;
 mod relay;
 mod state;
@@ -64,6 +65,16 @@ async fn run_with_state(state: AppState) -> Result<()> {
     let bind_addr = state.config.bind_addr;
     let app = build_router(state.clone());
 
+    if let Some(failover) = state.config.failover_package.as_ref() {
+        info!(
+            failover_package = %failover.package_path.display(),
+            cluster_id = %failover.cluster_id,
+            source_node_id = %failover.source_node_id,
+            target_node_id = %failover.target_node_id,
+            "loaded managed rendezvous failover package for standalone service"
+        );
+    }
+
     info!(
         bind_addr = %bind_addr,
         public_url = %state.config.public_url,
@@ -72,11 +83,7 @@ async fn run_with_state(state: AppState) -> Result<()> {
     );
 
     if let Some(mtls) = state.config.mtls.as_ref() {
-        let tls_config = auth::build_mtls_rustls_config(
-            &mtls.client_ca_cert_path,
-            &mtls.cert_path,
-            &mtls.key_path,
-        )?;
+        let tls_config = auth::build_mtls_rustls_config(mtls)?;
         axum_server::bind(bind_addr)
             .acceptor(MtlsAuthenticatedPeerAcceptor::new(tls_config))
             .serve(app.into_make_service())
@@ -261,6 +268,7 @@ mod tests {
             relay_public_urls: vec![rendezvous_public_url.clone()],
             mtls: None,
             allow_insecure_http: true,
+            failover_package: None,
         });
         let rendezvous_state_for_server = rendezvous_state.clone();
         let rendezvous_handle = tokio::spawn(async move {
@@ -465,10 +473,13 @@ mod tests {
             relay_public_urls: vec![rendezvous_public_url.clone()],
             mtls: Some(config::RendezvousMtlsConfig {
                 client_ca_cert_path: rendezvous_ca_path.clone(),
-                cert_path: rendezvous_cert_path,
-                key_path: rendezvous_key_path,
+                server_identity: config::RendezvousServerTlsIdentity::Files {
+                    cert_path: rendezvous_cert_path,
+                    key_path: rendezvous_key_path,
+                },
             }),
             allow_insecure_http: false,
+            failover_package: None,
         });
 
         let source_dir = fresh_test_dir("relay-required-source-mtls");
@@ -710,10 +721,12 @@ mod tests {
         let rendezvous_dir = fresh_test_dir("relay-client-device-rendezvous-mtls");
         let rendezvous_bind_addr = free_bind_addr();
         let rendezvous_public_url = format!("https://{rendezvous_bind_addr}");
-        let (rendezvous_ca_path, rendezvous_cert_path, rendezvous_key_path) = write_tls_material(
+        let (rendezvous_cert_pem, rendezvous_key_pem) =
+            issue_server_cert(&ca).expect("rendezvous server cert should issue");
+        let (rendezvous_ca_path, _, _) = write_tls_material(
             &rendezvous_dir,
             &ca.ca_pem,
-            &issue_server_cert(&ca).expect("rendezvous server cert should issue"),
+            &(rendezvous_cert_pem.clone(), rendezvous_key_pem.clone()),
         )
         .expect("rendezvous TLS material should write");
         let rendezvous_state = AppState::new(RendezvousServiceConfig {
@@ -722,10 +735,13 @@ mod tests {
             relay_public_urls: vec![rendezvous_public_url.clone()],
             mtls: Some(config::RendezvousMtlsConfig {
                 client_ca_cert_path: rendezvous_ca_path.clone(),
-                cert_path: rendezvous_cert_path,
-                key_path: rendezvous_key_path,
+                server_identity: config::RendezvousServerTlsIdentity::InlinePem {
+                    cert_pem: rendezvous_cert_pem,
+                    key_pem: rendezvous_key_pem,
+                },
             }),
             allow_insecure_http: false,
+            failover_package: None,
         });
 
         let target_node_id = Uuid::now_v7();
