@@ -3691,6 +3691,10 @@ async fn build_test_state(
         rendezvous_registration_enabled: false,
         rendezvous_mtls_required: false,
         managed_rendezvous_public_url: None,
+        rendezvous_registration_state: Arc::new(Mutex::new(HashMap::from([(
+            "http://127.0.0.1:39080".to_string(),
+            super::RendezvousEndpointRegistrationRuntime::default(),
+        )]))),
         relay_mode: super::RelayMode::Fallback,
         enrollment_issuer_url: None,
         node_enrollment_path: None,
@@ -3702,6 +3706,7 @@ async fn build_test_state(
         outbound_clients: Arc::new(tokio::sync::RwLock::new(super::OutboundClients {
             internal_http: reqwest::Client::new(),
             rendezvous_control: None,
+            rendezvous_controls: Vec::new(),
         })),
         metadata_commit_mode: MetadataCommitMode::Local,
         autonomous_replication_on_put_enabled: false,
@@ -4135,7 +4140,11 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     .expect("rendezvous client should build");
     *state.outbound_clients.write().await = super::OutboundClients {
         internal_http: reqwest::Client::new(),
-        rendezvous_control: Some(rendezvous_client),
+        rendezvous_control: Some(rendezvous_client.clone()),
+        rendezvous_controls: vec![super::RendezvousEndpointClient {
+            url: relay_base_url.clone(),
+            control: rendezvous_client,
+        }],
     };
 
     let observed_paths = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -4288,6 +4297,267 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
 
     relay_handle.abort();
     let _ = relay_handle.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.rendezvous_registration_enabled = true;
+    state.peer_heartbeat_config = PeerHeartbeatConfig {
+        enabled: false,
+        interval_secs: 30,
+    };
+
+    let bind_addr_a = free_bind_addr();
+    let bind_addr_b = free_bind_addr();
+    let rendezvous_url_a = format!("http://{bind_addr_a}");
+    let rendezvous_url_b = format!("http://{bind_addr_b}");
+    *state.rendezvous_urls.lock().unwrap() =
+        vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
+    *state.rendezvous_registration_state.lock().await = HashMap::from([
+        (
+            rendezvous_url_a.clone(),
+            super::RendezvousEndpointRegistrationRuntime::default(),
+        ),
+        (
+            rendezvous_url_b.clone(),
+            super::RendezvousEndpointRegistrationRuntime::default(),
+        ),
+    ]);
+
+    let shared_client = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()],
+            heartbeat_interval_secs: 30,
+        },
+        None,
+        None,
+    )
+    .expect("shared rendezvous client should build");
+    let client_a = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![rendezvous_url_a.clone()],
+            heartbeat_interval_secs: 30,
+        },
+        None,
+        None,
+    )
+    .expect("endpoint A rendezvous client should build");
+    let client_b = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![rendezvous_url_b.clone()],
+            heartbeat_interval_secs: 30,
+        },
+        None,
+        None,
+    )
+    .expect("endpoint B rendezvous client should build");
+    *state.outbound_clients.write().await = super::OutboundClients {
+        internal_http: reqwest::Client::new(),
+        rendezvous_control: Some(shared_client),
+        rendezvous_controls: vec![
+            super::RendezvousEndpointClient {
+                url: rendezvous_url_a.clone(),
+                control: client_a,
+            },
+            super::RendezvousEndpointClient {
+                url: rendezvous_url_b.clone(),
+                control: client_b,
+            },
+        ],
+    };
+
+    let registrations_a = Arc::new(Mutex::new(0u64));
+    let registrations_a_state = registrations_a.clone();
+    let app_a = Router::new().route(
+        "/control/presence/register",
+        post(
+            move |Json(registration): Json<transport_sdk::PresenceRegistration>| {
+                let registrations_a_state = registrations_a_state.clone();
+                async move {
+                    *registrations_a_state.lock().await += 1;
+                    let updated_at_unix = super::unix_ts();
+                    Json(transport_sdk::RegisterPresenceResponse {
+                        accepted: true,
+                        updated_at_unix,
+                        entry: transport_sdk::PresenceEntry {
+                            registration,
+                            updated_at_unix,
+                        },
+                    })
+                }
+            },
+        ),
+    );
+    let listener_a = tokio::net::TcpListener::bind(bind_addr_a)
+        .await
+        .expect("endpoint A listener should bind");
+    let handle_a = tokio::spawn(async move {
+        axum::serve(listener_a, app_a)
+            .await
+            .expect("endpoint A should serve");
+    });
+
+    let heartbeat_handle = super::spawn_rendezvous_presence_heartbeat(
+        state.clone(),
+        Some("http://127.0.0.1:39080".to_string()),
+        Some("https://127.0.0.1:49080".to_string()),
+        true,
+        30,
+    );
+
+    wait_for_condition(
+        "first endpoint receives degraded retries",
+        Duration::from_secs(4),
+        || {
+            let registrations_a = registrations_a.clone();
+            async move { *registrations_a.lock().await >= 2 }
+        },
+    )
+    .await;
+
+    {
+        let registration_state = state.rendezvous_registration_state.lock().await;
+        let endpoint_b = registration_state
+            .get(&rendezvous_url_b)
+            .expect("endpoint B state should exist");
+        assert!(
+            endpoint_b.consecutive_failures >= 1,
+            "endpoint B should have at least one failed registration before it starts"
+        );
+    }
+
+    let registrations_b = Arc::new(Mutex::new(0u64));
+    let registrations_b_state = registrations_b.clone();
+    let app_b = Router::new().route(
+        "/control/presence/register",
+        post(
+            move |Json(registration): Json<transport_sdk::PresenceRegistration>| {
+                let registrations_b_state = registrations_b_state.clone();
+                async move {
+                    *registrations_b_state.lock().await += 1;
+                    let updated_at_unix = super::unix_ts();
+                    Json(transport_sdk::RegisterPresenceResponse {
+                        accepted: true,
+                        updated_at_unix,
+                        entry: transport_sdk::PresenceEntry {
+                            registration,
+                            updated_at_unix,
+                        },
+                    })
+                }
+            },
+        ),
+    );
+    let listener_b = tokio::net::TcpListener::bind(bind_addr_b)
+        .await
+        .expect("endpoint B listener should bind");
+    let handle_b = tokio::spawn(async move {
+        axum::serve(listener_b, app_b)
+            .await
+            .expect("endpoint B should serve");
+    });
+
+    wait_for_condition(
+        "all rendezvous endpoints connected",
+        Duration::from_secs(4),
+        || {
+            let registrations_a = registrations_a.clone();
+            let registrations_b = registrations_b.clone();
+            let state = state.clone();
+            let rendezvous_url_a = rendezvous_url_a.clone();
+            let rendezvous_url_b = rendezvous_url_b.clone();
+            async move {
+                if *registrations_a.lock().await < 2 || *registrations_b.lock().await < 1 {
+                    return false;
+                }
+
+                let registration_state = state.rendezvous_registration_state.lock().await;
+                registration_state
+                    .get(&rendezvous_url_a)
+                    .is_some_and(|entry| {
+                        entry.consecutive_failures == 0 && entry.last_success_unix.is_some()
+                    })
+                    && registration_state
+                        .get(&rendezvous_url_b)
+                        .is_some_and(|entry| {
+                            entry.consecutive_failures == 0 && entry.last_success_unix.is_some()
+                        })
+            }
+        },
+    )
+    .await;
+
+    heartbeat_handle.abort();
+    let _ = heartbeat_handle.await;
+    handle_a.abort();
+    let _ = handle_a.await;
+    handle_b.abort();
+    let _ = handle_b.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_config_view_includes_endpoint_registration_state() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.rendezvous_registration_enabled = true;
+    state.peer_heartbeat_config = PeerHeartbeatConfig {
+        enabled: false,
+        interval_secs: 17,
+    };
+
+    let rendezvous_url_a = "https://rendezvous-a.example:9443/".to_string();
+    let rendezvous_url_b = "https://rendezvous-b.example:9443/".to_string();
+    *state.rendezvous_urls.lock().unwrap() =
+        vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
+    *state.rendezvous_registration_state.lock().await = HashMap::from([
+        (
+            rendezvous_url_a.clone(),
+            super::RendezvousEndpointRegistrationRuntime {
+                last_attempt_unix: Some(10),
+                last_success_unix: Some(10),
+                consecutive_failures: 0,
+                last_error: None,
+            },
+        ),
+        (
+            rendezvous_url_b.clone(),
+            super::RendezvousEndpointRegistrationRuntime {
+                last_attempt_unix: Some(11),
+                last_success_unix: Some(8),
+                consecutive_failures: 3,
+                last_error: Some("connection refused".to_string()),
+            },
+        ),
+    ]);
+
+    let view = super::build_rendezvous_config_view(&state, false).await;
+
+    assert_eq!(view.registration_interval_secs, 17);
+    assert_eq!(
+        view.disconnected_retry_interval_secs,
+        super::RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS
+    );
+    assert_eq!(view.endpoint_registrations.len(), 2);
+    assert_eq!(view.endpoint_registrations[0].url, rendezvous_url_a);
+    assert_eq!(
+        format!("{:?}", view.endpoint_registrations[0].status),
+        "Connected"
+    );
+    assert_eq!(view.endpoint_registrations[1].url, rendezvous_url_b);
+    assert_eq!(
+        format!("{:?}", view.endpoint_registrations[1].status),
+        "Disconnected"
+    );
+    assert_eq!(
+        view.endpoint_registrations[1].last_error.as_deref(),
+        Some("connection refused")
+    );
+
     cleanup_test_state(&state).await;
 }
 

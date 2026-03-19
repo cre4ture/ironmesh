@@ -145,6 +145,16 @@ export type RendezvousConfigView = {
   editable_urls: string[];
   managed_embedded_url: string | null;
   registration_enabled: boolean;
+  registration_interval_secs: number;
+  disconnected_retry_interval_secs: number;
+  endpoint_registrations: {
+    url: string;
+    status: "pending" | "connected" | "disconnected";
+    last_attempt_unix: number | null;
+    last_success_unix: number | null;
+    consecutive_failures: number;
+    last_error: string | null;
+  }[];
   mtls_required: boolean;
   persistence_source: "node_enrollment" | "runtime_only";
   persisted: boolean;

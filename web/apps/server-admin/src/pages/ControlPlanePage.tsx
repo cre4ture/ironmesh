@@ -25,13 +25,33 @@ import {
   TextInput,
   Textarea
 } from "@mantine/core";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
+
+function formatUnixTimestamp(value: number | null): string {
+  if (!value) {
+    return "never";
+  }
+
+  return new Date(value * 1000).toLocaleString();
+}
+
+function registrationBadgeColor(status: "pending" | "connected" | "disconnected"): string {
+  if (status === "connected") {
+    return "green";
+  }
+  if (status === "disconnected") {
+    return "red";
+  }
+  return "gray";
+}
 
 export function ControlPlanePage() {
   const { adminTokenOverride } = useAdminAccess();
   const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
   const [editableRendezvousUrlsText, setEditableRendezvousUrlsText] = useState("");
+  const [rendezvousUrlsDirty, setRendezvousUrlsDirty] = useState(false);
+  const rendezvousUrlsDirtyRef = useRef(false);
   const [rendezvousConfigLoading, setRendezvousConfigLoading] = useState(true);
   const [rendezvousPassphrase, setRendezvousPassphrase] = useState("");
   const [rendezvousTargetNodeId, setRendezvousTargetNodeId] = useState("");
@@ -55,33 +75,46 @@ export function ControlPlanePage() {
   >(null);
 
   useEffect(() => {
+    rendezvousUrlsDirtyRef.current = rendezvousUrlsDirty;
+  }, [rendezvousUrlsDirty]);
+
+  useEffect(() => {
     let cancelled = false;
 
-    async function refreshRendezvousConfig() {
-      setRendezvousConfigLoading(true);
+    async function refreshRendezvousConfig(showLoading: boolean, preserveDraft: boolean) {
+      if (showLoading) {
+        setRendezvousConfigLoading(true);
+      }
       try {
         const payload = await getRendezvousConfig(adminTokenOverride);
         if (cancelled) {
           return;
         }
         setRendezvousConfig(payload);
-        setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
+        if (!preserveDraft || !rendezvousUrlsDirtyRef.current) {
+          setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
+          setRendezvousUrlsDirty(false);
+        }
       } catch (actionError) {
         if (cancelled) {
           return;
         }
         setError(actionError instanceof Error ? actionError.message : String(actionError));
       } finally {
-        if (!cancelled) {
+        if (!cancelled && showLoading) {
           setRendezvousConfigLoading(false);
         }
       }
     }
 
-    void refreshRendezvousConfig();
+    void refreshRendezvousConfig(true, false);
+    const refreshInterval = window.setInterval(() => {
+      void refreshRendezvousConfig(false, true);
+    }, 5000);
 
     return () => {
       cancelled = true;
+      window.clearInterval(refreshInterval);
     };
   }, [adminTokenOverride]);
 
@@ -96,6 +129,7 @@ export function ControlPlanePage() {
       const payload = await updateRendezvousConfig({ editable_urls }, adminTokenOverride);
       setRendezvousConfig(payload);
       setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
+      setRendezvousUrlsDirty(false);
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
     } finally {
@@ -185,6 +219,14 @@ export function ControlPlanePage() {
     }
   }
 
+  const endpointRegistrations = rendezvousConfig?.endpoint_registrations ?? [];
+  const connectedRegistrations = endpointRegistrations.filter(
+    (endpoint) => endpoint.status === "connected"
+  ).length;
+  const disconnectedRegistrations = endpointRegistrations.filter(
+    (endpoint) => endpoint.status === "disconnected"
+  ).length;
+
   return (
     <Stack gap="lg">
       {error ? <Alert color="red" title="Request failed">{error}</Alert> : null}
@@ -239,7 +281,10 @@ export function ControlPlanePage() {
                   minRows={10}
                   autosize
                   value={editableRendezvousUrlsText}
-                  onChange={(event) => setEditableRendezvousUrlsText(event.currentTarget.value)}
+                  onChange={(event) => {
+                    setEditableRendezvousUrlsText(event.currentTarget.value);
+                    setRendezvousUrlsDirty(true);
+                  }}
                   placeholder={"https://rendezvous-a.example:9443\nhttps://rendezvous-b.example:9443"}
                 />
                 <Text size="sm" c="dimmed">
@@ -257,6 +302,54 @@ export function ControlPlanePage() {
               </Stack>
             </Grid.Col>
           </Grid>
+          {rendezvousConfig?.registration_enabled ? (
+            <Stack gap="sm">
+              <Group justify="space-between">
+                <Text fw={600}>Registration state</Text>
+                <Badge
+                  color={disconnectedRegistrations > 0 ? "yellow" : "green"}
+                  variant="light"
+                >
+                  {endpointRegistrations.length === 0
+                    ? "no endpoints"
+                    : `${connectedRegistrations}/${endpointRegistrations.length} connected`}
+                </Badge>
+              </Group>
+              <Text size="sm" c="dimmed">
+                Successful registrations refresh every {rendezvousConfig.registration_interval_secs}s.
+                When any rendezvous service is disconnected, the node retries every{" "}
+                {rendezvousConfig.disconnected_retry_interval_secs}s until all endpoints recover.
+              </Text>
+              {endpointRegistrations.map((endpoint) => (
+                <Card key={endpoint.url} withBorder radius="md" padding="sm">
+                  <Stack gap={4}>
+                    <Group justify="space-between" align="flex-start">
+                      <Text ff="monospace" size="sm" style={{ wordBreak: "break-all" }}>
+                        {endpoint.url}
+                      </Text>
+                      <Badge color={registrationBadgeColor(endpoint.status)} variant="light">
+                        {endpoint.status}
+                      </Badge>
+                    </Group>
+                    <Text size="sm" c="dimmed">
+                      Last attempt: {formatUnixTimestamp(endpoint.last_attempt_unix)}
+                    </Text>
+                    <Text size="sm" c="dimmed">
+                      Last success: {formatUnixTimestamp(endpoint.last_success_unix)}
+                    </Text>
+                    <Text size="sm" c="dimmed">
+                      Consecutive failures: {endpoint.consecutive_failures}
+                    </Text>
+                    {endpoint.last_error ? (
+                      <Text size="sm" c="red">
+                        Last error: {endpoint.last_error}
+                      </Text>
+                    ) : null}
+                  </Stack>
+                </Card>
+              ))}
+            </Stack>
+          ) : null}
         </Stack>
       </Card>
 

@@ -78,6 +78,8 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'/')
     .add(b'=')
     .add(b'?');
+const RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS: u64 = 1;
+const RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, ReplicationPlan,
@@ -117,6 +119,8 @@ struct ServerState {
     rendezvous_registration_enabled: bool,
     rendezvous_mtls_required: bool,
     managed_rendezvous_public_url: Option<String>,
+    rendezvous_registration_state:
+        Arc<Mutex<HashMap<String, RendezvousEndpointRegistrationRuntime>>>,
     relay_mode: RelayMode,
     enrollment_issuer_url: Option<String>,
     node_enrollment_path: Option<PathBuf>,
@@ -152,6 +156,39 @@ struct PublicTlsRuntime {
 struct OutboundClients {
     internal_http: reqwest::Client,
     rendezvous_control: Option<RendezvousControlClient>,
+    rendezvous_controls: Vec<RendezvousEndpointClient>,
+}
+
+#[derive(Clone)]
+struct RendezvousEndpointClient {
+    url: String,
+    control: RendezvousControlClient,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RendezvousEndpointRegistrationRuntime {
+    last_attempt_unix: Option<u64>,
+    last_success_unix: Option<u64>,
+    consecutive_failures: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RendezvousEndpointRegistrationStatus {
+    Pending,
+    Connected,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RendezvousEndpointRegistrationView {
+    url: String,
+    status: RendezvousEndpointRegistrationStatus,
+    last_attempt_unix: Option<u64>,
+    last_success_unix: Option<u64>,
+    consecutive_failures: u64,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1199,6 +1236,15 @@ async fn current_rendezvous_control(state: &ServerState) -> Option<RendezvousCon
         .clone()
 }
 
+async fn current_rendezvous_endpoint_clients(state: &ServerState) -> Vec<RendezvousEndpointClient> {
+    state
+        .outbound_clients
+        .read()
+        .await
+        .rendezvous_controls
+        .clone()
+}
+
 fn current_rendezvous_urls(state: &ServerState) -> Vec<String> {
     state
         .rendezvous_urls
@@ -1212,6 +1258,70 @@ fn replace_rendezvous_urls(state: &ServerState, urls: Vec<String>) {
         .rendezvous_urls
         .lock()
         .expect("rendezvous URL mutex poisoned") = urls;
+}
+
+async fn sync_rendezvous_registration_state(state: &ServerState) {
+    let urls = current_rendezvous_urls(state);
+    let desired = urls.iter().cloned().collect::<HashSet<_>>();
+    let mut registration_state = state.rendezvous_registration_state.lock().await;
+    registration_state.retain(|url, _| desired.contains(url));
+    for url in urls {
+        registration_state.entry(url).or_default();
+    }
+}
+
+async fn record_rendezvous_registration_success(state: &ServerState, url: &str) -> bool {
+    let now = unix_ts();
+    let mut registration_state = state.rendezvous_registration_state.lock().await;
+    let entry = registration_state.entry(url.to_string()).or_default();
+    let recovered = entry.consecutive_failures > 0;
+    entry.last_attempt_unix = Some(now);
+    entry.last_success_unix = Some(now);
+    entry.consecutive_failures = 0;
+    entry.last_error = None;
+    recovered
+}
+
+async fn record_rendezvous_registration_failure(
+    state: &ServerState,
+    url: &str,
+    error: &str,
+) -> u64 {
+    let now = unix_ts();
+    let mut registration_state = state.rendezvous_registration_state.lock().await;
+    let entry = registration_state.entry(url.to_string()).or_default();
+    entry.last_attempt_unix = Some(now);
+    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+    entry.last_error = Some(error.to_string());
+    entry.consecutive_failures
+}
+
+async fn rendezvous_registration_views(
+    state: &ServerState,
+) -> Vec<RendezvousEndpointRegistrationView> {
+    let urls = current_rendezvous_urls(state);
+    let registration_state = state.rendezvous_registration_state.lock().await;
+    urls.into_iter()
+        .map(|url| {
+            let runtime = registration_state.get(&url).cloned().unwrap_or_default();
+            let status = if runtime.consecutive_failures > 0 {
+                RendezvousEndpointRegistrationStatus::Disconnected
+            } else if runtime.last_success_unix.is_some() {
+                RendezvousEndpointRegistrationStatus::Connected
+            } else {
+                RendezvousEndpointRegistrationStatus::Pending
+            };
+
+            RendezvousEndpointRegistrationView {
+                url,
+                status,
+                last_attempt_unix: runtime.last_attempt_unix,
+                last_success_unix: runtime.last_success_unix,
+                consecutive_failures: runtime.consecutive_failures,
+                last_error: runtime.last_error,
+            }
+        })
+        .collect()
 }
 
 fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
@@ -1287,6 +1397,51 @@ fn load_live_trust_material(state: &ServerState) -> Result<LiveTrustMaterial> {
     })
 }
 
+fn build_rendezvous_control_clients(
+    cluster_id: ClusterId,
+    rendezvous_urls: &[String],
+    heartbeat_interval_secs: u64,
+    rendezvous_ca_pem: Option<&str>,
+    rendezvous_client_identity_pem: Option<&[u8]>,
+) -> Result<(
+    Option<RendezvousControlClient>,
+    Vec<RendezvousEndpointClient>,
+)> {
+    if rendezvous_urls.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+
+    let shared_config = RendezvousClientConfig {
+        cluster_id,
+        rendezvous_urls: rendezvous_urls.to_vec(),
+        heartbeat_interval_secs,
+    };
+    let shared = RendezvousControlClient::new(
+        shared_config,
+        rendezvous_ca_pem,
+        rendezvous_client_identity_pem,
+    )?;
+
+    let mut endpoints = Vec::with_capacity(rendezvous_urls.len());
+    for url in rendezvous_urls {
+        let control = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![url.clone()],
+                heartbeat_interval_secs,
+            },
+            rendezvous_ca_pem,
+            rendezvous_client_identity_pem,
+        )?;
+        endpoints.push(RendezvousEndpointClient {
+            url: url.clone(),
+            control,
+        });
+    }
+
+    Ok((Some(shared), endpoints))
+}
+
 fn build_outbound_clients_with_urls(
     state: &ServerState,
     rendezvous_urls: &[String],
@@ -1302,33 +1457,32 @@ fn build_outbound_clients_with_urls(
         reqwest::Client::new()
     };
 
-    let rendezvous_control = if state.rendezvous_registration_enabled && !rendezvous_urls.is_empty()
-    {
-        let rendezvous_client_identity_pem = state
-            .internal_tls_runtime
-            .as_ref()
-            .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
-            .transpose()?;
-        Some(RendezvousControlClient::new(
-            RendezvousClientConfig {
-                cluster_id: state.cluster_id,
-                rendezvous_urls: rendezvous_urls.to_vec(),
-                heartbeat_interval_secs: state.peer_heartbeat_config.interval_secs.max(5),
-            },
-            trust_material
-                .rendezvous_ca_pem
-                .as_deref()
-                .or(trust_material.public_ca_pem.as_deref())
-                .or(trust_material.cluster_ca_pem.as_deref()),
-            rendezvous_client_identity_pem.as_deref(),
-        )?)
-    } else {
-        None
-    };
+    let (rendezvous_control, rendezvous_controls) =
+        if state.rendezvous_registration_enabled && !rendezvous_urls.is_empty() {
+            let rendezvous_client_identity_pem = state
+                .internal_tls_runtime
+                .as_ref()
+                .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
+                .transpose()?;
+            build_rendezvous_control_clients(
+                state.cluster_id,
+                rendezvous_urls,
+                state.peer_heartbeat_config.interval_secs.max(5),
+                trust_material
+                    .rendezvous_ca_pem
+                    .as_deref()
+                    .or(trust_material.public_ca_pem.as_deref())
+                    .or(trust_material.cluster_ca_pem.as_deref()),
+                rendezvous_client_identity_pem.as_deref(),
+            )?
+        } else {
+            (None, Vec::new())
+        };
 
     Ok(OutboundClients {
         internal_http,
         rendezvous_control,
+        rendezvous_controls,
     })
 }
 
@@ -2605,28 +2759,34 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .as_ref()
         .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
         .transpose()?;
-    let rendezvous_control = if config.rendezvous_registration_enabled {
-        match RendezvousControlClient::new(
-            RendezvousClientConfig {
-                cluster_id: config.cluster_id,
-                rendezvous_urls: config.rendezvous_urls.clone(),
-                heartbeat_interval_secs: config.peer_heartbeat_interval_secs.max(5),
-            },
+    let (rendezvous_control, rendezvous_controls) = if config.rendezvous_registration_enabled {
+        match build_rendezvous_control_clients(
+            config.cluster_id,
+            &config.rendezvous_urls,
+            config.peer_heartbeat_interval_secs.max(5),
             rendezvous_ca_pem
                 .as_deref()
                 .or(public_ca_pem.as_deref())
                 .or(cluster_ca_pem.as_deref()),
             rendezvous_client_identity_pem.as_deref(),
         ) {
-            Ok(client) => Some(client),
+            Ok(clients) => clients,
             Err(err) => {
                 warn!(error = %err, "failed to initialize rendezvous control client");
-                None
+                (None, Vec::new())
             }
         }
     } else {
-        None
+        (None, Vec::new())
     };
+    let rendezvous_registration_state = Arc::new(Mutex::new(
+        config
+            .rendezvous_urls
+            .iter()
+            .cloned()
+            .map(|url| (url, RendezvousEndpointRegistrationRuntime::default()))
+            .collect(),
+    ));
 
     let state = ServerState {
         data_dir: config.data_dir.clone(),
@@ -2649,6 +2809,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             .managed_rendezvous
             .as_ref()
             .map(|managed| managed.public_url.clone()),
+        rendezvous_registration_state,
         relay_mode: config.relay_mode,
         enrollment_issuer_url: config.enrollment_issuer_url.clone(),
         node_enrollment_path: config.node_enrollment_path.clone(),
@@ -2665,6 +2826,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         outbound_clients: Arc::new(RwLock::new(OutboundClients {
             internal_http,
             rendezvous_control,
+            rendezvous_controls,
         })),
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
@@ -3079,10 +3241,11 @@ fn spawn_rendezvous_presence_heartbeat(
     internal_peer_url: Option<String>,
     public_peer_api_enabled: bool,
     interval_secs: u64,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(5)));
-        ticker.tick().await;
+        let connected_interval = Duration::from_secs(interval_secs.max(5));
+        let retry_interval = Duration::from_secs(RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS)
+            .min(connected_interval);
 
         loop {
             let local_descriptor = {
@@ -3099,32 +3262,112 @@ fn spawn_rendezvous_presence_heartbeat(
                 public_peer_api_enabled,
                 local_descriptor.as_ref(),
             );
-            let Some(client) = current_rendezvous_control(&state).await else {
-                ticker.tick().await;
-                continue;
-            };
 
-            match client.register_presence(&registration).await {
-                Ok(response) => {
-                    tracing::debug!(
-                        node_id = %state.node_id,
-                        updated_at_unix = response.updated_at_unix,
-                        "registered rendezvous presence"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        node_id = %state.node_id,
-                        rendezvous_urls = ?client.config().rendezvous_urls,
-                        "failed to register rendezvous presence"
-                    );
+            let clients = current_rendezvous_endpoint_clients(&state).await;
+            if clients.is_empty() {
+                tokio::time::sleep(connected_interval).await;
+                continue;
+            }
+
+            let mut registrations = tokio::task::JoinSet::new();
+            for endpoint in clients {
+                let url = endpoint.url.clone();
+                let client = endpoint.control.clone();
+                let registration = registration.clone();
+                registrations.spawn(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS),
+                        client.register_presence(&registration),
+                    )
+                    .await;
+                    (url, result)
+                });
+            }
+
+            let mut all_registered = true;
+            while let Some(result) = registrations.join_next().await {
+                let Ok((url, result)) = result else {
+                    all_registered = false;
+                    continue;
+                };
+                match result {
+                    Ok(Ok(response)) => {
+                        let recovered = record_rendezvous_registration_success(&state, &url).await;
+                        if recovered {
+                            info!(
+                                node_id = %state.node_id,
+                                rendezvous_url = %url,
+                                updated_at_unix = response.updated_at_unix,
+                                "rendezvous presence registration recovered"
+                            );
+                        } else {
+                            tracing::debug!(
+                                node_id = %state.node_id,
+                                rendezvous_url = %url,
+                                updated_at_unix = response.updated_at_unix,
+                                "registered rendezvous presence"
+                            );
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        all_registered = false;
+                        let error_text = err.to_string();
+                        let failures =
+                            record_rendezvous_registration_failure(&state, &url, &error_text).await;
+                        if failures == 1 || failures % 10 == 0 {
+                            warn!(
+                                error = %err,
+                                node_id = %state.node_id,
+                                rendezvous_url = %url,
+                                consecutive_failures = failures,
+                                "failed to register rendezvous presence"
+                            );
+                        } else {
+                            tracing::debug!(
+                                error = %err,
+                                node_id = %state.node_id,
+                                rendezvous_url = %url,
+                                consecutive_failures = failures,
+                                "failed to register rendezvous presence"
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        all_registered = false;
+                        let error_text = format!(
+                            "timed out contacting rendezvous endpoint {url} while registering presence"
+                        );
+                        let failures =
+                            record_rendezvous_registration_failure(&state, &url, &error_text).await;
+                        if failures == 1 || failures % 10 == 0 {
+                            warn!(
+                                error = %error_text,
+                                node_id = %state.node_id,
+                                rendezvous_url = %url,
+                                consecutive_failures = failures,
+                                "failed to register rendezvous presence"
+                            );
+                        } else {
+                            tracing::debug!(
+                                error = %error_text,
+                                node_id = %state.node_id,
+                                rendezvous_url = %url,
+                                consecutive_failures = failures,
+                                "failed to register rendezvous presence"
+                            );
+                        }
+                    }
                 }
             }
 
-            ticker.tick().await;
+            tokio::time::sleep(if all_registered {
+                connected_interval
+            } else {
+                retry_interval
+            })
+            .await;
         }
-    });
+    })
 }
 
 fn build_rendezvous_presence_registration(
@@ -5489,6 +5732,9 @@ struct RendezvousConfigView {
     editable_urls: Vec<String>,
     managed_embedded_url: Option<String>,
     registration_enabled: bool,
+    registration_interval_secs: u64,
+    disconnected_retry_interval_secs: u64,
+    endpoint_registrations: Vec<RendezvousEndpointRegistrationView>,
     mtls_required: bool,
     persistence_source: RendezvousConfigPersistenceSource,
     persisted: bool,
@@ -7942,12 +8188,18 @@ fn rendezvous_config_persistence_source(state: &ServerState) -> RendezvousConfig
     }
 }
 
-fn build_rendezvous_config_view(state: &ServerState, persisted: bool) -> RendezvousConfigView {
+async fn build_rendezvous_config_view(
+    state: &ServerState,
+    persisted: bool,
+) -> RendezvousConfigView {
     RendezvousConfigView {
         effective_urls: current_rendezvous_urls(state),
         editable_urls: current_editable_rendezvous_urls(state),
         managed_embedded_url: state.managed_rendezvous_public_url.clone(),
         registration_enabled: state.rendezvous_registration_enabled,
+        registration_interval_secs: state.peer_heartbeat_config.interval_secs.max(5),
+        disconnected_retry_interval_secs: RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS,
+        endpoint_registrations: rendezvous_registration_views(state).await,
         mtls_required: state.rendezvous_mtls_required,
         persistence_source: rendezvous_config_persistence_source(state),
         persisted,
@@ -8023,7 +8275,7 @@ async fn get_rendezvous_config(
         Err(status) => return status.into_response(),
     };
 
-    let view = build_rendezvous_config_view(&state, state.node_enrollment_path.is_some());
+    let view = build_rendezvous_config_view(&state, state.node_enrollment_path.is_some()).await;
     append_admin_audit(
         &state,
         action,
@@ -8131,7 +8383,8 @@ async fn update_rendezvous_config(
 
     replace_rendezvous_urls(&state, effective_urls);
     *state.outbound_clients.write().await = outbound_clients;
-    let view = build_rendezvous_config_view(&state, persisted);
+    sync_rendezvous_registration_state(&state).await;
+    let view = build_rendezvous_config_view(&state, persisted).await;
 
     append_admin_audit(
         &state,
