@@ -10,7 +10,9 @@ import type {
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
-  ReplicationPlan
+  ReplicationPlan,
+  SetupStatus,
+  SetupTransitionResponse
 } from "./types";
 
 type AdminRequestOptions = {
@@ -97,6 +99,51 @@ export async function getRecentLogs(limit = 200): Promise<LogsResponse> {
   return fetchJson<LogsResponse>(`/logs?limit=${limit}`, {
     credentials: "same-origin",
     cache: "no-store"
+  });
+}
+
+export async function getSetupStatus(): Promise<SetupStatus> {
+  return fetchJson<SetupStatus>("/setup/status", {
+    credentials: "same-origin",
+    cache: "no-store"
+  });
+}
+
+export async function startSetupCluster(request: {
+  admin_password: string;
+  public_origin: string;
+}): Promise<SetupTransitionResponse> {
+  return fetchJson<SetupTransitionResponse>("/setup/start-cluster", {
+    method: "POST",
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request)
+  });
+}
+
+export async function generateSetupJoinRequest(request: {
+  public_origin: string;
+}): Promise<Record<string, unknown>> {
+  return fetchJson<Record<string, unknown>>("/setup/join/request", {
+    method: "POST",
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request)
+  });
+}
+
+export async function importSetupEnrollmentPackage(request: {
+  admin_password: string;
+  package_json: string;
+}): Promise<SetupTransitionResponse> {
+  return fetchJson<SetupTransitionResponse>("/setup/join/import", {
+    method: "POST",
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request)
   });
 }
 

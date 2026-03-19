@@ -17,7 +17,13 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.locator("pre").filter({ hasText: '"cluster_id"' })).toBeVisible();
   await expect(page.locator("pre").filter({ hasText: '"direct_endpoints"' })).toBeVisible();
 
+  await page.getByText("Logs", { exact: true }).click();
+  await expect(page.getByText("server node listening")).toBeVisible();
+
   await page.getByText("Certificates", { exact: true }).click();
   await expect(page.getByText("Not configured on this node")).toHaveCount(2);
   await expect(page.getByText("Auto renew", { exact: true })).toBeVisible();
+
+  await page.getByText("Setup", { exact: true }).click();
+  await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
 });

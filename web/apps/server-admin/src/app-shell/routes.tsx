@@ -1,10 +1,11 @@
-import { IconArrowsTransferUp, IconCertificate, IconDashboard, IconKey, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconKey, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
 import { SetupPage } from "../pages/SetupPage";
 import { BootstrapBundlesPage } from "../pages/BootstrapBundlesPage";
 import { ClientCredentialsPage } from "../pages/ClientCredentialsPage";
 import { CertificatesPage } from "../pages/CertificatesPage";
 import { ControlPlanePage } from "../pages/ControlPlanePage";
+import { LogsPage } from "../pages/LogsPage";
 
 export const serverAdminRoutes = [
   {
@@ -48,5 +49,12 @@ export const serverAdminRoutes = [
     description: "Export and import managed signer plus embedded rendezvous promotion packages.",
     icon: IconArrowsTransferUp,
     element: <ControlPlanePage />
+  },
+  {
+    id: "logs",
+    label: "Logs",
+    description: "Inspect recent server logs without relying on the old inline preformatted block.",
+    icon: IconFileText,
+    element: <LogsPage />
   }
 ] as const;

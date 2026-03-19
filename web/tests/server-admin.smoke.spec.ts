@@ -15,6 +15,15 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
+  await page.getByText("Setup", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "pending_join" })).toBeVisible();
+  await page.getByRole("button", { name: "Generate join request" }).click();
+  await expect(
+    page.getByText('{ "version": 1, "node_id": "node-beta", "cluster_id": "cluster-alpha" }', {
+      exact: true
+    })
+  ).toBeVisible();
+
   await page.getByText("Provisioning", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
   await page.getByRole("button", { name: "Issue bootstrap bundle" }).click();
@@ -39,6 +48,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 
   await page.getByText("Certificates", { exact: true }).click();
   await expect(page.getByText("Fingerprint: internal-cert-fingerprint", { exact: true })).toBeVisible();
+
+  await page.getByText("Logs", { exact: true }).click();
+  await expect(page.getByText("replication audit healthy")).toBeVisible();
 
   await page.getByText("Control Plane", { exact: true }).click();
   await page.getByRole("textbox", { name: "Target node ID" }).fill("node-beta");
@@ -171,12 +183,57 @@ async function installServerAdminMocks(page: Page) {
       });
     }
 
-    if (pathname === "/logs" && method === "GET" && searchParams.get("limit") === "120") {
+    if (pathname === "/logs" && method === "GET") {
       return json(route, {
         entries: [
           "2026-03-19T17:00:00Z INFO runtime ready",
           "2026-03-19T17:00:02Z INFO replication audit healthy"
         ]
+      });
+    }
+
+    if (pathname === "/setup/status" && method === "GET") {
+      return json(route, {
+        state: "pending_join",
+        data_dir: "/tmp/ironmesh-node-beta",
+        bind_addr: "0.0.0.0:8443",
+        bootstrap_tls_cert_path: "/tmp/bootstrap.pem",
+        bootstrap_tls_fingerprint: "setup-fingerprint",
+        cluster_id: null,
+        node_id: "node-beta",
+        pending_join_request: {
+          version: 1,
+          node_id: "node-beta",
+          cluster_id: "cluster-alpha"
+        }
+      });
+    }
+
+    if (pathname === "/setup/start-cluster" && method === "POST") {
+      return json(route, {
+        status: "transitioning_to_online",
+        cluster_id: "cluster-new",
+        node_id: "node-new",
+        public_url: "https://node-new.local",
+        restart_required: false
+      });
+    }
+
+    if (pathname === "/setup/join/request" && method === "POST") {
+      return json(route, {
+        version: 1,
+        node_id: "node-beta",
+        cluster_id: "cluster-alpha"
+      });
+    }
+
+    if (pathname === "/setup/join/import" && method === "POST") {
+      return json(route, {
+        status: "transitioning_to_online",
+        cluster_id: "cluster-alpha",
+        node_id: "node-beta",
+        public_url: "https://node-beta.local",
+        restart_required: false
       });
     }
 

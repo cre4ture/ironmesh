@@ -49,14 +49,14 @@ Files:
 Pages to reach parity:
 
 - [x] Dashboard
-- [ ] Setup
+- [x] Setup
 - [x] Admin login/session
 - [x] Bootstrap bundles
 - [x] Node enrollment
 - [x] Client credentials
 - [x] Certificates
 - [x] Replication
-- [ ] Logs
+- [x] Logs
 - [x] Control plane promotion
 
 Current Rust sources to replace:
@@ -136,7 +136,8 @@ Likely touch points:
 - Prefer static assets over SSR frameworks.
 - Keep `server-admin` and `client-ui` as separate apps.
 - Use `packages/ui` and `packages/api` for shared code, not one giant combined app.
-- Current Phase 2 slice covers the high-value runtime admin flows first; setup parity and a dedicated logs page are still pending.
+- Current Phase 2 slice covers the high-value runtime admin flows in the React app, including Setup and Logs.
+- The React app now includes Setup and Logs pages; the remaining setup-specific gap is that bootstrap setup mode still serves the handwritten setup assets rather than the shared React app.
 - Current Phase 3 slice uses a `build.rs` handoff: when `web/apps/server-admin/dist` exists, runtime admin routes serve that built app through the existing `/`, `/ui/app.css`, and `/ui/app.js` paths; otherwise the crate falls back to the handwritten runtime UI.
 - One Playwright smoke test runs against the built `server-admin` app through `vite preview` with mocked runtime APIs.
 - The Rust-served browser smoke now runs against a real `server-node` local-edge process with an admin-token override and verifies the built React app is what `/` serves at runtime.
