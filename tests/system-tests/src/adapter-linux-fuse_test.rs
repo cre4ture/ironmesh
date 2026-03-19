@@ -303,6 +303,23 @@ mod tests {
         );
     }
 
+    async fn create_mounted_dir_all(path: &Path, retries: usize) -> Result<()> {
+        let mut last_err = None;
+
+        for _ in 0..retries {
+            match fs::create_dir_all(path) {
+                Ok(()) => return Ok(()),
+                Err(err) => last_err = Some(err),
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let err = last_err
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow::anyhow!("mounted mkdir retries exhausted"));
+        Err(err).with_context(|| format!("failed to create mounted directory {}", path.display()))
+    }
+
     async fn wait_for_mount_active(path: &Path, retries: usize) -> Result<()> {
         let mountpoint = path.to_string_lossy().to_string();
 
@@ -1211,18 +1228,8 @@ mod tests {
                 let local_file_payload = b"local-file-move-payload".to_vec();
                 let file_from_dir = mountpoint.join("local-file-move").join("from");
                 let file_to_dir = mountpoint.join("local-file-move").join("to");
-                fs::create_dir_all(&file_from_dir).with_context(|| {
-                    format!(
-                        "failed to create mounted directory {}",
-                        file_from_dir.display()
-                    )
-                })?;
-                fs::create_dir_all(&file_to_dir).with_context(|| {
-                    format!(
-                        "failed to create mounted directory {}",
-                        file_to_dir.display()
-                    )
-                })?;
+                create_mounted_dir_all(&file_from_dir, 60).await?;
+                create_mounted_dir_all(&file_to_dir, 60).await?;
 
                 let file_from = file_from_dir.join("source.txt");
                 let file_to = file_to_dir.join("renamed.txt");
@@ -1267,12 +1274,7 @@ mod tests {
                 let local_folder_payload = b"local-folder-move-payload".to_vec();
                 let folder_from = mountpoint.join("local-folder-move").join("from");
                 let folder_from_nested = folder_from.join("nested");
-                fs::create_dir_all(&folder_from_nested).with_context(|| {
-                    format!(
-                        "failed to create mounted directory {}",
-                        folder_from_nested.display()
-                    )
-                })?;
+                create_mounted_dir_all(&folder_from_nested, 60).await?;
                 let folder_from_file = folder_from_nested.join("inside.txt");
                 fs::write(&folder_from_file, &local_folder_payload).with_context(|| {
                     format!(

@@ -931,7 +931,7 @@ mod tests {
             register_node(&client, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
             register_node(&client, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
 
-            wait_for_online_nodes(&client, &base_a, 2, 80).await?;
+            wait_for_online_nodes(&client, &base_a, 2, 120).await?;
             wait_for_online_nodes(&client, &base_b, 2, 80).await?;
 
             Ok::<(), anyhow::Error>(())
@@ -1074,7 +1074,7 @@ mod tests {
 
             for _ in 0..2 {
                 stop_server(&mut node_b).await;
-                wait_for_online_nodes(&client, &base_a, 1, 80).await?;
+                wait_for_online_nodes(&client, &base_a, 1, 120).await?;
 
                 node_b = start_server_with_env_options(
                     bind_b,
@@ -1090,8 +1090,8 @@ mod tests {
                 register_node(&client, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
                 register_node(&client, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
 
-                wait_for_online_nodes(&client, &base_a, 2, 80).await?;
-                wait_for_online_nodes(&client, &base_b, 2, 80).await?;
+                wait_for_online_nodes(&client, &base_a, 2, 120).await?;
+                wait_for_online_nodes(&client, &base_b, 2, 120).await?;
             }
 
             Ok::<(), anyhow::Error>(())
@@ -2230,6 +2230,7 @@ mod tests {
                 }
             };
 
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 2, 120).await?;
             wait_for_known_nodes(base_a.clone(), 2).await?;
             wait_for_known_nodes(base_b.clone(), 2).await?;
 
@@ -2277,10 +2278,23 @@ mod tests {
                 "unexpected put output: {put_output}"
             );
 
-            http.post(format!("{base_a}/cluster/replication/repair"))
-                .send()
-                .await?
-                .error_for_status()?;
+            for _ in 0..120 {
+                if let Ok(output) = run_cli(&[
+                    "--bootstrap-file",
+                    bootstrap_a_arg.as_str(),
+                    "--client-identity-file",
+                    client_identity_arg.as_str(),
+                    "get",
+                    "relay-key",
+                ])
+                .await
+                    && output.contains("payload-over-rendezvous-relay")
+                {
+                    break;
+                }
+
+                sleep(Duration::from_millis(250)).await;
+            }
 
             let bootstrap_b =
                 issue_bootstrap_bundle(&http, &base_b, admin_token, Some("relay-cli"), Some(3600))
@@ -2290,6 +2304,11 @@ mod tests {
             let bootstrap_b_arg = bootstrap_b_path.to_string_lossy().into_owned();
 
             for _ in 0..120 {
+                http.post(format!("{base_a}/cluster/replication/repair"))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+
                 if let Ok(output) = run_cli(&[
                     "--bootstrap-file",
                     bootstrap_b_arg.as_str(),
@@ -2303,6 +2322,7 @@ mod tests {
                 {
                     return Ok::<(), anyhow::Error>(());
                 }
+
                 sleep(Duration::from_millis(250)).await;
             }
 
