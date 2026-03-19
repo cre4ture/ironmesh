@@ -18,7 +18,7 @@ export const serverAdminRoutes = [
   {
     id: "setup",
     label: "Setup",
-    description: "Notes about the first-run zero-touch setup flow and its current handoff points.",
+    description: "First-run zero-touch setup for starting a cluster, generating join requests, and importing enrollment packages.",
     icon: IconServerCog,
     element: <SetupPage />
   },

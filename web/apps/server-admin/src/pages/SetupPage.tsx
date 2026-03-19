@@ -126,13 +126,12 @@ export function SetupPage() {
       <Stack gap="lg">
         {error ? <Alert color="red" title="Setup endpoint error">{error}</Alert> : null}
         <Alert color="teal" title="Bootstrap setup APIs are not active on this node">
-          This React page now understands the first-run setup endpoints, but the current server is already in normal
-          runtime mode. When the same app is served from bootstrap setup mode later, this page will drive cluster
-          creation, join-request generation, and enrollment import directly.
+          This node is already in normal runtime mode. The shared React admin app now uses this same Setup page during
+          first-run bootstrap mode, and keeps it here as a reference view once setup is complete.
         </Alert>
         <Card withBorder radius="md" padding="lg">
           <Stack gap="sm">
-            <Text fw={700}>What setup mode will cover</Text>
+            <Text fw={700}>What setup mode covers</Text>
             <Text c="dimmed">Start a new cluster, generate a join request, import a node enrollment package, and hand off into the runtime admin session.</Text>
           </Stack>
         </Card>
@@ -147,9 +146,9 @@ export function SetupPage() {
 
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
-          This is the React replacement for the first-run bootstrap UI. It uses the same `/setup/*` endpoints as
-          the handwritten setup page and is designed to hand off into the normal runtime admin session once the node
-          transitions to online mode.
+          This is the live first-run bootstrap UI for starting a managed cluster or joining an existing one. It uses
+          the `/setup/*` endpoints directly and hands off into the normal runtime admin session once the node
+          transitions online.
         </Text>
         <Button variant="light" onClick={() => void refresh()} loading={availability === "loading"}>
           Refresh

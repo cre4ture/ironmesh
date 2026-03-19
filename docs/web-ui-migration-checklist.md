@@ -125,8 +125,9 @@ Likely touch points:
 - [x] `pnpm build`
 - [x] `pnpm test:e2e:server-admin`
 - [x] `pnpm test:e2e:server-admin-rust`
+- [x] `pnpm test:e2e:server-admin-setup-rust`
 - [x] server-node serves built admin assets
-- [ ] setup flow still works end to end
+- [x] setup flow still works end to end
 - [x] runtime admin flow still works end to end
 - [ ] client web UI still works in desktop/web contexts
 - [ ] Android embedded client web UI still works
@@ -137,7 +138,7 @@ Likely touch points:
 - Keep `server-admin` and `client-ui` as separate apps.
 - Use `packages/ui` and `packages/api` for shared code, not one giant combined app.
 - Current Phase 2 slice covers the high-value runtime admin flows in the React app, including Setup and Logs.
-- The React app now includes Setup and Logs pages; the remaining setup-specific gap is that bootstrap setup mode still serves the handwritten setup assets rather than the shared React app.
-- Current Phase 3 slice uses a `build.rs` handoff: when `web/apps/server-admin/dist` exists, runtime admin routes serve that built app through the existing `/`, `/ui/app.css`, and `/ui/app.js` paths; otherwise the crate falls back to the handwritten runtime UI.
+- The React app now serves both runtime admin mode and bootstrap setup mode through the same `/`, `/ui/app.css`, and `/ui/app.js` asset paths.
+- Current Phase 3 slice uses a strict `build.rs` handoff: `cargo build` now runs `pnpm build` in `web/`, and server-node routes always serve the built app for both runtime and setup mode.
 - One Playwright smoke test runs against the built `server-admin` app through `vite preview` with mocked runtime APIs.
-- The Rust-served browser smoke now runs against a real `server-node` local-edge process with an admin-token override and verifies the built React app is what `/` serves at runtime.
+- The Rust-served browser smokes now cover both a real runtime node and a real first-run setup node, including setup-to-runtime transition after `Start a new cluster`.

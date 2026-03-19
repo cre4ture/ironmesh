@@ -1,20 +1,62 @@
-import { AppShell, Badge, Burger, Button, Group, NavLink, ScrollArea, Stack, Text } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import { getSetupStatus } from "@ironmesh/api";
 import { PageHeader } from "@ironmesh/ui";
+import { Alert, AppShell, Badge, Burger, Button, Center, Group, Loader, NavLink, ScrollArea, Stack, Text } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
 import { ironmeshProductName } from "@ironmesh/config";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { serverAdminRoutes } from "./routes";
 import { AdminAccessDrawer } from "../components/AdminAccessDrawer";
 import { useAdminAccess } from "../lib/admin-access";
 
+type SurfaceMode = "probing" | "runtime" | "setup";
+
 export function ServerAdminShell() {
   const [opened, { toggle }] = useDisclosure();
   const [accessOpened, accessControls] = useDisclosure(false);
+  const [surfaceMode, setSurfaceMode] = useState<SurfaceMode>("probing");
+  const [surfaceError, setSurfaceError] = useState<string | null>(null);
   const [activeRouteId, setActiveRouteId] = useState<(typeof serverAdminRoutes)[number]["id"]>(
     serverAdminRoutes[0].id
   );
   const { sessionStatus } = useAdminAccess();
-  const activeRoute = serverAdminRoutes.find((route) => route.id === activeRouteId) ?? serverAdminRoutes[0];
+  const visibleRoutes =
+    surfaceMode === "setup"
+      ? serverAdminRoutes.filter((route) => route.id === "setup")
+      : serverAdminRoutes;
+  const activeRoute = visibleRoutes.find((route) => route.id === activeRouteId) ?? visibleRoutes[0];
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function detectSurfaceMode() {
+      try {
+        await getSetupStatus();
+        if (cancelled) {
+          return;
+        }
+        setSurfaceMode("setup");
+        setSurfaceError(null);
+        setActiveRouteId("setup");
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        setSurfaceMode("runtime");
+        if (!message.startsWith("HTTP 404")) {
+          setSurfaceError(`Failed to probe setup mode: ${message}`);
+        } else {
+          setSurfaceError(null);
+        }
+      }
+    }
+
+    void detectSurfaceMode();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <>
@@ -35,10 +77,14 @@ export function ServerAdminShell() {
               </Stack>
             </Group>
             <Group gap="sm">
-              <Badge color={sessionStatus?.authenticated ? "teal" : "gray"}>
-                {sessionStatus?.authenticated ? "signed in" : "sign in required"}
+              <Badge color={surfaceMode === "setup" ? "blue" : sessionStatus?.authenticated ? "teal" : "gray"}>
+                {surfaceMode === "setup"
+                  ? "setup mode"
+                  : sessionStatus?.authenticated
+                    ? "signed in"
+                    : "sign in required"}
               </Badge>
-              <Button variant="light" onClick={accessControls.open}>
+              <Button variant="light" onClick={accessControls.open} disabled={surfaceMode === "setup"}>
                 Admin Access
               </Button>
             </Group>
@@ -48,7 +94,7 @@ export function ServerAdminShell() {
         <AppShell.Navbar p="sm">
           <AppShell.Section grow component={ScrollArea}>
             <Stack gap="xs">
-              {serverAdminRoutes.map((route) => {
+              {visibleRoutes.map((route) => {
                 const Icon = route.icon;
                 return (
                   <NavLink
@@ -66,11 +112,30 @@ export function ServerAdminShell() {
 
         <AppShell.Main>
           <Stack gap="xl">
-            <PageHeader
-              title={activeRoute.label}
-              description={activeRoute.description}
-            />
-            {activeRoute.element}
+            {surfaceMode === "probing" ? (
+              <>
+                <PageHeader
+                  title="Detecting Node Mode"
+                  description="Checking whether this node is in first-run setup mode or normal runtime mode."
+                />
+                <Center py="xl">
+                  <Stack align="center" gap="sm">
+                    <Loader color="teal" />
+                    <Text c="dimmed">Loading the server-admin surface…</Text>
+                  </Stack>
+                </Center>
+              </>
+            ) : (
+              <>
+                <PageHeader title={activeRoute.label} description={activeRoute.description} />
+                {surfaceError ? (
+                  <Alert color="yellow" title="Setup probe warning">
+                    {surfaceError}
+                  </Alert>
+                ) : null}
+                {activeRoute.element}
+              </>
+            )}
           </Stack>
         </AppShell.Main>
       </AppShell>

@@ -576,10 +576,12 @@ impl PersistentStore {
             .await
     }
 
+    #[cfg(test)]
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
     }
 
+    #[cfg(test)]
     pub fn object_count(&self) -> usize {
         self.current_state.objects.len()
     }

@@ -15,15 +15,6 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
-  await page.getByText("Setup", { exact: true }).click();
-  await expect(page.getByRole("heading", { name: "pending_join" })).toBeVisible();
-  await page.getByRole("button", { name: "Generate join request" }).click();
-  await expect(
-    page.getByText('{ "version": 1, "node_id": "node-beta", "cluster_id": "cluster-alpha" }', {
-      exact: true
-    })
-  ).toBeVisible();
-
   await page.getByText("Provisioning", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
   await page.getByRole("button", { name: "Issue bootstrap bundle" }).click();
@@ -52,6 +43,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByText("replication audit healthy")).toBeVisible();
 
+  await page.getByText("Setup", { exact: true }).click();
+  await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
+
   await page.getByText("Control Plane", { exact: true }).click();
   await page.getByRole("textbox", { name: "Target node ID" }).fill("node-beta");
   await page.getByLabel("Passphrase").first().fill("promotion-passphrase");
@@ -68,7 +62,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("node-beta <- node-alpha")).toBeVisible();
 });
 
-async function installServerAdminMocks(page: Page) {
+async function installServerAdminMocks(page: Page, options?: { setupMode?: boolean }) {
   let authenticated = false;
   const revokedDeviceIds = new Set<string>();
 
@@ -192,7 +186,7 @@ async function installServerAdminMocks(page: Page) {
       });
     }
 
-    if (pathname === "/setup/status" && method === "GET") {
+    if (pathname === "/setup/status" && method === "GET" && options?.setupMode) {
       return json(route, {
         state: "pending_join",
         data_dir: "/tmp/ironmesh-node-beta",
@@ -207,6 +201,15 @@ async function installServerAdminMocks(page: Page) {
           cluster_id: "cluster-alpha"
         }
       });
+    }
+
+    if (pathname === "/setup/status" && method === "GET") {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json; charset=utf-8",
+        body: JSON.stringify({ error: "setup mode not active" })
+      });
+      return;
     }
 
     if (pathname === "/setup/start-cluster" && method === "POST") {

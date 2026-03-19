@@ -126,7 +126,6 @@ struct ServerState {
     metadata_commit_mode: MetadataCommitMode,
     autonomous_replication_on_put_enabled: bool,
     inflight_requests: Arc<AtomicUsize>,
-    replication_audit_interval_secs: u64,
     peer_heartbeat_config: PeerHeartbeatConfig,
     repair_config: RepairConfig,
     log_buffer: Arc<LogBuffer>,
@@ -784,16 +783,6 @@ enum StartupRepairStatus {
     Running,
     SkippedNoGaps,
     Completed,
-}
-
-fn startup_repair_status_label(status: StartupRepairStatus) -> &'static str {
-    match status {
-        StartupRepairStatus::Disabled => "disabled",
-        StartupRepairStatus::Scheduled => "scheduled",
-        StartupRepairStatus::Running => "running",
-        StartupRepairStatus::SkippedNoGaps => "completed (no gaps)",
-        StartupRepairStatus::Completed => "completed",
-    }
 }
 
 #[derive(Debug, Default)]
@@ -2636,7 +2625,6 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
         inflight_requests: Arc::new(AtomicUsize::new(0)),
-        replication_audit_interval_secs: config.audit_interval_secs,
         peer_heartbeat_config,
         repair_config,
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),

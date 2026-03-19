@@ -21,6 +21,7 @@ pnpm typecheck
 pnpm build
 pnpm test:e2e:server-admin
 pnpm test:e2e:server-admin-rust
+pnpm test:e2e:server-admin-setup-rust
 ```
 
 ## Current scope

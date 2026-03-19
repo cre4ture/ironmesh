@@ -3703,7 +3703,6 @@ async fn build_test_state(
         metadata_commit_mode: MetadataCommitMode::Local,
         autonomous_replication_on_put_enabled: false,
         inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        replication_audit_interval_secs: 3600,
         peer_heartbeat_config: PeerHeartbeatConfig {
             enabled: false,
             interval_secs: 15,
