@@ -145,6 +145,24 @@ export type ManagedControlPlanePromotionPackage = {
   rendezvous_failover: Record<string, unknown>;
 };
 
+export type ManagedRendezvousFailoverPackage = Record<string, unknown> & {
+  cluster_id?: string;
+  source_node_id?: string;
+  target_node_id?: string;
+  public_url?: string;
+};
+
+export type ManagedRendezvousFailoverImportResponse = {
+  status: string;
+  cluster_id: string;
+  source_node_id: string;
+  target_node_id: string;
+  public_url: string;
+  restart_required: boolean;
+  cert_path: string;
+  key_path: string;
+};
+
 export type ControlPlanePromotionImportResponse = {
   status: string;
   cluster_id: string;

@@ -47,8 +47,25 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
 
   await page.getByText("Control Plane", { exact: true }).click();
-  await page.getByRole("textbox", { name: "Target node ID" }).fill("node-beta");
-  await page.getByLabel("Passphrase").first().fill("promotion-passphrase");
+  await page.getByRole("textbox", { name: "Target node ID" }).first().fill("node-beta");
+  await page.getByLabel("Passphrase").first().fill("rendezvous-passphrase");
+  await page.getByRole("button", { name: "Export rendezvous failover package" }).click();
+  await expect(page.getByText("https://node-beta.local/rendezvous")).toBeVisible();
+
+  const rendezvousPackageJson = JSON.stringify({
+    version: 1,
+    cluster_id: "cluster-alpha",
+    source_node_id: "node-alpha",
+    target_node_id: "node-beta",
+    public_url: "https://node-beta.local/rendezvous"
+  });
+  await page.getByLabel("Rendezvous failover package JSON").fill(rendezvousPackageJson);
+  await page.getByLabel("Passphrase").nth(1).fill("rendezvous-passphrase");
+  await page.getByRole("button", { name: "Import rendezvous failover package" }).click();
+  await expect(page.getByText("tls/rendezvous.key")).toBeVisible();
+
+  await page.getByRole("textbox", { name: "Target node ID" }).nth(1).fill("node-beta");
+  await page.getByLabel("Passphrase").nth(2).fill("promotion-passphrase");
   await page.getByRole("button", { name: "Export promotion package" }).click();
   await expect(page.getByText("signer_backup")).toBeVisible();
 
@@ -57,9 +74,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
     rendezvous_failover: { version: 1, to: "node-beta" }
   });
   await page.getByLabel("Promotion package JSON").fill(packageJson);
-  await page.getByLabel("Passphrase").nth(1).fill("promotion-passphrase");
+  await page.getByLabel("Passphrase").nth(3).fill("promotion-passphrase");
   await page.getByRole("button", { name: "Import promotion package" }).click();
-  await expect(page.getByText("node-beta <- node-alpha")).toBeVisible();
+  await expect(page.getByText("tls/cluster-ca.pem")).toBeVisible();
 });
 
 async function installServerAdminMocks(page: Page, options?: { setupMode?: boolean }) {
@@ -333,6 +350,29 @@ async function installServerAdminMocks(page: Page, options?: { setupMode?: boole
           version: 1,
           to: "node-beta"
         }
+      });
+    }
+
+    if (pathname === "/auth/managed-rendezvous/failover/export" && method === "POST") {
+      return json(route, {
+        version: 1,
+        cluster_id: "cluster-alpha",
+        source_node_id: "node-alpha",
+        target_node_id: "node-beta",
+        public_url: "https://node-beta.local/rendezvous"
+      });
+    }
+
+    if (pathname === "/auth/managed-rendezvous/failover/import" && method === "POST") {
+      return json(route, {
+        status: "imported",
+        cluster_id: "cluster-alpha",
+        source_node_id: "node-alpha",
+        target_node_id: "node-beta",
+        public_url: "https://node-beta.local/rendezvous",
+        restart_required: true,
+        cert_path: "tls/rendezvous.pem",
+        key_path: "tls/rendezvous.key"
       });
     }
 

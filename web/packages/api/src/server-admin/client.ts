@@ -7,6 +7,8 @@ import type {
   ControlPlanePromotionImportResponse,
   LogsResponse,
   ManagedControlPlanePromotionPackage,
+  ManagedRendezvousFailoverImportResponse,
+  ManagedRendezvousFailoverPackage,
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
@@ -199,6 +201,42 @@ export async function getNodeCertificateStatus(
   return fetchAdminJson<NodeCertificateStatusResponse>("/auth/node-certificates/status", {
     adminTokenOverride
   });
+}
+
+export async function exportManagedRendezvousFailover(
+  request: {
+    passphrase: string;
+    target_node_id: string;
+    public_url?: string | null;
+  },
+  adminTokenOverride?: string
+): Promise<ManagedRendezvousFailoverPackage> {
+  return fetchAdminJson<ManagedRendezvousFailoverPackage>(
+    "/auth/managed-rendezvous/failover/export",
+    {
+      method: "POST",
+      adminTokenOverride,
+      body: request
+    }
+  );
+}
+
+export async function importManagedRendezvousFailover(
+  request: {
+    passphrase: string;
+    package: ManagedRendezvousFailoverPackage;
+    bind_addr?: string | null;
+  },
+  adminTokenOverride?: string
+): Promise<ManagedRendezvousFailoverImportResponse> {
+  return fetchAdminJson<ManagedRendezvousFailoverImportResponse>(
+    "/auth/managed-rendezvous/failover/import",
+    {
+      method: "POST",
+      adminTokenOverride,
+      body: request
+    }
+  );
 }
 
 export async function exportManagedControlPlanePromotion(

@@ -24,6 +24,10 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("Not configured on this node")).toHaveCount(2);
   await expect(page.getByText("Auto renew", { exact: true })).toBeVisible();
 
+  await page.getByText("Control Plane", { exact: true }).click();
+  await expect(page.getByText("Export rendezvous-only failover package")).toBeVisible();
+  await expect(page.getByText("Dedicated standalone rendezvous-service")).toBeVisible();
+
   await page.getByText("Setup", { exact: true }).click();
   await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
 });
