@@ -120,10 +120,14 @@ async fn main() -> Result<()> {
             print_json_endpoint(&client, "/cluster/replication/plan").await
         }
         Commands::ServeWeb { bind } => {
-            let client = build_authenticated_sdk_from_cli(&cli).await?;
             let bind_addr: SocketAddr = bind.parse()?;
-            let web_ui_config =
-                WebUiConfig::from_client(client).with_service_name("cli-client-web");
+            let web_ui_config = if cli.server_url.is_some() || cli.bootstrap_file.is_some() {
+                let client = build_authenticated_sdk_from_cli(&cli).await?;
+                WebUiConfig::from_client(client)
+            } else {
+                WebUiConfig::new("http://127.0.0.1:9")
+            }
+            .with_service_name("cli-client-web");
             let app = web_ui_backend::router(web_ui_config);
 
             println!("web interface at http://{bind_addr}");
