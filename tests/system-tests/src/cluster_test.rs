@@ -2176,9 +2176,9 @@ mod tests {
     #[tokio::test]
     async fn relay_required_rendezvous_cluster_supports_bootstrap_enrollment_and_replication()
     -> Result<()> {
-        let rendezvous_bind = "127.0.0.1:19126";
-        let bind_a = "127.0.0.1:19127";
-        let bind_b = "127.0.0.1:19128";
+        let rendezvous_bind = "127.0.0.1:19147";
+        let bind_a = "127.0.0.1:19148";
+        let bind_b = "127.0.0.1:19149";
         let cluster_id = "11111111-1111-7111-8111-111111111111";
         let node_id_a = "00000000-0000-0000-0000-0000000007a1";
         let node_id_b = "00000000-0000-0000-0000-0000000007b2";
