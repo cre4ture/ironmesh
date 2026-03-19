@@ -119,11 +119,19 @@ async fn start_cfapi_adapter_with_resolved_inputs(
 ) -> Result<ChildGuard> {
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
+    let unique_sync_root_id = {
+        let suffix = root_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("sync-root");
+        format!("{sync_root_id}.{suffix}")
+    };
 
     let register_output = Command::new(&os_integration_bin)
         .arg("register")
         .arg("--sync-root-id")
-        .arg(sync_root_id)
+        .arg(&unique_sync_root_id)
         .arg("--display-name")
         .arg(display_name)
         .arg("--root-path")
@@ -143,7 +151,7 @@ async fn start_cfapi_adapter_with_resolved_inputs(
     command
         .arg("serve")
         .arg("--sync-root-id")
-        .arg(sync_root_id)
+        .arg(&unique_sync_root_id)
         .arg("--display-name")
         .arg(display_name)
         .arg("--root-path")
