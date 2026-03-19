@@ -7,7 +7,8 @@
     "dev:client-ui": "pnpm --filter @ironmesh/client-ui dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test:e2e:server-admin": "pnpm build && playwright test tests/server-admin.smoke.spec.ts"
+    "test:e2e:server-admin": "pnpm build && playwright test tests/server-admin.smoke.spec.ts",
+    "test:e2e:server-admin-rust": "pnpm build && cargo build -p server-node --manifest-path ../Cargo.toml && playwright test tests/server-admin.rust.smoke.spec.ts --config playwright.server-node.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.52.0",
