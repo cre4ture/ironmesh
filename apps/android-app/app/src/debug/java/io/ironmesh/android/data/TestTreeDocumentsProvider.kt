@@ -9,7 +9,6 @@ import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
 import java.io.File
 import java.io.FileNotFoundException
-import java.io.IOException
 
 class TestTreeDocumentsProvider : DocumentsProvider() {
     override fun onCreate(): Boolean = true
