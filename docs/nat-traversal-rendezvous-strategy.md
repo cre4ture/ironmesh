@@ -276,6 +276,16 @@ Meaning:
 - relay use is a first-class part of the model,
 - clients can make path decisions without any legacy bootstrap constraints.
 
+Distribution note:
+
+- the full bootstrap schema should not be assumed to fit in a reliable single QR,
+- when onboarding depends on QR scanning, the preferred transport is a small claim payload that redeems through the rendezvous-facing endpoint and returns the full bootstrap over pinned HTTPS,
+- this is especially important when only the rendezvous service is directly reachable and the redeem endpoint is not trusted by public PKI.
+
+See:
+
+- `docs/bootstrap-claim-qr-strategy.md`
+
 ### 8.2 Node descriptor evolution
 
 Extend node metadata beyond static `public_url` / `internal_url`.

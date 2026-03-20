@@ -318,12 +318,16 @@ Decision:
 - keep the current pairing/bootstrap-based client onboarding path for the first implementation,
 - the preferred initial UX is:
   - admin UI issues client bootstrap,
-  - QR/bootstrap bundle carries the pairing/enrollment seed,
+  - QR should carry a small bootstrap claim plus rendezvous trust bootstrap rather than the full client bootstrap JSON,
   - client enrolls and receives its long-lived identity material.
 
 Reason:
 
 - this fits the current implementation best and avoids introducing a separate approval-queue model for clients before it is needed.
+
+Follow-up design note:
+
+- `docs/bootstrap-claim-qr-strategy.md` documents the recommended claim-based QR replacement, including the case where only the rendezvous service is directly reachable and the redeem endpoint is not trusted by public PKI.
 
 ### 11.9 Automation without env vars
 
