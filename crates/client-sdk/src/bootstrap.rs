@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use common::{ClusterId, NodeId};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,9 @@ use std::path::Path;
 use std::time::Duration;
 use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots,
-    ClientBootstrap as TransportClientBootstrap, ClientIdentityMaterial, RelayMode,
+    ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
+    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
+    ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ClientIdentityMaterial, RelayMode,
     TransportPathKind,
 };
 
@@ -100,9 +103,12 @@ impl PlannedConnectionBootstrapTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapEnrollmentResult {
     pub cluster_id: ClusterId,
-    pub server_base_url: String,
+    #[serde(default)]
+    pub server_base_url: Option<String>,
     #[serde(default)]
     pub server_ca_pem: Option<String>,
+    #[serde(default)]
+    pub connection_bootstrap_json: Option<String>,
     pub device_id: String,
     #[serde(default)]
     pub label: Option<String>,
@@ -553,8 +559,13 @@ impl ConnectionBootstrap {
 
         Ok(BootstrapEnrollmentResult {
             cluster_id: resolved.cluster_id,
-            server_base_url: resolved.server_base_url,
+            server_base_url: Some(resolved.server_base_url.clone()),
             server_ca_pem: resolved.server_ca_pem,
+            connection_bootstrap_json: Some(persistable_bootstrap_json(
+                self,
+                &enrollment.device_id,
+                enrollment.label.as_deref(),
+            )?),
             device_id: enrollment.device_id,
             label: enrollment.label,
             public_key_pem: identity.public_key_pem,
@@ -590,6 +601,106 @@ impl ConnectionBootstrap {
     }
 }
 
+pub fn enroll_connection_input_blocking(
+    raw_input: &str,
+    device_id_override: Option<&str>,
+    device_label_override: Option<&str>,
+) -> Result<BootstrapEnrollmentResult> {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        bail!("bootstrap claim or bundle is required");
+    }
+
+    if let Ok(claim) = ClientBootstrapClaim::from_json_str(trimmed) {
+        return enroll_bootstrap_claim_blocking(&claim, device_id_override, device_label_override);
+    }
+
+    ConnectionBootstrap::from_json_str(trimmed)?
+        .enroll_blocking(device_id_override, device_label_override)
+}
+
+pub fn enroll_bootstrap_claim_blocking(
+    claim: &ClientBootstrapClaim,
+    device_id_override: Option<&str>,
+    device_label_override: Option<&str>,
+) -> Result<BootstrapEnrollmentResult> {
+    claim.validate()?;
+
+    let device_id = normalize_optional(device_id_override)
+        .map(|value| {
+            value
+                .parse()
+                .with_context(|| format!("invalid bootstrap claim device_id {}", value))
+        })
+        .transpose()?;
+    let label = normalize_optional(device_label_override);
+    let mut identity =
+        ClientIdentityMaterial::generate(claim.cluster_id, device_id, label.clone())?;
+    let rendezvous_ca_pem = claim_rendezvous_ca_pem(&claim.trust)?;
+    let redeem_url = Url::parse(&claim.rendezvous_url)
+        .with_context(|| format!("invalid claim rendezvous URL {}", claim.rendezvous_url))?
+        .join("bootstrap-claims/redeem")
+        .with_context(|| {
+            format!(
+                "failed to build bootstrap claim redeem URL from {}",
+                claim.rendezvous_url
+            )
+        })?;
+    let response = build_blocking_reqwest_client_from_pem(Some(&rendezvous_ca_pem))?
+        .post(redeem_url)
+        .json(&ClientBootstrapClaimRedeemRequest {
+            claim_token: claim.claim_token.clone(),
+            device_id: Some(identity.device_id.to_string()),
+            label,
+            public_key_pem: identity.public_key_pem.clone(),
+        })
+        .send()
+        .context("failed to call /bootstrap-claims/redeem")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .unwrap_or_else(|_| "<failed to read response body>".to_string());
+    let redeemed = parse_bootstrap_claim_redeem_response(status, body)?;
+    identity.apply_issued_identity(&redeemed.issued_identity()?)?;
+
+    let bootstrap = connection_bootstrap_from_transport(&redeemed.bootstrap);
+    let server_base_url = preferred_direct_server_base_url(&bootstrap)?;
+    let server_ca_pem = bootstrap.trust_roots.public_api_ca_pem.clone();
+    let connection_bootstrap_json = Some(persistable_bootstrap_json(
+        &bootstrap,
+        &redeemed.device_id,
+        redeemed.label.as_deref(),
+    )?);
+
+    Ok(BootstrapEnrollmentResult {
+        cluster_id: redeemed.cluster_id,
+        server_base_url,
+        server_ca_pem,
+        connection_bootstrap_json,
+        device_id: redeemed.device_id,
+        label: redeemed.label,
+        public_key_pem: identity.public_key_pem,
+        private_key_pem: identity.private_key_pem,
+        credential_pem: redeemed.credential_pem,
+        rendezvous_client_identity_pem: redeemed.rendezvous_client_identity_pem,
+        created_at_unix: redeemed.created_at_unix,
+        expires_at_unix: redeemed.expires_at_unix,
+    })
+}
+
+fn parse_bootstrap_claim_redeem_response(
+    status: reqwest::StatusCode,
+    body: String,
+) -> Result<ClientBootstrapClaimRedeemResponse> {
+    if !status.is_success() {
+        bail!("bootstrap claim redeem failed with HTTP {status}: {body}");
+    }
+    let redeemed = serde_json::from_str::<ClientBootstrapClaimRedeemResponse>(&body)
+        .context("failed to parse /bootstrap-claims/redeem response")?;
+    redeemed.validate()?;
+    Ok(redeemed)
+}
+
 fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) -> Result<bool> {
     let server_base_url = target
         .server_base_url
@@ -620,6 +731,81 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
         Ok(response) => Ok(response.status().is_success()),
         Err(_) => Ok(false),
     }
+}
+
+fn persistable_bootstrap_json(
+    bootstrap: &ConnectionBootstrap,
+    device_id: &str,
+    label: Option<&str>,
+) -> Result<String> {
+    let mut bootstrap = bootstrap.clone();
+    bootstrap.pairing_token = None;
+    bootstrap.device_id = Some(device_id.trim().to_string());
+    if let Some(label) = normalize_optional(label) {
+        bootstrap.device_label = Some(label);
+    }
+    bootstrap.to_json_pretty()
+}
+
+fn connection_bootstrap_from_transport(
+    bootstrap: &TransportClientBootstrap,
+) -> ConnectionBootstrap {
+    ConnectionBootstrap {
+        version: bootstrap.version,
+        cluster_id: bootstrap.cluster_id,
+        rendezvous_urls: bootstrap.rendezvous_urls.clone(),
+        rendezvous_mtls_required: bootstrap.rendezvous_mtls_required,
+        direct_endpoints: bootstrap.direct_endpoints.clone(),
+        relay_mode: bootstrap.relay_mode,
+        trust_roots: bootstrap.trust_roots.clone(),
+        pairing_token: bootstrap.pairing_token.clone(),
+        device_label: bootstrap.device_label.clone(),
+        device_id: bootstrap.device_id.map(|value| value.to_string()),
+    }
+}
+
+fn preferred_direct_server_base_url(bootstrap: &ConnectionBootstrap) -> Result<Option<String>> {
+    Ok(bootstrap
+        .normalized_candidate_direct_endpoints()?
+        .into_iter()
+        .next()
+        .map(|endpoint| endpoint.url))
+}
+
+fn claim_rendezvous_ca_pem(trust: &ClientBootstrapClaimTrust) -> Result<String> {
+    trust.validate()?;
+    match trust.mode {
+        ClientBootstrapClaimTrustMode::RendezvousCaPem => trust
+            .ca_pem
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow!("bootstrap claim trust is missing ca_pem")),
+        ClientBootstrapClaimTrustMode::RendezvousCaDerB64u => {
+            let encoded = trust
+                .ca_der_b64u
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("bootstrap claim trust is missing ca_der_b64u"))?;
+            let der = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .context("failed to decode bootstrap claim rendezvous CA DER")?;
+            Ok(pem_from_der_certificate(&der))
+        }
+    }
+}
+
+fn pem_from_der_certificate(der: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let body = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
 }
 
 fn normalize_optional(value: Option<&str>) -> Option<String> {

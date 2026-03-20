@@ -1,4 +1,12 @@
-import { issueBootstrapBundle, issueNodeEnrollmentFromJoinRequest, type BootstrapBundle, type NodeEnrollmentPackage } from "@ironmesh/api";
+import {
+  issueBootstrapBundle,
+  issueBootstrapClaim,
+  issueNodeEnrollmentFromJoinRequest,
+  type BootstrapBundle,
+  type BootstrapClaim,
+  type BootstrapClaimIssueResponse,
+  type NodeEnrollmentPackage
+} from "@ironmesh/api";
 import { Alert, Badge, Button, Card, Grid, Group, NumberInput, Stack, Text, TextInput, Textarea } from "@mantine/core";
 import { JsonBlock } from "@ironmesh/ui";
 import QRCode from "qrcode";
@@ -9,7 +17,9 @@ export function BootstrapBundlesPage() {
   const { adminTokenOverride } = useAdminAccess();
   const [deviceLabel, setDeviceLabel] = useState("desktop-client");
   const [expiresInSecs, setExpiresInSecs] = useState<number | string>(3600);
-  const [bootstrapBundle, setBootstrapBundle] = useState<BootstrapBundle | null>(null);
+  const [issuedBootstrap, setIssuedBootstrap] = useState<BootstrapClaimIssueResponse | null>(null);
+  const [fallbackBootstrapBundle, setFallbackBootstrapBundle] = useState<BootstrapBundle | null>(null);
+  const [bootstrapNotice, setBootstrapNotice] = useState<string | null>(null);
   const [joinRequestRaw, setJoinRequestRaw] = useState("");
   const [tlsValiditySecs, setTlsValiditySecs] = useState<number | string>(2592000);
   const [tlsRenewalWindowSecs, setTlsRenewalWindowSecs] = useState<number | string>(518400);
@@ -19,10 +29,20 @@ export function BootstrapBundlesPage() {
   const [error, setError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<"bootstrap" | "join-enrollment" | null>(null);
 
+  const bootstrapBundle: BootstrapBundle | null = issuedBootstrap?.bootstrap_bundle ?? fallbackBootstrapBundle;
+  const bootstrapClaim: BootstrapClaim | null = issuedBootstrap?.bootstrap_claim ?? null;
   const bundleEndpointCount = bootstrapBundle?.direct_endpoints?.length ?? 0;
-  const bootstrapBundlePayload = useMemo(
-    () => (bootstrapBundle ? JSON.stringify(bootstrapBundle) : null),
-    [bootstrapBundle]
+  const bootstrapQrPayload = useMemo(
+    () => {
+      if (bootstrapClaim) {
+        return JSON.stringify(bootstrapClaim);
+      }
+      if (bootstrapBundle) {
+        return JSON.stringify(bootstrapBundle);
+      }
+      return null;
+    },
+    [bootstrapBundle, bootstrapClaim]
   );
   const joinRequestPreview = (() => {
     try {
@@ -42,7 +62,7 @@ export function BootstrapBundlesPage() {
 
   useEffect(() => {
     let cancelled = false;
-    if (!bootstrapBundlePayload) {
+    if (!bootstrapQrPayload) {
       setBootstrapBundleQrDataUrl(null);
       setBootstrapBundleQrError(null);
       return;
@@ -51,7 +71,7 @@ export function BootstrapBundlesPage() {
     setBootstrapBundleQrDataUrl(null);
     setBootstrapBundleQrError(null);
 
-    void QRCode.toDataURL(bootstrapBundlePayload, {
+    void QRCode.toDataURL(bootstrapQrPayload, {
       errorCorrectionLevel: "L",
       margin: 1,
       width: 320
@@ -70,27 +90,51 @@ export function BootstrapBundlesPage() {
     return () => {
       cancelled = true;
     };
-  }, [bootstrapBundlePayload]);
+  }, [bootstrapQrPayload]);
 
   async function handleIssueBootstrap() {
     setPendingAction("bootstrap");
     setError(null);
-    setBootstrapBundle(null);
+    setIssuedBootstrap(null);
+    setFallbackBootstrapBundle(null);
+    setBootstrapNotice(null);
     try {
-      const payload = await issueBootstrapBundle(
-        {
-          label: deviceLabel.trim() || null,
-          expires_in_secs:
-            typeof expiresInSecs === "number" && Number.isFinite(expiresInSecs) ? expiresInSecs : 3600
-        },
-        adminTokenOverride
-      );
-      setBootstrapBundle(payload);
+      const request = {
+        label: deviceLabel.trim() || null,
+        expires_in_secs:
+          typeof expiresInSecs === "number" && Number.isFinite(expiresInSecs) ? expiresInSecs : 3600
+      };
+      try {
+        const payload = await issueBootstrapClaim(request, adminTokenOverride);
+        setIssuedBootstrap(payload);
+      } catch (claimError) {
+        const message = claimError instanceof Error ? claimError.message : String(claimError);
+        if (!message.startsWith("HTTP 404:") && !message.startsWith("HTTP 412:")) {
+          throw claimError;
+        }
+        const fallbackBundle = await issueBootstrapBundle(request, adminTokenOverride);
+        setFallbackBootstrapBundle(fallbackBundle);
+        setBootstrapNotice("Compact claim issuance is unavailable on this node, so the page fell back to a full bootstrap QR.");
+      }
     } catch (issueError) {
       setError(issueError instanceof Error ? issueError.message : String(issueError));
     } finally {
       setPendingAction(null);
     }
+  }
+
+  function handleDownloadBootstrapBundle() {
+    if (!bootstrapBundle) {
+      return;
+    }
+    const payload = JSON.stringify(bootstrapBundle, null, 2);
+    const blob = new Blob([payload], { type: "application/json" });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `ironmesh-client-bootstrap-${bootstrapBundle.cluster_id ?? "bundle"}.json`;
+    link.click();
+    window.URL.revokeObjectURL(url);
   }
 
   async function handleIssueJoinEnrollment() {
@@ -126,6 +170,7 @@ export function BootstrapBundlesPage() {
   return (
     <Stack gap="lg">
       {error ? <Alert color="red" title="Request failed">{error}</Alert> : null}
+      {bootstrapNotice ? <Alert color="blue" title="Bootstrap QR fallback">{bootstrapNotice}</Alert> : null}
       <Text c="dimmed" maw={760}>
         This page handles the two main provisioning tasks still exposed through the runtime admin surface:
         issuing client bootstrap bundles and approving node join requests into enrollment packages.
@@ -136,12 +181,13 @@ export function BootstrapBundlesPage() {
           <Card withBorder radius="md" padding="lg" h="100%">
             <Stack gap="md">
               <Group justify="space-between">
-                <Text fw={700}>Client bootstrap bundle</Text>
-                <Badge variant="light">{bootstrapBundle ? "issued" : "ready"}</Badge>
+                <Text fw={700}>Client bootstrap claim</Text>
+                <Badge variant="light">{bootstrapClaim ? "issued" : "ready"}</Badge>
               </Group>
               <Text c="dimmed">
-                Issue a bootstrap bundle for a new client. This uses the current admin session or the
-                advanced token override from the header drawer.
+                Issue a compact QR claim for a new client, then keep the full bootstrap bundle available
+                as a file fallback. This uses the current admin session or the advanced token override
+                from the header drawer.
               </Text>
               <TextInput
                 label="Device label"
@@ -157,20 +203,42 @@ export function BootstrapBundlesPage() {
               />
               <Group>
                 <Button onClick={() => void handleIssueBootstrap()} loading={pendingAction === "bootstrap"}>
-                  Issue bootstrap bundle
+                  Issue bootstrap claim
+                </Button>
+                <Button
+                  variant="default"
+                  onClick={handleDownloadBootstrapBundle}
+                  disabled={!bootstrapBundle}
+                >
+                  Download bootstrap bundle
                 </Button>
               </Group>
               <Text size="sm" c="dimmed">
                 Current bundle summary: cluster {String(bootstrapBundle?.cluster_id ?? "unknown")}, relay mode{" "}
                 {String(bootstrapBundle?.relay_mode ?? "unknown")}, direct endpoints {bundleEndpointCount}.
               </Text>
-              {bootstrapBundle ? (
+              {bootstrapClaim ? (
                 <Stack gap="xs">
-                  <Text fw={600}>Scan with the ironmesh Android app</Text>
+                  <Text fw={600}>Scan the compact claim with the ironmesh Android app</Text>
                   {bootstrapBundleQrDataUrl ? (
                     <img
                       src={bootstrapBundleQrDataUrl}
-                      alt="Client bootstrap bundle QR code"
+                      alt="Client bootstrap QR code"
+                      style={{ width: 320, maxWidth: "100%", display: "block" }}
+                    />
+                  ) : (
+                    <Text size="sm" c={bootstrapBundleQrError ? "red" : "dimmed"}>
+                      {bootstrapBundleQrError ? `Failed to generate QR code: ${bootstrapBundleQrError}` : "Generating QR code..."}
+                    </Text>
+                  )}
+                </Stack>
+              ) : bootstrapBundle ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Scan the full bootstrap bundle with the ironmesh Android app</Text>
+                  {bootstrapBundleQrDataUrl ? (
+                    <img
+                      src={bootstrapBundleQrDataUrl}
+                      alt="Client bootstrap QR code"
                       style={{ width: 320, maxWidth: "100%", display: "block" }}
                     />
                   ) : (
@@ -180,7 +248,7 @@ export function BootstrapBundlesPage() {
                   )}
                 </Stack>
               ) : null}
-              <JsonBlock value={bootstrapBundle ?? { status: "no bundle issued yet" }} />
+              <JsonBlock value={issuedBootstrap ?? bootstrapBundle ?? { status: "no bootstrap claim issued yet" }} />
             </Stack>
           </Card>
         </Grid.Col>

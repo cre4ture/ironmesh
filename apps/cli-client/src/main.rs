@@ -176,20 +176,25 @@ async fn enroll_from_bootstrap(
     let device_id = device_id.map(ToString::to_string);
     let label = label.map(ToString::to_string);
 
-    let enrolled =
-        tokio::task::spawn_blocking(move || -> Result<(ClientIdentityMaterial, String)> {
+    let enrolled = tokio::task::spawn_blocking(
+        move || -> Result<(ClientIdentityMaterial, Option<String>)> {
             let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)?;
             let enrolled = bootstrap.enroll_blocking(device_id.as_deref(), label.as_deref())?;
             let identity = enrolled.client_identity_material()?;
             identity.write_to_path(&output_path)?;
             Ok((identity, enrolled.server_base_url))
-        })
-        .await
-        .context("enroll task panicked")??;
+        },
+    )
+    .await
+    .context("enroll task panicked")??;
 
     println!("enrolled device {}", enrolled.0.device_id);
     println!("cluster {}", enrolled.0.cluster_id);
-    println!("server {}", enrolled.1);
+    if let Some(server_base_url) = enrolled.1.as_deref() {
+        println!("server {server_base_url}");
+    } else {
+        println!("server relay-only");
+    }
     println!("identity {}", output_path_for_print.display());
     Ok(())
 }

@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod bootstrap_claim;
 pub mod candidates;
 pub mod http_connector;
 pub mod identity;
@@ -13,6 +14,12 @@ pub use bootstrap::{
     BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots, CLIENT_BOOTSTRAP_VERSION,
     ClientBootstrap, NodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage, NodeJoinRequest,
     RelayMode,
+};
+pub use bootstrap_claim::{
+    CLIENT_BOOTSTRAP_CLAIM_KIND, CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim,
+    ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
+    ClientBootstrapClaimPublishResponse, ClientBootstrapClaimRedeemRequest,
+    ClientBootstrapClaimRedeemResponse, ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode,
 };
 pub use candidates::{CandidateKind, ConnectionCandidate, rank_candidates};
 pub use http_connector::{HttpRouteKind, TransportHttpClientConfig, TransportHttpRequestTarget};

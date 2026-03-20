@@ -8,7 +8,7 @@ pub mod remote_sync;
 
 pub use bootstrap::{
     BootstrapEnrollmentResult, ConnectionBootstrap, PlannedConnectionBootstrapTarget,
-    ResolvedConnectionBootstrap,
+    ResolvedConnectionBootstrap, enroll_bootstrap_claim_blocking, enroll_connection_input_blocking,
 };
 pub use client_node::ClientNode;
 pub use connection::{
@@ -31,7 +31,9 @@ pub use remote_sync::{
     RemoteSyncScheduler, RemoteSyncStrategy, changed_paths_between,
 };
 pub use transport_sdk::{
-    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
-    RelayMode, RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, RendezvousRuntimeState, build_signed_request_headers,
+    BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientBootstrapClaim,
+    ClientBootstrapClaimIssueResponse, ClientBootstrapClaimRedeemRequest,
+    ClientBootstrapClaimRedeemResponse, ClientIdentityMaterial, RelayMode, RendezvousClientConfig,
+    RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
+    RendezvousRuntimeState, build_signed_request_headers,
 };

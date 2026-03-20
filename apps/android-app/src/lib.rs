@@ -5,6 +5,7 @@ use bytes::Bytes;
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
     IronMeshClient, build_reqwest_client_from_pem, build_signed_request_headers,
+    enroll_connection_input_blocking,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -800,9 +801,11 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enr
         let bootstrap_json: String = env.get_string(&bootstrap_json)?.into();
         let device_id = normalize_optional_string(optional_jstring(&mut env, device_id)?);
         let label = normalize_optional_string(optional_jstring(&mut env, label)?);
-        let bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)?;
-        let enrolled: BootstrapEnrollmentResult =
-            bootstrap.enroll_blocking(device_id.as_deref(), label.as_deref())?;
+        let enrolled: BootstrapEnrollmentResult = enroll_connection_input_blocking(
+            &bootstrap_json,
+            device_id.as_deref(),
+            label.as_deref(),
+        )?;
         serde_json::to_string(&enrolled)
             .context("failed to serialize bootstrap enrollment response")
     })();

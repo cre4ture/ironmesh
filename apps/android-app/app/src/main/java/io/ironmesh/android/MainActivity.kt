@@ -277,7 +277,7 @@ private fun SettingsView(
     val onScanQr: () -> Unit = {
         scanLauncher.launch(
             ScanOptions().apply {
-                setPrompt("Scan bootstrap bundle QR code")
+                setPrompt("Scan bootstrap claim QR code")
                 setBeepEnabled(false)
                 setOrientationLocked(false)
             },
@@ -408,7 +408,7 @@ private fun ServerControls(
         modifier = Modifier.fillMaxWidth(),
         value = state.bootstrapInput,
         onValueChange = vm::updateBootstrapInput,
-        label = { Text("Connection Bundle") },
+        label = { Text("Bootstrap Claim or Bundle") },
         minLines = 4,
     )
 

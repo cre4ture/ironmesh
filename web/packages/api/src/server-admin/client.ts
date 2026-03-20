@@ -1,6 +1,7 @@
 import { fetchJson } from "../shared/http";
 import type {
   AdminSessionStatus,
+  BootstrapClaimIssueResponse,
   BootstrapBundle,
   ClientCredentialView,
   ClusterSummary,
@@ -155,6 +156,17 @@ export async function issueBootstrapBundle(
   adminTokenOverride?: string
 ): Promise<BootstrapBundle> {
   return fetchAdminJson<BootstrapBundle>("/auth/bootstrap-bundles/issue", {
+    method: "POST",
+    adminTokenOverride,
+    body: request
+  });
+}
+
+export async function issueBootstrapClaim(
+  request: { label?: string | null; expires_in_secs?: number | null },
+  adminTokenOverride?: string
+): Promise<BootstrapClaimIssueResponse> {
+  return fetchAdminJson<BootstrapClaimIssueResponse>("/auth/bootstrap-claims/issue", {
     method: "POST",
     adminTokenOverride,
     body: request

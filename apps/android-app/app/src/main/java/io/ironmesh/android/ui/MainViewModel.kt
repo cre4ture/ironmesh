@@ -411,7 +411,7 @@ class MainViewModel(
     fun enrollDevice() {
         val bootstrapJson = uiState.value.bootstrapInput.trim()
         if (bootstrapJson.isBlank()) {
-            setStatus("Error: Connection bundle is required")
+            setStatus("Error: Bootstrap claim or bundle is required")
             return
         }
 

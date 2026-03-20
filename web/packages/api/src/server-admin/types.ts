@@ -93,6 +93,27 @@ export type BootstrapBundle = Record<string, unknown> & {
   };
 };
 
+export type BootstrapClaimTrust = {
+  mode: "rendezvous_ca_der_b64u" | "rendezvous_ca_pem";
+  ca_der_b64u?: string | null;
+  ca_pem?: string | null;
+};
+
+export type BootstrapClaim = Record<string, unknown> & {
+  version?: number;
+  kind?: string;
+  cluster_id?: string;
+  rendezvous_url?: string;
+  trust?: BootstrapClaimTrust;
+  claim_token?: string;
+  expires_at_unix?: number;
+};
+
+export type BootstrapClaimIssueResponse = {
+  bootstrap_bundle: BootstrapBundle;
+  bootstrap_claim: BootstrapClaim;
+};
+
 export type NodeEnrollmentPackage = Record<string, unknown> & {
   bootstrap?: Record<string, unknown>;
   public_tls_material?: Record<string, unknown> | null;

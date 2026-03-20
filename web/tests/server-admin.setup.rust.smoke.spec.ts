@@ -14,8 +14,8 @@ test("server-admin setup mode uses the shared React app and transitions to runti
   await expect(page.getByText("signed in", { exact: true })).toBeVisible({ timeout: 60_000 });
 
   await page.getByText("Provisioning", { exact: true }).click();
-  await page.getByRole("button", { name: "Issue bootstrap bundle" }).click();
+  await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
   await expect(page.locator("pre").filter({ hasText: '"cluster_id"' })).toBeVisible();
   await expect(page.locator("pre").filter({ hasText: '"rendezvous_urls"' })).toBeVisible();
-  await expect(page.getByAltText("Client bootstrap bundle QR code")).toBeVisible();
+  await expect(page.getByAltText("Client bootstrap QR code")).toBeVisible();
 });

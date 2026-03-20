@@ -17,9 +17,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 
   await page.getByText("Provisioning", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
-  await page.getByRole("button", { name: "Issue bootstrap bundle" }).click();
+  await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
   await expect(page.locator("pre").filter({ hasText: '"relay_mode": "relay-preferred"' })).toBeVisible();
-  await expect(page.getByAltText("Client bootstrap bundle QR code")).toBeVisible();
+  await expect(page.getByAltText("Client bootstrap QR code")).toBeVisible();
 
   await page.getByLabel("Node join request JSON").fill(
     JSON.stringify({
@@ -274,21 +274,35 @@ async function installServerAdminMocks(page: Page, options?: { setupMode?: boole
       });
     }
 
-    if (pathname === "/auth/bootstrap-bundles/issue" && method === "POST") {
+    if (pathname === "/auth/bootstrap-claims/issue" && method === "POST") {
       return json(route, {
-        cluster_id: "cluster-alpha",
-        relay_mode: "relay-preferred",
-        rendezvous_mtls_required: true,
-        rendezvous_urls: ["https://node-alpha.local/rendezvous"],
-        direct_endpoints: [
-          {
-            url: "https://node-alpha.local",
-            usage: "public_api",
-            node_id: "node-alpha"
+        bootstrap_bundle: {
+          cluster_id: "cluster-alpha",
+          relay_mode: "relay-preferred",
+          rendezvous_mtls_required: true,
+          rendezvous_urls: ["https://node-alpha.local/rendezvous"],
+          direct_endpoints: [
+            {
+              url: "https://node-alpha.local",
+              usage: "public_api",
+              node_id: "node-alpha"
+            }
+          ],
+          trust_roots: {
+            cluster_ca_pem: "-----BEGIN CERTIFICATE-----\\ncluster\\n-----END CERTIFICATE-----"
           }
-        ],
-        trust_roots: {
-          cluster_ca_pem: "-----BEGIN CERTIFICATE-----\\ncluster\\n-----END CERTIFICATE-----"
+        },
+        bootstrap_claim: {
+          version: 1,
+          kind: "client_bootstrap_claim",
+          cluster_id: "cluster-alpha",
+          rendezvous_url: "https://node-alpha.local/rendezvous",
+          claim_token: "im-claim-example",
+          expires_at_unix: 1_900_003_600,
+          trust: {
+            mode: "rendezvous_ca_der_b64u",
+            ca_der_b64u: "TUlJQy4uLg"
+          }
         }
       });
     }

@@ -1,3 +1,4 @@
+use crate::bootstrap_claims::BootstrapClaimBroker;
 use crate::config::RendezvousServiceConfig;
 use crate::presence::PresenceRegistry;
 use crate::relay::RelayBroker;
@@ -7,6 +8,7 @@ pub struct AppState {
     pub config: RendezvousServiceConfig,
     pub presence: PresenceRegistry,
     pub relay: RelayBroker,
+    pub bootstrap_claims: BootstrapClaimBroker,
 }
 
 impl AppState {
@@ -15,6 +17,7 @@ impl AppState {
             config,
             presence: PresenceRegistry::new(),
             relay: RelayBroker::new(),
+            bootstrap_claims: BootstrapClaimBroker::new(),
         }
     }
 }

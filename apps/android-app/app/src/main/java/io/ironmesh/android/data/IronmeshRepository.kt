@@ -9,6 +9,7 @@ import java.io.OutputStream
 
 data class BootstrapEnrollmentData(
     val cluster_id: String,
+    val connection_bootstrap_json: String? = null,
     val device_id: String,
     val label: String? = null,
     val public_key_pem: String,
@@ -61,7 +62,7 @@ class IronmeshRepository {
             clusterId = enrolled.cluster_id,
             deviceId = enrolled.device_id,
             label = enrolled.label,
-            connectionBootstrapJson = bootstrapJson.trim(),
+            connectionBootstrapJson = enrolled.connection_bootstrap_json?.trim().orEmpty(),
             directServerBaseUrl = enrolled.server_base_url.orEmpty(),
             serverCaPem = enrolled.server_ca_pem,
             publicKeyPem = enrolled.public_key_pem,

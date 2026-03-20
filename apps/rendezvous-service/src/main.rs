@@ -1,4 +1,5 @@
 mod auth;
+mod bootstrap_claims;
 mod config;
 mod control;
 mod failover;
@@ -9,16 +10,23 @@ mod state;
 use anyhow::Result;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use transport_sdk::peer::PeerIdentity;
 use transport_sdk::relay::{
     RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
     RelayTicketRequest,
 };
 use transport_sdk::rendezvous::PresenceRegistration;
+use transport_sdk::{
+    ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
+    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, ClientEnrollmentRequest,
+    encode_optional_body_base64,
+};
 
 use crate::auth::{
     MaybeAuthenticatedPeer, MtlsAuthenticatedPeerAcceptor, ensure_authenticated_peer_identity,
@@ -54,10 +62,27 @@ fn build_router(state: AppState) -> Router {
         .route("/control/presence", get(list_presence))
         .route("/control/presence/register", post(register_presence))
         .route("/control/relay/ticket", post(issue_relay_ticket))
+        .route(
+            "/control/bootstrap-claims/publish",
+            post(publish_bootstrap_claim),
+        )
+        .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
         .route("/relay/http/request", post(submit_relay_http_request))
         .route("/relay/http/poll", post(poll_relay_http_request))
         .route("/relay/http/respond", post(complete_relay_http_request))
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayedEnrollmentResponse {
+    cluster_id: uuid::Uuid,
+    device_id: String,
+    label: Option<String>,
+    public_key_pem: String,
+    credential_pem: String,
+    rendezvous_client_identity_pem: Option<String>,
+    created_at_unix: Option<u64>,
+    expires_at_unix: Option<u64>,
 }
 
 async fn run_with_state(state: AppState) -> Result<()> {
@@ -162,6 +187,169 @@ async fn issue_relay_ticket(
         .validate()
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(Json(ticket))
+}
+
+async fn publish_bootstrap_claim(
+    State(state): State<AppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
+    Json(request): Json<ClientBootstrapClaimPublishRequest>,
+) -> std::result::Result<Json<ClientBootstrapClaimPublishResponse>, (StatusCode, String)> {
+    request
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    ensure_authenticated_peer_identity(
+        state.config.mtls.is_some(),
+        &authenticated_peer,
+        &request.issuer,
+        "bootstrap claim issuer",
+    )
+    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
+
+    let response = state
+        .bootstrap_claims
+        .publish(request)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    Ok(Json(response))
+}
+
+async fn redeem_bootstrap_claim(
+    State(state): State<AppState>,
+    Json(request): Json<ClientBootstrapClaimRedeemRequest>,
+) -> std::result::Result<impl axum::response::IntoResponse, (StatusCode, String)> {
+    request
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    let claim_token = request.claim_token.clone();
+    let claim = state
+        .bootstrap_claims
+        .take_for_redeem(&claim_token)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                "bootstrap claim is unavailable".to_string(),
+            )
+        })?;
+
+    let pairing_token = claim
+        .bootstrap
+        .pairing_token
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bootstrap claim is missing a pairing token".to_string(),
+            )
+        })?;
+
+    let device_id = request
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid device_id {value}"),
+                )
+            })
+        })
+        .transpose()?;
+    let label = request
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let enroll_request = ClientEnrollmentRequest {
+        cluster_id: claim.bootstrap.cluster_id,
+        pairing_token,
+        device_id,
+        label,
+        public_key_pem: request.public_key_pem.clone(),
+    };
+    enroll_request
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    let relay_request = RelayHttpRequest {
+        ticket: relay::issue_relay_ticket(
+            RelayTicketRequest {
+                cluster_id: claim.bootstrap.cluster_id,
+                source: claim.issuer.clone(),
+                target: PeerIdentity::Node(claim.target_node_id),
+                requested_expires_in_secs: Some(30),
+            },
+            &state.config.relay_public_urls,
+        ),
+        request_id: uuid::Uuid::now_v7().to_string(),
+        method: "POST".to_string(),
+        path_and_query: "/auth/device/enroll".to_string(),
+        headers: vec![transport_sdk::RelayHttpHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        body_base64: encode_optional_body_base64(
+            serde_json::to_vec(&enroll_request)
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+                .as_slice(),
+        ),
+    };
+
+    let relay_response = match state.relay.submit_and_await(relay_request).await {
+        Ok(response) => response,
+        Err(err) => {
+            state.bootstrap_claims.restore(&claim_token, claim).await;
+            return Err((StatusCode::BAD_GATEWAY, err.to_string()));
+        }
+    };
+
+    let relay_status =
+        StatusCode::from_u16(relay_response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let relay_body = relay_response
+        .body_bytes()
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    if relay_status.is_server_error() {
+        state.bootstrap_claims.restore(&claim_token, claim).await;
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            String::from_utf8_lossy(&relay_body).to_string(),
+        ));
+    }
+    if !relay_status.is_success() {
+        return Err((
+            relay_status,
+            String::from_utf8_lossy(&relay_body).trim().to_string(),
+        ));
+    }
+
+    let enrolled = serde_json::from_slice::<RelayedEnrollmentResponse>(&relay_body)
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let mut bootstrap = claim.bootstrap.clone();
+    bootstrap.pairing_token = None;
+    bootstrap.device_id = enrolled.device_id.parse().ok();
+    bootstrap.device_label = enrolled.label.clone();
+
+    let response = ClientBootstrapClaimRedeemResponse {
+        bootstrap,
+        cluster_id: enrolled.cluster_id,
+        device_id: enrolled.device_id,
+        label: enrolled.label,
+        public_key_pem: enrolled.public_key_pem,
+        credential_pem: enrolled.credential_pem,
+        rendezvous_client_identity_pem: enrolled.rendezvous_client_identity_pem,
+        created_at_unix: enrolled.created_at_unix,
+        expires_at_unix: enrolled.expires_at_unix,
+    };
+    response
+        .validate()
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+
+    Ok(([(CACHE_CONTROL, "no-store")], Json(response)))
 }
 
 async fn submit_relay_http_request(
@@ -904,6 +1092,241 @@ mod tests {
         let _ = rendezvous_handle.await;
         let _ = std::fs::remove_dir_all(&rendezvous_dir);
         let _ = std::fs::remove_dir_all(&health_dir);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_claim_redeem_flows_through_mtls_rendezvous_without_client_cert() {
+        let ca = issue_test_ca().expect("test CA should generate");
+
+        let rendezvous_dir = fresh_test_dir("bootstrap-claim-rendezvous-mtls");
+        let rendezvous_bind_addr = free_bind_addr();
+        let rendezvous_public_url = format!("https://{rendezvous_bind_addr}");
+        let (rendezvous_cert_pem, rendezvous_key_pem) =
+            issue_server_cert(&ca).expect("rendezvous server cert should issue");
+        let (rendezvous_ca_path, _, _) = write_tls_material(
+            &rendezvous_dir,
+            &ca.ca_pem,
+            &(rendezvous_cert_pem.clone(), rendezvous_key_pem.clone()),
+        )
+        .expect("rendezvous TLS material should write");
+        let rendezvous_state = AppState::new(RendezvousServiceConfig {
+            bind_addr: rendezvous_bind_addr,
+            public_url: rendezvous_public_url.clone(),
+            relay_public_urls: vec![rendezvous_public_url.clone()],
+            mtls: Some(config::RendezvousMtlsConfig {
+                client_ca_cert_path: rendezvous_ca_path.clone(),
+                server_identity: config::RendezvousServerTlsIdentity::InlinePem {
+                    cert_pem: rendezvous_cert_pem,
+                    key_pem: rendezvous_key_pem,
+                },
+            }),
+            allow_insecure_http: false,
+            failover_package: None,
+        });
+
+        let target_node_id = Uuid::now_v7();
+        let target_tls =
+            issue_node_cert(&ca, target_node_id).expect("target node cert should issue");
+        let target_identity_pem = format!("{}\n{}", target_tls.0, target_tls.1);
+        let target_tls_paths = write_tls_material(&rendezvous_dir, &ca.ca_pem, &target_tls)
+            .expect("target TLS material should write");
+
+        let rendezvous_state_for_server = rendezvous_state.clone();
+        let rendezvous_handle = tokio::spawn(async move {
+            run_with_state(rendezvous_state_for_server)
+                .await
+                .expect("mTLS rendezvous service should run");
+        });
+
+        let node_control = transport_sdk::RendezvousControlClient::new(
+            transport_sdk::RendezvousClientConfig {
+                cluster_id: Uuid::now_v7(),
+                rendezvous_urls: vec![rendezvous_public_url.clone()],
+                heartbeat_interval_secs: 15,
+            },
+            Some(&ca.ca_pem),
+            Some(target_identity_pem.as_bytes()),
+        )
+        .expect("node control client should build");
+        wait_for_http_status(
+            &build_https_client_with_identity(
+                &rendezvous_ca_path,
+                &target_tls_paths.1,
+                &target_tls_paths.2,
+            )
+            .expect("node health client should build"),
+            &format!("{rendezvous_public_url}/health"),
+            StatusCode::OK,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let cluster_id = node_control.config().cluster_id;
+        let claim_token = "im-claim-test-token";
+        let published_bootstrap = transport_sdk::ClientBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec![rendezvous_public_url.clone()],
+            rendezvous_mtls_required: true,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "https://unreachable.example".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(target_node_id),
+            }],
+            relay_mode: RelayMode::Required,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: Some(ca.ca_pem.clone()),
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: Some(ca.ca_pem.clone()),
+            },
+            pairing_token: Some("pair-token".to_string()),
+            device_label: Some("Phone".to_string()),
+            device_id: None,
+        };
+        node_control
+            .publish_bootstrap_claim(&transport_sdk::ClientBootstrapClaimPublishRequest {
+                cluster_id,
+                issuer: transport_sdk::PeerIdentity::Node(target_node_id),
+                target_node_id,
+                claim_secret_hash: blake3::hash(claim_token.as_bytes()).to_hex().to_string(),
+                expires_at_unix: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    + 300,
+                bootstrap: published_bootstrap.clone(),
+            })
+            .await
+            .expect("bootstrap claim should publish");
+
+        let poller_handle = tokio::spawn({
+            let rendezvous_public_url = rendezvous_public_url.clone();
+            let ca_pem = ca.ca_pem.clone();
+            async move {
+                let client = transport_sdk::RendezvousControlClient::new(
+                    transport_sdk::RendezvousClientConfig {
+                        cluster_id,
+                        rendezvous_urls: vec![rendezvous_public_url],
+                        heartbeat_interval_secs: 15,
+                    },
+                    Some(&ca_pem),
+                    Some(target_identity_pem.as_bytes()),
+                )
+                .expect("target rendezvous client should build");
+
+                let request = loop {
+                    let polled = client
+                        .poll_relay_http_request(&transport_sdk::RelayHttpPollRequest {
+                            cluster_id,
+                            target: transport_sdk::PeerIdentity::Node(target_node_id),
+                            wait_timeout_ms: Some(2_000),
+                        })
+                        .await
+                        .expect("relay poll should succeed");
+                    if let Some(request) = polled.request {
+                        break request;
+                    }
+                };
+
+                assert_eq!(request.path_and_query, "/auth/device/enroll");
+                let enroll_request: transport_sdk::ClientEnrollmentRequest =
+                    serde_json::from_slice(
+                        &request.body_bytes().expect("relay body should decode"),
+                    )
+                    .expect("relay body should parse");
+                assert_eq!(enroll_request.pairing_token, "pair-token");
+                assert_eq!(enroll_request.label.as_deref(), Some("Laptop"));
+
+                client
+                    .respond_relay_http_request(&transport_sdk::RelayHttpResponse {
+                        cluster_id,
+                        session_id: request.session_id,
+                        request_id: request.request_id,
+                        responder: transport_sdk::PeerIdentity::Node(target_node_id),
+                        status: 201,
+                        headers: vec![transport_sdk::RelayHttpHeader {
+                            name: "content-type".to_string(),
+                            value: "application/json".to_string(),
+                        }],
+                        body_base64: transport_sdk::encode_optional_body_base64(
+                            serde_json::to_string(&serde_json::json!({
+                                "cluster_id": cluster_id,
+                                "device_id": enroll_request.device_id.expect("device id should be present"),
+                                "label": enroll_request.label,
+                                "public_key_pem": enroll_request.public_key_pem,
+                                "credential_pem": "issued-credential",
+                                "rendezvous_client_identity_pem": "issued-rendezvous-identity",
+                                "created_at_unix": 11,
+                                "expires_at_unix": 22
+                            }))
+                            .expect("relay enrollment response should serialize")
+                            .as_bytes(),
+                        ),
+                    })
+                    .await
+                    .expect("relay enrollment response should submit");
+            }
+        });
+
+        let public_client = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(ca.ca_pem.as_bytes()).expect("CA PEM should parse"),
+            )
+            .build()
+            .expect("public claim client should build");
+        let redeem_response = public_client
+            .post(format!("{rendezvous_public_url}/bootstrap-claims/redeem"))
+            .json(&transport_sdk::ClientBootstrapClaimRedeemRequest {
+                claim_token: claim_token.to_string(),
+                device_id: Some(Uuid::now_v7().to_string()),
+                label: Some("Laptop".to_string()),
+                public_key_pem: "device-public-key".to_string(),
+            })
+            .send()
+            .await
+            .expect("claim redeem should succeed");
+        assert_eq!(redeem_response.status(), StatusCode::OK);
+        assert_eq!(
+            redeem_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let redeemed = redeem_response
+            .json::<transport_sdk::ClientBootstrapClaimRedeemResponse>()
+            .await
+            .expect("claim redeem response should decode");
+        assert_eq!(redeemed.cluster_id, cluster_id);
+        assert_eq!(redeemed.label.as_deref(), Some("Laptop"));
+        assert_eq!(redeemed.bootstrap.pairing_token, None);
+        assert_eq!(
+            redeemed.bootstrap.rendezvous_urls,
+            published_bootstrap.rendezvous_urls
+        );
+        assert_eq!(
+            redeemed.rendezvous_client_identity_pem.as_deref(),
+            Some("issued-rendezvous-identity")
+        );
+
+        let second_redeem = public_client
+            .post(format!("{rendezvous_public_url}/bootstrap-claims/redeem"))
+            .json(&transport_sdk::ClientBootstrapClaimRedeemRequest {
+                claim_token: claim_token.to_string(),
+                device_id: Some(Uuid::now_v7().to_string()),
+                label: Some("Laptop".to_string()),
+                public_key_pem: "device-public-key".to_string(),
+            })
+            .send()
+            .await
+            .expect("second claim redeem should return a response");
+        assert_eq!(second_redeem.status(), StatusCode::NOT_FOUND);
+
+        poller_handle.abort();
+        let _ = poller_handle.await;
+        rendezvous_handle.abort();
+        let _ = rendezvous_handle.await;
+        let _ = std::fs::remove_dir_all(&rendezvous_dir);
     }
 
     fn free_bind_addr() -> SocketAddr {

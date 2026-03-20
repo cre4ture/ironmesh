@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bootstrap::RelayMode;
+use crate::bootstrap_claim::{
+    ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
+};
 use crate::candidates::ConnectionCandidate;
 use crate::peer::PeerIdentity;
 use crate::relay::{
@@ -254,6 +257,22 @@ impl RendezvousControlClient {
             );
         }
         self.post_json("/control/relay/ticket", request).await
+    }
+
+    pub async fn publish_bootstrap_claim(
+        &self,
+        request: &ClientBootstrapClaimPublishRequest,
+    ) -> Result<ClientBootstrapClaimPublishResponse> {
+        request.validate()?;
+        if request.cluster_id != self.config.cluster_id {
+            bail!(
+                "bootstrap claim publish request cluster_id {} does not match rendezvous client cluster_id {}",
+                request.cluster_id,
+                self.config.cluster_id
+            );
+        }
+        self.post_json("/control/bootstrap-claims/publish", request)
+            .await
     }
 
     pub async fn submit_relay_http_request(

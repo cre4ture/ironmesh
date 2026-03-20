@@ -25,6 +25,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::RustlsConfig;
+use base64::Engine;
 use bytes::Bytes;
 use common::{ClusterId, HealthStatus, NodeId};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -49,8 +50,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial, BootstrapServerTlsFiles,
-    BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots, CandidateKind,
-    ClientBootstrap as TransportClientBootstrap, ConnectionCandidate,
+    BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots,
+    CLIENT_BOOTSTRAP_CLAIM_KIND, CLIENT_BOOTSTRAP_CLAIM_VERSION, CandidateKind,
+    ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
+    ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
+    ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ConnectionCandidate,
     NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
     NodeJoinRequest, PeerIdentity, PeerTransportClient, PeerTransportClientConfig,
     PresenceRegistration, RelayHttpHeader, RelayHttpPollRequest, RelayHttpRequest,
@@ -2974,6 +2978,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/auth/bootstrap-bundles/issue",
             post(issue_bootstrap_bundle),
         )
+        .route("/auth/bootstrap-claims/issue", post(issue_bootstrap_claim))
         .route("/auth/node-bootstraps/issue", post(issue_node_bootstrap))
         .route("/auth/node-enrollments/issue", post(issue_node_enrollment))
         .route(
@@ -5947,6 +5952,129 @@ fn bootstrap_rendezvous_urls(state: &ServerState) -> std::result::Result<Vec<Str
     })
 }
 
+async fn issue_client_bootstrap_impl(
+    state: &ServerState,
+    request: PairingTokenIssueRequest,
+) -> std::result::Result<(TransportClientBootstrap, u64), StatusCode> {
+    let rendezvous_urls = bootstrap_rendezvous_urls(state)?;
+    let pairing_response = issue_pairing_token_impl(state, request).await?;
+
+    let endpoints = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        let mut endpoints = cluster
+            .list_nodes()
+            .into_iter()
+            .filter_map(|node| {
+                node.public_api_url().map(|url| BootstrapEndpoint {
+                    url: url.to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(node.node_id),
+                })
+            })
+            .collect::<Vec<_>>();
+        endpoints.sort_by(|left, right| {
+            left.url
+                .cmp(&right.url)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        endpoints.dedup_by(|left, right| left.url == right.url && left.node_id == right.node_id);
+        endpoints
+    };
+
+    let bootstrap = TransportClientBootstrap {
+        version: 1,
+        cluster_id: state.cluster_id,
+        rendezvous_urls,
+        rendezvous_mtls_required: state.rendezvous_mtls_required,
+        direct_endpoints: endpoints,
+        relay_mode: state.relay_mode,
+        trust_roots: bootstrap_trust_roots(state)?,
+        pairing_token: Some(pairing_response.pairing_token),
+        device_label: pairing_response.label,
+        device_id: None,
+    };
+
+    Ok((bootstrap, pairing_response.expires_at_unix))
+}
+
+fn bootstrap_claim_rendezvous_url(
+    bootstrap: &TransportClientBootstrap,
+) -> std::result::Result<String, StatusCode> {
+    bootstrap
+        .rendezvous_urls
+        .first()
+        .cloned()
+        .ok_or(StatusCode::PRECONDITION_FAILED)
+}
+
+fn rendezvous_claim_trust_from_bootstrap(
+    bootstrap: &TransportClientBootstrap,
+) -> std::result::Result<ClientBootstrapClaimTrust, StatusCode> {
+    let rendezvous_ca_pem = bootstrap
+        .trust_roots
+        .rendezvous_ca_pem
+        .as_deref()
+        .or(bootstrap.trust_roots.public_api_ca_pem.as_deref())
+        .or(bootstrap.trust_roots.cluster_ca_pem.as_deref())
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut reader = std::io::BufReader::new(rendezvous_ca_pem.as_bytes());
+    let cert = CertificateDer::pem_reader_iter(&mut reader)
+        .next()
+        .transpose()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(ClientBootstrapClaimTrust {
+        mode: ClientBootstrapClaimTrustMode::RendezvousCaDerB64u,
+        ca_der_b64u: Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cert.as_ref())),
+        ca_pem: None,
+    })
+}
+
+fn generate_bootstrap_claim_token() -> String {
+    format!(
+        "im-claim-{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+async fn publish_client_bootstrap_claim(
+    state: &ServerState,
+    bootstrap: &TransportClientBootstrap,
+    expires_at_unix: u64,
+) -> std::result::Result<ClientBootstrapClaim, StatusCode> {
+    let rendezvous = current_rendezvous_control(state)
+        .await
+        .ok_or(StatusCode::PRECONDITION_FAILED)?;
+    let claim_token = generate_bootstrap_claim_token();
+    let claim = ClientBootstrapClaim {
+        version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
+        kind: CLIENT_BOOTSTRAP_CLAIM_KIND.to_string(),
+        cluster_id: bootstrap.cluster_id,
+        rendezvous_url: bootstrap_claim_rendezvous_url(bootstrap)?,
+        trust: rendezvous_claim_trust_from_bootstrap(bootstrap)?,
+        claim_token: claim_token.clone(),
+        expires_at_unix,
+    };
+    claim
+        .validate()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    rendezvous
+        .publish_bootstrap_claim(&ClientBootstrapClaimPublishRequest {
+            cluster_id: state.cluster_id,
+            issuer: PeerIdentity::Node(state.node_id),
+            target_node_id: state.node_id,
+            claim_secret_hash: hash_token(&claim_token),
+            expires_at_unix,
+            bootstrap: bootstrap.clone(),
+        })
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(claim)
+}
+
 fn build_bootstrap_direct_endpoints(
     public_url: Option<&str>,
     internal_url: Option<&str>,
@@ -6286,37 +6414,10 @@ async fn issue_bootstrap_bundle(
         Err(status) => return status.into_response(),
     };
 
-    let rendezvous_urls = match bootstrap_rendezvous_urls(&state) {
-        Ok(urls) => urls,
-        Err(status) => return status.into_response(),
-    };
-
-    let pairing_response = match issue_pairing_token_impl(&state, request).await {
+    let request_label = request.label.clone();
+    let (bootstrap, expires_at_unix) = match issue_client_bootstrap_impl(&state, request).await {
         Ok(response) => response,
         Err(status) => return status.into_response(),
-    };
-
-    let endpoints = {
-        let mut cluster = state.cluster.lock().await;
-        cluster.update_health_and_detect_offline_transition();
-        let mut endpoints = cluster
-            .list_nodes()
-            .into_iter()
-            .filter_map(|node| {
-                node.public_api_url().map(|url| BootstrapEndpoint {
-                    url: url.to_string(),
-                    usage: Some(BootstrapEndpointUse::PublicApi),
-                    node_id: Some(node.node_id),
-                })
-            })
-            .collect::<Vec<_>>();
-        endpoints.sort_by(|left, right| {
-            left.url
-                .cmp(&right.url)
-                .then_with(|| left.node_id.cmp(&right.node_id))
-        });
-        endpoints.dedup_by(|left, right| left.url == right.url && left.node_id == right.node_id);
-        endpoints
     };
 
     append_admin_audit(
@@ -6328,30 +6429,72 @@ async fn issue_bootstrap_bundle(
         true,
         "success",
         json!({
-            "label": pairing_response.label,
-            "endpoint_count": endpoints.len(),
-            "expires_at_unix": pairing_response.expires_at_unix,
+            "label": request_label,
+            "endpoint_count": bootstrap.direct_endpoints.len(),
+            "expires_at_unix": expires_at_unix,
         }),
     )
     .await;
 
-    let bootstrap = TransportClientBootstrap {
-        version: 1,
-        cluster_id: state.cluster_id,
-        rendezvous_urls,
-        rendezvous_mtls_required: state.rendezvous_mtls_required,
-        direct_endpoints: endpoints,
-        relay_mode: state.relay_mode,
-        trust_roots: match bootstrap_trust_roots(&state) {
-            Ok(trust_roots) => trust_roots,
-            Err(status) => return status.into_response(),
-        },
-        pairing_token: Some(pairing_response.pairing_token),
-        device_label: pairing_response.label,
-        device_id: None,
+    (StatusCode::CREATED, Json(bootstrap)).into_response()
+}
+
+async fn issue_bootstrap_claim(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<PairingTokenIssueRequest>,
+) -> impl IntoResponse {
+    let action = "auth/bootstrap-claims/issue";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "label": request.label,
+            "expires_in_secs": request.expires_in_secs,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
     };
 
-    (StatusCode::CREATED, Json(bootstrap)).into_response()
+    let request_label = request.label.clone();
+    let (bootstrap_bundle, expires_at_unix) =
+        match issue_client_bootstrap_impl(&state, request).await {
+            Ok(response) => response,
+            Err(status) => return status.into_response(),
+        };
+    let bootstrap_claim =
+        match publish_client_bootstrap_claim(&state, &bootstrap_bundle, expires_at_unix).await {
+            Ok(claim) => claim,
+            Err(status) => return status.into_response(),
+        };
+    let response = ClientBootstrapClaimIssueResponse {
+        bootstrap_bundle,
+        bootstrap_claim,
+    };
+
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({
+            "label": request_label,
+            "endpoint_count": response.bootstrap_bundle.direct_endpoints.len(),
+            "expires_at_unix": response.bootstrap_claim.expires_at_unix,
+        }),
+    )
+    .await;
+
+    (StatusCode::CREATED, Json(response)).into_response()
 }
 
 async fn issue_node_bootstrap(

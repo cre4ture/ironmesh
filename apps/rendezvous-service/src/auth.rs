@@ -96,11 +96,11 @@ pub fn ensure_authenticated_peer_identity(
 #[derive(Clone)]
 pub struct WithAuthenticatedPeer<S> {
     inner: S,
-    authenticated_peer: AuthenticatedPeer,
+    authenticated_peer: Option<AuthenticatedPeer>,
 }
 
 impl<S> WithAuthenticatedPeer<S> {
-    pub fn new(inner: S, authenticated_peer: AuthenticatedPeer) -> Self {
+    pub fn new(inner: S, authenticated_peer: Option<AuthenticatedPeer>) -> Self {
         Self {
             inner,
             authenticated_peer,
@@ -124,7 +124,9 @@ where
     }
 
     fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
-        req.extensions_mut().insert(self.authenticated_peer.clone());
+        if let Some(authenticated_peer) = self.authenticated_peer.clone() {
+            req.extensions_mut().insert(authenticated_peer);
+        }
         self.inner.call(req)
     }
 }
@@ -184,14 +186,14 @@ where
 
 pub fn authenticated_peer_from_tls_stream<T>(
     tls_stream: &TlsStream<T>,
-) -> Result<AuthenticatedPeer> {
+) -> Result<Option<AuthenticatedPeer>> {
     let (_, conn) = tls_stream.get_ref();
-    let certs = conn
-        .peer_certificates()
-        .context("missing peer certificate")?;
+    let Some(certs) = conn.peer_certificates() else {
+        return Ok(None);
+    };
 
     let identity = extract_peer_identity_from_peer_certs(certs)?;
-    Ok(AuthenticatedPeer { identity })
+    Ok(Some(AuthenticatedPeer { identity }))
 }
 
 pub fn build_mtls_rustls_config(
@@ -251,6 +253,7 @@ pub fn build_mtls_rustls_config(
     };
 
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .allow_unauthenticated()
         .build()
         .context("failed creating rendezvous client certificate verifier")?;
 

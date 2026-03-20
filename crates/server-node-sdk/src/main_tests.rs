@@ -654,6 +654,131 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
 }
 
 #[tokio::test]
+async fn issue_bootstrap_claim_returns_compact_qr_payload_and_publishes_to_rendezvous() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let (cluster_ca_pem, _) = generate_test_internal_ca();
+    let (public_ca_pem, _) = generate_test_internal_ca();
+    let (rendezvous_ca_pem, _) = generate_test_internal_ca();
+    state.public_ca_pem = Some(public_ca_pem.clone());
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
+    state.rendezvous_registration_enabled = true;
+    state.rendezvous_mtls_required = true;
+
+    let captured_publish = Arc::new(Mutex::new(
+        None::<transport_sdk::ClientBootstrapClaimPublishRequest>,
+    ));
+    let captured_publish_state = captured_publish.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock rendezvous should bind");
+    let rendezvous_addr = listener.local_addr().expect("mock rendezvous addr");
+    let rendezvous_url = format!("http://{rendezvous_addr}");
+    *state.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
+    let rendezvous_server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/control/bootstrap-claims/publish",
+                post(
+                    move |Json(request): Json<
+                        transport_sdk::ClientBootstrapClaimPublishRequest,
+                    >| {
+                        let captured_publish_state = captured_publish_state.clone();
+                        async move {
+                            *captured_publish_state.lock().await = Some(request.clone());
+                            Json(transport_sdk::ClientBootstrapClaimPublishResponse {
+                                accepted: true,
+                                expires_at_unix: request.expires_at_unix,
+                            })
+                        }
+                    },
+                ),
+            ),
+        )
+        .await
+        .expect("mock rendezvous should serve");
+    });
+
+    let rendezvous_client = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![rendezvous_url.clone()],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("rendezvous client should build");
+    *state.outbound_clients.write().await = super::OutboundClients {
+        internal_http: reqwest::Client::new(),
+        rendezvous_control: Some(rendezvous_client.clone()),
+        rendezvous_controls: vec![super::RendezvousEndpointClient {
+            url: rendezvous_url.clone(),
+            control: rendezvous_client,
+        }],
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_bootstrap_claim(
+        State(state.clone()),
+        headers,
+        Json(super::PairingTokenIssueRequest {
+            label: Some("tablet".to_string()),
+            expires_in_secs: Some(600),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let issued: transport_sdk::ClientBootstrapClaimIssueResponse =
+        serde_json::from_slice(&body).unwrap();
+    assert_eq!(issued.bootstrap_bundle.cluster_id, state.cluster_id);
+    assert_eq!(issued.bootstrap_claim.rendezvous_url, rendezvous_url,);
+    assert_eq!(
+        issued.bootstrap_claim.kind,
+        transport_sdk::CLIENT_BOOTSTRAP_CLAIM_KIND
+    );
+    assert_eq!(
+        issued.bootstrap_claim.trust.mode,
+        transport_sdk::ClientBootstrapClaimTrustMode::RendezvousCaDerB64u
+    );
+    assert!(issued.bootstrap_claim.trust.ca_der_b64u.is_some());
+    assert!(issued.bootstrap_claim.claim_token.starts_with("im-claim-"));
+    assert!(issued.bootstrap_bundle.pairing_token.is_some());
+
+    let published = captured_publish
+        .lock()
+        .await
+        .clone()
+        .expect("claim publish request should be captured");
+    assert_eq!(published.cluster_id, state.cluster_id);
+    assert_eq!(
+        published.issuer,
+        transport_sdk::PeerIdentity::Node(state.node_id)
+    );
+    assert_eq!(published.target_node_id, state.node_id);
+    assert_eq!(
+        published.claim_secret_hash,
+        super::hash_token(&issued.bootstrap_claim.claim_token)
+    );
+    assert_eq!(published.bootstrap.cluster_id, state.cluster_id);
+    assert_eq!(
+        published.bootstrap.trust_roots.rendezvous_ca_pem.as_deref(),
+        Some(rendezvous_ca_pem.as_str())
+    );
+
+    rendezvous_server.abort();
+    let _ = rendezvous_server.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn server_node_config_loads_from_node_bootstrap_file() {
     let root = fresh_test_dir("node-bootstrap-config");
     let bootstrap_path = root.join("node-bootstrap.json");
