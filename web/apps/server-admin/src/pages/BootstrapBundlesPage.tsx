@@ -1,7 +1,8 @@
 import { issueBootstrapBundle, issueNodeEnrollmentFromJoinRequest, type BootstrapBundle, type NodeEnrollmentPackage } from "@ironmesh/api";
 import { Alert, Badge, Button, Card, Grid, Group, NumberInput, Stack, Text, TextInput, Textarea } from "@mantine/core";
 import { JsonBlock } from "@ironmesh/ui";
-import { useState } from "react";
+import QRCode from "qrcode";
+import { useEffect, useMemo, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 
 export function BootstrapBundlesPage() {
@@ -13,10 +14,16 @@ export function BootstrapBundlesPage() {
   const [tlsValiditySecs, setTlsValiditySecs] = useState<number | string>(2592000);
   const [tlsRenewalWindowSecs, setTlsRenewalWindowSecs] = useState<number | string>(518400);
   const [issuedEnrollment, setIssuedEnrollment] = useState<NodeEnrollmentPackage | null>(null);
+  const [bootstrapBundleQrDataUrl, setBootstrapBundleQrDataUrl] = useState<string | null>(null);
+  const [bootstrapBundleQrError, setBootstrapBundleQrError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<"bootstrap" | "join-enrollment" | null>(null);
 
   const bundleEndpointCount = bootstrapBundle?.direct_endpoints?.length ?? 0;
+  const bootstrapBundlePayload = useMemo(
+    () => (bootstrapBundle ? JSON.stringify(bootstrapBundle) : null),
+    [bootstrapBundle]
+  );
   const joinRequestPreview = (() => {
     try {
       const parsed = JSON.parse(joinRequestRaw);
@@ -33,9 +40,42 @@ export function BootstrapBundlesPage() {
     }
   })();
 
+  useEffect(() => {
+    let cancelled = false;
+    if (!bootstrapBundlePayload) {
+      setBootstrapBundleQrDataUrl(null);
+      setBootstrapBundleQrError(null);
+      return;
+    }
+
+    setBootstrapBundleQrDataUrl(null);
+    setBootstrapBundleQrError(null);
+
+    void QRCode.toDataURL(bootstrapBundlePayload, {
+      errorCorrectionLevel: "L",
+      margin: 1,
+      width: 320
+    })
+      .then((dataUrl: string) => {
+        if (!cancelled) {
+          setBootstrapBundleQrDataUrl(dataUrl);
+        }
+      })
+      .catch((qrError: unknown) => {
+        if (!cancelled) {
+          setBootstrapBundleQrError(qrError instanceof Error ? qrError.message : String(qrError));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [bootstrapBundlePayload]);
+
   async function handleIssueBootstrap() {
     setPendingAction("bootstrap");
     setError(null);
+    setBootstrapBundle(null);
     try {
       const payload = await issueBootstrapBundle(
         {
@@ -124,6 +164,22 @@ export function BootstrapBundlesPage() {
                 Current bundle summary: cluster {String(bootstrapBundle?.cluster_id ?? "unknown")}, relay mode{" "}
                 {String(bootstrapBundle?.relay_mode ?? "unknown")}, direct endpoints {bundleEndpointCount}.
               </Text>
+              {bootstrapBundle ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Scan with the ironmesh Android app</Text>
+                  {bootstrapBundleQrDataUrl ? (
+                    <img
+                      src={bootstrapBundleQrDataUrl}
+                      alt="Client bootstrap bundle QR code"
+                      style={{ width: 320, maxWidth: "100%", display: "block" }}
+                    />
+                  ) : (
+                    <Text size="sm" c={bootstrapBundleQrError ? "red" : "dimmed"}>
+                      {bootstrapBundleQrError ? `Failed to generate QR code: ${bootstrapBundleQrError}` : "Generating QR code..."}
+                    </Text>
+                  )}
+                </Stack>
+              ) : null}
               <JsonBlock value={bootstrapBundle ?? { status: "no bundle issued yet" }} />
             </Stack>
           </Card>

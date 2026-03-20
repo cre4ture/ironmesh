@@ -19,6 +19,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
   await page.getByRole("button", { name: "Issue bootstrap bundle" }).click();
   await expect(page.locator("pre").filter({ hasText: '"relay_mode": "relay-preferred"' })).toBeVisible();
+  await expect(page.getByAltText("Client bootstrap bundle QR code")).toBeVisible();
 
   await page.getByLabel("Node join request JSON").fill(
     JSON.stringify({

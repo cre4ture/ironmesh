@@ -16,6 +16,7 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await page.getByRole("button", { name: "Issue bootstrap bundle" }).click();
   await expect(page.locator("pre").filter({ hasText: '"cluster_id"' })).toBeVisible();
   await expect(page.locator("pre").filter({ hasText: '"direct_endpoints"' })).toBeVisible();
+  await expect(page.getByAltText("Client bootstrap bundle QR code")).toBeVisible();
 
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByText("server node listening")).toBeVisible();
