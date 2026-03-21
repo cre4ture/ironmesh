@@ -5,15 +5,65 @@ mod tests {
 
     use std::collections::HashSet;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::Duration;
     use std::time::Instant;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::framework::*;
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
-    use reqwest::StatusCode;
+    use client_sdk::{ClientIdentityMaterial, IronMeshClient, build_signed_request_headers};
+    use reqwest::{Method, RequestBuilder, StatusCode};
     use tokio::time::sleep;
     use uuid::Uuid;
+
+    #[derive(Clone)]
+    struct AuthenticatedTestHttp {
+        base_url: String,
+        http: reqwest::Client,
+        identity: ClientIdentityMaterial,
+    }
+
+    impl AuthenticatedTestHttp {
+        fn new(base_url: String, identity: ClientIdentityMaterial) -> Self {
+            Self {
+                base_url,
+                http: reqwest::Client::new(),
+                identity,
+            }
+        }
+
+        fn request(&self, method: Method, path_and_query: &str) -> Result<RequestBuilder> {
+            let normalized = if path_and_query.starts_with('/') {
+                path_and_query.to_string()
+            } else {
+                format!("/{path_and_query}")
+            };
+            let headers = build_signed_request_headers(
+                &self.identity,
+                method.as_str(),
+                &normalized,
+                unix_ts(),
+                None,
+            )?;
+            let url = format!("{}{}", self.base_url.trim_end_matches('/'), normalized);
+            Ok(headers.apply_to_reqwest(self.http.request(method, url)))
+        }
+    }
+
+    struct AuthenticatedClusterFixture {
+        server: ChildGuard,
+        data_dir: PathBuf,
+        client_dir: PathBuf,
+        sdk: IronMeshClient,
+        http: AuthenticatedTestHttp,
+    }
+
+    struct EnrolledHttpClient {
+        client_dir: PathBuf,
+        http: AuthenticatedTestHttp,
+    }
 
     async fn start_authenticated_cluster_test_client(
         bind: &str,
@@ -37,6 +87,122 @@ mod tests {
         )
         .await?;
         Ok((server, enrolled))
+    }
+
+    async fn start_authenticated_cluster_fixture(
+        bind: &str,
+        server_name: &str,
+        client_name: &str,
+    ) -> Result<AuthenticatedClusterFixture> {
+        start_authenticated_cluster_fixture_with_options(
+            bind,
+            server_name,
+            client_name,
+            Uuid::new_v4().to_string(),
+            1,
+            None,
+            None,
+            &[],
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_authenticated_cluster_fixture_with_options(
+        bind: &str,
+        server_name: &str,
+        client_name: &str,
+        node_id: String,
+        replication_factor: usize,
+        metadata_commit_mode: Option<&str>,
+        heartbeat_timeout_secs: Option<u64>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<AuthenticatedClusterFixture> {
+        let data_dir = fresh_data_dir(server_name);
+        let client_dir = fresh_data_dir(client_name);
+        let server = start_authenticated_server_with_env_options(
+            bind,
+            &data_dir,
+            &node_id,
+            replication_factor,
+            metadata_commit_mode,
+            heartbeat_timeout_secs,
+            extra_env,
+        )
+        .await?;
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+        let enrolled = issue_bootstrap_bundle_and_enroll_client(
+            &http,
+            &base_url,
+            TEST_ADMIN_TOKEN,
+            &client_dir,
+            "cluster-http.bootstrap.json",
+            Some(client_name),
+            Some(3600),
+        )
+        .await?;
+        let sdk = enrolled.build_client_async().await?;
+        let http = AuthenticatedTestHttp::new(base_url, enrolled.identity.clone());
+        Ok(AuthenticatedClusterFixture {
+            server,
+            data_dir,
+            client_dir,
+            sdk,
+            http,
+        })
+    }
+
+    fn unix_ts() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    async fn enroll_authenticated_http_client(
+        base_url: &str,
+        client_name: &str,
+    ) -> Result<EnrolledHttpClient> {
+        let client_dir = fresh_data_dir(client_name);
+        let http = reqwest::Client::new();
+        let enrolled = issue_bootstrap_bundle_and_enroll_client(
+            &http,
+            base_url,
+            TEST_ADMIN_TOKEN,
+            &client_dir,
+            "cluster-http.bootstrap.json",
+            Some(client_name),
+            Some(3600),
+        )
+        .await?;
+        Ok(EnrolledHttpClient {
+            client_dir,
+            http: AuthenticatedTestHttp::new(base_url.to_string(), enrolled.identity),
+        })
+    }
+
+    async fn wait_for_object_payload_authenticated(
+        client: &AuthenticatedTestHttp,
+        key: &str,
+        expected: &str,
+        attempts: usize,
+    ) -> Result<()> {
+        for _ in 0..attempts {
+            let response = client
+                .request(Method::GET, &format!("/store/{key}"))?
+                .send()
+                .await?;
+            if response.status() == StatusCode::OK {
+                let body = response.text().await?;
+                if body == expected {
+                    return Ok(());
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("timed out waiting for object '{key}' to match expected payload")
     }
 
     #[tokio::test]
@@ -72,15 +238,15 @@ mod tests {
         data_dir_suffix: &str,
         payload_len: usize,
     ) -> Result<()> {
-        let data_dir = fresh_data_dir(data_dir_suffix);
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
-        let base_url = format!("http://{bind}");
-        let client = reqwest::Client::new();
+        let mut fixture = start_authenticated_cluster_fixture(
+            bind,
+            data_dir_suffix,
+            &format!("{data_dir_suffix}-client"),
+        )
+        .await?;
 
         let result = async {
             let key = "large-payload.bin";
-            let put_url = format!("{base_url}/store/{key}");
-            let get_url = format!("{base_url}/store/{key}");
 
             let mut payload = vec![b'X'; payload_len];
             payload[0..6].copy_from_slice(b"BEGIN:");
@@ -88,18 +254,20 @@ mod tests {
             let payload = Bytes::from(payload);
 
             if payload_len > CHUNK_UPLOAD_THRESHOLD_BYTES {
-                put_store_chunked(&client, &base_url, key, &payload).await?;
+                put_store_chunked(&fixture.http, key, &payload).await?;
             } else {
-                client
-                    .put(&put_url)
+                fixture
+                    .http
+                    .request(Method::PUT, &format!("/store/{key}"))?
                     .body(payload.clone())
                     .send()
                     .await?
                     .error_for_status()?;
             }
 
-            let fetched = client
-                .get(&get_url)
+            let fetched = fixture
+                .http
+                .request(Method::GET, &format!("/store/{key}"))?
                 .send()
                 .await?
                 .error_for_status()?
@@ -113,14 +281,14 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
-        let _ = fs::remove_dir_all(&data_dir);
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
 
     async fn put_store_chunked(
-        client: &reqwest::Client,
-        base_url: &str,
+        client: &AuthenticatedTestHttp,
         key: &str,
         payload: &[u8],
     ) -> Result<()> {
@@ -128,7 +296,7 @@ mod tests {
 
         for chunk in payload.chunks(CHUNK_UPLOAD_SIZE_BYTES) {
             let response: serde_json::Value = client
-                .post(format!("{base_url}/store-chunks/upload"))
+                .request(Method::POST, "/store-chunks/upload")?
                 .body(chunk.to_vec())
                 .send()
                 .await?
@@ -157,7 +325,7 @@ mod tests {
         });
 
         client
-            .post(format!("{base_url}/store/{key}?complete"))
+            .request(Method::POST, &format!("/store/{key}?complete"))?
             .json(&complete_payload)
             .send()
             .await?
@@ -436,30 +604,35 @@ mod tests {
     #[tokio::test]
     async fn snapshot_time_travel_read_via_http() -> Result<()> {
         let bind = "127.0.0.1:19083";
-        let data_dir = fresh_data_dir("snapshot-time-travel");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
-        let base_url = format!("http://{bind}");
-        let client = reqwest::Client::new();
+        let mut fixture = start_authenticated_cluster_fixture(
+            bind,
+            "snapshot-time-travel",
+            "snapshot-time-travel-client",
+        )
+        .await?;
 
         let result = async {
-            client
-                .put(format!("{base_url}/store/history-key"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/history-key")?
                 .body("v1")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let first_snapshot_id = latest_snapshot_id(&client, &base_url).await?;
+            let first_snapshot_id = latest_snapshot_id_for_client(&fixture.sdk).await?;
 
-            client
-                .put(format!("{base_url}/store/history-key"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/history-key")?
                 .body("v2")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let latest = client
-                .get(format!("{base_url}/store/history-key"))
+            let latest = fixture
+                .http
+                .request(Method::GET, "/store/history-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -467,10 +640,12 @@ mod tests {
                 .await?;
             assert_eq!(latest, "v2");
 
-            let historical = client
-                .get(format!(
-                    "{base_url}/store/history-key?snapshot={first_snapshot_id}"
-                ))
+            let historical = fixture
+                .http
+                .request(
+                    Method::GET,
+                    &format!("/store/history-key?snapshot={first_snapshot_id}"),
+                )?
                 .send()
                 .await?
                 .error_for_status()?
@@ -482,18 +657,17 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
-        let _ = fs::remove_dir_all(&data_dir);
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
 
     #[tokio::test]
     async fn store_index_lists_keys_by_prefix_and_depth() -> Result<()> {
         let bind = "127.0.0.1:19122";
-        let data_dir = fresh_data_dir("store-index");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
-        let base_url = format!("http://{bind}");
-        let client = reqwest::Client::new();
+        let mut fixture =
+            start_authenticated_cluster_fixture(bind, "store-index", "store-index-client").await?;
 
         let result = async {
             for (key, payload) in [
@@ -502,16 +676,18 @@ mod tests {
                 ("docs/api/v1.json", "api"),
             ] {
                 let encoded = key.replace('/', "%2F");
-                client
-                    .put(format!("{base_url}/store/{encoded}"))
+                fixture
+                    .http
+                    .request(Method::PUT, &format!("/store/{encoded}"))?
                     .body(payload)
                     .send()
                     .await?
                     .error_for_status()?;
             }
 
-            let index: serde_json::Value = client
-                .get(format!("{base_url}/store/index?prefix=docs&depth=1"))
+            let index: serde_json::Value = fixture
+                .http
+                .request(Method::GET, "/store/index?prefix=docs&depth=1")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -537,28 +713,32 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
-        let _ = fs::remove_dir_all(&data_dir);
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
 
     #[tokio::test]
     async fn corrupted_chunk_returns_conflict() -> Result<()> {
         let bind = "127.0.0.1:19084";
-        let data_dir = fresh_data_dir("corrupt-detection");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
-        let base_url = format!("http://{bind}");
-        let client = reqwest::Client::new();
+        let mut fixture = start_authenticated_cluster_fixture(
+            bind,
+            "corrupt-detection",
+            "corrupt-detection-client",
+        )
+        .await?;
 
         let result = async {
-            client
-                .put(format!("{base_url}/store/corrupt-me"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/corrupt-me")?
                 .body("payload-for-corruption-check")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let chunk_file = first_chunk_file(data_dir.join("chunks"))?;
+            let chunk_file = first_chunk_file(fixture.data_dir.join("chunks"))?;
             let mut bytes = fs::read(&chunk_file)?;
             if bytes.is_empty() {
                 bail!("chunk file unexpectedly empty: {}", chunk_file.display());
@@ -566,8 +746,9 @@ mod tests {
             bytes[0] ^= 0xFF;
             fs::write(&chunk_file, bytes)?;
 
-            let response = client
-                .get(format!("{base_url}/store/corrupt-me"))
+            let response = fixture
+                .http
+                .request(Method::GET, "/store/corrupt-me")?
                 .send()
                 .await?;
             assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -576,29 +757,31 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
-        let _ = fs::remove_dir_all(&data_dir);
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
 
     #[tokio::test]
     async fn version_graph_and_confirm_flow() -> Result<()> {
         let bind = "127.0.0.1:19085";
-        let data_dir = fresh_data_dir("version-graph");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
-        let base_url = format!("http://{bind}");
-        let client = reqwest::Client::new();
+        let mut fixture =
+            start_authenticated_cluster_fixture(bind, "version-graph", "version-graph-client")
+                .await?;
 
         let result = async {
-            client
-                .put(format!("{base_url}/store/versioned-key"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/versioned-key")?
                 .body("v1")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let first_versions_payload = client
-                .get(format!("{base_url}/versions/versioned-key"))
+            let first_versions_payload = fixture
+                .http
+                .request(Method::GET, "/versions/versioned-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -615,15 +798,17 @@ mod tests {
                 .context("missing first version id")?
                 .to_string();
 
-            client
-                .put(format!("{base_url}/store/versioned-key?state=provisional"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/versioned-key?state=provisional")?
                 .body("v2")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let second_versions_payload = client
-                .get(format!("{base_url}/versions/versioned-key"))
+            let second_versions_payload = fixture
+                .http
+                .request(Method::GET, "/versions/versioned-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -652,10 +837,12 @@ mod tests {
                 .context("missing provisional version id")?
                 .to_string();
 
-            let v1_payload = client
-                .get(format!(
-                    "{base_url}/store/versioned-key?version={first_version_id}"
-                ))
+            let v1_payload = fixture
+                .http
+                .request(
+                    Method::GET,
+                    &format!("/store/versioned-key?version={first_version_id}"),
+                )?
                 .send()
                 .await?
                 .error_for_status()?
@@ -663,16 +850,19 @@ mod tests {
                 .await?;
             assert_eq!(v1_payload, "v1");
 
-            let confirm_response = client
-                .post(format!(
-                    "{base_url}/versions/versioned-key/confirm/{provisional_version_id}"
-                ))
+            let confirm_response = fixture
+                .http
+                .request(
+                    Method::POST,
+                    &format!("/versions/versioned-key/confirm/{provisional_version_id}"),
+                )?
                 .send()
                 .await?;
             assert_eq!(confirm_response.status(), StatusCode::NO_CONTENT);
 
-            let third_versions_payload = client
-                .get(format!("{base_url}/versions/versioned-key"))
+            let third_versions_payload = fixture
+                .http
+                .request(Method::GET, "/versions/versioned-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -701,36 +891,38 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
-        let _ = fs::remove_dir_all(&data_dir);
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
 
     #[tokio::test]
     async fn read_modes_respect_preferred_and_confirmed_visibility() -> Result<()> {
         let bind = "127.0.0.1:19087";
-        let data_dir = fresh_data_dir("read-modes");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
-        let base_url = format!("http://{bind}");
-        let client = reqwest::Client::new();
+        let mut fixture =
+            start_authenticated_cluster_fixture(bind, "read-modes", "read-modes-client").await?;
 
         let result = async {
-            client
-                .put(format!("{base_url}/store/read-mode-key"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/read-mode-key")?
                 .body("confirmed-v1")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            client
-                .put(format!("{base_url}/store/read-mode-key?state=provisional"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/read-mode-key?state=provisional")?
                 .body("provisional-v2")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let versions_payload = client
-                .get(format!("{base_url}/versions/read-mode-key"))
+            let versions_payload = fixture
+                .http
+                .request(Method::GET, "/versions/read-mode-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -744,8 +936,9 @@ mod tests {
                 .context("missing preferred_head_reason")?;
             assert_eq!(reason, "provisional_fallback_no_confirmed");
 
-            let preferred_default = client
-                .get(format!("{base_url}/store/read-mode-key"))
+            let preferred_default = fixture
+                .http
+                .request(Method::GET, "/store/read-mode-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -753,10 +946,9 @@ mod tests {
                 .await?;
             assert_eq!(preferred_default, "provisional-v2");
 
-            let preferred_explicit = client
-                .get(format!(
-                    "{base_url}/store/read-mode-key?read_mode=preferred"
-                ))
+            let preferred_explicit = fixture
+                .http
+                .request(Method::GET, "/store/read-mode-key?read_mode=preferred")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -764,10 +956,12 @@ mod tests {
                 .await?;
             assert_eq!(preferred_explicit, "provisional-v2");
 
-            let provisional_allowed = client
-                .get(format!(
-                    "{base_url}/store/read-mode-key?read_mode=provisional_allowed"
-                ))
+            let provisional_allowed = fixture
+                .http
+                .request(
+                    Method::GET,
+                    "/store/read-mode-key?read_mode=provisional_allowed",
+                )?
                 .send()
                 .await?
                 .error_for_status()?
@@ -775,27 +969,27 @@ mod tests {
                 .await?;
             assert_eq!(provisional_allowed, "provisional-v2");
 
-            let confirmed_only = client
-                .get(format!(
-                    "{base_url}/store/read-mode-key?read_mode=confirmed_only"
-                ))
+            let confirmed_only = fixture
+                .http
+                .request(Method::GET, "/store/read-mode-key?read_mode=confirmed_only")?
                 .send()
                 .await?;
             assert_eq!(confirmed_only.status(), StatusCode::NOT_FOUND);
 
-            client
-                .put(format!(
-                    "{base_url}/store/confirmed-head-key?state=confirmed"
-                ))
+            fixture
+                .http
+                .request(Method::PUT, "/store/confirmed-head-key?state=confirmed")?
                 .body("confirmed-head")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let confirmed_head = client
-                .get(format!(
-                    "{base_url}/store/confirmed-head-key?read_mode=confirmed_only"
-                ))
+            let confirmed_head = fixture
+                .http
+                .request(
+                    Method::GET,
+                    "/store/confirmed-head-key?read_mode=confirmed_only",
+                )?
                 .send()
                 .await?
                 .error_for_status()?
@@ -803,25 +997,27 @@ mod tests {
                 .await?;
             assert_eq!(confirmed_head, "confirmed-head");
 
-            client
-                .put(format!(
-                    "{base_url}/store/provisional-only-key?state=provisional"
-                ))
+            fixture
+                .http
+                .request(Method::PUT, "/store/provisional-only-key?state=provisional")?
                 .body("only-provisional")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let provisional_only_confirmed = client
-                .get(format!(
-                    "{base_url}/store/provisional-only-key?read_mode=confirmed_only"
-                ))
+            let provisional_only_confirmed = fixture
+                .http
+                .request(
+                    Method::GET,
+                    "/store/provisional-only-key?read_mode=confirmed_only",
+                )?
                 .send()
                 .await?;
             assert_eq!(provisional_only_confirmed.status(), StatusCode::NOT_FOUND);
 
-            let bad_mode = client
-                .get(format!("{base_url}/store/read-mode-key?read_mode=unknown"))
+            let bad_mode = fixture
+                .http
+                .request(Method::GET, "/store/read-mode-key?read_mode=unknown")?
                 .send()
                 .await?;
             assert_eq!(bad_mode.status(), StatusCode::BAD_REQUEST);
@@ -830,33 +1026,34 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
-        let _ = fs::remove_dir_all(&data_dir);
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
 
     #[tokio::test]
     async fn commit_endpoint_enforces_quorum_mode() -> Result<()> {
         let bind = "127.0.0.1:19086";
-        let data_dir = fresh_data_dir("version-commit-quorum");
-        let mut server = start_server_with_options(
+        let mut fixture = start_authenticated_cluster_fixture_with_options(
             bind,
-            &data_dir,
-            "00000000-0000-0000-0000-0000000000a1",
+            "version-commit-quorum",
+            "version-commit-quorum-client",
+            "00000000-0000-0000-0000-0000000000a1".to_string(),
             3,
             Some("quorum"),
             Some(1),
+            &[],
         )
         .await?;
 
-        let base_url = format!("http://{bind}");
         let internal_base_url = internal_base_url_from_public_bind(bind)?;
         let client = reqwest::Client::new();
 
         let result = async {
             register_node(
                 &client,
-                &base_url,
+                &fixture.http.base_url,
                 "00000000-0000-0000-0000-0000000000b2",
                 "http://127.0.0.1:29091",
                 "dc-b",
@@ -865,7 +1062,7 @@ mod tests {
             .await?;
             register_node(
                 &client,
-                &base_url,
+                &fixture.http.base_url,
                 "00000000-0000-0000-0000-0000000000c3",
                 "http://127.0.0.1:29092",
                 "dc-c",
@@ -873,15 +1070,17 @@ mod tests {
             )
             .await?;
 
-            client
-                .put(format!("{base_url}/store/quorum-key?state=provisional"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/quorum-key?state=provisional")?
                 .body("v1")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let versions_payload = client
-                .get(format!("{base_url}/versions/quorum-key"))
+            let versions_payload = fixture
+                .http
+                .request(Method::GET, "/versions/quorum-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -908,15 +1107,17 @@ mod tests {
 
             sleep(Duration::from_millis(2_300)).await;
             client
-                .get(format!("{base_url}/cluster/status"))
+                .get(format!("{}/cluster/status", fixture.http.base_url))
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let rejected = client
-                .post(format!(
-                    "{base_url}/versions/quorum-key/commit/{provisional_version_id}"
-                ))
+            let rejected = fixture
+                .http
+                .request(
+                    Method::POST,
+                    &format!("/versions/quorum-key/commit/{provisional_version_id}"),
+                )?
                 .send()
                 .await?;
             assert_eq!(rejected.status(), StatusCode::CONFLICT);
@@ -941,10 +1142,12 @@ mod tests {
                 .await?
                 .error_for_status()?;
 
-            let accepted = client
-                .post(format!(
-                    "{base_url}/versions/quorum-key/commit/{provisional_version_id}"
-                ))
+            let accepted = fixture
+                .http
+                .request(
+                    Method::POST,
+                    &format!("/versions/quorum-key/commit/{provisional_version_id}"),
+                )?
                 .send()
                 .await?;
             assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
@@ -953,8 +1156,9 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
-        let _ = fs::remove_dir_all(&data_dir);
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
 
@@ -1192,20 +1396,23 @@ mod tests {
         let data_b = fresh_data_dir("multi-node-b");
         let data_c = fresh_data_dir("multi-node-c");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
-        let mut node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
+        let mut node_a = start_authenticated_server(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_authenticated_server(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_c = start_authenticated_server(bind_c, &data_c, node_id_c, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let base_c = format!("http://{bind_c}");
         let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "multi-node-a-client").await?;
 
         let result = async {
             register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
             register_node(&http, &base_a, node_id_c, &base_c, "dc-c", "rack-3").await?;
 
-            http.put(format!("{base_a}/store/multi-key"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/multi-key")?
                 .body("multi-node-payload")
                 .send()
                 .await?
@@ -1267,6 +1474,7 @@ mod tests {
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
 
         result
     }
@@ -1371,20 +1579,25 @@ mod tests {
         let data_b = fresh_data_dir("repair-b");
         let data_c = fresh_data_dir("repair-c");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
-        let mut node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
+        let mut node_a = start_authenticated_server(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_authenticated_server(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_c = start_authenticated_server(bind_c, &data_c, node_id_c, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let base_c = format!("http://{bind_c}");
         let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "repair-a-client").await?;
+        let client_b = enroll_authenticated_http_client(&base_b, "repair-b-client").await?;
+        let client_c = enroll_authenticated_http_client(&base_c, "repair-c-client").await?;
 
         let result = async {
             register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
             register_node(&http, &base_a, node_id_c, &base_c, "dc-c", "rack-3").await?;
 
-            http.put(format!("{base_a}/store/repair-key"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/repair-key")?
                 .body("repair-payload")
                 .send()
                 .await?
@@ -1437,12 +1650,14 @@ mod tests {
                 "repair should not increase under-replication"
             );
 
-            let b_read = http
-                .get(format!("{base_b}/store/repair-key"))
+            let b_read = client_b
+                .http
+                .request(Method::GET, "/store/repair-key")?
                 .send()
                 .await?;
-            let c_read = http
-                .get(format!("{base_c}/store/repair-key"))
+            let c_read = client_c
+                .http
+                .request(Method::GET, "/store/repair-key")?
                 .send()
                 .await?;
             assert!(
@@ -1460,6 +1675,9 @@ mod tests {
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
+        let _ = fs::remove_dir_all(&client_b.client_dir);
+        let _ = fs::remove_dir_all(&client_c.client_dir);
 
         result
     }
@@ -1475,19 +1693,23 @@ mod tests {
         let data_a = fresh_data_dir("auto-repair-a");
         let data_b = fresh_data_dir("auto-repair-b");
 
-        let mut node_a = start_server_with_env(
+        let mut node_a = start_authenticated_server_with_env_options(
             bind_a,
             &data_a,
             node_id_a,
             2,
+            None,
+            None,
             &[("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
         )
         .await?;
-        let mut node_b = start_server_with_env(
+        let mut node_b = start_authenticated_server_with_env_options(
             bind_b,
             &data_b,
             node_id_b,
             2,
+            None,
+            None,
             &[("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
         )
         .await?;
@@ -1495,18 +1717,28 @@ mod tests {
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "auto-repair-a-client").await?;
+        let client_b = enroll_authenticated_http_client(&base_b, "auto-repair-b-client").await?;
 
         let result = async {
             register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
 
             let payload = "autonomous-replication-payload";
-            http.put(format!("{base_a}/store/autonomous-repair-key"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/autonomous-repair-key")?
                 .body(payload)
                 .send()
                 .await?
                 .error_for_status()?;
 
-            wait_for_object_payload(&http, &base_b, "autonomous-repair-key", payload, 120).await?;
+            wait_for_object_payload_authenticated(
+                &client_b.http,
+                "autonomous-repair-key",
+                payload,
+                120,
+            )
+            .await?;
 
             Ok::<(), anyhow::Error>(())
         }
@@ -1516,6 +1748,8 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
+        let _ = fs::remove_dir_all(&client_b.client_dir);
 
         result
     }
@@ -1534,26 +1768,31 @@ mod tests {
         let data_b = fresh_data_dir("repair-batch-b");
         let data_c = fresh_data_dir("repair-batch-c");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
-        let mut node_c = start_server_with_config(bind_c, &data_c, node_id_c, 2).await?;
+        let mut node_a = start_authenticated_server(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_authenticated_server(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_c = start_authenticated_server(bind_c, &data_c, node_id_c, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let base_c = format!("http://{bind_c}");
         let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "repair-batch-a-client").await?;
 
         let result = async {
             register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
             register_node(&http, &base_a, node_id_c, &base_c, "dc-c", "rack-3").await?;
 
-            http.put(format!("{base_a}/store/repair-batch-key-a"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/repair-batch-key-a")?
                 .body("payload-a")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            http.put(format!("{base_a}/store/repair-batch-key-b"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/repair-batch-key-b")?
                 .body("payload-b")
                 .send()
                 .await?
@@ -1583,6 +1822,7 @@ mod tests {
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
 
         result
     }
@@ -1598,24 +1838,29 @@ mod tests {
         let data_a = fresh_data_dir("repair-version-a");
         let data_b = fresh_data_dir("repair-version-b");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_a = start_authenticated_server(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_authenticated_server(bind_b, &data_b, node_id_b, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "repair-version-a-client").await?;
+        let client_b = enroll_authenticated_http_client(&base_b, "repair-version-b-client").await?;
 
         let result = async {
             register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
 
-            http.put(format!("{base_a}/store/repair-version-key"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/repair-version-key")?
                 .body("repair-version-payload")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            let versions_a: serde_json::Value = http
-                .get(format!("{base_a}/versions/repair-version-key"))
+            let versions_a: serde_json::Value = client_a
+                .http
+                .request(Method::GET, "/versions/repair-version-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -1645,8 +1890,9 @@ mod tests {
                 "expected at least one successful transfer, report={repair_report:?}"
             );
 
-            let versions_b: serde_json::Value = http
-                .get(format!("{base_b}/versions/repair-version-key"))
+            let versions_b: serde_json::Value = client_b
+                .http
+                .request(Method::GET, "/versions/repair-version-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -1680,6 +1926,8 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
+        let _ = fs::remove_dir_all(&client_b.client_dir);
 
         result
     }
@@ -1696,12 +1944,14 @@ mod tests {
         let data_a = fresh_data_dir("repair-rename-a");
         let data_b = fresh_data_dir("repair-rename-b");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_a = start_authenticated_server(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_authenticated_server(bind_b, &data_b, node_id_b, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "repair-rename-a-client").await?;
+        let client_b = enroll_authenticated_http_client(&base_b, "repair-rename-b-client").await?;
 
         let result = async {
             register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
@@ -1713,7 +1963,9 @@ mod tests {
             let to_path = "rename-gap-to.txt";
             let payload = "rename-gap-payload";
 
-            http.put(format!("{base_a}/store/{from_path}"))
+            client_a
+                .http
+                .request(Method::PUT, &format!("/store/{from_path}"))?
                 .body(payload)
                 .send()
                 .await?
@@ -1724,9 +1976,11 @@ mod tests {
                 .await?
                 .error_for_status()?;
 
-            wait_for_object_payload(&http, &base_b, from_path, payload, 120).await?;
+            wait_for_object_payload_authenticated(&client_b.http, from_path, payload, 120).await?;
 
-            http.post(format!("{base_a}/store/rename"))
+            client_a
+                .http
+                .request(Method::POST, "/store/rename")?
                 .json(&serde_json::json!({
                     "from_path": from_path,
                     "to_path": to_path,
@@ -1743,9 +1997,14 @@ mod tests {
 
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(5) {
-                let new_resp = http.get(format!("{base_b}/store/{to_path}")).send().await?;
-                let old_resp = http
-                    .get(format!("{base_b}/store/{from_path}"))
+                let new_resp = client_b
+                    .http
+                    .request(Method::GET, &format!("/store/{to_path}"))?
+                    .send()
+                    .await?;
+                let old_resp = client_b
+                    .http
+                    .request(Method::GET, &format!("/store/{from_path}"))?
                     .send()
                     .await?;
 
@@ -1771,6 +2030,8 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
+        let _ = fs::remove_dir_all(&client_b.client_dir);
 
         result
     }
@@ -3018,14 +3279,18 @@ mod tests {
     #[tokio::test]
     async fn maintenance_cleanup_removes_orphans_and_keeps_live_data() -> Result<()> {
         let bind = "127.0.0.1:19102";
-        let data_dir = fresh_data_dir("maintenance-cleanup");
-        let mut server = start_server_with_data_dir(bind, &data_dir).await?;
-        let base_url = format!("http://{bind}");
+        let mut fixture = start_authenticated_cluster_fixture(
+            bind,
+            "maintenance-cleanup",
+            "maintenance-cleanup-client",
+        )
+        .await?;
         let client = reqwest::Client::new();
 
         let result = async {
-            client
-                .put(format!("{base_url}/store/live-key"))
+            fixture
+                .http
+                .request(Method::PUT, "/store/live-key")?
                 .body("live-payload")
                 .send()
                 .await?
@@ -3034,7 +3299,10 @@ mod tests {
             let orphan_chunk_bytes = b"orphan-chunk-payload";
             let orphan_chunk_hash =
                 "aa11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff".to_string();
-            let orphan_chunk_dir = data_dir.join("chunks").join(&orphan_chunk_hash[0..2]);
+            let orphan_chunk_dir = fixture
+                .data_dir
+                .join("chunks")
+                .join(&orphan_chunk_hash[0..2]);
             fs::create_dir_all(&orphan_chunk_dir)?;
             fs::write(
                 orphan_chunk_dir.join(&orphan_chunk_hash),
@@ -3057,7 +3325,8 @@ mod tests {
             let orphan_manifest_hash =
                 "bb11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff".to_string();
             fs::write(
-                data_dir
+                fixture
+                    .data_dir
                     .join("manifests")
                     .join(format!("{orphan_manifest_hash}.json")),
                 orphan_manifest_bytes,
@@ -3065,8 +3334,10 @@ mod tests {
 
             let cleanup_response = client
                 .post(format!(
-                    "{base_url}/maintenance/cleanup?retention_secs=0&dry_run=false&approve=true"
+                    "{}/maintenance/cleanup?retention_secs=0&dry_run=false&approve=true",
+                    fixture.http.base_url
                 ))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -3089,8 +3360,9 @@ mod tests {
                 "expected at least one orphan chunk to be deleted"
             );
 
-            let live_payload = client
-                .get(format!("{base_url}/store/live-key"))
+            let live_payload = fixture
+                .http
+                .request(Method::GET, "/store/live-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -3098,7 +3370,8 @@ mod tests {
                 .await?;
             assert_eq!(live_payload, "live-payload");
 
-            let orphan_manifest_still_exists = data_dir
+            let orphan_manifest_still_exists = fixture
+                .data_dir
                 .join("manifests")
                 .join(format!("{orphan_manifest_hash}.json"))
                 .exists();
@@ -3111,8 +3384,9 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
-        let _ = fs::remove_dir_all(&data_dir);
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
 }

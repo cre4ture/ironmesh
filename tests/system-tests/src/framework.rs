@@ -248,11 +248,43 @@ pub async fn start_authenticated_server(
     node_id: &str,
     replication_factor: usize,
 ) -> Result<ChildGuard> {
+    start_authenticated_server_with_env_options(
+        bind,
+        data_dir,
+        node_id,
+        replication_factor,
+        None,
+        None,
+        &[],
+    )
+    .await
+}
+
+pub async fn start_authenticated_server_with_env_options(
+    bind: &str,
+    data_dir: &Path,
+    node_id: &str,
+    replication_factor: usize,
+    metadata_commit_mode: Option<&str>,
+    heartbeat_timeout_secs: Option<u64>,
+    extra_env: &[(&str, &str)],
+) -> Result<ChildGuard> {
     let env = [
         ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
         ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
     ];
-    start_server_with_env(bind, data_dir, node_id, replication_factor, &env).await
+    let mut merged_env = env.to_vec();
+    merged_env.extend_from_slice(extra_env);
+    start_server_with_env_options(
+        bind,
+        data_dir,
+        node_id,
+        replication_factor,
+        metadata_commit_mode,
+        heartbeat_timeout_secs,
+        &merged_env,
+    )
+    .await
 }
 
 pub async fn start_zero_touch_server(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
@@ -581,19 +613,6 @@ pub async fn register_node(
         .error_for_status()?;
 
     Ok(())
-}
-
-pub async fn latest_snapshot_id(http: &reqwest::Client, base_url: &str) -> Result<String> {
-    let payload = http
-        .get(format!("{base_url}/snapshots"))
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-
-    let parsed: serde_json::Value = serde_json::from_str(&payload)?;
-    latest_snapshot_id_from_value(parsed)
 }
 
 pub async fn latest_snapshot_id_for_client(client: &IronMeshClient) -> Result<String> {
