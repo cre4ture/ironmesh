@@ -10,9 +10,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use web_ui_backend::{WebUiBootstrapPersistence, WebUiConfig};
 
+const GIT_VERSION: &str =
+    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
 #[command(about = "CLI client for ironmesh distributed storage")]
+#[command(version = GIT_VERSION)]
 struct Cli {
     #[arg(long)]
     server_url: Option<String>,

@@ -9,3 +9,7 @@ authors.workspace = true
 anyhow.workspace = true
 adapter-linux-fuse = { path = "../../crates/adapter-linux-fuse" }
 adapter-windows-cfapi = { path = "../../crates/adapter-windows-cfapi" }
+
+[dev-dependencies]
+assert_cmd.workspace = true
+git-version.workspace = true

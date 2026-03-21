@@ -20,9 +20,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use sync_core::{SyncPolicy, SyncSnapshot};
 
+const GIT_VERSION: &str =
+    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+
 #[derive(Debug, Parser)]
 #[command(name = "adapter-linux-fuse-mount")]
 #[command(about = "Mount an Ironmesh FUSE view from a SyncSnapshot JSON or a live server-node")]
+#[command(version = GIT_VERSION)]
 struct Args {
     #[arg(long)]
     snapshot_file: Option<PathBuf>,

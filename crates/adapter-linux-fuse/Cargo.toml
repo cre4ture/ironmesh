@@ -15,6 +15,7 @@ server-node-sdk = { path = "../server-node-sdk" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 fuser = { version = "0.14", default-features = false }
+git-version = { workspace = true }
 libc = { version = "0.2" }
 serde_json = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }

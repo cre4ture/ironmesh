@@ -18,9 +18,13 @@ use crate::runtime::{
 };
 use sync_core::SyncPolicy;
 
+const GIT_VERSION: &str =
+    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+
 #[derive(Debug, Parser)]
 #[command(name = "adapter-windows-cfapi")]
 #[command(about = "Combined CLI for register and serve")]
+#[command(version = GIT_VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

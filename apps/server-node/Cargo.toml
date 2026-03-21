@@ -7,5 +7,10 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+git-version.workspace = true
 server-node-sdk = { path = "../../crates/server-node-sdk" }
 tokio.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true

@@ -9,6 +9,9 @@ use crate::failover::{
     DecryptedRendezvousFailoverPackage, load_rendezvous_failover_package, normalize_public_url,
 };
 
+const GIT_VERSION: &str =
+    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+
 #[derive(Debug, Clone)]
 pub enum RendezvousServerTlsIdentity {
     Files {
@@ -30,7 +33,7 @@ pub struct RendezvousMtlsConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Parser)]
 #[command(name = "rendezvous-service")]
 #[command(about = "Standalone Ironmesh rendezvous plus relay service")]
-#[command(version)]
+#[command(version = GIT_VERSION)]
 pub struct RendezvousServiceCliConfig {
     #[arg(
         long = "failover-package",
