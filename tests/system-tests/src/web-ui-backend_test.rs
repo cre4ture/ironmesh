@@ -18,6 +18,15 @@ mod tests {
 
     const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 
+    fn sample_png_bytes() -> Vec<u8> {
+        let image = image::DynamicImage::new_rgba8(4, 3);
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("sample PNG encode should succeed");
+        cursor.into_inner()
+    }
+
     async fn start_web_backend_with_args(bind: &str, cli_args: &[&str]) -> Result<ChildGuard> {
         let cli_bin = binary_path("cli-client")?;
         let child = Command::new(cli_bin)
@@ -348,6 +357,64 @@ mod tests {
             assert_eq!(get_deleted.status(), StatusCode::BAD_GATEWAY);
 
             assert!(upstream_client.get(delete_key).await.is_err());
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn web_ui_backend_proxies_media_thumbnail_requests() -> Result<()> {
+        let server_bind = "127.0.0.1:19386";
+        let web_bind = "127.0.0.1:19387";
+        let web_base = format!("http://{web_bind}");
+        let client = reqwest::Client::new();
+
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-thumb-server",
+            "web-ui-thumb-client",
+        )
+        .await?;
+
+        let result = async {
+            client
+                .post(format!("{web_base}/api/store/put-binary"))
+                .query(&[("key", "gallery/cat.png")])
+                .body(sample_png_bytes())
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let response = client
+                .get(format!("{web_base}/media/thumbnail"))
+                .query(&[("key", "gallery/cat.png")])
+                .send()
+                .await?
+                .error_for_status()?;
+
+            assert_eq!(
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("image/jpeg")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("public, max-age=31536000, immutable")
+            );
+
+            let body = response.bytes().await?;
+            assert!(!body.is_empty(), "thumbnail body should not be empty");
 
             Ok::<(), anyhow::Error>(())
         }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -203,7 +203,7 @@ pub fn router(config: WebUiConfig) -> Router {
 
     Router::new()
         .route("/", get(web_static_index))
-        .route("/{*path}", get(web_static_file))
+        .route("/media/thumbnail", get(web_media_thumbnail))
         .route("/api/health", get(web_health))
         .route("/api/snapshots", get(web_snapshots))
         .route("/api/versions", get(web_versions))
@@ -222,6 +222,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/api/rendezvous/refresh", post(web_refresh_rendezvous))
         .route("/api/ping", get(web_ping))
+        .route("/{*path}", get(web_static_file))
         .with_state(state)
 }
 
@@ -260,6 +261,14 @@ struct WebStoreBinaryGetQuery {
 #[derive(Debug, Deserialize)]
 struct WebStoreBinaryPutQuery {
     key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebMediaThumbnailQuery {
+    key: String,
+    snapshot: Option<String>,
+    version: Option<String>,
+    read_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,6 +555,20 @@ fn build_versions_request_path(key: &str) -> Result<String> {
     build_relative_path(&["versions", key], &[])
 }
 
+fn build_media_thumbnail_request_path(query: &WebMediaThumbnailQuery) -> Result<String> {
+    let mut query_pairs = vec![("key", query.key.as_str())];
+    if let Some(snapshot) = query.snapshot.as_deref() {
+        query_pairs.push(("snapshot", snapshot));
+    }
+    if let Some(version) = query.version.as_deref() {
+        query_pairs.push(("version", version));
+    }
+    if let Some(read_mode) = query.read_mode.as_deref() {
+        query_pairs.push(("read_mode", read_mode));
+    }
+    build_relative_path(&["media", "thumbnail"], &query_pairs)
+}
+
 fn content_type_for(path: &str) -> &'static str {
     if path.ends_with(".css") {
         "text/css; charset=utf-8"
@@ -639,6 +662,39 @@ async fn web_versions(
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
+}
+
+async fn web_media_thumbnail(
+    State(state): State<WebState>,
+    Query(query): Query<WebMediaThumbnailQuery>,
+) -> impl IntoResponse {
+    if query.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    let thumbnail_path = match build_media_thumbnail_request_path(&query) {
+        Ok(path) => path,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let response = match current_sdk(&state)
+        .await
+        .get_relative_path(&thumbnail_path)
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    };
+
+    let mut headers = HeaderMap::new();
+    if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+        headers.insert(CONTENT_TYPE, value);
+    }
+    if let Some(value) = response.headers.get(CACHE_CONTROL).cloned() {
+        headers.insert(CACHE_CONTROL, value);
+    }
+
+    (response.status, headers, response.body).into_response()
 }
 
 async fn web_cluster_status(State(state): State<WebState>) -> impl IntoResponse {

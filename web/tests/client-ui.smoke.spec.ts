@@ -25,6 +25,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("button", { name: "Load versions" }).click();
   await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();
 
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 images")).toBeVisible();
+
   await page.getByText("Cluster", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
   await expect(page.getByText("Under replicated")).toBeVisible();
@@ -83,11 +88,62 @@ async function installClientUiMocks(page: Page) {
 
     if (pathname === "/api/store/list" && method === "GET") {
       return json(route, {
+        prefix: searchParams.get("prefix") ?? "",
+        depth: Number(searchParams.get("depth") ?? "1"),
+        entry_count: 4,
         entries: [
           { path: "docs/readme.txt", entry_type: "key" },
-          { path: "media/", entry_type: "prefix" }
+          { path: "media/", entry_type: "prefix" },
+          {
+            path: "gallery/cat.png",
+            entry_type: "key",
+            media: {
+              status: "ready",
+              content_fingerprint: "fingerprint-cat",
+              media_type: "image",
+              mime_type: "image/png",
+              width: 1024,
+              height: 768,
+              taken_at_unix: 1712345678,
+              thumbnail: {
+                url: "/media/thumbnail?key=gallery%2Fcat.png",
+                profile: "grid",
+                width: 256,
+                height: 192,
+                format: "jpeg",
+                size_bytes: 1234
+              }
+            }
+          },
+          {
+            path: "gallery/dog.jpg",
+            entry_type: "key",
+            media: {
+              status: "pending",
+              content_fingerprint: "fingerprint-dog",
+              media_type: "image",
+              mime_type: "image/jpeg",
+              thumbnail: {
+                url: "/media/thumbnail?key=gallery%2Fdog.jpg",
+                profile: "grid",
+                width: 256,
+                height: 256,
+                format: "jpeg",
+                size_bytes: 0
+              }
+            }
+          }
         ]
       });
+    }
+
+    if (pathname === "/media/thumbnail" && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "image/jpeg",
+        body: Buffer.from([255, 216, 255, 217])
+      });
+      return;
     }
 
     if (pathname === "/api/snapshots" && method === "GET") {

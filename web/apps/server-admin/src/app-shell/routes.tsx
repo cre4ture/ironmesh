@@ -1,4 +1,4 @@
-import { IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconKey, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
 import { SetupPage } from "../pages/SetupPage";
 import { BootstrapBundlesPage } from "../pages/BootstrapBundlesPage";
@@ -6,6 +6,7 @@ import { ClientCredentialsPage } from "../pages/ClientCredentialsPage";
 import { CertificatesPage } from "../pages/CertificatesPage";
 import { ControlPlanePage } from "../pages/ControlPlanePage";
 import { LogsPage } from "../pages/LogsPage";
+import { GalleryPage } from "../pages/GalleryPage";
 
 export const serverAdminRoutes = [
   {
@@ -21,6 +22,13 @@ export const serverAdminRoutes = [
     description: "First-run zero-touch setup for starting a cluster, generating join requests, and importing enrollment packages.",
     icon: IconServerCog,
     element: <SetupPage />
+  },
+  {
+    id: "gallery",
+    label: "Gallery",
+    description: "Browse image objects from the server node side using admin-authenticated snapshot, index, and preview routes.",
+    icon: IconPhoto,
+    element: <GalleryPage />
   },
   {
     id: "bootstrap",

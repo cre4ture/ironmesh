@@ -56,6 +56,13 @@ struct BufferedTransportResponse {
     body: Bytes,
 }
 
+#[derive(Debug, Clone)]
+pub struct RelativePathResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UploadMode {
     Direct,
@@ -609,6 +616,19 @@ impl IronMeshClient {
             .build()
             .context("failed to create runtime for JSON path request")?;
         runtime.block_on(self.get_json_path(&path))
+    }
+
+    pub async fn get_relative_path(&self, path: &str) -> Result<RelativePathResponse> {
+        let url = self.relative_url(path)?;
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to request {path}"))?;
+        Ok(RelativePathResponse {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        })
     }
 
     pub async fn load_snapshot_from_server(

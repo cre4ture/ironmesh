@@ -25,6 +25,7 @@ import {
   IconFiles,
   IconFolder,
   IconPlugConnected,
+  IconPhoto,
   IconRefresh,
   IconServer
 } from "@tabler/icons-react";
@@ -58,8 +59,9 @@ import {
   type VersionGraphResponse
 } from "@ironmesh/api";
 import { useEffect, useRef, useState } from "react";
+import { GalleryPage } from "../pages/GalleryPage";
 
-type PageId = "overview" | "rendezvous" | "store" | "explorer" | "cluster";
+type PageId = "overview" | "rendezvous" | "store" | "explorer" | "gallery" | "cluster";
 
 const pages = [
   {
@@ -85,6 +87,12 @@ const pages = [
     label: "Explorer",
     icon: IconFolder,
     description: "Browse prefixes, snapshots, and version history."
+  },
+  {
+    id: "gallery" as const,
+    label: "Gallery",
+    icon: IconPhoto,
+    description: "Browse image objects through the shared media-aware store index."
   },
   {
     id: "cluster" as const,
@@ -204,6 +212,8 @@ export function ClientShell() {
             {activePageId === "store" ? <StorePage /> : null}
 
             {activePageId === "explorer" ? <ExplorerPage /> : null}
+
+            {activePageId === "gallery" ? <GalleryPage /> : null}
 
             {activePageId === "cluster" ? (
               <ClusterPage

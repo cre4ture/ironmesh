@@ -44,6 +44,10 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByText("replication audit healthy")).toBeVisible();
 
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 images", { exact: true })).toBeVisible();
+
   await page.getByText("Setup", { exact: true }).click();
   await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
 
@@ -200,6 +204,79 @@ async function installServerAdminMocks(
     if (pathname === "/auth/admin/logout" && method === "POST") {
       authenticated = false;
       return json(route, { status: "ok" });
+    }
+
+    if (pathname === "/auth/store/snapshots" && method === "GET") {
+      return json(route, [{ id: "snapshot-admin-001" }]);
+    }
+
+    if (pathname === "/auth/store/index" && method === "GET") {
+      return json(route, {
+        prefix: searchParams.get("prefix") ?? "",
+        depth: Number(searchParams.get("depth") ?? "1"),
+        entry_count: 4,
+        entries: [
+          { path: "docs/readme.txt", entry_type: "key" },
+          { path: "media/", entry_type: "prefix" },
+          {
+            path: "gallery/cat.png",
+            entry_type: "key",
+            media: {
+              status: "ready",
+              content_fingerprint: "fingerprint-cat",
+              media_type: "image",
+              mime_type: "image/png",
+              width: 1024,
+              height: 768,
+              taken_at_unix: 1_712_345_678,
+              thumbnail: {
+                url: "/auth/media/thumbnail?key=gallery%2Fcat.png",
+                profile: "grid",
+                width: 256,
+                height: 192,
+                format: "jpeg",
+                size_bytes: 1234
+              }
+            }
+          },
+          {
+            path: "gallery/dog.jpg",
+            entry_type: "key",
+            media: {
+              status: "pending",
+              content_fingerprint: "fingerprint-dog",
+              media_type: "image",
+              mime_type: "image/jpeg",
+              thumbnail: {
+                url: "/auth/media/thumbnail?key=gallery%2Fdog.jpg",
+                profile: "grid",
+                width: 256,
+                height: 256,
+                format: "jpeg",
+                size_bytes: 0
+              }
+            }
+          }
+        ]
+      });
+    }
+
+    if (pathname === "/auth/media/thumbnail" && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "image/jpeg",
+        body: Buffer.from([255, 216, 255, 217])
+      });
+      return;
+    }
+
+    if (pathname.startsWith("/auth/store/") && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "image/png",
+        body: Buffer.from([137, 80, 78, 71])
+      });
+      return;
     }
 
     if (pathname === "/cluster/status" && method === "GET") {

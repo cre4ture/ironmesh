@@ -21,6 +21,9 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await page.getByText("Logs", { exact: true }).click();
   await expect(page.getByText("server node listening")).toBeVisible();
 
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("No image objects in view")).toBeVisible();
+
   await page.getByText("Certificates", { exact: true }).click();
   await expect(page.getByText("Not configured on this node")).toHaveCount(2);
   await expect(page.getByText("Auto renew", { exact: true })).toBeVisible();

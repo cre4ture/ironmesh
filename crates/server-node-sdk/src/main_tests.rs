@@ -3917,6 +3917,169 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_turso
 );
 
+async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let put = {
+        let mut locked = state.store.lock().await;
+        locked
+            .put_object_versioned(
+                "gallery/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let locked = state.store.lock().await;
+        locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index_admin(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        payload["entries"][0]["media"]["thumbnail"]["url"],
+        "/auth/media/thumbnail?key=gallery%2Fcat.png"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    list_store_index_admin_uses_admin_thumbnail_route_impl,
+    list_store_index_admin_uses_admin_thumbnail_route,
+    list_store_index_admin_uses_admin_thumbnail_route_turso
+);
+
+async fn get_media_thumbnail_admin_requires_auth_and_serves_image_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let put = {
+        let mut locked = state.store.lock().await;
+        locked
+            .put_object_versioned(
+                "gallery/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let locked = state.store.lock().await;
+        locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+    }
+
+    let query = super::MediaThumbnailQuery {
+        key: "gallery/cat.png".to_string(),
+        snapshot: None,
+        version: None,
+        read_mode: None,
+    };
+
+    let unauthorized = axum::response::IntoResponse::into_response(
+        super::get_media_thumbnail_admin(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Query(query.clone()),
+        )
+        .await,
+    );
+    assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = axum::response::IntoResponse::into_response(
+        super::get_media_thumbnail_admin(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::extract::Query(query),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/jpeg")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(!body.is_empty());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    get_media_thumbnail_admin_requires_auth_and_serves_image_impl,
+    get_media_thumbnail_admin_requires_auth_and_serves_image,
+    get_media_thumbnail_admin_requires_auth_and_serves_image_turso
+);
+
+async fn get_object_admin_returns_bytes_with_admin_token_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let payload = bytes::Bytes::from(sample_png_bytes());
+    {
+        let mut locked = state.store.lock().await;
+        locked
+            .put_object_versioned("gallery/cat.png", payload.clone(), PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = axum::response::IntoResponse::into_response(
+        super::get_object_admin(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::extract::Path("gallery/cat.png".to_string()),
+            axum::extract::Query(super::ObjectGetQuery {
+                snapshot: None,
+                version: None,
+                read_mode: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), payload.as_ref());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    get_object_admin_returns_bytes_with_admin_token_impl,
+    get_object_admin_returns_bytes_with_admin_token,
+    get_object_admin_returns_bytes_with_admin_token_turso
+);
+
 async fn local_edge_mode_serves_health_without_internal_tls_impl(backend: MainTestBackend) {
     let bind_addr = free_bind_addr();
     let data_dir = std::env::temp_dir().join(format!(

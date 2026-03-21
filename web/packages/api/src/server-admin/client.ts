@@ -1,5 +1,7 @@
 import { fetchJson } from "../shared/http";
 import type {
+  AdminSnapshotSummary,
+  AdminStoreListResponse,
   AdminSessionStatus,
   BootstrapClaimIssueResponse,
   BootstrapBundle,
@@ -66,6 +68,34 @@ export async function loginAdmin(password: string): Promise<{ status: string }> 
 export async function logoutAdmin(adminTokenOverride?: string): Promise<{ status: string }> {
   return fetchAdminJson<{ status: string }>("/auth/admin/logout", {
     method: "POST",
+    adminTokenOverride
+  });
+}
+
+export async function listAdminSnapshots(
+  adminTokenOverride?: string
+): Promise<AdminSnapshotSummary[]> {
+  return fetchAdminJson<AdminSnapshotSummary[]>("/auth/store/snapshots", {
+    adminTokenOverride
+  });
+}
+
+export async function listAdminStoreEntries(
+  prefix?: string,
+  depth = 1,
+  snapshot?: string | null,
+  adminTokenOverride?: string
+): Promise<AdminStoreListResponse> {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, depth))
+  });
+  if (prefix?.trim()) {
+    query.set("prefix", prefix.trim());
+  }
+  if (snapshot?.trim()) {
+    query.set("snapshot", snapshot.trim());
+  }
+  return fetchAdminJson<AdminStoreListResponse>(`/auth/store/index?${query.toString()}`, {
     adminTokenOverride
   });
 }

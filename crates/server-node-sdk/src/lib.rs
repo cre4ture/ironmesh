@@ -2971,6 +2971,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/admin/session", get(get_admin_session_status))
         .route("/auth/admin/login", post(login_admin_session))
         .route("/auth/admin/logout", post(logout_admin_session))
+        .route("/auth/store/snapshots", get(list_snapshots_admin))
+        .route("/auth/store/index", get(list_store_index_admin))
+        .route("/auth/media/thumbnail", get(get_media_thumbnail_admin))
+        .route("/auth/store/{key}", get(get_object_admin))
         .route(
             "/auth/rendezvous-config",
             get(get_rendezvous_config).put(update_rendezvous_config),
@@ -4497,6 +4501,24 @@ async fn node_certificate_status(
 }
 
 async fn list_snapshots(State(state): State<ServerState>) -> impl IntoResponse {
+    list_snapshots_response(&state).await
+}
+
+async fn list_snapshots_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/store/snapshots/get";
+    if let Err(status) =
+        authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        return status.into_response();
+    }
+
+    list_snapshots_response(&state).await
+}
+
+async fn list_snapshots_response(state: &ServerState) -> Response {
     let store = state.store.lock().await;
     match store.list_snapshots().await {
         Ok(snapshots) => (StatusCode::OK, Json(snapshots)).into_response(),
@@ -4507,14 +4529,14 @@ async fn list_snapshots(State(state): State<ServerState>) -> impl IntoResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ObjectGetQuery {
     snapshot: Option<String>,
     version: Option<String>,
     read_mode: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct StoreIndexQuery {
     prefix: Option<String>,
     depth: Option<usize>,
@@ -4533,7 +4555,7 @@ struct StoreIndexChangeWaitResponse {
     changed: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct MediaThumbnailQuery {
     key: String,
     snapshot: Option<String>,
@@ -5098,6 +5120,40 @@ async fn list_store_index(
     State(state): State<ServerState>,
     Query(query): Query<StoreIndexQuery>,
 ) -> impl IntoResponse {
+    list_store_index_response(&state, query, "/media/thumbnail").await
+}
+
+async fn list_store_index_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<StoreIndexQuery>,
+) -> impl IntoResponse {
+    let action = "auth/store/index/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "prefix": query.prefix.clone(),
+            "depth": query.depth,
+            "snapshot": query.snapshot.clone(),
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    list_store_index_response(&state, query, "/auth/media/thumbnail").await
+}
+
+async fn list_store_index_response(
+    state: &ServerState,
+    query: StoreIndexQuery,
+    thumbnail_route: &str,
+) -> Response {
     let prefix = query.prefix.unwrap_or_default();
     let depth = query.depth.unwrap_or(1).max(1);
 
@@ -5163,6 +5219,7 @@ async fn list_store_index(
                         &entry.path,
                         query.snapshot.as_deref(),
                         &lookup,
+                        thumbnail_route,
                     ));
                 }
                 Ok(None) => {}
@@ -5260,8 +5317,9 @@ fn build_media_index_response(
     key: &str,
     snapshot: Option<&str>,
     lookup: &MediaCacheLookup,
+    thumbnail_route: &str,
 ) -> MediaIndexResponse {
-    let thumbnail_url = build_thumbnail_url(key, snapshot);
+    let thumbnail_url = build_thumbnail_url(key, snapshot, thumbnail_route);
     match lookup.metadata.as_ref() {
         Some(metadata) => MediaIndexResponse {
             status: media_cache_status_label(&metadata.status).to_string(),
@@ -5309,15 +5367,15 @@ fn build_media_index_response(
     }
 }
 
-fn build_thumbnail_url(key: &str, snapshot: Option<&str>) -> String {
+fn build_thumbnail_url(key: &str, snapshot: Option<&str>, thumbnail_route: &str) -> String {
     let encoded_key = utf8_percent_encode(key, QUERY_COMPONENT_ENCODE_SET).to_string();
     match snapshot {
         Some(snapshot_id) => {
             let encoded_snapshot =
                 utf8_percent_encode(snapshot_id, QUERY_COMPONENT_ENCODE_SET).to_string();
-            format!("/media/thumbnail?key={encoded_key}&snapshot={encoded_snapshot}")
+            format!("{thumbnail_route}?key={encoded_key}&snapshot={encoded_snapshot}")
         }
-        None => format!("/media/thumbnail?key={encoded_key}"),
+        None => format!("{thumbnail_route}?key={encoded_key}"),
     }
 }
 
@@ -5435,6 +5493,37 @@ async fn get_object(
     Path(key): Path<String>,
     Query(query): Query<ObjectGetQuery>,
 ) -> impl IntoResponse {
+    get_object_response(&state, &key, query).await
+}
+
+async fn get_object_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Query(query): Query<ObjectGetQuery>,
+) -> impl IntoResponse {
+    let action = "auth/store/object/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "key": key.clone(),
+            "snapshot": query.snapshot.clone(),
+            "version": query.version.clone(),
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    get_object_response(&state, &key, query).await
+}
+
+async fn get_object_response(state: &ServerState, key: &str, query: ObjectGetQuery) -> Response {
     let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
         Some(value) => value,
         None => return StatusCode::BAD_REQUEST.into_response(),
@@ -5443,7 +5532,7 @@ async fn get_object(
     let store = state.store.lock().await;
     match store
         .get_object(
-            &key,
+            key,
             query.snapshot.as_deref(),
             query.version.as_deref(),
             read_mode,
@@ -5467,6 +5556,36 @@ async fn get_media_thumbnail(
     State(state): State<ServerState>,
     Query(query): Query<MediaThumbnailQuery>,
 ) -> impl IntoResponse {
+    get_media_thumbnail_response(&state, query).await
+}
+
+async fn get_media_thumbnail_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<MediaThumbnailQuery>,
+) -> impl IntoResponse {
+    let action = "auth/media/thumbnail/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "key": query.key.clone(),
+            "snapshot": query.snapshot.clone(),
+            "version": query.version.clone(),
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    get_media_thumbnail_response(&state, query).await
+}
+
+async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnailQuery) -> Response {
     let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
         Some(value) => value,
         None => return StatusCode::BAD_REQUEST.into_response(),

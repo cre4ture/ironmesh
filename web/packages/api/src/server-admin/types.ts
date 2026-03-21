@@ -1,9 +1,19 @@
+import type { StoreIndexEntry, StoreIndexResponse } from "../shared/store-index";
+
 export type AdminSessionStatus = {
   login_required: boolean;
   authenticated: boolean;
   session_expires_at_unix: number | null;
   token_override_enabled: boolean;
 };
+
+export type AdminSnapshotSummary = {
+  id: string;
+} & Record<string, unknown>;
+
+export type AdminStoreEntry = StoreIndexEntry;
+
+export type AdminStoreListResponse = StoreIndexResponse;
 
 export type ClusterSummary = {
   local_node_id: string;

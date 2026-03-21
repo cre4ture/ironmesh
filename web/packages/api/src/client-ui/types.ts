@@ -1,3 +1,5 @@
+import type { StoreIndexEntry, StoreIndexResponse } from "../shared/store-index";
+
 export type JsonObject = Record<string, unknown>;
 
 export type ClientUiPingResponse = {
@@ -50,15 +52,9 @@ export type StoreGetResponse = {
   value: string;
 };
 
-export type StoreEntry = {
-  path: string;
-  entry_type: string;
-  meta?: JsonObject;
-};
+export type StoreEntry = StoreIndexEntry;
 
-export type StoreListResponse = {
-  entries: StoreEntry[];
-};
+export type StoreListResponse = StoreIndexResponse;
 
 export type SnapshotSummary = {
   id: string;
