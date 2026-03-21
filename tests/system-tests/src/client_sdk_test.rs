@@ -6,9 +6,38 @@ mod tests {
 
     use anyhow::{Context, Result};
     use bytes::Bytes;
-    use client_sdk::{ClientNode, ContentAddressedClientCache, IronMeshClient, UploadMode};
+    use client_sdk::{ClientNode, ContentAddressedClientCache, UploadMode};
+    use uuid::Uuid;
 
-    use crate::framework::{fresh_data_dir, latest_snapshot_id, start_server, stop_server};
+    use crate::framework::{
+        EnrolledTestClient, TEST_ADMIN_TOKEN, fresh_data_dir,
+        issue_bootstrap_bundle_and_enroll_client, latest_snapshot_id_for_client,
+        start_authenticated_server, stop_server,
+    };
+
+    async fn start_authenticated_test_client(
+        bind: &str,
+        server_name: &str,
+        client_name: &str,
+    ) -> Result<(crate::framework::ChildGuard, EnrolledTestClient)> {
+        let data_dir = fresh_data_dir(server_name);
+        let client_dir = fresh_data_dir(client_name);
+        let node_id = Uuid::new_v4().to_string();
+        let server = start_authenticated_server(bind, &data_dir, &node_id, 1).await?;
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+        let enrolled = issue_bootstrap_bundle_and_enroll_client(
+            &http,
+            &base_url,
+            TEST_ADMIN_TOKEN,
+            &client_dir,
+            "client.bootstrap.json",
+            Some(client_name),
+            Some(3600),
+        )
+        .await?;
+        Ok((server, enrolled))
+    }
 
     fn count_files_recursively(root: &std::path::Path) -> Result<usize> {
         fn visit(path: &std::path::Path, total: &mut usize) -> Result<()> {
@@ -32,10 +61,11 @@ mod tests {
     #[tokio::test]
     async fn sdk_roundtrip_against_live_server() -> Result<()> {
         let bind = "127.0.0.1:19230";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) =
+            start_authenticated_test_client(bind, "sdk-roundtrip-server", "sdk-roundtrip-client")
+                .await?;
 
-        let client = ClientNode::from_direct_base_url(&base_url);
+        let client = ClientNode::with_client(enrolled.build_client_async().await?);
         let key = "sdk-roundtrip";
         let value = Bytes::from_static(b"hello-from-sdk");
 
@@ -50,10 +80,14 @@ mod tests {
     #[tokio::test]
     async fn client_node_cache_entries_and_remove_cached_work() -> Result<()> {
         let bind = "127.0.0.1:19231";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "client-node-cache-server",
+            "client-node-cache-client",
+        )
+        .await?;
 
-        let client = ClientNode::from_direct_base_url(&base_url);
+        let client = ClientNode::with_client(enrolled.build_client_async().await?);
         let key = "cache-key";
         let payload = Bytes::from_static(b"cached-value");
 
@@ -89,11 +123,15 @@ mod tests {
     #[tokio::test]
     async fn client_node_snapshot_and_reader_writer_paths_work() -> Result<()> {
         let bind = "127.0.0.1:19232";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "client-node-snapshots-server",
+            "client-node-snapshots-client",
+        )
+        .await?;
 
-        let client = ClientNode::from_direct_base_url(&base_url);
-        let http = reqwest::Client::new();
+        let sdk = enrolled.build_client_async().await?;
+        let client = ClientNode::with_client(sdk.clone());
 
         let result = async {
             let versioned_key = "history/client-node";
@@ -101,7 +139,7 @@ mod tests {
             let second = Bytes::from_static(b"v2-from-client-node");
 
             client.put(versioned_key, first.clone()).await?;
-            let snapshot_id = latest_snapshot_id(&http, &base_url).await?;
+            let snapshot_id = latest_snapshot_id_for_client(&sdk).await?;
             client
                 .put_large_aware(versioned_key, second.clone())
                 .await?;
@@ -168,10 +206,14 @@ mod tests {
     #[tokio::test]
     async fn ironmesh_client_upload_modes_and_reader_writer_paths_work() -> Result<()> {
         let bind = "127.0.0.1:19233";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "ironmesh-client-upload-modes-server",
+            "ironmesh-client-upload-modes-client",
+        )
+        .await?;
 
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let sdk = enrolled.build_client_async().await?;
 
         let result = async {
             let direct_report = sdk
@@ -250,10 +292,14 @@ mod tests {
     async fn ironmesh_client_put_large_aware_covers_small_and_large_bytes_and_reader_uploads()
     -> Result<()> {
         let bind = "127.0.0.1:19237";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "ironmesh-client-large-aware-server",
+            "ironmesh-client-large-aware-client",
+        )
+        .await?;
 
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let sdk = enrolled.build_client_async().await?;
 
         let result = async {
             let small_bytes_payload = Bytes::from_static(b"bytes-small-upload");
@@ -356,17 +402,20 @@ mod tests {
     #[tokio::test]
     async fn ironmesh_client_snapshot_store_index_and_snapshot_loading_work() -> Result<()> {
         let bind = "127.0.0.1:19234";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "ironmesh-client-snapshots-server",
+            "ironmesh-client-snapshots-client",
+        )
+        .await?;
 
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
-        let http = reqwest::Client::new();
+        let sdk = enrolled.build_client_async().await?;
 
         let result = async {
             let versioned_key = "history/sdk";
             sdk.put(versioned_key, Bytes::from_static(b"sdk-v1"))
                 .await?;
-            let snapshot_id = latest_snapshot_id(&http, &base_url).await?;
+            let snapshot_id = latest_snapshot_id_for_client(&sdk).await?;
             sdk.put(versioned_key, Bytes::from_static(b"sdk-v2"))
                 .await?;
 
@@ -455,10 +504,14 @@ mod tests {
     #[tokio::test]
     async fn ironmesh_client_missing_object_returns_errors() -> Result<()> {
         let bind = "127.0.0.1:19235";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "ironmesh-client-missing-object-server",
+            "ironmesh-client-missing-object-client",
+        )
+        .await?;
 
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let sdk = enrolled.build_client_async().await?;
 
         let result = async {
             assert!(sdk.get("missing-key").await.is_err());
@@ -488,12 +541,19 @@ mod tests {
     #[tokio::test]
     async fn content_addressed_client_cache_persists_and_reuses_local_content() -> Result<()> {
         let bind = "127.0.0.1:19236";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "content-addressed-cache-server",
+            "content-addressed-cache-client",
+        )
+        .await?;
         let cache_dir = fresh_data_dir("content-addressed-client-cache");
 
         let result = async {
-            let client = ContentAddressedClientCache::from_direct_base_url(&base_url, &cache_dir)?;
+            let client = ContentAddressedClientCache::with_client(
+                enrolled.build_client_async().await?,
+                &cache_dir,
+            )?;
             let payload = Bytes::from(vec![b'Z'; CHUNK_UPLOAD_THRESHOLD_BYTES + 4096]);
 
             client.put("cached/a", payload.clone()).await?;
@@ -509,8 +569,10 @@ mod tests {
             client.rename_path("cached/b", "cached/c", false).await?;
             client.delete_path("cached/a").await?;
 
-            let persisted_client =
-                ContentAddressedClientCache::from_direct_base_url(&base_url, &cache_dir)?;
+            let persisted_client = ContentAddressedClientCache::with_client(
+                enrolled.build_client_async().await?,
+                &cache_dir,
+            )?;
             let cached = persisted_client.get_cached_or_fetch("cached/c").await?;
             assert_eq!(cached, payload);
 

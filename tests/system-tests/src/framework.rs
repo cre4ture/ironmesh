@@ -1,6 +1,8 @@
 use anyhow::Context;
 use anyhow::{Result, bail};
-use client_sdk::IronMeshClient;
+use client_sdk::{
+    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, enroll_connection_input_blocking,
+};
 use reqwest::StatusCode;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
@@ -12,6 +14,25 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use uuid::Uuid;
+
+pub const TEST_ADMIN_TOKEN: &str = "system-test-admin";
+
+#[derive(Debug, Clone)]
+pub struct EnrolledTestClient {
+    pub bootstrap: ConnectionBootstrap,
+    pub bootstrap_path: PathBuf,
+    pub identity: ClientIdentityMaterial,
+}
+
+impl EnrolledTestClient {
+    pub async fn build_client_async(&self) -> Result<IronMeshClient> {
+        let bootstrap = self.bootstrap.clone();
+        let identity = self.identity.clone();
+        tokio::task::spawn_blocking(move || bootstrap.build_client_with_identity(&identity))
+            .await
+            .context("authenticated bootstrap client construction task panicked")?
+    }
+}
 
 struct TestCa {
     ca_pem: String,
@@ -218,6 +239,19 @@ impl Drop for ChildGuard {
 pub async fn start_server(bind: &str) -> Result<ChildGuard> {
     let data_dir = fresh_data_dir("default-server");
     start_server_with_data_dir(bind, &data_dir).await
+}
+
+pub async fn start_authenticated_server(
+    bind: &str,
+    data_dir: &Path,
+    node_id: &str,
+    replication_factor: usize,
+) -> Result<ChildGuard> {
+    let env = [
+        ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+        ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+    ];
+    start_server_with_env(bind, data_dir, node_id, replication_factor, &env).await
 }
 
 pub async fn start_zero_touch_server(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
@@ -558,6 +592,15 @@ pub async fn latest_snapshot_id(http: &reqwest::Client, base_url: &str) -> Resul
         .await?;
 
     let parsed: serde_json::Value = serde_json::from_str(&payload)?;
+    latest_snapshot_id_from_value(parsed)
+}
+
+pub async fn latest_snapshot_id_for_client(client: &IronMeshClient) -> Result<String> {
+    let parsed = client.get_json_path("/snapshots").await?;
+    latest_snapshot_id_from_value(parsed)
+}
+
+fn latest_snapshot_id_from_value(parsed: serde_json::Value) -> Result<String> {
     let latest = parsed
         .as_array()
         .and_then(|arr| {
@@ -658,6 +701,58 @@ pub async fn issue_bootstrap_bundle(
         .json::<client_sdk::ConnectionBootstrap>()
         .await
         .context("failed to decode bootstrap bundle response")
+}
+
+pub fn default_client_identity_path(bootstrap_path: &Path) -> PathBuf {
+    if let Some(stem) = bootstrap_path.file_stem() {
+        let mut file_name = stem.to_os_string();
+        file_name.push(".client-identity.json");
+        return bootstrap_path.with_file_name(file_name);
+    }
+    bootstrap_path.with_file_name("ironmesh-client-identity.json")
+}
+
+pub async fn issue_bootstrap_bundle_and_enroll_client(
+    http: &reqwest::Client,
+    base_url: &str,
+    admin_token: &str,
+    client_dir: &Path,
+    bootstrap_file_name: &str,
+    label: Option<&str>,
+    expires_in_secs: Option<u64>,
+) -> Result<EnrolledTestClient> {
+    let issued_bootstrap =
+        issue_bootstrap_bundle(http, base_url, admin_token, label, expires_in_secs).await?;
+    let bootstrap_path = client_dir.join(bootstrap_file_name);
+    issued_bootstrap.write_to_path(&bootstrap_path)?;
+
+    let bootstrap_json = issued_bootstrap.to_json_pretty()?;
+    let label = label.map(ToString::to_string);
+    let enrolled = tokio::task::spawn_blocking(move || {
+        enroll_connection_input_blocking(&bootstrap_json, None, label.as_deref())
+    })
+    .await
+    .context("bootstrap enrollment task panicked")??;
+
+    let persisted_bootstrap_json = enrolled
+        .connection_bootstrap_json
+        .clone()
+        .context("enrollment response did not include connection_bootstrap_json")?;
+    let persisted_bootstrap = ConnectionBootstrap::from_json_str(&persisted_bootstrap_json)
+        .context("failed to parse persisted bootstrap JSON from enrollment response")?;
+    persisted_bootstrap.write_to_path(&bootstrap_path)?;
+
+    let identity = enrolled
+        .client_identity_material()
+        .context("failed to build client identity material from enrollment response")?;
+    let identity_path = default_client_identity_path(&bootstrap_path);
+    identity.write_to_path(&identity_path)?;
+
+    Ok(EnrolledTestClient {
+        bootstrap: persisted_bootstrap,
+        bootstrap_path,
+        identity,
+    })
 }
 
 #[allow(dead_code)]

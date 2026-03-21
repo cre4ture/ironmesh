@@ -3,20 +3,25 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        ChildGuard, binary_path, start_server, stop_server, wait_for_url_status,
+        ChildGuard, EnrolledTestClient, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
+        issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client, run_cli,
+        start_authenticated_server, start_rendezvous_service, start_server_with_env, stop_server,
+        wait_for_rendezvous_registered_endpoints, wait_for_url_status,
     };
     use anyhow::{Context, Result};
+    use client_sdk::BootstrapEndpointUse;
     use reqwest::StatusCode;
+    use std::fs;
     use std::process::Stdio;
     use tokio::process::Command;
+    use uuid::Uuid;
 
     const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 
-    async fn start_web_backend(bind: &str, server_url: &str) -> Result<ChildGuard> {
+    async fn start_web_backend_with_args(bind: &str, cli_args: &[&str]) -> Result<ChildGuard> {
         let cli_bin = binary_path("cli-client")?;
         let child = Command::new(cli_bin)
-            .arg("--server-url")
-            .arg(server_url)
+            .args(cli_args)
             .arg("serve-web")
             .arg("--bind")
             .arg(bind)
@@ -30,16 +35,49 @@ mod tests {
         Ok(ChildGuard::new(child))
     }
 
+    async fn start_authenticated_web_backend(
+        server_bind: &str,
+        web_bind: &str,
+        server_name: &str,
+        client_name: &str,
+    ) -> Result<(ChildGuard, ChildGuard, EnrolledTestClient)> {
+        let data_dir = fresh_data_dir(server_name);
+        let client_dir = fresh_data_dir(client_name);
+        let node_id = Uuid::new_v4().to_string();
+        let server = start_authenticated_server(server_bind, &data_dir, &node_id, 1).await?;
+        let base_url = format!("http://{server_bind}");
+        let http = reqwest::Client::new();
+        let enrolled = issue_bootstrap_bundle_and_enroll_client(
+            &http,
+            &base_url,
+            TEST_ADMIN_TOKEN,
+            &client_dir,
+            "web-ui.bootstrap.json",
+            Some(client_name),
+            Some(3600),
+        )
+        .await?;
+        let bootstrap_arg = enrolled.bootstrap_path.to_string_lossy().into_owned();
+        let web =
+            start_web_backend_with_args(web_bind, &["--bootstrap-file", bootstrap_arg.as_str()])
+                .await?;
+        Ok((server, web, enrolled))
+    }
+
     #[tokio::test]
     async fn web_ui_backend_serves_react_client_ui_assets() -> Result<()> {
         let server_bind = "127.0.0.1:19378";
         let web_bind = "127.0.0.1:19379";
-        let server_base = format!("http://{server_bind}");
         let web_base = format!("http://{web_bind}");
         let client = reqwest::Client::new();
 
-        let mut server = start_server(server_bind).await?;
-        let mut web = start_web_backend(web_bind, &server_base).await?;
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-assets-server",
+            "web-ui-assets-client",
+        )
+        .await?;
 
         let result = async {
             let html = client
@@ -84,14 +122,19 @@ mod tests {
     async fn web_ui_backend_text_store_roundtrip() -> Result<()> {
         let server_bind = "127.0.0.1:19380";
         let web_bind = "127.0.0.1:19381";
-        let server_base = format!("http://{server_bind}");
         let web_base = format!("http://{web_bind}");
         let key = "ui-text.txt";
         let value = "hello-from-web-ui-backend";
         let client = reqwest::Client::new();
 
-        let mut server = start_server(server_bind).await?;
-        let mut web = start_web_backend(web_bind, &server_base).await?;
+        let (mut server, mut web, enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-text-server",
+            "web-ui-text-client",
+        )
+        .await?;
+        let upstream_client = enrolled.build_client_async().await?;
 
         let result = async {
             let put_payload = serde_json::json!({
@@ -124,14 +167,8 @@ mod tests {
             assert_eq!(get_resp.get("key").and_then(|v| v.as_str()), Some(key));
             assert_eq!(get_resp.get("value").and_then(|v| v.as_str()), Some(value));
 
-            let upstream = client
-                .get(format!("{server_base}/store/{key}"))
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
-            assert_eq!(upstream, value);
+            let upstream = upstream_client.get(key).await?;
+            assert_eq!(upstream, bytes::Bytes::from(value.to_string()));
 
             Ok::<(), anyhow::Error>(())
         }
@@ -146,7 +183,6 @@ mod tests {
     async fn web_ui_backend_binary_chunked_roundtrip() -> Result<()> {
         let server_bind = "127.0.0.1:19382";
         let web_bind = "127.0.0.1:19383";
-        let server_base = format!("http://{server_bind}");
         let web_base = format!("http://{web_bind}");
         let key = "ui-large.bin";
         let mut payload = vec![b'B'; CHUNK_UPLOAD_THRESHOLD_BYTES + 128];
@@ -154,8 +190,13 @@ mod tests {
         let payload_len = payload.len();
         let client = reqwest::Client::new();
 
-        let mut server = start_server(server_bind).await?;
-        let mut web = start_web_backend(web_bind, &server_base).await?;
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-binary-server",
+            "web-ui-binary-client",
+        )
+        .await?;
 
         let result = async {
             let put_resp: serde_json::Value = client
@@ -217,12 +258,17 @@ mod tests {
     async fn web_ui_backend_store_list_and_delete_flow() -> Result<()> {
         let server_bind = "127.0.0.1:19384";
         let web_bind = "127.0.0.1:19385";
-        let server_base = format!("http://{server_bind}");
         let web_base = format!("http://{web_bind}");
         let client = reqwest::Client::new();
 
-        let mut server = start_server(server_bind).await?;
-        let mut web = start_web_backend(web_bind, &server_base).await?;
+        let (mut server, mut web, enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-list-delete-server",
+            "web-ui-list-delete-client",
+        )
+        .await?;
+        let upstream_client = enrolled.build_client_async().await?;
 
         let result = async {
             for (key, value) in [
@@ -301,11 +347,7 @@ mod tests {
                 .await?;
             assert_eq!(get_deleted.status(), StatusCode::BAD_GATEWAY);
 
-            let upstream_deleted = client
-                .get(format!("{server_base}/store/{delete_key}"))
-                .send()
-                .await?;
-            assert_eq!(upstream_deleted.status(), StatusCode::NOT_FOUND);
+            assert!(upstream_client.get(delete_key).await.is_err());
 
             Ok::<(), anyhow::Error>(())
         }
@@ -313,6 +355,147 @@ mod tests {
 
         stop_server(&mut web).await;
         stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn web_ui_backend_bootstrap_enroll_default_identity_supports_relay_only_serve_web()
+    -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19390";
+        let server_bind = "127.0.0.1:19391";
+        let web_bind = "127.0.0.1:19392";
+        let cluster_id = "11111111-1111-7111-8111-111111119390";
+        let node_id = "00000000-0000-0000-0000-000000009390";
+        let admin_token = "admin-secret";
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let server_base = format!("http://{server_bind}");
+        let web_base = format!("http://{web_bind}");
+        let data_dir = fresh_data_dir("web-ui-relay-only-node");
+        let client_dir = fresh_data_dir("web-ui-relay-only-client");
+
+        let node_env = [
+            ("IRONMESH_NODE_MODE", "local-edge"),
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut server =
+            start_server_with_env(server_bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let mut bootstrap = issue_bootstrap_bundle(
+                &http,
+                &server_base,
+                admin_token,
+                Some("relay-web-ui"),
+                Some(3600),
+            )
+            .await?;
+            let bootstrap_path = client_dir.join("relay-web.bootstrap.json");
+            bootstrap.write_to_path(&bootstrap_path)?;
+            let bootstrap_arg = bootstrap_path.to_string_lossy().into_owned();
+
+            let enroll_output = run_cli(&[
+                "--bootstrap-file",
+                bootstrap_arg.as_str(),
+                "enroll",
+                "--label",
+                "relay-web-ui",
+            ])
+            .await?;
+            assert!(
+                enroll_output.contains("enrolled device"),
+                "unexpected enroll output: {enroll_output}"
+            );
+
+            let default_identity_path = client_dir.join("relay-web.bootstrap.client-identity.json");
+            assert!(
+                default_identity_path.exists(),
+                "expected default client identity file to be written at {}",
+                default_identity_path.display()
+            );
+
+            for endpoint in &mut bootstrap.direct_endpoints {
+                if endpoint.usage == Some(BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+            bootstrap.write_to_path(&bootstrap_path)?;
+
+            let mut web = start_web_backend_with_args(
+                web_bind,
+                &["--bootstrap-file", bootstrap_arg.as_str()],
+            )
+            .await?;
+
+            let result = async {
+                let rendezvous_refresh: serde_json::Value = http
+                    .post(format!("{web_base}/api/rendezvous/refresh"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let transport_mode = rendezvous_refresh
+                    .get("transport_mode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                assert_eq!(transport_mode, "relay");
+
+                let put_payload = serde_json::json!({
+                    "key": "relay-web-ui.txt",
+                    "value": "payload-via-relay-web-ui",
+                });
+                let put_response: serde_json::Value = http
+                    .post(format!("{web_base}/api/store/put"))
+                    .json(&put_payload)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                assert_eq!(
+                    put_response.get("key").and_then(|value| value.as_str()),
+                    Some("relay-web-ui.txt")
+                );
+
+                let get_response: serde_json::Value = http
+                    .get(format!("{web_base}/api/store/get"))
+                    .query(&[("key", "relay-web-ui.txt")])
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                assert_eq!(
+                    get_response.get("value").and_then(|value| value.as_str()),
+                    Some("payload-via-relay-web-ui")
+                );
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_server(&mut web).await;
+            result
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        stop_server(&mut rendezvous).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
         result
     }
 }
