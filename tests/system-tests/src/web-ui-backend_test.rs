@@ -627,6 +627,46 @@ mod tests {
                     .unwrap_or_default();
                 assert_eq!(transport_mode, "relay");
 
+                let cluster_status: serde_json::Value = http
+                    .get(format!("{web_base}/api/cluster/status"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                assert_eq!(
+                    cluster_status
+                        .get("total_nodes")
+                        .and_then(|value| value.as_u64()),
+                    Some(1)
+                );
+
+                let cluster_nodes: serde_json::Value = http
+                    .get(format!("{web_base}/api/cluster/nodes"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                assert_eq!(
+                    cluster_nodes.as_array().map(|entries| entries.len()),
+                    Some(1)
+                );
+
+                let replication_plan: serde_json::Value = http
+                    .get(format!("{web_base}/api/cluster/replication/plan"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                assert_eq!(
+                    replication_plan
+                        .get("under_replicated")
+                        .and_then(|value| value.as_u64()),
+                    Some(0)
+                );
+
                 let put_payload = serde_json::json!({
                     "key": "relay-web-ui.txt",
                     "value": "payload-via-relay-web-ui",
