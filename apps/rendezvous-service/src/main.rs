@@ -1022,6 +1022,7 @@ mod tests {
                                 version: Some("v1".to_string()),
                                 content_hash: Some("hash-1".to_string()),
                                 size_bytes: Some(7),
+                                modified_at_unix: None,
                                 content_fingerprint: None,
                                 media: None,
                             }],

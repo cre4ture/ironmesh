@@ -146,6 +146,13 @@ pub struct SnapshotInfo {
     pub object_count: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct SnapshotObjectState {
+    pub created_at_unix: u64,
+    pub objects: HashMap<String, String>,
+    pub object_ids: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CleanupReport {
     pub retention_secs: u64,
@@ -594,6 +601,10 @@ impl PersistentStore {
         self.current_state.objects.clone()
     }
 
+    pub fn current_object_ids(&self) -> HashMap<String, String> {
+        self.current_state.object_ids.clone()
+    }
+
     pub async fn object_sizes_by_key(
         &self,
         object_hashes: &HashMap<String, String>,
@@ -607,14 +618,60 @@ impl PersistentStore {
         Ok(sizes)
     }
 
-    pub async fn snapshot_object_hashes(
+    pub async fn object_modified_at_by_key(
+        &self,
+        object_hashes: &HashMap<String, String>,
+        object_ids: &HashMap<String, String>,
+        max_created_at_unix: Option<u64>,
+    ) -> Result<HashMap<String, u64>> {
+        let mut modified = HashMap::with_capacity(object_hashes.len());
+        for (key, manifest_hash) in object_hashes {
+            let Some(object_id) = object_ids.get(key) else {
+                continue;
+            };
+            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+                continue;
+            };
+
+            let matching_created_at = index
+                .versions
+                .values()
+                .filter(|record| record.manifest_hash == *manifest_hash)
+                .filter(|record| {
+                    max_created_at_unix
+                        .map(|limit| record.created_at_unix <= limit)
+                        .unwrap_or(true)
+                })
+                .map(|record| record.created_at_unix)
+                .max()
+                .or_else(|| {
+                    index
+                        .versions
+                        .values()
+                        .filter(|record| record.manifest_hash == *manifest_hash)
+                        .map(|record| record.created_at_unix)
+                        .max()
+                });
+
+            if let Some(created_at_unix) = matching_created_at {
+                modified.insert(key.clone(), created_at_unix);
+            }
+        }
+        Ok(modified)
+    }
+
+    pub async fn snapshot_object_state(
         &self,
         snapshot_id: &str,
-    ) -> Result<Option<HashMap<String, String>>> {
+    ) -> Result<Option<SnapshotObjectState>> {
         Ok(self
-            .load_snapshot_manifest(snapshot_id)
+            .read_snapshot(snapshot_id)
             .await?
-            .map(|manifest| manifest.objects))
+            .map(|manifest| SnapshotObjectState {
+                created_at_unix: manifest.created_at_unix,
+                objects: manifest.objects,
+                object_ids: manifest.object_ids,
+            }))
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {

@@ -18,7 +18,8 @@ import {
   Table,
   Text,
   TextInput,
-  Textarea
+  Textarea,
+  UnstyledButton
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
@@ -58,10 +59,12 @@ import {
   type StoreListResponse,
   type VersionGraphResponse
 } from "@ironmesh/api";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { GalleryPage } from "../pages/GalleryPage";
 
 type PageId = "overview" | "rendezvous" | "store" | "explorer" | "gallery" | "cluster";
+type ExplorerSortField = "path" | "type" | "size" | "modified";
+type ExplorerSortDirection = "asc" | "desc";
 
 const pages = [
   {
@@ -789,6 +792,14 @@ function ExplorerPage() {
   const [versionsPayload, setVersionsPayload] = useState<VersionGraphResponse | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [sortField, setSortField] = useState<ExplorerSortField>("path");
+  const [sortDirection, setSortDirection] = useState<ExplorerSortDirection>("asc");
+
+  const sortedEntries = useMemo(() => {
+    const entries = [...(entriesPayload?.entries ?? [])];
+    entries.sort((left, right) => compareExplorerEntries(left, right, sortField, sortDirection));
+    return entries;
+  }, [entriesPayload, sortDirection, sortField]);
 
   useEffect(() => {
     void refreshSnapshots();
@@ -882,6 +893,15 @@ function ExplorerPage() {
     }
   }
 
+  function toggleSort(field: ExplorerSortField) {
+    if (sortField === field) {
+      setSortDirection((current) => (current === "asc" ? "desc" : "asc"));
+      return;
+    }
+    setSortField(field);
+    setSortDirection(field === "size" || field === "modified" ? "desc" : "asc");
+  }
+
   return (
     <>
       <PageHeader
@@ -940,13 +960,15 @@ function ExplorerPage() {
                 <Table striped highlightOnHover withTableBorder>
                   <Table.Thead>
                     <Table.Tr>
-                      <Table.Th>Path</Table.Th>
-                      <Table.Th>Type</Table.Th>
+                      <Table.Th>{renderExplorerHeader("Path", "path", sortField, sortDirection, toggleSort)}</Table.Th>
+                      <Table.Th>{renderExplorerHeader("Type", "type", sortField, sortDirection, toggleSort)}</Table.Th>
+                      <Table.Th>{renderExplorerHeader("Size", "size", sortField, sortDirection, toggleSort)}</Table.Th>
+                      <Table.Th>{renderExplorerHeader("Modified", "modified", sortField, sortDirection, toggleSort)}</Table.Th>
                       <Table.Th>Action</Table.Th>
                     </Table.Tr>
                   </Table.Thead>
                   <Table.Tbody>
-                    {(entriesPayload?.entries ?? []).map((entry) => {
+                    {sortedEntries.map((entry) => {
                       const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
                       return (
                         <Table.Tr key={entry.path}>
@@ -954,6 +976,8 @@ function ExplorerPage() {
                             <Code>{entry.path}</Code>
                           </Table.Td>
                           <Table.Td>{isPrefix ? "prefix" : entry.entry_type}</Table.Td>
+                          <Table.Td>{formatExplorerSize(isPrefix ? null : entry.size_bytes)}</Table.Td>
+                          <Table.Td>{formatExplorerModifiedAt(entry.modified_at_unix)}</Table.Td>
                           <Table.Td>
                             <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
                               {isPrefix ? "Open" : "Read"}
@@ -1136,6 +1160,123 @@ function formatUnixTimestamp(value: number | null): string {
   }
 
   return new Date(value * 1000).toLocaleString();
+}
+
+function formatExplorerModifiedAt(value: number | null | undefined): string {
+  if (!value) {
+    return "—";
+  }
+  return new Date(value * 1000).toLocaleString();
+}
+
+function formatExplorerSize(value: number | null | undefined): string {
+  if (value === null || value === undefined) {
+    return "—";
+  }
+
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const rounded = size >= 10 ? size.toFixed(0) : size.toFixed(1);
+  return `${rounded} ${units[unitIndex]}`;
+}
+
+function renderExplorerHeader(
+  label: string,
+  field: ExplorerSortField,
+  activeField: ExplorerSortField,
+  direction: ExplorerSortDirection,
+  onToggle: (field: ExplorerSortField) => void
+) {
+  const indicator =
+    activeField === field ? (direction === "asc" ? "↑" : "↓") : "↕";
+
+  return (
+    <UnstyledButton onClick={() => onToggle(field)}>
+      <Group gap={6} wrap="nowrap">
+        <Text fw={600} size="sm">
+          {label}
+        </Text>
+        <Text c="dimmed" size="xs">
+          {indicator}
+        </Text>
+      </Group>
+    </UnstyledButton>
+  );
+}
+
+function compareExplorerEntries(
+  left: StoreEntry,
+  right: StoreEntry,
+  field: ExplorerSortField,
+  direction: ExplorerSortDirection
+): number {
+  const leftIsPrefix = left.entry_type === "prefix" || left.path.endsWith("/");
+  const rightIsPrefix = right.entry_type === "prefix" || right.path.endsWith("/");
+
+  let result = 0;
+  switch (field) {
+    case "path":
+      result = left.path.localeCompare(right.path);
+      break;
+    case "type":
+      result = normalizeExplorerType(left).localeCompare(normalizeExplorerType(right));
+      if (result === 0) {
+        result = left.path.localeCompare(right.path);
+      }
+      break;
+    case "size":
+      result = compareNullableNumbers(
+        leftIsPrefix ? null : left.size_bytes,
+        rightIsPrefix ? null : right.size_bytes,
+        direction
+      );
+      if (result === 0) {
+        result = left.path.localeCompare(right.path);
+      }
+      break;
+    case "modified":
+      result = compareNullableNumbers(left.modified_at_unix, right.modified_at_unix, direction);
+      if (result === 0) {
+        result = left.path.localeCompare(right.path);
+      }
+      break;
+  }
+
+  return field === "size" || field === "modified"
+    ? result
+    : direction === "asc"
+      ? result
+      : -result;
+}
+
+function compareNullableNumbers(
+  left: number | null | undefined,
+  right: number | null | undefined,
+  direction: ExplorerSortDirection
+): number {
+  if (left == null && right == null) {
+    return 0;
+  }
+  if (left == null) {
+    return 1;
+  }
+  if (right == null) {
+    return -1;
+  }
+  return direction === "asc" ? left - right : right - left;
+}
+
+function normalizeExplorerType(entry: StoreEntry): string {
+  return entry.entry_type === "prefix" || entry.path.endsWith("/") ? "prefix" : entry.entry_type;
 }
 
 function rendezvousStatusColor(status: "unknown" | "connected" | "disconnected"): string {

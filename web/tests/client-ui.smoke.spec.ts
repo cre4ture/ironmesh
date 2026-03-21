@@ -18,7 +18,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: /Size/ })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: /Modified/ })).toBeVisible();
   await expect(page.getByRole("cell", { name: "docs/readme.txt" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "23 B" })).toBeVisible();
   await page.getByRole("button", { name: "Read" }).first().click();
   await expect(page.getByText("hello from the mocked store")).toBeVisible();
   await page.getByLabel("Key").fill("docs/readme.txt");
@@ -93,11 +96,18 @@ async function installClientUiMocks(page: Page) {
         depth: Number(searchParams.get("depth") ?? "1"),
         entry_count: 4,
         entries: [
-          { path: "docs/readme.txt", entry_type: "key" },
+          {
+            path: "docs/readme.txt",
+            entry_type: "key",
+            size_bytes: 23,
+            modified_at_unix: 1_712_345_600
+          },
           { path: "media/", entry_type: "prefix" },
           {
             path: "gallery/cat.png",
             entry_type: "key",
+            size_bytes: 3_145_728,
+            modified_at_unix: 1_712_345_678,
             media: {
               status: "ready",
               content_fingerprint: "fingerprint-cat",
@@ -119,6 +129,8 @@ async function installClientUiMocks(page: Page) {
           {
             path: "gallery/dog.jpg",
             entry_type: "key",
+            size_bytes: 2_048,
+            modified_at_unix: 1_712_300_000,
             media: {
               status: "pending",
               content_fingerprint: "fingerprint-dog",

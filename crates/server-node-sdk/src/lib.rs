@@ -4643,6 +4643,8 @@ struct StoreIndexEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    modified_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     media: Option<MediaIndexResponse>,
@@ -5196,11 +5198,12 @@ async fn list_store_index_response(
     let prefix = query.prefix.unwrap_or_default();
     let depth = query.depth.unwrap_or(1).max(1);
 
-    let (keys, key_hashes, key_sizes) = {
+    let (keys, key_hashes, key_sizes, key_modified_times) = {
         let store = state.store.lock().await;
         if let Some(snapshot_id) = query.snapshot.as_deref() {
-            match store.snapshot_object_hashes(snapshot_id).await {
-                Ok(Some(object_hashes)) => {
+            match store.snapshot_object_state(snapshot_id).await {
+                Ok(Some(snapshot_state)) => {
+                    let object_hashes = snapshot_state.objects;
                     let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
                     keys.sort();
                     let sizes = match store.object_sizes_by_key(&object_hashes).await {
@@ -5210,7 +5213,25 @@ async fn list_store_index_response(
                             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                         }
                     };
-                    (keys, object_hashes, sizes)
+                    let modified_times = match store
+                        .object_modified_at_by_key(
+                            &object_hashes,
+                            &snapshot_state.object_ids,
+                            Some(snapshot_state.created_at_unix),
+                        )
+                        .await
+                    {
+                        Ok(modified_times) => modified_times,
+                        Err(err) => {
+                            tracing::error!(
+                                snapshot_id = %snapshot_id,
+                                error = %err,
+                                "failed to compute snapshot key modified times"
+                            );
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    };
+                    (keys, object_hashes, sizes, modified_times)
                 }
                 Ok(None) => return StatusCode::NOT_FOUND.into_response(),
                 Err(err) => {
@@ -5220,6 +5241,7 @@ async fn list_store_index_response(
             }
         } else {
             let object_hashes = store.current_object_hashes();
+            let object_ids = store.current_object_ids();
             let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
             keys.sort();
             let sizes = match store.object_sizes_by_key(&object_hashes).await {
@@ -5229,7 +5251,17 @@ async fn list_store_index_response(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
-            (keys, object_hashes, sizes)
+            let modified_times = match store
+                .object_modified_at_by_key(&object_hashes, &object_ids, None)
+                .await
+            {
+                Ok(modified_times) => modified_times,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to compute current key modified times");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            (keys, object_hashes, sizes, modified_times)
         }
     };
 
@@ -5239,6 +5271,7 @@ async fn list_store_index_response(
         depth,
         Some(&key_hashes),
         Some(&key_sizes),
+        Some(&key_modified_times),
     );
     {
         let store = state.store.lock().await;
@@ -5317,6 +5350,7 @@ fn collapse_store_index_entries_for_tree_view(
                 version: None,
                 content_hash: None,
                 size_bytes: None,
+                modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
             });
@@ -5479,7 +5513,7 @@ fn looks_like_image_path(path: &str) -> bool {
 
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
-    build_store_index_entries_with_hashes(keys, prefix, depth, None, None)
+    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None)
 }
 
 fn build_store_index_entries_with_hashes(
@@ -5488,6 +5522,7 @@ fn build_store_index_entries_with_hashes(
     depth: usize,
     hashes_by_key: Option<&HashMap<String, String>>,
     sizes_by_key: Option<&HashMap<String, u64>>,
+    modified_times_by_key: Option<&HashMap<String, u64>>,
 ) -> Vec<StoreIndexEntry> {
     let normalized_prefix = prefix.trim_end_matches('/');
     let mut file_entries = BTreeSet::new();
@@ -5538,6 +5573,7 @@ fn build_store_index_entries_with_hashes(
             version: None,
             content_hash: None,
             size_bytes: None,
+            modified_at_unix: None,
             content_fingerprint: None,
             media: None,
         });
@@ -5545,12 +5581,16 @@ fn build_store_index_entries_with_hashes(
     for path in file_entries {
         let content_hash = hashes_by_key.and_then(|values| values.get(&path)).cloned();
         let size_bytes = sizes_by_key.and_then(|values| values.get(&path)).copied();
+        let modified_at_unix = modified_times_by_key
+            .and_then(|values| values.get(&path))
+            .copied();
         entries.push(StoreIndexEntry {
             path,
             entry_type: "key".to_string(),
             version: None,
             content_hash,
             size_bytes,
+            modified_at_unix,
             content_fingerprint: None,
             media: None,
         });

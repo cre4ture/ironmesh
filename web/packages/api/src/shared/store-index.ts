@@ -32,6 +32,7 @@ export type StoreIndexEntry = {
   version?: string | null;
   content_hash?: string | null;
   size_bytes?: number | null;
+  modified_at_unix?: number | null;
   content_fingerprint?: string | null;
   media?: StoreIndexMedia | null;
 };

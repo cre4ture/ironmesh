@@ -94,6 +94,8 @@ pub struct StoreIndexEntry {
     #[serde(default)]
     pub size_bytes: Option<u64>,
     #[serde(default)]
+    pub modified_at_unix: Option<u64>,
+    #[serde(default)]
     pub content_fingerprint: Option<String>,
     #[serde(default)]
     pub media: Option<StoreIndexMedia>,
@@ -1287,6 +1289,7 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>) {
                 version: None,
                 content_hash: None,
                 size_bytes: None,
+                modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
             });
@@ -1380,6 +1383,7 @@ mod tests {
                 version: None,
                 content_hash: None,
                 size_bytes: None,
+                modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
             },
@@ -1389,6 +1393,7 @@ mod tests {
                 version: None,
                 content_hash: None,
                 size_bytes: Some(42),
+                modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
             },
@@ -1416,6 +1421,7 @@ mod tests {
             version: None,
             content_hash: None,
             size_bytes: Some(7),
+            modified_at_unix: None,
             content_fingerprint: None,
             media: None,
         }];
@@ -1438,6 +1444,7 @@ mod tests {
                 version: None,
                 content_hash: None,
                 size_bytes: None,
+                modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
             },
@@ -1447,6 +1454,7 @@ mod tests {
                 version: None,
                 content_hash: None,
                 size_bytes: Some(11),
+                modified_at_unix: None,
                 content_fingerprint: None,
                 media: None,
             },
@@ -1516,6 +1524,7 @@ mod tests {
                             version: Some("v1".to_string()),
                             content_hash: Some("hash-1".to_string()),
                             size_bytes: Some(42),
+                            modified_at_unix: None,
                             content_fingerprint: None,
                             media: None,
                         }],
