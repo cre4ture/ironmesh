@@ -35,6 +35,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
   await expect(page.getByText("2 images")).toBeVisible();
+  const thumbnailsPerRowInput = page.getByRole("textbox", { name: "Thumbnails per row" });
+  await thumbnailsPerRowInput.click();
+  await page.getByRole("option", { name: "4 per row" }).click();
+  await expect(thumbnailsPerRowInput).toHaveValue("4 per row");
 
   await page.getByText("Cluster", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();

@@ -77,6 +77,7 @@ export function GallerySurface({
 }: GallerySurfaceProps) {
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(4);
+  const [thumbnailsPerRow, setThumbnailsPerRow] = useState(3);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<GalleryPayload | null>(null);
@@ -206,6 +207,24 @@ export function GallerySurface({
                   setSortOrder(value === "path_asc" ? "path_asc" : "captured_desc")
                 }
               />
+              <Select
+                label="Thumbnails per row"
+                data={[
+                  { value: "1", label: "1 per row" },
+                  { value: "2", label: "2 per row" },
+                  { value: "3", label: "3 per row" },
+                  { value: "4", label: "4 per row" },
+                  { value: "5", label: "5 per row" },
+                  { value: "6", label: "6 per row" }
+                ]}
+                value={String(thumbnailsPerRow)}
+                onChange={(value) => {
+                  const parsed = Number(value);
+                  setThumbnailsPerRow(
+                    Number.isFinite(parsed) && parsed >= 1 && parsed <= 6 ? parsed : 3
+                  );
+                }}
+              />
               <Group gap="sm">
                 <Button onClick={() => void refreshEntries()}>Load</Button>
                 <Button variant="default" onClick={() => void refreshEntries(parentPrefix(prefix))}>
@@ -251,7 +270,14 @@ export function GallerySurface({
               </Stack>
             </Card>
           ) : (
-            <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
+            <SimpleGrid
+              cols={{
+                base: 1,
+                sm: Math.min(thumbnailsPerRow, 2),
+                md: Math.min(thumbnailsPerRow, 3),
+                lg: thumbnailsPerRow
+              }}
+            >
               {imageEntries.map((entry) => (
                 <Card
                   key={entry.path}
