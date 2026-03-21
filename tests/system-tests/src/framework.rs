@@ -987,6 +987,7 @@ pub async fn wait_for_rendezvous_registered_endpoints(
     );
 }
 
+#[allow(dead_code)]
 pub async fn wait_for_object_payload(
     http: &reqwest::Client,
     base_url: &str,

@@ -2108,14 +2108,24 @@ mod tests {
             ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
         ];
 
-        let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 3, &env).await?;
-        let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 3, &env).await?;
-        let mut node_c = start_server_with_env(bind_c, &data_c, node_id_c, 3, &env).await?;
+        let mut node_a = start_authenticated_server_with_env_options(
+            bind_a, &data_a, node_id_a, 3, None, None, &env,
+        )
+        .await?;
+        let mut node_b = start_authenticated_server_with_env_options(
+            bind_b, &data_b, node_id_b, 3, None, None, &env,
+        )
+        .await?;
+        let mut node_c = start_authenticated_server_with_env_options(
+            bind_c, &data_c, node_id_c, 3, None, None, &env,
+        )
+        .await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let base_c = format!("http://{bind_c}");
         let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "repair-perf-a-client").await?;
 
         let result = async {
             register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
@@ -2123,7 +2133,9 @@ mod tests {
 
             let object_count = 12u64;
             for idx in 0..object_count {
-                http.put(format!("{base_a}/store/repair-perf-key-{idx}"))
+                client_a
+                    .http
+                    .request(Method::PUT, &format!("/store/repair-perf-key-{idx}"))?
                     .body("x")
                     .send()
                     .await?
@@ -2203,6 +2215,7 @@ mod tests {
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&data_c);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
 
         result
     }
@@ -2301,27 +2314,35 @@ mod tests {
         let data_a = fresh_data_dir("rejoin-a");
         let data_b = fresh_data_dir("rejoin-b");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_a = start_authenticated_server(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_authenticated_server(bind_b, &data_b, node_id_b, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "rejoin-a-client").await?;
+        let client_b = enroll_authenticated_http_client(&base_b, "rejoin-b-client").await?;
 
         let result = async {
-            http.put(format!("{base_a}/store/rejoin-key"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/rejoin-key")?
                 .body("a-confirmed")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            http.put(format!("{base_a}/store/rejoin-key?state=provisional"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/rejoin-key?state=provisional")?
                 .body("a-branch")
                 .send()
                 .await?
                 .error_for_status()?;
 
-            http.put(format!("{base_b}/store/rejoin-key?state=provisional"))
+            client_b
+                .http
+                .request(Method::PUT, "/store/rejoin-key?state=provisional")?
                 .body("b-branch")
                 .send()
                 .await?
@@ -2344,8 +2365,9 @@ mod tests {
                 "expected at least one imported provisional commit"
             );
 
-            let versions_payload = http
-                .get(format!("{base_a}/versions/rejoin-key"))
+            let versions_payload = client_a
+                .http
+                .request(Method::GET, "/versions/rejoin-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -2380,8 +2402,12 @@ mod tests {
                     .and_then(|v| v.as_str())
                     .context("missing version_id")?;
 
-                let payload = http
-                    .get(format!("{base_a}/store/rejoin-key?version={version_id}"))
+                let payload = client_a
+                    .http
+                    .request(
+                        Method::GET,
+                        &format!("/store/rejoin-key?version={version_id}"),
+                    )?
                     .send()
                     .await?
                     .error_for_status()?
@@ -2402,6 +2428,8 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
+        let _ = fs::remove_dir_all(&client_b.client_dir);
 
         result
     }
@@ -2417,15 +2445,21 @@ mod tests {
         let data_a = fresh_data_dir("reconcile-idempotent-a");
         let data_b = fresh_data_dir("reconcile-idempotent-b");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_a = start_authenticated_server(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_authenticated_server(bind_b, &data_b, node_id_b, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let http = reqwest::Client::new();
+        let client_a =
+            enroll_authenticated_http_client(&base_a, "reconcile-idempotent-a-client").await?;
+        let client_b =
+            enroll_authenticated_http_client(&base_b, "reconcile-idempotent-b-client").await?;
 
         let result = async {
-            http.put(format!("{base_b}/store/replay-key?state=provisional"))
+            client_b
+                .http
+                .request(Method::PUT, "/store/replay-key?state=provisional")?
                 .body("remote-branch")
                 .send()
                 .await?
@@ -2447,8 +2481,9 @@ mod tests {
                 .context("missing first imported count")?;
             assert!(first_imported >= 1, "expected first reconcile to import");
 
-            let versions_after_first: serde_json::Value = http
-                .get(format!("{base_a}/versions/replay-key"))
+            let versions_after_first: serde_json::Value = client_a
+                .http
+                .request(Method::GET, "/versions/replay-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -2483,8 +2518,9 @@ mod tests {
                 "expected replay skips on second reconcile"
             );
 
-            let versions_after_second: serde_json::Value = http
-                .get(format!("{base_a}/versions/replay-key"))
+            let versions_after_second: serde_json::Value = client_a
+                .http
+                .request(Method::GET, "/versions/replay-key")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -2506,6 +2542,8 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
+        let _ = fs::remove_dir_all(&client_b.client_dir);
 
         result
     }
@@ -3001,8 +3039,6 @@ mod tests {
         let cluster_id = "11111111-1111-7111-8111-111111111114";
         let node_id_a = "00000000-0000-0000-0000-0000000008c1";
         let node_id_b = "00000000-0000-0000-0000-0000000008c2";
-        let admin_token = "admin-secret";
-
         let rendezvous_url = format!("http://{rendezvous_bind}");
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -3019,13 +3055,20 @@ mod tests {
             ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
             ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
             ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
-        let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 2, &node_env).await?;
-        let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 2, &node_env).await?;
+        let mut node_a = start_authenticated_server_with_env_options(
+            bind_a, &data_a, node_id_a, 2, None, None, &node_env,
+        )
+        .await?;
+        let mut node_b = start_authenticated_server_with_env_options(
+            bind_b, &data_b, node_id_b, 2, None, None, &node_env,
+        )
+        .await?;
         let http = reqwest::Client::new();
+        let client_a =
+            enroll_authenticated_http_client(&base_a, "relay-restart-repl-a-client").await?;
 
         let result = async {
             let wait_for_known_nodes = |base_url: String, expected_nodes: usize| {
@@ -3058,7 +3101,9 @@ mod tests {
             wait_for_known_nodes(base_a.clone(), 2).await?;
             wait_for_known_nodes(base_b.clone(), 2).await?;
 
-            http.put(format!("{base_a}/store/restart-relay-key"))
+            client_a
+                .http
+                .request(Method::PUT, "/store/restart-relay-key")?
                 .body("payload-after-rendezvous-restart")
                 .send()
                 .await?
@@ -3081,16 +3126,32 @@ mod tests {
                 "expected at least one successful relay-required transfer, report={repair_report:?}"
             );
 
-            wait_for_object_payload(
+            let bootstrap_b = issue_bootstrap_bundle(
                 &http,
                 &base_b,
-                "restart-relay-key",
-                "payload-after-rendezvous-restart",
-                120,
+                TEST_ADMIN_TOKEN,
+                Some("relay-restart-repl-b"),
+                Some(3600),
             )
             .await?;
+            let identity = client_a.http.identity.clone();
+            let client_b_sdk = tokio::task::spawn_blocking(move || {
+                bootstrap_b.build_client_with_identity(&identity)
+            })
+            .await
+            .context("relay-required node B client construction task panicked")??;
 
-            Ok::<(), anyhow::Error>(())
+            for _ in 0..120 {
+                if let Ok(bytes) = client_b_sdk.get("restart-relay-key").await
+                    && bytes.as_ref() == b"payload-after-rendezvous-restart"
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(250)).await;
+            }
+
+            bail!("replicated relay-required payload was not readable through node B bootstrap-aware client");
+
         }
         .await;
 
@@ -3099,6 +3160,7 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
 
         result
     }
