@@ -146,14 +146,17 @@ export function BootstrapBundlesPage() {
     setBootstrapBundleQrDataUrl(null);
     setBootstrapBundleQrError(null);
 
-    void QRCode.toDataURL(bootstrapQrPayload, {
-      errorCorrectionLevel: "L",
-      margin: 1,
-      width: 320
+    void QRCode.toString(bootstrapQrPayload, {
+      errorCorrectionLevel: "H",
+      type: "svg",
+      margin: 4,
+      width: 512
     })
-      .then((dataUrl: string) => {
+      .then((svg: string) => {
         if (!cancelled) {
-          setBootstrapBundleQrDataUrl(dataUrl);
+          setBootstrapBundleQrDataUrl(
+            `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+          );
         }
       })
       .catch((qrError: unknown) => {
@@ -312,7 +315,7 @@ export function BootstrapBundlesPage() {
                     <img
                       src={bootstrapBundleQrDataUrl}
                       alt="Client bootstrap QR code"
-                      style={{ width: 320, maxWidth: "100%", display: "block" }}
+                      style={{ width: 512, maxWidth: "100%", display: "block" }}
                     />
                   ) : (
                     <Text size="sm" c={bootstrapBundleQrError ? "red" : "dimmed"}>
@@ -327,7 +330,7 @@ export function BootstrapBundlesPage() {
                     <img
                       src={bootstrapBundleQrDataUrl}
                       alt="Client bootstrap QR code"
-                      style={{ width: 320, maxWidth: "100%", display: "block" }}
+                      style={{ width: 512, maxWidth: "100%", display: "block" }}
                     />
                   ) : (
                     <Text size="sm" c={bootstrapBundleQrError ? "red" : "dimmed"}>
