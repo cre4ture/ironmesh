@@ -3,9 +3,11 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        ChildGuard, binary_path, fresh_data_dir, register_node, start_rendezvous_service,
-        start_server, start_server_with_env, stop_server, wait_for_online_nodes,
-        wait_for_rendezvous_registered_endpoints, wait_for_store_index_entry, wait_for_url_status,
+        ChildGuard, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
+        issue_bootstrap_bundle_and_enroll_client, register_node, start_authenticated_server,
+        start_rendezvous_service, start_server, start_server_with_env, stop_server,
+        wait_for_online_nodes, wait_for_rendezvous_registered_endpoints,
+        wait_for_store_index_entry, wait_for_url_status,
     };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
@@ -17,31 +19,104 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::process::Command;
     use tokio::time::sleep;
+    use uuid::Uuid;
 
     const LARGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+
+    #[derive(Debug, Clone)]
+    struct LinuxFuseConnection {
+        server_base_url: Option<String>,
+        bootstrap_path: Option<PathBuf>,
+        client_identity_path: Option<PathBuf>,
+    }
+
+    impl LinuxFuseConnection {
+        fn direct(server_base_url: impl Into<String>) -> Self {
+            Self {
+                server_base_url: Some(server_base_url.into()),
+                bootstrap_path: None,
+                client_identity_path: None,
+            }
+        }
+
+        fn apply_to_command(&self, command: &mut Command) {
+            if let Some(server_base_url) = self.server_base_url.as_deref() {
+                command.arg("--server-base-url").arg(server_base_url);
+            }
+            if let Some(bootstrap_path) = self.bootstrap_path.as_deref() {
+                command.arg("--bootstrap-file").arg(bootstrap_path);
+            }
+            if let Some(client_identity_path) = self.client_identity_path.as_deref() {
+                command
+                    .arg("--client-identity-file")
+                    .arg(client_identity_path);
+            }
+        }
+    }
+
+    struct AuthenticatedLinuxFuseFixture {
+        server: ChildGuard,
+        sdk: IronMeshClient,
+        connection: LinuxFuseConnection,
+    }
+
+    async fn start_authenticated_linux_fuse_fixture(
+        bind: &str,
+    ) -> Result<AuthenticatedLinuxFuseFixture> {
+        let nonce = bind.replace(['.', ':'], "-");
+        let data_dir = fresh_data_dir(&format!("linux-fuse-auth-server-{nonce}"));
+        let client_dir = fresh_data_dir(&format!("linux-fuse-auth-client-{nonce}"));
+        let node_id = Uuid::new_v4().to_string();
+        let server = start_authenticated_server(bind, &data_dir, &node_id, 1).await?;
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+        let enrolled = issue_bootstrap_bundle_and_enroll_client(
+            &http,
+            &base_url,
+            TEST_ADMIN_TOKEN,
+            &client_dir,
+            "linux-fuse.bootstrap.json",
+            Some("linux-fuse-test"),
+            Some(3600),
+        )
+        .await?;
+        let sdk = enrolled.build_client_async().await?;
+        let connection = LinuxFuseConnection {
+            server_base_url: None,
+            bootstrap_path: Some(enrolled.bootstrap_path.clone()),
+            client_identity_path: Some(crate::framework::default_client_identity_path(
+                &enrolled.bootstrap_path,
+            )),
+        };
+        Ok(AuthenticatedLinuxFuseFixture {
+            server,
+            sdk,
+            connection,
+        })
+    }
 
     fn fuse_runtime_available() -> bool {
         Path::new("/dev/fuse").exists()
     }
 
     async fn start_linux_fuse_adapter(
-        server_base_url: &str,
+        connection: &LinuxFuseConnection,
         mountpoint: &Path,
     ) -> Result<ChildGuard> {
-        start_linux_fuse_adapter_with_refresh(server_base_url, mountpoint, 500).await
+        start_linux_fuse_adapter_with_refresh(connection, mountpoint, 500).await
     }
 
     async fn start_linux_fuse_adapter_with_refresh(
-        server_base_url: &str,
+        connection: &LinuxFuseConnection,
         mountpoint: &Path,
         remote_refresh_interval_ms: u64,
     ) -> Result<ChildGuard> {
         let os_integration_bin = binary_path("os-integration")?;
         let mountpoint_arg = mountpoint.to_string_lossy().to_string();
 
-        let child = Command::new(os_integration_bin)
-            .arg("--server-base-url")
-            .arg(server_base_url)
+        let mut command = Command::new(os_integration_bin);
+        connection.apply_to_command(&mut command);
+        let child = command
             .arg("--mountpoint")
             .arg(&mountpoint_arg)
             .arg("--remote-refresh-interval-ms")
@@ -544,16 +619,15 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-live-mount");
-        let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
 
         let result = async {
             sdk.put_large_aware(seed_key, Bytes::from(seed_payload.clone()))
                 .await?;
 
-            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let mut adapter = start_linux_fuse_adapter(&fixture.connection, &mountpoint).await?;
             let mount_result = async {
                 let mounted_file = mountpoint.join(seed_key);
                 wait_for_file(&mounted_file, 100).await?;
@@ -578,7 +652,7 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        stop_server(&mut fixture.server).await;
         let _ = fs::remove_dir_all(&mountpoint);
         result
     }
@@ -589,10 +663,9 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-nested-folders");
-        let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
 
         let nested_steps = vec![
             ("l1", "l1/small-l1.txt", b"upload-l1".to_vec()),
@@ -605,7 +678,7 @@ mod tests {
             sdk.put_large_aware("seed-nested.txt", Bytes::from_static(b"seed-nested"))
                 .await?;
 
-            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let mut adapter = start_linux_fuse_adapter(&fixture.connection, &mountpoint).await?;
             let phase_one = async {
                 let seed_path = mountpoint.join("seed-nested.txt");
                 wait_for_file(&seed_path, 100).await?;
@@ -661,7 +734,7 @@ mod tests {
             phase_one?;
 
             // Remount to validate download/hydration from server for each uploaded file.
-            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let mut adapter = start_linux_fuse_adapter(&fixture.connection, &mountpoint).await?;
             let phase_two = async {
                 for (dir, key, payload) in &nested_steps {
                     let mounted_path = mountpoint.join(key);
@@ -709,7 +782,7 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        stop_server(&mut fixture.server).await;
         let _ = fs::remove_dir_all(&mountpoint);
         result
     }
@@ -753,7 +826,8 @@ mod tests {
                 )
                 .await?;
 
-            let mut adapter = start_linux_fuse_adapter(&base_a, &mountpoint).await?;
+            let node_a_connection = LinuxFuseConnection::direct(base_a.clone());
+            let mut adapter = start_linux_fuse_adapter(&node_a_connection, &mountpoint).await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-cluster-delete.txt");
                 wait_for_file(&seed_path, 150).await?;
@@ -811,10 +885,9 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-empty-folder");
-        let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
 
         let result = async {
             // Seed one remote file so we have a deterministic mount-readiness probe.
@@ -824,7 +897,7 @@ mod tests {
             )
             .await?;
 
-            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let mut adapter = start_linux_fuse_adapter(&fixture.connection, &mountpoint).await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-empty-folder.txt");
                 wait_for_file(&seed_path, 120).await?;
@@ -854,7 +927,7 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        stop_server(&mut fixture.server).await;
         let _ = fs::remove_dir_all(&mountpoint);
         result
     }
@@ -865,17 +938,17 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-refresh");
-        let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
 
         let result = async {
             sdk.put_large_aware("seed-refresh.txt", Bytes::from_static(b"seed-refresh"))
                 .await?;
 
             let mut adapter =
-                start_linux_fuse_adapter_with_refresh(&base_url, &mountpoint, 500).await?;
+                start_linux_fuse_adapter_with_refresh(&fixture.connection, &mountpoint, 500)
+                    .await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-refresh.txt");
                 wait_for_file(&seed_path, 120).await?;
@@ -909,7 +982,7 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        stop_server(&mut fixture.server).await;
         let _ = fs::remove_dir_all(&mountpoint);
         result
     }
@@ -947,8 +1020,9 @@ mod tests {
             sdk.put_large_aware("seed-refresh.txt", Bytes::from_static(b"seed-refresh"))
                 .await?;
 
+            let local_edge_connection = LinuxFuseConnection::direct(local_edge_base_url.clone());
             let mut adapter =
-                start_linux_fuse_adapter_with_refresh(&local_edge_base_url, &mountpoint, 250)
+                start_linux_fuse_adapter_with_refresh(&local_edge_connection, &mountpoint, 250)
                     .await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-refresh.txt");
@@ -1044,8 +1118,9 @@ mod tests {
             )
             .await?;
 
+            let local_edge_connection = LinuxFuseConnection::direct(local_edge_base_url.clone());
             let mut adapter =
-                start_linux_fuse_adapter_with_refresh(&local_edge_base_url, &mountpoint, 250)
+                start_linux_fuse_adapter_with_refresh(&local_edge_connection, &mountpoint, 250)
                     .await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-remote-delete-local-edge.txt");
@@ -1116,10 +1191,9 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-update-refresh");
-        let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
 
         let result = async {
             let remote_key = "live-refresh/updated.txt";
@@ -1127,7 +1201,8 @@ mod tests {
                 .await?;
 
             let mut adapter =
-                start_linux_fuse_adapter_with_refresh(&base_url, &mountpoint, 250).await?;
+                start_linux_fuse_adapter_with_refresh(&fixture.connection, &mountpoint, 250)
+                    .await?;
             let scenario = async {
                 let mounted_file = mountpoint.join(remote_key);
                 wait_for_file(&mounted_file, 180).await?;
@@ -1146,7 +1221,7 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        stop_server(&mut fixture.server).await;
         let _ = fs::remove_dir_all(&mountpoint);
         result
     }
@@ -1157,10 +1232,9 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-size-reporting");
-        let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
 
         let result = async {
             let size_probe_payload = b"size-probe-remote-file".to_vec();
@@ -1169,7 +1243,7 @@ mod tests {
             sdk.put_large_aware("reported-size.txt", Bytes::from(size_probe_payload.clone()))
                 .await?;
 
-            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let mut adapter = start_linux_fuse_adapter(&fixture.connection, &mountpoint).await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-size-reporting.txt");
                 wait_for_file(&seed_path, 120).await?;
@@ -1197,7 +1271,7 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        stop_server(&mut fixture.server).await;
         let _ = fs::remove_dir_all(&mountpoint);
         result
     }
@@ -1208,10 +1282,9 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-local-rename-move");
-        let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
 
         let result = async {
             sdk.put_large_aware(
@@ -1220,7 +1293,7 @@ mod tests {
             )
             .await?;
 
-            let mut adapter = start_linux_fuse_adapter(&base_url, &mountpoint).await?;
+            let mut adapter = start_linux_fuse_adapter(&fixture.connection, &mountpoint).await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-local-rename.txt");
                 wait_for_file(&seed_path, 120).await?;
@@ -1339,7 +1412,7 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        stop_server(&mut fixture.server).await;
         let _ = fs::remove_dir_all(&mountpoint);
         result
     }
@@ -1350,10 +1423,9 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = format!("http://{bind}");
         let mountpoint = fresh_data_dir("linux-fuse-remote-rename-move");
-        let mut server = start_server(bind).await?;
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
 
         let result = async {
             sdk.put_large_aware(
@@ -1363,7 +1435,8 @@ mod tests {
             .await?;
 
             let mut adapter =
-                start_linux_fuse_adapter_with_refresh(&base_url, &mountpoint, 250).await?;
+                start_linux_fuse_adapter_with_refresh(&fixture.connection, &mountpoint, 250)
+                    .await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-remote-rename.txt");
                 wait_for_file(&seed_path, 120).await?;
@@ -1433,7 +1506,7 @@ mod tests {
         }
         .await;
 
-        stop_server(&mut server).await;
+        stop_server(&mut fixture.server).await;
         let _ = fs::remove_dir_all(&mountpoint);
         result
     }
@@ -1474,8 +1547,9 @@ mod tests {
             )
             .await?;
 
+            let local_edge_connection = LinuxFuseConnection::direct(local_edge_base_url.clone());
             let mut adapter =
-                start_linux_fuse_adapter_with_refresh(&local_edge_base_url, &mountpoint, 250)
+                start_linux_fuse_adapter_with_refresh(&local_edge_connection, &mountpoint, 250)
                     .await?;
             let scenario = async {
                 let seed_path = mountpoint.join("seed-remote-rename-local-edge.txt");
@@ -1584,12 +1658,11 @@ mod tests {
         let sdk = IronMeshClient::from_direct_base_url(&base_url);
 
         let result = async {
-            let mut adapter = start_linux_fuse_adapter_with_refresh(
-                &cluster.local_edge_base_url,
-                &mountpoint,
-                250,
-            )
-            .await?;
+            let local_edge_connection =
+                LinuxFuseConnection::direct(cluster.local_edge_base_url.clone());
+            let mut adapter =
+                start_linux_fuse_adapter_with_refresh(&local_edge_connection, &mountpoint, 250)
+                    .await?;
 
             wait_for_mount_active(&mountpoint, 150).await?;
             let local_edge_base_url = cluster.local_edge_base_url.clone();
