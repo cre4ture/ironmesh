@@ -1329,9 +1329,14 @@ async fn rendezvous_registration_views(
 }
 
 fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
-    let urls = current_rendezvous_urls(state);
-    match state.managed_rendezvous_public_url.as_deref() {
-        Some(managed_url) => urls.into_iter().filter(|url| url != managed_url).collect(),
+    let urls = normalize_rendezvous_url_list(&current_rendezvous_urls(state))
+        .unwrap_or_else(|_| current_rendezvous_urls(state));
+    match state
+        .managed_rendezvous_public_url
+        .as_deref()
+        .and_then(|url| canonicalize_rendezvous_url(url).ok())
+    {
+        Some(managed_url) => urls.into_iter().filter(|url| url != &managed_url).collect(),
         None => urls,
     }
 }
@@ -1491,7 +1496,7 @@ fn build_outbound_clients_with_urls(
 }
 
 fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
-    let rendezvous_urls = current_rendezvous_urls(state);
+    let rendezvous_urls = normalize_rendezvous_url_list(&current_rendezvous_urls(state))?;
     build_outbound_clients_with_urls(state, &rendezvous_urls)
 }
 
@@ -2763,10 +2768,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .as_ref()
         .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
         .transpose()?;
+    let normalized_rendezvous_urls = normalize_rendezvous_url_list(&config.rendezvous_urls)?;
     let (rendezvous_control, rendezvous_controls) = if config.rendezvous_registration_enabled {
         match build_rendezvous_control_clients(
             config.cluster_id,
-            &config.rendezvous_urls,
+            &normalized_rendezvous_urls,
             config.peer_heartbeat_interval_secs.max(5),
             rendezvous_ca_pem
                 .as_deref()
@@ -2787,7 +2793,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         config
             .rendezvous_urls
             .iter()
-            .cloned()
+            .map(|url| canonicalize_rendezvous_url(url).unwrap_or_else(|_| url.clone()))
             .map(|url| (url, RendezvousEndpointRegistrationRuntime::default()))
             .collect(),
     ));
@@ -2806,7 +2812,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         public_tls_runtime,
         internal_tls_runtime,
         rendezvous_ca_pem,
-        rendezvous_urls: Arc::new(StdMutex::new(config.rendezvous_urls.clone())),
+        rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls)),
         rendezvous_registration_enabled: config.rendezvous_registration_enabled,
         rendezvous_mtls_required: config.rendezvous_mtls_required,
         managed_rendezvous_public_url: config
@@ -3108,6 +3114,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
     let internal_app = Router::new()
         .route("/health", get(health))
+        .route("/auth/device/enroll", post(enroll_client_device))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route(
@@ -5617,6 +5624,7 @@ struct TombstoneRestoreQuery {
 struct PairingTokenIssueRequest {
     label: Option<String>,
     expires_in_secs: Option<u64>,
+    preferred_rendezvous_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5895,6 +5903,7 @@ async fn issue_pairing_token(
         json!({
             "label": request.label,
             "expires_in_secs": request.expires_in_secs,
+            "preferred_rendezvous_url": request.preferred_rendezvous_url,
         }),
     )
     .await
@@ -5946,7 +5955,8 @@ fn bootstrap_trust_roots(
 
 fn bootstrap_rendezvous_urls(state: &ServerState) -> std::result::Result<Vec<String>, StatusCode> {
     Ok(if state.rendezvous_registration_enabled {
-        current_rendezvous_urls(state)
+        normalize_rendezvous_url_list(&current_rendezvous_urls(state))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     } else {
         Vec::new()
     })
@@ -5998,16 +6008,6 @@ async fn issue_client_bootstrap_impl(
     Ok((bootstrap, pairing_response.expires_at_unix))
 }
 
-fn bootstrap_claim_rendezvous_url(
-    bootstrap: &TransportClientBootstrap,
-) -> std::result::Result<String, StatusCode> {
-    bootstrap
-        .rendezvous_urls
-        .first()
-        .cloned()
-        .ok_or(StatusCode::PRECONDITION_FAILED)
-}
-
 fn rendezvous_claim_trust_from_bootstrap(
     bootstrap: &TransportClientBootstrap,
 ) -> std::result::Result<ClientBootstrapClaimTrust, StatusCode> {
@@ -6040,39 +6040,184 @@ fn generate_bootstrap_claim_token() -> String {
     )
 }
 
+async fn resolve_bootstrap_claim_publish_target(
+    state: &ServerState,
+    bootstrap: &TransportClientBootstrap,
+    preferred_rendezvous_url: Option<&str>,
+) -> std::result::Result<Vec<String>, (StatusCode, String)> {
+    if let Some(preferred_rendezvous_url) = preferred_rendezvous_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let preferred_rendezvous_url = canonicalize_rendezvous_url(preferred_rendezvous_url)
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid preferred rendezvous URL: {err}"),
+                )
+            })?;
+        let configured_urls = bootstrap_rendezvous_urls(state).map_err(|status| {
+            (
+                status,
+                "bootstrap claim issuance requires rendezvous to be configured on this node"
+                    .to_string(),
+            )
+        })?;
+        if !configured_urls.contains(&preferred_rendezvous_url) {
+            return Err((
+                StatusCode::PRECONDITION_FAILED,
+                format!(
+                    "selected rendezvous service is not configured on this node: {preferred_rendezvous_url}"
+                ),
+            ));
+        }
+        return Ok(vec![preferred_rendezvous_url]);
+    }
+
+    let rendezvous_urls =
+        normalize_rendezvous_url_list(&bootstrap.rendezvous_urls).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to normalize bootstrap rendezvous URLs: {err}"),
+            )
+        })?;
+    if rendezvous_urls.is_empty() {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "bootstrap claim issuance requires rendezvous to be configured on this node"
+                .to_string(),
+        ));
+    }
+    Ok(rendezvous_urls)
+}
+
+fn build_bootstrap_claim_publish_client(
+    state: &ServerState,
+    rendezvous_url: &str,
+) -> std::result::Result<RendezvousControlClient, (StatusCode, String)> {
+    let trust_material = load_live_trust_material(state).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load rendezvous trust material: {err}"),
+        )
+    })?;
+    let rendezvous_client_identity_pem = state
+        .internal_tls_runtime
+        .as_ref()
+        .map(|tls| build_identity_pem_from_paths(&tls.cert_path, &tls.key_path))
+        .transpose()
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load rendezvous client identity: {err}"),
+            )
+        })?;
+    let rendezvous_url = canonicalize_rendezvous_url(rendezvous_url).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid rendezvous URL: {err}"),
+        )
+    })?;
+
+    RendezvousControlClient::new(
+        RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![rendezvous_url],
+            heartbeat_interval_secs: state.peer_heartbeat_config.interval_secs.max(5),
+        },
+        trust_material
+            .rendezvous_ca_pem
+            .as_deref()
+            .or(trust_material.public_ca_pem.as_deref())
+            .or(trust_material.cluster_ca_pem.as_deref()),
+        rendezvous_client_identity_pem.as_deref(),
+    )
+    .map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build rendezvous client for bootstrap claim publication: {err}"),
+        )
+    })
+}
+
+fn map_bootstrap_claim_publish_error(error: String) -> (StatusCode, String) {
+    if error.contains("404") {
+        (
+            StatusCode::BAD_GATEWAY,
+            "configured rendezvous service does not support bootstrap claims yet; restart it with the updated build".to_string(),
+        )
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed publishing bootstrap claim to rendezvous: {error}"),
+        )
+    }
+}
+
 async fn publish_client_bootstrap_claim(
     state: &ServerState,
     bootstrap: &TransportClientBootstrap,
     expires_at_unix: u64,
-) -> std::result::Result<ClientBootstrapClaim, StatusCode> {
-    let rendezvous = current_rendezvous_control(state)
-        .await
-        .ok_or(StatusCode::PRECONDITION_FAILED)?;
+    preferred_rendezvous_url: Option<&str>,
+) -> std::result::Result<ClientBootstrapClaim, (StatusCode, String)> {
+    let rendezvous_urls =
+        resolve_bootstrap_claim_publish_target(state, bootstrap, preferred_rendezvous_url).await?;
     let claim_token = generate_bootstrap_claim_token();
-    let claim = ClientBootstrapClaim {
-        version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
-        kind: CLIENT_BOOTSTRAP_CLAIM_KIND.to_string(),
-        cluster_id: bootstrap.cluster_id,
-        rendezvous_url: bootstrap_claim_rendezvous_url(bootstrap)?,
-        trust: rendezvous_claim_trust_from_bootstrap(bootstrap)?,
-        claim_token: claim_token.clone(),
+    let claim_trust = rendezvous_claim_trust_from_bootstrap(bootstrap).map_err(|status| {
+        (
+            status,
+            "failed to build compact rendezvous trust material for the bootstrap claim".to_string(),
+        )
+    })?;
+    let publish_request = ClientBootstrapClaimPublishRequest {
+        cluster_id: state.cluster_id,
+        issuer: PeerIdentity::Node(state.node_id),
+        target_node_id: state.node_id,
+        claim_secret_hash: hash_token(&claim_token),
         expires_at_unix,
+        bootstrap: bootstrap.clone(),
     };
-    claim
-        .validate()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    rendezvous
-        .publish_bootstrap_claim(&ClientBootstrapClaimPublishRequest {
-            cluster_id: state.cluster_id,
-            issuer: PeerIdentity::Node(state.node_id),
-            target_node_id: state.node_id,
-            claim_secret_hash: hash_token(&claim_token),
-            expires_at_unix,
-            bootstrap: bootstrap.clone(),
-        })
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    Ok(claim)
+    let preferred_rendezvous_selected = preferred_rendezvous_url
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let mut last_error = None;
+
+    for rendezvous_url in rendezvous_urls {
+        let rendezvous = build_bootstrap_claim_publish_client(state, &rendezvous_url)?;
+        match rendezvous.publish_bootstrap_claim(&publish_request).await {
+            Ok(_) => {
+                let claim = ClientBootstrapClaim {
+                    version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
+                    kind: CLIENT_BOOTSTRAP_CLAIM_KIND.to_string(),
+                    cluster_id: bootstrap.cluster_id,
+                    rendezvous_url,
+                    trust: claim_trust.clone(),
+                    claim_token: claim_token.clone(),
+                    expires_at_unix,
+                };
+                claim.validate().map_err(|err| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to validate generated bootstrap claim: {err}"),
+                    )
+                })?;
+                return Ok(claim);
+            }
+            Err(err) => {
+                let error = err.to_string();
+                if preferred_rendezvous_selected {
+                    return Err(map_bootstrap_claim_publish_error(error));
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(map_bootstrap_claim_publish_error(
+        last_error.unwrap_or_else(|| {
+            "bootstrap claim issuance requires a reachable rendezvous service".to_string()
+        }),
+    ))
 }
 
 fn build_bootstrap_direct_endpoints(
@@ -6406,6 +6551,7 @@ async fn issue_bootstrap_bundle(
         json!({
             "label": request.label,
             "expires_in_secs": request.expires_in_secs,
+            "preferred_rendezvous_url": request.preferred_rendezvous_url,
         }),
     )
     .await
@@ -6463,16 +6609,50 @@ async fn issue_bootstrap_claim(
     };
 
     let request_label = request.label.clone();
+    let preferred_rendezvous_url = request.preferred_rendezvous_url.clone();
     let (bootstrap_bundle, expires_at_unix) =
         match issue_client_bootstrap_impl(&state, request).await {
             Ok(response) => response,
-            Err(status) => return status.into_response(),
+            Err(status) => {
+                let error = "failed to issue bootstrap bundle backing the bootstrap claim";
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": error }),
+                )
+                .await;
+                return (status, Json(json!({ "error": error }))).into_response();
+            }
         };
-    let bootstrap_claim =
-        match publish_client_bootstrap_claim(&state, &bootstrap_bundle, expires_at_unix).await {
-            Ok(claim) => claim,
-            Err(status) => return status.into_response(),
-        };
+    let bootstrap_claim = match publish_client_bootstrap_claim(
+        &state,
+        &bootstrap_bundle,
+        expires_at_unix,
+        preferred_rendezvous_url.as_deref(),
+    )
+    .await
+    {
+        Ok(claim) => claim,
+        Err((status, error)) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": error }),
+            )
+            .await;
+            return (status, Json(json!({ "error": error }))).into_response();
+        }
+    };
     let response = ClientBootstrapClaimIssueResponse {
         bootstrap_bundle,
         bootstrap_claim,
@@ -8335,8 +8515,10 @@ async fn build_rendezvous_config_view(
     state: &ServerState,
     persisted: bool,
 ) -> RendezvousConfigView {
+    let effective_urls = normalize_rendezvous_url_list(&current_rendezvous_urls(state))
+        .unwrap_or_else(|_| current_rendezvous_urls(state));
     RendezvousConfigView {
-        effective_urls: current_rendezvous_urls(state),
+        effective_urls,
         editable_urls: current_editable_rendezvous_urls(state),
         managed_embedded_url: state.managed_rendezvous_public_url.clone(),
         registration_enabled: state.rendezvous_registration_enabled,
@@ -8349,6 +8531,13 @@ async fn build_rendezvous_config_view(
     }
 }
 
+fn canonicalize_rendezvous_url(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let parsed = reqwest::Url::parse(trimmed)
+        .with_context(|| format!("invalid rendezvous URL {trimmed:?}"))?;
+    Ok(parsed.to_string())
+}
+
 fn normalize_rendezvous_url_list(values: &[String]) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut normalized = Vec::new();
@@ -8358,9 +8547,7 @@ fn normalize_rendezvous_url_list(values: &[String]) -> Result<Vec<String>> {
         if trimmed.is_empty() {
             continue;
         }
-        let parsed = reqwest::Url::parse(trimmed)
-            .with_context(|| format!("invalid rendezvous URL {trimmed:?}"))?;
-        let canonical = parsed.to_string();
+        let canonical = canonicalize_rendezvous_url(trimmed)?;
         if seen.insert(canonical.clone()) {
             normalized.push(canonical);
         }
@@ -8377,9 +8564,7 @@ fn build_effective_rendezvous_urls(
     let mut seen = HashSet::new();
 
     if let Some(managed_url) = state.managed_rendezvous_public_url.as_deref() {
-        let parsed = reqwest::Url::parse(managed_url)
-            .with_context(|| format!("invalid managed rendezvous URL {managed_url:?}"))?;
-        let canonical = parsed.to_string();
+        let canonical = canonicalize_rendezvous_url(managed_url)?;
         seen.insert(canonical.clone());
         effective_urls.push(canonical);
     }

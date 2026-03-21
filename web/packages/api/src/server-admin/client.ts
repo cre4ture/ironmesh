@@ -163,7 +163,11 @@ export async function issueBootstrapBundle(
 }
 
 export async function issueBootstrapClaim(
-  request: { label?: string | null; expires_in_secs?: number | null },
+  request: {
+    label?: string | null;
+    expires_in_secs?: number | null;
+    preferred_rendezvous_url?: string | null;
+  },
   adminTokenOverride?: string
 ): Promise<BootstrapClaimIssueResponse> {
   return fetchAdminJson<BootstrapClaimIssueResponse>("/auth/bootstrap-claims/issue", {

@@ -87,9 +87,87 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("tls/cluster-ca.pem")).toBeVisible();
 });
 
-async function installServerAdminMocks(page: Page, options?: { setupMode?: boolean }) {
+test("server-admin provisioning can target a selected rendezvous service", async ({ page }) => {
+  await installServerAdminMocks(page);
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Provisioning", { exact: true }).click();
+  await page.getByLabel("Preferred rendezvous service").selectOption("https://rendezvous-a.local:9443/");
+  await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
+
+  await expect(page.locator("pre").filter({ hasText: '"rendezvous_url": "https://rendezvous-a.local:9443/"' })).toBeVisible();
+  await expect(page.getByText("Request failed", { exact: true })).toHaveCount(0);
+});
+
+test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
+  await installServerAdminMocks(page, { bootstrapClaimMode: "bad_gateway" });
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Provisioning", { exact: true }).click();
+  await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
+
+  await expect(page.getByText("Compact claim issuance is temporarily unavailable on this node, so the page fell back to a full bootstrap QR.")).toBeVisible();
+  await expect(page.getByText("Scan the full bootstrap bundle with the ironmesh Android app")).toBeVisible();
+  await expect(page.getByAltText("Client bootstrap QR code")).toBeVisible();
+  await expect(page.locator("pre").filter({ hasText: '"relay_mode": "relay-preferred"' })).toBeVisible();
+  await expect(page.getByText("Request failed", { exact: true })).toHaveCount(0);
+});
+
+test("server-admin provisioning does not fall back when a specific rendezvous service is selected", async ({ page }) => {
+  await installServerAdminMocks(page, { bootstrapClaimMode: "bad_gateway" });
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Provisioning", { exact: true }).click();
+  await page.getByLabel("Preferred rendezvous service").selectOption("https://rendezvous-a.local:9443/");
+  await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
+
+  await expect(page.getByText("Request failed", { exact: true })).toBeVisible();
+  await expect(page.getByText("Compact claim issuance is temporarily unavailable on this node, so the page fell back to a full bootstrap QR.")).toHaveCount(0);
+});
+
+async function installServerAdminMocks(
+  page: Page,
+  options?: { setupMode?: boolean; bootstrapClaimMode?: "success" | "bad_gateway" }
+) {
   let authenticated = false;
   const revokedDeviceIds = new Set<string>();
+  const bootstrapBundle = {
+    cluster_id: "cluster-alpha",
+    relay_mode: "relay-preferred",
+    rendezvous_mtls_required: true,
+    rendezvous_urls: ["https://node-alpha.local/rendezvous"],
+    direct_endpoints: [
+      {
+        url: "https://node-alpha.local",
+        usage: "public_api",
+        node_id: "node-alpha"
+      }
+    ],
+    trust_roots: {
+      cluster_ca_pem: "-----BEGIN CERTIFICATE-----\\ncluster\\n-----END CERTIFICATE-----"
+    }
+  };
   let rendezvousConfig = {
     effective_urls: ["https://embedded-rendezvous.local:9443", "https://rendezvous-a.local:9443"],
     editable_urls: ["https://rendezvous-a.local:9443"],
@@ -275,28 +353,24 @@ async function installServerAdminMocks(page: Page, options?: { setupMode?: boole
     }
 
     if (pathname === "/auth/bootstrap-claims/issue" && method === "POST") {
+      const body = route.request().postDataJSON() as { preferred_rendezvous_url?: string | null };
+      if (options?.bootstrapClaimMode === "bad_gateway") {
+        await route.fulfill({
+          status: 502
+        });
+        return;
+      }
+
       return json(route, {
-        bootstrap_bundle: {
-          cluster_id: "cluster-alpha",
-          relay_mode: "relay-preferred",
-          rendezvous_mtls_required: true,
-          rendezvous_urls: ["https://node-alpha.local/rendezvous"],
-          direct_endpoints: [
-            {
-              url: "https://node-alpha.local",
-              usage: "public_api",
-              node_id: "node-alpha"
-            }
-          ],
-          trust_roots: {
-            cluster_ca_pem: "-----BEGIN CERTIFICATE-----\\ncluster\\n-----END CERTIFICATE-----"
-          }
-        },
+        bootstrap_bundle: bootstrapBundle,
         bootstrap_claim: {
           version: 1,
           kind: "client_bootstrap_claim",
           cluster_id: "cluster-alpha",
-          rendezvous_url: "https://node-alpha.local/rendezvous",
+          rendezvous_url:
+            typeof body.preferred_rendezvous_url === "string" && body.preferred_rendezvous_url.trim().length > 0
+              ? new URL(body.preferred_rendezvous_url).toString()
+              : "https://node-alpha.local/rendezvous",
           claim_token: "im-claim-example",
           expires_at_unix: 1_900_003_600,
           trust: {
@@ -305,6 +379,10 @@ async function installServerAdminMocks(page: Page, options?: { setupMode?: boole
           }
         }
       });
+    }
+
+    if (pathname === "/auth/bootstrap-bundles/issue" && method === "POST") {
+      return json(route, bootstrapBundle);
     }
 
     if (pathname === "/auth/node-join-requests/issue-enrollment" && method === "POST") {

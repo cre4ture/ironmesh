@@ -885,12 +885,20 @@ fn apply_managed_rendezvous_config(
         return;
     }
 
+    let canonical_public_url = reqwest::Url::parse(&public_url)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| public_url.clone());
     if config
         .rendezvous_urls
         .iter()
-        .all(|existing| existing != &public_url)
+        .map(|existing| {
+            reqwest::Url::parse(existing)
+                .map(|url| url.to_string())
+                .unwrap_or_else(|_| existing.clone())
+        })
+        .all(|existing| existing != canonical_public_url)
     {
-        config.rendezvous_urls.push(public_url.clone());
+        config.rendezvous_urls.push(canonical_public_url.clone());
     }
     config.rendezvous_registration_enabled = true;
     config.rendezvous_mtls_required = true;
@@ -1660,6 +1668,41 @@ mod tests {
                 .as_ref()
                 .map(|cfg| cfg.public_url.as_str()),
             Some("https://node-a.local:9443")
+        );
+    }
+
+    #[test]
+    fn apply_managed_rendezvous_config_deduplicates_trailing_slash_variants() {
+        let dir = temp_dir("managed-rendezvous-config-dedup");
+        let runtime_internal_dir = managed_setup_dir(&dir).join("runtime").join("internal");
+        std::fs::create_dir_all(&runtime_internal_dir).unwrap();
+        std::fs::write(runtime_internal_dir.join("cluster-ca.pem"), "cluster-ca").unwrap();
+        let rendezvous_dir = managed_rendezvous_dir(&dir);
+        std::fs::create_dir_all(&rendezvous_dir).unwrap();
+        std::fs::write(rendezvous_dir.join("rendezvous.pem"), "cert").unwrap();
+        std::fs::write(rendezvous_dir.join("rendezvous.key"), "key").unwrap();
+
+        let managed_state = ManagedSetupState {
+            managed_rendezvous_bind_addr: Some("0.0.0.0:9443".to_string()),
+            managed_rendezvous_public_url: Some("https://node-a.local:9443".to_string()),
+            ..ManagedSetupState::default()
+        };
+        let mut config = ServerNodeConfig::local_edge(
+            dir.join("data"),
+            "127.0.0.1:28080".parse::<SocketAddr>().unwrap(),
+        );
+        config
+            .rendezvous_urls
+            .push("https://node-a.local:9443/".to_string());
+
+        apply_managed_rendezvous_config(&dir, &managed_state, &mut config);
+
+        assert_eq!(
+            config.rendezvous_urls,
+            vec![
+                format!("http://{}", config.bind_addr),
+                "https://node-a.local:9443/".to_string()
+            ]
         );
     }
 

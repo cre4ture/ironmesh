@@ -1,22 +1,42 @@
 import {
+  getRendezvousConfig,
   issueBootstrapBundle,
   issueBootstrapClaim,
   issueNodeEnrollmentFromJoinRequest,
   type BootstrapBundle,
   type BootstrapClaim,
   type BootstrapClaimIssueResponse,
-  type NodeEnrollmentPackage
+  type NodeEnrollmentPackage,
+  type RendezvousConfigView
 } from "@ironmesh/api";
-import { Alert, Badge, Button, Card, Grid, Group, NumberInput, Stack, Text, TextInput, Textarea } from "@mantine/core";
+import { Alert, Badge, Button, Card, Grid, Group, NativeSelect, NumberInput, Stack, Text, TextInput, Textarea } from "@mantine/core";
 import { JsonBlock } from "@ironmesh/ui";
 import QRCode from "qrcode";
 import { useEffect, useMemo, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 
+function shouldFallbackToFullBootstrapQr(message: string): boolean {
+  return (
+    message.startsWith("HTTP 404:") ||
+    message.startsWith("HTTP 412:") ||
+    message.startsWith("HTTP 502:")
+  );
+}
+
+function normalizeRendezvousUrl(value: string): string {
+  try {
+    return new URL(value).toString();
+  } catch {
+    return value;
+  }
+}
+
 export function BootstrapBundlesPage() {
   const { adminTokenOverride } = useAdminAccess();
   const [deviceLabel, setDeviceLabel] = useState("desktop-client");
   const [expiresInSecs, setExpiresInSecs] = useState<number | string>(3600);
+  const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
+  const [selectedRendezvousUrl, setSelectedRendezvousUrl] = useState("");
   const [issuedBootstrap, setIssuedBootstrap] = useState<BootstrapClaimIssueResponse | null>(null);
   const [fallbackBootstrapBundle, setFallbackBootstrapBundle] = useState<BootstrapBundle | null>(null);
   const [bootstrapNotice, setBootstrapNotice] = useState<string | null>(null);
@@ -59,6 +79,61 @@ export function BootstrapBundlesPage() {
       return null;
     }
   })();
+  const rendezvousSelectData = useMemo(() => {
+    const managedEmbeddedUrl = rendezvousConfig?.managed_embedded_url
+      ? normalizeRendezvousUrl(rendezvousConfig.managed_embedded_url)
+      : null;
+    const endpointStatusByUrl = new Map(
+      (rendezvousConfig?.endpoint_registrations ?? []).map((endpoint) => [
+        normalizeRendezvousUrl(endpoint.url),
+        endpoint.status
+      ])
+    );
+
+    return [
+      { value: "", label: "Automatic (first successful configured rendezvous)" },
+      ...(rendezvousConfig?.effective_urls ?? []).map((url) => {
+        const normalized = normalizeRendezvousUrl(url);
+        const status = endpointStatusByUrl.get(normalized);
+        const details = [
+          normalized === managedEmbeddedUrl ? "embedded" : null,
+          status ?? null
+        ].filter((value): value is string => value !== null);
+        return {
+          value: normalized,
+          label: details.length > 0 ? `${normalized} (${details.join(", ")})` : normalized
+        };
+      })
+    ];
+  }, [rendezvousConfig]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void getRendezvousConfig(adminTokenOverride)
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+        setRendezvousConfig(payload);
+        setSelectedRendezvousUrl((current) => {
+          if (!current) {
+            return current;
+          }
+          const available = new Set(payload.effective_urls.map(normalizeRendezvousUrl));
+          return available.has(normalizeRendezvousUrl(current)) ? normalizeRendezvousUrl(current) : "";
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRendezvousConfig(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [adminTokenOverride]);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,22 +174,24 @@ export function BootstrapBundlesPage() {
     setFallbackBootstrapBundle(null);
     setBootstrapNotice(null);
     try {
+      const preferredRendezvousUrl = selectedRendezvousUrl.trim() || null;
       const request = {
         label: deviceLabel.trim() || null,
         expires_in_secs:
-          typeof expiresInSecs === "number" && Number.isFinite(expiresInSecs) ? expiresInSecs : 3600
+          typeof expiresInSecs === "number" && Number.isFinite(expiresInSecs) ? expiresInSecs : 3600,
+        preferred_rendezvous_url: preferredRendezvousUrl
       };
       try {
         const payload = await issueBootstrapClaim(request, adminTokenOverride);
         setIssuedBootstrap(payload);
       } catch (claimError) {
         const message = claimError instanceof Error ? claimError.message : String(claimError);
-        if (!message.startsWith("HTTP 404:") && !message.startsWith("HTTP 412:")) {
+        if (preferredRendezvousUrl || !shouldFallbackToFullBootstrapQr(message)) {
           throw claimError;
         }
         const fallbackBundle = await issueBootstrapBundle(request, adminTokenOverride);
         setFallbackBootstrapBundle(fallbackBundle);
-        setBootstrapNotice("Compact claim issuance is unavailable on this node, so the page fell back to a full bootstrap QR.");
+        setBootstrapNotice("Compact claim issuance is temporarily unavailable on this node, so the page fell back to a full bootstrap QR.");
       }
     } catch (issueError) {
       setError(issueError instanceof Error ? issueError.message : String(issueError));
@@ -201,6 +278,17 @@ export function BootstrapBundlesPage() {
                 value={expiresInSecs}
                 onChange={setExpiresInSecs}
               />
+              <NativeSelect
+                label="Preferred rendezvous service"
+                data={rendezvousSelectData}
+                value={selectedRendezvousUrl}
+                onChange={(event) => setSelectedRendezvousUrl(event.currentTarget.value)}
+              />
+              <Text size="sm" c="dimmed">
+                Leave this on automatic to let the node try the configured rendezvous services in order.
+                If you pick a specific rendezvous endpoint, claim publication uses only that endpoint and
+                fails instead of falling back.
+              </Text>
               <Group>
                 <Button onClick={() => void handleIssueBootstrap()} loading={pendingAction === "bootstrap"}>
                   Issue bootstrap claim
