@@ -24,6 +24,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("cell", { name: "23 B" })).toBeVisible();
   await page.getByRole("button", { name: "Read" }).first().click();
   await expect(page.getByText("hello from the mocked store")).toBeVisible();
+  const explorerDownload = page.waitForEvent("download");
+  await page.getByRole("row", { name: /docs\/readme\.txt/ }).getByRole("button", { name: "Download" }).click();
+  expect((await explorerDownload).suggestedFilename()).toBe("mock.bin");
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();
   await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();

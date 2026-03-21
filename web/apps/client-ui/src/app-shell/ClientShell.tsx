@@ -37,7 +37,7 @@ import {
 } from "@ironmesh/ui";
 import {
   deleteStoreValue,
-  downloadBinaryObject,
+  getBinaryObjectDownloadUrl,
   getClientHealth,
   getClientClusterNodes,
   getClientClusterStatus,
@@ -665,15 +665,16 @@ function StorePage() {
       return;
     }
 
-    const payload = await withAction("download-binary", () => downloadBinaryObject(key));
-    if (payload) {
-      triggerBrowserDownload(payload);
+    setPendingAction("download-binary");
+    setError(null);
+    try {
+      triggerBrowserDownloadFromUrl(getBinaryObjectDownloadUrl(key));
       setResult({
         key,
-        saved_as: payload.filename,
-        size_bytes: payload.blob.size,
-        type: payload.contentType
+        download_started: true
       });
+    } finally {
+      setPendingAction(null);
     }
   }
 
@@ -845,7 +846,7 @@ function ExplorerPage() {
       return;
     }
 
-    setLoading("read-entry");
+    setLoading(`read-entry:${entry.path}`);
     setError(null);
     try {
       const payload = await getStoreValue(entry.path, snapshotId);
@@ -855,6 +856,15 @@ function ExplorerPage() {
     } finally {
       setLoading(null);
     }
+  }
+
+  function downloadEntry(entry: StoreEntry) {
+    if (entry.entry_type === "prefix" || entry.path.endsWith("/")) {
+      return;
+    }
+
+    setError(null);
+    triggerBrowserDownloadFromUrl(getBinaryObjectDownloadUrl(entry.path, snapshotId));
   }
 
   async function loadVersions() {
@@ -979,9 +989,25 @@ function ExplorerPage() {
                           <Table.Td>{formatExplorerSize(isPrefix ? null : entry.size_bytes)}</Table.Td>
                           <Table.Td>{formatExplorerModifiedAt(entry.modified_at_unix)}</Table.Td>
                           <Table.Td>
-                            <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
-                              {isPrefix ? "Open" : "Read"}
-                            </Button>
+                            {isPrefix ? (
+                              <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
+                                Open
+                              </Button>
+                            ) : (
+                              <Group gap="xs" wrap="nowrap">
+                                <Button
+                                  size="xs"
+                                  variant="light"
+                                  loading={loading === `read-entry:${entry.path}`}
+                                  onClick={() => void readEntry(entry)}
+                                >
+                                  Read
+                                </Button>
+                                <Button size="xs" variant="default" onClick={() => downloadEntry(entry)}>
+                                  Download
+                                </Button>
+                              </Group>
+                            )}
                           </Table.Td>
                         </Table.Tr>
                       );
@@ -1326,13 +1352,10 @@ function parentPrefix(path: string): string {
   return normalized.split("/").slice(0, -1).join("/") + "/";
 }
 
-function triggerBrowserDownload(payload: { blob: Blob; filename: string }) {
-  const objectUrl = URL.createObjectURL(payload.blob);
+function triggerBrowserDownloadFromUrl(url: string) {
   const anchor = document.createElement("a");
-  anchor.href = objectUrl;
-  anchor.download = payload.filename;
+  anchor.href = url;
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(objectUrl);
 }

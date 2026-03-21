@@ -125,8 +125,27 @@ export async function putBinaryObject(key: string, file: File): Promise<StorePut
   return readJsonResponse<StorePutResponse>(response);
 }
 
-export async function downloadBinaryObject(key: string): Promise<BinaryDownloadResult> {
-  const response = await fetch(`/api/store/get-binary?key=${encodeURIComponent(key)}`);
+export function getBinaryObjectDownloadUrl(
+  key: string,
+  snapshot?: string | null,
+  version?: string | null
+): string {
+  const query = new URLSearchParams({ key });
+  if (snapshot?.trim()) {
+    query.set("snapshot", snapshot.trim());
+  }
+  if (version?.trim()) {
+    query.set("version", version.trim());
+  }
+  return `/api/store/get-binary?${query.toString()}`;
+}
+
+export async function downloadBinaryObject(
+  key: string,
+  snapshot?: string | null,
+  version?: string | null
+): Promise<BinaryDownloadResult> {
+  const response = await fetch(getBinaryObjectDownloadUrl(key, snapshot, version));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
