@@ -1,15 +1,21 @@
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Certificate;
 use reqwest::Client;
+use reqwest::ClientBuilder;
 use reqwest::Url;
 use reqwest::blocking::Client as BlockingClient;
+use reqwest::blocking::ClientBuilder as BlockingClientBuilder;
+use std::collections::HashSet;
 use std::fs;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use std::time::Duration;
 use transport_sdk::{ClientIdentityMaterial, RendezvousClientConfig};
 
 use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
 
 const RELAY_REQUEST_BASE_URL: &str = "https://relay.invalid/";
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn load_root_certificate(path: &Path) -> Result<Certificate> {
     let pem = fs::read(path)
@@ -23,7 +29,7 @@ pub fn load_root_certificate_pem(pem: &str) -> Result<Certificate> {
 }
 
 pub fn build_reqwest_client_from_pem(server_ca_pem: Option<&str>) -> Result<Client> {
-    let builder = Client::builder();
+    let builder = configure_reqwest_client_builder(Client::builder());
     let builder = if let Some(pem) = server_ca_pem {
         builder.add_root_certificate(load_root_certificate_pem(pem)?)
     } else {
@@ -32,15 +38,45 @@ pub fn build_reqwest_client_from_pem(server_ca_pem: Option<&str>) -> Result<Clie
     builder.build().context("failed building HTTP client")
 }
 
-pub fn build_blocking_reqwest_client_from_pem(
+pub fn build_reqwest_client_from_pem_for_url(
     server_ca_pem: Option<&str>,
-) -> Result<BlockingClient> {
-    let builder = BlockingClient::builder();
+    url: &Url,
+) -> Result<Client> {
+    let builder = configure_reqwest_client_builder(Client::builder());
     let builder = if let Some(pem) = server_ca_pem {
         builder.add_root_certificate(load_root_certificate_pem(pem)?)
     } else {
         builder
     };
+    let builder = apply_best_effort_url_resolution(builder, url);
+    builder.build().context("failed building HTTP client")
+}
+
+pub fn build_blocking_reqwest_client_from_pem(
+    server_ca_pem: Option<&str>,
+) -> Result<BlockingClient> {
+    let builder = configure_blocking_reqwest_client_builder(BlockingClient::builder());
+    let builder = if let Some(pem) = server_ca_pem {
+        builder.add_root_certificate(load_root_certificate_pem(pem)?)
+    } else {
+        builder
+    };
+    builder
+        .build()
+        .context("failed building blocking HTTP client")
+}
+
+pub fn build_blocking_reqwest_client_from_pem_for_url(
+    server_ca_pem: Option<&str>,
+    url: &Url,
+) -> Result<BlockingClient> {
+    let builder = configure_blocking_reqwest_client_builder(BlockingClient::builder());
+    let builder = if let Some(pem) = server_ca_pem {
+        builder.add_root_certificate(load_root_certificate_pem(pem)?)
+    } else {
+        builder
+    };
+    let builder = apply_best_effort_url_resolution_blocking(builder, url);
     builder
         .build()
         .context("failed building blocking HTTP client")
@@ -52,7 +88,7 @@ pub fn build_http_client_from_pem(
 ) -> Result<IronMeshClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
-    let http = build_reqwest_client_from_pem(server_ca_pem)?;
+    let http = build_reqwest_client_from_pem_for_url(server_ca_pem, &base_url)?;
 
     Ok(IronMeshClient::from_direct_http_client(
         base_url.as_str(),
@@ -67,7 +103,7 @@ pub fn build_http_client_with_identity_from_pem(
 ) -> Result<IronMeshClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
-    let http = build_reqwest_client_from_pem(server_ca_pem)?;
+    let http = build_reqwest_client_from_pem_for_url(server_ca_pem, &base_url)?;
     Ok(
         IronMeshClient::from_direct_http_client(base_url.as_str(), http)
             .with_client_identity(identity.clone()),
@@ -154,10 +190,77 @@ pub fn build_blocking_http_client(server_ca_cert: Option<&Path>) -> Result<Block
     build_blocking_reqwest_client_from_pem(server_ca_pem.as_deref())
 }
 
+fn configure_reqwest_client_builder(builder: ClientBuilder) -> ClientBuilder {
+    // Keep connection attempts short so clients can fail over quickly when a
+    // hostname publishes an unreachable IPv6 address ahead of a working IPv4 one.
+    builder.connect_timeout(HTTP_CONNECT_TIMEOUT)
+}
+
+fn configure_blocking_reqwest_client_builder(
+    builder: BlockingClientBuilder,
+) -> BlockingClientBuilder {
+    builder.connect_timeout(HTTP_CONNECT_TIMEOUT)
+}
+
+fn apply_best_effort_url_resolution(builder: ClientBuilder, url: &Url) -> ClientBuilder {
+    if let Some((host, addrs)) = preferred_socket_addrs_for_url(url) {
+        builder.resolve_to_addrs(&host, &addrs)
+    } else {
+        builder
+    }
+}
+
+fn apply_best_effort_url_resolution_blocking(
+    builder: BlockingClientBuilder,
+    url: &Url,
+) -> BlockingClientBuilder {
+    if let Some((host, addrs)) = preferred_socket_addrs_for_url(url) {
+        builder.resolve_to_addrs(&host, &addrs)
+    } else {
+        builder
+    }
+}
+
+fn preferred_socket_addrs_for_url(url: &Url) -> Option<(String, Vec<SocketAddr>)> {
+    let host = url.host_str()?.trim();
+    if host.is_empty() || host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    let addrs = (host, port).to_socket_addrs().ok()?;
+    let addrs = prioritize_socket_addrs(addrs);
+    if addrs.is_empty() {
+        None
+    } else {
+        Some((host.to_string(), addrs))
+    }
+}
+
+fn prioritize_socket_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+
+    for addr in addrs {
+        if !seen.insert(addr) {
+            continue;
+        }
+        if addr.is_ipv4() {
+            ipv4.push(addr);
+        } else {
+            ipv6.push(addr);
+        }
+    }
+
+    ipv4.extend(ipv6);
+    ipv4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::NodeId;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use transport_sdk::RelayMode;
     use transport_sdk::TransportPathKind;
     use uuid::Uuid;
@@ -194,6 +297,14 @@ mod tests {
                 .to_string()
                 .contains("failed to parse server base URL")
         );
+    }
+
+    #[test]
+    fn prioritize_socket_addrs_prefers_ipv4_and_deduplicates() {
+        let ipv6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 443));
+        let ipv4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 443));
+        let prioritized = prioritize_socket_addrs([ipv6, ipv4, ipv6, ipv4]);
+        assert_eq!(prioritized, vec![ipv4, ipv6]);
     }
 
     #[test]

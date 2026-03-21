@@ -12,10 +12,11 @@ pub use bootstrap::{
 };
 pub use client_node::ClientNode;
 pub use connection::{
-    build_blocking_http_client, build_blocking_reqwest_client_from_pem, build_http_client,
-    build_http_client_from_pem, build_http_client_with_identity,
-    build_http_client_with_identity_from_pem, build_http_client_with_identity_from_planned_target,
-    build_reqwest_client_from_pem, load_root_certificate, load_root_certificate_pem,
+    build_blocking_http_client, build_blocking_reqwest_client_from_pem,
+    build_blocking_reqwest_client_from_pem_for_url, build_http_client, build_http_client_from_pem,
+    build_http_client_with_identity, build_http_client_with_identity_from_pem,
+    build_http_client_with_identity_from_planned_target, build_reqwest_client_from_pem,
+    build_reqwest_client_from_pem_for_url, load_root_certificate, load_root_certificate_pem,
 };
 pub use content_addressed_client_cache::ContentAddressedClientCache;
 pub use device_auth::{

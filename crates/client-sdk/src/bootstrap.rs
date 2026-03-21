@@ -16,7 +16,7 @@ use transport_sdk::{
 };
 
 use crate::connection::{
-    build_blocking_reqwest_client_from_pem, build_http_client_from_pem,
+    build_blocking_reqwest_client_from_pem_for_url, build_http_client_from_pem,
     build_http_client_with_identity_from_planned_target,
 };
 use crate::device_auth::{
@@ -646,16 +646,17 @@ pub fn enroll_bootstrap_claim_blocking(
                 claim.rendezvous_url
             )
         })?;
-    let response = build_blocking_reqwest_client_from_pem(Some(&rendezvous_ca_pem))?
-        .post(redeem_url)
-        .json(&ClientBootstrapClaimRedeemRequest {
-            claim_token: claim.claim_token.clone(),
-            device_id: Some(identity.device_id.to_string()),
-            label,
-            public_key_pem: identity.public_key_pem.clone(),
-        })
-        .send()
-        .context("failed to call /bootstrap-claims/redeem")?;
+    let response =
+        build_blocking_reqwest_client_from_pem_for_url(Some(&rendezvous_ca_pem), &redeem_url)?
+            .post(redeem_url)
+            .json(&ClientBootstrapClaimRedeemRequest {
+                claim_token: claim.claim_token.clone(),
+                device_id: Some(identity.device_id.to_string()),
+                label,
+                public_key_pem: identity.public_key_pem.clone(),
+            })
+            .send()
+            .context("failed to call /bootstrap-claims/redeem")?;
     let status = response.status();
     let body = response
         .text()
@@ -713,11 +714,12 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
         .with_context(|| format!("failed to build health URL from {endpoint}"))?;
 
     let probe_client = if endpoint.scheme() == "https" {
-        build_blocking_reqwest_client_from_pem(
+        build_blocking_reqwest_client_from_pem_for_url(
             target
                 .server_ca_pem
                 .as_deref()
                 .or(target.cluster_ca_pem.as_deref()),
+            &health_url,
         )
         .context("failed building bootstrap trusted client")?
     } else {

@@ -1,14 +1,15 @@
 use anyhow::{Context, Result, anyhow, bail};
 use common::ClusterId;
-use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::Path;
 use transport_sdk::IssuedClientIdentity;
 
 use crate::connection::{
-    build_blocking_http_client, build_blocking_reqwest_client_from_pem, load_root_certificate,
+    build_blocking_http_client, build_blocking_reqwest_client_from_pem_for_url,
+    build_reqwest_client_from_pem_for_url,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,14 +63,19 @@ pub async fn enroll_device(
     let enroll_url = base_url
         .join("auth/device/enroll")
         .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
-    let mut builder = Client::builder();
-    if let Some(ca_cert_path) = server_ca_cert {
-        builder = builder.add_root_certificate(load_root_certificate(ca_cert_path)?);
+    let server_ca_pem = if let Some(ca_cert_path) = server_ca_cert {
+        Some(fs::read_to_string(ca_cert_path).with_context(|| {
+            format!(
+                "failed to read server CA certificate {}",
+                ca_cert_path.display()
+            )
+        })?)
     } else if base_url.scheme() == "https" {
         bail!("server-ca-cert needed for HTTPS server");
-    }
-    let response = builder
-        .build()?
+    } else {
+        None
+    };
+    let response = build_reqwest_client_from_pem_for_url(server_ca_pem.as_deref(), &enroll_url)?
         .post(enroll_url)
         .json(request)
         .send()
@@ -86,7 +92,17 @@ pub fn enroll_device_blocking(
     let enroll_url = base_url
         .join("auth/device/enroll")
         .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
-    let client = build_blocking_http_client(server_ca_cert)?;
+    let client = if let Some(ca_cert_path) = server_ca_cert {
+        let server_ca_pem = fs::read_to_string(ca_cert_path).with_context(|| {
+            format!(
+                "failed to read server CA certificate {}",
+                ca_cert_path.display()
+            )
+        })?;
+        build_blocking_reqwest_client_from_pem_for_url(Some(&server_ca_pem), &enroll_url)?
+    } else {
+        build_blocking_http_client(server_ca_cert)?
+    };
     let response = client
         .post(enroll_url)
         .json(request)
@@ -107,7 +123,7 @@ pub fn enroll_device_blocking_from_pem(
     let enroll_url = base_url
         .join("auth/device/enroll")
         .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
-    let client = build_blocking_reqwest_client_from_pem(server_ca_pem)?;
+    let client = build_blocking_reqwest_client_from_pem_for_url(server_ca_pem, &enroll_url)?;
     let response = client
         .post(enroll_url)
         .json(request)

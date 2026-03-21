@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    IronMeshClient, build_reqwest_client_from_pem, build_signed_request_headers,
+    IronMeshClient, build_reqwest_client_from_pem_for_url, build_signed_request_headers,
     enroll_connection_input_blocking,
 };
 use jni::JNIEnv;
@@ -1085,7 +1085,10 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let target = base
             .join(&relative_url)
             .with_context(|| format!("failed to resolve relative URL {relative_url}"))?;
-        let client = build_reqwest_client_from_pem(resolved_target.server_ca_pem.as_deref())?;
+        let client = build_reqwest_client_from_pem_for_url(
+            resolved_target.server_ca_pem.as_deref(),
+            &target,
+        )?;
         let client_identity = parse_client_identity_json(client_identity_json)?;
         let mut request = client.get(target.clone());
         if let Some(identity) = client_identity.as_ref() {
