@@ -638,7 +638,7 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
 
     assert_eq!(
         bootstrap.rendezvous_urls,
-        vec!["https://rendezvous.example".to_string()]
+        vec!["https://rendezvous.example/".to_string()]
     );
     assert!(bootstrap.rendezvous_mtls_required);
     assert_eq!(
@@ -1326,7 +1326,7 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
     assert_eq!(bootstrap.cluster_id, state.cluster_id);
     assert_eq!(
         bootstrap.rendezvous_urls,
-        vec!["https://rendezvous.example".to_string()]
+        vec!["https://rendezvous.example/".to_string()]
     );
     assert!(bootstrap.rendezvous_mtls_required);
     assert_eq!(bootstrap.relay_mode, transport_sdk::RelayMode::Required);

@@ -1657,7 +1657,7 @@ mod tests {
             config.rendezvous_urls,
             vec![
                 format!("http://{}", config.bind_addr),
-                "https://node-a.local:9443".to_string()
+                "https://node-a.local:9443/".to_string()
             ]
         );
         assert!(config.rendezvous_registration_enabled);

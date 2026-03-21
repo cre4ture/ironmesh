@@ -965,7 +965,7 @@ mod tests {
         )
         .await?;
 
-        let base_a = format!("https://{bind_a}");
+        let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let client = reqwest::Client::new();
 
@@ -1025,7 +1025,7 @@ mod tests {
         )
         .await?;
 
-        let base_a = format!("https://{bind_a}");
+        let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let client = reqwest::Client::new();
 
@@ -1104,7 +1104,7 @@ mod tests {
         )
         .await?;
 
-        let base_a = format!("https://{bind_a}");
+        let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let client = reqwest::Client::new();
 
