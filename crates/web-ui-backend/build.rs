@@ -10,6 +10,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
     let web_workspace_dir =
         canonicalize_or_fallback(manifest_dir.join("..").join("..").join("web"));
+    let generated_dist_dir = out_dir.join("client-ui-dist");
     let mut client_ui_dist_candidates = client_ui_dist_candidates(&web_workspace_dir);
 
     println!("cargo:rerun-if-changed=build.rs");
@@ -154,14 +155,15 @@ fn main() {
     let generated_index = out_dir.join("client_ui_index.html");
     let generated_css = out_dir.join("client_ui_app.css");
     let generated_js = out_dir.join("client_ui_app.js");
-    run_frontend_build(&web_workspace_dir);
+    run_frontend_build(&web_workspace_dir, &generated_dist_dir);
 
+    client_ui_dist_candidates.insert(0, generated_dist_dir.clone());
     client_ui_dist_candidates.extend(discover_dist_dirs(&web_workspace_dir));
     client_ui_dist_candidates.sort();
     client_ui_dist_candidates.dedup();
     let client_ui_dist_dir = locate_dist_dir(&client_ui_dist_candidates).unwrap_or_else(|| {
         panic!(
-            "failed locating built client-ui dist after `pnpm --filter @ironmesh/client-ui build`; checked: {}",
+            "failed locating built client-ui dist after frontend build; checked: {}",
             format_path_list(&client_ui_dist_candidates)
         )
     });
@@ -281,7 +283,7 @@ fn format_path_list(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn run_frontend_build(web_workspace_dir: &Path) {
+fn run_frontend_build(web_workspace_dir: &Path, generated_dist_dir: &Path) {
     if !web_workspace_dir.exists() {
         panic!(
             "frontend workspace missing at {}. The client-ui must be built during cargo builds.",
@@ -289,18 +291,39 @@ fn run_frontend_build(web_workspace_dir: &Path) {
         );
     }
 
-    let status = run_pnpm_command(web_workspace_dir, &["--filter", "@ironmesh/client-ui", "build"])
-        .unwrap_or_else(|error| {
+    if generated_dist_dir.exists() {
+        fs::remove_dir_all(generated_dist_dir).unwrap_or_else(|error| {
             panic!(
-                "failed to execute `pnpm --filter @ironmesh/client-ui build` in {}: {error}. Install Node.js and pnpm, then ensure `pnpm` is on PATH.",
-                web_workspace_dir.display()
+                "failed cleaning generated client-ui dist {} before rebuild: {error}",
+                generated_dist_dir.display()
             )
         });
+    }
+
+    let generated_dist_arg = generated_dist_dir.to_string_lossy().into_owned();
+    let args = [
+        "--filter",
+        "@ironmesh/client-ui",
+        "exec",
+        "vite",
+        "build",
+        "--outDir",
+        generated_dist_arg.as_str(),
+    ];
+
+    let status = run_pnpm_command(web_workspace_dir, &args).unwrap_or_else(|error| {
+        panic!(
+            "failed to execute `pnpm --filter @ironmesh/client-ui exec vite build --outDir {}` in {}: {error}. Install Node.js and pnpm, then ensure `pnpm` is on PATH.",
+            generated_dist_dir.display(),
+            web_workspace_dir.display()
+        )
+    });
 
     if !status.success() {
         panic!(
-            "`pnpm --filter @ironmesh/client-ui build` failed in {}. Fix the frontend build before running cargo again.",
-            web_workspace_dir.display()
+            "frontend build failed in {} while generating {}. Fix the client-ui build before running cargo again.",
+            web_workspace_dir.display(),
+            generated_dist_dir.display()
         );
     }
 }
