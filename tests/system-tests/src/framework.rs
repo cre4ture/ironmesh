@@ -236,6 +236,7 @@ impl Drop for ChildGuard {
     }
 }
 
+#[allow(dead_code)]
 pub async fn start_server(bind: &str) -> Result<ChildGuard> {
     let data_dir = fresh_data_dir("default-server");
     start_server_with_data_dir(bind, &data_dir).await

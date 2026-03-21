@@ -11,26 +11,56 @@ mod tests {
     use crate::framework::*;
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
-    use client_sdk::IronMeshClient;
     use reqwest::StatusCode;
     use tokio::time::sleep;
+    use uuid::Uuid;
+
+    async fn start_authenticated_cluster_test_client(
+        bind: &str,
+        server_name: &str,
+        client_name: &str,
+    ) -> Result<(crate::framework::ChildGuard, EnrolledTestClient)> {
+        let data_dir = fresh_data_dir(server_name);
+        let client_dir = fresh_data_dir(client_name);
+        let node_id = Uuid::new_v4().to_string();
+        let server = start_authenticated_server(bind, &data_dir, &node_id, 1).await?;
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+        let enrolled = issue_bootstrap_bundle_and_enroll_client(
+            &http,
+            &base_url,
+            TEST_ADMIN_TOKEN,
+            &client_dir,
+            "cluster.bootstrap.json",
+            Some(client_name),
+            Some(3600),
+        )
+        .await?;
+        Ok((server, enrolled))
+    }
 
     #[tokio::test]
     async fn cli_put_then_get_against_live_server() -> Result<()> {
         let bind = "127.0.0.1:19081";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_cluster_test_client(
+            bind,
+            "cluster-cli-roundtrip-server",
+            "cluster-cli-roundtrip-client",
+        )
+        .await?;
+        let bootstrap_path = enrolled.bootstrap_path.to_string_lossy().to_string();
 
         run_cli(&[
-            "--server-url",
-            &base_url,
+            "--bootstrap-file",
+            &bootstrap_path,
             "put",
             "cli-roundtrip",
             "hello-from-cli",
         ])
         .await?;
 
-        let output = run_cli(&["--server-url", &base_url, "get", "cli-roundtrip"]).await?;
+        let output =
+            run_cli(&["--bootstrap-file", &bootstrap_path, "get", "cli-roundtrip"]).await?;
         assert!(output.contains("hello-from-cli"));
 
         stop_server(&mut server).await;
@@ -1748,9 +1778,13 @@ mod tests {
     #[tokio::test]
     async fn recursive_directory_delete_query_removes_remote_subtree() -> Result<()> {
         let bind = "127.0.0.1:19146";
-        let base_url = format!("http://{bind}");
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
-        let mut server = start_server(bind).await?;
+        let (mut server, enrolled) = start_authenticated_cluster_test_client(
+            bind,
+            "cluster-recursive-delete-server",
+            "cluster-recursive-delete-client",
+        )
+        .await?;
+        let sdk = enrolled.build_client_async().await?;
 
         let result = async {
             for (key, payload) in [
