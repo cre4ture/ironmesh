@@ -798,10 +798,14 @@ function ExplorerPage() {
   const [sortDirection, setSortDirection] = useState<ExplorerSortDirection>("asc");
 
   const sortedEntries = useMemo(() => {
-    const entries = [...(entriesPayload?.entries ?? [])];
-    entries.sort((left, right) => compareExplorerEntries(left, right, sortField, sortDirection));
+    const entries = (entriesPayload?.entries ?? []).filter((entry) =>
+      shouldDisplayExplorerEntry(entry, prefix)
+    );
+    entries.sort((left, right) =>
+      compareExplorerEntries(left, right, sortField, sortDirection, prefix)
+    );
     return entries;
-  }, [entriesPayload, sortDirection, sortField]);
+  }, [entriesPayload, prefix, sortDirection, sortField]);
 
   useEffect(() => {
     void refreshSnapshots();
@@ -991,10 +995,11 @@ function ExplorerPage() {
                   <Table.Tbody>
                     {sortedEntries.map((entry) => {
                       const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+                      const displayPath = explorerDisplayPath(entry, prefix);
                       return (
                         <Table.Tr key={entry.path}>
                           <Table.Td>
-                            <Code>{entry.path}</Code>
+                            <Code>{displayPath}</Code>
                           </Table.Td>
                           <Table.Td>{isPrefix ? "prefix" : entry.entry_type}</Table.Td>
                           <Table.Td>{formatExplorerSize(isPrefix ? null : entry.size_bytes)}</Table.Td>
@@ -1254,20 +1259,23 @@ function compareExplorerEntries(
   left: StoreEntry,
   right: StoreEntry,
   field: ExplorerSortField,
-  direction: ExplorerSortDirection
+  direction: ExplorerSortDirection,
+  prefix: string
 ): number {
   const leftIsPrefix = left.entry_type === "prefix" || left.path.endsWith("/");
   const rightIsPrefix = right.entry_type === "prefix" || right.path.endsWith("/");
+  const leftDisplayPath = explorerDisplayPath(left, prefix);
+  const rightDisplayPath = explorerDisplayPath(right, prefix);
 
   let result = 0;
   switch (field) {
     case "path":
-      result = left.path.localeCompare(right.path);
+      result = leftDisplayPath.localeCompare(rightDisplayPath);
       break;
     case "type":
       result = normalizeExplorerType(left).localeCompare(normalizeExplorerType(right));
       if (result === 0) {
-        result = left.path.localeCompare(right.path);
+        result = leftDisplayPath.localeCompare(rightDisplayPath);
       }
       break;
     case "size":
@@ -1277,13 +1285,13 @@ function compareExplorerEntries(
         direction
       );
       if (result === 0) {
-        result = left.path.localeCompare(right.path);
+        result = leftDisplayPath.localeCompare(rightDisplayPath);
       }
       break;
     case "modified":
       result = compareNullableNumbers(left.modified_at_unix, right.modified_at_unix, direction);
       if (result === 0) {
-        result = left.path.localeCompare(right.path);
+        result = leftDisplayPath.localeCompare(rightDisplayPath);
       }
       break;
   }
@@ -1293,6 +1301,62 @@ function compareExplorerEntries(
     : direction === "asc"
       ? result
       : -result;
+}
+
+function shouldDisplayExplorerEntry(entry: StoreEntry, prefix: string): boolean {
+  const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+  const normalizedPrefix = normalizeExplorerPrefix(prefix);
+  if (!normalizedPrefix) {
+    return true;
+  }
+
+  const normalizedPath = normalizeExplorerPath(entry.path, isPrefix);
+  if (!normalizedPath) {
+    return false;
+  }
+  if (normalizedPath === normalizedPrefix) {
+    return false;
+  }
+  if (isPrefix && normalizedPrefix.startsWith(normalizedPath)) {
+    return false;
+  }
+  if (!normalizedPath.startsWith(normalizedPrefix)) {
+    return false;
+  }
+
+  return normalizedPath.slice(normalizedPrefix.length).length > 0;
+}
+
+function explorerDisplayPath(entry: StoreEntry, prefix: string): string {
+  const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+  const normalizedPrefix = normalizeExplorerPrefix(prefix);
+  const normalizedPath = normalizeExplorerPath(entry.path, isPrefix);
+
+  if (!normalizedPrefix || !normalizedPath.startsWith(normalizedPrefix)) {
+    return normalizedPath || entry.path;
+  }
+
+  const relativePath = normalizedPath.slice(normalizedPrefix.length);
+  return relativePath || normalizedPath;
+}
+
+function normalizeExplorerPrefix(prefix: string): string {
+  const trimmed = prefix.trim().replace(/^\/+/, "");
+  if (!trimmed) {
+    return "";
+  }
+  return `${trimmed.replace(/\/+$/, "")}/`;
+}
+
+function normalizeExplorerPath(path: string, isPrefix: boolean): string {
+  const trimmed = path.trim().replace(/^\/+/, "");
+  if (!trimmed) {
+    return "";
+  }
+  if (isPrefix || trimmed.endsWith("/")) {
+    return `${trimmed.replace(/\/+$/, "")}/`;
+  }
+  return trimmed;
 }
 
 function compareNullableNumbers(

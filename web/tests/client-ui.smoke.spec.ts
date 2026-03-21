@@ -27,6 +27,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   const explorerDownload = page.waitForEvent("download");
   await page.getByRole("row", { name: /docs\/readme\.txt/ }).getByRole("button", { name: "Download" }).click();
   expect((await explorerDownload).suggestedFilename()).toBe("mock.bin");
+  await page.getByRole("row", { name: /^docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
+  await expect(page.getByRole("cell", { name: "readme.txt" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "nested/" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "docs/" })).toHaveCount(0);
+  await expect(page.getByRole("cell", { name: "gallery/" })).toHaveCount(0);
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();
   await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();
@@ -110,11 +115,31 @@ async function installClientUiMocks(page: Page) {
 
     if (pathname === "/api/store/list" && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
+      const prefix = searchParams.get("prefix") ?? "";
+      if (prefix === "docs/") {
+        return json(route, {
+          prefix,
+          depth: Number(searchParams.get("depth") ?? "1"),
+          entry_count: 4,
+          entries: [
+            { path: "docs/", entry_type: "prefix" },
+            {
+              path: "docs/readme.txt",
+              entry_type: "key",
+              size_bytes: 23,
+              modified_at_unix: 1_712_345_600
+            },
+            { path: "docs/nested/", entry_type: "prefix" },
+            { path: "gallery/", entry_type: "prefix" }
+          ]
+        });
+      }
       return json(route, {
-        prefix: searchParams.get("prefix") ?? "",
+        prefix,
         depth: Number(searchParams.get("depth") ?? "1"),
-        entry_count: 4,
+        entry_count: 5,
         entries: [
+          { path: "docs/", entry_type: "prefix" },
           {
             path: "docs/readme.txt",
             entry_type: "key",
