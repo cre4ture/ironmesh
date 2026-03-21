@@ -1,5 +1,6 @@
 import {
   getClusterNodes,
+  getRendezvousConfig,
   getClusterSummary,
   getRecentLogs,
   getReplicationPlan,
@@ -7,6 +8,7 @@ import {
   type ClusterSummary,
   type LogsResponse,
   type NodeDescriptor,
+  type RendezvousConfigView,
   type ReplicationPlan
 } from "@ironmesh/api";
 import {
@@ -14,6 +16,7 @@ import {
   Badge,
   Button,
   Card,
+  Code,
   Divider,
   Grid,
   Group,
@@ -26,16 +29,21 @@ import {
 import { JsonBlock, StatCard } from "@ironmesh/ui";
 import { useCallback, useEffect, useState } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
+import { useAdminAccess } from "../lib/admin-access";
 
 export function DashboardPage() {
+  const { adminTokenOverride, sessionStatus } = useAdminAccess();
   const [clusterSummary, setClusterSummary] = useState<ClusterSummary | null>(null);
   const [nodes, setNodes] = useState<NodeDescriptor[]>([]);
   const [replicationPlan, setReplicationPlan] = useState<ReplicationPlan | null>(null);
+  const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
   const [logs, setLogs] = useState<LogsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [repairResult, setRepairResult] = useState<Record<string, unknown> | null>(null);
   const [repairPending, setRepairPending] = useState(false);
+  const canInspectRendezvous =
+    Boolean(adminTokenOverride.trim()) || Boolean(sessionStatus?.authenticated);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -51,12 +59,21 @@ export function DashboardPage() {
       setNodes(nodeList);
       setReplicationPlan(plan);
       setLogs(recentLogs);
+      if (canInspectRendezvous) {
+        try {
+          setRendezvousConfig(await getRendezvousConfig(adminTokenOverride));
+        } catch {
+          setRendezvousConfig(null);
+        }
+      } else {
+        setRendezvousConfig(null);
+      }
     } catch (refreshError) {
       setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [adminTokenOverride, canInspectRendezvous]);
 
   useEffect(() => {
     void refresh();
@@ -75,6 +92,12 @@ export function DashboardPage() {
       setRepairPending(false);
     }
   }
+
+  const localNode = clusterSummary
+    ? nodes.find((node) => node.node_id === clusterSummary.local_node_id) ?? null
+    : null;
+  const connectedRendezvousEndpoints =
+    rendezvousConfig?.endpoint_registrations.filter((endpoint) => endpoint.status === "connected") ?? [];
 
   return (
     <Stack gap="lg">
@@ -146,6 +169,77 @@ export function DashboardPage() {
       </Grid>
 
       <Grid>
+        <Grid.Col span={{ base: 12, xl: 6 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>This node</Text>
+              <Group gap="sm">
+                <Badge variant="light">
+                  {clusterSummary?.local_node_id ?? (loading ? "loading" : "unknown")}
+                </Badge>
+                <Badge
+                  color={localNode?.reachability.relay_required ? "teal" : "blue"}
+                  variant="light"
+                >
+                  {localNode?.reachability.relay_required ? "relay-required" : "direct-capable"}
+                </Badge>
+              </Group>
+              <Text size="sm">
+                Public API: <Code>{localNode?.reachability.public_api_url ?? "not advertised"}</Code>
+              </Text>
+              <Text size="sm">
+                Peer API: <Code>{localNode?.reachability.peer_api_url ?? "not advertised"}</Code>
+              </Text>
+              <Text size="sm" c="dimmed">
+                The admin UI itself is served directly by this node.
+              </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, xl: 6 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>Rendezvous participation</Text>
+              <Group gap="sm">
+                <Badge
+                  color={rendezvousConfig?.registration_enabled ? "teal" : "gray"}
+                  variant="light"
+                >
+                  {rendezvousConfig?.registration_enabled ? "registration enabled" : "registration disabled"}
+                </Badge>
+                <Badge
+                  color={connectedRendezvousEndpoints.length > 0 ? "green" : "gray"}
+                  variant="light"
+                >
+                  {rendezvousConfig
+                    ? `${connectedRendezvousEndpoints.length}/${rendezvousConfig.endpoint_registrations.length} connected`
+                    : loading
+                      ? "loading"
+                      : "unknown"}
+                </Badge>
+              </Group>
+              <Text size="sm">
+                Embedded listener: <Code>{rendezvousConfig?.managed_embedded_url ?? "not hosted here"}</Code>
+              </Text>
+              <Text size="sm">
+                Connected rendezvous:{" "}
+                <Code>
+                  {connectedRendezvousEndpoints[0]?.url ??
+                    rendezvousConfig?.effective_urls[0] ??
+                    "none configured"}
+                </Code>
+              </Text>
+              {!canInspectRendezvous ? (
+                <Text size="sm" c="dimmed">
+                  Sign in or provide an admin token override to inspect the live rendezvous registration details here.
+                </Text>
+              ) : null}
+              <Text size="sm" c="dimmed">
+                Full rendezvous URL editing and failover workflows remain on the Control Plane page.
+              </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
         <Grid.Col span={{ base: 12, xl: 7 }}>
           <Card withBorder radius="md" padding="lg">
             <Stack gap="md">

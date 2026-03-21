@@ -29,6 +29,8 @@ export type ClientRendezvousView = {
   transport_mode: "direct" | "relay";
   relay_mode: "disabled" | "fallback" | "preferred" | "required" | null;
   configured_urls: string[];
+  direct_url: string | null;
+  direct_target_node_id: string | null;
   active_url: string | null;
   active_target_node_id: string | null;
   mtls_required: boolean;

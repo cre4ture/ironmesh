@@ -290,6 +290,8 @@ struct WebClientRendezvousView {
     transport_mode: &'static str,
     relay_mode: Option<RelayMode>,
     configured_urls: Vec<String>,
+    direct_url: Option<String>,
+    direct_target_node_id: Option<String>,
     active_url: Option<String>,
     active_target_node_id: Option<String>,
     mtls_required: bool,
@@ -335,6 +337,10 @@ fn normalize_rendezvous_urls(urls: &[String]) -> Vec<String> {
         normalized.push(trimmed.to_string());
     }
     normalized
+}
+
+fn normalize_runtime_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
 }
 
 fn endpoint_status_label(state: &RendezvousEndpointConnectionState) -> &'static str {
@@ -425,6 +431,22 @@ async fn build_rendezvous_view(state: &WebState) -> WebClientRendezvousView {
     let active_url = relay_runtime_state
         .as_ref()
         .and_then(|snapshot| snapshot.active_url.clone());
+    let direct_url = runtime
+        .sdk
+        .direct_server_base_url()
+        .map(normalize_runtime_url);
+    let direct_target_node_id = runtime.rendezvous.as_ref().and_then(|config| {
+        let direct_url = direct_url.as_ref()?;
+        config
+            .bootstrap
+            .direct_endpoints
+            .iter()
+            .find_map(|endpoint| {
+                (normalize_runtime_url(&endpoint.url) == *direct_url)
+                    .then(|| endpoint.node_id.map(|node_id| node_id.to_string()))
+                    .flatten()
+            })
+    });
     let endpoint_statuses = relay_runtime_state
         .map(|snapshot| map_endpoint_statuses(snapshot.endpoint_statuses))
         .unwrap_or_else(|| map_endpoint_statuses(runtime.last_rendezvous_probe_statuses.clone()));
@@ -435,6 +457,8 @@ async fn build_rendezvous_view(state: &WebState) -> WebClientRendezvousView {
         transport_mode,
         relay_mode,
         configured_urls,
+        direct_url,
+        direct_target_node_id,
         active_url,
         active_target_node_id: runtime
             .sdk

@@ -8,12 +8,22 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   await expect(page.getByRole("cell", { name: "node-alpha", exact: true })).toBeVisible();
   await expect(page.getByText("runtime ready")).toBeVisible();
+  await expect(page.getByText("This node", { exact: true })).toBeVisible();
+  await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
+  await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
+  await expect(page.getByText("Sign in or provide an admin token override to inspect the live rendezvous registration details here.")).toBeVisible();
 
   await page.getByRole("button", { name: "Admin Access" }).click();
   await page.getByLabel("Admin password").fill("hunter2-harder");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
+  await expect(
+    page
+      .getByRole("paragraph")
+      .filter({ hasText: "Embedded listener: https://embedded-rendezvous.local:9443" })
+      .getByRole("code")
+  ).toBeVisible();
 
   await page.getByText("Provisioning", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
@@ -52,7 +62,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
 
   await page.getByText("Control Plane", { exact: true }).click();
-  await expect(page.getByText("embedded-rendezvous.local:9443")).toBeVisible();
+  await expect(page.getByText("https://embedded-rendezvous.local:9443", { exact: true })).toBeVisible();
   await page
     .getByRole("textbox", { name: "Editable operator-managed URLs" })
     .fill("https://rendezvous-a.local:9443\nhttps://rendezvous-b.local:9443");
@@ -177,6 +187,26 @@ async function installServerAdminMocks(
     editable_urls: ["https://rendezvous-a.local:9443"],
     managed_embedded_url: "https://embedded-rendezvous.local:9443",
     registration_enabled: true,
+    registration_interval_secs: 30,
+    disconnected_retry_interval_secs: 5,
+    endpoint_registrations: [
+      {
+        url: "https://embedded-rendezvous.local:9443",
+        status: "connected",
+        last_attempt_unix: 1_900_000_000,
+        last_success_unix: 1_900_000_000,
+        consecutive_failures: 0,
+        last_error: null
+      },
+      {
+        url: "https://rendezvous-a.local:9443",
+        status: "connected",
+        last_attempt_unix: 1_900_000_010,
+        last_success_unix: 1_900_000_010,
+        consecutive_failures: 0,
+        last_error: null
+      }
+    ],
     mtls_required: true,
     persistence_source: "node_enrollment",
     persisted: true

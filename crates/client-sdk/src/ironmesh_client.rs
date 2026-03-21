@@ -239,6 +239,15 @@ impl IronMeshClient {
         }
     }
 
+    pub fn direct_server_base_url(&self) -> Option<&str> {
+        match &self.transport {
+            ClientTransport::Direct {
+                server_base_url, ..
+            } => Some(server_base_url.as_str()),
+            ClientTransport::Relay(_) => None,
+        }
+    }
+
     pub fn rendezvous_client(&self) -> Option<RendezvousControlClient> {
         match &self.transport {
             ClientTransport::Direct { .. } => None,

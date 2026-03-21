@@ -8,6 +8,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   await expect(page.getByRole("banner").getByText("cli-client-web", { exact: true })).toBeVisible();
   await expect(page.getByText("Transport-aware", { exact: true })).toBeVisible();
+  await expect(page.getByText("Active route")).toBeVisible();
+  await expect(page.getByText("Direct")).toBeVisible();
+  await expect(page.getByText("node-alpha", { exact: true })).toBeVisible();
+  await expect(page.getByText("https://node-alpha.local", { exact: true })).toBeVisible();
 
   await page.getByText("Store", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
@@ -48,7 +52,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByText("Cluster", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
   await expect(page.getByText("Under replicated")).toBeVisible();
-  await expect(page.getByText('"node-alpha"')).toBeVisible();
+  await expect(page.locator("pre").filter({ hasText: '"node_id": "node-alpha"' })).toBeVisible();
   await expect(page.getByText('"under_replicated": 1')).toBeVisible();
 });
 
@@ -68,12 +72,41 @@ async function installClientUiMocks(page: Page) {
 
     if (pathname === "/api/cluster/status" && method === "GET") {
       return json(route, {
+        local_node_id: "node-alpha",
         total_nodes: 2,
         online_nodes: 2,
         offline_nodes: 0,
         policy: {
           replication_factor: 2
         }
+      });
+    }
+
+    if (pathname === "/api/rendezvous" && method === "GET") {
+      return json(route, {
+        available: true,
+        editable: true,
+        transport_mode: "direct",
+        relay_mode: "preferred",
+        configured_urls: ["https://rendezvous-a.local:9443"],
+        direct_url: "https://node-alpha.local",
+        direct_target_node_id: "node-alpha",
+        active_url: null,
+        active_target_node_id: null,
+        mtls_required: true,
+        persistence_source: "bootstrap_file",
+        last_probe_error: null,
+        endpoint_statuses: [
+          {
+            url: "https://rendezvous-a.local:9443",
+            status: "connected",
+            last_attempt_unix: 1_712_345_600,
+            last_success_unix: 1_712_345_600,
+            consecutive_failures: 0,
+            last_error: null,
+            active: false
+          }
+        ]
       });
     }
 

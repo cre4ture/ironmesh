@@ -41,6 +41,7 @@ import {
   getClientHealth,
   getClientClusterNodes,
   getClientClusterStatus,
+  getClientRendezvous,
   getClientReplicationPlan,
   getClientPing,
   getStoreValue,
@@ -112,6 +113,7 @@ export function ClientShell() {
   const [ping, setPing] = useState<ClientUiPingResponse | null>(null);
   const [health, setHealth] = useState<JsonObject | null>(null);
   const [clusterStatus, setClusterStatus] = useState<JsonObject | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ClientRendezvousView | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(true);
   const [overviewError, setOverviewError] = useState<string | null>(null);
 
@@ -123,14 +125,16 @@ export function ClientShell() {
     setOverviewLoading(true);
     setOverviewError(null);
     try {
-      const [nextPing, nextHealth, nextClusterStatus] = await Promise.all([
+      const [nextPing, nextHealth, nextClusterStatus, nextConnectionStatus] = await Promise.all([
         getClientPing(),
         getClientHealth(),
-        getClientClusterStatus()
+        getClientClusterStatus(),
+        getClientRendezvous()
       ]);
       setPing(nextPing);
       setHealth(nextHealth);
       setClusterStatus(nextClusterStatus);
+      setConnectionStatus(nextConnectionStatus);
     } catch (error) {
       setOverviewError(error instanceof Error ? error.message : "Failed to refresh client overview");
     } finally {
@@ -205,6 +209,7 @@ export function ClientShell() {
                 ping={ping}
                 health={health}
                 clusterStatus={clusterStatus}
+                connectionStatus={connectionStatus}
                 loading={overviewLoading}
                 error={overviewError}
                 onRefresh={refreshOverview}
@@ -239,17 +244,27 @@ type OverviewPageProps = {
   ping: ClientUiPingResponse | null;
   health: JsonObject | null;
   clusterStatus: JsonObject | null;
+  connectionStatus: ClientRendezvousView | null;
   loading: boolean;
   error: string | null;
   onRefresh: () => Promise<void>;
 };
 
-function OverviewPage({ ping, health, clusterStatus, loading, error, onRefresh }: OverviewPageProps) {
+function OverviewPage({
+  ping,
+  health,
+  clusterStatus,
+  connectionStatus,
+  loading,
+  error,
+  onRefresh
+}: OverviewPageProps) {
   const totalNodes = getNumber(clusterStatus, "total_nodes");
   const onlineNodes = getNumber(clusterStatus, "online_nodes");
   const offlineNodes = getNumber(clusterStatus, "offline_nodes");
   const replicationFactor = getNestedNumber(clusterStatus, "policy", "replication_factor");
   const runtimeMode = typeof health?.mode === "string" ? health.mode : "runtime";
+  const connectionSummary = summarizeClientConnection(connectionStatus);
 
   return (
     <>
@@ -295,6 +310,32 @@ function OverviewPage({ ping, health, clusterStatus, loading, error, onRefresh }
               <Text c="dimmed" size="sm">
                 This web UI runs on top of the same transport-aware Rust client used by desktop, Android, and CLI flows.
               </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 6 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>Active route</Text>
+              <Group gap="sm">
+                <Badge color={connectionStatus?.transport_mode === "relay" ? "teal" : "blue"} variant="light">
+                  {connectionSummary.routeMode}
+                </Badge>
+                {connectionStatus?.transport_mode === "relay" && connectionStatus.active_url ? (
+                  <Badge variant="light">{summarizeUrl(connectionStatus.active_url)}</Badge>
+                ) : null}
+              </Group>
+              <Text size="sm">
+                Target: <Code>{connectionSummary.target}</Code>
+              </Text>
+              <Text size="sm">
+                Path: <Code>{connectionSummary.path}</Code>
+              </Text>
+              {connectionSummary.detail ? (
+                <Text size="sm" c="dimmed">
+                  {connectionSummary.detail}
+                </Text>
+              ) : null}
             </Stack>
           </Card>
         </Grid.Col>
@@ -1202,6 +1243,42 @@ function formatUnixTimestamp(value: number | null): string {
   }
 
   return new Date(value * 1000).toLocaleString();
+}
+
+function summarizeClientConnection(connection: ClientRendezvousView | null): {
+  routeMode: string;
+  target: string;
+  path: string;
+  detail: string | null;
+} {
+  if (!connection) {
+    return {
+      routeMode: "loading",
+      target: "loading",
+      path: "loading",
+      detail: null
+    };
+  }
+
+  if (connection.transport_mode === "relay") {
+    return {
+      routeMode: "Relay",
+      target: connection.active_target_node_id ?? "indirect node unknown",
+      path: connection.active_url ?? "rendezvous endpoint unknown",
+      detail: connection.active_url
+        ? `Traffic is currently relayed through ${summarizeUrl(connection.active_url)}.`
+        : "Relay transport is active, but no rendezvous endpoint is marked active yet."
+    };
+  }
+
+  return {
+    routeMode: "Direct",
+    target: connection.direct_target_node_id ?? "server node unknown",
+    path: connection.direct_url ?? "direct endpoint unknown",
+    detail: connection.direct_url
+      ? "Requests are currently going straight to the selected server node."
+      : "This session is on a direct path, but the originating direct endpoint is not available."
+  };
 }
 
 function formatExplorerModifiedAt(value: number | null | undefined): string {
