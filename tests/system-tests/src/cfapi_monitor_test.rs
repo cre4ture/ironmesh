@@ -3,39 +3,107 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        fresh_data_dir, https_client_with_root_from_data_dir, issue_bootstrap_bundle, start_server,
-        start_server_with_public_https_env, stop_server,
+        TEST_ADMIN_TOKEN, fresh_data_dir, https_client_with_root_from_data_dir,
+        issue_bootstrap_bundle, start_authenticated_server, start_server_with_public_https_env,
+        stop_server,
     };
-    use crate::framework_win::{
-        start_cfapi_adapter, start_cfapi_adapter_with_bootstrap, start_cfapi_adapter_with_refresh,
-    };
+    use crate::framework_win::start_cfapi_adapter_with_bootstrap;
     use bytes::Bytes;
-    use client_sdk::{ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient};
+    use client_sdk::{
+        ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
+        enroll_connection_input_blocking,
+    };
     use reqwest::Client;
     use std::ffi::c_void;
     use std::fs::File;
     use std::io::Write;
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
+    use uuid::Uuid;
     use windows_sys::Win32::Storage::CloudFilters::{
         CF_IN_SYNC_STATE_IN_SYNC, CF_PLACEHOLDER_INFO_STANDARD, CF_PLACEHOLDER_STANDARD_INFO,
         CfGetPlaceholderInfo,
     };
 
-    async fn run_cfapi_monitor_case(bind: &str, initial_content: &str, modified_content: &str) {
-        let _server = start_server(bind)
-            .await
-            .expect("Failed to start local server-node");
+    const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".ironmesh-connection.json";
+    const DEFAULT_CLIENT_IDENTITY_FILE_NAME: &str = ".ironmesh-client-identity.json";
 
+    struct AuthenticatedCfapiFixture {
+        server: crate::framework::ChildGuard,
+        server_data_dir: PathBuf,
+        sdk: IronMeshClient,
+        bootstrap_file: PathBuf,
+    }
+
+    async fn start_authenticated_cfapi_fixture(
+        bind: &str,
+        sync_root: &Path,
+        label: &str,
+    ) -> anyhow::Result<AuthenticatedCfapiFixture> {
+        let nonce = bind.replace(['.', ':'], "-");
+        let server_data_dir = fresh_data_dir(&format!("cfapi-auth-server-{nonce}"));
+        let node_id = Uuid::new_v4().to_string();
+        let server = start_authenticated_server(bind, &server_data_dir, &node_id, 1).await?;
         let base_url = format!("http://{bind}");
+        let http = Client::new();
+        let bootstrap =
+            issue_bootstrap_bundle(&http, &base_url, TEST_ADMIN_TOKEN, Some(label), Some(600))
+                .await?;
+
+        let bootstrap_file = sync_root.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+        bootstrap.write_to_path(&bootstrap_file)?;
+
+        let bootstrap_json = bootstrap.to_json_pretty()?;
+        let label = label.to_string();
+        let enrolled = tokio::task::spawn_blocking(move || {
+            enroll_connection_input_blocking(&bootstrap_json, None, Some(label.as_str()))
+        })
+        .await
+        .expect("bootstrap enrollment task should join")?;
+
+        let persisted_bootstrap_json = enrolled
+            .connection_bootstrap_json
+            .clone()
+            .expect("enrollment response should include persisted bootstrap json");
+        let persisted_bootstrap = ConnectionBootstrap::from_json_str(&persisted_bootstrap_json)
+            .expect("failed to parse persisted bootstrap json");
+        persisted_bootstrap
+            .write_to_path(&bootstrap_file)
+            .expect("failed to persist enrolled bootstrap");
+
+        let identity = enrolled
+            .client_identity_material()
+            .expect("failed to build client identity material from enrollment response");
+        let client_identity_file = sync_root.join(DEFAULT_CLIENT_IDENTITY_FILE_NAME);
+        identity
+            .write_to_path(&client_identity_file)
+            .expect("failed to persist client identity");
+
+        let sdk = tokio::task::spawn_blocking(move || {
+            persisted_bootstrap.build_client_with_identity(&identity)
+        })
+        .await
+        .expect("bootstrap client builder task should join")
+        .expect("failed to build authenticated SDK client from bootstrap");
+
+        Ok(AuthenticatedCfapiFixture {
+            server,
+            server_data_dir,
+            sdk,
+            bootstrap_file,
+        })
+    }
+
+    async fn run_cfapi_monitor_case(bind: &str, initial_content: &str, modified_content: &str) {
         let sync_root = fresh_data_dir("cfapi-monitor-sync-root-parameterized");
         std::fs::create_dir_all(&sync_root).expect("Failed to create sync root");
+        let mut fixture = start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-monitor")
+            .await
+            .expect("Failed to start authenticated CFAPI fixture");
 
         let test_file = sync_root.join("monitor_test.txt");
-        let server_url = format!("{}/store/monitor_test.txt", base_url);
-        let client = Client::new();
 
         // Step 1: Create new file
         let mut file = File::create(&test_file).expect("Failed to create file");
@@ -44,27 +112,24 @@ mod tests {
         file.sync_all().expect("Failed to sync file");
 
         // start CFAPI adapter to monitor the sync root and upload changes to server
-        let _adapter = start_cfapi_adapter(
+        let _adapter = start_cfapi_adapter_with_bootstrap(
             "ironmesh.systemtest.syncroot",
             "ironmesh System Test Sync Root",
             &sync_root,
-            &base_url,
+            500,
+            &fixture.bootstrap_file,
         )
         .await
         .expect("Failed to register and serve CFAPI adapter");
 
         // Wait for monitor to detect and upload
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        let resp = client
-            .get(&server_url)
-            .send()
-            .await
-            .expect("Failed to GET file");
-        let body = resp.text().await.expect("Failed to read response body");
-        assert!(
-            body.contains(initial_content),
-            "Initial content not found on server"
-        );
+        wait_for_remote_payload(
+            &fixture.sdk,
+            "monitor_test.txt",
+            initial_content.as_bytes(),
+            220,
+        )
+        .await;
 
         // Step 2: Modify file
         let mut file = File::create(&test_file).expect("Failed to open file for modification");
@@ -75,17 +140,17 @@ mod tests {
         drop(file); // close file to ensure changes are flushed
 
         // Wait for monitor to detect and upload
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        let resp = client
-            .get(&server_url)
-            .send()
-            .await
-            .expect("Failed to GET file after modification");
-        let body = resp.text().await.expect("Failed to read response body");
-        assert!(
-            body.contains(modified_content),
-            "Modified content not found on server"
-        );
+        wait_for_remote_payload(
+            &fixture.sdk,
+            "monitor_test.txt",
+            modified_content.as_bytes(),
+            220,
+        )
+        .await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
     }
 
     async fn wait_for_path(path: &Path, retries: usize) {
@@ -364,15 +429,12 @@ mod tests {
     }
 
     async fn run_cfapi_hydration_case(bind: &str, key: &str, payload: &[u8]) {
-        let _server = start_server(bind)
-            .await
-            .expect("failed to start local server-node");
-
-        let base_url = format!("http://{bind}");
         let sync_root = fresh_data_dir("cfapi-hydration-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture = start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-hydration")
+            .await
+            .expect("failed to start authenticated CFAPI fixture");
 
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
         let path_parts: Vec<&str> = key.split('/').collect();
         let mut current_dir = String::new();
         for dir in path_parts.iter().take(path_parts.len() - 1) {
@@ -381,11 +443,15 @@ mod tests {
             }
             current_dir.push_str(dir);
             let dir_key = format!("{current_dir}/");
-            sdk.put(dir_key, Bytes::new())
+            fixture
+                .sdk
+                .put(dir_key, Bytes::new())
                 .await
                 .expect("failed to put folder");
         }
-        sdk.put_large_aware(key, Bytes::from(payload.to_vec()))
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from(payload.to_vec()))
             .await
             .expect("failed to seed remote object");
 
@@ -393,11 +459,12 @@ mod tests {
             "ironmesh.systemtest.hydration.{}",
             bind.replace(['.', ':'], "_")
         );
-        let _adapter = start_cfapi_adapter(
+        let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
             "ironmesh System Test Hydration Root",
             &sync_root,
-            &base_url,
+            500,
+            &fixture.bootstrap_file,
         )
         .await
         .expect("failed to register and serve CFAPI adapter");
@@ -405,6 +472,10 @@ mod tests {
         let local_file = sync_root.join(key.replace('/', "\\"));
         wait_for_path(&local_file, 200).await;
         wait_for_hydrated_payload(&local_file, payload, 150).await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
     }
 
     async fn run_cfapi_remote_additions_case(
@@ -413,32 +484,35 @@ mod tests {
         file_key: &str,
         payload: &[u8],
     ) {
-        let _server = start_server(bind)
-            .await
-            .expect("failed to start local server-node");
-
-        let base_url = format!("http://{bind}");
         let sync_root = fresh_data_dir("cfapi-remote-additions-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-remote-additions")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
 
         let sync_root_id = format!(
             "ironmesh.systemtest.remote.additions.{}",
             bind.replace(['.', ':'], "_")
         );
-        let _adapter = start_cfapi_adapter(
+        let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
             "ironmesh System Test Remote Additions Root",
             &sync_root,
-            &base_url,
+            500,
+            &fixture.bootstrap_file,
         )
         .await
         .expect("failed to register and serve CFAPI adapter");
 
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
-        sdk.put(folder_key, Bytes::new())
+        fixture
+            .sdk
+            .put(folder_key, Bytes::new())
             .await
             .expect("failed to seed remote folder marker");
-        sdk.put_large_aware(file_key, Bytes::from(payload.to_vec()))
+        fixture
+            .sdk
+            .put_large_aware(file_key, Bytes::from(payload.to_vec()))
             .await
             .expect("failed to seed remote file");
 
@@ -447,6 +521,10 @@ mod tests {
         wait_for_path(&folder_path, 250).await;
         wait_for_path(&local_file, 250).await;
         wait_for_hydrated_payload(&local_file, payload, 200).await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
     }
 
     #[tokio::test]
@@ -499,21 +577,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_cfapi_local_empty_folder_is_uploaded_as_directory_marker() {
-        let _server = start_server("127.0.0.1:19095")
-            .await
-            .expect("failed to start local server-node");
-
-        let base_url = "http://127.0.0.1:19095";
-        let sdk = IronMeshClient::from_direct_base_url(base_url);
         let sync_root = fresh_data_dir("cfapi-local-empty-folder-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture = start_authenticated_cfapi_fixture(
+            "127.0.0.1:19095",
+            &sync_root,
+            "cfapi-local-empty-folder",
+        )
+        .await
+        .expect("failed to start authenticated CFAPI fixture");
 
-        let _adapter = start_cfapi_adapter_with_refresh(
+        let _adapter = start_cfapi_adapter_with_bootstrap(
             "ironmesh.systemtest.local.empty.folder",
             "ironmesh System Test Local Empty Folder",
             &sync_root,
-            base_url,
             500,
+            &fixture.bootstrap_file,
         )
         .await
         .expect("failed to register and serve CFAPI adapter");
@@ -523,30 +602,36 @@ mod tests {
             .expect("failed to create empty folder inside sync root");
         wait_for_path(&empty_dir, 50).await;
 
-        wait_for_remote_directory_marker_shape(&sdk, "created-empty-folder", 220).await;
+        wait_for_remote_directory_marker_shape(&fixture.sdk, "created-empty-folder", 220).await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
     }
 
     #[tokio::test]
     async fn test_cfapi_local_empty_folder_rename_updates_remote_namespace() {
-        let _server = start_server("127.0.0.1:19096")
-            .await
-            .expect("failed to start local server-node");
-
-        let base_url = "http://127.0.0.1:19096";
-        let sdk = IronMeshClient::from_direct_base_url(base_url);
-        sdk.put("rename-empty/from/", Bytes::new())
+        let sync_root = fresh_data_dir("cfapi-local-empty-folder-rename-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture = start_authenticated_cfapi_fixture(
+            "127.0.0.1:19096",
+            &sync_root,
+            "cfapi-empty-folder-rename",
+        )
+        .await
+        .expect("failed to start authenticated CFAPI fixture");
+        fixture
+            .sdk
+            .put("rename-empty/from/", Bytes::new())
             .await
             .expect("failed to seed remote empty folder marker");
 
-        let sync_root = fresh_data_dir("cfapi-local-empty-folder-rename-sync-root");
-        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
-
-        let _adapter = start_cfapi_adapter_with_refresh(
+        let _adapter = start_cfapi_adapter_with_bootstrap(
             "ironmesh.systemtest.local.empty.folder.rename",
             "ironmesh System Test Local Empty Folder Rename",
             &sync_root,
-            base_url,
             500,
+            &fixture.bootstrap_file,
         )
         .await
         .expect("failed to register and serve CFAPI adapter");
@@ -558,8 +643,12 @@ mod tests {
             .expect("failed to rename empty folder inside sync root");
         wait_for_path(&new_dir, 50).await;
 
-        wait_for_remote_directory_presence_any_shape(&sdk, "rename-empty/to", 220).await;
-        wait_for_remote_directory_absence(&sdk, "rename-empty/from", 220).await;
+        wait_for_remote_directory_presence_any_shape(&fixture.sdk, "rename-empty/to", 220).await;
+        wait_for_remote_directory_absence(&fixture.sdk, "rename-empty/from", 220).await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
     }
 
     #[tokio::test]
@@ -670,25 +759,25 @@ mod tests {
     #[tokio::test]
     async fn test_cfapi_modified_placeholder_returns_to_in_sync_state_after_upload() {
         let bind = "127.0.0.1:19098";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind)
-            .await
-            .expect("failed to start local server-node");
 
         let result = async {
             let sync_root = fresh_data_dir("cfapi-in-sync-state-sync-root");
             std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+            let mut fixture =
+                start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-in-sync-state").await?;
 
-            let sdk = IronMeshClient::from_direct_base_url(&base_url);
-            sdk.put_large_aware("sync-status/check.txt", Bytes::from_static(b"remote seed"))
+            fixture
+                .sdk
+                .put_large_aware("sync-status/check.txt", Bytes::from_static(b"remote seed"))
                 .await
                 .expect("failed to seed remote object");
 
-            let _adapter = start_cfapi_adapter(
+            let _adapter = start_cfapi_adapter_with_bootstrap(
                 "ironmesh.systemtest.sync.status.check",
                 "ironmesh System Test Sync Status",
                 &sync_root,
-                &base_url,
+                500,
+                &fixture.bootstrap_file,
             )
             .await
             .expect("failed to register and serve CFAPI adapter");
@@ -700,7 +789,7 @@ mod tests {
             std::fs::write(&local_file, b"modified locally via cfapi")
                 .expect("failed to modify hydrated placeholder");
             wait_for_remote_payload(
-                &sdk,
+                &fixture.sdk,
                 "sync-status/check.txt",
                 b"modified locally via cfapi",
                 220,
@@ -708,11 +797,12 @@ mod tests {
             .await;
             wait_for_placeholder_in_sync(&local_file, 220).await;
 
+            stop_server(&mut fixture.server).await;
+            let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+
             Ok::<(std::path::PathBuf,), anyhow::Error>((sync_root,))
         }
         .await;
-
-        stop_server(&mut server).await;
 
         match result {
             Ok((sync_root,)) => {
@@ -725,28 +815,29 @@ mod tests {
     #[tokio::test]
     async fn test_cfapi_overwrite_waits_for_quiet_period_before_uploading_latest_bytes() {
         let bind = "127.0.0.1:19099";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind)
-            .await
-            .expect("failed to start local server-node");
 
         let result = async {
             let sync_root = fresh_data_dir("cfapi-overwrite-quiet-period-sync-root");
             std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+            let mut fixture =
+                start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-overwrite-quiet")
+                    .await?;
 
-            let sdk = IronMeshClient::from_direct_base_url(&base_url);
-            sdk.put_large_aware(
-                "overwrite/check.txt",
-                Bytes::from_static(b"original remote"),
-            )
-            .await
-            .expect("failed to seed remote object");
+            fixture
+                .sdk
+                .put_large_aware(
+                    "overwrite/check.txt",
+                    Bytes::from_static(b"original remote"),
+                )
+                .await
+                .expect("failed to seed remote object");
 
-            let _adapter = start_cfapi_adapter(
+            let _adapter = start_cfapi_adapter_with_bootstrap(
                 "ironmesh.systemtest.overwrite.quiet.period",
                 "ironmesh System Test Overwrite Quiet Period",
                 &sync_root,
-                &base_url,
+                500,
+                &fixture.bootstrap_file,
             )
             .await
             .expect("failed to register and serve CFAPI adapter");
@@ -764,7 +855,8 @@ mod tests {
             }
 
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let still_remote = sdk
+            let still_remote = fixture
+                .sdk
                 .get("overwrite/check.txt")
                 .await
                 .expect("failed to fetch remote payload during quiet period");
@@ -776,15 +868,21 @@ mod tests {
 
             std::fs::write(&local_file, b"final overwrite payload")
                 .expect("failed to write final overwrite payload");
-            wait_for_remote_payload(&sdk, "overwrite/check.txt", b"final overwrite payload", 220)
-                .await;
+            wait_for_remote_payload(
+                &fixture.sdk,
+                "overwrite/check.txt",
+                b"final overwrite payload",
+                220,
+            )
+            .await;
             wait_for_placeholder_in_sync(&local_file, 220).await;
+
+            stop_server(&mut fixture.server).await;
+            let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
 
             Ok::<std::path::PathBuf, anyhow::Error>(sync_root)
         }
         .await;
-
-        stop_server(&mut server).await;
 
         match result {
             Ok(sync_root) => {
@@ -797,21 +895,20 @@ mod tests {
     #[tokio::test]
     async fn test_cfapi_overwriting_already_uploaded_local_file_returns_to_placeholder() {
         let bind = "127.0.0.1:19100";
-        let base_url = format!("http://{bind}");
-        let mut server = start_server(bind)
-            .await
-            .expect("failed to start local server-node");
 
         let result = async {
             let sync_root = fresh_data_dir("cfapi-overwrite-uploaded-file-sync-root");
             std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+            let mut fixture =
+                start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-overwrite-uploaded")
+                    .await?;
 
-            let sdk = IronMeshClient::from_direct_base_url(&base_url);
-            let _adapter = start_cfapi_adapter(
+            let _adapter = start_cfapi_adapter_with_bootstrap(
                 "ironmesh.systemtest.overwrite.uploaded.file",
                 "ironmesh System Test Overwrite Uploaded File",
                 &sync_root,
-                &base_url,
+                500,
+                &fixture.bootstrap_file,
             )
             .await
             .expect("failed to register and serve CFAPI adapter");
@@ -825,7 +922,13 @@ mod tests {
             let initial_payload = b"initial local upload";
             std::fs::write(&local_file, initial_payload)
                 .expect("failed to write initial local file");
-            wait_for_remote_payload(&sdk, "overwrite-local/photo.jpg", initial_payload, 220).await;
+            wait_for_remote_payload(
+                &fixture.sdk,
+                "overwrite-local/photo.jpg",
+                initial_payload,
+                220,
+            )
+            .await;
             wait_for_placeholder_present(&local_file, 220).await;
 
             let overwritten_payload = b"overwritten local upload";
@@ -837,16 +940,22 @@ mod tests {
                 .expect("failed to sync overwritten local file");
             drop(file);
 
-            wait_for_remote_payload(&sdk, "overwrite-local/photo.jpg", overwritten_payload, 220)
-                .await;
+            wait_for_remote_payload(
+                &fixture.sdk,
+                "overwrite-local/photo.jpg",
+                overwritten_payload,
+                220,
+            )
+            .await;
             wait_for_placeholder_in_sync(&local_file, 220).await;
             wait_for_hydrated_payload(&local_file, overwritten_payload, 200).await;
+
+            stop_server(&mut fixture.server).await;
+            let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
 
             Ok::<std::path::PathBuf, anyhow::Error>(sync_root)
         }
         .await;
-
-        stop_server(&mut server).await;
 
         match result {
             Ok(sync_root) => {

@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::sleep;
 
+#[allow(dead_code)]
 pub async fn start_cfapi_adapter(
     sync_root_id: &str,
     display_name: &str,
@@ -28,6 +29,7 @@ pub async fn start_cfapi_adapter(
     .await
 }
 
+#[allow(dead_code)]
 pub async fn start_cfapi_adapter_with_refresh(
     sync_root_id: &str,
     display_name: &str,
@@ -46,6 +48,7 @@ pub async fn start_cfapi_adapter_with_refresh(
     .await
 }
 
+#[allow(dead_code)]
 pub async fn start_cfapi_adapter_with_refresh_and_pairing(
     sync_root_id: &str,
     display_name: &str,
@@ -66,6 +69,7 @@ pub async fn start_cfapi_adapter_with_refresh_and_pairing(
     .await
 }
 
+#[allow(dead_code)]
 pub async fn start_cfapi_adapter_with_refresh_pairing_and_ca(
     sync_root_id: &str,
     display_name: &str,
