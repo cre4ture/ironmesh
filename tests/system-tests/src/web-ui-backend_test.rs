@@ -189,6 +189,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ui_backend_store_get_preview_truncates_large_payload() -> Result<()> {
+        let server_bind = "127.0.0.1:19390";
+        let web_bind = "127.0.0.1:19391";
+        let web_base = format!("http://{web_bind}");
+        let key = "ui-preview.txt";
+        let value = "A".repeat(4096);
+        let client = reqwest::Client::new();
+
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-preview-server",
+            "web-ui-preview-client",
+        )
+        .await?;
+
+        let result = async {
+            let put_payload = serde_json::json!({
+                "key": key,
+                "value": value,
+            });
+
+            client
+                .post(format!("{web_base}/api/store/put"))
+                .json(&put_payload)
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let get_resp: serde_json::Value = client
+                .get(format!("{web_base}/api/store/get"))
+                .query(&[("key", key), ("preview_bytes", "1024")])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            assert_eq!(get_resp.get("key").and_then(|v| v.as_str()), Some(key));
+            assert_eq!(
+                get_resp.get("truncated").and_then(|v| v.as_bool()),
+                Some(true)
+            );
+            assert_eq!(
+                get_resp.get("total_size_bytes").and_then(|v| v.as_u64()),
+                Some(4096)
+            );
+            assert_eq!(
+                get_resp.get("preview_size_bytes").and_then(|v| v.as_u64()),
+                Some(1024)
+            );
+            assert_eq!(
+                get_resp
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .map(|value| value.len()),
+                Some(1024)
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
     async fn web_ui_backend_binary_chunked_roundtrip() -> Result<()> {
         let server_bind = "127.0.0.1:19382";
         let web_bind = "127.0.0.1:19383";

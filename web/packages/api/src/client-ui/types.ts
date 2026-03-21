@@ -50,6 +50,9 @@ export type StoreGetResponse = {
   snapshot?: string | null;
   version?: string | null;
   value: string;
+  truncated?: boolean;
+  total_size_bytes?: number;
+  preview_size_bytes?: number | null;
 };
 
 export type StoreEntry = StoreIndexEntry;

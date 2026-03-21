@@ -77,6 +77,18 @@ async function installClientUiMocks(page: Page) {
     }
 
     if (pathname === "/api/store/get" && method === "GET") {
+      if (searchParams.get("preview_bytes")) {
+        expect(searchParams.get("preview_bytes")).toBe("1024");
+        return json(route, {
+          key: searchParams.get("key"),
+          value: "hello from the mocked store",
+          version: searchParams.get("version"),
+          snapshot: searchParams.get("snapshot"),
+          truncated: false,
+          total_size_bytes: 27,
+          preview_size_bytes: 27
+        });
+      }
       return json(route, {
         key: searchParams.get("key"),
         value: "hello from the mocked store",

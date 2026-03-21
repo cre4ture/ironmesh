@@ -85,7 +85,8 @@ export async function listStoreEntries(
 export async function getStoreValue(
   key: string,
   snapshot?: string | null,
-  version?: string | null
+  version?: string | null,
+  previewBytes?: number | null
 ): Promise<StoreGetResponse> {
   const query = new URLSearchParams({ key });
   if (snapshot?.trim()) {
@@ -93,6 +94,9 @@ export async function getStoreValue(
   }
   if (version?.trim()) {
     query.set("version", version.trim());
+  }
+  if (previewBytes && previewBytes > 0) {
+    query.set("preview_bytes", String(Math.floor(previewBytes)));
   }
   return fetchJson<StoreGetResponse>(`/api/store/get?${query.toString()}`);
 }

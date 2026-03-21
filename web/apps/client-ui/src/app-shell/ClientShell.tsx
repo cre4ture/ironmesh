@@ -65,6 +65,7 @@ import { GalleryPage } from "../pages/GalleryPage";
 type PageId = "overview" | "rendezvous" | "store" | "explorer" | "gallery" | "cluster";
 type ExplorerSortField = "path" | "type" | "size" | "modified";
 type ExplorerSortDirection = "asc" | "desc";
+const EXPLORER_PREVIEW_BYTES = 1024;
 
 const pages = [
   {
@@ -849,7 +850,12 @@ function ExplorerPage() {
     setLoading(`read-entry:${entry.path}`);
     setError(null);
     try {
-      const payload = await getStoreValue(entry.path, snapshotId);
+      const payload = await getStoreValue(
+        entry.path,
+        snapshotId,
+        null,
+        EXPLORER_PREVIEW_BYTES
+      );
       setSelectedPayload(payload);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed reading object");
@@ -894,7 +900,12 @@ function ExplorerPage() {
     setLoading("read-version");
     setError(null);
     try {
-      const payload = await getStoreValue(versionKey.trim(), null, versionId);
+      const payload = await getStoreValue(
+        versionKey.trim(),
+        null,
+        versionId,
+        EXPLORER_PREVIEW_BYTES
+      );
       setSelectedPayload(payload);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed reading version");

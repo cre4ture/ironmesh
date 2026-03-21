@@ -239,6 +239,7 @@ struct WebStoreGetQuery {
     key: String,
     snapshot: Option<String>,
     version: Option<String>,
+    preview_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -772,16 +773,34 @@ async fn web_store_get(
     };
 
     match payload_result {
-        Ok(payload) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "key": query.key,
-                "snapshot": query.snapshot,
-                "version": query.version,
-                "value": String::from_utf8_lossy(&payload)
-            })),
-        )
-            .into_response(),
+        Ok(payload) => {
+            let total_size_bytes = payload.len();
+            let preview_size_bytes = query
+                .preview_bytes
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.min(total_size_bytes));
+            let truncated = preview_size_bytes
+                .map(|preview_size_bytes| preview_size_bytes < total_size_bytes)
+                .unwrap_or(false);
+            let visible_payload = match preview_size_bytes {
+                Some(preview_size_bytes) => &payload[..preview_size_bytes],
+                None => payload.as_ref(),
+            };
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "key": query.key,
+                    "snapshot": query.snapshot,
+                    "version": query.version,
+                    "value": String::from_utf8_lossy(visible_payload),
+                    "truncated": truncated,
+                    "total_size_bytes": total_size_bytes,
+                    "preview_size_bytes": preview_size_bytes,
+                })),
+            )
+                .into_response()
+        }
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
