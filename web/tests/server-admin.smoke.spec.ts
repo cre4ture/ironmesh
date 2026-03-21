@@ -211,6 +211,7 @@ async function installServerAdminMocks(
     }
 
     if (pathname === "/auth/store/index" && method === "GET") {
+      expect(searchParams.get("view")).toBe("tree");
       return json(route, {
         prefix: searchParams.get("prefix") ?? "",
         depth: Number(searchParams.get("depth") ?? "1"),

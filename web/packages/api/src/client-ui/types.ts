@@ -1,4 +1,4 @@
-import type { StoreIndexEntry, StoreIndexResponse } from "../shared/store-index";
+import type { StoreIndexEntry, StoreIndexResponse, StoreListView } from "../shared/store-index";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -55,6 +55,8 @@ export type StoreGetResponse = {
 export type StoreEntry = StoreIndexEntry;
 
 export type StoreListResponse = StoreIndexResponse;
+
+export type { StoreListView };
 
 export type SnapshotSummary = {
   id: string;

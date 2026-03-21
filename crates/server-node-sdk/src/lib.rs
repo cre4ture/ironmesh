@@ -1,7 +1,7 @@
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -4571,6 +4571,14 @@ struct StoreIndexQuery {
     prefix: Option<String>,
     depth: Option<usize>,
     snapshot: Option<String>,
+    view: Option<StoreIndexView>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StoreIndexView {
+    Raw,
+    Tree,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5169,6 +5177,7 @@ async fn list_store_index_admin(
             "prefix": query.prefix.clone(),
             "depth": query.depth,
             "snapshot": query.snapshot.clone(),
+            "view": query.view,
         }),
     )
     .await
@@ -5265,6 +5274,10 @@ async fn list_store_index_response(
         }
     }
 
+    if matches!(query.view, Some(StoreIndexView::Tree)) {
+        entries = collapse_store_index_entries_for_tree_view(entries);
+    }
+
     let mut response = (
         StatusCode::OK,
         Json(StoreIndexResponse {
@@ -5282,6 +5295,34 @@ async fn list_store_index_response(
             .insert("x-ironmesh-change-sequence", header_value);
     }
     response
+}
+
+fn collapse_store_index_entries_for_tree_view(
+    entries: Vec<StoreIndexEntry>,
+) -> Vec<StoreIndexEntry> {
+    let mut collapsed = BTreeMap::new();
+
+    for entry in entries {
+        let is_directory_like = entry.entry_type == "prefix" || entry.path.ends_with('/');
+        if !is_directory_like {
+            collapsed.insert(entry.path.clone(), entry);
+            continue;
+        }
+
+        collapsed
+            .entry(entry.path.clone())
+            .or_insert_with(|| StoreIndexEntry {
+                path: entry.path,
+                entry_type: "prefix".to_string(),
+                version: None,
+                content_hash: None,
+                size_bytes: None,
+                content_fingerprint: None,
+                media: None,
+            });
+    }
+
+    collapsed.into_values().collect()
 }
 
 async fn wait_for_store_index_change(

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, RelayMode,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, UploadMode, build_http_client_from_pem,
+    RendezvousEndpointStatus, StoreIndexView, UploadMode, build_http_client_from_pem,
     build_http_client_with_identity_from_pem,
 };
 use reqwest::Url;
@@ -231,6 +231,7 @@ struct WebStoreListQuery {
     prefix: Option<String>,
     depth: Option<usize>,
     snapshot: Option<String>,
+    view: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,12 +723,25 @@ async fn web_store_list(
     State(state): State<WebState>,
     Query(query): Query<WebStoreListQuery>,
 ) -> impl IntoResponse {
+    let view = match query.view.as_deref() {
+        None => None,
+        Some("tree") => Some(StoreIndexView::Tree),
+        Some("raw") => Some(StoreIndexView::Raw),
+        Some(other) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported store list view: {other}"),
+            );
+        }
+    };
+
     match current_sdk(&state)
         .await
-        .store_index(
+        .store_index_with_view(
             query.prefix.as_deref(),
             query.depth.unwrap_or(1).max(1),
             query.snapshot.as_deref(),
+            view,
         )
         .await
     {

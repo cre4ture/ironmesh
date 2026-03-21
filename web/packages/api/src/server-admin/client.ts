@@ -17,6 +17,7 @@ import type {
   NodeEnrollmentPackage,
   RendezvousConfigView,
   ReplicationPlan,
+  StoreListView,
   SetupStatus,
   SetupTransitionResponse
 } from "./types";
@@ -84,7 +85,8 @@ export async function listAdminStoreEntries(
   prefix?: string,
   depth = 1,
   snapshot?: string | null,
-  adminTokenOverride?: string
+  adminTokenOverride?: string,
+  view: StoreListView = "tree"
 ): Promise<AdminStoreListResponse> {
   const query = new URLSearchParams({
     depth: String(Math.max(1, depth))
@@ -95,6 +97,7 @@ export async function listAdminStoreEntries(
   if (snapshot?.trim()) {
     query.set("snapshot", snapshot.trim());
   }
+  query.set("view", view);
   return fetchAdminJson<AdminStoreListResponse>(`/auth/store/index?${query.toString()}`, {
     adminTokenOverride
   });

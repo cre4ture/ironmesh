@@ -6,6 +6,7 @@ import type {
   SnapshotSummary,
   StoreGetResponse,
   StoreListResponse,
+  StoreListView,
   StorePutResponse,
   VersionGraphResponse
 } from "./types";
@@ -65,7 +66,8 @@ export async function listSnapshots(): Promise<SnapshotSummary[]> {
 export async function listStoreEntries(
   prefix?: string,
   depth = 1,
-  snapshot?: string | null
+  snapshot?: string | null,
+  view: StoreListView = "tree"
 ): Promise<StoreListResponse> {
   const query = new URLSearchParams({
     depth: String(Math.max(1, depth))
@@ -76,6 +78,7 @@ export async function listStoreEntries(
   if (snapshot?.trim()) {
     query.set("snapshot", snapshot.trim());
   }
+  query.set("view", view);
   return fetchJson<StoreListResponse>(`/api/store/list?${query.toString()}`);
 }
 

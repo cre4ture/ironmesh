@@ -87,6 +87,7 @@ async function installClientUiMocks(page: Page) {
     }
 
     if (pathname === "/api/store/list" && method === "GET") {
+      expect(searchParams.get("view")).toBe("tree");
       return json(route, {
         prefix: searchParams.get("prefix") ?? "",
         depth: Number(searchParams.get("depth") ?? "1"),

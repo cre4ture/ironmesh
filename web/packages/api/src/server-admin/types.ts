@@ -1,4 +1,4 @@
-import type { StoreIndexEntry, StoreIndexResponse } from "../shared/store-index";
+import type { StoreIndexEntry, StoreIndexResponse, StoreListView } from "../shared/store-index";
 
 export type AdminSessionStatus = {
   login_required: boolean;
@@ -14,6 +14,8 @@ export type AdminSnapshotSummary = {
 export type AdminStoreEntry = StoreIndexEntry;
 
 export type AdminStoreListResponse = StoreIndexResponse;
+
+export type { StoreListView };
 
 export type ClusterSummary = {
   local_node_id: string;

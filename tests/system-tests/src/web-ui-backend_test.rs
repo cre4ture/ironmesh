@@ -320,6 +320,44 @@ mod tests {
             assert!(paths.contains(&"docs/api/".to_string()));
             assert!(paths.contains(&"docs/guide/".to_string()));
 
+            for (key, value) in [("cameras/", ""), ("cameras/front.jpg", "jpeg")] {
+                let payload = serde_json::json!({
+                    "key": key,
+                    "value": value,
+                });
+                client
+                    .post(format!("{web_base}/api/store/put"))
+                    .json(&payload)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            let tree_resp: serde_json::Value = client
+                .get(format!("{web_base}/api/store/list"))
+                .query(&[("depth", "1"), ("view", "tree")])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let tree_entries = tree_resp
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .context("missing entries in tree /api/store/list response")?;
+            let cameras_entries = tree_entries
+                .iter()
+                .filter(|entry| entry.get("path").and_then(|v| v.as_str()) == Some("cameras/"))
+                .collect::<Vec<_>>();
+            assert_eq!(cameras_entries.len(), 1);
+            assert_eq!(
+                cameras_entries[0]
+                    .get("entry_type")
+                    .and_then(|v| v.as_str()),
+                Some("prefix")
+            );
+
             let delete_key = "web-delete.txt";
             let delete_payload = serde_json::json!({
                 "key": delete_key,

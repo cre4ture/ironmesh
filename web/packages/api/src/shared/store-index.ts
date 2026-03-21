@@ -42,3 +42,5 @@ export type StoreIndexResponse = {
   entry_count: number;
   entries: StoreIndexEntry[];
 };
+
+export type StoreListView = "raw" | "tree";

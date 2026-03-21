@@ -3586,6 +3586,48 @@ fn store_index_prefix_returns_matching_keys() {
 }
 
 #[test]
+fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
+    let entries = vec![
+        super::StoreIndexEntry {
+            path: "images/".to_string(),
+            entry_type: "prefix".to_string(),
+            version: None,
+            content_hash: None,
+            size_bytes: None,
+            content_fingerprint: None,
+            media: None,
+        },
+        super::StoreIndexEntry {
+            path: "images/".to_string(),
+            entry_type: "key".to_string(),
+            version: None,
+            content_hash: Some("marker".to_string()),
+            size_bytes: Some(0),
+            content_fingerprint: None,
+            media: None,
+        },
+        super::StoreIndexEntry {
+            path: "images/cat.png".to_string(),
+            entry_type: "key".to_string(),
+            version: None,
+            content_hash: Some("content".to_string()),
+            size_bytes: Some(123),
+            content_fingerprint: None,
+            media: None,
+        },
+    ];
+
+    let collapsed = super::collapse_store_index_entries_for_tree_view(entries);
+
+    assert_eq!(collapsed.len(), 2);
+    assert_eq!(collapsed[0].path, "images/");
+    assert_eq!(collapsed[0].entry_type, "prefix");
+    assert_eq!(collapsed[0].content_hash, None);
+    assert_eq!(collapsed[1].path, "images/cat.png");
+    assert_eq!(collapsed[1].entry_type, "key");
+}
+
+#[test]
 fn autonomous_post_write_replication_trigger_guard_blocks_internal_writes() {
     assert!(should_trigger_autonomous_post_write_replication(
         true, false
@@ -3885,6 +3927,7 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 prefix: Some("gallery".to_string()),
                 depth: Some(2),
                 snapshot: None,
+                view: None,
             }),
         )
         .await,
@@ -3947,6 +3990,7 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 prefix: Some("gallery".to_string()),
                 depth: Some(2),
                 snapshot: None,
+                view: None,
             }),
         )
         .await,

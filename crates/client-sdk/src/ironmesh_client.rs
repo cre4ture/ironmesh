@@ -111,6 +111,21 @@ pub struct StoreIndexResponse {
     pub entries: Vec<StoreIndexEntry>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreIndexView {
+    Raw,
+    Tree,
+}
+
+impl StoreIndexView {
+    fn as_query_value(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Tree => "tree",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoreIndexChangeWaitResponse {
     pub sequence: u64,
@@ -519,11 +534,26 @@ impl IronMeshClient {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<StoreIndexResponse> {
+        self.store_index_with_view(prefix, depth, snapshot, None)
+            .await
+    }
+
+    pub async fn store_index_with_view(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        view: Option<StoreIndexView>,
+    ) -> Result<StoreIndexResponse> {
         let mut url = self.store_index_url()?;
         url.query_pairs_mut()
             .append_pair("depth", &depth.max(1).to_string());
         append_optional_query(&mut url, "prefix", prefix);
         append_optional_query(&mut url, "snapshot", snapshot);
+        if let Some(view) = view {
+            url.query_pairs_mut()
+                .append_pair("view", view.as_query_value());
+        }
 
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)
@@ -553,11 +583,21 @@ impl IronMeshClient {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<StoreIndexResponse> {
+        self.store_index_with_view_blocking(prefix, depth, snapshot, None)
+    }
+
+    pub fn store_index_with_view_blocking(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        view: Option<StoreIndexView>,
+    ) -> Result<StoreIndexResponse> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed to create runtime for store index request")?;
-        runtime.block_on(self.store_index(prefix, depth, snapshot))
+        runtime.block_on(self.store_index_with_view(prefix, depth, snapshot, view))
     }
 
     pub async fn wait_for_store_index_change(
