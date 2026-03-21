@@ -274,6 +274,48 @@ mod tests {
             .context("failed decoding bootstrap bundle response")
     }
 
+    async fn issue_bootstrap_claim_with_cookie(
+        http: &reqwest::Client,
+        bind: &str,
+        session_cookie: &str,
+        label: Option<&str>,
+        expires_in_secs: Option<u64>,
+        preferred_rendezvous_url: Option<&str>,
+    ) -> Result<client_sdk::ClientBootstrapClaimIssueResponse> {
+        http.post(format!("https://{bind}/auth/bootstrap-claims/issue"))
+            .header(reqwest::header::COOKIE, session_cookie)
+            .json(&serde_json::json!({
+                "label": label,
+                "expires_in_secs": expires_in_secs,
+                "preferred_rendezvous_url": preferred_rendezvous_url,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<client_sdk::ClientBootstrapClaimIssueResponse>()
+            .await
+            .context("failed decoding bootstrap claim response")
+    }
+
+    async fn update_rendezvous_config_with_cookie(
+        http: &reqwest::Client,
+        bind: &str,
+        session_cookie: &str,
+        editable_urls: &[&str],
+    ) -> Result<serde_json::Value> {
+        http.put(format!("https://{bind}/auth/rendezvous-config"))
+            .header(reqwest::header::COOKIE, session_cookie)
+            .json(&serde_json::json!({
+                "editable_urls": editable_urls,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("failed decoding rendezvous config response")
+    }
+
     async fn export_managed_control_plane_promotion_with_cookie(
         http: &reqwest::Client,
         bind: &str,
@@ -923,7 +965,7 @@ mod tests {
         )
         .await?;
 
-        let base_a = format!("http://{bind_a}");
+        let base_a = format!("https://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let client = reqwest::Client::new();
 
@@ -983,7 +1025,7 @@ mod tests {
         )
         .await?;
 
-        let base_a = format!("http://{bind_a}");
+        let base_a = format!("https://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let client = reqwest::Client::new();
 
@@ -1062,7 +1104,7 @@ mod tests {
         )
         .await?;
 
-        let base_a = format!("http://{bind_a}");
+        let base_a = format!("https://{bind_a}");
         let base_b = format!("http://{bind_b}");
         let client = reqwest::Client::new();
 
@@ -2335,6 +2377,101 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&client_dir);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn bootstrap_claim_redeems_through_selected_rendezvous_when_multiple_are_configured()
+    -> Result<()> {
+        let dedicated_rendezvous_bind = "127.0.0.1:19165";
+        let bind_a = "127.0.0.1:19166";
+        let admin_password = "selected-rendezvous-password";
+        let dedicated_rendezvous_url = format!("http://{dedicated_rendezvous_bind}");
+        let data_a = fresh_data_dir("bootstrap-claim-selected-rendezvous-node-a");
+        let client_dir = fresh_data_dir("bootstrap-claim-selected-rendezvous-client");
+
+        let mut dedicated_rendezvous = start_rendezvous_service(dedicated_rendezvous_bind).await?;
+        let mut node_a = start_zero_touch_server(bind_a, &data_a).await?;
+        let insecure_http = insecure_https_client()?;
+
+        let result = async {
+            setup_start_cluster(&insecure_http, bind_a, admin_password).await?;
+            wait_for_runtime_admin_surface(&insecure_http, bind_a).await?;
+            let admin_cookie = admin_login_cookie(&insecure_http, bind_a, admin_password).await?;
+
+            let rendezvous_config = update_rendezvous_config_with_cookie(
+                &insecure_http,
+                bind_a,
+                &admin_cookie,
+                &[dedicated_rendezvous_url.as_str()],
+            )
+            .await?;
+            let effective_urls = rendezvous_config
+                .get("effective_urls")
+                .and_then(|value| value.as_array())
+                .context("missing effective_urls in rendezvous config response")?;
+            assert_eq!(effective_urls.len(), 2);
+            assert!(
+                effective_urls
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .any(|value| value == format!("{dedicated_rendezvous_url}/")),
+                "expected dedicated rendezvous URL in effective config: {rendezvous_config}"
+            );
+
+            wait_for_rendezvous_registered_endpoints(&dedicated_rendezvous_url, 1, 120).await?;
+
+            let issued = issue_bootstrap_claim_with_cookie(
+                &insecure_http,
+                bind_a,
+                &admin_cookie,
+                Some("selected-rendezvous-cli"),
+                Some(3600),
+                Some(dedicated_rendezvous_url.as_str()),
+            )
+            .await?;
+            issued.validate()?;
+            assert_eq!(
+                issued.bootstrap_claim.rendezvous_url,
+                format!("{dedicated_rendezvous_url}/")
+            );
+
+            let claim_path = client_dir.join("selected-rendezvous.claim.json");
+            fs::write(&claim_path, issued.bootstrap_claim.to_json_pretty()?)
+                .context("failed writing bootstrap claim json")?;
+            let claim_arg = claim_path.to_string_lossy().into_owned();
+
+            let client_identity_path = client_dir.join("selected-rendezvous.identity.json");
+            let client_identity_arg = client_identity_path.to_string_lossy().into_owned();
+
+            let enroll_output = run_cli(&[
+                "--bootstrap-file",
+                claim_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "enroll",
+                "--label",
+                "selected-rendezvous-cli",
+            ])
+            .await?;
+            assert!(
+                enroll_output.contains("enrolled device"),
+                "unexpected enroll output: {enroll_output}"
+            );
+            assert!(
+                client_identity_path.exists(),
+                "expected client identity file to be written"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut dedicated_rendezvous).await;
+        let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&client_dir);
 
         result

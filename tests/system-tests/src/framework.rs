@@ -660,6 +660,30 @@ pub async fn issue_bootstrap_bundle(
         .context("failed to decode bootstrap bundle response")
 }
 
+#[allow(dead_code)]
+pub async fn issue_bootstrap_claim(
+    http: &reqwest::Client,
+    base_url: &str,
+    admin_token: &str,
+    label: Option<&str>,
+    expires_in_secs: Option<u64>,
+    preferred_rendezvous_url: Option<&str>,
+) -> Result<client_sdk::ClientBootstrapClaimIssueResponse> {
+    http.post(format!("{base_url}/auth/bootstrap-claims/issue"))
+        .header("x-ironmesh-admin-token", admin_token)
+        .json(&serde_json::json!({
+            "label": label,
+            "expires_in_secs": expires_in_secs,
+            "preferred_rendezvous_url": preferred_rendezvous_url,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<client_sdk::ClientBootstrapClaimIssueResponse>()
+        .await
+        .context("failed to decode bootstrap claim response")
+}
+
 pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {
     let cli_bin = binary_path("cli-client")?;
 

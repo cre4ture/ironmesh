@@ -3864,60 +3864,93 @@ fn normalize_peer_path_and_query(path_and_query: &str) -> Result<String> {
 fn spawn_rendezvous_relay_http_agent(state: ServerState, local_base_url: String) {
     tokio::spawn(async move {
         loop {
-            let Some(client) = current_rendezvous_control(&state).await else {
+            let clients = current_rendezvous_endpoint_clients(&state).await;
+            if clients.is_empty() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
-            };
-            match client
-                .poll_relay_http_request(&RelayHttpPollRequest {
-                    cluster_id: state.cluster_id,
-                    target: PeerIdentity::Node(state.node_id),
-                    wait_timeout_ms: Some(15_000),
-                })
-                .await
-            {
-                Ok(response) => {
-                    let Some(request) = response.request else {
-                        continue;
-                    };
-                    let local_http = current_internal_http(&state).await;
+            }
+            let cluster_id = state.cluster_id;
+            let node_id = state.node_id;
 
-                    let relay_response = match execute_local_relay_http_request(
-                        &local_http,
-                        &local_base_url,
-                        &request,
-                    )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(err) => RelayHttpResponse {
-                            cluster_id: request.cluster_id,
-                            session_id: request.session_id.clone(),
-                            request_id: request.request_id.clone(),
-                            responder: request.target.clone(),
-                            status: 502,
-                            headers: vec![RelayHttpHeader {
-                                name: "content-type".to_string(),
-                                value: "text/plain; charset=utf-8".to_string(),
-                            }],
-                            body_base64: encode_optional_body_base64(
-                                format!("relay execution failed: {err:#}").as_bytes(),
-                            ),
-                        },
-                    };
+            let mut polls = tokio::task::JoinSet::new();
+            for endpoint in clients {
+                polls.spawn(async move {
+                    let result = endpoint
+                        .control
+                        .poll_relay_http_request(&RelayHttpPollRequest {
+                            cluster_id,
+                            target: PeerIdentity::Node(node_id),
+                            wait_timeout_ms: Some(15_000),
+                        })
+                        .await;
+                    (endpoint, result)
+                });
+            }
 
-                    if let Err(err) = client.respond_relay_http_request(&relay_response).await {
+            let mut handled_request = false;
+            while let Some(result) = polls.join_next().await {
+                let Ok((endpoint, result)) = result else {
+                    continue;
+                };
+                match result {
+                    Ok(response) => {
+                        let Some(request) = response.request else {
+                            continue;
+                        };
+                        handled_request = true;
+                        polls.abort_all();
+                        let local_http = current_internal_http(&state).await;
+
+                        let relay_response = match execute_local_relay_http_request(
+                            &local_http,
+                            &local_base_url,
+                            &request,
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(err) => RelayHttpResponse {
+                                cluster_id: request.cluster_id,
+                                session_id: request.session_id.clone(),
+                                request_id: request.request_id.clone(),
+                                responder: request.target.clone(),
+                                status: 502,
+                                headers: vec![RelayHttpHeader {
+                                    name: "content-type".to_string(),
+                                    value: "text/plain; charset=utf-8".to_string(),
+                                }],
+                                body_base64: encode_optional_body_base64(
+                                    format!("relay execution failed: {err:#}").as_bytes(),
+                                ),
+                            },
+                        };
+
+                        if let Err(err) = endpoint
+                            .control
+                            .respond_relay_http_request(&relay_response)
+                            .await
+                        {
+                            warn!(
+                                error = %err,
+                                rendezvous_url = %endpoint.url,
+                                request_id = %request.request_id,
+                                "failed to submit relayed HTTP response"
+                            );
+                        }
+                        break;
+                    }
+                    Err(err) => {
                         warn!(
                             error = %err,
-                            request_id = %request.request_id,
-                            "failed to submit relayed HTTP response"
+                            rendezvous_url = %endpoint.url,
+                            "relay HTTP poll failed"
                         );
                     }
                 }
-                Err(err) => {
-                    warn!(error = %err, "relay HTTP poll failed");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+            }
+
+            if !handled_request {
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
     });

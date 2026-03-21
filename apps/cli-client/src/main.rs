@@ -4,8 +4,9 @@ use clap::{Parser, Subcommand};
 use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient,
     build_http_client_from_pem, build_http_client_with_identity_from_pem,
-    normalize_server_base_url,
+    enroll_connection_input_blocking, normalize_server_base_url,
 };
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use web_ui_backend::{WebUiBootstrapPersistence, WebUiConfig};
@@ -182,8 +183,17 @@ async fn enroll_from_bootstrap(
 
     let enrolled = tokio::task::spawn_blocking(
         move || -> Result<(ClientIdentityMaterial, Option<String>)> {
-            let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)?;
-            let enrolled = bootstrap.enroll_blocking(device_id.as_deref(), label.as_deref())?;
+            let connection_input = fs::read_to_string(&bootstrap_path).with_context(|| {
+                format!(
+                    "failed to read bootstrap input {}",
+                    bootstrap_path.display()
+                )
+            })?;
+            let enrolled = enroll_connection_input_blocking(
+                &connection_input,
+                device_id.as_deref(),
+                label.as_deref(),
+            )?;
             let identity = enrolled.client_identity_material()?;
             identity.write_to_path(&output_path)?;
             Ok((identity, enrolled.server_base_url))
