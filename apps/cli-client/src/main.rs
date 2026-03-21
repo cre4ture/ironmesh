@@ -271,10 +271,18 @@ fn read_optional_utf8_file(path: Option<&Path>) -> Result<Option<String>> {
 }
 
 fn read_client_identity_from_cli(cli: &Cli) -> Result<Option<ClientIdentityMaterial>> {
-    cli.client_identity_file
-        .as_deref()
-        .map(ClientIdentityMaterial::from_path)
-        .transpose()
+    if let Some(path) = cli.client_identity_file.as_deref() {
+        return ClientIdentityMaterial::from_path(path).map(Some);
+    }
+
+    if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
+        let default_path = default_client_identity_path(bootstrap_path);
+        if default_path.exists() {
+            return ClientIdentityMaterial::from_path(&default_path).map(Some);
+        }
+    }
+
+    Ok(None)
 }
 
 fn read_server_ca_override_from_cli(cli: &Cli) -> Result<Option<String>> {

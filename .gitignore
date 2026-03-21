@@ -14,3 +14,4 @@ web/.turbo
 web/playwright-report
 web/test-results
 !.vscode/extensions.json
+ironmesh-client-*.json
