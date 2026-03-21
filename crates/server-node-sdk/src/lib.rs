@@ -6,7 +6,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -2854,6 +2854,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         client_auth_replay_cache: Arc::new(Mutex::new(ClientAuthReplayCache::default())),
     };
 
+    refresh_local_node_storage(&state).await;
+
     let persisted_attempts = {
         let store = state.store.lock().await;
         match store.load_repair_attempts().await {
@@ -3251,6 +3253,31 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     Ok(())
 }
 
+fn storage_stats_for_path(path: &FsPath) -> Result<(u64, u64)> {
+    let capacity_bytes = fs2::total_space(path)
+        .with_context(|| format!("failed to read capacity for {}", path.display()))?;
+    let free_bytes = fs2::available_space(path)
+        .with_context(|| format!("failed to read free space for {}", path.display()))?;
+    Ok((capacity_bytes, free_bytes.min(capacity_bytes)))
+}
+
+async fn refresh_local_node_storage(state: &ServerState) {
+    let (capacity_bytes, free_bytes) = match storage_stats_for_path(&state.data_dir) {
+        Ok(stats) => stats,
+        Err(err) => {
+            warn!(
+                path = %state.data_dir.display(),
+                error = %err,
+                "failed to refresh local node storage stats"
+            );
+            return;
+        }
+    };
+
+    let mut cluster = state.cluster.lock().await;
+    let _ = cluster.update_node_storage(state.node_id, free_bytes, capacity_bytes);
+}
+
 fn spawn_rendezvous_presence_heartbeat(
     state: ServerState,
     public_url: Option<String>,
@@ -3264,6 +3291,8 @@ fn spawn_rendezvous_presence_heartbeat(
             .min(connected_interval);
 
         loop {
+            refresh_local_node_storage(&state).await;
+
             let local_descriptor = {
                 let cluster = state.cluster.lock().await;
                 cluster
@@ -4334,6 +4363,7 @@ fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
 
         loop {
             ticker.tick().await;
+            refresh_local_node_storage(&state).await;
 
             let (local_descriptor, peers) = {
                 let mut cluster = state.cluster.lock().await;
@@ -8964,6 +8994,7 @@ async fn cluster_status(State(state): State<ServerState>) -> Json<cluster::Clust
 }
 
 async fn list_nodes(State(state): State<ServerState>) -> Json<Vec<NodeDescriptor>> {
+    refresh_local_node_storage(&state).await;
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
     Json(cluster.list_nodes())

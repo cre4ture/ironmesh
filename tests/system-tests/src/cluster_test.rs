@@ -1222,6 +1222,185 @@ mod tests {
         result
     }
 
+    async fn wait_for_live_storage_stats(
+        client: &reqwest::Client,
+        base_a: &str,
+        base_b: &str,
+        node_id_a: &str,
+        node_id_b: &str,
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            let nodes_a = match client.get(format!("{base_a}/cluster/nodes")).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(ok) => match ok.json::<serde_json::Value>().await {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+
+            let nodes_b = match client.get(format!("{base_b}/cluster/nodes")).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(ok) => match ok.json::<serde_json::Value>().await {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+
+            let Some((a_local_capacity, a_local_free)) = node_storage_tuple(&nodes_a, node_id_a)
+            else {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let Some((a_remote_capacity, a_remote_free)) = node_storage_tuple(&nodes_a, node_id_b)
+            else {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let Some((b_local_capacity, b_local_free)) = node_storage_tuple(&nodes_b, node_id_b)
+            else {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let Some((b_remote_capacity, b_remote_free)) = node_storage_tuple(&nodes_b, node_id_a)
+            else {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+
+            let placeholder_capacity = 1_000_000;
+            let placeholder_free = 800_000;
+            let local_ready = a_local_capacity > 0
+                && a_local_free > 0
+                && b_local_capacity > 0
+                && b_local_free > 0;
+            let peer_ready = a_remote_capacity > 0
+                && a_remote_free > 0
+                && b_remote_capacity > 0
+                && b_remote_free > 0
+                && (a_remote_capacity != placeholder_capacity || a_remote_free != placeholder_free)
+                && (b_remote_capacity != placeholder_capacity || b_remote_free != placeholder_free);
+
+            if local_ready && peer_ready {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "cluster nodes did not report live storage stats at {base_a}/cluster/nodes and {base_b}/cluster/nodes"
+        );
+    }
+
+    fn node_storage_tuple(nodes: &serde_json::Value, node_id: &str) -> Option<(u64, u64)> {
+        nodes.as_array().and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                (entry.get("node_id").and_then(|value| value.as_str()) == Some(node_id)).then(
+                    || {
+                        (
+                            entry
+                                .get("capacity_bytes")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0),
+                            entry
+                                .get("free_bytes")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0),
+                        )
+                    },
+                )
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn autonomous_peer_heartbeat_updates_live_storage_stats_for_all_listed_nodes()
+    -> Result<()> {
+        let bind_a = "127.0.0.1:19146";
+        let bind_b = "127.0.0.1:19147";
+        let node_id_a = "00000000-0000-0000-0000-0000000007e3";
+        let node_id_b = "00000000-0000-0000-0000-0000000007f4";
+
+        let data_a = fresh_data_dir("autonomous-storage-a");
+        let data_b = fresh_data_dir("autonomous-storage-b");
+
+        let heartbeat_env = [
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+        ];
+
+        let mut node_a = start_open_server_with_env_options(
+            bind_a,
+            &data_a,
+            node_id_a,
+            2,
+            None,
+            Some(2),
+            &heartbeat_env,
+        )
+        .await?;
+
+        let mut node_b = start_open_server_with_env_options(
+            bind_b,
+            &data_b,
+            node_id_b,
+            2,
+            None,
+            Some(2),
+            &heartbeat_env,
+        )
+        .await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            register_node(&client, &base_a, node_id_b, &base_b, "dc-b", "rack-b").await?;
+            register_node(&client, &base_b, node_id_a, &base_a, "dc-a", "rack-a").await?;
+
+            wait_for_online_nodes(&client, &base_a, 2, 120).await?;
+            wait_for_online_nodes(&client, &base_b, 2, 120).await?;
+            wait_for_live_storage_stats(&client, &base_a, &base_b, node_id_a, node_id_b, 160)
+                .await?;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
     #[tokio::test]
     async fn autonomous_peer_heartbeat_recovers_after_peer_restart() -> Result<()> {
         let bind_a = "127.0.0.1:19125";

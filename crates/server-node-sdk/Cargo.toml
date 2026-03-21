@@ -21,6 +21,7 @@ blake3.workspace = true
 bytes.workspace = true
 common = { path = "../common" }
 exif = { package = "kamadak-exif", version = "0.6" }
+fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 percent-encoding = "2"
 pbkdf2 = "0.12"

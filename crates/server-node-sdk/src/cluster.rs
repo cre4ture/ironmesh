@@ -198,6 +198,21 @@ impl ClusterService {
         }
     }
 
+    pub fn update_node_storage(
+        &mut self,
+        node_id: NodeId,
+        free_bytes: u64,
+        capacity_bytes: u64,
+    ) -> bool {
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.free_bytes = free_bytes;
+            node.capacity_bytes = capacity_bytes;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn list_nodes(&self) -> Vec<NodeDescriptor> {
         let mut nodes: Vec<_> = self.nodes.values().cloned().collect();
         nodes.sort_by_key(|node| node.node_id);
