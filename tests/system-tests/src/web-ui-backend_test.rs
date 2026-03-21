@@ -5,8 +5,8 @@ mod tests {
     use crate::framework::{
         ChildGuard, EnrolledTestClient, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
         issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client, run_cli,
-        start_authenticated_server, start_rendezvous_service, start_server_with_env, stop_server,
-        wait_for_rendezvous_registered_endpoints, wait_for_url_status,
+        start_authenticated_server, start_open_server_with_env, start_rendezvous_service,
+        stop_server, wait_for_rendezvous_registered_endpoints, wait_for_url_status,
     };
     use anyhow::{Context, Result};
     use client_sdk::BootstrapEndpointUse;
@@ -388,7 +388,7 @@ mod tests {
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
         let mut server =
-            start_server_with_env(server_bind, &data_dir, node_id, 1, &node_env).await?;
+            start_open_server_with_env(server_bind, &data_dir, node_id, 1, &node_env).await?;
         let http = reqwest::Client::new();
 
         let result = async {

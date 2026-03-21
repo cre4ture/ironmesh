@@ -4,8 +4,8 @@
 mod tests {
     use crate::framework::{
         TEST_ADMIN_TOKEN, fresh_data_dir, https_client_with_root_from_data_dir,
-        issue_bootstrap_bundle, start_authenticated_server, start_server_with_public_https_env,
-        stop_server,
+        issue_bootstrap_bundle, start_authenticated_server,
+        start_open_server_with_public_https_env, stop_server,
     };
     use crate::framework_win::start_cfapi_adapter_with_bootstrap;
     use bytes::Bytes;
@@ -661,7 +661,7 @@ mod tests {
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
         let rendezvous_urls = base_url.clone();
 
-        let mut server = start_server_with_public_https_env(
+        let mut server = start_open_server_with_public_https_env(
             bind,
             &server_data_dir,
             "",

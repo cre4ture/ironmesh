@@ -1177,7 +1177,7 @@ mod tests {
             ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
-        let mut node_a = start_server_with_env_options(
+        let mut node_a = start_open_server_with_env_options(
             bind_a,
             &data_a,
             node_id_a,
@@ -1188,7 +1188,7 @@ mod tests {
         )
         .await?;
 
-        let mut node_b = start_server_with_env_options(
+        let mut node_b = start_open_server_with_env_options(
             bind_b,
             &data_b,
             node_id_b,
@@ -1237,7 +1237,7 @@ mod tests {
             ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
-        let mut node_a = start_server_with_env_options(
+        let mut node_a = start_open_server_with_env_options(
             bind_a,
             &data_a,
             node_id_a,
@@ -1248,7 +1248,7 @@ mod tests {
         )
         .await?;
 
-        let mut node_b = start_server_with_env_options(
+        let mut node_b = start_open_server_with_env_options(
             bind_b,
             &data_b,
             node_id_b,
@@ -1272,7 +1272,7 @@ mod tests {
             stop_server(&mut node_b).await;
             wait_for_online_nodes(&client, &base_a, 1, 80).await?;
 
-            node_b = start_server_with_env_options(
+            node_b = start_open_server_with_env_options(
                 bind_b,
                 &data_b,
                 node_id_b,
@@ -1316,7 +1316,7 @@ mod tests {
             ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
-        let mut node_a = start_server_with_env_options(
+        let mut node_a = start_open_server_with_env_options(
             bind_a,
             &data_a,
             node_id_a,
@@ -1327,7 +1327,7 @@ mod tests {
         )
         .await?;
 
-        let mut node_b = start_server_with_env_options(
+        let mut node_b = start_open_server_with_env_options(
             bind_b,
             &data_b,
             node_id_b,
@@ -1352,7 +1352,7 @@ mod tests {
                 stop_server(&mut node_b).await;
                 wait_for_online_nodes(&client, &base_a, 1, 120).await?;
 
-                node_b = start_server_with_env_options(
+                node_b = start_open_server_with_env_options(
                     bind_b,
                     &data_b,
                     node_id_b,
@@ -1486,7 +1486,7 @@ mod tests {
         let remove_node_id = "00000000-0000-0000-0000-0000000000e2";
 
         let data_dir = fresh_data_dir("node-decommission");
-        let mut server = start_server_with_config(bind, &data_dir, local_node_id, 2).await?;
+        let mut server = start_open_server_with_config(bind, &data_dir, local_node_id, 2).await?;
 
         let base_url = format!("http://{bind}");
         let http = reqwest::Client::new();
@@ -2226,7 +2226,7 @@ mod tests {
         let node_id = "00000000-0000-0000-0000-0000000006a1";
         let data_dir = fresh_data_dir("internal-mtls-requires-client-cert");
 
-        let mut server = start_server_with_config(bind, &data_dir, node_id, 1).await?;
+        let mut server = start_open_server_with_config(bind, &data_dir, node_id, 1).await?;
         let internal_base = internal_base_url_from_public_bind(bind)?;
 
         let https_only = https_client_with_root_from_data_dir(&data_dir)?;
@@ -2263,8 +2263,8 @@ mod tests {
         let data_a = fresh_data_dir("internal-mtls-heartbeat-a");
         let data_b = fresh_data_dir("internal-mtls-heartbeat-b");
 
-        let mut node_a = start_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
-        let mut node_b = start_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_a = start_open_server_with_config(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_open_server_with_config(bind_b, &data_b, node_id_b, 2).await?;
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
@@ -2581,8 +2581,10 @@ mod tests {
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
-        let mut node_a = start_server_with_env(bind_a, &data_a, node_id_a, 2, &node_env).await?;
-        let mut node_b = start_server_with_env(bind_b, &data_b, node_id_b, 2, &node_env).await?;
+        let mut node_a =
+            start_open_server_with_env(bind_a, &data_a, node_id_a, 2, &node_env).await?;
+        let mut node_b =
+            start_open_server_with_env(bind_b, &data_b, node_id_b, 2, &node_env).await?;
         let http = reqwest::Client::new();
 
         let result = async {
@@ -2837,7 +2839,7 @@ mod tests {
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
-        let mut node = start_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let mut node = start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
         let http = reqwest::Client::new();
 
         let result = async {
@@ -2945,7 +2947,7 @@ mod tests {
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
-        let mut node = start_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let mut node = start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
         let http = reqwest::Client::new();
 
         let result = async {

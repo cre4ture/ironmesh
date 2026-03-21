@@ -237,9 +237,9 @@ impl Drop for ChildGuard {
 }
 
 #[allow(dead_code)]
-pub async fn start_server(bind: &str) -> Result<ChildGuard> {
+pub async fn start_open_server(bind: &str) -> Result<ChildGuard> {
     let data_dir = fresh_data_dir("default-server");
-    start_server_with_data_dir(bind, &data_dir).await
+    start_open_server_with_data_dir(bind, &data_dir).await
 }
 
 pub async fn start_authenticated_server(
@@ -275,7 +275,7 @@ pub async fn start_authenticated_server_with_env_options(
     ];
     let mut merged_env = env.to_vec();
     merged_env.extend_from_slice(extra_env);
-    start_server_with_env_options(
+    start_open_server_with_env_options(
         bind,
         data_dir,
         node_id,
@@ -349,20 +349,20 @@ pub async fn start_zero_touch_server(bind: &str, data_dir: &Path) -> Result<Chil
     Ok(ChildGuard::new(child))
 }
 
-pub async fn start_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
-    start_server_with_config(bind, data_dir, "", 3).await
+pub async fn start_open_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
+    start_open_server_with_config(bind, data_dir, "", 3).await
 }
 
-pub async fn start_server_with_config(
+pub async fn start_open_server_with_config(
     bind: &str,
     data_dir: &Path,
     node_id: &str,
     replication_factor: usize,
 ) -> Result<ChildGuard> {
-    start_server_with_options(bind, data_dir, node_id, replication_factor, None, None).await
+    start_open_server_with_options(bind, data_dir, node_id, replication_factor, None, None).await
 }
 
-pub async fn start_server_with_options(
+pub async fn start_open_server_with_options(
     bind: &str,
     data_dir: &Path,
     node_id: &str,
@@ -370,7 +370,7 @@ pub async fn start_server_with_options(
     metadata_commit_mode: Option<&str>,
     heartbeat_timeout_secs: Option<u64>,
 ) -> Result<ChildGuard> {
-    start_server_with_env_options(
+    start_open_server_with_env_options(
         bind,
         data_dir,
         node_id,
@@ -382,14 +382,14 @@ pub async fn start_server_with_options(
     .await
 }
 
-pub async fn start_server_with_env(
+pub async fn start_open_server_with_env(
     bind: &str,
     data_dir: &Path,
     node_id: &str,
     replication_factor: usize,
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
-    start_server_with_env_options(
+    start_open_server_with_env_options(
         bind,
         data_dir,
         node_id,
@@ -402,7 +402,7 @@ pub async fn start_server_with_env(
 }
 
 #[allow(dead_code)]
-pub async fn start_server_with_public_https_env(
+pub async fn start_open_server_with_public_https_env(
     bind: &str,
     data_dir: &Path,
     node_id: &str,
@@ -422,7 +422,7 @@ pub async fn start_server_with_public_https_env(
     .await
 }
 
-pub async fn start_server_with_env_options(
+pub async fn start_open_server_with_env_options(
     bind: &str,
     data_dir: &Path,
     node_id: &str,
