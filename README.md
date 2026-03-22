@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/ironmesh-logo.svg" alt="ironmesh logo" width="560" />
+</p>
+
 # ironmesh
 
 Rust workspace for a distributed file storage platform with server, client SDK, CLI + web UI, and mobile app shells.

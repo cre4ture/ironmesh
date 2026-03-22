@@ -1,8 +1,7 @@
 import { getSetupStatus } from "@ironmesh/api";
-import { PageHeader } from "@ironmesh/ui";
+import { IronmeshBrand, PageHeader } from "@ironmesh/ui";
 import { Alert, AppShell, Badge, Burger, Button, Center, Group, Loader, NavLink, ScrollArea, Stack, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { ironmeshProductName } from "@ironmesh/config";
 import { useEffect, useState } from "react";
 import { serverAdminRoutes } from "./routes";
 import { AdminAccessDrawer } from "../components/AdminAccessDrawer";
@@ -81,12 +80,7 @@ export function ServerAdminShell() {
           <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
             <Group gap="sm">
               <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-              <Stack gap={0}>
-                <Text fw={800} tt="uppercase" size="sm" c="teal">
-                  {ironmeshProductName}
-                </Text>
-                <Text fw={700}>Server Admin</Text>
-              </Stack>
+              <IronmeshBrand surfaceLabel="Server Admin" />
             </Group>
             <Group gap="sm">
               <Badge color={surfaceMode === "setup" ? "blue" : sessionStatus?.authenticated ? "teal" : "gray"}>

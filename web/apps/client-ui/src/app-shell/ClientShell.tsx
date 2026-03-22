@@ -32,6 +32,7 @@ import {
   IconServer
 } from "@tabler/icons-react";
 import {
+  IronmeshBrand,
   JsonBlock,
   PageHeader,
   StatCard
@@ -168,12 +169,7 @@ export function ClientShell() {
           <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
             <Group gap="sm">
               <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-              <Stack gap={0}>
-                <Text fw={800} tt="uppercase" size="sm" c="teal">
-                  ironmesh
-                </Text>
-                <Text fw={700}>Client UI</Text>
-              </Stack>
+              <IronmeshBrand surfaceLabel="Client UI" />
             </Group>
             <Group gap="sm">
               {ping ? <Badge variant="light">{ping.service}</Badge> : null}

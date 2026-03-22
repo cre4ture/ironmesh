@@ -10,6 +10,7 @@ import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
 import android.util.Log
 import android.webkit.MimeTypeMap
+import io.ironmesh.android.R
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
@@ -44,7 +45,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             DocumentsContract.Root.FLAG_SUPPORTS_CREATE or
                 DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD,
             mimeTypes = "*/*",
-            icon = android.R.drawable.sym_def_app_icon,
+            icon = R.drawable.ic_ironmesh_mark,
         )
         return result
     }
