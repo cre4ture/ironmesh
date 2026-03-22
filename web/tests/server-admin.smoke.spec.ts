@@ -6,6 +6,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByRole("banner").getByText("v0.1.0", { exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "node-alpha", exact: true })).toBeVisible();
   await expect(page.getByText("runtime ready")).toBeVisible();
   await expect(page.getByText("This node", { exact: true })).toBeVisible();

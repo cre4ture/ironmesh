@@ -60,6 +60,7 @@ import {
   type StoreListResponse,
   type VersionGraphResponse
 } from "@ironmesh/api";
+import { ironmeshUiVersionLabel } from "@ironmesh/config";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { GalleryPage } from "../pages/GalleryPage";
 
@@ -174,6 +175,7 @@ export function ClientShell() {
             </Group>
             <Group gap="sm">
               {ping ? <Badge variant="light">{ping.service}</Badge> : null}
+              <Badge variant="outline">{ironmeshUiVersionLabel}</Badge>
               <Badge color="teal" variant="filled">
                 Transport-aware
               </Badge>

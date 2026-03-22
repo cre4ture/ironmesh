@@ -2,7 +2,7 @@ import { getSetupStatus } from "@ironmesh/api";
 import { PageHeader } from "@ironmesh/ui";
 import { Alert, AppShell, Badge, Burger, Button, Center, Group, Loader, NavLink, ScrollArea, Stack, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { ironmeshProductName } from "@ironmesh/config";
+import { ironmeshProductName, ironmeshUiVersionLabel } from "@ironmesh/config";
 import { useEffect, useState } from "react";
 import { serverAdminRoutes } from "./routes";
 import { AdminAccessDrawer } from "../components/AdminAccessDrawer";
@@ -89,6 +89,7 @@ export function ServerAdminShell() {
               </Stack>
             </Group>
             <Group gap="sm">
+              <Badge variant="outline">{ironmeshUiVersionLabel}</Badge>
               <Badge color={surfaceMode === "setup" ? "blue" : sessionStatus?.authenticated ? "teal" : "gray"}>
                 {surfaceMode === "setup"
                   ? "setup mode"

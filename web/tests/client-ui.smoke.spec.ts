@@ -7,6 +7,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   await expect(page.getByRole("banner").getByText("cli-client-web", { exact: true })).toBeVisible();
+  await expect(page.getByRole("banner").getByText("v0.1.0", { exact: true })).toBeVisible();
   await expect(page.getByText("Transport-aware", { exact: true })).toBeVisible();
   await expect(page.getByText("Active route")).toBeVisible();
   await expect(page.getByText("Direct")).toBeVisible();
