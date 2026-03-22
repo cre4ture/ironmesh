@@ -4,6 +4,10 @@
 
 Idea.
 
+Implementation plan:
+
+- `docs/read-through-chunk-cache-implementation-plan.md`
+
 ## Motivation
 
 The current storage and replication model is optimized for full-object replicas:
