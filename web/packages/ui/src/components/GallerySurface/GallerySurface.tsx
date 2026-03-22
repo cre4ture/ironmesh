@@ -15,9 +15,16 @@ import {
   SimpleGrid,
   Stack,
   Text,
-  TextInput
+  TextInput,
+  ThemeIcon
 } from "@mantine/core";
-import { IconChevronLeft, IconChevronRight, IconRefresh } from "@tabler/icons-react";
+import {
+  IconArrowUp,
+  IconChevronLeft,
+  IconChevronRight,
+  IconFolder,
+  IconRefresh
+} from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 
@@ -65,6 +72,14 @@ export type GalleryImageRequests = {
   original?: GalleryPreviewRequest | null;
 };
 
+type GalleryNavigationItem = {
+  key: string;
+  kind: "up" | "prefix";
+  label: string;
+  description: string;
+  targetPrefix: string;
+};
+
 type GallerySurfaceProps = {
   intro?: string;
   previewHint: string;
@@ -102,6 +117,11 @@ export function GallerySurface({
   const imageEntries = sortGalleryEntries(
     (entriesPayload?.entries ?? []).filter(isGalleryImageEntry),
     sortOrder
+  );
+  const currentGalleryPrefix = normalizeGalleryPrefix(entriesPayload?.prefix ?? prefix);
+  const navigationItems = buildGalleryNavigationItems(
+    entriesPayload?.entries ?? [],
+    currentGalleryPrefix
   );
   const readyCount = imageEntries.filter((entry) => entry.media?.status === "ready").length;
   const pendingCount = imageEntries.filter((entry) => entry.media?.status === "pending").length;
@@ -290,6 +310,9 @@ export function GallerySurface({
               </Group>
               <Group gap="xs">
                 <Badge variant="light">{imageEntries.length} images</Badge>
+                <Badge color="blue" variant="light">
+                  {navigationItems.filter((item) => item.kind === "prefix").length} folders
+                </Badge>
                 <Badge color="green" variant="light">
                   {readyCount} ready
                 </Badge>
@@ -314,7 +337,7 @@ export function GallerySurface({
         </Grid.Col>
 
         <Grid.Col span={{ base: 12, xl: 8 }}>
-          {imageEntries.length === 0 ? (
+          {imageEntries.length === 0 && navigationItems.length === 0 ? (
             <Card withBorder radius="md" padding="xl">
               <Stack gap="xs" align="center">
                 <Text fw={700}>No image objects in view</Text>
@@ -332,16 +355,49 @@ export function GallerySurface({
                 lg: thumbnailsPerRow
               }}
             >
-              {imageEntries.map((entry) => {
-                const imageRequests = getImageRequests(entry, snapshotId);
-                return (
-                  <Card
-                  key={entry.path}
+              {navigationItems.map((item) => (
+                <Card
+                  key={item.key}
                   withBorder
                   radius="md"
                   padding="sm"
                   style={{ cursor: "pointer" }}
-                  onClick={() => setSelectedPath(entry.path)}
+                  onClick={() => void refreshEntries(item.targetPrefix)}
+                >
+                  <Card.Section>
+                    <AspectRatio ratio={1}>
+                      <Center style={{ height: "100%", background: "var(--mantine-color-blue-0)" }}>
+                        <Stack gap="xs" align="center">
+                          <ThemeIcon size={54} radius="xl" variant="light" color="blue">
+                            {item.kind === "up" ? <IconArrowUp size={28} /> : <IconFolder size={28} />}
+                          </ThemeIcon>
+                          <Text fw={700}>{item.label}</Text>
+                        </Stack>
+                      </Center>
+                    </AspectRatio>
+                  </Card.Section>
+
+                  <Stack gap={6} mt="sm">
+                    <Badge color="blue" variant="light">
+                      {item.kind === "up" ? "navigation" : "folder"}
+                    </Badge>
+                    <Text size="sm" c="dimmed">
+                      {item.description}
+                    </Text>
+                  </Stack>
+                </Card>
+              ))}
+
+              {imageEntries.map((entry) => {
+                const imageRequests = getImageRequests(entry, snapshotId);
+                return (
+                  <Card
+                    key={entry.path}
+                    withBorder
+                    radius="md"
+                    padding="sm"
+                    style={{ cursor: "pointer" }}
+                    onClick={() => setSelectedPath(entry.path)}
                   >
                     <Card.Section>
                       <AspectRatio ratio={1}>
@@ -804,6 +860,10 @@ function isGalleryImageEntry(entry: GalleryEntry): boolean {
   return imageExtensions.some((extension) => lowerPath.endsWith(extension));
 }
 
+function isGalleryPrefixEntry(entry: GalleryEntry): boolean {
+  return entry.entry_type === "prefix" || entry.path.endsWith("/");
+}
+
 function sortGalleryEntries(entries: GalleryEntry[], sortOrder: GallerySortOrder): GalleryEntry[] {
   return [...entries].sort((left, right) => {
     if (sortOrder === "path_asc") {
@@ -848,6 +908,72 @@ function requestSignature(request: GalleryPreviewRequest | null | undefined): st
     Object.entries(request.headers ?? {}).sort(([left], [right]) => left.localeCompare(right))
   );
   return `${request.url}::${headers}`;
+}
+
+function buildGalleryNavigationItems(
+  entries: GalleryEntry[],
+  currentPrefix: string
+): GalleryNavigationItem[] {
+  const items: GalleryNavigationItem[] = [];
+  const seenPrefixes = new Set<string>();
+
+  if (currentPrefix) {
+    const parent = parentPrefix(currentPrefix);
+    items.push({
+      key: `up:${currentPrefix}`,
+      kind: "up",
+      label: "Up one level",
+      description: parent || "Return to the root folder",
+      targetPrefix: parent
+    });
+  }
+
+  for (const entry of entries) {
+    if (!isGalleryPrefixEntry(entry)) {
+      continue;
+    }
+
+    const normalizedPath = normalizeGalleryPrefix(entry.path);
+    if (!normalizedPath || normalizedPath === currentPrefix) {
+      continue;
+    }
+    if (!normalizedPath.startsWith(currentPrefix)) {
+      continue;
+    }
+
+    const relativePath = normalizedPath.slice(currentPrefix.length);
+    const trimmedRelative = relativePath.replace(/\/$/, "");
+    if (!trimmedRelative || trimmedRelative.includes("/")) {
+      continue;
+    }
+    if (seenPrefixes.has(normalizedPath)) {
+      continue;
+    }
+
+    seenPrefixes.add(normalizedPath);
+    items.push({
+      key: `prefix:${normalizedPath}`,
+      kind: "prefix",
+      label: `${trimmedRelative}/`,
+      description: `Open ${normalizedPath}`,
+      targetPrefix: normalizedPath
+    });
+  }
+
+  return items.sort((left, right) => {
+    if (left.kind !== right.kind) {
+      return left.kind === "up" ? -1 : 1;
+    }
+    return left.label.localeCompare(right.label);
+  });
+}
+
+function normalizeGalleryPrefix(path: string): string {
+  const trimmed = path.trim().replace(/^\/+/, "");
+  if (!trimmed) {
+    return "";
+  }
+  return `${trimmed.replace(/\/+$/, "")}/`;
 }
 
 function formatTakenAt(value: number): string {

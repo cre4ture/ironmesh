@@ -69,6 +69,13 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("button", { name: "Next image" }).click();
   await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
+  await page.getByLabel("Prefix").fill("docs/");
+  await page.getByRole("button", { name: "Load" }).click();
+  await expect(page.getByText("nested/", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Up one level")).toBeVisible();
+  await expect(page.getByText("No image objects in view")).toHaveCount(0);
+  await page.getByText("Up one level").click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
 
   await page.getByText("Cluster", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
