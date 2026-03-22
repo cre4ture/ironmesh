@@ -18,14 +18,18 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use uuid::Uuid;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::CloudFilters::{
         CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PLACEHOLDER_INFO_STANDARD,
-        CF_PLACEHOLDER_STANDARD_INFO, CfGetPlaceholderInfo,
+        CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE_PLACEHOLDER, CfGetPlaceholderInfo,
+        CfGetPlaceholderStateFromAttributeTag,
     };
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
 
     const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".ironmesh-connection.json";
     const DEFAULT_CLIENT_IDENTITY_FILE_NAME: &str = ".ironmesh-client-identity.json";
@@ -250,6 +254,52 @@ mod tests {
     fn placeholder_standard_info(path: &Path) -> anyhow::Result<CF_PLACEHOLDER_STANDARD_INFO> {
         let file = File::open(path)?;
         placeholder_standard_info_for_file(&file)
+    }
+
+    fn path_placeholder_state(path: &Path) -> anyhow::Result<u32> {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut find_data = WIN32_FIND_DATAW::default();
+        let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut find_data) };
+        if handle == INVALID_HANDLE_VALUE {
+            anyhow::bail!(
+                "FindFirstFileW failed for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let state = unsafe {
+            CfGetPlaceholderStateFromAttributeTag(find_data.dwFileAttributes, find_data.dwReserved0)
+        };
+        unsafe {
+            FindClose(handle);
+        }
+        Ok(state)
+    }
+
+    async fn wait_for_placeholder_state(path: &Path, retries: usize) {
+        for _ in 0..retries {
+            if let Ok(state) = path_placeholder_state(path)
+                && (state & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let final_state = path_placeholder_state(path)
+            .map(|state| format!("placeholder_state=0x{state:08x}"))
+            .unwrap_or_else(|err| err.to_string());
+        panic!(
+            "placeholder state never appeared at {}: {}",
+            path.display(),
+            final_state
+        );
     }
 
     async fn wait_for_placeholder_in_sync(path: &Path, retries: usize) {
@@ -522,6 +572,7 @@ mod tests {
 
         let local_file = sync_root.join(key.replace('/', "\\"));
         wait_for_path(&local_file, 200).await;
+        wait_for_placeholder_state(&local_file, 60).await;
 
         pin_cfapi_placeholder(&sync_root, key, true)
             .await

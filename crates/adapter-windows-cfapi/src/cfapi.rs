@@ -1,10 +1,11 @@
-use crate::helpers::hresult_nonneg;
-use anyhow::Result;
+use crate::helpers::{hresult_nonneg, utf16_path};
+use anyhow::{Context, Result};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Storage::CloudFilters::{
-    CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_SET_PIN_FLAGS,
+    CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE,
+    CF_PLACEHOLDER_STATE_PLACEHOLDER, CF_SET_PIN_FLAGS,
 };
 
 pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
@@ -181,11 +182,32 @@ pub fn is_placeholder(file: &std::fs::File) -> bool {
     get_and_log_placeholder_info(file, "", "").is_ok()
 }
 
-pub fn path_is_placeholder(path: &Path) -> bool {
-    match std::fs::File::open(path) {
-        Ok(file) => is_placeholder(&file),
-        Err(_) => false,
+pub fn path_placeholder_state(path: &Path) -> Result<CF_PLACEHOLDER_STATE> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::CloudFilters::CfGetPlaceholderStateFromAttributeTag;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+
+    let wide_path = utf16_path(path);
+    let mut find_data = WIN32_FIND_DATAW::default();
+    let handle = unsafe { FindFirstFileW(wide_path.as_ptr(), &mut find_data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("FindFirstFileW failed for {}", path.display()));
     }
+
+    let state = unsafe {
+        CfGetPlaceholderStateFromAttributeTag(find_data.dwFileAttributes, find_data.dwReserved0)
+    };
+    unsafe {
+        FindClose(handle);
+    }
+    Ok(state)
+}
+
+pub fn path_is_placeholder(path: &Path) -> bool {
+    path_placeholder_state(path)
+        .map(|state| (state & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0)
+        .unwrap_or(false)
 }
 
 pub fn try_convert_materialized_file(
@@ -193,6 +215,14 @@ pub fn try_convert_materialized_file(
     rel_path: &str,
     metadata: &std::fs::Metadata,
 ) {
+    if path_is_placeholder(file_path) {
+        eprintln!(
+            "x: skipping convert for {} because placeholder state already present",
+            rel_path
+        );
+        return;
+    }
+
     {
         let attrs = metadata.file_attributes();
         eprintln!(
@@ -208,28 +238,21 @@ pub fn try_convert_materialized_file(
         .open(file_path)
     {
         Ok(fh_file) => {
-            if is_placeholder(&fh_file) {
+            let result = cf_convert_to_placeholder(&fh_file);
+            if result.is_ok() {
                 eprintln!(
-                    "x: skipping convert for {} because placeholder info present",
+                    "x: converted materialized file to placeholder: {}",
                     rel_path
                 );
             } else {
-                let result = cf_convert_to_placeholder(&fh_file);
-                if result.is_ok() {
-                    eprintln!(
-                        "x: converted materialized file to placeholder: {}",
-                        rel_path
-                    );
-                } else {
-                    eprintln!(
-                        "x: failed to convert materialized file to placeholder {}: {:?}",
-                        rel_path,
-                        result.err()
-                    );
-                    if let Ok(m) = std::fs::metadata(file_path) {
-                        let attrs = m.file_attributes();
-                        eprintln!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
-                    }
+                eprintln!(
+                    "x: failed to convert materialized file to placeholder {}: {:?}",
+                    rel_path,
+                    result.err()
+                );
+                if let Ok(m) = std::fs::metadata(file_path) {
+                    let attrs = m.file_attributes();
+                    eprintln!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
                 }
             }
         }

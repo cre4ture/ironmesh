@@ -38,17 +38,46 @@ impl SyncRootMonitor {
         }
     }
 
+    pub fn seed_seen(&mut self) {
+        self.seen = self.snapshot_entries();
+    }
+
     pub fn walk(&mut self) {
+        let mut current = self.snapshot_entries();
+        let paths = current.keys().cloned().collect::<Vec<_>>();
+        for rel_path in paths {
+            let path = self
+                .sync_root
+                .join(rel_path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()));
+            self.handle_entry(&path, rel_path, &mut current);
+        }
+
+        self.handle_deleted_entries(&current);
+        self.seen = current;
+    }
+
+    fn snapshot_entries(&self) -> HashMap<String, SeenEntry> {
         let mut current = HashMap::new();
         let walker = walkdir::WalkDir::new(&self.sync_root).into_iter();
         for entry in walker.flatten() {
             let path = entry.path();
             let rel_path = path_to_relative(&self.sync_root, &path.to_string_lossy());
-            self.handle_entry(path, rel_path, &mut current);
+            if rel_path.is_empty()
+                || is_internal_client_identity_relative_path(&rel_path)
+                || is_internal_connection_bootstrap_relative_path(&rel_path)
+            {
+                continue;
+            }
+
+            current.insert(
+                rel_path,
+                SeenEntry {
+                    is_dir: entry.file_type().is_dir(),
+                },
+            );
         }
 
-        self.handle_deleted_entries(&current);
-        self.seen = current;
+        current
     }
 
     fn handle_entry(
@@ -65,20 +94,16 @@ impl SyncRootMonitor {
         {
             return;
         }
-        let metadata = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => return,
+        let entry = match current.get(&rel_path).copied() {
+            Some(entry) => entry,
+            None => return,
         };
-        let entry = SeenEntry {
-            is_dir: metadata.is_dir(),
-        };
-        current.insert(rel_path.clone(), entry);
 
         if self.seen.get(&rel_path) == Some(&entry) {
             return;
         }
 
-        if metadata.is_dir() {
+        if entry.is_dir {
             eprintln!("{}: detected new directory {}", self.name, rel_path);
             let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
             let remote_path = directory_marker_path(&rel_path);
@@ -86,6 +111,10 @@ impl SyncRootMonitor {
                 .uploader
                 .upload_reader(&remote_path, &mut cursor, b"<DIR>".len() as u64);
         } else {
+            let metadata = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return,
+            };
             // Check if file is already a CFAPI placeholder using Windows file attributes
             let is_placeholder = path_is_placeholder(path);
             if is_placeholder {
@@ -177,5 +206,76 @@ fn directory_marker_path(path: &str) -> String {
         String::new()
     } else {
         format!("{}{}", trimmed.replace('\\', "/"), "/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockUploader {
+        uploads: Mutex<Vec<String>>,
+        deletes: Mutex<Vec<String>>,
+    }
+
+    impl Uploader for MockUploader {
+        fn upload_reader(
+            &self,
+            path: &str,
+            reader: &mut dyn Read,
+            _length: u64,
+        ) -> anyhow::Result<Option<String>> {
+            let mut sink = Vec::new();
+            let _ = reader.read_to_end(&mut sink)?;
+            self.uploads
+                .lock()
+                .expect("uploads lock poisoned")
+                .push(path.to_string());
+            Ok(None)
+        }
+
+        fn delete_path(&self, path: &str) -> anyhow::Result<()> {
+            self.deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .push(path.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn seed_seen_makes_startup_walk_passive_for_existing_entries() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root = std::env::temp_dir().join(format!("ironmesh-monitor-seed-seen-{unique}"));
+        std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create sync root");
+        std::fs::write(sync_root.join("docs").join("readme.txt"), b"hello")
+            .expect("failed to seed existing file");
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new("monitor-test", sync_root.clone(), uploader.clone());
+        monitor.seed_seen();
+        monitor.walk();
+
+        assert!(
+            uploader
+                .uploads
+                .lock()
+                .expect("uploads lock poisoned")
+                .is_empty(),
+            "startup walk should not upload pre-existing entries after seed_seen"
+        );
+        assert!(
+            uploader
+                .deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .is_empty(),
+            "startup walk should not emit deletes after seed_seen"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
     }
 }
