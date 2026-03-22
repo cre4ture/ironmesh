@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [dependencies]
 aes-gcm-siv = "0.11"
@@ -36,3 +37,6 @@ client-sdk = { path = "../../crates/client-sdk" }
 reqwest.workspace = true
 rcgen = "0.14"
 server-node-sdk = { path = "../../crates/server-node-sdk" }
+
+[target.'cfg(windows)'.build-dependencies]
+winres.workspace = true

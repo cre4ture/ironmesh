@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -13,3 +14,6 @@ adapter-windows-cfapi = { path = "../../crates/adapter-windows-cfapi" }
 [dev-dependencies]
 assert_cmd.workspace = true
 git-version.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winres.workspace = true

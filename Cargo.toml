@@ -44,3 +44,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 async-trait = "0.1"
 notify = "6"
+winres = "0.1"

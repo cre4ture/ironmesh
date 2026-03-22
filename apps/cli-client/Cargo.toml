@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -19,3 +20,6 @@ web-ui-backend = { path = "../../crates/web-ui-backend" }
 
 [dev-dependencies]
 assert_cmd.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winres.workspace = true
