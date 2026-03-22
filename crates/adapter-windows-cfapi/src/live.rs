@@ -1,5 +1,6 @@
-use crate::runtime::{Hydrator, Uploader};
+use crate::runtime::{HydrationProgress, HydrationRequest, HydrationResult, Hydrator, Uploader};
 use anyhow::{Context, Result};
+use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
     ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
@@ -7,6 +8,7 @@ use client_sdk::{
 use reqwest::Url;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::io::Write;
 
 #[derive(Clone)]
 pub struct ServerNodeHydrator {
@@ -56,6 +58,50 @@ impl Hydrator for ServerNodeHydrator {
             )
             .with_context(|| format!("failed to fetch object for path {path}"))?;
         Ok(bytes)
+    }
+
+    fn hydrate_range_to_writer(
+        &self,
+        request: HydrationRequest<'_>,
+        writer: &mut dyn Write,
+        on_progress: &mut dyn FnMut(HydrationProgress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<HydrationResult> {
+        eprintln!(
+            "hydrating range path {path} from server offset={} length={}",
+            request.offset,
+            request.length,
+            path = request.path,
+        );
+        let result = self
+            .sdk
+            .download_range_to_writer_with_progress_blocking(
+                DownloadRangeRequest {
+                    key: request.path,
+                    snapshot: None,
+                    version: None,
+                    start: request.offset,
+                    length: request.length,
+                },
+                writer,
+                &mut |progress: DownloadProgress| {
+                    on_progress(HydrationProgress {
+                        object_size_bytes: progress.object_size_bytes,
+                        range_start: progress.range_start,
+                        range_length: progress.range_length,
+                        bytes_transferred: progress.bytes_downloaded,
+                    });
+                },
+                should_cancel,
+            )
+            .with_context(|| format!("failed to fetch ranged object for path {}", request.path))?;
+
+        Ok(HydrationResult {
+            object_size_bytes: result.object_size_bytes,
+            range_start: result.range_start,
+            range_length: result.range_length,
+            bytes_transferred: result.bytes_downloaded,
+        })
     }
 }
 

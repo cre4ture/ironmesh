@@ -7,7 +7,7 @@ mod tests {
         issue_bootstrap_bundle, start_authenticated_server,
         start_open_server_with_public_https_env, stop_server,
     };
-    use crate::framework_win::start_cfapi_adapter_with_bootstrap;
+    use crate::framework_win::{pin_cfapi_placeholder, start_cfapi_adapter_with_bootstrap};
     use bytes::Bytes;
     use client_sdk::{
         ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
@@ -23,8 +23,8 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
     use windows_sys::Win32::Storage::CloudFilters::{
-        CF_IN_SYNC_STATE_IN_SYNC, CF_PLACEHOLDER_INFO_STANDARD, CF_PLACEHOLDER_STANDARD_INFO,
-        CfGetPlaceholderInfo,
+        CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PLACEHOLDER_INFO_STANDARD,
+        CF_PLACEHOLDER_STANDARD_INFO, CfGetPlaceholderInfo,
     };
 
     const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".ironmesh-connection.json";
@@ -478,6 +478,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
     }
 
+    async fn run_cfapi_pin_hydration_case(bind: &str, key: &str, payload: &[u8]) {
+        let sync_root = fresh_data_dir("cfapi-pin-hydration-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-pin-hydration")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
+
+        let path_parts: Vec<&str> = key.split('/').collect();
+        let mut current_dir = String::new();
+        for dir in path_parts.iter().take(path_parts.len() - 1) {
+            if !current_dir.is_empty() {
+                current_dir.push('/');
+            }
+            current_dir.push_str(dir);
+            let dir_key = format!("{current_dir}/");
+            fixture
+                .sdk
+                .put(dir_key, Bytes::new())
+                .await
+                .expect("failed to put folder");
+        }
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from(payload.to_vec()))
+            .await
+            .expect("failed to seed remote object");
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.pin.hydration.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Pin Hydration Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let local_file = sync_root.join(key.replace('/', "\\"));
+        wait_for_path(&local_file, 200).await;
+
+        pin_cfapi_placeholder(&sync_root, key, true)
+            .await
+            .expect("failed to pin placeholder locally");
+        wait_for_hydrated_payload(&local_file, payload, 200).await;
+
+        let after_pin = placeholder_standard_info(&local_file)
+            .expect("failed to read placeholder info after pin");
+        assert!(
+            after_pin.OnDiskDataSize >= payload.len() as i64,
+            "expected pin to hydrate file locally, got on_disk={} payload_len={}",
+            after_pin.OnDiskDataSize,
+            payload.len()
+        );
+        assert_eq!(
+            after_pin.PinState, CF_PIN_STATE_PINNED,
+            "expected pin request to mark the placeholder as pinned"
+        );
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
     async fn run_cfapi_remote_additions_case(
         bind: &str,
         folder_key: &str,
@@ -562,6 +630,17 @@ mod tests {
             "\nlarge-hydration-tail"
         );
         run_cfapi_hydration_case("127.0.0.1:19093", "hydrate/large.bin", payload.as_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_placeholder_pin_hydrates_from_remote_large() {
+        let payload = format!("{}{}", "P".repeat(3 * 1024 * 1024), "\npin-hydration-tail");
+        run_cfapi_pin_hydration_case(
+            "127.0.0.1:19101",
+            "hydrate/pinned-large.bin",
+            payload.as_bytes(),
+        )
+        .await;
     }
 
     #[tokio::test]

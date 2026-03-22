@@ -1,11 +1,13 @@
 use crate::helpers::hresult_nonneg;
 use anyhow::Result;
 use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
-use windows_sys::Win32::Storage::CloudFilters::CF_PLACEHOLDER_STANDARD_INFO;
+use windows_sys::Win32::Storage::CloudFilters::{
+    CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_SET_PIN_FLAGS,
+};
 
 pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::CloudFilters::CfConvertToPlaceholder;
 
     let hr = unsafe {
@@ -52,7 +54,6 @@ pub fn cf_set_in_sync_state(
     in_sync_state: windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE,
     in_sync_usn: Option<&mut i64>,
 ) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::CloudFilters::{CF_SET_IN_SYNC_FLAG_NONE, CfSetInSyncState};
 
     let hr = unsafe {
@@ -66,6 +67,47 @@ pub fn cf_set_in_sync_state(
         )
     };
     hresult_nonneg(hr, "CfSetInSyncState")
+}
+
+pub fn cf_set_pin_state(
+    file: &std::fs::File,
+    pin_state: CF_PIN_STATE,
+    pin_flags: CF_SET_PIN_FLAGS,
+) -> Result<()> {
+    use windows_sys::Win32::Storage::CloudFilters::CfSetPinState;
+
+    let hr = unsafe {
+        CfSetPinState(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            pin_state,
+            pin_flags,
+            std::ptr::null_mut(),
+        )
+    };
+    hresult_nonneg(hr, "CfSetPinState")
+}
+
+pub fn cf_report_provider_progress2(
+    connection_key: CF_CONNECTION_KEY,
+    transfer_key: i64,
+    request_key: i64,
+    provider_progress_total: i64,
+    provider_progress_completed: i64,
+    target_session_id: u32,
+) -> Result<()> {
+    use windows_sys::Win32::Storage::CloudFilters::CfReportProviderProgress2;
+
+    let hr = unsafe {
+        CfReportProviderProgress2(
+            connection_key,
+            transfer_key,
+            request_key,
+            provider_progress_total,
+            provider_progress_completed,
+            target_session_id,
+        )
+    };
+    hresult_nonneg(hr, "CfReportProviderProgress2")
 }
 
 pub fn cf_get_placeholder_standard_info(

@@ -90,6 +90,31 @@ pub struct ObjectHeadInfo {
     pub accept_ranges: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub object_size_bytes: u64,
+    pub range_start: u64,
+    pub range_length: u64,
+    pub bytes_downloaded: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadRangeResult {
+    pub object_size_bytes: u64,
+    pub range_start: u64,
+    pub range_length: u64,
+    pub bytes_downloaded: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadRangeRequest<'a> {
+    pub key: &'a str,
+    pub snapshot: Option<&'a str>,
+    pub version: Option<&'a str>,
+    pub start: u64,
+    pub length: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct UploadSessionStartRequest {
     key: String,
@@ -991,6 +1016,150 @@ impl IronMeshClient {
         Ok(())
     }
 
+    async fn download_range_to_writer_with_progress(
+        &self,
+        request: DownloadRangeRequest<'_>,
+        writer: &mut dyn Write,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<DownloadRangeResult> {
+        let key = request.key;
+        let snapshot = request.snapshot;
+        let version = request.version;
+        let head = self.head_object_response(key, snapshot, version).await?;
+        let range_start = request.start.min(head.total_size_bytes);
+        let range_end_exclusive = range_start
+            .saturating_add(request.length)
+            .min(head.total_size_bytes);
+        let range_length = range_end_exclusive.saturating_sub(range_start);
+
+        on_progress(DownloadProgress {
+            object_size_bytes: head.total_size_bytes,
+            range_start,
+            range_length,
+            bytes_downloaded: 0,
+        });
+
+        if range_length == 0 {
+            writer
+                .flush()
+                .with_context(|| format!("failed to flush output for key={key}"))?;
+            return Ok(DownloadRangeResult {
+                object_size_bytes: head.total_size_bytes,
+                range_start,
+                range_length,
+                bytes_downloaded: 0,
+            });
+        }
+
+        if !head.accept_ranges {
+            if range_start != 0 || range_length != head.total_size_bytes {
+                bail!(
+                    "server does not support byte ranges for key={key}, cannot satisfy requested range start={range_start} length={range_length}"
+                );
+            }
+
+            if should_cancel() {
+                bail!("download canceled for key={key}");
+            }
+
+            let payload = self.get_with_selector(key, snapshot, version).await?;
+            writer
+                .write_all(payload.as_ref())
+                .with_context(|| format!("failed to write payload chunk for key={key}"))?;
+            writer
+                .flush()
+                .with_context(|| format!("failed to flush output for key={key}"))?;
+
+            let bytes_downloaded = payload.len() as u64;
+            on_progress(DownloadProgress {
+                object_size_bytes: head.total_size_bytes,
+                range_start,
+                range_length,
+                bytes_downloaded,
+            });
+
+            return Ok(DownloadRangeResult {
+                object_size_bytes: head.total_size_bytes,
+                range_start,
+                range_length,
+                bytes_downloaded,
+            });
+        }
+
+        let mut offset = range_start;
+        let mut bytes_downloaded = 0_u64;
+        while offset < range_end_exclusive {
+            if should_cancel() {
+                bail!("download canceled for key={key}");
+            }
+
+            let end_inclusive = std::cmp::min(
+                offset + DOWNLOAD_SEGMENT_SIZE_BYTES as u64 - 1,
+                range_end_exclusive - 1,
+            );
+            let response = self
+                .get_object_range_response(
+                    key,
+                    snapshot,
+                    version,
+                    offset,
+                    end_inclusive,
+                    head.etag.as_deref(),
+                )
+                .await?;
+
+            match response.status {
+                StatusCode::PARTIAL_CONTENT => {
+                    let expected_len = (end_inclusive - offset + 1) as usize;
+                    if response.body.len() != expected_len {
+                        bail!(
+                            "server returned unexpected range length for key={key}: expected={expected_len} actual={}",
+                            response.body.len()
+                        );
+                    }
+                    writer
+                        .write_all(response.body.as_ref())
+                        .with_context(|| format!("failed to write payload chunk for key={key}"))?;
+                    bytes_downloaded += response.body.len() as u64;
+                    offset = end_inclusive + 1;
+                    on_progress(DownloadProgress {
+                        object_size_bytes: head.total_size_bytes,
+                        range_start,
+                        range_length,
+                        bytes_downloaded,
+                    });
+                }
+                StatusCode::OK if offset == 0 && range_length == head.total_size_bytes => {
+                    writer
+                        .write_all(response.body.as_ref())
+                        .with_context(|| format!("failed to write payload chunk for key={key}"))?;
+                    bytes_downloaded = response.body.len() as u64;
+                    offset = range_end_exclusive;
+                    on_progress(DownloadProgress {
+                        object_size_bytes: head.total_size_bytes,
+                        range_start,
+                        range_length,
+                        bytes_downloaded,
+                    });
+                }
+                status => {
+                    bail!("server rejected ranged download for key={key}: {status}");
+                }
+            }
+        }
+
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush output for key={key}"))?;
+        Ok(DownloadRangeResult {
+            object_size_bytes: head.total_size_bytes,
+            range_start,
+            range_length,
+            bytes_downloaded,
+        })
+    }
+
     pub fn put_file_resumable(
         &self,
         key: impl Into<String>,
@@ -1542,6 +1711,34 @@ impl IronMeshClient {
             .build()
             .context("failed to create runtime for download")?;
         runtime.block_on(self.download_with_range_requests(key, snapshot, version, writer))
+    }
+
+    pub fn download_range_to_writer_with_progress_blocking(
+        &self,
+        request: DownloadRangeRequest<'_>,
+        writer: &mut dyn Write,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<DownloadRangeResult> {
+        let key_owned = request.key.to_string();
+        let snapshot_owned = request.snapshot.map(ToString::to_string);
+        let version_owned = request.version.map(ToString::to_string);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for ranged download")?;
+        runtime.block_on(self.download_range_to_writer_with_progress(
+            DownloadRangeRequest {
+                key: key_owned.as_str(),
+                snapshot: snapshot_owned.as_deref(),
+                version: version_owned.as_deref(),
+                start: request.start,
+                length: request.length,
+            },
+            writer,
+            on_progress,
+            should_cancel,
+        ))
     }
 
     pub async fn get_object_size(

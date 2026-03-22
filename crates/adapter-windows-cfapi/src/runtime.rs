@@ -1,14 +1,17 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
+use crate::cfapi::cf_report_provider_progress2;
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
 use anyhow::{Result, anyhow};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +37,78 @@ impl SyncRootRegistration {
 
 pub trait Hydrator: Send + Sync + 'static {
     fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>>;
+
+    fn hydrate_range_to_writer(
+        &self,
+        request: HydrationRequest<'_>,
+        writer: &mut dyn Write,
+        on_progress: &mut dyn FnMut(HydrationProgress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<HydrationResult> {
+        if should_cancel() {
+            return Err(anyhow!("hydration canceled for {}", request.path));
+        }
+
+        let payload = self.hydrate(request.path, request.remote_version)?;
+        let range_start = request.offset.min(payload.len() as u64);
+        let range_end_exclusive = range_start
+            .saturating_add(request.length)
+            .min(payload.len() as u64);
+        let range_length = range_end_exclusive.saturating_sub(range_start);
+
+        on_progress(HydrationProgress {
+            object_size_bytes: payload.len() as u64,
+            range_start,
+            range_length,
+            bytes_transferred: 0,
+        });
+
+        let slice = &payload[range_start as usize..range_end_exclusive as usize];
+        writer
+            .write_all(slice)
+            .map_err(|err| anyhow!("failed to write hydrated bytes for {}: {err}", request.path))?;
+        writer
+            .flush()
+            .map_err(|err| anyhow!("failed to flush hydrated bytes for {}: {err}", request.path))?;
+
+        on_progress(HydrationProgress {
+            object_size_bytes: payload.len() as u64,
+            range_start,
+            range_length,
+            bytes_transferred: slice.len() as u64,
+        });
+
+        Ok(HydrationResult {
+            object_size_bytes: payload.len() as u64,
+            range_start,
+            range_length,
+            bytes_transferred: slice.len() as u64,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HydrationRequest<'a> {
+    pub path: &'a str,
+    pub remote_version: &'a str,
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HydrationProgress {
+    pub object_size_bytes: u64,
+    pub range_start: u64,
+    pub range_length: u64,
+    pub bytes_transferred: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HydrationResult {
+    pub object_size_bytes: u64,
+    pub range_start: u64,
+    pub range_length: u64,
+    pub bytes_transferred: u64,
 }
 
 pub trait Uploader: Send + Sync + 'static {
@@ -141,15 +216,19 @@ impl CfapiRuntime {
     ) -> Result<Vec<u8>> {
         eprintln!("handle_fetch_data: requested path={relative_path}");
         let normalized = normalize_path(relative_path);
-        let remote_versions = self
-            .remote_versions_by_path
-            .lock()
-            .expect("remote version map lock poisoned");
-        let remote_version = remote_versions
-            .get(&normalized)
-            .ok_or_else(|| anyhow!("unknown placeholder path: {relative_path}"))?;
+        let remote_version = self.resolve_remote_version(&normalized)?;
 
-        hydrator.hydrate(&normalized, remote_version)
+        hydrator.hydrate(&normalized, &remote_version)
+    }
+
+    pub fn resolve_remote_version(&self, relative_path: &str) -> Result<String> {
+        let normalized = normalize_path(relative_path);
+        self.remote_versions_by_path
+            .lock()
+            .expect("remote version map lock poisoned")
+            .get(&normalized)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown placeholder path: {relative_path}"))
     }
 
     pub fn set_remote_version(&self, relative_path: &str, remote_version: impl Into<String>) {
@@ -238,7 +317,6 @@ pub fn hresult_to_result(hr: i32, operation: &str) -> anyhow::Result<()> {
         ))
     }
 }
-use std::collections::HashSet;
 use std::ffi::c_void;
 
 use std::mem::{size_of, zeroed};
@@ -272,7 +350,8 @@ struct CallbackContext {
     runtime: Arc<CfapiRuntime>,
     hydrator: Box<dyn Hydrator>,
     hydrated_once_paths: Mutex<HashSet<String>>,
-    paths_by_file_id: Mutex<std::collections::HashMap<i64, String>>,
+    paths_by_file_id: Mutex<HashMap<i64, String>>,
+    fetch_cancellations: Mutex<HashMap<i64, Arc<AtomicBool>>>,
     upload_worker: Arc<UploadWorkerContext>,
     upload_debounce: Arc<UploadDebounceState>,
 }
@@ -504,7 +583,8 @@ pub fn connect_sync_root(
         runtime,
         hydrator,
         hydrated_once_paths: Mutex::new(HashSet::new()),
-        paths_by_file_id: Mutex::new(std::collections::HashMap::new()),
+        paths_by_file_id: Mutex::new(HashMap::new()),
+        fetch_cancellations: Mutex::new(HashMap::new()),
         upload_worker,
         upload_debounce,
     });
@@ -517,6 +597,10 @@ pub fn connect_sync_root(
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_FETCH_DATA,
             Callback: Some(callback_fetch_data),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
+            Callback: Some(callback_cancel_fetch_data),
         },
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
@@ -535,7 +619,7 @@ pub fn connect_sync_root(
             root_path.as_ptr(),
             callback_table.as_ptr(),
             (&mut *callback_context as *mut CallbackContext).cast::<c_void>(),
-            CF_CONNECT_FLAG_NONE,
+            CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
             &mut connection_key,
         )
     };
@@ -568,6 +652,114 @@ fn string_from_pcwstr(value: windows_sys::core::PCWSTR) -> String {
     }
 }
 
+fn callback_request_identity(callback_info: &CF_CALLBACK_INFO) -> i64 {
+    if callback_info.RequestKey != 0 {
+        callback_info.RequestKey
+    } else if callback_info.TransferKey != 0 {
+        callback_info.TransferKey
+    } else {
+        callback_info.FileId
+    }
+}
+
+fn callback_target_session_id(callback_info: &CF_CALLBACK_INFO) -> u32 {
+    if callback_info.ProcessInfo.is_null() {
+        0
+    } else {
+        unsafe { (*callback_info.ProcessInfo).SessionId }
+    }
+}
+
+fn resolve_relative_path_from_callback(
+    callback_info: &CF_CALLBACK_INFO,
+    context: &CallbackContext,
+) -> Option<String> {
+    let normalized_path = string_from_pcwstr(callback_info.NormalizedPath);
+    let mut relative_path = if normalized_path.is_empty() {
+        String::new()
+    } else {
+        path_to_relative(&context.sync_root, &normalized_path)
+    };
+    if relative_path.is_empty()
+        && let Ok(paths_by_file_id) = context.paths_by_file_id.lock()
+        && let Some(mapped) = paths_by_file_id.get(&callback_info.FileId)
+    {
+        relative_path = mapped.clone();
+    }
+    if relative_path.is_empty()
+        && !callback_info.FileIdentity.is_null()
+        && callback_info.FileIdentityLength > 0
+    {
+        let file_identity = unsafe {
+            std::slice::from_raw_parts(
+                callback_info.FileIdentity.cast::<u8>(),
+                callback_info.FileIdentityLength as usize,
+            )
+        };
+        if let Some(decoded_path) = decode_path_from_file_identity(file_identity) {
+            relative_path = decoded_path;
+        }
+    }
+
+    if relative_path.is_empty() {
+        None
+    } else {
+        Some(relative_path)
+    }
+}
+
+fn report_fetch_progress(
+    callback_info: &CF_CALLBACK_INFO,
+    progress: HydrationProgress,
+) -> Result<()> {
+    let total = progress
+        .object_size_bytes
+        .max(progress.range_start.saturating_add(progress.range_length));
+    let completed = progress
+        .range_start
+        .saturating_add(progress.bytes_transferred)
+        .min(total);
+    cf_report_provider_progress2(
+        callback_info.ConnectionKey,
+        callback_info.TransferKey,
+        callback_info.RequestKey,
+        total as i64,
+        completed as i64,
+        callback_target_session_id(callback_info),
+    )
+}
+
+struct CfapiTransferWriter<'a> {
+    callback_info: &'a CF_CALLBACK_INFO,
+    next_offset: u64,
+}
+
+impl<'a> CfapiTransferWriter<'a> {
+    fn new(callback_info: &'a CF_CALLBACK_INFO, start_offset: u64) -> Self {
+        Self {
+            callback_info,
+            next_offset: start_offset,
+        }
+    }
+}
+
+impl Write for CfapiTransferWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        execute_transfer_data_chunk(self.callback_info, self.next_offset, buf)
+            .map_err(std::io::Error::other)?;
+        self.next_offset = self.next_offset.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 unsafe extern "system" fn callback_fetch_data(
     callback_info: *const CF_CALLBACK_INFO,
     callback_parameters: *const CF_CALLBACK_PARAMETERS,
@@ -583,58 +775,101 @@ unsafe extern "system" fn callback_fetch_data(
     }
     let context = unsafe { &*context_ptr };
 
-    let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
-    let mut relative_path = if normalized_path.is_empty() {
-        String::new()
-    } else {
-        path_to_relative(&context.sync_root, &normalized_path)
-    };
-    if relative_path.is_empty()
-        && let Ok(paths_by_file_id) = context.paths_by_file_id.lock()
-        && let Some(mapped) = paths_by_file_id.get(&callback_info_ref.FileId)
-    {
-        relative_path = mapped.clone();
-    }
-    if relative_path.is_empty()
-        && !callback_info_ref.FileIdentity.is_null()
-        && callback_info_ref.FileIdentityLength > 0
-    {
-        let file_identity = unsafe {
-            std::slice::from_raw_parts(
-                callback_info_ref.FileIdentity.cast::<u8>(),
-                callback_info_ref.FileIdentityLength as usize,
-            )
-        };
-        if let Some(decoded_path) = decode_path_from_file_identity(file_identity) {
-            relative_path = decoded_path;
-        }
-    }
-    if relative_path.is_empty() {
-        eprintln!(
-            "cfapi fetch-data could not resolve relative path: normalized_path='{}' file_id={}",
-            normalized_path, callback_info_ref.FileId
-        );
-        return;
-    }
-
-    let payload = match context
-        .runtime
-        .handle_fetch_data(&relative_path, context.hydrator.as_ref())
-    {
-        Ok(data) => data,
-        Err(err) => {
-            eprintln!("cfapi fetch-data hydration error: {err}");
+    let relative_path = match resolve_relative_path_from_callback(callback_info_ref, context) {
+        Some(path) => path,
+        None => {
+            let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
+            eprintln!(
+                "cfapi fetch-data could not resolve relative path: normalized_path='{}' file_id={}",
+                normalized_path, callback_info_ref.FileId
+            );
             return;
         }
     };
 
-    if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
-        hydrated_paths.insert(relative_path.clone());
+    let remote_version = match context.runtime.resolve_remote_version(&relative_path) {
+        Ok(version) => version,
+        Err(err) => {
+            eprintln!("cfapi fetch-data missing remote version: {err}");
+            return;
+        }
+    };
+
+    let fetch_data = unsafe { (*callback_parameters).Anonymous.FetchData };
+    let range_start = fetch_data.RequiredFileOffset.max(0) as u64;
+    let range_length = fetch_data.RequiredLength.max(0) as u64;
+    let request_identity = callback_request_identity(callback_info_ref);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    if let Ok(mut fetch_cancellations) = context.fetch_cancellations.lock() {
+        fetch_cancellations.insert(request_identity, cancel_flag.clone());
     }
 
-    if let Err(err) = execute_transfer_data(callback_info_ref, callback_parameters, &payload) {
-        eprintln!("cfapi transfer-data execution error: {err}");
+    let mut writer = CfapiTransferWriter::new(callback_info_ref, range_start);
+    let mut progress_callback = |progress: HydrationProgress| {
+        if let Err(err) = report_fetch_progress(callback_info_ref, progress) {
+            eprintln!("cfapi progress-report error: {err}");
+        }
+    };
+    let should_cancel = || cancel_flag.load(Ordering::SeqCst);
+
+    let result = context.hydrator.hydrate_range_to_writer(
+        HydrationRequest {
+            path: &relative_path,
+            remote_version: &remote_version,
+            offset: range_start,
+            length: range_length,
+        },
+        &mut writer,
+        &mut progress_callback,
+        &should_cancel,
+    );
+
+    if let Ok(mut fetch_cancellations) = context.fetch_cancellations.lock() {
+        fetch_cancellations.remove(&request_identity);
     }
+
+    match result {
+        Ok(_) => {
+            if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
+                hydrated_paths.insert(relative_path);
+            }
+        }
+        Err(err) => {
+            eprintln!("cfapi fetch-data hydration error: {err}");
+        }
+    }
+}
+
+unsafe extern "system" fn callback_cancel_fetch_data(
+    callback_info: *const CF_CALLBACK_INFO,
+    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+) {
+    if callback_info.is_null() || callback_parameters.is_null() {
+        return;
+    }
+
+    let callback_info_ref = unsafe { &*callback_info };
+    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
+    if context_ptr.is_null() {
+        return;
+    }
+    let context = unsafe { &*context_ptr };
+
+    let request_identity = callback_request_identity(callback_info_ref);
+    if let Ok(fetch_cancellations) = context.fetch_cancellations.lock()
+        && let Some(cancel_flag) = fetch_cancellations.get(&request_identity)
+    {
+        cancel_flag.store(true, Ordering::SeqCst);
+    }
+
+    let cancel = unsafe { (*callback_parameters).Anonymous.Cancel };
+    let fetch = unsafe { cancel.Anonymous.FetchData };
+    let relative_path = resolve_relative_path_from_callback(callback_info_ref, context)
+        .unwrap_or_else(|| String::from("<unknown>"));
+    eprintln!(
+        "cfapi cancel-fetch-data: path={} offset={} length={}",
+        relative_path, fetch.FileOffset, fetch.Length
+    );
 }
 
 unsafe extern "system" fn callback_file_open(
@@ -721,26 +956,21 @@ unsafe extern "system" fn callback_file_close_completion(
     );
 }
 
-fn execute_transfer_data(
+fn execute_transfer_data_chunk(
     callback_info: &CF_CALLBACK_INFO,
-    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+    offset: u64,
     payload: &[u8],
 ) -> Result<()> {
-    let fetch_data = unsafe { (*callback_parameters).Anonymous.FetchData };
-    let required_offset = fetch_data.RequiredFileOffset.max(0) as usize;
-    let required_length = fetch_data.RequiredLength.max(0) as usize;
-
-    let start = required_offset.min(payload.len());
-    let max_len = payload.len().saturating_sub(start);
-    let transfer_len = required_length.min(max_len);
-    let transfer_slice = &payload[start..start + transfer_len];
+    if payload.is_empty() {
+        return Ok(());
+    }
 
     let transfer_data = CF_OPERATION_PARAMETERS_0_0 {
         Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
         CompletionStatus: 0,
-        Buffer: transfer_slice.as_ptr().cast::<c_void>(),
-        Offset: required_offset as i64,
-        Length: transfer_slice.len() as i64,
+        Buffer: payload.as_ptr().cast::<c_void>(),
+        Offset: offset as i64,
+        Length: payload.len() as i64,
     };
 
     let mut op_params = CF_OPERATION_PARAMETERS {

@@ -185,3 +185,38 @@ async fn start_cfapi_adapter_with_resolved_inputs(
     sleep(Duration::from_secs(2)).await;
     Ok(ChildGuard::new(child))
 }
+
+pub async fn pin_cfapi_placeholder(
+    root_path: &Path,
+    relative_path: &str,
+    wait: bool,
+) -> Result<()> {
+    let os_integration_bin = binary_path("os-integration")?;
+    let mut command = Command::new(os_integration_bin);
+    command
+        .arg("pin")
+        .arg("--root-path")
+        .arg(root_path)
+        .arg("--path")
+        .arg(relative_path)
+        .arg("--timeout-ms")
+        .arg("60000")
+        .arg("--poll-interval-ms")
+        .arg("200");
+    if wait {
+        command.arg("--wait");
+    }
+
+    let output = command
+        .output()
+        .await
+        .context("failed to execute os-integration pin")?;
+    if !output.status.success() {
+        bail!(
+            "os-integration pin failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}

@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use crate::adapter::WindowsCfapiAdapter;
 use crate::auth::{ClientEnrollmentOptions, resolve_or_enroll_client_identity};
+use crate::cfapi::{cf_get_placeholder_standard_info, cf_set_pin_state};
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
 use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
@@ -44,6 +46,7 @@ struct Cli {
 enum Commands {
     Serve(ServeArgs),
     Register(RegisterArgs),
+    Pin(PinArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -86,6 +89,20 @@ struct RegisterArgs {
     root_path: String,
 }
 
+#[derive(Debug, Parser)]
+struct PinArgs {
+    #[arg(long)]
+    root_path: String,
+    #[arg(long)]
+    path: String,
+    #[arg(long, default_value_t = false)]
+    wait: bool,
+    #[arg(long, default_value_t = 30_000)]
+    timeout_ms: u64,
+    #[arg(long, default_value_t = 250)]
+    poll_interval_ms: u64,
+}
+
 pub fn cli_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -95,6 +112,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                 SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
             register_sync_root(&registration)
         }
+        Commands::Pin(args) => pin_placeholder_locally(args),
 
         Commands::Serve(args) => {
             let registration =
@@ -234,5 +252,59 @@ pub fn cli_main() -> anyhow::Result<()> {
             drop(_connection);
             Ok(())
         }
+    }
+}
+
+fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
+    use windows_sys::Win32::Storage::CloudFilters::{CF_PIN_STATE_PINNED, CF_SET_PIN_FLAG_NONE};
+
+    let root_path = PathBuf::from(&args.root_path);
+    let target_path = if PathBuf::from(&args.path).is_absolute() {
+        PathBuf::from(&args.path)
+    } else {
+        root_path.join(args.path.replace('/', "\\"))
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target_path)?;
+    cf_set_pin_state(&file, CF_PIN_STATE_PINNED, CF_SET_PIN_FLAG_NONE)?;
+    eprintln!("requested pin for {}", target_path.display());
+
+    if !args.wait {
+        return Ok(());
+    }
+
+    let timeout = Duration::from_millis(args.timeout_ms.max(1));
+    let poll_interval = Duration::from_millis(args.poll_interval_ms.max(50));
+    let started = std::time::Instant::now();
+    let total_size = file.metadata()?.len() as i64;
+
+    loop {
+        let info = cf_get_placeholder_standard_info(&file)?;
+        eprintln!(
+            "pin progress: on_disk={} validated={} modified={} total={} pin_state={}",
+            info.OnDiskDataSize,
+            info.ValidatedDataSize,
+            info.ModifiedDataSize,
+            total_size,
+            info.PinState
+        );
+
+        if info.OnDiskDataSize >= total_size && info.ModifiedDataSize == 0 {
+            return Ok(());
+        }
+
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "timed out waiting for local pin hydration at {} (on_disk={} total={})",
+                target_path.display(),
+                info.OnDiskDataSize,
+                total_size
+            );
+        }
+
+        thread::sleep(poll_interval);
     }
 }

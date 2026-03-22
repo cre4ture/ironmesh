@@ -5265,10 +5265,9 @@ async fn upload_session_chunk(
         .received_chunks
         .get(index)
         .and_then(|entry| entry.as_ref())
+        && (existing.hash != next_ref.hash || existing.size_bytes != next_ref.size_bytes)
     {
-        if existing.hash != next_ref.hash || existing.size_bytes != next_ref.size_bytes {
-            return StatusCode::CONFLICT.into_response();
-        }
+        return StatusCode::CONFLICT.into_response();
     }
 
     session.received_chunks[index] = Some(next_ref);
@@ -6158,10 +6157,7 @@ fn build_object_stream(
             }
 
             let mut remaining = chunk.len;
-            let buffer_len = std::cmp::max(
-                1,
-                std::cmp::min(OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES, remaining),
-            );
+            let buffer_len = remaining.clamp(1, OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES);
             let mut buffer = vec![0_u8; buffer_len];
 
             while remaining > 0 {
