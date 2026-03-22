@@ -199,7 +199,7 @@ pub fn cli_main() -> anyhow::Result<()> {
             );
             let mut monitor =
                 SyncRootMonitor::new("monitor", registration.root_path.clone(), uploader.clone());
-            monitor.seed_seen();
+            monitor.seed_remote_entries(&action_plan);
             std::thread::spawn(move || {
                 monitor.run();
             });

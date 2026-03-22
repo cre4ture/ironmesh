@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{path_is_placeholder, try_convert_materialized_file};
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
@@ -42,6 +43,26 @@ impl SyncRootMonitor {
         self.seen = self.snapshot_entries();
     }
 
+    pub fn seed_remote_entries(&mut self, plan: &CfapiActionPlan) {
+        let mut seeded = HashMap::new();
+        for action in &plan.actions {
+            match action {
+                CfapiAction::EnsureDirectory { path } => {
+                    self.seed_existing_entry(&mut seeded, path, true);
+                }
+                CfapiAction::EnsurePlaceholder { path, .. }
+                | CfapiAction::HydrateOnDemand { path, .. } => {
+                    self.seed_existing_entry(&mut seeded, path, false);
+                    for parent in parent_directories_for_path(path) {
+                        self.seed_existing_entry(&mut seeded, &parent, true);
+                    }
+                }
+                CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
+            }
+        }
+        self.seen = seeded;
+    }
+
     pub fn walk(&mut self) {
         let mut current = self.snapshot_entries();
         let paths = current.keys().cloned().collect::<Vec<_>>();
@@ -78,6 +99,35 @@ impl SyncRootMonitor {
         }
 
         current
+    }
+
+    fn seed_existing_entry(
+        &self,
+        seeded: &mut HashMap<String, SeenEntry>,
+        rel_path: &str,
+        is_dir_hint: bool,
+    ) {
+        let normalized = rel_path.trim_matches(['/', '\\']).replace('\\', "/");
+        if normalized.is_empty()
+            || is_internal_client_identity_relative_path(&normalized)
+            || is_internal_connection_bootstrap_relative_path(&normalized)
+        {
+            return;
+        }
+
+        let full_path = self
+            .sync_root
+            .join(normalized.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()));
+        let metadata = match std::fs::metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return,
+        };
+        seeded.insert(
+            normalized,
+            SeenEntry {
+                is_dir: if metadata.is_dir() { true } else { is_dir_hint },
+            },
+        );
     }
 
     fn handle_entry(
@@ -209,6 +259,23 @@ fn directory_marker_path(path: &str) -> String {
     }
 }
 
+fn parent_directories_for_path(path: &str) -> Vec<String> {
+    let normalized = path.trim_matches(['/', '\\']).replace('\\', "/");
+    let segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut parents = Vec::with_capacity(segments.len().saturating_sub(1));
+    for index in 1..segments.len() {
+        parents.push(segments[..index].join("/"));
+    }
+    parents
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +341,48 @@ mod tests {
                 .expect("deletes lock poisoned")
                 .is_empty(),
             "startup walk should not emit deletes after seed_seen"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn seed_remote_entries_keeps_local_only_files_pending_for_upload() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root = std::env::temp_dir().join(format!("ironmesh-monitor-remote-seed-{unique}"));
+        std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create sync root");
+        std::fs::write(
+            sync_root.join("docs").join("readme.txt"),
+            b"remote baseline",
+        )
+        .expect("failed to seed remote placeholder stand-in");
+        std::fs::write(sync_root.join("local-only.txt"), b"local upload")
+            .expect("failed to seed local-only file");
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new("monitor-test", sync_root.clone(), uploader.clone());
+        monitor.seed_remote_entries(&CfapiActionPlan {
+            actions: vec![CfapiAction::EnsurePlaceholder {
+                path: "docs/readme.txt".to_string(),
+                remote_version: "v1".to_string(),
+            }],
+        });
+        monitor.walk();
+
+        let uploads = uploader
+            .uploads
+            .lock()
+            .expect("uploads lock poisoned")
+            .clone();
+        assert!(
+            uploads.iter().any(|path| path == "local-only.txt"),
+            "startup walk should still upload pre-existing local-only files"
+        );
+        assert!(
+            uploads
+                .iter()
+                .all(|path| path != "docs/" && path != "docs/readme.txt"),
+            "startup walk should not re-upload remote-seeded entries"
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
