@@ -106,10 +106,10 @@ use setup::{
 };
 use storage::{
     AdminAuditEvent, ClientCredentialRecord, ClientCredentialState, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, ObjectReadDescriptor,
-    ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord, PathMutationResult,
-    PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord, StoreReadError,
-    UploadChunkRef, VersionConsistencyState,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
+    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
+    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
+    ReplicationChunkInfo, StoreReadError, UploadChunkRef, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -3237,6 +3237,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/cluster/replication/export",
             get(export_replication_bundle),
         )
+        .route("/cluster/metadata/export", get(export_metadata_bundle))
         .route(
             "/cluster/replication/chunk/{hash}",
             get(get_replication_chunk),
@@ -3367,6 +3368,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/cluster/replication/export",
             get(export_replication_bundle),
         )
+        .route("/cluster/metadata/export", get(export_metadata_bundle))
         .route(
             "/cluster/replication/chunk/{hash}",
             get(get_replication_chunk),
@@ -4306,13 +4308,7 @@ struct LocalReplicationSubjectsResponse {
 }
 
 pub(crate) async fn sync_replica_views_once(state: &ServerState) {
-    let local_subjects = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
+    let local_subjects = local_cluster_replication_subjects(state).await;
 
     let mut changed = {
         let mut cluster = state.cluster.lock().await;
@@ -4384,6 +4380,166 @@ pub(crate) async fn sync_replica_views_once(state: &ServerState) {
     }
 }
 
+pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
+    let mut local_metadata_subjects = {
+        let store = state.store.lock().await;
+        store
+            .list_metadata_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+            .into_iter()
+            .collect::<HashSet<_>>()
+    };
+
+    let peers = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        cluster
+            .list_nodes()
+            .into_iter()
+            .filter(|node| {
+                node.node_id != state.node_id && node.status == cluster::NodeStatus::Online
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut imported_any = false;
+
+    for peer in peers {
+        let peer_subjects = match execute_peer_request(
+            state,
+            &peer,
+            reqwest::Method::GET,
+            "/cluster/replication/subjects/local",
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => {
+                match response.json::<LocalReplicationSubjectsResponse>() {
+                    Ok(payload) => payload.subjects,
+                    Err(err) => {
+                        tracing::debug!(
+                            node_id = %peer.node_id,
+                            error = %err,
+                            "failed decoding metadata subject sync payload"
+                        );
+                        continue;
+                    }
+                }
+            }
+            Ok(response) => {
+                tracing::debug!(
+                    node_id = %peer.node_id,
+                    status = response.status,
+                    "metadata subject sync request rejected"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    node_id = %peer.node_id,
+                    error = %err,
+                    "failed metadata subject sync request"
+                );
+                continue;
+            }
+        };
+
+        for subject in peer_subjects {
+            if local_metadata_subjects.contains(&subject) {
+                continue;
+            }
+
+            let Some((key, version_id)) = parse_replication_subject(&subject) else {
+                continue;
+            };
+
+            let export_path = build_metadata_export_path(&key, version_id.as_deref());
+            let response = match execute_peer_request(
+                state,
+                &peer,
+                reqwest::Method::GET,
+                &export_path,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            {
+                Ok(response) if response.is_success() => response,
+                Ok(response) => {
+                    tracing::debug!(
+                        node_id = %peer.node_id,
+                        key = %key,
+                        version_id = ?version_id,
+                        status = response.status,
+                        "metadata export request rejected"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        node_id = %peer.node_id,
+                        key = %key,
+                        version_id = ?version_id,
+                        error = %err,
+                        "failed metadata export request"
+                    );
+                    continue;
+                }
+            };
+
+            let bundle = match response.json::<MetadataExportBundle>() {
+                Ok(bundle) => bundle,
+                Err(err) => {
+                    tracing::debug!(
+                        node_id = %peer.node_id,
+                        key = %key,
+                        version_id = ?version_id,
+                        error = %err,
+                        "failed decoding metadata export bundle"
+                    );
+                    continue;
+                }
+            };
+
+            let import_changed = {
+                let mut store = state.store.lock().await;
+                match store.import_metadata_bundle(&bundle).await {
+                    Ok(changed) => changed,
+                    Err(err) => {
+                        tracing::warn!(
+                            node_id = %peer.node_id,
+                            key = %bundle.key,
+                            version_id = ?version_id,
+                            error = %err,
+                            "failed importing metadata bundle"
+                        );
+                        false
+                    }
+                }
+            };
+
+            if import_changed {
+                imported_any = true;
+            }
+
+            local_metadata_subjects.insert(subject);
+            if bundle.current_manifest_hash.is_some() {
+                local_metadata_subjects.insert(bundle.key.clone());
+            }
+            for version in &bundle.versions {
+                local_metadata_subjects.insert(format!("{}@{}", bundle.key, version.version_id));
+            }
+        }
+    }
+
+    if imported_any {
+        publish_namespace_change(state);
+    }
+}
+
 fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
@@ -4391,6 +4547,7 @@ fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
         loop {
             ticker.tick().await;
             sync_replica_views_once(&state).await;
+            sync_cluster_metadata_once(&state).await;
         }
     });
 }
@@ -4470,13 +4627,7 @@ async fn track_inflight_requests(
 }
 
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
-    let local_subjects = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
+    let local_subjects = local_cluster_replication_subjects(state).await;
     let cluster_subjects = {
         let cluster = state.cluster.lock().await;
         cluster.known_replication_subjects()
@@ -4486,6 +4637,28 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     subjects.extend(local_subjects);
     subjects.extend(cluster_subjects);
     subjects.into_iter().collect()
+}
+
+async fn local_cluster_replication_subjects(state: &ServerState) -> Vec<String> {
+    let readable_subjects = {
+        let store = state.store.lock().await;
+        store
+            .list_replication_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+    };
+    let declared_subjects = {
+        let cluster = state.cluster.lock().await;
+        cluster.subjects_for_node(state.node_id)
+    };
+
+    let readable: HashSet<String> = readable_subjects.into_iter().collect();
+    let mut subjects = declared_subjects
+        .into_iter()
+        .filter(|subject| readable.contains(subject))
+        .collect::<Vec<_>>();
+    subjects.sort();
+    subjects
 }
 
 async fn await_repair_busy_threshold(state: &ServerState) {
@@ -6221,6 +6394,88 @@ fn build_object_stream_response(
     response
 }
 
+fn read_through_replication_subject(
+    key: &str,
+    snapshot_id: Option<&str>,
+    version_id: Option<&str>,
+) -> Option<String> {
+    if let Some(version_id) = version_id {
+        return Some(format!("{key}@{version_id}"));
+    }
+    if snapshot_id.is_some() {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+async fn read_through_source_nodes(state: &ServerState, subject: &str) -> Vec<NodeDescriptor> {
+    let cluster = state.cluster.lock().await;
+    cluster
+        .replica_nodes_for_subject(subject)
+        .into_iter()
+        .filter(|node| node.node_id != state.node_id)
+        .collect()
+}
+
+async fn hydrate_missing_chunks_for_range(
+    state: &ServerState,
+    subject: &str,
+    missing_chunks: &[ReplicationChunkInfo],
+) -> Result<()> {
+    let sources = read_through_source_nodes(state, subject).await;
+    if sources.is_empty() {
+        bail!("no readable replica source available for subject={subject}");
+    }
+
+    for chunk in missing_chunks {
+        let mut fetched = false;
+        let chunk_path = format!("/cluster/replication/chunk/{}", chunk.hash);
+
+        for source in &sources {
+            let response = match execute_peer_request(
+                state,
+                source,
+                reqwest::Method::GET,
+                &chunk_path,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            {
+                Ok(response) if response.is_success() => response,
+                Ok(_) => continue,
+                Err(err) => {
+                    tracing::debug!(
+                        node_id = %source.node_id,
+                        chunk_hash = %chunk.hash,
+                        error = %err,
+                        "failed read-through chunk fetch"
+                    );
+                    continue;
+                }
+            };
+
+            {
+                let store = state.store.lock().await;
+                store
+                    .ingest_chunk(&chunk.hash, response.body.as_ref())
+                    .await?;
+            }
+            fetched = true;
+            break;
+        }
+
+        if !fetched {
+            bail!(
+                "failed read-through chunk fetch for subject={subject} chunk_hash={}",
+                chunk.hash
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn get_object_response(
     state: &ServerState,
     key: &str,
@@ -6233,16 +6488,19 @@ async fn get_object_response(
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let store = state.store.lock().await;
-    let descriptor = match store
-        .describe_object(
-            key,
-            query.snapshot.as_deref(),
-            query.version.as_deref(),
-            read_mode,
-        )
-        .await
-    {
+    let descriptor = {
+        let store = state.store.lock().await;
+        store
+            .describe_object(
+                key,
+                query.snapshot.as_deref(),
+                query.version.as_deref(),
+                read_mode,
+            )
+            .await
+    };
+
+    let descriptor = match descriptor {
         Ok(descriptor) => descriptor,
         Err(StoreReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
         Err(StoreReadError::Corrupt(msg)) => {
@@ -6285,19 +6543,62 @@ async fn get_object_response(
         );
     }
 
-    let read_result = match selected_range {
-        Some(range) => store
-            .plan_object_range_by_manifest_hash(
-                &manifest_hash,
-                range.start,
-                range.end_inclusive.saturating_add(1),
-            )
+    let (range_start, range_end_exclusive) = selected_range
+        .map(|range| (range.start, range.end_inclusive.saturating_add(1)))
+        .unwrap_or((0, total_size_bytes));
+
+    let missing_chunks = {
+        let store = state.store.lock().await;
+        match store
+            .missing_chunks_for_manifest_range(&manifest_hash, range_start, range_end_exclusive)
             .await
-            .map(|stream_plan| (StatusCode::PARTIAL_CONTENT, Some(range), stream_plan)),
-        None => store
-            .plan_object_range_by_manifest_hash(&manifest_hash, 0, total_size_bytes)
-            .await
-            .map(|stream_plan| (StatusCode::OK, None, stream_plan)),
+        {
+            Ok(chunks) => chunks,
+            Err(StoreReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+            Err(StoreReadError::Corrupt(msg)) => {
+                tracing::error!(key = %key, error = %msg, "detected corrupt data while planning object read");
+                return StatusCode::CONFLICT.into_response();
+            }
+            Err(StoreReadError::Internal(err)) => {
+                tracing::error!(key = %key, error = %err, "internal error while planning object read");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    if !missing_chunks.is_empty()
+        && let Some(subject) = read_through_replication_subject(
+            key,
+            query.snapshot.as_deref(),
+            query.version.as_deref(),
+        )
+        && let Err(err) = hydrate_missing_chunks_for_range(state, &subject, &missing_chunks).await
+    {
+        tracing::warn!(
+            key = %key,
+            subject = %subject,
+            missing_chunks = missing_chunks.len(),
+            error = %err,
+            "read-through chunk hydration failed"
+        );
+    }
+
+    let read_result = {
+        let store = state.store.lock().await;
+        match selected_range {
+            Some(range) => store
+                .plan_object_range_by_manifest_hash(
+                    &manifest_hash,
+                    range.start,
+                    range.end_inclusive.saturating_add(1),
+                )
+                .await
+                .map(|stream_plan| (StatusCode::PARTIAL_CONTENT, Some(range), stream_plan)),
+            None => store
+                .plan_object_range_by_manifest_hash(&manifest_hash, 0, total_size_bytes)
+                .await
+                .map(|stream_plan| (StatusCode::OK, None, stream_plan)),
+        }
     };
 
     match read_result {
@@ -9910,13 +10211,7 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
 }
 
 async fn local_replication_subjects(State(state): State<ServerState>) -> impl IntoResponse {
-    let subjects = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
-    };
+    let subjects = local_cluster_replication_subjects(&state).await;
 
     (
         StatusCode::OK,
@@ -10206,6 +10501,12 @@ struct ReplicationExportQuery {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+struct MetadataExportQuery {
+    key: String,
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct ReplicationManifestPushReport {
     version_id: String,
 }
@@ -10231,6 +10532,45 @@ async fn export_replication_bundle(
                 version_id = ?query.version_id,
                 error = %err,
                 "failed exporting replication bundle"
+            );
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+}
+
+fn build_metadata_export_path(key: &str, version_id: Option<&str>) -> String {
+    let encoded_key = utf8_percent_encode(key, QUERY_COMPONENT_ENCODE_SET).to_string();
+    let mut path = format!("/cluster/metadata/export?key={encoded_key}");
+    if let Some(version_id) = version_id {
+        let encoded_version =
+            utf8_percent_encode(version_id, QUERY_COMPONENT_ENCODE_SET).to_string();
+        path.push_str("&version_id=");
+        path.push_str(&encoded_version);
+    }
+    path
+}
+
+async fn export_metadata_bundle(
+    State(state): State<ServerState>,
+    Query(query): Query<MetadataExportQuery>,
+) -> impl IntoResponse {
+    let store = state.store.lock().await;
+    match store
+        .export_metadata_bundle(
+            &query.key,
+            query.version_id.as_deref(),
+            ObjectReadMode::Preferred,
+        )
+        .await
+    {
+        Ok(Some(bundle)) => (StatusCode::OK, Json(bundle)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::warn!(
+                key = %query.key,
+                version_id = ?query.version_id,
+                error = %err,
+                "failed exporting metadata bundle"
             );
             StatusCode::BAD_REQUEST.into_response()
         }

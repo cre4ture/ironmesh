@@ -346,6 +346,31 @@ impl ClusterService {
         subjects
     }
 
+    pub fn replica_nodes_for_subject(&self, key: &str) -> Vec<NodeDescriptor> {
+        let Some(node_ids) = self.replicas_by_key.get(key) else {
+            return Vec::new();
+        };
+
+        let mut nodes = node_ids
+            .iter()
+            .filter_map(|node_id| self.nodes.get(node_id).cloned())
+            .filter(|node| node.status == NodeStatus::Online)
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.node_id);
+        nodes
+    }
+
+    pub fn subjects_for_node(&self, node_id: NodeId) -> Vec<String> {
+        let mut subjects = self
+            .replicas_by_key
+            .iter()
+            .filter(|(_, replicas)| replicas.contains(&node_id))
+            .map(|(subject, _)| subject.clone())
+            .collect::<Vec<_>>();
+        subjects.sort();
+        subjects
+    }
+
     pub fn remove_replica(&mut self, key: &str, node_id: NodeId) {
         if let Some(nodes) = self.replicas_by_key.get_mut(key) {
             nodes.remove(&node_id);

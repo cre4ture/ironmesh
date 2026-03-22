@@ -3979,6 +3979,235 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_turso
 );
 
+async fn metadata_import_makes_store_index_visible_without_marking_local_replica_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+
+    let put = {
+        let mut locked = source.store.lock().await;
+        locked
+            .put_object_versioned(
+                "photos/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let bundle = {
+        let locked = source.store.lock().await;
+        locked
+            .export_metadata_bundle(
+                "photos/cat.png",
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    {
+        let mut locked = target.store.lock().await;
+        let changed = locked.import_metadata_bundle(&bundle).await.unwrap();
+        assert!(changed);
+
+        let metadata_subjects = locked.list_metadata_subjects().await.unwrap();
+        assert!(metadata_subjects.contains(&"photos/cat.png".to_string()));
+        assert!(metadata_subjects.contains(&format!("photos/cat.png@{}", put.version_id)));
+
+        let replica_subjects = locked.list_replication_subjects().await.unwrap();
+        assert!(!replica_subjects.contains(&"photos/cat.png".to_string()));
+        assert!(!replica_subjects.contains(&format!("photos/cat.png@{}", put.version_id)));
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(target.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("photos".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "photos/cat.png");
+    assert_eq!(entries[0]["content_hash"], put.manifest_hash);
+    assert_eq!(
+        entries[0]["size_bytes"].as_u64().unwrap(),
+        sample_png_bytes().len() as u64
+    );
+    assert!(entries[0]["modified_at_unix"].as_u64().unwrap() > 0);
+
+    let read_error = {
+        let locked = target.store.lock().await;
+        locked
+            .get_object(
+                "photos/cat.png",
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap_err()
+    };
+    assert!(matches!(
+        read_error,
+        super::storage::StoreReadError::Corrupt(_)
+    ));
+
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    metadata_import_makes_store_index_visible_without_marking_local_replica_impl,
+    metadata_import_makes_store_index_visible_without_marking_local_replica,
+    metadata_import_makes_store_index_visible_without_marking_local_replica_turso
+);
+
+async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+
+    let put = {
+        let mut locked = source.store.lock().await;
+        locked
+            .put_object_versioned(
+                "photos/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    {
+        let mut cluster = source.cluster.lock().await;
+        cluster.note_replica("photos/cat.png", source.node_id);
+        cluster.note_replica(format!("photos/cat.png@{}", put.version_id), source.node_id);
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route(
+            "/cluster/replication/chunk/{hash}",
+            get(super::get_replication_chunk),
+        )
+        .with_state(source.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("chunk route should serve");
+    });
+
+    {
+        let mut cluster = target.cluster.lock().await;
+        cluster.register_node(super::cluster::NodeDescriptor {
+            node_id: source.node_id,
+            reachability: super::cluster::NodeReachability {
+                public_api_url: Some(peer_base_url.clone()),
+                peer_api_url: Some(peer_base_url.clone()),
+                relay_required: false,
+            },
+            capabilities: super::cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: false,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 900_000,
+            last_heartbeat_unix: super::unix_ts(),
+            status: super::cluster::NodeStatus::Online,
+        });
+        cluster.note_replica("photos/cat.png", source.node_id);
+        cluster.note_replica(format!("photos/cat.png@{}", put.version_id), source.node_id);
+    }
+
+    let bundle = {
+        let locked = source.store.lock().await;
+        locked
+            .export_metadata_bundle(
+                "photos/cat.png",
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    {
+        let mut locked = target.store.lock().await;
+        locked.import_metadata_bundle(&bundle).await.unwrap();
+    }
+
+    let before_subjects = axum::response::IntoResponse::into_response(
+        super::local_replication_subjects(axum::extract::State(target.clone())).await,
+    );
+    let before_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(before_subjects.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(before_payload["subject_count"].as_u64().unwrap(), 0);
+
+    let response = super::get_object_response(
+        &target,
+        "photos/cat.png",
+        super::ObjectGetQuery {
+            snapshot: None,
+            version: None,
+            read_mode: None,
+        },
+        &HeaderMap::new(),
+        false,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), sample_png_bytes().as_slice());
+
+    let after_subjects = axum::response::IntoResponse::into_response(
+        super::local_replication_subjects(axum::extract::State(target.clone())).await,
+    );
+    let after_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(after_subjects.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after_payload["subject_count"].as_u64().unwrap(), 0);
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    read_through_fetch_serves_object_without_declaring_local_replica_impl,
+    read_through_fetch_serves_object_without_declaring_local_replica,
+    read_through_fetch_serves_object_without_declaring_local_replica_turso
+);
+
 async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());

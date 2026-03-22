@@ -369,6 +369,35 @@ pub struct ReplicationExportBundle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataVersionRecord {
+    pub version_id: String,
+    pub manifest_hash: String,
+    #[serde(default)]
+    pub logical_path: Option<String>,
+    pub parent_version_ids: Vec<String>,
+    pub state: VersionConsistencyState,
+    pub created_at_unix: u64,
+    pub copied_from_object_id: Option<String>,
+    pub copied_from_version_id: Option<String>,
+    pub copied_from_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataManifestRecord {
+    pub manifest_hash: String,
+    pub manifest_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataExportBundle {
+    pub key: String,
+    pub object_id: Option<String>,
+    pub current_manifest_hash: Option<String>,
+    pub versions: Vec<MetadataVersionRecord>,
+    pub manifests: Vec<MetadataManifestRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairAttemptRecord {
     pub attempts: u32,
     pub last_failure_unix: u64,
@@ -814,7 +843,7 @@ impl PersistentStore {
         Ok(Some(metadata))
     }
 
-    pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
+    pub async fn list_metadata_subjects(&self) -> Result<Vec<String>> {
         let mut subjects: HashSet<String> = self.current_state.objects.keys().cloned().collect();
         let mut indexed_object_ids = HashSet::new();
         for (path, object_id) in &self.current_state.object_ids {
@@ -841,6 +870,58 @@ impl PersistentStore {
                     .get(head_version_id)
                     .map(|record| record.manifest_hash == TOMBSTONE_MANIFEST_HASH)
                     .unwrap_or(false)
+                {
+                    subjects.insert(format!("{key}@{head_version_id}"));
+                }
+            }
+        }
+
+        let mut output: Vec<String> = subjects.into_iter().collect();
+        output.sort();
+        Ok(output)
+    }
+
+    pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
+        let mut subjects: HashSet<String> = HashSet::new();
+        let mut indexed_object_ids = HashSet::new();
+
+        for (key, manifest_hash) in &self.current_state.objects {
+            if self.manifest_is_fully_local(manifest_hash).await? {
+                subjects.insert(key.clone());
+            }
+        }
+
+        for (path, object_id) in &self.current_state.object_ids {
+            if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
+                indexed_object_ids.insert(object_id.clone());
+                for head_version_id in &index.head_version_ids {
+                    let Some(record) = index.versions.get(head_version_id) else {
+                        continue;
+                    };
+                    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
+                        || self.manifest_is_fully_local(&record.manifest_hash).await?
+                    {
+                        subjects.insert(format!("{path}@{head_version_id}"));
+                    }
+                }
+            }
+        }
+
+        for index in self.load_all_version_indexes().await? {
+            if indexed_object_ids.contains(&index.object_id) {
+                continue;
+            }
+
+            let Some(key) = self.resolve_key_for_version_index(&index).await? else {
+                continue;
+            };
+
+            for head_version_id in &index.head_version_ids {
+                let Some(record) = index.versions.get(head_version_id) else {
+                    continue;
+                };
+                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
+                    || self.manifest_is_fully_local(&record.manifest_hash).await?
                 {
                     subjects.insert(format!("{key}@{head_version_id}"));
                 }
@@ -1333,6 +1414,91 @@ impl PersistentStore {
         }))
     }
 
+    pub async fn export_metadata_bundle(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+        read_mode: ObjectReadMode,
+    ) -> Result<Option<MetadataExportBundle>> {
+        let object_id = if version_id.is_some() {
+            self.resolve_object_id_for_key_history(key).await?
+        } else {
+            self.object_id_for_key(key)
+                .or(self.resolve_object_id_for_key_history(key).await?)
+        };
+
+        let current_manifest_hash = self.current_state.objects.get(key).cloned();
+        let mut versions = Vec::new();
+        let mut manifests = Vec::new();
+        let mut seen_manifest_hashes = HashSet::new();
+
+        if let Some(object_id) = object_id.clone()
+            && let Some(index) = self.load_version_index_by_object_id(&object_id).await?
+        {
+            let selected_record = if let Some(version_id) = version_id {
+                index.versions.get(version_id)
+            } else {
+                version_record_for_read_mode(&index, read_mode)
+            };
+
+            let Some(record) = selected_record else {
+                return Ok(None);
+            };
+
+            versions.push(MetadataVersionRecord {
+                version_id: record.version_id.clone(),
+                manifest_hash: record.manifest_hash.clone(),
+                logical_path: record.logical_path.clone(),
+                parent_version_ids: record.parent_version_ids.clone(),
+                state: record.state.clone(),
+                created_at_unix: record.created_at_unix,
+                copied_from_object_id: record.copied_from_object_id.clone(),
+                copied_from_version_id: record.copied_from_version_id.clone(),
+                copied_from_path: record.copied_from_path.clone(),
+            });
+
+            if record.manifest_hash != TOMBSTONE_MANIFEST_HASH
+                && seen_manifest_hashes.insert(record.manifest_hash.clone())
+            {
+                let manifest_bytes = self
+                    .load_manifest_payload_by_hash(&record.manifest_hash)
+                    .await?
+                    .with_context(|| {
+                        format!(
+                            "missing manifest payload for key={key} version_id={:?} manifest_hash={}",
+                            version_id,
+                            record.manifest_hash
+                        )
+                    })?;
+                manifests.push(MetadataManifestRecord {
+                    manifest_hash: record.manifest_hash.clone(),
+                    manifest_bytes,
+                });
+            }
+        } else if let Some(manifest_hash) = current_manifest_hash.clone() {
+            let manifest_bytes = self
+                .load_manifest_payload_by_hash(&manifest_hash)
+                .await?
+                .with_context(|| {
+                    format!("missing manifest payload for key={key} manifest_hash={manifest_hash}")
+                })?;
+            manifests.push(MetadataManifestRecord {
+                manifest_hash,
+                manifest_bytes,
+            });
+        } else {
+            return Ok(None);
+        }
+
+        Ok(Some(MetadataExportBundle {
+            key: key.to_string(),
+            object_id,
+            current_manifest_hash,
+            versions,
+            manifests,
+        }))
+    }
+
     pub async fn read_chunk_payload(&self, hash: &str) -> Result<Option<Bytes>> {
         let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash);
         if !fs::try_exists(&chunk_path).await? {
@@ -1519,6 +1685,121 @@ impl PersistentStore {
         Ok(resolved_version_id)
     }
 
+    pub async fn import_metadata_bundle(&mut self, bundle: &MetadataExportBundle) -> Result<bool> {
+        let mut changed = false;
+
+        for manifest in &bundle.manifests {
+            if manifest.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            let computed_manifest_hash = hash_hex(&manifest.manifest_bytes);
+            if computed_manifest_hash != manifest.manifest_hash {
+                bail!(
+                    "metadata manifest hash mismatch: expected={} actual={computed_manifest_hash}",
+                    manifest.manifest_hash
+                );
+            }
+
+            let _: ObjectManifest = serde_json::from_slice(&manifest.manifest_bytes)
+                .context("invalid metadata manifest payload")?;
+
+            let manifest_path = self
+                .manifests_dir
+                .join(format!("{}.json", manifest.manifest_hash));
+            if !fs::try_exists(&manifest_path).await? {
+                write_atomic(&manifest_path, &manifest.manifest_bytes).await?;
+                changed = true;
+            }
+        }
+
+        let mut current_state_changed = false;
+
+        if !bundle.versions.is_empty() {
+            let object_id = bundle.object_id.clone().unwrap_or_else(generate_object_id);
+            let mut index = self
+                .load_version_index_by_object_id(&object_id)
+                .await?
+                .unwrap_or_else(|| empty_version_index(&object_id));
+            let mut index_changed = false;
+
+            for version in &bundle.versions {
+                let record = FileVersionRecord {
+                    version_id: version.version_id.clone(),
+                    object_id: object_id.clone(),
+                    manifest_hash: version.manifest_hash.clone(),
+                    logical_path: version.logical_path.clone(),
+                    parent_version_ids: version.parent_version_ids.clone(),
+                    state: version.state.clone(),
+                    created_at_unix: version.created_at_unix,
+                    copied_from_object_id: version.copied_from_object_id.clone(),
+                    copied_from_version_id: version.copied_from_version_id.clone(),
+                    copied_from_path: version.copied_from_path.clone(),
+                };
+
+                match index.versions.get(&version.version_id) {
+                    Some(existing)
+                        if existing.manifest_hash == record.manifest_hash
+                            && existing.logical_path == record.logical_path
+                            && existing.parent_version_ids == record.parent_version_ids
+                            && existing.state == record.state
+                            && existing.created_at_unix == record.created_at_unix
+                            && existing.copied_from_object_id == record.copied_from_object_id
+                            && existing.copied_from_version_id == record.copied_from_version_id
+                            && existing.copied_from_path == record.copied_from_path => {}
+                    Some(_) => {
+                        bail!(
+                            "metadata version collision for key={} version_id={}",
+                            bundle.key,
+                            version.version_id
+                        );
+                    }
+                    None => {
+                        index.versions.insert(version.version_id.clone(), record);
+                        index_changed = true;
+                    }
+                }
+            }
+
+            if index_changed {
+                index.head_version_ids = recompute_head_version_ids(&index);
+                index.preferred_head_version_id = choose_preferred_head(&index);
+                self.persist_version_index_by_object_id(&object_id, &index)
+                    .await?;
+                changed = true;
+            }
+
+            let before_manifest = self.current_state.objects.get(&bundle.key).cloned();
+            let before_object_id = self.current_state.object_ids.get(&bundle.key).cloned();
+            self.sync_current_state_for_key_from_index(&bundle.key, &index)?;
+            if self.current_state.objects.get(&bundle.key).cloned() != before_manifest
+                || self.current_state.object_ids.get(&bundle.key).cloned() != before_object_id
+            {
+                current_state_changed = true;
+            }
+        } else if let Some(manifest_hash) = bundle.current_manifest_hash.as_ref() {
+            let object_id = bundle.object_id.clone().unwrap_or_else(generate_object_id);
+            if self.current_state.objects.get(&bundle.key) != Some(manifest_hash)
+                || self.current_state.object_ids.get(&bundle.key) != Some(&object_id)
+            {
+                self.current_state
+                    .objects
+                    .insert(bundle.key.clone(), manifest_hash.clone());
+                self.current_state
+                    .object_ids
+                    .insert(bundle.key.clone(), object_id);
+                current_state_changed = true;
+            }
+        }
+
+        if current_state_changed {
+            self.persist_current_state().await?;
+            changed = true;
+        }
+
+        Ok(changed)
+    }
+
     pub async fn drop_replica_subject(
         &mut self,
         key: &str,
@@ -1631,6 +1912,38 @@ impl PersistentStore {
         let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
             .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
         Ok(Some(manifest))
+    }
+
+    async fn load_manifest_payload_by_hash(&self, manifest_hash: &str) -> Result<Option<Vec<u8>>> {
+        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+        Ok(Some(fs::read(&manifest_path).await?))
+    }
+
+    async fn manifest_is_fully_local(&self, manifest_hash: &str) -> Result<bool> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(true);
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            return Ok(false);
+        };
+
+        for chunk in &manifest.chunks {
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let metadata = match fs::metadata(&chunk_path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(err) => return Err(err.into()),
+            };
+            if metadata.len() != chunk.size_bytes as u64 {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     async fn clone_manifest_for_key(&self, manifest_hash: &str, key: &str) -> Result<String> {
@@ -2008,6 +2321,68 @@ impl PersistentStore {
         }
 
         Ok(ObjectStreamPlan { chunks: planned })
+    }
+
+    pub async fn missing_chunks_for_manifest_range(
+        &self,
+        manifest_hash: &str,
+        start: usize,
+        end_exclusive: usize,
+    ) -> std::result::Result<Vec<ReplicationChunkInfo>, StoreReadError> {
+        if start > end_exclusive {
+            return Err(StoreReadError::Internal(anyhow::anyhow!(
+                "invalid range start={start} end={end_exclusive}"
+            )));
+        }
+
+        let Some(manifest) = self
+            .load_manifest_by_hash(manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        if end_exclusive > manifest.total_size_bytes {
+            return Err(StoreReadError::Internal(anyhow::anyhow!(
+                "range end_exclusive={end_exclusive} exceeds object size={}",
+                manifest.total_size_bytes
+            )));
+        }
+
+        let mut missing = Vec::new();
+        let mut offset = 0usize;
+
+        for chunk in manifest.chunks {
+            let chunk_end = offset.saturating_add(chunk.size_bytes);
+            if chunk_end <= start {
+                offset = chunk_end;
+                continue;
+            }
+            if offset >= end_exclusive {
+                break;
+            }
+
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let is_missing = match fs::metadata(&chunk_path).await {
+                Ok(metadata) => metadata.len() != chunk.size_bytes as u64,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                Err(err) => return Err(StoreReadError::Internal(err.into())),
+            };
+
+            if is_missing {
+                missing.push(ReplicationChunkInfo {
+                    hash: chunk.hash,
+                    size_bytes: chunk.size_bytes,
+                });
+            }
+
+            offset = chunk_end;
+        }
+
+        Ok(missing)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
