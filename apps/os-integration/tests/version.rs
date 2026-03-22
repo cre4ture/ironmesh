@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_REVISION: &str =
+    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
 
 #[cfg(windows)]
 const EXPECTED_NAME: &str = "adapter-windows-cfapi";
@@ -15,5 +17,7 @@ fn version_reports_nested_platform_cli_package_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(format!("{EXPECTED_NAME} {PACKAGE_VERSION}\n"));
+        .stdout(format!(
+            "{EXPECTED_NAME} {PACKAGE_VERSION}\nBuild revision: {BUILD_REVISION}\n"
+        ));
 }

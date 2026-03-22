@@ -13,11 +13,16 @@ const BUILD_INFO: &str = git_version::git_version!(
     prefix = "Build revision: ",
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
+const LONG_VERSION: &str = git_version::git_version!(
+    prefix = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: "),
+    args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
+);
 
 #[derive(Debug, Parser)]
 #[command(name = "ironmesh-folder-agent")]
 #[command(about = "OS-independent folder synchronization agent for Ironmesh")]
 #[command(version = PACKAGE_VERSION)]
+#[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]
 struct Args {
     #[command(subcommand)]

@@ -16,11 +16,16 @@ const BUILD_INFO: &str = git_version::git_version!(
     prefix = "Build revision: ",
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
+const LONG_VERSION: &str = git_version::git_version!(
+    prefix = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: "),
+    args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
+);
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
 #[command(about = "CLI client for ironmesh distributed storage")]
 #[command(version = PACKAGE_VERSION)]
+#[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]
 struct Cli {
     #[arg(long)]
