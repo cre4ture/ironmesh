@@ -41,6 +41,8 @@ use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use time::OffsetDateTime;
+use tokio::fs::File as TokioFile;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::{Mutex, RwLock, watch};
 use tower::Service;
 use tracing::Subscriber;
@@ -89,6 +91,7 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'?');
 const RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS: u64 = 1;
 const RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 5;
+const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, ReplicationPlan,
@@ -104,10 +107,9 @@ use setup::{
 use storage::{
     AdminAuditEvent, ClientCredentialRecord, ClientCredentialState, MediaCacheLookup,
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, ObjectReadDescriptor,
-    ObjectReadMode,
-    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
-    ReconcileVersionEntry, RepairAttemptRecord, StoreReadError, UploadChunkRef,
-    VersionConsistencyState,
+    ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord, PathMutationResult,
+    PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord, StoreReadError,
+    UploadChunkRef, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -5151,9 +5153,7 @@ async fn start_upload_session(
         completed_result: None,
     };
     let response = upload_session_view(&session);
-    sessions
-        .sessions
-        .insert(session.upload_id.clone(), session);
+    sessions.sessions.insert(session.upload_id.clone(), session);
     if let Err(err) = persist_upload_session_store(&sessions).await {
         warn!(error = %err, "failed to persist upload session state");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -5261,7 +5261,11 @@ async fn upload_session_chunk(
         size_bytes: payload.len(),
     };
 
-    if let Some(existing) = session.received_chunks.get(index).and_then(|entry| entry.as_ref()) {
+    if let Some(existing) = session
+        .received_chunks
+        .get(index)
+        .and_then(|entry| entry.as_ref())
+    {
         if existing.hash != next_ref.hash || existing.size_bytes != next_ref.size_bytes {
             return StatusCode::CONFLICT.into_response();
         }
@@ -5347,7 +5351,11 @@ async fn complete_upload_session_route(
     };
 
     publish_namespace_change(&state);
-    spawn_media_cache_warmup(state.clone(), session.key.clone(), outcome.manifest_hash.clone());
+    spawn_media_cache_warmup(
+        state.clone(),
+        session.key.clone(),
+        outcome.manifest_hash.clone(),
+    );
 
     let mut cluster = state.cluster.lock().await;
     cluster.note_replica(&session.key, state.node_id);
@@ -5364,7 +5372,10 @@ async fn complete_upload_session_route(
         );
     }
 
-    if should_trigger_autonomous_post_write_replication(state.autonomous_replication_on_put_enabled, false) {
+    if should_trigger_autonomous_post_write_replication(
+        state.autonomous_replication_on_put_enabled,
+        false,
+    ) {
         let state_for_repair = state.clone();
         tokio::spawn(async move {
             let report =
@@ -6041,7 +6052,10 @@ fn parse_object_byte_range(value: &str, total_size_bytes: usize) -> Option<Objec
     let end_inclusive = if end_raw.is_empty() {
         total_size_bytes.saturating_sub(1)
     } else {
-        end_raw.parse::<usize>().ok()?.min(total_size_bytes.saturating_sub(1))
+        end_raw
+            .parse::<usize>()
+            .ok()?
+            .min(total_size_bytes.saturating_sub(1))
     };
     if end_inclusive < start {
         return None;
@@ -6082,9 +6096,7 @@ fn add_object_common_headers(
             .insert("x-ironmesh-object-size", value);
     }
     if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_LENGTH, value);
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
 }
 
@@ -6092,9 +6104,7 @@ fn build_range_not_satisfiable_response(etag: &str, total_size_bytes: usize) -> 
     let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
     add_object_common_headers(&mut response, etag, total_size_bytes, 0);
     if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total_size_bytes}")) {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_RANGE, value);
+        response.headers_mut().insert(header::CONTENT_RANGE, value);
     }
     response
 }
@@ -6117,32 +6127,92 @@ fn build_object_head_response(
             range.start, range.end_inclusive, total_size_bytes
         ))
     {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_RANGE, value);
+        response.headers_mut().insert(header::CONTENT_RANGE, value);
     }
     response
 }
 
-fn build_object_bytes_response(
+fn build_object_stream(
+    plan: ObjectStreamPlan,
+) -> impl futures_core::stream::Stream<Item = std::result::Result<Bytes, io::Error>> + Send + 'static
+{
+    async_stream::try_stream! {
+        for chunk in plan.chunks {
+            let mut file = TokioFile::open(&chunk.path).await.map_err(|err| {
+                io::Error::other(format!(
+                    "failed to open chunk hash={} path={}: {err}",
+                    chunk.hash,
+                    chunk.path.display()
+                ))
+            })?;
+
+            if chunk.start > 0 {
+                file.seek(SeekFrom::Start(chunk.start as u64)).await.map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to seek chunk hash={} path={} offset={}: {err}",
+                        chunk.hash,
+                        chunk.path.display(),
+                        chunk.start
+                    ))
+                })?;
+            }
+
+            let mut remaining = chunk.len;
+            let buffer_len = std::cmp::max(
+                1,
+                std::cmp::min(OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES, remaining),
+            );
+            let mut buffer = vec![0_u8; buffer_len];
+
+            while remaining > 0 {
+                let read_len = std::cmp::min(remaining, buffer.len());
+                let bytes_read = file.read(&mut buffer[..read_len]).await.map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to read chunk hash={} path={}: {err}",
+                        chunk.hash,
+                        chunk.path.display()
+                    ))
+                })?;
+                if bytes_read == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "unexpected EOF while streaming chunk hash={} path={}",
+                            chunk.hash,
+                            chunk.path.display()
+                        ),
+                    ))?;
+                }
+
+                remaining -= bytes_read;
+                yield Bytes::copy_from_slice(&buffer[..bytes_read]);
+            }
+        }
+    }
+}
+
+fn build_object_stream_body(plan: ObjectStreamPlan) -> Body {
+    Body::from_stream(build_object_stream(plan))
+}
+
+fn build_object_stream_response(
     status: StatusCode,
     etag: &str,
     total_size_bytes: usize,
     selected_range: Option<ObjectByteRange>,
-    payload: Bytes,
+    stream_plan: ObjectStreamPlan,
 ) -> Response {
-    let payload_len = payload.len();
-    let mut response = (status, payload).into_response();
-    add_object_common_headers(&mut response, etag, total_size_bytes, payload_len);
+    let content_length = stream_plan.content_length();
+    let mut response = Response::new(build_object_stream_body(stream_plan));
+    *response.status_mut() = status;
+    add_object_common_headers(&mut response, etag, total_size_bytes, content_length);
     if let Some(range) = selected_range
         && let Ok(value) = HeaderValue::from_str(&format!(
             "bytes {}-{}/{}",
             range.start, range.end_inclusive, total_size_bytes
         ))
     {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_RANGE, value);
+        response.headers_mut().insert(header::CONTENT_RANGE, value);
     }
     response
 }
@@ -6212,30 +6282,23 @@ async fn get_object_response(
     }
 
     let read_result = match selected_range {
-        Some(range) => {
-            store
-                .read_object_range_by_manifest_hash(
-                    &manifest_hash,
-                    range.start,
-                    range.end_inclusive.saturating_add(1),
-                )
-                .await
-                .map(|payload| (StatusCode::PARTIAL_CONTENT, Some(range), payload))
-        }
-        None => store
-            .get_object(
-                key,
-                query.snapshot.as_deref(),
-                query.version.as_deref(),
-                read_mode,
+        Some(range) => store
+            .plan_object_range_by_manifest_hash(
+                &manifest_hash,
+                range.start,
+                range.end_inclusive.saturating_add(1),
             )
             .await
-            .map(|payload| (StatusCode::OK, None, payload)),
+            .map(|stream_plan| (StatusCode::PARTIAL_CONTENT, Some(range), stream_plan)),
+        None => store
+            .plan_object_range_by_manifest_hash(&manifest_hash, 0, total_size_bytes)
+            .await
+            .map(|stream_plan| (StatusCode::OK, None, stream_plan)),
     };
 
     match read_result {
-        Ok((status, range, payload)) => {
-            build_object_bytes_response(status, &etag, total_size_bytes, range, payload)
+        Ok((status, range, stream_plan)) => {
+            build_object_stream_response(status, &etag, total_size_bytes, range, stream_plan)
         }
         Err(StoreReadError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(StoreReadError::Corrupt(msg)) => {
@@ -10828,9 +10891,13 @@ async fn write_json_atomic(path: &FsPath, payload: &[u8]) -> Result<()> {
     tokio::fs::write(&temp_path, payload)
         .await
         .with_context(|| format!("failed writing {}", temp_path.display()))?;
-    tokio::fs::rename(&temp_path, path)
-        .await
-        .with_context(|| format!("failed renaming {} -> {}", temp_path.display(), path.display()))
+    tokio::fs::rename(&temp_path, path).await.with_context(|| {
+        format!(
+            "failed renaming {} -> {}",
+            temp_path.display(),
+            path.display()
+        )
+    })
 }
 
 async fn run_cleanup(

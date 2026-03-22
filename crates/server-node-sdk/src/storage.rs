@@ -331,6 +331,25 @@ pub struct ObjectReadDescriptor {
     pub total_size_bytes: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectStreamChunkPlan {
+    pub hash: String,
+    pub path: PathBuf,
+    pub start: usize,
+    pub len: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectStreamPlan {
+    pub chunks: Vec<ObjectStreamChunkPlan>,
+}
+
+impl ObjectStreamPlan {
+    pub fn content_length(&self) -> usize {
+        self.chunks.iter().map(|chunk| chunk.len).sum()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationManifestPayload {
     pub key: String,
@@ -1809,6 +1828,7 @@ impl PersistentStore {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn read_object_range_by_manifest_hash(
         &self,
         manifest_hash: &str,
@@ -1904,6 +1924,93 @@ impl PersistentStore {
         Ok(assembled.freeze())
     }
 
+    pub async fn plan_object_range_by_manifest_hash(
+        &self,
+        manifest_hash: &str,
+        start: usize,
+        end_exclusive: usize,
+    ) -> std::result::Result<ObjectStreamPlan, StoreReadError> {
+        if start > end_exclusive {
+            return Err(StoreReadError::Internal(anyhow::anyhow!(
+                "invalid range start={start} end={end_exclusive}"
+            )));
+        }
+
+        let Some(manifest) = self
+            .load_manifest_by_hash(manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        if end_exclusive > manifest.total_size_bytes {
+            return Err(StoreReadError::Internal(anyhow::anyhow!(
+                "range end_exclusive={end_exclusive} exceeds object size={}",
+                manifest.total_size_bytes
+            )));
+        }
+
+        let mut planned = Vec::new();
+        let mut planned_size = 0usize;
+        let mut offset = 0usize;
+
+        for chunk in manifest.chunks {
+            let chunk_end = offset.saturating_add(chunk.size_bytes);
+            if chunk_end <= start {
+                offset = chunk_end;
+                continue;
+            }
+            if offset >= end_exclusive {
+                break;
+            }
+
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let metadata = fs::metadata(&chunk_path).await.map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    StoreReadError::Corrupt(format!("missing chunk hash={}", chunk.hash))
+                } else {
+                    StoreReadError::Internal(err.into())
+                }
+            })?;
+            if metadata.len() != chunk.size_bytes as u64 {
+                return Err(StoreReadError::Corrupt(format!(
+                    "size mismatch for chunk hash={} expected={} actual={}",
+                    chunk.hash,
+                    chunk.size_bytes,
+                    metadata.len()
+                )));
+            }
+
+            let slice_start = start.saturating_sub(offset);
+            let slice_end = std::cmp::min(chunk.size_bytes, end_exclusive.saturating_sub(offset));
+            if slice_start < slice_end {
+                let len = slice_end - slice_start;
+                planned_size = planned_size.saturating_add(len);
+                planned.push(ObjectStreamChunkPlan {
+                    hash: chunk.hash,
+                    path: chunk_path,
+                    start: slice_start,
+                    len,
+                });
+            }
+
+            offset = chunk_end;
+        }
+
+        if planned_size != end_exclusive.saturating_sub(start) {
+            return Err(StoreReadError::Corrupt(format!(
+                "planned range size mismatch expected={} actual={planned_size}",
+                end_exclusive.saturating_sub(start)
+            )));
+        }
+
+        Ok(ObjectStreamPlan { chunks: planned })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get_object(
         &self,
         key: &str,

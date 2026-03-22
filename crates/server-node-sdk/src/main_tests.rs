@@ -4127,6 +4127,117 @@ run_on_main_metadata_backends!(
     get_object_admin_returns_bytes_with_admin_token_turso
 );
 
+async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let payload = Bytes::from(
+        (0..8192)
+            .map(|index| b'a' + (index % 26) as u8)
+            .collect::<Vec<_>>(),
+    );
+    {
+        let mut locked = state.store.lock().await;
+        locked
+            .put_object_versioned("docs/range.txt", payload.clone(), PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    let head_response = axum::response::IntoResponse::into_response(
+        super::head_object(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("docs/range.txt".to_string()),
+            axum::extract::Query(super::ObjectGetQuery {
+                snapshot: None,
+                version: None,
+                read_mode: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(head_response.status(), axum::http::StatusCode::OK);
+    let etag = head_response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        head_response
+            .headers()
+            .get(axum::http::header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes")
+    );
+
+    let mut range_headers = HeaderMap::new();
+    range_headers.insert(axum::http::header::RANGE, "bytes=128-511".parse().unwrap());
+    range_headers.insert(axum::http::header::IF_RANGE, etag.parse().unwrap());
+    let range_response = axum::response::IntoResponse::into_response(
+        super::get_object(
+            axum::extract::State(state.clone()),
+            range_headers,
+            axum::extract::Path("docs/range.txt".to_string()),
+            axum::extract::Query(super::ObjectGetQuery {
+                snapshot: None,
+                version: None,
+                read_mode: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(
+        range_response.status(),
+        axum::http::StatusCode::PARTIAL_CONTENT
+    );
+    assert_eq!(
+        range_response
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 128-511/8192")
+    );
+    let range_body = to_bytes(range_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(range_body.as_ref(), &payload[128..512]);
+
+    let mut stale_headers = HeaderMap::new();
+    stale_headers.insert(axum::http::header::RANGE, "bytes=128-511".parse().unwrap());
+    stale_headers.insert(
+        axum::http::header::IF_RANGE,
+        "\"stale-etag\"".parse().unwrap(),
+    );
+    let stale_response = axum::response::IntoResponse::into_response(
+        super::get_object(
+            axum::extract::State(state.clone()),
+            stale_headers,
+            axum::extract::Path("docs/range.txt".to_string()),
+            axum::extract::Query(super::ObjectGetQuery {
+                snapshot: None,
+                version: None,
+                read_mode: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(stale_response.status(), axum::http::StatusCode::OK);
+    let stale_body = to_bytes(stale_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(stale_body.as_ref(), payload.as_ref());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    get_object_supports_range_requests_impl,
+    get_object_supports_range_requests,
+    get_object_supports_range_requests_turso
+);
+
 async fn local_edge_mode_serves_health_without_internal_tls_impl(backend: MainTestBackend) {
     let bind_addr = free_bind_addr();
     let data_dir = std::env::temp_dir().join(format!(
@@ -4348,6 +4459,10 @@ async fn build_test_state(
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
         client_credentials: Arc::new(Mutex::new(super::storage::ClientCredentialState::default())),
+        upload_sessions: Arc::new(Mutex::new(super::UploadSessionStore {
+            path: root.join("state").join("upload_sessions.json"),
+            sessions: HashMap::new(),
+        })),
         public_ca_pem: None,
         public_ca_key_pem: None,
         cluster_ca_pem: None,

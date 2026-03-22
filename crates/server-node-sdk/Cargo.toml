@@ -13,6 +13,7 @@ turso-metadata = ["dep:turso"]
 aead = "0.5"
 aes-gcm-siv = "0.11"
 anyhow.workspace = true
+async-stream = "0.3"
 async-trait.workspace = true
 axum.workspace = true
 axum-server = { version = "0.8", features = ["tls-rustls"] }
@@ -23,6 +24,7 @@ common = { path = "../common" }
 exif = { package = "kamadak-exif", version = "0.6" }
 fs2 = "0.4"
 git-version.workspace = true
+futures-core = "0.3"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 percent-encoding = "2"
 pbkdf2 = "0.12"
