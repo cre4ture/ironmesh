@@ -64,6 +64,8 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
+  await page.getByRole("button", { name: "Next image" }).click();
+  await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
   await page.getByText("Setup", { exact: true }).click();

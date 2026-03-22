@@ -55,6 +55,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
+  await page.getByRole("button", { name: "Next image" }).click();
+  await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
   await page.getByText("Cluster", { exact: true }).click();
@@ -286,7 +288,10 @@ async function installClientUiMocks(page: Page) {
     }
 
     if (pathname === "/api/store/get-binary" && method === "GET") {
-      if (searchParams.get("key") === "gallery/cat.png") {
+      if (
+        searchParams.get("key") === "gallery/cat.png" ||
+        searchParams.get("key") === "gallery/dog.jpg"
+      ) {
         await new Promise((resolve) => setTimeout(resolve, 250));
         await route.fulfill({
           status: 200,

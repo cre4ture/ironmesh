@@ -17,7 +17,7 @@ import {
   Text,
   TextInput
 } from "@mantine/core";
-import { IconRefresh } from "@tabler/icons-react";
+import { IconChevronLeft, IconChevronRight, IconRefresh } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 
@@ -86,7 +86,7 @@ export function GallerySurface({
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<GalleryPayload | null>(null);
-  const [selectedEntry, setSelectedEntry] = useState<GalleryEntry | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [sortOrder, setSortOrder] = useState<GallerySortOrder>("captured_desc");
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -105,9 +105,42 @@ export function GallerySurface({
   );
   const readyCount = imageEntries.filter((entry) => entry.media?.status === "ready").length;
   const pendingCount = imageEntries.filter((entry) => entry.media?.status === "pending").length;
+  const selectedIndex = selectedPath
+    ? imageEntries.findIndex((entry) => entry.path === selectedPath)
+    : -1;
+  const selectedEntry = selectedIndex >= 0 ? imageEntries[selectedIndex] ?? null : null;
   const selectedImageRequests = selectedEntry
     ? getImageRequests(selectedEntry, snapshotId)
     : null;
+  const canNavigatePrevious = selectedIndex > 0;
+  const canNavigateNext = selectedIndex >= 0 && selectedIndex < imageEntries.length - 1;
+
+  useEffect(() => {
+    if (selectedPath && selectedIndex === -1) {
+      setSelectedPath(null);
+    }
+  }, [selectedIndex, selectedPath]);
+
+  useEffect(() => {
+    if (selectedIndex < 0) {
+      return;
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "ArrowLeft" && canNavigatePrevious) {
+        event.preventDefault();
+        setSelectedPath(imageEntries[selectedIndex - 1]?.path ?? null);
+      }
+
+      if (event.key === "ArrowRight" && canNavigateNext) {
+        event.preventDefault();
+        setSelectedPath(imageEntries[selectedIndex + 1]?.path ?? null);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [canNavigateNext, canNavigatePrevious, imageEntries, selectedIndex]);
 
   async function refreshSnapshots() {
     setLoading("snapshots");
@@ -143,6 +176,19 @@ export function GallerySurface({
     } finally {
       setLoading(null);
     }
+  }
+
+  function showRelativeEntry(delta: -1 | 1) {
+    if (selectedIndex < 0) {
+      return;
+    }
+
+    const nextIndex = selectedIndex + delta;
+    if (nextIndex < 0 || nextIndex >= imageEntries.length) {
+      return;
+    }
+
+    setSelectedPath(imageEntries[nextIndex]?.path ?? null);
   }
 
   return (
@@ -290,12 +336,12 @@ export function GallerySurface({
                 const imageRequests = getImageRequests(entry, snapshotId);
                 return (
                   <Card
-                    key={entry.path}
-                    withBorder
-                    radius="md"
-                    padding="sm"
-                    style={{ cursor: "pointer" }}
-                    onClick={() => setSelectedEntry(entry)}
+                  key={entry.path}
+                  withBorder
+                  radius="md"
+                  padding="sm"
+                  style={{ cursor: "pointer" }}
+                  onClick={() => setSelectedPath(entry.path)}
                   >
                     <Card.Section>
                       <AspectRatio ratio={1}>
@@ -343,8 +389,12 @@ export function GallerySurface({
 
       <Modal
         opened={selectedEntry !== null}
-        onClose={() => setSelectedEntry(null)}
-        title={selectedEntry ? fileName(selectedEntry.path) : "Image preview"}
+        onClose={() => setSelectedPath(null)}
+        title={
+          selectedEntry
+            ? `${fileName(selectedEntry.path)} (${selectedIndex + 1} of ${imageEntries.length})`
+            : "Image preview"
+        }
         fullScreen
         styles={{
           body: {
@@ -358,9 +408,16 @@ export function GallerySurface({
               <GalleryLightboxImage
                 requests={selectedImageRequests}
                 alt={selectedEntry.path}
+                canNavigatePrevious={canNavigatePrevious}
+                canNavigateNext={canNavigateNext}
+                onNavigatePrevious={() => showRelativeEntry(-1)}
+                onNavigateNext={() => showRelativeEntry(1)}
               />
             </div>
             <Group gap="xs">
+              <Badge variant="light">
+                {selectedIndex + 1} / {imageEntries.length}
+              </Badge>
               <Badge color={mediaStatusColor(selectedEntry.media?.status)} variant="light">
                 {selectedEntry.media?.status ?? "uncached"}
               </Badge>
@@ -441,9 +498,20 @@ function GalleryImagePreview({ request, alt, fit }: GalleryImagePreviewProps) {
 type GalleryLightboxImageProps = {
   requests: GalleryImageRequests;
   alt: string;
+  canNavigatePrevious: boolean;
+  canNavigateNext: boolean;
+  onNavigatePrevious: () => void;
+  onNavigateNext: () => void;
 };
 
-function GalleryLightboxImage({ requests, alt }: GalleryLightboxImageProps) {
+function GalleryLightboxImage({
+  requests,
+  alt,
+  canNavigatePrevious,
+  canNavigateNext,
+  onNavigatePrevious,
+  onNavigateNext
+}: GalleryLightboxImageProps) {
   const thumbnail = useResolvedImageRequest(requests.thumbnail);
   const originalRequest =
     requests.original && !sameImageRequest(requests.thumbnail, requests.original)
@@ -453,6 +521,7 @@ function GalleryLightboxImage({ requests, alt }: GalleryLightboxImageProps) {
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const [originalFailed, setOriginalFailed] = useState(false);
   const [originalLoaded, setOriginalLoaded] = useState(false);
+  const [touchStart, setTouchStart] = useState<{ x: number; y: number } | null>(null);
   const thumbnailSignature = requestSignature(requests.thumbnail);
   const originalSignature = requestSignature(originalRequest);
   const showingOriginal = Boolean(originalRequest);
@@ -479,7 +548,40 @@ function GalleryLightboxImage({ requests, alt }: GalleryLightboxImageProps) {
         height: "100%",
         overflow: "hidden",
         borderRadius: "var(--mantine-radius-md)",
-        background: "var(--mantine-color-dark-9)"
+        background: "var(--mantine-color-dark-9)",
+        touchAction: "pan-y"
+      }}
+      onTouchStart={(event) => {
+        const touch = event.touches[0];
+        if (!touch) {
+          return;
+        }
+        setTouchStart({ x: touch.clientX, y: touch.clientY });
+      }}
+      onTouchEnd={(event) => {
+        if (!touchStart) {
+          return;
+        }
+
+        const touch = event.changedTouches[0];
+        setTouchStart(null);
+        if (!touch) {
+          return;
+        }
+
+        const deltaX = touch.clientX - touchStart.x;
+        const deltaY = touch.clientY - touchStart.y;
+        if (Math.abs(deltaX) < 48 || Math.abs(deltaX) <= Math.abs(deltaY)) {
+          return;
+        }
+
+        if (deltaX < 0 && canNavigateNext) {
+          onNavigateNext();
+        }
+
+        if (deltaX > 0 && canNavigatePrevious) {
+          onNavigatePrevious();
+        }
       }}
     >
       {thumbnailVisible ? (
@@ -563,7 +665,61 @@ function GalleryLightboxImage({ requests, alt }: GalleryLightboxImageProps) {
           </Badge>
         </div>
       ) : null}
+
+      <GalleryLightboxEdgeButton
+        direction="previous"
+        enabled={canNavigatePrevious}
+        onClick={onNavigatePrevious}
+      />
+      <GalleryLightboxEdgeButton
+        direction="next"
+        enabled={canNavigateNext}
+        onClick={onNavigateNext}
+      />
     </div>
+  );
+}
+
+type GalleryLightboxEdgeButtonProps = {
+  direction: "previous" | "next";
+  enabled: boolean;
+  onClick: () => void;
+};
+
+function GalleryLightboxEdgeButton({
+  direction,
+  enabled,
+  onClick
+}: GalleryLightboxEdgeButtonProps) {
+  const isPrevious = direction === "previous";
+
+  return (
+    <button
+      type="button"
+      aria-label={isPrevious ? "Previous image" : "Next image"}
+      onClick={onClick}
+      disabled={!enabled}
+      style={{
+        position: "absolute",
+        top: 0,
+        bottom: 0,
+        [isPrevious ? "left" : "right"]: 0,
+        width: "18%",
+        minWidth: 72,
+        border: 0,
+        padding: isPrevious ? "0 0 0 16px" : "0 16px 0 0",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: isPrevious ? "flex-start" : "flex-end",
+        cursor: enabled ? "pointer" : "default",
+        color: enabled ? "white" : "rgba(255, 255, 255, 0.28)",
+        background: isPrevious
+          ? "linear-gradient(90deg, rgba(0, 0, 0, 0.28) 0%, rgba(0, 0, 0, 0) 100%)"
+          : "linear-gradient(270deg, rgba(0, 0, 0, 0.28) 0%, rgba(0, 0, 0, 0) 100%)"
+      }}
+    >
+      {isPrevious ? <IconChevronLeft size={28} /> : <IconChevronRight size={28} />}
+    </button>
   );
 }
 
