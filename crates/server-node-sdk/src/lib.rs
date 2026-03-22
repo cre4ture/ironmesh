@@ -63,6 +63,10 @@ use transport_sdk::{
     credential_fingerprint, encode_optional_body_base64, verify_signed_request_headers,
 };
 use uuid::Uuid;
+
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_REVISION: &str =
+    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
@@ -4450,6 +4454,8 @@ async fn health(State(state): State<ServerState>) -> Json<HealthStatus> {
         node_id: state.node_id,
         role: "server-node".to_string(),
         online: true,
+        version: BUILD_VERSION.to_string(),
+        revision: BUILD_REVISION.to_string(),
     })
 }
 

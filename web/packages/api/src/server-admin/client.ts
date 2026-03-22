@@ -17,6 +17,7 @@ import type {
   NodeEnrollmentPackage,
   RendezvousConfigView,
   ReplicationPlan,
+  ServerHealthResponse,
   StoreListView,
   SetupStatus,
   SetupTransitionResponse
@@ -134,6 +135,13 @@ export async function triggerReplicationRepair(): Promise<Record<string, unknown
 
 export async function getRecentLogs(limit = 200): Promise<LogsResponse> {
   return fetchJson<LogsResponse>(`/logs?limit=${limit}`, {
+    credentials: "same-origin",
+    cache: "no-store"
+  });
+}
+
+export async function getServerHealth(): Promise<ServerHealthResponse> {
+  return fetchJson<ServerHealthResponse>("/health", {
     credentials: "same-origin",
     cache: "no-store"
   });

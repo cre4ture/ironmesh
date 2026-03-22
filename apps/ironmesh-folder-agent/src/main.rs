@@ -8,13 +8,17 @@ use sync_agent_core::{
     cleanup_ironmesh_part_files, delete_conflict_copies, resolve_conflict_action, run_folder_agent,
 };
 
-const GIT_VERSION: &str =
-    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_INFO: &str = git_version::git_version!(
+    prefix = "Build revision: ",
+    args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
+);
 
 #[derive(Debug, Parser)]
 #[command(name = "ironmesh-folder-agent")]
 #[command(about = "OS-independent folder synchronization agent for Ironmesh")]
-#[command(version = GIT_VERSION)]
+#[command(version = PACKAGE_VERSION)]
+#[command(after_help = BUILD_INFO)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,

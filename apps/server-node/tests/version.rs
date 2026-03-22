@@ -1,14 +1,13 @@
 use assert_cmd::Command;
 
-const GIT_VERSION: &str =
-    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[test]
-fn version_reports_git_descriptor() {
+fn version_reports_package_version() {
     Command::cargo_bin("server-node")
         .expect("server-node binary should build")
         .arg("--version")
         .assert()
         .success()
-        .stdout(format!("server-node {GIT_VERSION}\n"));
+        .stdout(format!("server-node {PACKAGE_VERSION}\n"));
 }

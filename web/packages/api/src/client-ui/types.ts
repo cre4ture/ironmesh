@@ -5,6 +5,8 @@ export type JsonObject = Record<string, unknown>;
 export type ClientUiPingResponse = {
   ok: boolean;
   service: string;
+  backend_version?: string;
+  backend_revision?: string;
 };
 
 export type ClientUiRuntimeInfo = {

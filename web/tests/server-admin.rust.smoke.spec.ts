@@ -3,7 +3,8 @@ import { expect, test } from "@playwright/test";
 test("server-admin is served by a real server-node runtime", async ({ page }) => {
   await page.goto("/");
 
-  await expect(page.getByRole("banner").getByText("v0.1.0", { exact: true })).toBeVisible();
+  await expect(page.getByRole("banner").getByText("UI v0.1.0", { exact: true })).toBeVisible();
+  await expect(page.getByRole("banner").getByText("Backend v0.1.0", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "ironmesh Server Node" })).toHaveCount(0);
   await expect(page.getByText("Server Admin", { exact: true })).toBeVisible();

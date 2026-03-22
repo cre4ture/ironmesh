@@ -60,7 +60,7 @@ import {
   type StoreListResponse,
   type VersionGraphResponse
 } from "@ironmesh/api";
-import { ironmeshUiVersionLabel } from "@ironmesh/config";
+import { ironmeshUiVersion, ironmeshUiVersionLabel } from "@ironmesh/config";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { GalleryPage } from "../pages/GalleryPage";
 
@@ -175,7 +175,14 @@ export function ClientShell() {
             </Group>
             <Group gap="sm">
               {ping ? <Badge variant="light">{ping.service}</Badge> : null}
-              <Badge variant="outline">{ironmeshUiVersionLabel}</Badge>
+              <Badge variant="outline">UI {ironmeshUiVersionLabel}</Badge>
+              <Badge
+                color={ping?.backend_version && ping.backend_version !== ironmeshUiVersion ? "red" : "gray"}
+                variant="outline"
+                title={ping?.backend_revision ?? undefined}
+              >
+                {ping?.backend_version ? `Backend v${ping.backend_version}` : "Backend unknown"}
+              </Badge>
               <Badge color="teal" variant="filled">
                 Transport-aware
               </Badge>

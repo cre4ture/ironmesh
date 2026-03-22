@@ -69,6 +69,17 @@ export type LogsResponse = {
   entries: string[];
 };
 
+export type ServerHealthResponse = {
+  node_id?: string;
+  role?: string;
+  online?: boolean;
+  mode?: string;
+  state?: string;
+  data_dir?: string;
+  version?: string;
+  revision?: string;
+};
+
 export type SetupStatus = {
   state: "uninitialized" | "pending_join" | "online";
   data_dir: string;

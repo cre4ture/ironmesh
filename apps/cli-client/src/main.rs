@@ -11,13 +11,17 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use web_ui_backend::{WebUiBootstrapPersistence, WebUiConfig};
 
-const GIT_VERSION: &str =
-    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_INFO: &str = git_version::git_version!(
+    prefix = "Build revision: ",
+    args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
+);
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
 #[command(about = "CLI client for ironmesh distributed storage")]
-#[command(version = GIT_VERSION)]
+#[command(version = PACKAGE_VERSION)]
+#[command(after_help = BUILD_INFO)]
 struct Cli {
     #[arg(long)]
     server_url: Option<String>,

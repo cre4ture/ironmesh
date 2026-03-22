@@ -7,7 +7,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   await expect(page.getByRole("banner").getByText("cli-client-web", { exact: true })).toBeVisible();
-  await expect(page.getByRole("banner").getByText("v0.1.0", { exact: true })).toBeVisible();
+  await expect(page.getByRole("banner").getByText("UI v0.1.0", { exact: true })).toBeVisible();
+  await expect(page.getByRole("banner").getByText("Backend v0.1.0", { exact: true })).toBeVisible();
   await expect(page.getByText("Transport-aware", { exact: true })).toBeVisible();
   await expect(page.getByText("Active route")).toBeVisible();
   await expect(page.getByText("Direct")).toBeVisible();
@@ -64,7 +65,12 @@ async function installClientUiMocks(page: Page) {
     const method = route.request().method();
 
     if (pathname === "/api/ping" && method === "GET") {
-      return json(route, { ok: true, service: "cli-client-web" });
+      return json(route, {
+        ok: true,
+        service: "cli-client-web",
+        backend_version: "0.1.0",
+        backend_revision: "v0.1.0-3-gmocked"
+      });
     }
 
     if (pathname === "/api/health" && method === "GET") {

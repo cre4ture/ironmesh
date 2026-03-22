@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BACKEND_REVISION: &str =
+    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+
 pub mod assets {
     pub fn app_html() -> String {
         include_str!(concat!(env!("OUT_DIR"), "/client_ui_index.html")).to_string()
@@ -647,7 +651,9 @@ async fn web_ping(State(state): State<WebState>) -> impl IntoResponse {
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "service": state.service_name
+            "service": state.service_name,
+            "backend_version": BACKEND_VERSION,
+            "backend_revision": BACKEND_REVISION,
         })),
     )
         .into_response()

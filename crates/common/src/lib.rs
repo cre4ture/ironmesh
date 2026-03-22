@@ -22,4 +22,6 @@ pub struct HealthStatus {
     pub node_id: NodeId,
     pub role: String,
     pub online: bool,
+    pub version: String,
+    pub revision: String,
 }

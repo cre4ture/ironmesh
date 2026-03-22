@@ -261,6 +261,8 @@ async fn setup_health(State(state): State<SetupServerState>) -> impl IntoRespons
             "mode": "bootstrap_setup",
             "state": managed.state,
             "data_dir": state.config.data_dir.display().to_string(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "revision": git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]),
         })),
     )
 }
