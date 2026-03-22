@@ -49,6 +49,32 @@ export type StorePutResponse = {
   chunk_count?: number;
 };
 
+export type StoreUploadSessionStartResponse = {
+  upload_id: string;
+  key: string;
+  total_size_bytes: number;
+  chunk_size_bytes: number;
+  chunk_count: number;
+  received_indexes: number[];
+  completed: boolean;
+};
+
+export type StoreUploadSessionChunkResponse = {
+  stored: boolean;
+  received_index: number;
+};
+
+export type StoreUploadSessionCompleteResponse = {
+  snapshot_id: string;
+  version_id: string;
+  manifest_hash: string;
+  state: string;
+  new_chunks: number;
+  dedup_reused_chunks: number;
+  created_new_version: boolean;
+  total_size_bytes: number;
+};
+
 export type StoreGetResponse = {
   key: string;
   snapshot?: string | null;

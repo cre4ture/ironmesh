@@ -20,6 +20,17 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
   await page.getByRole("button", { name: "Upload text object" }).click();
   await expect(page.getByText('"key": "docs/readme.txt"')).toBeVisible();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "sample.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from("sample-binary-payload")
+  });
+  await page.getByRole("button", { name: "Upload binary file" }).click();
+  await expect(page.getByText('"key": "images/demo.bin"')).toBeVisible();
+  await expect(page.getByText('"upload_mode": "chunked"')).toBeVisible();
+  await expect(page.getByText("Upload progress")).toBeVisible();
+  await expect(page.getByText("21 B / 21 B")).toBeVisible();
+  await expect(page.getByText("6 / 6 chunks acknowledged")).toBeVisible();
   await page.getByRole("button", { name: "Download text object" }).click();
   await expect(page.getByLabel("Downloaded payload")).toHaveValue("hello from the mocked store");
 
@@ -68,6 +79,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
 async function installClientUiMocks(page: Page) {
   const imageBody = tinyPngBuffer();
+  let uploadSessionStartCount = 0;
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -279,11 +291,41 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/store/put-binary" && method === "POST") {
+    if (pathname === "/api/store/uploads/start" && method === "POST") {
+      uploadSessionStartCount += 1;
+      const body = route.request().postDataJSON() as {
+        key: string;
+        total_size_bytes: number;
+      };
       return json(route, {
-        key: searchParams.get("key"),
-        size_bytes: 1234,
-        upload_mode: "direct"
+        upload_id: `upload-${uploadSessionStartCount}`,
+        key: body.key,
+        total_size_bytes: body.total_size_bytes,
+        chunk_size_bytes: 4,
+        chunk_count: Math.ceil(body.total_size_bytes / 4),
+        received_indexes: [],
+        completed: false
+      });
+    }
+
+    if (/^\/api\/store\/uploads\/[^/]+\/chunk\/\d+$/.test(pathname) && method === "PUT") {
+      const index = Number(pathname.split("/").pop() ?? "0");
+      return json(route, {
+        stored: true,
+        received_index: index
+      });
+    }
+
+    if (/^\/api\/store\/uploads\/[^/]+\/complete$/.test(pathname) && method === "POST") {
+      return json(route, {
+        snapshot_id: "snapshot-001",
+        version_id: "version-002",
+        manifest_hash: "manifest-upload",
+        state: "ready",
+        new_chunks: 3,
+        dedup_reused_chunks: 0,
+        created_new_version: true,
+        total_size_bytes: 21
       });
     }
 

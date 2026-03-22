@@ -3,7 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use client_sdk::{
@@ -218,6 +218,15 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/store/get", get(web_store_get))
         .route("/api/store/put", post(web_store_put))
         .route("/api/store/delete", delete(web_store_delete))
+        .route("/api/store/uploads/start", post(web_store_upload_start))
+        .route(
+            "/api/store/uploads/{upload_id}/chunk/{index}",
+            put(web_store_upload_chunk),
+        )
+        .route(
+            "/api/store/uploads/{upload_id}/complete",
+            post(web_store_upload_complete),
+        )
         .route("/api/store/get-binary", get(web_store_get_binary))
         .route("/api/store/put-binary", post(web_store_put_binary))
         .route(
@@ -267,6 +276,12 @@ struct WebStoreBinaryGetQuery {
 #[derive(Debug, Deserialize)]
 struct WebStoreBinaryPutQuery {
     key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreUploadSessionStartRequest {
+    key: String,
+    total_size_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -883,6 +898,61 @@ async fn web_store_delete(
             )
                 .into_response()
         }
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+async fn web_store_upload_start(
+    State(state): State<WebState>,
+    Json(request): Json<WebStoreUploadSessionStartRequest>,
+) -> impl IntoResponse {
+    if request.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    match current_sdk(&state)
+        .await
+        .begin_upload_session(request.key.trim(), request.total_size_bytes)
+        .await
+    {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+async fn web_store_upload_chunk(
+    State(state): State<WebState>,
+    Path((upload_id, index)): Path<(String, usize)>,
+    payload: Bytes,
+) -> impl IntoResponse {
+    if upload_id.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "upload_id must not be empty");
+    }
+
+    match current_sdk(&state)
+        .await
+        .upload_session_chunk_bytes(upload_id.trim(), index, payload.to_vec())
+        .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+async fn web_store_upload_complete(
+    State(state): State<WebState>,
+    Path(upload_id): Path<String>,
+) -> impl IntoResponse {
+    if upload_id.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "upload_id must not be empty");
+    }
+
+    match current_sdk(&state)
+        .await
+        .finalize_upload_session(upload_id.trim())
+        .await
+    {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }

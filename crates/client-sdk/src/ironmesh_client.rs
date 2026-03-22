@@ -84,6 +84,35 @@ pub struct UploadResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSessionStatus {
+    pub upload_id: String,
+    pub key: String,
+    pub total_size_bytes: u64,
+    pub chunk_size_bytes: usize,
+    pub chunk_count: usize,
+    pub received_indexes: Vec<usize>,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSessionChunkStatus {
+    pub stored: bool,
+    pub received_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSessionCompleteInfo {
+    pub snapshot_id: String,
+    pub version_id: String,
+    pub manifest_hash: String,
+    pub state: String,
+    pub new_chunks: usize,
+    pub dedup_reused_chunks: usize,
+    pub created_new_version: bool,
+    pub total_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectHeadInfo {
     pub total_size_bytes: u64,
     pub etag: Option<String>,
@@ -802,6 +831,17 @@ impl IronMeshClient {
             .with_context(|| format!("failed to parse upload session start response for {key}"))
     }
 
+    pub async fn begin_upload_session(
+        &self,
+        key: impl AsRef<str>,
+        total_size_bytes: u64,
+    ) -> Result<UploadSessionStatus> {
+        let view = self
+            .start_upload_session(key.as_ref(), total_size_bytes)
+            .await?;
+        Ok(upload_session_status_from_view(view))
+    }
+
     async fn get_upload_session(&self, upload_id: &str) -> Result<Option<UploadSessionView>> {
         let url = self.store_upload_session_url(upload_id)?;
         let response = self
@@ -843,6 +883,19 @@ impl IronMeshClient {
         })
     }
 
+    pub async fn upload_session_chunk_bytes(
+        &self,
+        upload_id: &str,
+        index: usize,
+        payload: Vec<u8>,
+    ) -> Result<UploadSessionChunkStatus> {
+        let response = self.upload_session_chunk(upload_id, index, payload).await?;
+        Ok(UploadSessionChunkStatus {
+            stored: response.stored,
+            received_index: response.received_index,
+        })
+    }
+
     async fn complete_upload_session(
         &self,
         upload_id: &str,
@@ -863,6 +916,14 @@ impl IronMeshClient {
         serde_json::from_slice::<UploadSessionCompleteResponse>(&response.body).with_context(|| {
             format!("failed to parse upload session completion response for {upload_id}")
         })
+    }
+
+    pub async fn finalize_upload_session(
+        &self,
+        upload_id: &str,
+    ) -> Result<UploadSessionCompleteInfo> {
+        let response = self.complete_upload_session(upload_id).await?;
+        Ok(upload_session_complete_info_from_response(response))
     }
 
     async fn head_object_response(
@@ -2067,6 +2128,33 @@ fn upload_result_from_session_complete(
         upload_mode: UploadMode::Chunked,
         chunk_size_bytes: Some(session.chunk_size_bytes),
         chunk_count: Some(session.chunk_count),
+    }
+}
+
+fn upload_session_status_from_view(view: UploadSessionView) -> UploadSessionStatus {
+    UploadSessionStatus {
+        upload_id: view.upload_id,
+        key: view.key,
+        total_size_bytes: view.total_size_bytes,
+        chunk_size_bytes: view.chunk_size_bytes,
+        chunk_count: view.chunk_count,
+        received_indexes: view.received_indexes,
+        completed: view.completed,
+    }
+}
+
+fn upload_session_complete_info_from_response(
+    response: UploadSessionCompleteResponse,
+) -> UploadSessionCompleteInfo {
+    UploadSessionCompleteInfo {
+        snapshot_id: response.snapshot_id,
+        version_id: response.version_id,
+        manifest_hash: response.manifest_hash,
+        state: response.state,
+        new_chunks: response.new_chunks,
+        dedup_reused_chunks: response.dedup_reused_chunks,
+        created_new_version: response.created_new_version,
+        total_size_bytes: response.total_size_bytes,
     }
 }
 

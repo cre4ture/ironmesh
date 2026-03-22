@@ -8,6 +8,9 @@ import type {
   StoreListResponse,
   StoreListView,
   StorePutResponse,
+  StoreUploadSessionChunkResponse,
+  StoreUploadSessionCompleteResponse,
+  StoreUploadSessionStartResponse,
   VersionGraphResponse
 } from "./types";
 
@@ -15,6 +18,15 @@ export type BinaryDownloadResult = {
   blob: Blob;
   filename: string;
   contentType: string;
+};
+
+export type BinaryUploadProgress = {
+  uploadedBytes: number;
+  totalBytes: number;
+  uploadedChunks: number;
+  totalChunks: number;
+  percent: number;
+  phase: "starting" | "uploading" | "finalizing" | "complete";
 };
 
 export async function getClientPing(): Promise<ClientUiPingResponse> {
@@ -118,15 +130,88 @@ export async function deleteStoreValue(key: string): Promise<JsonObject> {
   });
 }
 
-export async function putBinaryObject(key: string, file: File): Promise<StorePutResponse> {
-  const response = await fetch(`/api/store/put-binary?key=${encodeURIComponent(key)}`, {
-    method: "POST",
-    body: file,
-    headers: {
-      "content-type": file.type || "application/octet-stream"
+export async function putBinaryObject(
+  key: string,
+  file: File,
+  onProgress?: (progress: BinaryUploadProgress) => void
+): Promise<StorePutResponse> {
+  const session = await startStoreUploadSession(key, file.size);
+  const receivedIndexes = new Set(session.received_indexes);
+  let uploadedBytes = byteCountForReceivedIndexes(
+    receivedIndexes,
+    session.chunk_size_bytes,
+    file.size
+  );
+  let uploadedChunks = receivedIndexes.size;
+
+  onProgress?.(
+    buildBinaryUploadProgress(
+      uploadedBytes,
+      file.size,
+      uploadedChunks,
+      session.chunk_count,
+      uploadedChunks === 0 ? "starting" : "uploading"
+    )
+  );
+
+  for (let index = 0; index < session.chunk_count; index += 1) {
+    if (receivedIndexes.has(index)) {
+      continue;
     }
-  });
-  return readJsonResponse<StorePutResponse>(response);
+
+    const start = index * session.chunk_size_bytes;
+    const end = Math.min(start + session.chunk_size_bytes, file.size);
+    const chunk = file.slice(start, end);
+    const response = await fetch(`/api/store/uploads/${encodeURIComponent(session.upload_id)}/chunk/${index}`, {
+      method: "PUT",
+      body: chunk,
+      headers: {
+        "content-type": file.type || "application/octet-stream"
+      }
+    });
+    const ack = await readJsonResponse<StoreUploadSessionChunkResponse>(response);
+    if (ack.received_index !== index) {
+      throw new Error(`Chunk upload desynchronized at index ${index}`);
+    }
+    uploadedBytes += end - start;
+    uploadedChunks += 1;
+    onProgress?.(
+      buildBinaryUploadProgress(
+        uploadedBytes,
+        file.size,
+        uploadedChunks,
+        session.chunk_count,
+        "uploading"
+      )
+    );
+  }
+
+  onProgress?.(
+    buildBinaryUploadProgress(
+      file.size,
+      file.size,
+      session.chunk_count,
+      session.chunk_count,
+      "finalizing"
+    )
+  );
+  const completed = await completeStoreUploadSession(session.upload_id);
+  onProgress?.(
+    buildBinaryUploadProgress(
+      completed.total_size_bytes,
+      completed.total_size_bytes,
+      session.chunk_count,
+      session.chunk_count,
+      "complete"
+    )
+  );
+  return {
+    key: session.key,
+    size_bytes: completed.total_size_bytes,
+    upload_mode: "chunked",
+    chunk_size_bytes: session.chunk_size_bytes,
+    chunk_count: session.chunk_count
+  };
 }
 
 export function getBinaryObjectDownloadUrl(
@@ -172,6 +257,68 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
     throw new Error(await readErrorMessage(response));
   }
   return (await response.json()) as T;
+}
+
+async function startStoreUploadSession(
+  key: string,
+  totalSizeBytes: number
+): Promise<StoreUploadSessionStartResponse> {
+  return fetchJson<StoreUploadSessionStartResponse>("/api/store/uploads/start", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      key,
+      total_size_bytes: totalSizeBytes
+    })
+  });
+}
+
+async function completeStoreUploadSession(
+  uploadId: string
+): Promise<StoreUploadSessionCompleteResponse> {
+  return fetchJson<StoreUploadSessionCompleteResponse>(
+    `/api/store/uploads/${encodeURIComponent(uploadId)}/complete`,
+    {
+      method: "POST"
+    }
+  );
+}
+
+function byteCountForReceivedIndexes(
+  receivedIndexes: Set<number>,
+  chunkSizeBytes: number,
+  totalSizeBytes: number
+): number {
+  let uploadedBytes = 0;
+  for (const index of receivedIndexes) {
+    const start = index * chunkSizeBytes;
+    const end = Math.min(start + chunkSizeBytes, totalSizeBytes);
+    uploadedBytes += Math.max(0, end - start);
+  }
+  return uploadedBytes;
+}
+
+function buildBinaryUploadProgress(
+  uploadedBytes: number,
+  totalBytes: number,
+  uploadedChunks: number,
+  totalChunks: number,
+  phase: BinaryUploadProgress["phase"]
+): BinaryUploadProgress {
+  const safeTotalBytes = Math.max(0, totalBytes);
+  const safeUploadedBytes = Math.min(Math.max(0, uploadedBytes), safeTotalBytes);
+  const percent =
+    safeTotalBytes === 0 ? 100 : Math.round((safeUploadedBytes / safeTotalBytes) * 100);
+  return {
+    uploadedBytes: safeUploadedBytes,
+    totalBytes: safeTotalBytes,
+    uploadedChunks,
+    totalChunks,
+    percent,
+    phase
+  };
 }
 
 async function readErrorMessage(response: Response): Promise<string> {

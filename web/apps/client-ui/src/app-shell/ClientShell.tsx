@@ -12,6 +12,7 @@ import {
   Group,
   NavLink,
   NumberInput,
+  Progress,
   Select,
   SimpleGrid,
   Stack,
@@ -52,6 +53,7 @@ import {
   putStoreValue,
   refreshClientRendezvous,
   updateClientRendezvous,
+  type BinaryUploadProgress,
   type ClientRendezvousView,
   type ClientUiPingResponse,
   type JsonObject,
@@ -667,6 +669,7 @@ function StorePage() {
   const [binaryUploadKey, setBinaryUploadKey] = useState("images/demo.bin");
   const [binaryFile, setBinaryFile] = useState<File | null>(null);
   const [binaryDownloadKey, setBinaryDownloadKey] = useState("images/demo.bin");
+  const [binaryUploadProgress, setBinaryUploadProgress] = useState<BinaryUploadProgress | null>(null);
   const [result, setResult] = useState<unknown>({ message: "No operation run yet." });
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -713,7 +716,17 @@ function StorePage() {
       return;
     }
     const key = binaryUploadKey.trim() || binaryFile.name;
-    const payload = await withAction("upload-binary", () => putBinaryObject(key, binaryFile));
+    setBinaryUploadProgress({
+      uploadedBytes: 0,
+      totalBytes: binaryFile.size,
+      uploadedChunks: 0,
+      totalChunks: 0,
+      percent: 0,
+      phase: "starting"
+    });
+    const payload = await withAction("upload-binary", () =>
+      putBinaryObject(key, binaryFile, setBinaryUploadProgress)
+    );
     if (payload) {
       setBinaryUploadKey(key);
       setResult({
@@ -799,10 +812,50 @@ function StorePage() {
                 value={binaryUploadKey}
                 onChange={(event) => setBinaryUploadKey(event.currentTarget.value)}
               />
-              <FileInput label="File" value={binaryFile} onChange={setBinaryFile} />
+              <FileInput
+                label="File"
+                value={binaryFile}
+                onChange={(value) => {
+                  setBinaryFile(value);
+                  setBinaryUploadProgress(null);
+                }}
+              />
               <Button loading={pendingAction === "upload-binary"} onClick={() => void handleUploadBinary()}>
                 Upload binary file
               </Button>
+              {binaryUploadProgress ? (
+                <Stack gap={6}>
+                  <Group justify="space-between" gap="sm">
+                    <Text size="sm" fw={600}>
+                      Upload progress
+                    </Text>
+                    <Badge
+                      color={binaryUploadProgress.phase === "complete" ? "teal" : "blue"}
+                      variant="light"
+                    >
+                      {binaryUploadPhaseLabel(binaryUploadProgress.phase)}
+                    </Badge>
+                  </Group>
+                  <Progress
+                    value={binaryUploadProgress.percent}
+                    animated={
+                      pendingAction === "upload-binary" &&
+                      binaryUploadProgress.phase !== "complete"
+                    }
+                  />
+                  <Group justify="space-between" gap="sm">
+                    <Text size="sm">
+                      {formatExplorerSize(binaryUploadProgress.uploadedBytes)} / {formatExplorerSize(binaryUploadProgress.totalBytes)}
+                    </Text>
+                    <Text size="sm" c="dimmed">
+                      {binaryUploadProgress.percent}%
+                    </Text>
+                  </Group>
+                  <Text size="xs" c="dimmed">
+                    {binaryUploadProgress.uploadedChunks} / {binaryUploadProgress.totalChunks || 0} chunks acknowledged
+                  </Text>
+                </Stack>
+              ) : null}
             </Stack>
           </Card>
         </Grid.Col>
@@ -1340,6 +1393,19 @@ function formatExplorerSize(value: number | null | undefined): string {
   }
   const rounded = size >= 10 ? size.toFixed(0) : size.toFixed(1);
   return `${rounded} ${units[unitIndex]}`;
+}
+
+function binaryUploadPhaseLabel(phase: BinaryUploadProgress["phase"]): string {
+  if (phase === "starting") {
+    return "Starting";
+  }
+  if (phase === "uploading") {
+    return "Uploading";
+  }
+  if (phase === "finalizing") {
+    return "Finalizing";
+  }
+  return "Complete";
 }
 
 function renderExplorerHeader(
