@@ -37,6 +37,10 @@ pub mod assets {
     pub(crate) fn app_css() -> &'static str {
         include_str!(concat!(env!("OUT_DIR"), "/client_ui_app.css"))
     }
+
+    pub(crate) fn favicon_svg() -> &'static str {
+        include_str!("../../../docs/assets/ironmesh-favicon.svg")
+    }
 }
 
 #[derive(Clone)]
@@ -207,6 +211,7 @@ pub fn router(config: WebUiConfig) -> Router {
 
     Router::new()
         .route("/", get(web_static_index))
+        .route("/ironmesh-favicon.svg", get(web_static_favicon))
         .route("/media/thumbnail", get(web_media_thumbnail))
         .route("/api/health", get(web_health))
         .route("/api/snapshots", get(web_snapshots))
@@ -659,6 +664,15 @@ async fn web_static_file(Path(path): Path<String>) -> Response {
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn web_static_favicon() -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "image/svg+xml; charset=utf-8")],
+        assets::favicon_svg().as_bytes().to_vec(),
+    )
+        .into_response()
 }
 
 async fn web_ping(State(state): State<WebState>) -> impl IntoResponse {

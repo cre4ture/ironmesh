@@ -215,6 +215,7 @@ pub(crate) async fn run_setup_mode(
     let app = Router::new()
         .route("/", get(ui::index))
         .route("/health", get(setup_health))
+        .route("/ironmesh-favicon.svg", get(ui::favicon))
         .route("/ui/app.css", get(ui::app_css))
         .route("/ui/app.js", get(ui::app_js))
         .route("/setup/status", get(get_setup_status))

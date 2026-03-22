@@ -5,9 +5,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 
-function resolveWorkspaceVersion(): string {
+function resolveRepoRoot(): string {
   const configDir = path.dirname(fileURLToPath(import.meta.url));
-  const repoRoot = path.resolve(configDir, "../../../../");
+  return path.resolve(configDir, "../../../../");
+}
+
+function resolveWorkspaceVersion(): string {
+  const repoRoot = resolveRepoRoot();
   const cargoTomlPath = path.join(repoRoot, "Cargo.toml");
   const cargoToml = fs.readFileSync(cargoTomlPath, "utf8");
   const workspacePackageMatch = cargoToml.match(
@@ -17,8 +21,7 @@ function resolveWorkspaceVersion(): string {
 }
 
 function resolveWorkspaceRevision(): string {
-  const configDir = path.dirname(fileURLToPath(import.meta.url));
-  const repoRoot = path.resolve(configDir, "../../../../");
+  const repoRoot = resolveRepoRoot();
   try {
     return execSync("git describe --tags --always --dirty=-dirty --abbrev=12", {
       cwd: repoRoot,
@@ -31,11 +34,13 @@ function resolveWorkspaceRevision(): string {
 }
 
 export function makeViteConfig(appName: string) {
+  const repoRoot = resolveRepoRoot();
   const workspaceVersion = resolveWorkspaceVersion();
   const workspaceRevision = resolveWorkspaceRevision();
 
   return defineConfig({
     plugins: [react()],
+    publicDir: path.join(repoRoot, "docs", "assets"),
     define: {
       __IRONMESH_UI_VERSION__: JSON.stringify(workspaceVersion),
       __IRONMESH_UI_REVISION__: JSON.stringify(workspaceRevision)

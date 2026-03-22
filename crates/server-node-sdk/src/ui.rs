@@ -6,9 +6,21 @@ const INDEX_HTML_TEMPLATE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/server_admin_index.html"));
 const INDEX_CSS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.css"));
 const INDEX_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.js"));
+const FAVICON_SVG: &str = include_str!("../../../docs/assets/ironmesh-favicon.svg");
 
 pub(crate) async fn index() -> Html<&'static str> {
     Html(INDEX_HTML_TEMPLATE)
+}
+
+pub(crate) async fn favicon() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+        )],
+        FAVICON_SVG,
+    )
 }
 
 #[derive(Debug, Deserialize)]

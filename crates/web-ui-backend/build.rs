@@ -150,6 +150,16 @@ fn main() {
             .join("tsconfig.json")
             .display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("assets")
+            .join("ironmesh-favicon.svg")
+            .display()
+    );
     println!("cargo:rerun-if-env-changed=PATH");
 
     let generated_index = out_dir.join("client_ui_index.html");
@@ -174,13 +184,13 @@ fn main() {
             built_index_path.display()
         )
     });
-    let script_path = extract_attr(&index_html, "src").unwrap_or_else(|| {
+    let script_path = extract_script_src(&index_html).unwrap_or_else(|| {
         panic!(
             "failed locating script src in built client-ui HTML {}",
             built_index_path.display()
         )
     });
-    let stylesheet_path = extract_attr(&index_html, "href").unwrap_or_else(|| {
+    let stylesheet_path = extract_stylesheet_href(&index_html).unwrap_or_else(|| {
         panic!(
             "failed locating stylesheet href in built client-ui HTML {}",
             built_index_path.display()
@@ -205,11 +215,42 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_js.display()));
 }
 
-fn extract_attr(html: &str, attr: &str) -> Option<String> {
-    let needle = format!("{attr}=\"");
-    let start = html.find(&needle)? + needle.len();
-    let end = html[start..].find('"')? + start;
-    Some(html[start..end].to_string())
+fn extract_script_src(html: &str) -> Option<String> {
+    extract_tag_attr(html, "script", "src", &[])
+}
+
+fn extract_stylesheet_href(html: &str) -> Option<String> {
+    extract_tag_attr(html, "link", "href", &["rel=\"stylesheet\""])
+}
+
+fn extract_tag_attr(
+    html: &str,
+    tag_name: &str,
+    attr_name: &str,
+    required_snippets: &[&str],
+) -> Option<String> {
+    let tag_start = format!("<{tag_name}");
+    let attr_needle = format!("{attr_name}=\"");
+    let mut search_start = 0;
+
+    while let Some(tag_offset) = html[search_start..].find(&tag_start) {
+        let tag_start_index = search_start + tag_offset;
+        let tag_end_index = html[tag_start_index..].find('>')? + tag_start_index;
+        let tag = &html[tag_start_index..=tag_end_index];
+
+        if required_snippets
+            .iter()
+            .all(|snippet| tag.contains(snippet))
+        {
+            let attr_start = tag.find(&attr_needle)? + attr_needle.len();
+            let attr_end = tag[attr_start..].find('"')? + attr_start;
+            return Some(tag[attr_start..attr_end].to_string());
+        }
+
+        search_start = tag_end_index + 1;
+    }
+
+    None
 }
 
 fn resolve_dist_asset(dist_dir: &Path, asset_path: &str) -> PathBuf {

@@ -3257,6 +3257,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
     let mut public_app = Router::new()
         .route("/", get(ui::index))
+        .route("/ironmesh-favicon.svg", get(ui::favicon))
         .route("/ui/app.css", get(ui::app_css))
         .route("/ui/app.js", get(ui::app_js))
         .route("/logs", get(ui::list_logs))
