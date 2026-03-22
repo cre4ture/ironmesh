@@ -2,7 +2,8 @@ use std::env;
 use std::path::PathBuf;
 
 pub fn embed_icon(relative_icon_path: &str) {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
     let icon_path = manifest_dir.join(relative_icon_path);
     println!("cargo:rerun-if-changed={}", icon_path.display());
 
