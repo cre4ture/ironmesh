@@ -18,8 +18,8 @@ use sync_core::{EntryKind, SyncSnapshot};
 use crate::{
     FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeState, PathScope,
     RemoteTreeIndex, StartupStateStore, absolute_path, build_configured_client,
-    cleanup_ironmesh_part_files, delete_remote_file, describe_connection_target,
-    diff_local_trees, download_transfer_state_path, download_transfer_temp_path,
+    cleanup_ironmesh_part_files, delete_remote_file, describe_connection_target, diff_local_trees,
+    download_transfer_state_path, download_transfer_temp_path,
     load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
     local_entry_state_for_path, local_paths_to_preserve_on_startup,
     materialize_remote_conflict_copies, parent_directories, remote_file_hashes_by_local_path,

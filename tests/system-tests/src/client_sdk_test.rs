@@ -270,7 +270,11 @@ mod tests {
                     vec![b'C'; CHUNK_UPLOAD_THRESHOLD_BYTES + (CHUNK_UPLOAD_THRESHOLD_BYTES / 2)];
                 let payload_len = payload.len() as u64;
                 let mut reader = Cursor::new(payload);
-                chunked_reader_sdk.put_large_aware_reader("reader/chunked", &mut reader, payload_len)
+                chunked_reader_sdk.put_large_aware_reader(
+                    "reader/chunked",
+                    &mut reader,
+                    payload_len,
+                )
             })
             .await
             .context("put_large_aware_reader task join failed")??;
@@ -624,7 +628,7 @@ mod tests {
                 .context("failed to encode upload session start request")?,
             )
             .send()
-        .await?;
+            .await?;
         assert_eq!(start_response.status(), reqwest::StatusCode::CREATED);
         let start_json = start_response
             .json::<serde_json::Value>()
@@ -640,7 +644,7 @@ mod tests {
             .put(format!("{base_url}/store/uploads/{upload_id}/chunk/0"))
             .body(payload[..CHUNK_UPLOAD_THRESHOLD_BYTES].to_vec())
             .send()
-        .await?;
+            .await?;
         assert_eq!(first_chunk_response.status(), reqwest::StatusCode::OK);
 
         stop_server(&mut server).await;
@@ -649,7 +653,7 @@ mod tests {
         let session_after_restart = http
             .get(format!("{base_url}/store/uploads/{upload_id}"))
             .send()
-        .await?;
+            .await?;
         assert_eq!(session_after_restart.status(), reqwest::StatusCode::OK);
         let session_json = session_after_restart
             .json::<serde_json::Value>()
@@ -664,19 +668,25 @@ mod tests {
             vec![serde_json::Value::from(0_u64)]
         );
 
-        for (index, chunk) in payload.chunks(CHUNK_UPLOAD_THRESHOLD_BYTES).enumerate().skip(1) {
+        for (index, chunk) in payload
+            .chunks(CHUNK_UPLOAD_THRESHOLD_BYTES)
+            .enumerate()
+            .skip(1)
+        {
             let response = http
-                .put(format!("{base_url}/store/uploads/{upload_id}/chunk/{index}"))
+                .put(format!(
+                    "{base_url}/store/uploads/{upload_id}/chunk/{index}"
+                ))
                 .body(chunk.to_vec())
                 .send()
-            .await?;
+                .await?;
             assert_eq!(response.status(), reqwest::StatusCode::OK);
         }
 
         let complete_response = http
             .post(format!("{base_url}/store/uploads/{upload_id}/complete"))
             .send()
-        .await?;
+            .await?;
         assert_eq!(complete_response.status(), reqwest::StatusCode::OK);
 
         let sdk = IronMeshClient::from_direct_base_url(&base_url);

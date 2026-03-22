@@ -977,8 +977,8 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
     let result = (|| -> Result<jint> {
         let connection_input: String = env.get_string(&connection_input)?.into();
         let key: String = env.get_string(&key)?.into();
-        let size_bytes = u64::try_from(size_bytes)
-            .context("streamPutObject requires non-negative sizeBytes")?;
+        let size_bytes =
+            u64::try_from(size_bytes).context("streamPutObject requires non-negative sizeBytes")?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let mut reader = JavaInputStreamReader::new(&mut env, input_stream)?;

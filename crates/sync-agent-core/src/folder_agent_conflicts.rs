@@ -286,8 +286,8 @@ impl<R: Read> Read for HashingReader<R> {
 }
 
 fn file_content_hash(path: &Path) -> Result<String> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open local file {}", path.display()))?;
+    let file = File::open(path)
+        .with_context(|| format!("failed to open local file {}", path.display()))?;
     let mut reader = HashingReader::new(file);
     let mut buffer = [0_u8; 64 * 1024];
     loop {

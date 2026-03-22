@@ -310,7 +310,10 @@ mod tests {
 
         for (index, chunk) in payload.chunks(CHUNK_UPLOAD_SIZE_BYTES).enumerate() {
             client
-                .request(Method::PUT, &format!("/store/uploads/{upload_id}/chunk/{index}"))?
+                .request(
+                    Method::PUT,
+                    &format!("/store/uploads/{upload_id}/chunk/{index}"),
+                )?
                 .body(chunk.to_vec())
                 .send()
                 .await?
@@ -318,7 +321,10 @@ mod tests {
         }
 
         client
-            .request(Method::POST, &format!("/store/uploads/{upload_id}/complete"))?
+            .request(
+                Method::POST,
+                &format!("/store/uploads/{upload_id}/complete"),
+            )?
             .send()
             .await?
             .error_for_status()?;

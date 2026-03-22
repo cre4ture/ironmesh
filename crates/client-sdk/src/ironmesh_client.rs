@@ -788,7 +788,9 @@ impl IronMeshClient {
                 .with_context(|| format!("failed to parse upload session {upload_id}"))
                 .map(Some),
             StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Ok(None),
-            status => Err(anyhow!("upload session query failed for {upload_id}: {status}")),
+            status => Err(anyhow!(
+                "upload session query failed for {upload_id}: {status}"
+            )),
         }
     }
 
@@ -815,7 +817,10 @@ impl IronMeshClient {
         })
     }
 
-    async fn complete_upload_session(&self, upload_id: &str) -> Result<UploadSessionCompleteResponse> {
+    async fn complete_upload_session(
+        &self,
+        upload_id: &str,
+    ) -> Result<UploadSessionCompleteResponse> {
         let url = self.store_upload_session_complete_url(upload_id)?;
         let response = self
             .execute_buffered_request(Method::POST, url, Vec::new(), None)
@@ -829,9 +834,9 @@ impl IronMeshClient {
             );
         }
 
-        serde_json::from_slice::<UploadSessionCompleteResponse>(&response.body).with_context(
-            || format!("failed to parse upload session completion response for {upload_id}"),
-        )
+        serde_json::from_slice::<UploadSessionCompleteResponse>(&response.body).with_context(|| {
+            format!("failed to parse upload session completion response for {upload_id}")
+        })
     }
 
     async fn head_object_response(
@@ -994,8 +999,9 @@ impl IronMeshClient {
         let key = key.into();
         let source_path = source_path.as_ref();
         let state_path = state_path.as_ref();
-        let metadata = fs::metadata(source_path)
-            .with_context(|| format!("failed to inspect upload source {}", source_path.display()))?;
+        let metadata = fs::metadata(source_path).with_context(|| {
+            format!("failed to inspect upload source {}", source_path.display())
+        })?;
         let source_size_bytes = metadata.len();
         let source_modified_unix_ms = file_modified_unix_ms(&metadata);
 
@@ -1011,12 +1017,11 @@ impl IronMeshClient {
             .build()
             .context("failed to create runtime for resumable upload")?;
 
-        let persisted = load_json_file::<ResumableUploadFileState>(state_path)?
-            .filter(|state| {
-                state.key == key
-                    && state.source_size_bytes == source_size_bytes
-                    && state.source_modified_unix_ms == source_modified_unix_ms
-            });
+        let persisted = load_json_file::<ResumableUploadFileState>(state_path)?.filter(|state| {
+            state.key == key
+                && state.source_size_bytes == source_size_bytes
+                && state.source_modified_unix_ms == source_modified_unix_ms
+        });
 
         let mut session = match persisted {
             Some(state) => match runtime.block_on(self.get_upload_session(&state.upload_id))? {
@@ -1047,7 +1052,9 @@ impl IronMeshClient {
         if session.completed {
             remove_file_if_exists(state_path)?;
             if let Some(ref completed) = session.completed_result {
-                return Ok(upload_result_from_session_complete(&key, &session, completed));
+                return Ok(upload_result_from_session_complete(
+                    &key, &session, completed,
+                ));
             }
         }
 
@@ -1079,12 +1086,13 @@ impl IronMeshClient {
                 index,
             )
             .context("failed to determine expected upload chunk size")?;
-            file.read_exact(&mut buffer[..expected_size]).with_context(|| {
-                format!(
-                    "failed to read upload chunk index={index} from {}",
-                    source_path.display()
-                )
-            })?;
+            file.read_exact(&mut buffer[..expected_size])
+                .with_context(|| {
+                    format!(
+                        "failed to read upload chunk index={index} from {}",
+                        source_path.display()
+                    )
+                })?;
 
             let response = runtime.block_on(self.upload_session_chunk(
                 &session.upload_id,
@@ -1102,7 +1110,9 @@ impl IronMeshClient {
         let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
         remove_file_if_exists(state_path)?;
         session.completed_result = Some(completed.clone());
-        Ok(upload_result_from_session_complete(&key, &session, &completed))
+        Ok(upload_result_from_session_complete(
+            &key, &session, &completed,
+        ))
     }
 
     fn put_sized_reader_via_upload_session(
@@ -1127,9 +1137,11 @@ impl IronMeshClient {
                 index,
             )
             .context("failed to determine expected upload chunk size")?;
-            reader.read_exact(&mut buffer[..expected_size]).with_context(|| {
-                format!("failed reading upload chunk index={index} for key={key}")
-            })?;
+            reader
+                .read_exact(&mut buffer[..expected_size])
+                .with_context(|| {
+                    format!("failed reading upload chunk index={index} for key={key}")
+                })?;
             let response = runtime.block_on(self.upload_session_chunk(
                 &session.upload_id,
                 index,
@@ -1144,7 +1156,9 @@ impl IronMeshClient {
         }
 
         let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
-        Ok(upload_result_from_session_complete(&key, &session, &completed))
+        Ok(upload_result_from_session_complete(
+            &key, &session, &completed,
+        ))
     }
 
     pub fn download_file_resumable(
@@ -1179,8 +1193,9 @@ impl IronMeshClient {
                     format!("failed to create target directory {}", parent.display())
                 })?;
             }
-            fs::write(target_path, [])
-                .with_context(|| format!("failed to write empty object {}", target_path.display()))?;
+            fs::write(target_path, []).with_context(|| {
+                format!("failed to write empty object {}", target_path.display())
+            })?;
             remove_file_if_exists(temp_path)?;
             remove_file_if_exists(state_path)?;
             return Ok(());
@@ -1242,7 +1257,9 @@ impl IronMeshClient {
             .write(true)
             .truncate(false)
             .open(temp_path)
-            .with_context(|| format!("failed to open temp download file {}", temp_path.display()))?;
+            .with_context(|| {
+                format!("failed to open temp download file {}", temp_path.display())
+            })?;
 
         let mut offset = file
             .metadata()
@@ -1283,7 +1300,10 @@ impl IronMeshClient {
                         format!("failed to write temp download file {}", temp_path.display())
                     })?;
                     file.sync_data().with_context(|| {
-                        format!("failed to persist temp download file {}", temp_path.display())
+                        format!(
+                            "failed to persist temp download file {}",
+                            temp_path.display()
+                        )
                     })?;
                     offset = end_inclusive + 1;
                 }
@@ -1298,7 +1318,10 @@ impl IronMeshClient {
                         format!("failed to write temp download file {}", temp_path.display())
                     })?;
                     file.sync_data().with_context(|| {
-                        format!("failed to persist temp download file {}", temp_path.display())
+                        format!(
+                            "failed to persist temp download file {}",
+                            temp_path.display()
+                        )
                     })?;
                     offset = response.body.len() as u64;
                 }
@@ -1387,7 +1410,9 @@ impl IronMeshClient {
                 .await?;
         }
         let completed = self.complete_upload_session(&session.upload_id).await?;
-        Ok(upload_result_from_session_complete(&key, &session, &completed))
+        Ok(upload_result_from_session_complete(
+            &key, &session, &completed,
+        ))
     }
 
     pub fn put_large_aware_reader(
@@ -1454,9 +1479,7 @@ impl IronMeshClient {
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
 
-        let response = self
-            .head_object_response(key, snapshot, version)
-            .await?;
+        let response = self.head_object_response(key, snapshot, version).await?;
 
         Ok(response.total_size_bytes)
     }
