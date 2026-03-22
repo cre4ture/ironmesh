@@ -7,8 +7,8 @@ use client_sdk::{
 };
 use reqwest::Url;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct ServerNodeHydrator {
