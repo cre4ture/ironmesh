@@ -5901,27 +5901,14 @@ fn build_store_index_entries_with_hashes(
     sizes_by_key: Option<&HashMap<String, u64>>,
     modified_times_by_key: Option<&HashMap<String, u64>>,
 ) -> Vec<StoreIndexEntry> {
-    let normalized_prefix = prefix.trim_end_matches('/');
+    let normalized_prefix = prefix.trim().trim_matches('/');
     let mut file_entries = BTreeSet::new();
     let mut prefix_entries = BTreeSet::new();
 
     for key in keys {
-        if !normalized_prefix.is_empty() && !key.starts_with(normalized_prefix) {
+        let Some(remainder) = store_index_remainder_for_prefix(key, normalized_prefix) else {
             continue;
-        }
-
-        let mut remainder = if normalized_prefix.is_empty() {
-            key.as_str()
-        } else {
-            match key.strip_prefix(normalized_prefix) {
-                Some(value) => value,
-                None => continue,
-            }
         };
-
-        if remainder.starts_with('/') {
-            remainder = remainder.trim_start_matches('/');
-        }
 
         let segments: Vec<&str> = remainder
             .split('/')
@@ -5974,6 +5961,26 @@ fn build_store_index_entries_with_hashes(
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     entries
+}
+
+fn store_index_remainder_for_prefix<'a>(key: &'a str, normalized_prefix: &str) -> Option<&'a str> {
+    if normalized_prefix.is_empty() {
+        return Some(key.trim_start_matches('/'));
+    }
+
+    if key == normalized_prefix {
+        return Some("");
+    }
+
+    let remainder = key.strip_prefix(normalized_prefix)?;
+    if remainder.is_empty() {
+        return Some("");
+    }
+    if remainder.starts_with('/') {
+        return Some(remainder.trim_start_matches('/'));
+    }
+
+    None
 }
 
 async fn get_object(

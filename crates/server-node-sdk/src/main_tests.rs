@@ -3586,6 +3586,22 @@ fn store_index_prefix_returns_matching_keys() {
 }
 
 #[test]
+fn store_index_prefix_respects_path_boundaries() {
+    let keys = vec![
+        "images/cat.png".to_string(),
+        "images-1/alpha.png".to_string(),
+        "images-2/bravo.png".to_string(),
+    ];
+
+    let paths = build_store_index_entries(&keys, "images", 1)
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths, vec!["images/cat.png"]);
+}
+
+#[test]
 fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
     let entries = vec![
         super::StoreIndexEntry {
