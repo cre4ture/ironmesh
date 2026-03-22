@@ -109,6 +109,7 @@ pub fn mount_main() -> Result<()> {
     }
 
     let adapter = LinuxFuseAdapter::new(args.fs_name.clone());
+    let download_stage_root = download_stage_root(&args)?;
     let mut config = FuseMountConfig::new(args.mountpoint, args.fs_name);
     config.allow_other = args.allow_other;
 
@@ -220,7 +221,7 @@ pub fn mount_main() -> Result<()> {
         (None, None, None)
     };
 
-    let io = ServerNodeIo::with_client(client);
+    let io = ServerNodeIo::with_client(client, download_stage_root);
     let result = mount_action_plan_until_shutdown_with_updates(
         &config,
         action_plan,
@@ -291,6 +292,36 @@ fn local_edge_scope_label(args: &Args) -> String {
     parts.push(mountpoint);
 
     sanitize_path_component(&parts.join("__"))
+}
+
+fn download_stage_root(args: &Args) -> Result<PathBuf> {
+    let state_home = xdg_state_home().unwrap_or_else(std::env::temp_dir);
+    let path = state_home
+        .join("ironmesh")
+        .join("os-integration")
+        .join("downloads")
+        .join(download_scope_label(args));
+    fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create download stage root {}", path.display()))?;
+    Ok(path)
+}
+
+fn download_scope_label(args: &Args) -> String {
+    let mut hasher = blake3::Hasher::new();
+    if let Some(base_url) = args.server_base_url.as_deref() {
+        hasher.update(base_url.as_bytes());
+    }
+    hasher.update(&[0]);
+    if let Some(bootstrap_file) = args.bootstrap_file.as_ref() {
+        hasher.update(bootstrap_file.to_string_lossy().as_bytes());
+    }
+    hasher.update(&[0]);
+    if let Some(prefix) = args.prefix.as_deref() {
+        hasher.update(prefix.as_bytes());
+    }
+    hasher.update(&[0]);
+    hasher.update(args.mountpoint.to_string_lossy().as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 fn resolve_upstream_target(
@@ -383,11 +414,15 @@ fn filter_refresh_action_plan(plan: FuseActionPlan, changed_paths: &[String]) ->
 #[derive(Clone)]
 struct ServerNodeIo {
     sdk: IronMeshClient,
+    download_stage_root: PathBuf,
 }
 
 impl ServerNodeIo {
-    fn with_client(sdk: IronMeshClient) -> Self {
-        Self { sdk }
+    fn with_client(sdk: IronMeshClient, download_stage_root: PathBuf) -> Self {
+        Self {
+            sdk,
+            download_stage_root,
+        }
     }
 }
 
@@ -395,7 +430,13 @@ impl Hydrator for ServerNodeIo {
     fn hydrate(&self, path: &str, _remote_version: &str) -> Result<Vec<u8>> {
         let mut payload = Vec::new();
         self.sdk
-            .get_with_selector_writer(path, None, None, &mut payload)
+            .download_to_writer_resumable_staged(
+                path,
+                None,
+                None,
+                &mut payload,
+                &self.download_stage_root,
+            )
             .with_context(|| format!("failed to fetch object for path {path}"))?;
         Ok(payload)
     }

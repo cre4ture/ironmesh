@@ -13,6 +13,7 @@ use sync_core::{EntryKind, SyncSnapshot};
 use crate::folder_agent_state::{PathScope, current_unix_ms};
 use crate::{
     LocalEntryKind, LocalTreeState, RemoteTreeIndex, absolute_path, normalize_relative_path,
+    transfer_path_stem, transfer_state_root,
 };
 
 #[derive(Debug, Clone)]
@@ -216,6 +217,7 @@ pub fn materialize_remote_conflict_copies(
     conflicts: &[StartupConflict],
 ) -> Result<()> {
     let timestamp = current_unix_ms();
+    let staged_download_root = transfer_state_root(root_dir).join("conflict-copies");
 
     for conflict in conflicts {
         if conflict.reason != "dual_modify_conflict"
@@ -299,10 +301,61 @@ pub fn materialize_remote_conflict_copies(
             Duration::from_millis(0)
         };
         let mut writer = SleepAfterFirstWrite::new(file, delay);
+        let staged_stem = transfer_path_stem(&remote_key);
+        let staged_target = staged_download_root.join(format!("{staged_stem}.bin"));
+        let staged_temp = staged_download_root.join(format!("{staged_stem}.part"));
+        let staged_state = staged_download_root.join(format!("{staged_stem}.json"));
 
-        if let Err(error) = client.get_with_selector_writer(&remote_key, None, None, &mut writer) {
+        if let Err(error) = client.download_file_resumable(
+            &remote_key,
+            None,
+            None,
+            &staged_target,
+            &staged_temp,
+            &staged_state,
+        ) {
             eprintln!(
                 "startup-state: failed to download remote conflict copy for {}: {error}",
+                conflict.path
+            );
+            let _ = fs::remove_file(&temp_path);
+            continue;
+        }
+
+        let copy_result = (|| -> Result<()> {
+            let mut staged_file = File::open(&staged_target).with_context(|| {
+                format!(
+                    "failed to open staged conflict copy download {}",
+                    staged_target.display()
+                )
+            })?;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let read = staged_file.read(&mut buffer).with_context(|| {
+                    format!(
+                        "failed to read staged conflict copy download {}",
+                        staged_target.display()
+                    )
+                })?;
+                if read == 0 {
+                    break;
+                }
+                writer.write_all(&buffer[..read]).with_context(|| {
+                    format!(
+                        "failed to write conflict temp file {} from staged download",
+                        temp_path.display()
+                    )
+                })?;
+            }
+            writer.flush().with_context(|| {
+                format!("failed to flush conflict temp file {}", temp_path.display())
+            })?;
+            Ok(())
+        })();
+
+        if let Err(error) = copy_result {
+            eprintln!(
+                "startup-state: failed to materialize staged remote conflict copy for {}: {error}",
                 conflict.path
             );
             let _ = fs::remove_file(&temp_path);
@@ -326,6 +379,10 @@ pub fn materialize_remote_conflict_copies(
             let _ = fs::remove_file(&temp_path);
             continue;
         }
+
+        let _ = fs::remove_file(&staged_target);
+        let _ = fs::remove_file(&staged_temp);
+        let _ = fs::remove_file(&staged_state);
     }
 
     Ok(())

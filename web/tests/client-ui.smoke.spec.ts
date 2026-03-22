@@ -51,6 +51,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await thumbnailsPerRowInput.click();
   await page.getByRole("option", { name: "4 per row" }).click();
   await expect(thumbnailsPerRowInput).toHaveValue("4 per row");
+  await page.getByText("gallery/cat.png", { exact: true }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByText("Loading original image")).toBeVisible();
+  await expect(page.getByText("Loading original image")).toHaveCount(0);
+  await page.keyboard.press("Escape");
 
   await page.getByText("Cluster", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
@@ -60,6 +65,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 });
 
 async function installClientUiMocks(page: Page) {
+  const imageBody = tinyPngBuffer();
+
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const { pathname, searchParams } = url;
@@ -238,8 +245,8 @@ async function installClientUiMocks(page: Page) {
     if (pathname === "/media/thumbnail" && method === "GET") {
       await route.fulfill({
         status: 200,
-        contentType: "image/jpeg",
-        body: Buffer.from([255, 216, 255, 217])
+        contentType: "image/png",
+        body: imageBody
       });
       return;
     }
@@ -279,6 +286,15 @@ async function installClientUiMocks(page: Page) {
     }
 
     if (pathname === "/api/store/get-binary" && method === "GET") {
+      if (searchParams.get("key") === "gallery/cat.png") {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await route.fulfill({
+          status: 200,
+          contentType: "image/png",
+          body: imageBody
+        });
+        return;
+      }
       await route.fulfill({
         status: 200,
         contentType: "application/octet-stream",
@@ -300,4 +316,11 @@ async function json(route: Route, payload: unknown) {
     contentType: "application/json; charset=utf-8",
     body: JSON.stringify(payload)
   });
+}
+
+function tinyPngBuffer(): Buffer {
+  return Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII=",
+    "base64"
+  );
 }

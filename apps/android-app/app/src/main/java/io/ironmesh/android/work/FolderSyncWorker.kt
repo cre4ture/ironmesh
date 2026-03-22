@@ -7,6 +7,7 @@ import androidx.work.WorkerParameters
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import io.ironmesh.android.data.RustPreferencesBridge
 import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.data.FolderSyncStorageDiagnosticsHelper
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +23,7 @@ class FolderSyncWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         RustSafBridge.initialize(applicationContext)
+        RustPreferencesBridge.initialize(applicationContext)
         if (repository.hasContinuousFolderSyncActive()) {
             Log.i(TAG, "continuous folder sync is active; skipping one-shot worker run")
             return@withContext Result.success()

@@ -3,7 +3,7 @@ import {
   GallerySurface,
   PageHeader,
   type GalleryEntry,
-  type GalleryPreviewRequest
+  type GalleryImageRequests
 } from "@ironmesh/ui";
 import { useCallback } from "react";
 
@@ -14,9 +14,14 @@ export function GalleryPage() {
       listStoreEntries(prefix, depth, snapshotId),
     []
   );
-  const getPreviewRequest = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null): GalleryPreviewRequest => ({
-      url: entry.media?.thumbnail?.url || binaryObjectUrl(entry.path, snapshotId)
+  const getImageRequests = useCallback(
+    (entry: GalleryEntry, snapshotId: string | null): GalleryImageRequests => ({
+      thumbnail: {
+        url: entry.media?.thumbnail?.url || binaryObjectUrl(entry.path, snapshotId)
+      },
+      original: {
+        url: binaryObjectUrl(entry.path, snapshotId)
+      }
     }),
     []
   );
@@ -31,7 +36,7 @@ export function GalleryPage() {
         previewHint="Thumbnail URLs are used when the media index provides them, with full-object downloads as a fallback."
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
-        getPreviewRequest={getPreviewRequest}
+        getImageRequests={getImageRequests}
       />
     </>
   );

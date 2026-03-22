@@ -171,6 +171,23 @@ impl ClientNode {
             .get_with_selector_writer(key, snapshot, version, writer)
     }
 
+    pub fn download_to_writer_resumable_staged(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+        writer: &mut dyn std::io::Write,
+        staging_root: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        self.client.download_to_writer_resumable_staged(
+            key,
+            snapshot,
+            version,
+            writer,
+            staging_root,
+        )
+    }
+
     pub async fn cache_entries(&self) -> Vec<CacheEntry> {
         self.cache
             .read()

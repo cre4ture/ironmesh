@@ -123,6 +123,35 @@ fn persist_android_connection_bootstrap(bootstrap: &ConnectionBootstrap) -> Resu
     })
 }
 
+fn android_cache_dir() -> Result<PathBuf> {
+    with_android_preferences_env(|env, class| {
+        let value = env
+            .call_static_method(&class, "cacheDirPath", "()Ljava/lang/String;", &[])
+            .context("failed to query Android cache dir path")?
+            .l()
+            .context("Android cache dir path returned invalid value")?;
+        let value = JString::from(value);
+        let value: String = env
+            .get_string(&value)
+            .context("failed to decode Android cache dir path")?
+            .into();
+        Ok(PathBuf::from(value))
+    })
+}
+
+fn android_download_stage_root(category: &str, scope: &str) -> Result<PathBuf> {
+    let cache_dir = android_cache_dir()?;
+    let scope = scope.trim();
+    if scope.is_empty() {
+        anyhow::bail!("android download staging scope cannot be empty");
+    }
+    let scope_hash = blake3::hash(scope.as_bytes()).to_hex().to_string();
+    Ok(cache_dir
+        .join("ironmesh-downloads")
+        .join(category)
+        .join(scope_hash))
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AndroidFolderSyncServiceStatus {
@@ -886,11 +915,17 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
         let version = optional_jstring(&mut env, version)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
-        let rt = runtime()?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let stage_root = android_download_stage_root("jni-downloads", &connection_input)?;
         let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
-        let bytes = rt
-            .block_on(client.get_with_selector(key, snapshot.as_deref(), version.as_deref()))?
-            .to_vec();
+        let mut bytes = Vec::new();
+        client.download_to_writer_resumable_staged(
+            key,
+            snapshot.as_deref(),
+            version.as_deref(),
+            &mut bytes,
+            &stage_root,
+        )?;
         Ok(bytes)
     })();
 
@@ -1050,9 +1085,17 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let version = optional_jstring(&mut env, version)?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
+        initialize_android_preferences_bridge(&mut env)?;
+        let stage_root = android_download_stage_root("jni-downloads", &connection_input)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
         let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
-        client.get_with_selector_writer(key, snapshot.as_deref(), version.as_deref(), &mut writer)
+        client.download_to_writer_resumable_staged(
+            key,
+            snapshot.as_deref(),
+            version.as_deref(),
+            &mut writer,
+            &stage_root,
+        )
     })();
 
     if let Err(err) = result {
@@ -1160,6 +1203,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
+        initialize_android_preferences_bridge(&mut env)?;
 
         if local_tree_uri.is_some() {
             initialize_android_saf_bridge(&mut env)?;
@@ -1219,6 +1263,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
+        initialize_android_preferences_bridge(&mut env)?;
 
         if local_tree_uri.is_some() {
             initialize_android_saf_bridge(&mut env)?;

@@ -60,6 +60,11 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
   await expect(page.getByText("2 images", { exact: true })).toBeVisible();
+  await page.getByText("gallery/cat.png", { exact: true }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByText("Loading original image")).toBeVisible();
+  await expect(page.getByText("Loading original image")).toHaveCount(0);
+  await page.keyboard.press("Escape");
 
   await page.getByText("Setup", { exact: true }).click();
   await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
@@ -167,6 +172,7 @@ async function installServerAdminMocks(
   page: Page,
   options?: { setupMode?: boolean; bootstrapClaimMode?: "success" | "bad_gateway" }
 ) {
+  const imageBody = tinyPngBuffer();
   let authenticated = false;
   const revokedDeviceIds = new Set<string>();
   const bootstrapBundle = {
@@ -298,17 +304,20 @@ async function installServerAdminMocks(
     if (pathname === "/auth/media/thumbnail" && method === "GET") {
       await route.fulfill({
         status: 200,
-        contentType: "image/jpeg",
-        body: Buffer.from([255, 216, 255, 217])
+        contentType: "image/png",
+        body: imageBody
       });
       return;
     }
 
     if (pathname.startsWith("/auth/store/") && method === "GET") {
+      if (pathname === "/auth/store/gallery%2Fcat.png") {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
       await route.fulfill({
         status: 200,
         contentType: "image/png",
-        body: Buffer.from([137, 80, 78, 71])
+        body: imageBody
       });
       return;
     }
@@ -674,4 +683,11 @@ async function json(route: Route, payload: unknown) {
     contentType: "application/json; charset=utf-8",
     body: JSON.stringify(payload)
   });
+}
+
+function tinyPngBuffer(): Buffer {
+  return Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII=",
+    "base64"
+  );
 }

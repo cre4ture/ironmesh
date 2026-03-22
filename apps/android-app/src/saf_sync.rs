@@ -610,11 +610,12 @@ fn download_remote_file_to_saf(
     local_relative_path: &str,
     remote_key: &str,
 ) -> Result<()> {
+    let staging_root = crate::android_download_stage_root("saf-sync-downloads", tree_uri)?;
     with_bridge_env(|env, class| {
         let output_stream = open_tree_output_stream(env, &class, tree_uri, local_relative_path)?;
         let mut writer = JavaOutputStreamWriter::new(env, output_stream)?;
         client
-            .get_with_selector_writer(remote_key, None, None, &mut writer)
+            .download_to_writer_resumable_staged(remote_key, None, None, &mut writer, &staging_root)
             .with_context(|| format!("failed to download remote file {remote_key}"))?;
         writer.flush().with_context(|| {
             format!("failed to flush downloaded SAF file {local_relative_path}")

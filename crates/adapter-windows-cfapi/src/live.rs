@@ -5,15 +5,21 @@ use client_sdk::{
     build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
 use reqwest::Url;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct ServerNodeHydrator {
     sdk: IronMeshClient,
+    download_stage_root: PathBuf,
 }
 
 impl ServerNodeHydrator {
-    pub fn with_client(sdk: IronMeshClient) -> Self {
-        Self { sdk }
+    pub fn with_client(sdk: IronMeshClient, download_stage_root: PathBuf) -> Self {
+        Self {
+            sdk,
+            download_stage_root,
+        }
     }
 
     pub fn new(
@@ -29,7 +35,10 @@ impl ServerNodeHydrator {
             )?,
             None => build_http_client_from_pem(server_ca_pem, base_url.as_str())?,
         };
-        Ok(Self::with_client(sdk))
+        Ok(Self::with_client(
+            sdk,
+            windows_download_stage_root(base_url.as_str())?,
+        ))
     }
 }
 
@@ -38,7 +47,13 @@ impl Hydrator for ServerNodeHydrator {
         eprintln!("hydrating path {path} from server");
         let mut bytes = Vec::new();
         self.sdk
-            .get_with_selector_writer(path, None, None, &mut bytes)
+            .download_to_writer_resumable_staged(
+                path,
+                None,
+                None,
+                &mut bytes,
+                &self.download_stage_root,
+            )
             .with_context(|| format!("failed to fetch object for path {path}"))?;
         Ok(bytes)
     }
@@ -68,6 +83,28 @@ impl Uploader for ServerNodeHydrator {
 
 pub fn normalize_base_url(input: &str) -> Result<Url> {
     normalize_server_base_url(input)
+}
+
+pub fn windows_download_stage_root(scope: &str) -> Result<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = base
+        .join("ironmesh")
+        .join("cfapi-downloads")
+        .join(download_scope_label(scope));
+    fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create download stage root {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn windows_download_stage_root_for_sync_root(sync_root: &Path) -> Result<PathBuf> {
+    windows_download_stage_root(&sync_root.to_string_lossy())
+}
+
+fn download_scope_label(scope: &str) -> String {
+    blake3::hash(scope.as_bytes()).to_hex().to_string()
 }
 
 #[cfg(test)]

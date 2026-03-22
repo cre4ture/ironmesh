@@ -14,6 +14,7 @@ import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.data.FolderSyncStorageDiagnosticsHelper
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import io.ironmesh.android.data.RustPreferencesBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,6 +36,7 @@ class FolderSyncForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         RustSafBridge.initialize(applicationContext)
+        RustPreferencesBridge.initialize(applicationContext)
         ensureNotificationChannel()
         startForeground(
             NOTIFICATION_ID,

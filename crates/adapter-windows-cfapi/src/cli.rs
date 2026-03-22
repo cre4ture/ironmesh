@@ -155,8 +155,16 @@ pub fn cli_main() -> anyhow::Result<()> {
             let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
 
             let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
-            let hydrator = Box::new(ServerNodeHydrator::with_client(client.clone()));
-            let uploader = Arc::new(ServerNodeHydrator::with_client(client.clone()));
+            let download_stage_root =
+                crate::live::windows_download_stage_root_for_sync_root(&registration.root_path)?;
+            let hydrator = Box::new(ServerNodeHydrator::with_client(
+                client.clone(),
+                download_stage_root.clone(),
+            ));
+            let uploader = Arc::new(ServerNodeHydrator::with_client(
+                client.clone(),
+                download_stage_root,
+            ));
             let _connection =
                 connect_sync_root(&registration, runtime.clone(), hydrator, uploader.clone())?;
 

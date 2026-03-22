@@ -60,12 +60,17 @@ export type GalleryPreviewRequest = {
   headers?: Record<string, string>;
 };
 
+export type GalleryImageRequests = {
+  thumbnail: GalleryPreviewRequest;
+  original?: GalleryPreviewRequest | null;
+};
+
 type GallerySurfaceProps = {
   intro?: string;
   previewHint: string;
   loadSnapshots: () => Promise<GallerySnapshot[]>;
   loadEntries: (prefix: string, depth: number, snapshotId: string | null) => Promise<GalleryPayload>;
-  getPreviewRequest: (entry: GalleryEntry, snapshotId: string | null) => GalleryPreviewRequest;
+  getImageRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryImageRequests;
 };
 
 export function GallerySurface({
@@ -73,7 +78,7 @@ export function GallerySurface({
   previewHint,
   loadSnapshots,
   loadEntries,
-  getPreviewRequest
+  getImageRequests
 }: GallerySurfaceProps) {
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(4);
@@ -100,6 +105,9 @@ export function GallerySurface({
   );
   const readyCount = imageEntries.filter((entry) => entry.media?.status === "ready").length;
   const pendingCount = imageEntries.filter((entry) => entry.media?.status === "pending").length;
+  const selectedImageRequests = selectedEntry
+    ? getImageRequests(selectedEntry, snapshotId)
+    : null;
 
   async function refreshSnapshots() {
     setLoading("snapshots");
@@ -278,53 +286,56 @@ export function GallerySurface({
                 lg: thumbnailsPerRow
               }}
             >
-              {imageEntries.map((entry) => (
-                <Card
-                  key={entry.path}
-                  withBorder
-                  radius="md"
-                  padding="sm"
-                  style={{ cursor: "pointer" }}
-                  onClick={() => setSelectedEntry(entry)}
-                >
-                  <Card.Section>
-                    <AspectRatio ratio={1}>
-                      <GalleryImagePreview
-                        request={getPreviewRequest(entry, snapshotId)}
-                        alt={entry.path}
-                        fit="cover"
-                      />
-                    </AspectRatio>
-                  </Card.Section>
+              {imageEntries.map((entry) => {
+                const imageRequests = getImageRequests(entry, snapshotId);
+                return (
+                  <Card
+                    key={entry.path}
+                    withBorder
+                    radius="md"
+                    padding="sm"
+                    style={{ cursor: "pointer" }}
+                    onClick={() => setSelectedEntry(entry)}
+                  >
+                    <Card.Section>
+                      <AspectRatio ratio={1}>
+                        <GalleryImagePreview
+                          request={imageRequests.thumbnail}
+                          alt={entry.path}
+                          fit="cover"
+                        />
+                      </AspectRatio>
+                    </Card.Section>
 
-                  <Stack gap={6} mt="sm">
-                    <Group justify="space-between" align="flex-start" wrap="nowrap">
-                      <Text fw={700} lineClamp={1}>
-                        {fileName(entry.path)}
-                      </Text>
-                      <Badge color={mediaStatusColor(entry.media?.status)} variant="light">
-                        {entry.media?.status ?? "uncached"}
-                      </Badge>
-                    </Group>
-                    <Code>{entry.path}</Code>
-                    <Group gap={6}>
-                      {entry.media?.width && entry.media?.height ? (
-                        <Badge variant="dot">
-                          {entry.media.width} x {entry.media.height}
+                    <Stack gap={6} mt="sm">
+                      <Group justify="space-between" align="flex-start" wrap="nowrap">
+                        <Text fw={700} lineClamp={1}>
+                          {fileName(entry.path)}
+                        </Text>
+                        <Badge color={mediaStatusColor(entry.media?.status)} variant="light">
+                          {entry.media?.status ?? "uncached"}
                         </Badge>
+                      </Group>
+                      <Code>{entry.path}</Code>
+                      <Group gap={6}>
+                        {entry.media?.width && entry.media?.height ? (
+                          <Badge variant="dot">
+                            {entry.media.width} x {entry.media.height}
+                          </Badge>
+                        ) : null}
+                        {entry.media?.mime_type ? (
+                          <Badge variant="dot">{entry.media.mime_type}</Badge>
+                        ) : null}
+                      </Group>
+                      {entry.media?.taken_at_unix ? (
+                        <Text size="sm" c="dimmed">
+                          Captured {formatTakenAt(entry.media.taken_at_unix)}
+                        </Text>
                       ) : null}
-                      {entry.media?.mime_type ? (
-                        <Badge variant="dot">{entry.media.mime_type}</Badge>
-                      ) : null}
-                    </Group>
-                    {entry.media?.taken_at_unix ? (
-                      <Text size="sm" c="dimmed">
-                        Captured {formatTakenAt(entry.media.taken_at_unix)}
-                      </Text>
-                    ) : null}
-                  </Stack>
-                </Card>
-              ))}
+                    </Stack>
+                  </Card>
+                );
+              })}
             </SimpleGrid>
           )}
         </Grid.Col>
@@ -334,18 +345,21 @@ export function GallerySurface({
         opened={selectedEntry !== null}
         onClose={() => setSelectedEntry(null)}
         title={selectedEntry ? fileName(selectedEntry.path) : "Image preview"}
-        size="xl"
-        centered
+        fullScreen
+        styles={{
+          body: {
+            paddingTop: 0
+          }
+        }}
       >
-        {selectedEntry ? (
+        {selectedEntry && selectedImageRequests ? (
           <Stack gap="md">
-            <AspectRatio ratio={4 / 3}>
-              <GalleryImagePreview
-                request={getPreviewRequest(selectedEntry, snapshotId)}
+            <div style={{ height: "calc(100vh - 17rem)", minHeight: "24rem" }}>
+              <GalleryLightboxImage
+                requests={selectedImageRequests}
                 alt={selectedEntry.path}
-                fit="contain"
               />
-            </AspectRatio>
+            </div>
             <Group gap="xs">
               <Badge color={mediaStatusColor(selectedEntry.media?.status)} variant="light">
                 {selectedEntry.media?.status ?? "uncached"}
@@ -381,15 +395,193 @@ type GalleryImagePreviewProps = {
 };
 
 function GalleryImagePreview({ request, alt, fit }: GalleryImagePreviewProps) {
-  const [failed, setFailed] = useState(false);
-  const [resolvedSrc, setResolvedSrc] = useState<string | null>(request.url);
-  const hasHeaders = Boolean(request.headers && Object.keys(request.headers).length > 0);
-  const headerSignature = JSON.stringify(
-    Object.entries(request.headers ?? {}).sort(([left], [right]) => left.localeCompare(right))
+  const [imageFailed, setImageFailed] = useState(false);
+  const { resolvedSrc, failed: requestFailed } = useResolvedImageRequest(request);
+  const signature = requestSignature(request);
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [signature]);
+
+  if (requestFailed || imageFailed) {
+    return (
+      <Center style={{ height: "100%", background: "var(--mantine-color-gray-0)" }}>
+        <Text size="sm" c="dimmed">
+          Preview unavailable
+        </Text>
+      </Center>
+    );
+  }
+
+  if (!resolvedSrc) {
+    return (
+      <Center style={{ height: "100%", background: "var(--mantine-color-gray-0)" }}>
+        <Loader size="sm" color="gray" />
+      </Center>
+    );
+  }
+
+  return (
+    <img
+      src={resolvedSrc}
+      alt={alt}
+      loading="lazy"
+      decoding="async"
+      onError={() => setImageFailed(true)}
+      style={{
+        width: "100%",
+        height: "100%",
+        objectFit: fit,
+        background: "var(--mantine-color-gray-0)"
+      }}
+    />
   );
+}
+
+type GalleryLightboxImageProps = {
+  requests: GalleryImageRequests;
+  alt: string;
+};
+
+function GalleryLightboxImage({ requests, alt }: GalleryLightboxImageProps) {
+  const thumbnail = useResolvedImageRequest(requests.thumbnail);
+  const originalRequest =
+    requests.original && !sameImageRequest(requests.thumbnail, requests.original)
+      ? requests.original
+      : null;
+  const original = useResolvedImageRequest(originalRequest);
+  const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const [originalFailed, setOriginalFailed] = useState(false);
+  const [originalLoaded, setOriginalLoaded] = useState(false);
+  const thumbnailSignature = requestSignature(requests.thumbnail);
+  const originalSignature = requestSignature(originalRequest);
+  const showingOriginal = Boolean(originalRequest);
+
+  useEffect(() => {
+    setThumbnailFailed(false);
+  }, [thumbnailSignature]);
+
+  useEffect(() => {
+    setOriginalFailed(false);
+    setOriginalLoaded(false);
+  }, [originalSignature]);
+
+  const thumbnailVisible = Boolean(thumbnail.resolvedSrc) && !thumbnail.failed && !thumbnailFailed;
+  const originalVisible = Boolean(original.resolvedSrc) && !original.failed && !originalFailed;
+  const fullImageUnavailable = showingOriginal && (original.failed || originalFailed);
+  const originalPending = showingOriginal && !fullImageUnavailable && !originalLoaded;
+
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: "100%",
+        height: "100%",
+        overflow: "hidden",
+        borderRadius: "var(--mantine-radius-md)",
+        background: "var(--mantine-color-dark-9)"
+      }}
+    >
+      {thumbnailVisible ? (
+        <img
+          src={thumbnail.resolvedSrc ?? undefined}
+          alt={alt}
+          loading="eager"
+          decoding="async"
+          onError={() => setThumbnailFailed(true)}
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            filter: originalPending ? "none" : "blur(0px)",
+            background: "var(--mantine-color-dark-9)"
+          }}
+        />
+      ) : (
+        <Center
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: "var(--mantine-color-gray-0)"
+          }}
+        >
+          <Loader size="sm" color="gray" />
+        </Center>
+      )}
+
+      {originalVisible ? (
+        <img
+          src={original.resolvedSrc ?? undefined}
+          alt={alt}
+          loading="eager"
+          decoding="async"
+          onLoad={() => setOriginalLoaded(true)}
+          onError={() => setOriginalFailed(true)}
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            opacity: originalLoaded ? 1 : 0,
+            transition: "opacity 180ms ease",
+            background: "transparent"
+          }}
+        />
+      ) : null}
+
+      {originalPending ? (
+        <div
+          style={{
+            position: "absolute",
+            top: 16,
+            right: 16
+          }}
+        >
+          <Badge
+            color="dark"
+            variant="filled"
+            style={{ display: "flex", alignItems: "center", gap: 8 }}
+          >
+            Loading original image
+          </Badge>
+        </div>
+      ) : null}
+
+      {fullImageUnavailable ? (
+        <div
+          style={{
+            position: "absolute",
+            left: 16,
+            bottom: 16
+          }}
+        >
+          <Badge color="yellow" variant="filled">
+            Full image unavailable, showing thumbnail
+          </Badge>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function useResolvedImageRequest(
+  request: GalleryPreviewRequest | null | undefined
+): { resolvedSrc: string | null; failed: boolean } {
+  const [failed, setFailed] = useState(false);
+  const [resolvedSrc, setResolvedSrc] = useState<string | null>(request?.url ?? null);
+  const hasHeaders = Boolean(request?.headers && Object.keys(request.headers).length > 0);
+  const signature = requestSignature(request);
 
   useEffect(() => {
     setFailed(false);
+
+    if (!request) {
+      setResolvedSrc(null);
+      return;
+    }
 
     if (!hasHeaders) {
       setResolvedSrc(request.url);
@@ -434,41 +626,9 @@ function GalleryImagePreview({ request, alt, fit }: GalleryImagePreviewProps) {
         URL.revokeObjectURL(objectUrl);
       }
     };
-  }, [hasHeaders, headerSignature, request.url]);
+  }, [hasHeaders, request?.url, signature]);
 
-  if (failed) {
-    return (
-      <Center style={{ height: "100%", background: "var(--mantine-color-gray-0)" }}>
-        <Text size="sm" c="dimmed">
-          Preview unavailable
-        </Text>
-      </Center>
-    );
-  }
-
-  if (!resolvedSrc) {
-    return (
-      <Center style={{ height: "100%", background: "var(--mantine-color-gray-0)" }}>
-        <Loader size="sm" color="gray" />
-      </Center>
-    );
-  }
-
-  return (
-    <img
-      src={resolvedSrc}
-      alt={alt}
-      loading="lazy"
-      decoding="async"
-      onError={() => setFailed(true)}
-      style={{
-        width: "100%",
-        height: "100%",
-        objectFit: fit,
-        background: "var(--mantine-color-gray-0)"
-      }}
-    />
-  );
+  return { resolvedSrc, failed };
 }
 
 function isGalleryImageEntry(entry: GalleryEntry): boolean {
@@ -514,6 +674,24 @@ function mediaStatusColor(status?: string | null): string {
     return "red";
   }
   return "gray";
+}
+
+function sameImageRequest(
+  left: GalleryPreviewRequest | null | undefined,
+  right: GalleryPreviewRequest | null | undefined
+): boolean {
+  return requestSignature(left) === requestSignature(right);
+}
+
+function requestSignature(request: GalleryPreviewRequest | null | undefined): string {
+  if (!request) {
+    return "";
+  }
+
+  const headers = JSON.stringify(
+    Object.entries(request.headers ?? {}).sort(([left], [right]) => left.localeCompare(right))
+  );
+  return `${request.url}::${headers}`;
 }
 
 function formatTakenAt(value: number): string {

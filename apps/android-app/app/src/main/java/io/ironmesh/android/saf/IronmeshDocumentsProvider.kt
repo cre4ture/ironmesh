@@ -13,6 +13,7 @@ import android.webkit.MimeTypeMap
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
+import io.ironmesh.android.data.RustPreferencesBridge
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.FileInputStream
@@ -24,7 +25,10 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
     private val repository = IronmeshRepository()
     private val documentEntries = ConcurrentHashMap<String, StoreIndexEntry>()
 
-    override fun onCreate(): Boolean = true
+    override fun onCreate(): Boolean {
+        context?.applicationContext?.let { RustPreferencesBridge.initialize(it) }
+        return true
+    }
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(resolveRootProjection(projection))

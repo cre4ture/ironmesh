@@ -11,6 +11,7 @@ authors.workspace = true
 sync-core = { path = "../sync-core" }
 client-sdk = { path = "../client-sdk" }
 anyhow = { workspace = true }
+blake3.workspace = true
 clap = { workspace = true }
 git-version = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }

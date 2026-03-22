@@ -20,4 +20,10 @@ object RustPreferencesBridge {
             current.copy(connectionBootstrapJson = bootstrapJson.trim()),
         )
     }
+
+    @JvmStatic
+    fun cacheDirPath(): String {
+        val context = appContext ?: error("RustPreferencesBridge is not initialized")
+        return context.cacheDir.absolutePath
+    }
 }
