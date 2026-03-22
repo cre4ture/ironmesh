@@ -98,6 +98,8 @@ Client node pool should:
 - Persistent replica index across restarts.
 - Cleanup scheduling/automation policy tuning.
 - Client-side multi-node adaptive routing implementation.
+- Cluster-wide metadata visibility plus read-through chunk caching for non-replica reads.
+  See `docs/read-through-chunk-cache-proposal.md`.
 
 ## Current implementation status (phased)
 
@@ -153,6 +155,12 @@ Client node pool should:
 - Reduces split-brain risk for globally visible "preferred head" metadata.
 - Limits traffic and reconciliation overhead compared to pure eventual on all metadata.
 
+Follow-up design note:
+
+- `docs/read-through-chunk-cache-proposal.md` describes a proposed end state where
+  metadata becomes cluster-visible while chunk data remains placement-aware and can
+  be fetched into a local read-through cache on demand.
+
 ## Next implementation checklist (Hybrid rollout)
 
 1. **Phase A — Version graph metadata primitives**
@@ -174,6 +182,14 @@ Client node pool should:
 5. **Phase E — Verification and cleanup alignment**
 	- Extend replication auditor to account for version DAG branches.
 	- Schedule cleanup with safety margin and low-free-space prioritization.
+
+Required end-to-end validation for the proposed cluster-visible metadata plus read-through cache path:
+
+- add a system test with 5 server-nodes and replication factor 3,
+- upload one file to node 1,
+- wait for metadata replication to complete,
+- read the file from each node separately,
+- require every read to succeed regardless of which nodes hold full replicas.
 
 ### Decision 3: Delete semantics
 

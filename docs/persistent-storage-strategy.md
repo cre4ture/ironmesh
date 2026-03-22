@@ -112,3 +112,5 @@ On every read:
 - Refcount + garbage collection for unreferenced chunks.
 - Signed snapshot manifests for stronger tamper evidence.
 - Resumable upload session metadata persisted on disk (for crash-safe resume across restarts).
+- Cluster-wide metadata visibility and read-through chunk caching for non-replica reads.
+  See `docs/read-through-chunk-cache-proposal.md`.
