@@ -49,6 +49,7 @@ object RustClientBridge {
         connectionInput: String,
         key: String,
         input: InputStream,
+        sizeBytes: Long,
         serverCaPem: String?,
         clientIdentityJson: String?,
     ): Int

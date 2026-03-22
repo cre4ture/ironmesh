@@ -7,7 +7,6 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +18,8 @@ use sync_core::{EntryKind, SyncSnapshot};
 use crate::{
     FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeState, PathScope,
     RemoteTreeIndex, StartupStateStore, absolute_path, build_configured_client,
-    cleanup_ironmesh_part_files, delete_remote_file, describe_connection_target, diff_local_trees,
+    cleanup_ironmesh_part_files, delete_remote_file, describe_connection_target,
+    diff_local_trees, download_transfer_state_path, download_transfer_temp_path,
     load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
     local_entry_state_for_path, local_paths_to_preserve_on_startup,
     materialize_remote_conflict_copies, parent_directories, remote_file_hashes_by_local_path,
@@ -747,6 +747,8 @@ fn download_remote_file(
     state_store: Option<&StartupStateStore>,
 ) -> Result<()> {
     let target = absolute_path(root_dir, local_relative_path);
+    let temp_path = download_transfer_temp_path(root_dir, remote_key);
+    let state_path = download_transfer_state_path(root_dir, remote_key);
 
     if target.is_dir() {
         fs::remove_dir_all(&target)
@@ -757,32 +759,13 @@ fn download_remote_file(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
     }
-
-    let temp_name = format!(
-        ".{}.ironmesh-part-{}",
-        target
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_else(|| "object".to_string()),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let temp_path = target.with_file_name(temp_name);
-
-    let mut file = File::create(&temp_path)
-        .with_context(|| format!("failed to create temp file {}", temp_path.display()))?;
     client
-        .get_with_selector_writer(remote_key, None, None, &mut file)
+        .download_file_resumable(remote_key, None, None, &target, &temp_path, &state_path)
         .with_context(|| format!("failed to download remote file {remote_key}"))?;
 
-    file.sync_all()
-        .with_context(|| format!("failed to flush temp file {}", temp_path.display()))?;
-
     if let Some(store) = state_store {
-        let metadata = fs::metadata(&temp_path)
-            .with_context(|| format!("failed to inspect temp file {}", temp_path.display()))?;
+        let metadata = fs::metadata(&target)
+            .with_context(|| format!("failed to inspect downloaded file {}", target.display()))?;
         let entry_state = local_entry_state_from_metadata(&metadata);
         store
             .upsert_baseline_entry_with_hash(local_relative_path, &entry_state, remote_content_hash)
@@ -790,14 +773,6 @@ fn download_remote_file(
                 format!("failed to persist baseline file entry for {local_relative_path}")
             })?;
     }
-
-    fs::rename(&temp_path, &target).with_context(|| {
-        format!(
-            "failed to place downloaded file {} into {}",
-            temp_path.display(),
-            target.display()
-        )
-    })?;
 
     Ok(())
 }

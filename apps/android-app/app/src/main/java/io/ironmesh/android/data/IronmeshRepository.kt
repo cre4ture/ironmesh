@@ -147,6 +147,7 @@ class IronmeshRepository {
         connectionInput: String,
         key: String,
         input: InputStream,
+        sizeBytes: Long,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): Int {
@@ -154,6 +155,7 @@ class IronmeshRepository {
             normalizedConnectionInput(connectionInput),
             key,
             input,
+            sizeBytes,
             serverCaPem,
             normalizedClientIdentityJson(clientIdentityJson),
         )

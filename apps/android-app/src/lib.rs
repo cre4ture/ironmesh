@@ -10,7 +10,7 @@ use client_sdk::{
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jbyte, jbyteArray, jint, jstring};
+use jni::sys::{jboolean, jbyte, jbyteArray, jint, jlong, jstring};
 use reqwest::Method;
 use reqwest::Url;
 use serde::Serialize;
@@ -970,17 +970,20 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
     connection_input: JString<'local>,
     key: JString<'local>,
     input_stream: JObject<'local>,
+    size_bytes: jlong,
     server_ca_pem: jstring,
     client_identity_json: jstring,
 ) -> jint {
     let result = (|| -> Result<jint> {
         let connection_input: String = env.get_string(&connection_input)?.into();
         let key: String = env.get_string(&key)?.into();
+        let size_bytes = u64::try_from(size_bytes)
+            .context("streamPutObject requires non-negative sizeBytes")?;
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let mut reader = JavaInputStreamReader::new(&mut env, input_stream)?;
         let client = configured_client_node(connection_input, server_ca_pem, client_identity_json)?;
-        let report = client.put_chunked_reader(key, &mut reader)?;
+        let report = client.put_large_aware_reader(key, &mut reader, size_bytes)?;
         Ok(report.meta.size_bytes as jint)
     })();
 

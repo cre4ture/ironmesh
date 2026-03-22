@@ -325,6 +325,12 @@ pub struct UploadChunkRef {
     pub size_bytes: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectReadDescriptor {
+    pub manifest_hash: String,
+    pub total_size_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationManifestPayload {
     pub key: String,
@@ -1775,6 +1781,127 @@ impl PersistentStore {
         self.media_thumbnails_dir
             .join(content_fingerprint)
             .join(format!("{profile}.jpg"))
+    }
+
+    pub async fn describe_object(
+        &self,
+        key: &str,
+        snapshot_id: Option<&str>,
+        version_id: Option<&str>,
+        read_mode: ObjectReadMode,
+    ) -> std::result::Result<ObjectReadDescriptor, StoreReadError> {
+        let manifest_hash = self
+            .resolve_manifest_hash_for_key(key, snapshot_id, version_id, read_mode)
+            .await?;
+        let Some(manifest) = self
+            .load_manifest_by_hash(&manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        Ok(ObjectReadDescriptor {
+            manifest_hash,
+            total_size_bytes: manifest.total_size_bytes,
+        })
+    }
+
+    pub async fn read_object_range_by_manifest_hash(
+        &self,
+        manifest_hash: &str,
+        start: usize,
+        end_exclusive: usize,
+    ) -> std::result::Result<Bytes, StoreReadError> {
+        if start > end_exclusive {
+            return Err(StoreReadError::Internal(anyhow::anyhow!(
+                "invalid range start={start} end={end_exclusive}"
+            )));
+        }
+
+        let Some(manifest) = self
+            .load_manifest_by_hash(manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        if end_exclusive > manifest.total_size_bytes {
+            return Err(StoreReadError::Internal(anyhow::anyhow!(
+                "range end_exclusive={end_exclusive} exceeds object size={}",
+                manifest.total_size_bytes
+            )));
+        }
+        if start == end_exclusive {
+            return Ok(Bytes::new());
+        }
+
+        let mut assembled = BytesMut::with_capacity(end_exclusive.saturating_sub(start));
+        let mut offset = 0usize;
+
+        for chunk in manifest.chunks {
+            let chunk_end = offset.saturating_add(chunk.size_bytes);
+            if chunk_end <= start {
+                offset = chunk_end;
+                continue;
+            }
+            if offset >= end_exclusive {
+                break;
+            }
+
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            if !fs::try_exists(&chunk_path)
+                .await
+                .map_err(|err| StoreReadError::Internal(err.into()))?
+            {
+                return Err(StoreReadError::Corrupt(format!(
+                    "missing chunk hash={}",
+                    chunk.hash
+                )));
+            }
+
+            let payload = fs::read(&chunk_path)
+                .await
+                .map_err(|err| StoreReadError::Internal(err.into()))?;
+            if payload.len() != chunk.size_bytes {
+                return Err(StoreReadError::Corrupt(format!(
+                    "size mismatch for chunk hash={} expected={} actual={}",
+                    chunk.hash,
+                    chunk.size_bytes,
+                    payload.len()
+                )));
+            }
+
+            let actual_hash = hash_hex(&payload);
+            if actual_hash != chunk.hash {
+                return Err(StoreReadError::Corrupt(format!(
+                    "hash mismatch for chunk expected={} actual={}",
+                    chunk.hash, actual_hash
+                )));
+            }
+
+            let slice_start = start.saturating_sub(offset);
+            let slice_end = std::cmp::min(payload.len(), end_exclusive.saturating_sub(offset));
+            if slice_start < slice_end {
+                assembled.extend_from_slice(&payload[slice_start..slice_end]);
+            }
+            offset = chunk_end;
+        }
+
+        if assembled.len() != end_exclusive.saturating_sub(start) {
+            return Err(StoreReadError::Corrupt(format!(
+                "assembled range size mismatch expected={} actual={}",
+                end_exclusive.saturating_sub(start),
+                assembled.len()
+            )));
+        }
+
+        Ok(assembled.freeze())
     }
 
     pub async fn get_object(

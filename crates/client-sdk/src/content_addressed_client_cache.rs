@@ -199,13 +199,16 @@ impl ContentAddressedClientCache {
         Ok(())
     }
 
-    pub fn put_chunked_reader(
+    pub fn put_large_aware_reader(
         &self,
         key: impl Into<String>,
         reader: &mut dyn std::io::Read,
+        length: u64,
     ) -> Result<UploadResult> {
         let key = key.into();
-        let report = self.client.put_chunked_reader(key.clone(), reader)?;
+        let report = self
+            .client
+            .put_large_aware_reader(key.clone(), reader, length)?;
         let storage = Arc::clone(&self.storage);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

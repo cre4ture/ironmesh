@@ -2,17 +2,19 @@
 mod tests {
     const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 
+    use std::fs;
     use std::io::Cursor;
 
     use anyhow::{Context, Result};
     use bytes::Bytes;
-    use client_sdk::{ClientNode, ContentAddressedClientCache, UploadMode};
+    use client_sdk::{ClientNode, ContentAddressedClientCache, IronMeshClient, UploadMode};
+    use serde_json::json;
     use uuid::Uuid;
 
     use crate::framework::{
         EnrolledTestClient, TEST_ADMIN_TOKEN, fresh_data_dir,
         issue_bootstrap_bundle_and_enroll_client, latest_snapshot_id_for_client,
-        start_authenticated_server, stop_server,
+        start_authenticated_server, start_open_server_with_config, stop_server,
     };
 
     async fn start_authenticated_test_client(
@@ -176,20 +178,25 @@ mod tests {
             let chunked_payload =
                 vec![b'R'; CHUNK_UPLOAD_THRESHOLD_BYTES + (CHUNK_UPLOAD_THRESHOLD_BYTES / 4)];
             let expected_chunked_payload = chunked_payload.clone();
+            let chunked_payload_len = chunked_payload.len() as u64;
             let blocking_client = client.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut reader = Cursor::new(chunked_payload);
-                let report = blocking_client.put_chunked_reader(chunked_key, &mut reader)?;
+                let report = blocking_client.put_large_aware_reader(
+                    chunked_key,
+                    &mut reader,
+                    chunked_payload_len,
+                )?;
                 assert!(matches!(report.upload_mode, UploadMode::Chunked));
                 Ok(())
             })
             .await
-            .context("put_chunked_reader task join failed")??;
+            .context("put_large_aware_reader task join failed")??;
 
             let entries = client.cache_entries().await;
             assert!(
                 !entries.iter().any(|entry| entry.key == chunked_key),
-                "put_chunked_reader should invalidate cached entry for the key"
+                "put_large_aware_reader should invalidate cached entry for the key"
             );
 
             let refreshed = client.get_cached_or_fetch(chunked_key).await?;
@@ -261,11 +268,12 @@ mod tests {
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let payload =
                     vec![b'C'; CHUNK_UPLOAD_THRESHOLD_BYTES + (CHUNK_UPLOAD_THRESHOLD_BYTES / 2)];
+                let payload_len = payload.len() as u64;
                 let mut reader = Cursor::new(payload);
-                chunked_reader_sdk.put_chunked_reader("reader/chunked", &mut reader)
+                chunked_reader_sdk.put_large_aware_reader("reader/chunked", &mut reader, payload_len)
             })
             .await
-            .context("put_chunked_reader task join failed")??;
+            .context("put_large_aware_reader task join failed")??;
 
             let writer_sdk = sdk.clone();
             let writer = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
@@ -592,5 +600,168 @@ mod tests {
 
         stop_server(&mut server).await;
         result
+    }
+
+    #[tokio::test]
+    async fn upload_sessions_survive_server_restart_and_complete() -> Result<()> {
+        let bind = "127.0.0.1:19238";
+        let server_data_dir = fresh_data_dir("upload-session-restart-server");
+        let node_id = Uuid::new_v4().to_string();
+        let base_url = format!("http://{bind}");
+        let http = reqwest::Client::new();
+
+        let mut server = start_open_server_with_config(bind, &server_data_dir, &node_id, 1).await?;
+
+        let payload = vec![b'U'; (CHUNK_UPLOAD_THRESHOLD_BYTES * 2) + 333];
+        let start_response = http
+            .post(format!("{base_url}/store/uploads/start"))
+            .header("content-type", "application/json")
+            .body(
+                serde_json::to_vec(&json!({
+                    "key": "resumable/upload.bin",
+                    "total_size_bytes": payload.len(),
+                }))
+                .context("failed to encode upload session start request")?,
+            )
+            .send()
+        .await?;
+        assert_eq!(start_response.status(), reqwest::StatusCode::CREATED);
+        let start_json = start_response
+            .json::<serde_json::Value>()
+            .await
+            .context("failed to decode upload session start response")?;
+        let upload_id = start_json
+            .get("upload_id")
+            .and_then(|value| value.as_str())
+            .context("upload session start response missing upload_id")?
+            .to_string();
+
+        let first_chunk_response = http
+            .put(format!("{base_url}/store/uploads/{upload_id}/chunk/0"))
+            .body(payload[..CHUNK_UPLOAD_THRESHOLD_BYTES].to_vec())
+            .send()
+        .await?;
+        assert_eq!(first_chunk_response.status(), reqwest::StatusCode::OK);
+
+        stop_server(&mut server).await;
+        server = start_open_server_with_config(bind, &server_data_dir, &node_id, 1).await?;
+
+        let session_after_restart = http
+            .get(format!("{base_url}/store/uploads/{upload_id}"))
+            .send()
+        .await?;
+        assert_eq!(session_after_restart.status(), reqwest::StatusCode::OK);
+        let session_json = session_after_restart
+            .json::<serde_json::Value>()
+            .await
+            .context("failed to decode upload session after restart")?;
+        assert_eq!(
+            session_json
+                .get("received_indexes")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            vec![serde_json::Value::from(0_u64)]
+        );
+
+        for (index, chunk) in payload.chunks(CHUNK_UPLOAD_THRESHOLD_BYTES).enumerate().skip(1) {
+            let response = http
+                .put(format!("{base_url}/store/uploads/{upload_id}/chunk/{index}"))
+                .body(chunk.to_vec())
+                .send()
+            .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+
+        let complete_response = http
+            .post(format!("{base_url}/store/uploads/{upload_id}/complete"))
+            .send()
+        .await?;
+        assert_eq!(complete_response.status(), reqwest::StatusCode::OK);
+
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let fetched = sdk.get("resumable/upload.bin").await?;
+        assert_eq!(fetched, Bytes::from(payload));
+
+        stop_server(&mut server).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ironmesh_client_resumable_file_helpers_roundtrip_large_files() -> Result<()> {
+        let bind = "127.0.0.1:19239";
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "resumable-file-helpers-server",
+            "resumable-file-helpers-client",
+        )
+        .await?;
+        let working_dir = fresh_data_dir("resumable-file-helpers-work");
+        fs::create_dir_all(&working_dir)?;
+
+        let sdk = enrolled.build_client_async().await?;
+        let upload_source = working_dir.join("source.bin");
+        let upload_state = working_dir.join("upload.state.json");
+        let download_target = working_dir.join("downloaded.bin");
+        let download_temp = working_dir.join("downloaded.part");
+        let download_state = working_dir.join("download.state.json");
+        let payload = vec![b'F'; (CHUNK_UPLOAD_THRESHOLD_BYTES * 2) + 517];
+        fs::write(&upload_source, &payload)?;
+
+        let upload_client = sdk.clone();
+        let upload_source_clone = upload_source.clone();
+        let upload_state_clone = upload_state.clone();
+        let upload_report = tokio::task::spawn_blocking(move || {
+            upload_client.put_file_resumable(
+                "resumable/file.bin",
+                &upload_source_clone,
+                &upload_state_clone,
+            )
+        })
+        .await
+        .context("resumable file upload task join failed")??;
+        assert!(matches!(upload_report.upload_mode, UploadMode::Chunked));
+        assert!(!upload_state.exists());
+
+        let head = sdk.head_object("resumable/file.bin", None, None).await?;
+        let etag = head
+            .etag
+            .context("missing etag on resumable download head response")?;
+
+        fs::write(&download_temp, &payload[..CHUNK_UPLOAD_THRESHOLD_BYTES])?;
+        fs::write(
+            &download_state,
+            serde_json::to_vec_pretty(&json!({
+                "key": "resumable/file.bin",
+                "snapshot": null,
+                "version": null,
+                "expected_size_bytes": payload.len(),
+                "etag": etag,
+            }))?,
+        )?;
+
+        let download_client = sdk.clone();
+        let download_target_clone = download_target.clone();
+        let download_temp_clone = download_temp.clone();
+        let download_state_clone = download_state.clone();
+        tokio::task::spawn_blocking(move || {
+            download_client.download_file_resumable(
+                "resumable/file.bin",
+                None,
+                None,
+                &download_target_clone,
+                &download_temp_clone,
+                &download_state_clone,
+            )
+        })
+        .await
+        .context("resumable file download task join failed")??;
+
+        assert_eq!(fs::read(&download_target)?, payload);
+        assert!(!download_temp.exists());
+        assert!(!download_state.exists());
+
+        stop_server(&mut server).await;
+        Ok(())
     }
 }

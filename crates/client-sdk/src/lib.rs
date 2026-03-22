@@ -24,8 +24,8 @@ pub use device_auth::{
     enroll_device_blocking_from_pem,
 };
 pub use ironmesh_client::{
-    IronMeshClient, StoreIndexEntry, StoreIndexResponse, StoreIndexView, UploadMode, UploadResult,
-    normalize_server_base_url, snapshot_from_store_index_entries,
+    IronMeshClient, ObjectHeadInfo, StoreIndexEntry, StoreIndexResponse, StoreIndexView,
+    UploadMode, UploadResult, normalize_server_base_url, snapshot_from_store_index_entries,
 };
 pub use remote_sync::{
     RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,

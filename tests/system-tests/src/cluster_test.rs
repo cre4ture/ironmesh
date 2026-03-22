@@ -292,41 +292,33 @@ mod tests {
         key: &str,
         payload: &[u8],
     ) -> Result<()> {
-        let mut uploaded_chunks = Vec::new();
+        let start_response: serde_json::Value = client
+            .request(Method::POST, "/store/uploads/start")?
+            .json(&serde_json::json!({
+                "key": key,
+                "total_size_bytes": payload.len(),
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let upload_id = start_response
+            .get("upload_id")
+            .and_then(|value| value.as_str())
+            .context("upload session start response missing upload_id")?;
 
-        for chunk in payload.chunks(CHUNK_UPLOAD_SIZE_BYTES) {
-            let response: serde_json::Value = client
-                .request(Method::POST, "/store-chunks/upload")?
+        for (index, chunk) in payload.chunks(CHUNK_UPLOAD_SIZE_BYTES).enumerate() {
+            client
+                .request(Method::PUT, &format!("/store/uploads/{upload_id}/chunk/{index}"))?
                 .body(chunk.to_vec())
                 .send()
                 .await?
-                .error_for_status()?
-                .json()
-                .await?;
-
-            let hash = response
-                .get("hash")
-                .and_then(|v| v.as_str())
-                .context("chunk upload response missing hash")?;
-            let size_bytes = response
-                .get("size_bytes")
-                .and_then(|v| v.as_u64())
-                .context("chunk upload response missing size_bytes")?;
-
-            uploaded_chunks.push(serde_json::json!({
-                "hash": hash,
-                "size_bytes": size_bytes,
-            }));
+                .error_for_status()?;
         }
 
-        let complete_payload = serde_json::json!({
-            "total_size_bytes": payload.len(),
-            "chunks": uploaded_chunks,
-        });
-
         client
-            .request(Method::POST, &format!("/store/{key}?complete"))?
-            .json(&complete_payload)
+            .request(Method::POST, &format!("/store/uploads/{upload_id}/complete"))?
             .send()
             .await?
             .error_for_status()?;

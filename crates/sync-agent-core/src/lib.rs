@@ -188,6 +188,32 @@ fn is_ironmesh_internal_relative_path(relative_path: &str) -> bool {
     })
 }
 
+pub(crate) fn transfer_state_root(root_dir: &Path) -> PathBuf {
+    root_dir.join(".ironmesh").join("transfers")
+}
+
+pub(crate) fn transfer_path_stem(remote_key: &str) -> String {
+    blake3::hash(remote_key.as_bytes()).to_hex().to_string()
+}
+
+pub(crate) fn upload_transfer_state_path(root_dir: &Path, remote_key: &str) -> PathBuf {
+    transfer_state_root(root_dir)
+        .join("uploads")
+        .join(format!("{}.json", transfer_path_stem(remote_key)))
+}
+
+pub(crate) fn download_transfer_state_path(root_dir: &Path, remote_key: &str) -> PathBuf {
+    transfer_state_root(root_dir)
+        .join("downloads")
+        .join(format!("{}.json", transfer_path_stem(remote_key)))
+}
+
+pub(crate) fn download_transfer_temp_path(root_dir: &Path, remote_key: &str) -> PathBuf {
+    transfer_state_root(root_dir)
+        .join("downloads")
+        .join(format!("{}.part", transfer_path_stem(remote_key)))
+}
+
 pub fn local_entry_state_for_path(
     root: &Path,
     relative_path: impl AsRef<str>,

@@ -146,13 +146,16 @@ impl ClientNode {
         Ok(())
     }
 
-    pub fn put_chunked_reader(
+    pub fn put_large_aware_reader(
         &self,
         key: impl Into<String>,
         reader: &mut dyn std::io::Read,
+        length: u64,
     ) -> Result<UploadResult> {
         let key = key.into();
-        let report = self.client.put_chunked_reader(key.clone(), reader)?;
+        let report = self
+            .client
+            .put_large_aware_reader(key.clone(), reader, length)?;
         self.cache.blocking_write().remove(&key);
         Ok(report)
     }

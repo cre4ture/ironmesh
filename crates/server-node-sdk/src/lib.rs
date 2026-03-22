@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use axum::body::Body;
 use axum::extract::FromRequestParts;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header;
@@ -102,7 +103,8 @@ use setup::{
 };
 use storage::{
     AdminAuditEvent, ClientCredentialRecord, ClientCredentialState, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, ObjectReadMode,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, ObjectReadDescriptor,
+    ObjectReadMode,
     PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
     ReconcileVersionEntry, RepairAttemptRecord, StoreReadError, UploadChunkRef,
     VersionConsistencyState,
@@ -116,6 +118,7 @@ struct ServerState {
     store: Arc<Mutex<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     client_credentials: Arc<Mutex<ClientCredentialState>>,
+    upload_sessions: Arc<Mutex<UploadSessionStore>>,
     public_ca_pem: Option<String>,
     public_ca_key_pem: Option<String>,
     cluster_ca_pem: Option<String>,
@@ -242,6 +245,78 @@ struct ClientAuthControl {
     require_client_auth: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UploadSessionRecord {
+    upload_id: String,
+    owner_device_id: Option<String>,
+    key: String,
+    total_size_bytes: u64,
+    chunk_size_bytes: usize,
+    chunk_count: usize,
+    state: VersionConsistencyState,
+    parent_version_ids: Vec<String>,
+    explicit_version_id: Option<String>,
+    received_chunks: Vec<Option<UploadChunkRef>>,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    expires_at_unix: u64,
+    completed: bool,
+    completed_result: Option<UploadSessionCompleteResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct UploadSessionFile {
+    #[serde(default)]
+    sessions: HashMap<String, UploadSessionRecord>,
+}
+
+#[derive(Debug)]
+struct UploadSessionStore {
+    path: PathBuf,
+    sessions: HashMap<String, UploadSessionRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadSessionStartRequest {
+    key: String,
+    total_size_bytes: u64,
+    state: Option<String>,
+    #[serde(default)]
+    parent: Vec<String>,
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UploadSessionView {
+    upload_id: String,
+    key: String,
+    total_size_bytes: u64,
+    chunk_size_bytes: usize,
+    chunk_count: usize,
+    received_indexes: Vec<usize>,
+    expires_at_unix: u64,
+    completed: bool,
+    completed_result: Option<UploadSessionCompleteResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UploadSessionChunkResponse {
+    stored: bool,
+    received_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UploadSessionCompleteResponse {
+    snapshot_id: String,
+    version_id: String,
+    manifest_hash: String,
+    state: VersionConsistencyState,
+    new_chunks: usize,
+    dedup_reused_chunks: usize,
+    created_new_version: bool,
+    total_size_bytes: u64,
+}
+
 #[derive(Debug, Default)]
 struct ClientAuthReplayCache {
     seen_requests: HashMap<String, u64>,
@@ -269,6 +344,91 @@ impl ClientAuthReplayCache {
         self.seen_requests
             .retain(|_, seen_at| *seen_at >= oldest_allowed);
     }
+}
+
+fn upload_sessions_path(data_dir: &FsPath) -> PathBuf {
+    data_dir.join("state").join("upload_sessions.json")
+}
+
+async fn load_upload_session_store(data_dir: &FsPath) -> Result<UploadSessionStore> {
+    let path = upload_sessions_path(data_dir);
+    if !tokio::fs::try_exists(&path).await? {
+        return Ok(UploadSessionStore {
+            path,
+            sessions: HashMap::new(),
+        });
+    }
+
+    let payload = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("failed reading {}", path.display()))?;
+    let parsed = serde_json::from_slice::<UploadSessionFile>(&payload)
+        .with_context(|| format!("failed parsing {}", path.display()))?;
+    Ok(UploadSessionStore {
+        path,
+        sessions: parsed.sessions,
+    })
+}
+
+async fn persist_upload_session_store(store: &UploadSessionStore) -> Result<()> {
+    let payload = serde_json::to_vec_pretty(&UploadSessionFile {
+        sessions: store.sessions.clone(),
+    })
+    .context("failed encoding upload session state")?;
+    write_json_atomic(&store.path, &payload).await
+}
+
+fn prune_expired_upload_sessions(store: &mut UploadSessionStore, now: u64) {
+    store
+        .sessions
+        .retain(|_, session| session.expires_at_unix > now);
+}
+
+fn upload_session_view(session: &UploadSessionRecord) -> UploadSessionView {
+    UploadSessionView {
+        upload_id: session.upload_id.clone(),
+        key: session.key.clone(),
+        total_size_bytes: session.total_size_bytes,
+        chunk_size_bytes: session.chunk_size_bytes,
+        chunk_count: session.chunk_count,
+        received_indexes: session
+            .received_chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.as_ref().map(|_| index))
+            .collect(),
+        expires_at_unix: session.expires_at_unix,
+        completed: session.completed,
+        completed_result: session.completed_result.clone(),
+    }
+}
+
+fn expected_upload_chunk_size(
+    total_size_bytes: u64,
+    chunk_size_bytes: usize,
+    chunk_count: usize,
+    index: usize,
+) -> Option<usize> {
+    if chunk_count == 0 {
+        return None;
+    }
+    if index >= chunk_count {
+        return None;
+    }
+    if index + 1 < chunk_count {
+        return Some(chunk_size_bytes);
+    }
+    let consumed = (chunk_count.saturating_sub(1) as u64) * chunk_size_bytes as u64;
+    Some(total_size_bytes.saturating_sub(consumed) as usize)
+}
+
+fn request_device_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(transport_sdk::HEADER_DEVICE_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 impl AdminSessionStore {
@@ -301,6 +461,7 @@ impl AdminSessionStore {
 
 const CLIENT_AUTH_MAX_CLOCK_SKEW_SECS: u64 = 300;
 const ADMIN_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
+const UPLOAD_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 
 impl<S> FromRequestParts<S> for InternalCaller
 where
@@ -2801,6 +2962,22 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             .map(|url| (url, RendezvousEndpointRegistrationRuntime::default()))
             .collect(),
     ));
+    let upload_session_store = match load_upload_session_store(&config.data_dir).await {
+        Ok(mut store) => {
+            prune_expired_upload_sessions(&mut store, unix_ts());
+            if let Err(err) = persist_upload_session_store(&store).await {
+                warn!(error = %err, "failed to persist pruned upload session state");
+            }
+            store
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to load upload session state; starting empty");
+            UploadSessionStore {
+                path: upload_sessions_path(&config.data_dir),
+                sessions: HashMap::new(),
+            }
+        }
+    };
 
     let state = ServerState {
         data_dir: config.data_dir.clone(),
@@ -2809,6 +2986,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         store,
         cluster: Arc::new(Mutex::new(cluster)),
         client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
+        upload_sessions: Arc::new(Mutex::new(upload_session_store)),
         public_ca_pem,
         public_ca_key_pem,
         cluster_ca_pem,
@@ -2950,17 +3128,29 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
         )
+        .route("/store/uploads/start", post(start_upload_session))
+        .route(
+            "/store/uploads/{upload_id}",
+            get(get_upload_session).delete(delete_upload_session),
+        )
+        .route(
+            "/store/uploads/{upload_id}/chunk/{index}",
+            put(upload_session_chunk),
+        )
+        .route(
+            "/store/uploads/{upload_id}/complete",
+            post(complete_upload_session_route),
+        )
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
-        .route("/store-chunks/upload", post(upload_store_chunk))
         .route(
             "/store/{key}",
             put(put_object)
                 .get(get_object)
-                .delete(delete_object)
-                .post(complete_chunked_upload),
+                .head(head_object)
+                .delete(delete_object),
         )
         .route("/versions/{key}", get(list_versions))
         .route(
@@ -3135,17 +3325,29 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/store/index/changes/wait",
             get(wait_for_store_index_change),
         )
+        .route("/store/uploads/start", post(start_upload_session))
+        .route(
+            "/store/uploads/{upload_id}",
+            get(get_upload_session).delete(delete_upload_session),
+        )
+        .route(
+            "/store/uploads/{upload_id}/chunk/{index}",
+            put(upload_session_chunk),
+        )
+        .route(
+            "/store/uploads/{upload_id}/complete",
+            post(complete_upload_session_route),
+        )
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
-        .route("/store-chunks/upload", post(upload_store_chunk))
         .route(
             "/store/{key}",
             put(put_object)
                 .get(get_object)
-                .delete(delete_object)
-                .post(complete_chunked_upload),
+                .head(head_object)
+                .delete(delete_object),
         )
         .route("/versions/{key}", get(list_versions))
         .route(
@@ -4576,6 +4778,12 @@ struct ObjectGetQuery {
     read_mode: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ObjectByteRange {
+    start: usize,
+    end_inclusive: usize,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct StoreIndexQuery {
     prefix: Option<String>,
@@ -4699,30 +4907,6 @@ struct PathMutationRequest {
     to_path: String,
     #[serde(default)]
     overwrite: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct StoreChunkUploadResponse {
-    hash: String,
-    size_bytes: usize,
-    stored: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompleteStoreUploadRequest {
-    total_size_bytes: usize,
-    chunks: Vec<UploadChunkRef>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompleteStoreUploadQuery {
-    state: Option<String>,
-    #[serde(default)]
-    parent: Vec<String>,
-    version_id: Option<String>,
-    #[serde(default)]
-    internal_replication: bool,
-    complete: Option<String>,
 }
 
 fn should_trigger_autonomous_post_write_replication(
@@ -4923,129 +5107,302 @@ async fn put_object(
     }
 }
 
-async fn upload_store_chunk(State(state): State<ServerState>, payload: Bytes) -> impl IntoResponse {
-    if payload.is_empty() {
+async fn start_upload_session(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<UploadSessionStartRequest>,
+) -> impl IntoResponse {
+    let key = request.key.trim();
+    if key.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let store = state.store.lock().await;
-    match store.ingest_chunk_auto(&payload).await {
-        Ok((hash, stored)) => (
-            StatusCode::OK,
-            Json(StoreChunkUploadResponse {
-                hash,
-                size_bytes: payload.len(),
-                stored,
-            }),
-        )
-            .into_response(),
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to ingest store chunk upload");
-            StatusCode::BAD_REQUEST.into_response()
-        }
-    }
-}
-
-async fn complete_chunked_upload(
-    State(state): State<ServerState>,
-    Path(key): Path<String>,
-    Query(query): Query<CompleteStoreUploadQuery>,
-    Json(payload): Json<CompleteStoreUploadRequest>,
-) -> impl IntoResponse {
-    if query.complete.is_none() {
-        return StatusCode::BAD_REQUEST;
-    }
-
-    if query.version_id.is_some() && !query.internal_replication {
-        return StatusCode::BAD_REQUEST;
-    }
-
-    let version_state = match query.state.as_deref() {
+    let version_state = match request.state.as_deref() {
         None | Some("confirmed") => VersionConsistencyState::Confirmed,
         Some("provisional") => VersionConsistencyState::Provisional,
-        Some(_) => return StatusCode::BAD_REQUEST,
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let chunk_size_bytes = 1024 * 1024;
+    let chunk_count = if request.total_size_bytes == 0 {
+        1
+    } else {
+        ((request.total_size_bytes - 1) / chunk_size_bytes as u64 + 1) as usize
+    };
+    let now = unix_ts();
+
+    let mut sessions = state.upload_sessions.lock().await;
+    prune_expired_upload_sessions(&mut sessions, now);
+
+    let session = UploadSessionRecord {
+        upload_id: Uuid::now_v7().to_string(),
+        owner_device_id: request_device_id(&headers),
+        key: key.to_string(),
+        total_size_bytes: request.total_size_bytes,
+        chunk_size_bytes,
+        chunk_count,
+        state: version_state,
+        parent_version_ids: request.parent,
+        explicit_version_id: request.version_id,
+        received_chunks: vec![None; chunk_count],
+        created_at_unix: now,
+        updated_at_unix: now,
+        expires_at_unix: now.saturating_add(UPLOAD_SESSION_TTL_SECS),
+        completed: false,
+        completed_result: None,
+    };
+    let response = upload_session_view(&session);
+    sessions
+        .sessions
+        .insert(session.upload_id.clone(), session);
+    if let Err(err) = persist_upload_session_store(&sessions).await {
+        warn!(error = %err, "failed to persist upload session state");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+async fn get_upload_session(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(upload_id): Path<String>,
+) -> impl IntoResponse {
+    let requester_device_id = request_device_id(&headers);
+    let now = unix_ts();
+    let mut sessions = state.upload_sessions.lock().await;
+    prune_expired_upload_sessions(&mut sessions, now);
+    let Some(session) = sessions.sessions.get(&upload_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(owner_device_id) = session.owner_device_id.as_deref()
+        && requester_device_id.as_deref() != Some(owner_device_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(upload_session_view(session)).into_response()
+}
+
+async fn delete_upload_session(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(upload_id): Path<String>,
+) -> impl IntoResponse {
+    let requester_device_id = request_device_id(&headers);
+    let now = unix_ts();
+    let mut sessions = state.upload_sessions.lock().await;
+    prune_expired_upload_sessions(&mut sessions, now);
+
+    let Some(session) = sessions.sessions.get(&upload_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(owner_device_id) = session.owner_device_id.as_deref()
+        && requester_device_id.as_deref() != Some(owner_device_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    sessions.sessions.remove(&upload_id);
+    if let Err(err) = persist_upload_session_store(&sessions).await {
+        warn!(error = %err, "failed to persist upload session deletion");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn upload_session_chunk(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((upload_id, index)): Path<(String, usize)>,
+    payload: Bytes,
+) -> impl IntoResponse {
+    let requester_device_id = request_device_id(&headers);
+    let now = unix_ts();
+
+    let mut sessions = state.upload_sessions.lock().await;
+    prune_expired_upload_sessions(&mut sessions, now);
+
+    let Some(session) = sessions.sessions.get_mut(&upload_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(owner_device_id) = session.owner_device_id.as_deref()
+        && requester_device_id.as_deref() != Some(owner_device_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if session.completed {
+        return StatusCode::CONFLICT.into_response();
+    }
+
+    let Some(expected_size) = expected_upload_chunk_size(
+        session.total_size_bytes,
+        session.chunk_size_bytes,
+        session.chunk_count,
+        index,
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if payload.len() != expected_size {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let (hash, stored) = {
+        let store = state.store.lock().await;
+        match store.ingest_chunk_auto(&payload).await {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(error = %err, upload_id = %upload_id, index, "failed to ingest upload session chunk");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+    };
+    let next_ref = UploadChunkRef {
+        hash,
+        size_bytes: payload.len(),
     };
 
-    let mut store = state.store.lock().await;
-    match store
-        .put_object_from_chunks(
-            &key,
-            payload.total_size_bytes,
-            &payload.chunks,
-            PutOptions {
-                parent_version_ids: query.parent,
-                state: version_state,
-                inherit_preferred_parent: true,
-                create_snapshot: !query.internal_replication,
-                explicit_version_id: query.version_id,
-            },
-        )
-        .await
-    {
-        Ok(outcome) => {
-            drop(store);
-            publish_namespace_change(&state);
-            spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
-
-            let mut cluster = state.cluster.lock().await;
-            cluster.note_replica(&key, state.node_id);
-            cluster.note_replica(
-                format!("{}@{}", key, outcome.version_id.as_str()),
-                state.node_id,
-            );
-            drop(cluster);
-
-            if let Err(err) = persist_cluster_replicas_state(&state).await {
-                warn!(
-                    error = %err,
-                    "failed to persist cluster replicas after chunked upload complete"
-                );
-            }
-
-            if should_trigger_autonomous_post_write_replication(
-                state.autonomous_replication_on_put_enabled,
-                query.internal_replication,
-            ) {
-                let state_for_repair = state.clone();
-                tokio::spawn(async move {
-                    let report =
-                        replication::execute_replication_repair_inner(&state_for_repair, None)
-                            .await;
-                    if report.attempted_transfers > 0 || report.failed_transfers > 0 {
-                        info!(
-                            attempted = report.attempted_transfers,
-                            success = report.successful_transfers,
-                            failed = report.failed_transfers,
-                            skipped = report.skipped_items,
-                            skipped_backoff = report.skipped_backoff,
-                            skipped_max_retries = report.skipped_max_retries,
-                            "autonomous post-write replication run"
-                        );
-                    }
-                });
-            }
-
-            info!(
-                key = %key,
-                snapshot_id = %outcome.snapshot_id,
-                version_id = %outcome.version_id,
-                version_state = ?outcome.state,
-                created_new_version = outcome.created_new_version,
-                new_chunks = outcome.new_chunks,
-                dedup_reused_chunks = outcome.dedup_reused_chunks,
-                "stored object from chunked upload"
-            );
-            StatusCode::CREATED
-        }
-        Err(err) => {
-            tracing::error!(
-                error = %err,
-                key = %key,
-                "failed to finalize chunked object upload"
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
+    if let Some(existing) = session.received_chunks.get(index).and_then(|entry| entry.as_ref()) {
+        if existing.hash != next_ref.hash || existing.size_bytes != next_ref.size_bytes {
+            return StatusCode::CONFLICT.into_response();
         }
     }
+
+    session.received_chunks[index] = Some(next_ref);
+    session.updated_at_unix = now;
+    session.expires_at_unix = now.saturating_add(UPLOAD_SESSION_TTL_SECS);
+    let response = UploadSessionChunkResponse {
+        stored,
+        received_index: index,
+    };
+
+    if let Err(err) = persist_upload_session_store(&sessions).await {
+        warn!(error = %err, "failed to persist upload session chunk state");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn complete_upload_session_route(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(upload_id): Path<String>,
+) -> impl IntoResponse {
+    let requester_device_id = request_device_id(&headers);
+    let now = unix_ts();
+    let mut sessions = state.upload_sessions.lock().await;
+    prune_expired_upload_sessions(&mut sessions, now);
+
+    let Some(session) = sessions.sessions.get_mut(&upload_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(owner_device_id) = session.owner_device_id.as_deref()
+        && requester_device_id.as_deref() != Some(owner_device_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if session.completed
+        && let Some(result) = session.completed_result.clone()
+    {
+        return (StatusCode::OK, Json(result)).into_response();
+    }
+    if session.received_chunks.iter().any(|entry| entry.is_none()) {
+        return StatusCode::CONFLICT.into_response();
+    }
+
+    let chunk_refs = session
+        .received_chunks
+        .iter()
+        .filter_map(|entry| entry.clone())
+        .collect::<Vec<_>>();
+
+    let outcome = {
+        let mut store = state.store.lock().await;
+        match store
+            .put_object_from_chunks(
+                &session.key,
+                session.total_size_bytes as usize,
+                &chunk_refs,
+                PutOptions {
+                    parent_version_ids: session.parent_version_ids.clone(),
+                    state: session.state.clone(),
+                    inherit_preferred_parent: true,
+                    create_snapshot: true,
+                    explicit_version_id: session.explicit_version_id.clone(),
+                },
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    key = %session.key,
+                    upload_id = %upload_id,
+                    "failed to finalize upload session"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    publish_namespace_change(&state);
+    spawn_media_cache_warmup(state.clone(), session.key.clone(), outcome.manifest_hash.clone());
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(&session.key, state.node_id);
+    cluster.note_replica(
+        format!("{}@{}", session.key, outcome.version_id.as_str()),
+        state.node_id,
+    );
+    drop(cluster);
+
+    if let Err(err) = persist_cluster_replicas_state(&state).await {
+        warn!(
+            error = %err,
+            "failed to persist cluster replicas after upload session complete"
+        );
+    }
+
+    if should_trigger_autonomous_post_write_replication(state.autonomous_replication_on_put_enabled, false) {
+        let state_for_repair = state.clone();
+        tokio::spawn(async move {
+            let report =
+                replication::execute_replication_repair_inner(&state_for_repair, None).await;
+            if report.attempted_transfers > 0 || report.failed_transfers > 0 {
+                info!(
+                    attempted = report.attempted_transfers,
+                    success = report.successful_transfers,
+                    failed = report.failed_transfers,
+                    skipped = report.skipped_items,
+                    skipped_backoff = report.skipped_backoff,
+                    skipped_max_retries = report.skipped_max_retries,
+                    "autonomous post-write replication run"
+                );
+            }
+        });
+    }
+
+    let response = UploadSessionCompleteResponse {
+        snapshot_id: outcome.snapshot_id.clone(),
+        version_id: outcome.version_id.clone(),
+        manifest_hash: outcome.manifest_hash.clone(),
+        state: outcome.state.clone(),
+        new_chunks: outcome.new_chunks,
+        dedup_reused_chunks: outcome.dedup_reused_chunks,
+        created_new_version: outcome.created_new_version,
+        total_size_bytes: session.total_size_bytes,
+    };
+    session.completed = true;
+    session.completed_result = Some(response.clone());
+    session.updated_at_unix = now;
+    session.expires_at_unix = now.saturating_add(UPLOAD_SESSION_TTL_SECS);
+    if let Err(err) = persist_upload_session_store(&sessions).await {
+        warn!(error = %err, "failed to persist completed upload session");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 async fn delete_object(
@@ -5611,10 +5968,20 @@ fn build_store_index_entries_with_hashes(
 
 async fn get_object(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     Query(query): Query<ObjectGetQuery>,
 ) -> impl IntoResponse {
-    get_object_response(&state, &key, query).await
+    get_object_response(&state, &key, query, &headers, false).await
+}
+
+async fn head_object(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Query(query): Query<ObjectGetQuery>,
+) -> impl IntoResponse {
+    get_object_response(&state, &key, query, &headers, true).await
 }
 
 async fn get_object_admin(
@@ -5641,18 +6008,160 @@ async fn get_object_admin(
         return status.into_response();
     }
 
-    get_object_response(&state, &key, query).await
+    get_object_response(&state, &key, query, &headers, false).await
 }
 
-async fn get_object_response(state: &ServerState, key: &str, query: ObjectGetQuery) -> Response {
+fn object_etag(manifest_hash: &str) -> String {
+    format!("\"{manifest_hash}\"")
+}
+
+fn parse_object_byte_range(value: &str, total_size_bytes: usize) -> Option<ObjectByteRange> {
+    let trimmed = value.trim();
+    let range_spec = trimmed.strip_prefix("bytes=")?.trim();
+    if range_spec.contains(',') {
+        return None;
+    }
+    let (start_raw, end_raw) = range_spec.split_once('-')?;
+    if start_raw.is_empty() {
+        let suffix_len = end_raw.parse::<usize>().ok()?;
+        if suffix_len == 0 || total_size_bytes == 0 {
+            return None;
+        }
+        let clamped_len = suffix_len.min(total_size_bytes);
+        return Some(ObjectByteRange {
+            start: total_size_bytes.saturating_sub(clamped_len),
+            end_inclusive: total_size_bytes.saturating_sub(1),
+        });
+    }
+
+    let start = start_raw.parse::<usize>().ok()?;
+    if start >= total_size_bytes {
+        return None;
+    }
+    let end_inclusive = if end_raw.is_empty() {
+        total_size_bytes.saturating_sub(1)
+    } else {
+        end_raw.parse::<usize>().ok()?.min(total_size_bytes.saturating_sub(1))
+    };
+    if end_inclusive < start {
+        return None;
+    }
+
+    Some(ObjectByteRange {
+        start,
+        end_inclusive,
+    })
+}
+
+fn range_matches_if_range(headers: &HeaderMap, current_etag: &str) -> bool {
+    let Some(value) = headers.get(header::IF_RANGE) else {
+        return true;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let trimmed = value.trim();
+    trimmed == current_etag || trimmed.trim_matches('"') == current_etag.trim_matches('"')
+}
+
+fn add_object_common_headers(
+    response: &mut Response,
+    etag: &str,
+    total_size_bytes: usize,
+    content_length: usize,
+) {
+    if let Ok(value) = HeaderValue::from_str("bytes") {
+        response.headers_mut().insert(header::ACCEPT_RANGES, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&total_size_bytes.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ironmesh-object-size", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, value);
+    }
+}
+
+fn build_range_not_satisfiable_response(etag: &str, total_size_bytes: usize) -> Response {
+    let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+    add_object_common_headers(&mut response, etag, total_size_bytes, 0);
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total_size_bytes}")) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_RANGE, value);
+    }
+    response
+}
+
+fn build_object_head_response(
+    status: StatusCode,
+    etag: &str,
+    total_size_bytes: usize,
+    selected_range: Option<ObjectByteRange>,
+) -> Response {
+    let content_length = selected_range
+        .map(|range| range.end_inclusive - range.start + 1)
+        .unwrap_or(total_size_bytes);
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = status;
+    add_object_common_headers(&mut response, etag, total_size_bytes, content_length);
+    if let Some(range) = selected_range
+        && let Ok(value) = HeaderValue::from_str(&format!(
+            "bytes {}-{}/{}",
+            range.start, range.end_inclusive, total_size_bytes
+        ))
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_RANGE, value);
+    }
+    response
+}
+
+fn build_object_bytes_response(
+    status: StatusCode,
+    etag: &str,
+    total_size_bytes: usize,
+    selected_range: Option<ObjectByteRange>,
+    payload: Bytes,
+) -> Response {
+    let payload_len = payload.len();
+    let mut response = (status, payload).into_response();
+    add_object_common_headers(&mut response, etag, total_size_bytes, payload_len);
+    if let Some(range) = selected_range
+        && let Ok(value) = HeaderValue::from_str(&format!(
+            "bytes {}-{}/{}",
+            range.start, range.end_inclusive, total_size_bytes
+        ))
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_RANGE, value);
+    }
+    response
+}
+
+async fn get_object_response(
+    state: &ServerState,
+    key: &str,
+    query: ObjectGetQuery,
+    headers: &HeaderMap,
+    head_only: bool,
+) -> Response {
     let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
         Some(value) => value,
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
 
     let store = state.store.lock().await;
-    match store
-        .get_object(
+    let descriptor = match store
+        .describe_object(
             key,
             query.snapshot.as_deref(),
             query.version.as_deref(),
@@ -5660,7 +6169,74 @@ async fn get_object_response(state: &ServerState, key: &str, query: ObjectGetQue
         )
         .await
     {
-        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+        Ok(descriptor) => descriptor,
+        Err(StoreReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(StoreReadError::Corrupt(msg)) => {
+            tracing::error!(key = %key, error = %msg, "detected corrupt data while reading object");
+            return StatusCode::CONFLICT.into_response();
+        }
+        Err(StoreReadError::Internal(err)) => {
+            tracing::error!(key = %key, error = %err, "internal error while reading object");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let ObjectReadDescriptor {
+        manifest_hash,
+        total_size_bytes,
+    } = descriptor;
+    let etag = object_etag(&manifest_hash);
+
+    let selected_range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|_| range_matches_if_range(headers, &etag))
+        .map(|value| parse_object_byte_range(value, total_size_bytes));
+
+    let selected_range = match selected_range {
+        Some(Some(range)) => Some(range),
+        Some(None) => return build_range_not_satisfiable_response(&etag, total_size_bytes),
+        None => None,
+    };
+
+    if head_only {
+        return build_object_head_response(
+            if selected_range.is_some() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            },
+            &etag,
+            total_size_bytes,
+            selected_range,
+        );
+    }
+
+    let read_result = match selected_range {
+        Some(range) => {
+            store
+                .read_object_range_by_manifest_hash(
+                    &manifest_hash,
+                    range.start,
+                    range.end_inclusive.saturating_add(1),
+                )
+                .await
+                .map(|payload| (StatusCode::PARTIAL_CONTENT, Some(range), payload))
+        }
+        None => store
+            .get_object(
+                key,
+                query.snapshot.as_deref(),
+                query.version.as_deref(),
+                read_mode,
+            )
+            .await
+            .map(|payload| (StatusCode::OK, None, payload)),
+    };
+
+    match read_result {
+        Ok((status, range, payload)) => {
+            build_object_bytes_response(status, &etag, total_size_bytes, range, payload)
+        }
         Err(StoreReadError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(StoreReadError::Corrupt(msg)) => {
             tracing::error!(key = %key, error = %msg, "detected corrupt data while reading object");
@@ -10232,6 +10808,29 @@ fn unix_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+async fn write_json_atomic(path: &FsPath, payload: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path {} has no parent directory", path.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed creating {}", parent.display()))?;
+
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("state"),
+        Uuid::new_v4().simple()
+    ));
+    tokio::fs::write(&temp_path, payload)
+        .await
+        .with_context(|| format!("failed writing {}", temp_path.display()))?;
+    tokio::fs::rename(&temp_path, path)
+        .await
+        .with_context(|| format!("failed renaming {} -> {}", temp_path.display(), path.display()))
 }
 
 async fn run_cleanup(

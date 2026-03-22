@@ -6,10 +6,14 @@ use reqwest::Method;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use reqwest::Url;
-use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{
+    ACCEPT_RANGES, CONTENT_LENGTH, ETAG, HeaderMap, HeaderName, HeaderValue, IF_RANGE, RANGE,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
@@ -20,6 +24,7 @@ use transport_sdk::{
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
+const DOWNLOAD_SEGMENT_SIZE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct IronMeshClient {
@@ -77,10 +82,83 @@ pub struct UploadResult {
     pub chunk_count: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StoreChunkUploadResponse {
-    hash: String,
-    size_bytes: usize,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectHeadInfo {
+    pub total_size_bytes: u64,
+    pub etag: Option<String>,
+    pub accept_ranges: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadSessionStartRequest {
+    key: String,
+    total_size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(default)]
+    parent: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct UploadSessionView {
+    upload_id: String,
+    key: String,
+    total_size_bytes: u64,
+    chunk_size_bytes: usize,
+    chunk_count: usize,
+    #[serde(default, alias = "received_chunks")]
+    received_indexes: Vec<usize>,
+    completed: bool,
+    #[serde(default)]
+    completed_result: Option<UploadSessionCompleteResponse>,
+    #[allow(dead_code)]
+    expires_at_unix: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct UploadSessionChunkResponse {
+    #[allow(dead_code)]
+    stored: bool,
+    received_index: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct UploadSessionCompleteResponse {
+    snapshot_id: String,
+    version_id: String,
+    manifest_hash: String,
+    state: String,
+    new_chunks: usize,
+    dedup_reused_chunks: usize,
+    created_new_version: bool,
+    total_size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectHeadResponse {
+    total_size_bytes: u64,
+    etag: Option<String>,
+    accept_ranges: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResumableUploadFileState {
+    upload_id: String,
+    key: String,
+    source_size_bytes: u64,
+    source_modified_unix_ms: u128,
+    chunk_size_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResumableDownloadFileState {
+    key: String,
+    snapshot: Option<String>,
+    version: Option<String>,
+    expected_size_bytes: u64,
+    etag: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,18 +253,6 @@ pub struct StoreIndexThumbnail {
 }
 
 #[derive(Debug, Serialize)]
-struct CompleteStoreUploadRequest {
-    total_size_bytes: usize,
-    chunks: Vec<CompleteStoreUploadChunkRef>,
-}
-
-#[derive(Debug, Serialize)]
-struct CompleteStoreUploadChunkRef {
-    hash: String,
-    size_bytes: usize,
-}
-
-#[derive(Debug, Serialize)]
 struct PathMutationRequest {
     from_path: String,
     to_path: String,
@@ -261,13 +327,6 @@ impl IronMeshClient {
                 server_base_url, ..
             } => server_base_url.as_str(),
             ClientTransport::Relay(relay) => relay.request_base_url.as_str(),
-        }
-    }
-
-    fn direct_http(&self) -> Option<&HttpClient> {
-        match &self.transport {
-            ClientTransport::Direct { http, .. } => Some(http),
-            ClientTransport::Relay(_) => None,
         }
     }
 
@@ -682,6 +741,580 @@ impl IronMeshClient {
         })
     }
 
+    async fn start_upload_session(
+        &self,
+        key: &str,
+        total_size_bytes: u64,
+    ) -> Result<UploadSessionView> {
+        let url = self.store_upload_session_start_url()?;
+        let payload = serde_json::to_vec(&UploadSessionStartRequest {
+            key: key.to_string(),
+            total_size_bytes,
+            state: None,
+            parent: Vec::new(),
+            version_id: None,
+        })
+        .context("failed to encode upload session start payload")?;
+
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                url,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
+            .await
+            .with_context(|| format!("failed to start upload session for key={key}"))?;
+        if !response.status.is_success() {
+            bail!(
+                "server rejected upload session start for key={key}: {}",
+                response.status
+            );
+        }
+
+        serde_json::from_slice::<UploadSessionView>(&response.body)
+            .with_context(|| format!("failed to parse upload session start response for {key}"))
+    }
+
+    async fn get_upload_session(&self, upload_id: &str) -> Result<Option<UploadSessionView>> {
+        let url = self.store_upload_session_url(upload_id)?;
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to query upload session {upload_id}"))?;
+
+        match response.status {
+            StatusCode::OK => serde_json::from_slice::<UploadSessionView>(&response.body)
+                .with_context(|| format!("failed to parse upload session {upload_id}"))
+                .map(Some),
+            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Ok(None),
+            status => Err(anyhow!("upload session query failed for {upload_id}: {status}")),
+        }
+    }
+
+    async fn upload_session_chunk(
+        &self,
+        upload_id: &str,
+        index: usize,
+        payload: Vec<u8>,
+    ) -> Result<UploadSessionChunkResponse> {
+        let url = self.store_upload_session_chunk_url(upload_id, index)?;
+        let response = self
+            .execute_buffered_request(Method::PUT, url, Vec::new(), Some(payload))
+            .await
+            .with_context(|| format!("failed to upload chunk {index} for session={upload_id}"))?;
+        if !response.status.is_success() {
+            bail!(
+                "upload session chunk rejected for session={upload_id} index={index}: {}",
+                response.status
+            );
+        }
+
+        serde_json::from_slice::<UploadSessionChunkResponse>(&response.body).with_context(|| {
+            format!("failed to parse upload session chunk response for session={upload_id}")
+        })
+    }
+
+    async fn complete_upload_session(&self, upload_id: &str) -> Result<UploadSessionCompleteResponse> {
+        let url = self.store_upload_session_complete_url(upload_id)?;
+        let response = self
+            .execute_buffered_request(Method::POST, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to complete upload session {upload_id}"))?;
+
+        if !response.status.is_success() {
+            bail!(
+                "upload session completion rejected for session={upload_id}: {}",
+                response.status
+            );
+        }
+
+        serde_json::from_slice::<UploadSessionCompleteResponse>(&response.body).with_context(
+            || format!("failed to parse upload session completion response for {upload_id}"),
+        )
+    }
+
+    async fn head_object_response(
+        &self,
+        key: &str,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<ObjectHeadResponse> {
+        let mut url = self.store_key_url(key)?;
+        append_optional_query(&mut url, "snapshot", snapshot);
+        append_optional_query(&mut url, "version", version);
+
+        let response = self
+            .execute_buffered_request(Method::HEAD, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to HEAD object key={key}"))?;
+        if !response.status.is_success() {
+            bail!(
+                "object not found or inaccessible key={key}: {}",
+                response.status
+            );
+        }
+
+        let total_size_bytes = response
+            .headers
+            .get("x-ironmesh-object-size")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| {
+                response
+                    .headers
+                    .get(CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+
+        Ok(ObjectHeadResponse {
+            total_size_bytes,
+            etag: response
+                .headers
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            accept_ranges: response
+                .headers
+                .get(ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.eq_ignore_ascii_case("bytes"))
+                .unwrap_or(false),
+        })
+    }
+
+    async fn get_object_range_response(
+        &self,
+        key: &str,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+        start: u64,
+        end_inclusive: u64,
+        if_range: Option<&str>,
+    ) -> Result<BufferedTransportResponse> {
+        let mut url = self.store_key_url(key)?;
+        append_optional_query(&mut url, "snapshot", snapshot);
+        append_optional_query(&mut url, "version", version);
+
+        let mut headers = vec![range_header(start, end_inclusive)];
+        if let Some(if_range) = if_range {
+            headers.push(simple_header(IF_RANGE, if_range)?);
+        }
+
+        self.execute_buffered_request(Method::GET, url, headers, None)
+            .await
+            .with_context(|| {
+                format!("failed to GET object range key={key} start={start} end={end_inclusive}")
+            })
+    }
+
+    async fn download_with_range_requests(
+        &self,
+        key: &str,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
+        let head = self.head_object_response(key, snapshot, version).await?;
+        if head.total_size_bytes == 0 {
+            writer
+                .flush()
+                .with_context(|| format!("failed to flush output for key={key}"))?;
+            return Ok(());
+        }
+
+        if !head.accept_ranges {
+            let payload = self.get_with_selector(key, snapshot, version).await?;
+            writer
+                .write_all(payload.as_ref())
+                .with_context(|| format!("failed to write payload chunk for key={key}"))?;
+            writer
+                .flush()
+                .with_context(|| format!("failed to flush output for key={key}"))?;
+            return Ok(());
+        }
+
+        let mut offset = 0_u64;
+        while offset < head.total_size_bytes {
+            let end_inclusive = std::cmp::min(
+                offset + DOWNLOAD_SEGMENT_SIZE_BYTES as u64 - 1,
+                head.total_size_bytes - 1,
+            );
+            let response = self
+                .get_object_range_response(
+                    key,
+                    snapshot,
+                    version,
+                    offset,
+                    end_inclusive,
+                    head.etag.as_deref(),
+                )
+                .await?;
+
+            match response.status {
+                StatusCode::PARTIAL_CONTENT => {
+                    let expected_len = (end_inclusive - offset + 1) as usize;
+                    if response.body.len() != expected_len {
+                        bail!(
+                            "server returned unexpected range length for key={key}: expected={expected_len} actual={}",
+                            response.body.len()
+                        );
+                    }
+                    writer
+                        .write_all(response.body.as_ref())
+                        .with_context(|| format!("failed to write payload chunk for key={key}"))?;
+                    offset = end_inclusive + 1;
+                }
+                StatusCode::OK if offset == 0 => {
+                    writer
+                        .write_all(response.body.as_ref())
+                        .with_context(|| format!("failed to write payload chunk for key={key}"))?;
+                    offset = head.total_size_bytes;
+                }
+                status => {
+                    bail!("server rejected ranged download for key={key}: {status}");
+                }
+            }
+        }
+
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush output for key={key}"))?;
+        Ok(())
+    }
+
+    pub fn put_file_resumable(
+        &self,
+        key: impl Into<String>,
+        source_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+    ) -> Result<UploadResult> {
+        let key = key.into();
+        let source_path = source_path.as_ref();
+        let state_path = state_path.as_ref();
+        let metadata = fs::metadata(source_path)
+            .with_context(|| format!("failed to inspect upload source {}", source_path.display()))?;
+        let source_size_bytes = metadata.len();
+        let source_modified_unix_ms = file_modified_unix_ms(&metadata);
+
+        if source_size_bytes <= LARGE_UPLOAD_THRESHOLD_BYTES as u64 {
+            let mut file = File::open(source_path).with_context(|| {
+                format!("failed to open upload source {}", source_path.display())
+            })?;
+            return self.put_large_aware_reader(key, &mut file, source_size_bytes);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for resumable upload")?;
+
+        let persisted = load_json_file::<ResumableUploadFileState>(state_path)?
+            .filter(|state| {
+                state.key == key
+                    && state.source_size_bytes == source_size_bytes
+                    && state.source_modified_unix_ms == source_modified_unix_ms
+            });
+
+        let mut session = match persisted {
+            Some(state) => match runtime.block_on(self.get_upload_session(&state.upload_id))? {
+                Some(session)
+                    if session.key == key && session.total_size_bytes == source_size_bytes =>
+                {
+                    session
+                }
+                _ => {
+                    remove_file_if_exists(state_path)?;
+                    runtime.block_on(self.start_upload_session(&key, source_size_bytes))?
+                }
+            },
+            None => runtime.block_on(self.start_upload_session(&key, source_size_bytes))?,
+        };
+
+        persist_json_file_atomic(
+            state_path,
+            &ResumableUploadFileState {
+                upload_id: session.upload_id.clone(),
+                key: key.clone(),
+                source_size_bytes,
+                source_modified_unix_ms,
+                chunk_size_bytes: session.chunk_size_bytes,
+            },
+        )?;
+
+        if session.completed {
+            remove_file_if_exists(state_path)?;
+            if let Some(ref completed) = session.completed_result {
+                return Ok(upload_result_from_session_complete(&key, &session, completed));
+            }
+        }
+
+        let received = session
+            .received_indexes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut file = File::open(source_path)
+            .with_context(|| format!("failed to open upload source {}", source_path.display()))?;
+        let mut buffer = vec![0_u8; session.chunk_size_bytes];
+
+        for index in 0..session.chunk_count {
+            if received.contains(&index) {
+                continue;
+            }
+
+            let offset = (index as u64)
+                .checked_mul(session.chunk_size_bytes as u64)
+                .context("upload chunk offset overflow")?;
+            file.seek(SeekFrom::Start(offset)).with_context(|| {
+                format!("failed to seek upload source {}", source_path.display())
+            })?;
+
+            let expected_size = expected_chunk_size(
+                session.total_size_bytes,
+                session.chunk_size_bytes,
+                session.chunk_count,
+                index,
+            )
+            .context("failed to determine expected upload chunk size")?;
+            file.read_exact(&mut buffer[..expected_size]).with_context(|| {
+                format!(
+                    "failed to read upload chunk index={index} from {}",
+                    source_path.display()
+                )
+            })?;
+
+            let response = runtime.block_on(self.upload_session_chunk(
+                &session.upload_id,
+                index,
+                buffer[..expected_size].to_vec(),
+            ))?;
+            if response.received_index != index {
+                bail!(
+                    "server acknowledged unexpected upload chunk index={} expected={index}",
+                    response.received_index
+                );
+            }
+        }
+
+        let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
+        remove_file_if_exists(state_path)?;
+        session.completed_result = Some(completed.clone());
+        Ok(upload_result_from_session_complete(&key, &session, &completed))
+    }
+
+    fn put_sized_reader_via_upload_session(
+        &self,
+        key: impl Into<String>,
+        reader: &mut dyn Read,
+        total_size_bytes: u64,
+    ) -> Result<UploadResult> {
+        let key = key.into();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for upload")?;
+        let session = runtime.block_on(self.start_upload_session(&key, total_size_bytes))?;
+        let mut buffer = vec![0_u8; session.chunk_size_bytes];
+
+        for index in 0..session.chunk_count {
+            let expected_size = expected_chunk_size(
+                total_size_bytes,
+                session.chunk_size_bytes,
+                session.chunk_count,
+                index,
+            )
+            .context("failed to determine expected upload chunk size")?;
+            reader.read_exact(&mut buffer[..expected_size]).with_context(|| {
+                format!("failed reading upload chunk index={index} for key={key}")
+            })?;
+            let response = runtime.block_on(self.upload_session_chunk(
+                &session.upload_id,
+                index,
+                buffer[..expected_size].to_vec(),
+            ))?;
+            if response.received_index != index {
+                bail!(
+                    "server acknowledged unexpected upload chunk index={} expected={index}",
+                    response.received_index
+                );
+            }
+        }
+
+        let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
+        Ok(upload_result_from_session_complete(&key, &session, &completed))
+    }
+
+    pub fn download_file_resumable(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+        target_path: impl AsRef<Path>,
+        temp_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let key = key.as_ref();
+        let target_path = target_path.as_ref();
+        let temp_path = temp_path.as_ref();
+        let state_path = state_path.as_ref();
+        let snapshot_owned = snapshot.map(ToString::to_string);
+        let version_owned = version.map(ToString::to_string);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for resumable download")?;
+        let head = runtime.block_on(self.head_object_response(
+            key,
+            snapshot_owned.as_deref(),
+            version_owned.as_deref(),
+        ))?;
+
+        if head.total_size_bytes == 0 {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create target directory {}", parent.display())
+                })?;
+            }
+            fs::write(target_path, [])
+                .with_context(|| format!("failed to write empty object {}", target_path.display()))?;
+            remove_file_if_exists(temp_path)?;
+            remove_file_if_exists(state_path)?;
+            return Ok(());
+        }
+
+        if !head.accept_ranges {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(temp_path)
+                .with_context(|| format!("failed to create temp file {}", temp_path.display()))?;
+            runtime.block_on(self.download_with_range_requests(
+                key,
+                snapshot_owned.as_deref(),
+                version_owned.as_deref(),
+                &mut file,
+            ))?;
+            file.sync_all()
+                .with_context(|| format!("failed to flush temp file {}", temp_path.display()))?;
+            place_downloaded_file(temp_path, target_path)?;
+            remove_file_if_exists(state_path)?;
+            return Ok(());
+        }
+
+        let Some(current_etag) = head.etag.clone() else {
+            bail!("server omitted ETag for resumable download key={key}");
+        };
+
+        let expected_state = ResumableDownloadFileState {
+            key: key.to_string(),
+            snapshot: snapshot_owned.clone(),
+            version: version_owned.clone(),
+            expected_size_bytes: head.total_size_bytes,
+            etag: current_etag.clone(),
+        };
+
+        let should_reset = load_json_file::<ResumableDownloadFileState>(state_path)?
+            .is_some_and(|persisted| persisted != expected_state);
+        if should_reset {
+            remove_file_if_exists(temp_path)?;
+            remove_file_if_exists(state_path)?;
+        }
+
+        persist_json_file_atomic(state_path, &expected_state)?;
+        if let Some(parent) = temp_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create temp directory {}", parent.display()))?;
+        }
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create target directory {}", parent.display())
+            })?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(temp_path)
+            .with_context(|| format!("failed to open temp download file {}", temp_path.display()))?;
+
+        let mut offset = file
+            .metadata()
+            .with_context(|| format!("failed to inspect temp file {}", temp_path.display()))?
+            .len();
+        if offset > head.total_size_bytes {
+            file.set_len(0)
+                .with_context(|| format!("failed to reset temp file {}", temp_path.display()))?;
+            offset = 0;
+        }
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed to seek temp file {}", temp_path.display()))?;
+
+        while offset < head.total_size_bytes {
+            let end_inclusive = std::cmp::min(
+                offset + DOWNLOAD_SEGMENT_SIZE_BYTES as u64 - 1,
+                head.total_size_bytes - 1,
+            );
+            let response = runtime.block_on(self.get_object_range_response(
+                key,
+                snapshot_owned.as_deref(),
+                version_owned.as_deref(),
+                offset,
+                end_inclusive,
+                Some(current_etag.as_str()),
+            ))?;
+
+            match response.status {
+                StatusCode::PARTIAL_CONTENT => {
+                    let expected_len = (end_inclusive - offset + 1) as usize;
+                    if response.body.len() != expected_len {
+                        bail!(
+                            "server returned unexpected range length for key={key}: expected={expected_len} actual={}",
+                            response.body.len()
+                        );
+                    }
+                    file.write_all(response.body.as_ref()).with_context(|| {
+                        format!("failed to write temp download file {}", temp_path.display())
+                    })?;
+                    file.sync_data().with_context(|| {
+                        format!("failed to persist temp download file {}", temp_path.display())
+                    })?;
+                    offset = end_inclusive + 1;
+                }
+                StatusCode::OK if offset == 0 => {
+                    file.set_len(0).with_context(|| {
+                        format!("failed to reset temp download file {}", temp_path.display())
+                    })?;
+                    file.seek(SeekFrom::Start(0)).with_context(|| {
+                        format!("failed to seek temp download file {}", temp_path.display())
+                    })?;
+                    file.write_all(response.body.as_ref()).with_context(|| {
+                        format!("failed to write temp download file {}", temp_path.display())
+                    })?;
+                    file.sync_data().with_context(|| {
+                        format!("failed to persist temp download file {}", temp_path.display())
+                    })?;
+                    offset = response.body.len() as u64;
+                }
+                status => {
+                    bail!("server rejected resumable download for key={key}: {status}");
+                }
+            }
+        }
+
+        file.sync_all()
+            .with_context(|| format!("failed to flush temp file {}", temp_path.display()))?;
+        place_downloaded_file(temp_path, target_path)?;
+        remove_file_if_exists(state_path)?;
+        Ok(())
+    }
+
     pub async fn load_snapshot_from_server(
         &self,
         prefix: Option<&str>,
@@ -748,72 +1381,13 @@ impl IronMeshClient {
                 chunk_count: None,
             });
         }
-
-        let chunk_upload_url = self.store_chunk_upload_url()?;
-        let complete_url = self.store_complete_url(&key)?;
-        let mut uploaded_total: usize = 0;
-        let mut chunk_refs = Vec::new();
-
-        for chunk in data.chunks(CHUNK_UPLOAD_SIZE_BYTES) {
-            uploaded_total = uploaded_total
-                .checked_add(chunk.len())
-                .context("uploaded byte count overflow")?;
-
-            let response = self
-                .execute_buffered_request(
-                    Method::POST,
-                    chunk_upload_url.clone(),
-                    Vec::new(),
-                    Some(chunk.to_vec()),
-                )
-                .await
-                .with_context(|| format!("failed to upload chunk for key={key}"))?;
-            if !response.status.is_success() {
-                bail!("chunk upload rejected for key={key}: {}", response.status);
-            }
-
-            let uploaded = serde_json::from_slice::<StoreChunkUploadResponse>(&response.body)
-                .with_context(|| format!("failed to parse chunk upload response for {key}"))?;
-
-            chunk_refs.push(CompleteStoreUploadChunkRef {
-                hash: uploaded.hash,
-                size_bytes: uploaded.size_bytes,
-            });
+        let session = self.start_upload_session(&key, length as u64).await?;
+        for (index, chunk) in data.chunks(CHUNK_UPLOAD_SIZE_BYTES).enumerate() {
+            self.upload_session_chunk(&session.upload_id, index, chunk.to_vec())
+                .await?;
         }
-
-        let complete_payload = CompleteStoreUploadRequest {
-            total_size_bytes: uploaded_total,
-            chunks: chunk_refs,
-        };
-
-        let response = self
-            .execute_buffered_request(
-                Method::POST,
-                complete_url,
-                vec![json_content_type_header()],
-                Some(
-                    serde_json::to_vec(&complete_payload)
-                        .context("failed to encode chunked upload completion payload")?,
-                ),
-            )
-            .await
-            .with_context(|| format!("failed to finalize chunked upload for key={key}"))?;
-        if !response.status.is_success() {
-            bail!(
-                "chunked finalize rejected for key={key}: {}",
-                response.status
-            );
-        }
-
-        Ok(UploadResult {
-            meta: StorageObjectMeta {
-                key,
-                size_bytes: complete_payload.total_size_bytes,
-            },
-            upload_mode: UploadMode::Chunked,
-            chunk_size_bytes: Some(CHUNK_UPLOAD_SIZE_BYTES),
-            chunk_count: Some(complete_payload.chunks.len()),
-        })
+        let completed = self.complete_upload_session(&session.upload_id).await?;
+        Ok(upload_result_from_session_complete(&key, &session, &completed))
     }
 
     pub fn put_large_aware_reader(
@@ -851,104 +1425,7 @@ impl IronMeshClient {
 
         eprintln!("using chunked upload for key={key} with length={length} bytes");
 
-        self.put_chunked_reader(key, reader)
-    }
-
-    pub fn put_chunked_reader(
-        &self,
-        key: impl Into<String>,
-        reader: &mut dyn std::io::Read,
-    ) -> Result<UploadResult> {
-        let key = key.into();
-        let chunk_upload_url = self.store_chunk_upload_url()?;
-        let complete_url = self.store_complete_url(&key)?;
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for upload")?;
-
-        let mut uploaded_total: usize = 0;
-        let mut chunk_refs = Vec::new();
-        let mut chunk = vec![0u8; CHUNK_UPLOAD_SIZE_BYTES];
-
-        loop {
-            let read_bytes = reader
-                .read(&mut chunk)
-                .with_context(|| format!("failed reading chunk for key={key}"))?;
-            if read_bytes == 0 {
-                break;
-            }
-
-            uploaded_total = uploaded_total
-                .checked_add(read_bytes)
-                .context("uploaded byte count overflow")?;
-
-            let response = runtime
-                .block_on(self.execute_buffered_request(
-                    Method::POST,
-                    chunk_upload_url.clone(),
-                    Vec::new(),
-                    Some(chunk[..read_bytes].to_vec()),
-                ))
-                .with_context(|| format!("failed to upload chunk for key={key}"))?;
-            if !response.status.is_success() {
-                bail!("chunk upload rejected for key={key}: {}", response.status);
-            }
-
-            let uploaded = serde_json::from_slice::<StoreChunkUploadResponse>(&response.body)
-                .with_context(|| format!("failed to parse chunk upload response for {key}"))?;
-
-            chunk_refs.push(CompleteStoreUploadChunkRef {
-                hash: uploaded.hash,
-                size_bytes: uploaded.size_bytes,
-            });
-        }
-
-        if chunk_refs.is_empty() {
-            let meta = runtime.block_on(self.put(key, Bytes::new()))?;
-            return Ok(UploadResult {
-                meta,
-                upload_mode: UploadMode::Direct,
-                chunk_size_bytes: None,
-                chunk_count: None,
-            });
-        }
-
-        let complete_payload = CompleteStoreUploadRequest {
-            total_size_bytes: uploaded_total,
-            chunks: chunk_refs,
-        };
-
-        let response = runtime
-            .block_on(
-                self.execute_buffered_request(
-                    Method::POST,
-                    complete_url,
-                    vec![json_content_type_header()],
-                    Some(
-                        serde_json::to_vec(&complete_payload)
-                            .context("failed to encode chunked upload completion payload")?,
-                    ),
-                ),
-            )
-            .with_context(|| format!("failed to finalize chunked upload for key={key}"))?;
-        if !response.status.is_success() {
-            bail!(
-                "chunked finalize rejected for key={key}: {}",
-                response.status
-            );
-        }
-
-        Ok(UploadResult {
-            meta: StorageObjectMeta {
-                key,
-                size_bytes: complete_payload.total_size_bytes,
-            },
-            upload_mode: UploadMode::Chunked,
-            chunk_size_bytes: Some(CHUNK_UPLOAD_SIZE_BYTES),
-            chunk_count: Some(complete_payload.chunks.len()),
-        })
+        self.put_sized_reader_via_upload_session(key, reader, length)
     }
 
     pub fn get_with_selector_writer(
@@ -959,58 +1436,11 @@ impl IronMeshClient {
         writer: &mut dyn Write,
     ) -> Result<()> {
         let key = key.as_ref();
-        let mut url = self.store_key_url(key)?;
-        append_optional_query(&mut url, "snapshot", snapshot);
-        append_optional_query(&mut url, "version", version);
-
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed to create runtime for download")?;
-
-        if matches!(self.transport, ClientTransport::Relay(_)) {
-            let payload = runtime
-                .block_on(self.get_with_selector(key, snapshot, version))
-                .with_context(|| format!("failed to GET object key={key}"))?;
-            writer
-                .write_all(payload.as_ref())
-                .with_context(|| format!("failed to write payload chunk for key={key}"))?;
-            writer
-                .flush()
-                .with_context(|| format!("failed to flush output for key={key}"))?;
-            return Ok(());
-        }
-
-        let direct_http = self
-            .direct_http()
-            .ok_or_else(|| anyhow!("direct HTTP transport is unavailable"))?;
-        let request_headers = self.request_auth_headers(&Method::GET, &url)?;
-        let mut response = runtime
-            .block_on(
-                self.apply_headers_to_request(direct_http.get(url.clone()), &request_headers)
-                    .send(),
-            )
-            .with_context(|| format!("failed to GET object key={key}"))?
-            .error_for_status()
-            .with_context(|| format!("object not found or inaccessible key={key}"))?;
-
-        loop {
-            let chunk = runtime
-                .block_on(response.chunk())
-                .with_context(|| format!("failed to read payload chunk for key={key}"))?;
-
-            match chunk {
-                Some(chunk) => writer
-                    .write_all(chunk.as_ref())
-                    .with_context(|| format!("failed to write payload chunk for key={key}"))?,
-                None => break,
-            }
-        }
-
-        writer
-            .flush()
-            .with_context(|| format!("failed to flush output for key={key}"))?;
-        Ok(())
+        runtime.block_on(self.download_with_range_requests(key, snapshot, version, writer))
     }
 
     pub async fn get_object_size(
@@ -1025,30 +1455,41 @@ impl IronMeshClient {
         append_optional_query(&mut url, "version", version);
 
         let response = self
-            .execute_buffered_request(Method::HEAD, url, Vec::new(), None)
-            .await
-            .with_context(|| format!("failed to HEAD object key={key}"))?;
+            .head_object_response(key, snapshot, version)
+            .await?;
 
-        if response.status == StatusCode::METHOD_NOT_ALLOWED {
-            let bytes = self.get_with_selector(key, snapshot, version).await?;
-            return Ok(bytes.len() as u64);
-        }
+        Ok(response.total_size_bytes)
+    }
 
-        if !response.status.is_success() {
-            bail!(
-                "object not found or inaccessible key={key}: {}",
-                response.status
-            );
-        }
+    pub async fn head_object(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<ObjectHeadInfo> {
+        let key = key.as_ref();
+        let response = self.head_object_response(key, snapshot, version).await?;
+        Ok(ObjectHeadInfo {
+            total_size_bytes: response.total_size_bytes,
+            etag: response.etag,
+            accept_ranges: response.accept_ranges,
+        })
+    }
 
-        if let Some(content_length) = buffered_content_length(&response)
-            && content_length > 0
-        {
-            return Ok(content_length);
-        }
-
-        let bytes = self.get_with_selector(key, snapshot, version).await?;
-        Ok(bytes.len() as u64)
+    pub fn head_object_blocking(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<ObjectHeadInfo> {
+        let key = key.as_ref().to_string();
+        let snapshot = snapshot.map(|value| value.to_string());
+        let version = version.map(|value| value.to_string());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for object head request")?;
+        runtime.block_on(self.head_object(&key, snapshot.as_deref(), version.as_deref()))
     }
 
     pub fn get_object_size_blocking(
@@ -1127,21 +1568,6 @@ impl IronMeshClient {
         Ok(url)
     }
 
-    fn store_chunk_upload_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
-
-        {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| anyhow!("server URL cannot be a base"))?;
-            segments.push("store-chunks");
-            segments.push("upload");
-        }
-
-        Ok(url)
-    }
-
     fn store_rename_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(self.server_base_url())
             .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
@@ -1187,7 +1613,7 @@ impl IronMeshClient {
         Ok(url)
     }
 
-    fn store_complete_url(&self, key: &str) -> Result<Url> {
+    fn store_upload_session_start_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(self.server_base_url())
             .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
 
@@ -1196,9 +1622,60 @@ impl IronMeshClient {
                 .path_segments_mut()
                 .map_err(|_| anyhow!("server URL cannot be a base"))?;
             segments.push("store");
-            segments.push(key);
+            segments.push("uploads");
+            segments.push("start");
         }
-        url.query_pairs_mut().append_pair("complete", "");
+
+        Ok(url)
+    }
+
+    fn store_upload_session_url(&self, upload_id: &str) -> Result<Url> {
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("uploads");
+            segments.push(upload_id);
+        }
+
+        Ok(url)
+    }
+
+    fn store_upload_session_chunk_url(&self, upload_id: &str, index: usize) -> Result<Url> {
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("uploads");
+            segments.push(upload_id);
+            segments.push("chunk");
+            segments.push(&index.to_string());
+        }
+
+        Ok(url)
+    }
+
+    fn store_upload_session_complete_url(&self, upload_id: &str) -> Result<Url> {
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("uploads");
+            segments.push(upload_id);
+            segments.push("complete");
+        }
 
         Ok(url)
     }
@@ -1223,20 +1700,155 @@ fn buffered_response_from_relay(response: RelayHttpResponse) -> Result<BufferedT
     })
 }
 
-fn buffered_content_length(response: &BufferedTransportResponse) -> Option<u64> {
-    response
-        .headers
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .or(Some(response.body.len() as u64))
-}
-
 fn json_content_type_header() -> RelayHttpHeader {
     RelayHttpHeader {
         name: "content-type".to_string(),
         value: "application/json".to_string(),
     }
+}
+
+fn range_header(start: u64, end_inclusive: u64) -> RelayHttpHeader {
+    RelayHttpHeader {
+        name: RANGE.as_str().to_string(),
+        value: format!("bytes={start}-{end_inclusive}"),
+    }
+}
+
+fn simple_header(name: HeaderName, value: &str) -> Result<RelayHttpHeader> {
+    let header_value =
+        HeaderValue::from_str(value).with_context(|| format!("invalid header value for {name}"))?;
+    Ok(RelayHttpHeader {
+        name: name.as_str().to_string(),
+        value: header_value
+            .to_str()
+            .context("header value must be valid utf-8")?
+            .to_string(),
+    })
+}
+
+fn expected_chunk_size(
+    total_size_bytes: u64,
+    chunk_size_bytes: usize,
+    chunk_count: usize,
+    index: usize,
+) -> Option<usize> {
+    if index >= chunk_count {
+        return None;
+    }
+    if total_size_bytes == 0 {
+        return Some(0);
+    }
+    if index + 1 == chunk_count {
+        let remainder = total_size_bytes as usize % chunk_size_bytes;
+        return Some(if remainder == 0 {
+            chunk_size_bytes
+        } else {
+            remainder
+        });
+    }
+    Some(chunk_size_bytes)
+}
+
+fn upload_result_from_session_complete(
+    key: &str,
+    session: &UploadSessionView,
+    completed: &UploadSessionCompleteResponse,
+) -> UploadResult {
+    let _ = (
+        &completed.snapshot_id,
+        &completed.version_id,
+        &completed.manifest_hash,
+        &completed.state,
+        completed.new_chunks,
+        completed.dedup_reused_chunks,
+        completed.created_new_version,
+    );
+    UploadResult {
+        meta: StorageObjectMeta {
+            key: key.to_string(),
+            size_bytes: completed.total_size_bytes as usize,
+        },
+        upload_mode: UploadMode::Chunked,
+        chunk_size_bytes: Some(session.chunk_size_bytes),
+        chunk_count: Some(session.chunk_count),
+    }
+}
+
+fn load_json_file<T>(path: &Path) -> Result<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    match fs::read(path) {
+        Ok(payload) => serde_json::from_slice(&payload)
+            .with_context(|| format!("failed to parse {}", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn persist_json_file_atomic<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let payload = serde_json::to_vec_pretty(value)
+        .with_context(|| format!("failed to encode {}", path.display()))?;
+    let temp_path = path.with_extension(format!(
+        "{}tmp",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| format!("{value}."))
+            .unwrap_or_default()
+    ));
+    fs::write(&temp_path, payload)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to place transfer state {} into {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn place_downloaded_file(temp_path: &Path, target_path: &Path) -> Result<()> {
+    match fs::remove_file(target_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to replace {}", target_path.display()));
+        }
+    }
+    fs::rename(temp_path, target_path).with_context(|| {
+        format!(
+            "failed to place downloaded file {} into {}",
+            temp_path.display(),
+            target_path.display()
+        )
+    })
+}
+
+fn file_modified_unix_ms(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis())
+        .unwrap_or(0)
 }
 
 pub fn normalize_server_base_url(input: &str) -> Result<Url> {

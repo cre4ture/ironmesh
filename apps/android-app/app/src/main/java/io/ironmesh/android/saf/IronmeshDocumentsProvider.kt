@@ -14,6 +14,8 @@ import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
 import kotlinx.coroutines.runBlocking
+import java.io.File
+import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -144,16 +146,41 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             val writeSide = pipe[1]
 
             Thread {
-                ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
-                    runBlocking {
-                        repository.streamPutObject(
-                            resolveConnectionInput(),
-                            target.path,
-                            input,
-                            resolveServerCaPem(),
-                            resolveClientIdentityJson(),
-                        )
+                val appContext = context
+                val cacheDir = appContext?.cacheDir
+                if (cacheDir == null) {
+                    Log.e(TAG, "Missing application context for SAF upload staging")
+                    readSide.close()
+                    return@Thread
+                }
+
+                val stagedFile = File.createTempFile("ironmesh-upload-", ".bin", cacheDir)
+                try {
+                    ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
+                        stagedFile.outputStream().use { stagedOutput ->
+                            input.copyTo(stagedOutput)
+                            stagedOutput.flush()
+                        }
                     }
+
+                    FileInputStream(stagedFile).use { stagedInput ->
+                        runBlocking {
+                            repository.streamPutObject(
+                                resolveConnectionInput(),
+                                target.path,
+                                stagedInput,
+                                stagedFile.length(),
+                                resolveServerCaPem(),
+                                resolveClientIdentityJson(),
+                            )
+                        }
+                    }
+                } catch (e: IOException) {
+                    Log.w(TAG, "Client closed upload pipe: ${e.message}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error staging SAF upload", e)
+                } finally {
+                    stagedFile.delete()
                 }
             }.start()
 

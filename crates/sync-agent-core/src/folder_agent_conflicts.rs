@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::{
     PathScope, StartupStateStore, absolute_path, build_configured_client, conflict_copy_dir,
     copy_file_atomically, current_unix_ms, delete_conflict_copies, local_entry_state_for_path,
-    newest_remote_conflict_copy, normalize_relative_path,
+    newest_remote_conflict_copy, normalize_relative_path, upload_transfer_state_path,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
@@ -199,22 +199,21 @@ pub fn upload_local_file(
     client: &IronMeshClient,
     scope: &PathScope,
     relative_path: &str,
-    size_bytes: u64,
+    _size_bytes: u64,
 ) -> Result<String> {
     let absolute = absolute_path(root_dir, relative_path);
-    let mut file = File::open(&absolute)
-        .with_context(|| format!("failed to open local file {}", absolute.display()))?;
+    let content_hash = file_content_hash(&absolute)?;
 
     let remote_key = scope.local_to_remote(relative_path).ok_or_else(|| {
         anyhow::anyhow!("refusing to upload local root without concrete scoped path")
     })?;
+    let state_path = upload_transfer_state_path(root_dir, &remote_key);
 
-    let mut hashing_reader = HashingReader::new(&mut file);
     client
-        .put_large_aware_reader(remote_key.clone(), &mut hashing_reader, size_bytes)
+        .put_file_resumable(remote_key.clone(), &absolute, &state_path)
         .with_context(|| format!("failed to upload local file {relative_path} to {remote_key}"))?;
 
-    Ok(hashing_reader.content_hash_hex())
+    Ok(content_hash)
 }
 
 pub fn delete_remote_file(
@@ -284,6 +283,22 @@ impl<R: Read> Read for HashingReader<R> {
         }
         Ok(read)
     }
+}
+
+fn file_content_hash(path: &Path) -> Result<String> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open local file {}", path.display()))?;
+    let mut reader = HashingReader::new(file);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash local file {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+    }
+    Ok(reader.content_hash_hex())
 }
 
 fn preserve_local_conflict_copy(
