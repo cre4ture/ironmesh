@@ -6,7 +6,7 @@ use crate::close_upload::{
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
@@ -319,13 +319,15 @@ pub fn hresult_to_result(hr: i32, operation: &str) -> anyhow::Result<()> {
 }
 use std::ffi::c_void;
 
-use std::mem::{size_of, zeroed};
+use std::mem::size_of;
 
 use std::path::Path;
 use std::ptr::null;
 
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
+use wincs::{HydrationType, PopulationType, Registration, SecurityId, SyncRootId, SyncRootIdBuilder};
+use widestring::U16String;
 
 pub struct SyncRootConnection {
     connection_key: CF_CONNECTION_KEY,
@@ -359,54 +361,33 @@ struct CallbackContext {
 pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
     validate_registration(registration)?;
     std::fs::create_dir_all(&registration.root_path)?;
+    if let Ok(existing_sync_root_id) = SyncRootId::from_path(&registration.root_path) {
+        let _ = existing_sync_root_id.unregister();
+    }
 
-    let root_path = utf16_path(&registration.root_path);
-    let provider_name = utf16_string(&registration.display_name);
-    let provider_version = utf16_string("0.1.0");
-    let sync_root_identity = registration.sync_root_id.as_bytes();
+    let sync_root_id = build_shell_sync_root_id(registration)?;
+    let display_name = U16String::from_str(&registration.display_name);
+    let provider_version = U16String::from_str(env!("CARGO_PKG_VERSION"));
+    let icon_resource = current_executable_icon_resource()?;
 
-    let registration_desc = CF_SYNC_REGISTRATION {
-        StructSize: size_of::<CF_SYNC_REGISTRATION>() as u32,
-        ProviderName: provider_name.as_ptr(),
-        ProviderVersion: provider_version.as_ptr(),
-        SyncRootIdentity: sync_root_identity.as_ptr().cast::<c_void>(),
-        SyncRootIdentityLength: sync_root_identity.len() as u32,
-        FileIdentity: sync_root_identity.as_ptr().cast::<c_void>(),
-        FileIdentityLength: sync_root_identity.len() as u32,
-        ProviderId: unsafe { zeroed() },
-    };
-
-    let policies = CF_SYNC_POLICIES {
-        StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
-        Hydration: CF_HYDRATION_POLICY {
-            Primary: CF_HYDRATION_POLICY_PROGRESSIVE,
-            Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
-        },
-        Population: CF_POPULATION_POLICY {
-            Primary: CF_POPULATION_POLICY_FULL,
-            Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
-        },
-        InSync: CF_INSYNC_POLICY_NONE,
-        HardLink: CF_HARDLINK_POLICY_NONE,
-        PlaceholderManagement: CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT,
-    };
-
-    let hr = unsafe {
-        CfRegisterSyncRoot(
-            root_path.as_ptr(),
-            &registration_desc,
-            &policies,
-            CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT | CF_REGISTER_FLAG_UPDATE,
-        )
-    };
-
-    hresult_to_result(hr, "CfRegisterSyncRoot")
+    Registration::from_sync_root_id(&sync_root_id)
+        .display_name(display_name.as_ref())
+        .icon(icon_resource, 0)
+        .version(provider_version.as_ref())
+        .hydration_type(HydrationType::Progressive)
+        .population_type(PopulationType::Full)
+        .allow_pinning()
+        .show_siblings_as_group()
+        .register(&registration.root_path)
+        .map_err(|error| anyhow!("failed to register sync root with Explorer shell: {error}"))
 }
 
 pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
-    let root_path_utf16 = utf16_path(root_path);
-    let hr = unsafe { CfUnregisterSyncRoot(root_path_utf16.as_ptr()) };
-    hresult_to_result(hr, "CfUnregisterSyncRoot")
+    let sync_root_id = SyncRootId::from_path(root_path)
+        .map_err(|error| anyhow!("failed to resolve sync root registration for {}: {error}", root_path.display()))?;
+    sync_root_id
+        .unregister()
+        .map_err(|error| anyhow!("failed to unregister sync root {}: {error}", root_path.display()))
 }
 
 fn parse_size_from_remote_version(remote_version: &str) -> Option<i64> {
@@ -1005,6 +986,19 @@ fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
         return Err(anyhow!("root path cannot be empty"));
     }
     Ok(())
+}
+
+fn build_shell_sync_root_id(registration: &SyncRootRegistration) -> Result<SyncRootId> {
+    SyncRootIdBuilder::new(U16String::from_str("Ironmesh"))
+        .user_security_id(SecurityId::current_user().context("failed to resolve current Windows security id")?)
+        .account_name(U16String::from_str(&registration.sync_root_id))
+        .build()
+        .map_err(|error| anyhow!("failed to build shell sync root id: {error}"))
+}
+
+fn current_executable_icon_resource() -> Result<U16String> {
+    let current_executable = std::env::current_exe().context("failed to resolve current executable path for icon resource")?;
+    Ok(U16String::from_os_str(current_executable.as_os_str()))
 }
 
 #[cfg(test)]

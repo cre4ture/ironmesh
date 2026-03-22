@@ -18,6 +18,8 @@ reqwest = { workspace = true, default-features = false, features = ["blocking", 
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+widestring = "1.1"
+wincs = "0.1"
 windows-sys = { version = "0.61", features = [
 	"Win32_Foundation",
 	"Win32_Storage_CloudFilters",
