@@ -62,6 +62,13 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await thumbnailsPerRowInput.click();
   await page.getByRole("option", { name: "4 per row" }).click();
   await expect(thumbnailsPerRowInput).toHaveValue("4 per row");
+  await page.getByText("Cluster", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "Thumbnails per row" })).toHaveValue("4 per row");
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "Thumbnails per row" })).toHaveValue("4 per row");
   await page.getByText("gallery/cat.png", { exact: true }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();

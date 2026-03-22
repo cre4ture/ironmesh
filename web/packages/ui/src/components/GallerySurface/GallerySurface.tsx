@@ -31,6 +31,7 @@ import { JsonBlock } from "../JsonBlock/JsonBlock";
 type GallerySortOrder = "captured_desc" | "path_asc";
 
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
+const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "ironmesh.gallery.thumbnails_per_row";
 
 export type GallerySnapshot = {
   id: string;
@@ -97,7 +98,7 @@ export function GallerySurface({
 }: GallerySurfaceProps) {
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(4);
-  const [thumbnailsPerRow, setThumbnailsPerRow] = useState(3);
+  const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<GalleryPayload | null>(null);
@@ -113,6 +114,10 @@ export function GallerySurface({
   useEffect(() => {
     void refreshEntries();
   }, [loadEntries]);
+
+  useEffect(() => {
+    persistThumbnailsPerRow(thumbnailsPerRow);
+  }, [thumbnailsPerRow]);
 
   const imageEntries = sortGalleryEntries(
     (entriesPayload?.entries ?? []).filter(isGalleryImageEntry),
@@ -293,10 +298,7 @@ export function GallerySurface({
                 ]}
                 value={String(thumbnailsPerRow)}
                 onChange={(value) => {
-                  const parsed = Number(value);
-                  setThumbnailsPerRow(
-                    Number.isFinite(parsed) && parsed >= 1 && parsed <= 6 ? parsed : 3
-                  );
+                  setThumbnailsPerRow(parseThumbnailsPerRow(value));
                 }}
               />
               <Group gap="sm">
@@ -974,6 +976,30 @@ function normalizeGalleryPrefix(path: string): string {
     return "";
   }
   return `${trimmed.replace(/\/+$/, "")}/`;
+}
+
+function loadStoredThumbnailsPerRow(): number {
+  if (typeof window === "undefined") {
+    return 3;
+  }
+
+  return parseThumbnailsPerRow(window.localStorage.getItem(GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY));
+}
+
+function persistThumbnailsPerRow(value: number) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(
+    GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY,
+    String(parseThumbnailsPerRow(value))
+  );
+}
+
+function parseThumbnailsPerRow(value: string | number | null | undefined): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) && parsed >= 1 && parsed <= 6 ? parsed : 3;
 }
 
 function formatTakenAt(value: number): string {
