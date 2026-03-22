@@ -7,11 +7,12 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   await expect(page.getByRole("banner").getByText("cli-client-web", { exact: true })).toBeVisible();
-  await expect(page.getByRole("banner").getByText("UI v0.1.0", { exact: true })).toBeVisible();
-  await expect(page.getByRole("banner").getByText("Backend v0.1.0", { exact: true })).toBeVisible();
   await expect(page.getByText("Transport-aware", { exact: true })).toBeVisible();
+  await expect(page.getByText("Version info", { exact: true })).toBeVisible();
+  await expect(page.getByText(/UI build:\s*0\.1\.0 \(/)).toBeVisible();
+  await expect(page.getByText("Backend build: 0.1.0 (v0.1.0-3-gmocked)")).toBeVisible();
   await expect(page.getByText("Active route")).toBeVisible();
-  await expect(page.getByText("Direct")).toBeVisible();
+  await expect(page.getByText("Direct", { exact: true })).toBeVisible();
   await expect(page.getByText("node-alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("https://node-alpha.local", { exact: true })).toBeVisible();
 

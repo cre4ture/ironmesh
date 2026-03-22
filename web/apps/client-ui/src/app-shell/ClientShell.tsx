@@ -60,7 +60,7 @@ import {
   type StoreListResponse,
   type VersionGraphResponse
 } from "@ironmesh/api";
-import { ironmeshUiVersion, ironmeshUiVersionLabel } from "@ironmesh/config";
+import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { GalleryPage } from "../pages/GalleryPage";
 
@@ -175,14 +175,6 @@ export function ClientShell() {
             </Group>
             <Group gap="sm">
               {ping ? <Badge variant="light">{ping.service}</Badge> : null}
-              <Badge variant="outline">UI {ironmeshUiVersionLabel}</Badge>
-              <Badge
-                color={ping?.backend_version && ping.backend_version !== ironmeshUiVersion ? "red" : "gray"}
-                variant="outline"
-                title={ping?.backend_revision ?? undefined}
-              >
-                {ping?.backend_version ? `Backend v${ping.backend_version}` : "Backend unknown"}
-              </Badge>
               <Badge color="teal" variant="filled">
                 Transport-aware
               </Badge>
@@ -274,6 +266,7 @@ function OverviewPage({
   const replicationFactor = getNestedNumber(clusterStatus, "policy", "replication_factor");
   const runtimeMode = typeof health?.mode === "string" ? health.mode : "runtime";
   const connectionSummary = summarizeClientConnection(connectionStatus);
+  const versionMismatch = Boolean(ping?.backend_version) && ping?.backend_version !== ironmeshUiVersion;
 
   return (
     <>
@@ -319,6 +312,28 @@ function OverviewPage({
               <Text c="dimmed" size="sm">
                 This web UI runs on top of the same transport-aware Rust client used by desktop, Android, and CLI flows.
               </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 6 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>Version info</Text>
+              <Text size="sm">
+                UI build: <Code>{formatFullVersion(ironmeshUiVersion, ironmeshUiRevision)}</Code>
+              </Text>
+              <Text size="sm">
+                Backend build: <Code>{formatFullVersion(ping?.backend_version, ping?.backend_revision)}</Code>
+              </Text>
+              {versionMismatch ? (
+                <Alert color="yellow" variant="light">
+                  The bundled UI version does not match the connected backend version.
+                </Alert>
+              ) : (
+                <Text size="sm" c="dimmed">
+                  UI and backend build details are shown here directly for easier diagnostics.
+                </Text>
+              )}
             </Stack>
           </Card>
         </Grid.Col>
@@ -1288,6 +1303,16 @@ function summarizeClientConnection(connection: ClientRendezvousView | null): {
       ? "Requests are currently going straight to the selected server node."
       : "This session is on a direct path, but the originating direct endpoint is not available."
   };
+}
+
+function formatFullVersion(version: string | null | undefined, revision: string | null | undefined): string {
+  if (!version && !revision) {
+    return "unknown";
+  }
+  if (version && revision) {
+    return `${version} (${revision})`;
+  }
+  return version ?? revision ?? "unknown";
 }
 
 function formatExplorerModifiedAt(value: number | null | undefined): string {

@@ -2,6 +2,7 @@ import {
   getClusterNodes,
   getRendezvousConfig,
   getClusterSummary,
+  getServerHealth,
   getRecentLogs,
   getReplicationPlan,
   triggerReplicationRepair,
@@ -9,8 +10,10 @@ import {
   type LogsResponse,
   type NodeDescriptor,
   type RendezvousConfigView,
-  type ReplicationPlan
+  type ReplicationPlan,
+  type ServerHealthResponse
 } from "@ironmesh/api";
+import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
 import {
   Alert,
   Badge,
@@ -38,6 +41,7 @@ export function DashboardPage() {
   const [replicationPlan, setReplicationPlan] = useState<ReplicationPlan | null>(null);
   const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
   const [logs, setLogs] = useState<LogsResponse | null>(null);
+  const [backendHealth, setBackendHealth] = useState<ServerHealthResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [repairResult, setRepairResult] = useState<Record<string, unknown> | null>(null);
@@ -49,16 +53,18 @@ export function DashboardPage() {
     setLoading(true);
     setError(null);
     try {
-      const [summary, nodeList, plan, recentLogs] = await Promise.all([
+      const [summary, nodeList, plan, recentLogs, health] = await Promise.all([
         getClusterSummary(),
         getClusterNodes(),
         getReplicationPlan(),
-        getRecentLogs(120)
+        getRecentLogs(120),
+        getServerHealth()
       ]);
       setClusterSummary(summary);
       setNodes(nodeList);
       setReplicationPlan(plan);
       setLogs(recentLogs);
+      setBackendHealth(health);
       if (canInspectRendezvous) {
         try {
           setRendezvousConfig(await getRendezvousConfig(adminTokenOverride));
@@ -98,6 +104,7 @@ export function DashboardPage() {
     : null;
   const connectedRendezvousEndpoints =
     rendezvousConfig?.endpoint_registrations.filter((endpoint) => endpoint.status === "connected") ?? [];
+  const versionMismatch = Boolean(backendHealth?.version) && backendHealth?.version !== ironmeshUiVersion;
 
   return (
     <Stack gap="lg">
@@ -193,6 +200,28 @@ export function DashboardPage() {
               <Text size="sm" c="dimmed">
                 The admin UI itself is served directly by this node.
               </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, xl: 6 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>Version info</Text>
+              <Text size="sm">
+                UI build: <Code>{formatFullVersion(ironmeshUiVersion, ironmeshUiRevision)}</Code>
+              </Text>
+              <Text size="sm">
+                Backend build: <Code>{formatFullVersion(backendHealth?.version, backendHealth?.revision)}</Code>
+              </Text>
+              {versionMismatch ? (
+                <Alert color="yellow" variant="light">
+                  The bundled server-admin UI version does not match the running backend version.
+                </Alert>
+              ) : (
+                <Text size="sm" c="dimmed">
+                  UI and backend build details are shown here directly for easier operator diagnostics.
+                </Text>
+              )}
             </Stack>
           </Card>
         </Grid.Col>
@@ -324,4 +353,14 @@ export function DashboardPage() {
       </Grid>
     </Stack>
   );
+}
+
+function formatFullVersion(version: string | null | undefined, revision: string | null | undefined): string {
+  if (!version && !revision) {
+    return "unknown";
+  }
+  if (version && revision) {
+    return `${version} (${revision})`;
+  }
+  return version ?? revision ?? "unknown";
 }
