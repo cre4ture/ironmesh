@@ -4,11 +4,10 @@
 mod tests {
     use crate::framework::{
         ChildGuard, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
-        issue_bootstrap_bundle_and_enroll_client, register_node, start_authenticated_server,
-        lock_test_resources, path_resource_key, start_open_server_with_env,
+        issue_bootstrap_bundle_and_enroll_client, lock_test_resources, path_resource_key,
+        register_node, start_authenticated_server, start_open_server_with_env,
         start_rendezvous_service, stop_server, wait_for_online_nodes,
-        wait_for_rendezvous_registered_endpoints, wait_for_store_index_entry,
-        wait_for_url_status,
+        wait_for_rendezvous_registered_endpoints, wait_for_store_index_entry, wait_for_url_status,
     };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
@@ -114,9 +113,11 @@ mod tests {
     ) -> Result<ChildGuard> {
         let os_integration_bin = binary_path("os-integration")?;
         let mountpoint_arg = mountpoint.to_string_lossy().to_string();
-        let resource_guards =
-            lock_test_resources(["linux-fuse-adapter".to_string(), path_resource_key(mountpoint)])
-                .await;
+        let resource_guards = lock_test_resources([
+            "linux-fuse-adapter".to_string(),
+            path_resource_key(mountpoint),
+        ])
+        .await;
 
         let mut command = Command::new(os_integration_bin);
         connection.apply_to_command(&mut command);

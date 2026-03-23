@@ -324,10 +324,12 @@ use std::mem::size_of;
 use std::path::Path;
 use std::ptr::null;
 
+use widestring::U16String;
+use wincs::{
+    HydrationType, PopulationType, Registration, SecurityId, SyncRootId, SyncRootIdBuilder,
+};
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
-use wincs::{HydrationType, PopulationType, Registration, SecurityId, SyncRootId, SyncRootIdBuilder};
-use widestring::U16String;
 
 pub struct SyncRootConnection {
     connection_key: CF_CONNECTION_KEY,
@@ -386,11 +388,18 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
 }
 
 pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
-    let sync_root_id = SyncRootId::from_path(root_path)
-        .map_err(|error| anyhow!("failed to resolve sync root registration for {}: {error}", root_path.display()))?;
-    sync_root_id
-        .unregister()
-        .map_err(|error| anyhow!("failed to unregister sync root {}: {error}", root_path.display()))
+    let sync_root_id = SyncRootId::from_path(root_path).map_err(|error| {
+        anyhow!(
+            "failed to resolve sync root registration for {}: {error}",
+            root_path.display()
+        )
+    })?;
+    sync_root_id.unregister().map_err(|error| {
+        anyhow!(
+            "failed to unregister sync root {}: {error}",
+            root_path.display()
+        )
+    })
 }
 
 fn parse_size_from_remote_version(remote_version: &str) -> Option<i64> {
@@ -993,14 +1002,17 @@ fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
 
 fn build_shell_sync_root_id(registration: &SyncRootRegistration) -> Result<SyncRootId> {
     SyncRootIdBuilder::new(U16String::from_str("Ironmesh"))
-        .user_security_id(SecurityId::current_user().context("failed to resolve current Windows security id")?)
+        .user_security_id(
+            SecurityId::current_user().context("failed to resolve current Windows security id")?,
+        )
         .account_name(U16String::from_str(&registration.sync_root_id))
         .build()
         .map_err(|error| anyhow!("failed to build shell sync root id: {error}"))
 }
 
 fn current_executable_icon_resource() -> Result<U16String> {
-    let current_executable = std::env::current_exe().context("failed to resolve current executable path for icon resource")?;
+    let current_executable = std::env::current_exe()
+        .context("failed to resolve current executable path for icon resource")?;
     Ok(U16String::from_os_str(current_executable.as_os_str()))
 }
 

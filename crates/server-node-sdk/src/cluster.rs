@@ -290,7 +290,10 @@ impl ClusterService {
             .entry(key.clone())
             .or_default()
             .insert(node_id);
-        self.available_by_key.entry(key).or_default().insert(node_id);
+        self.available_by_key
+            .entry(key)
+            .or_default()
+            .insert(node_id);
     }
 
     pub fn replace_node_available_view(&mut self, node_id: NodeId, subjects: &[String]) -> bool {

@@ -813,5 +813,4 @@ mod tests {
         stop_server(&mut server).await;
         Ok(())
     }
-
 }
