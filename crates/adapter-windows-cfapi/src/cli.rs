@@ -117,6 +117,7 @@ pub fn cli_main() -> anyhow::Result<()> {
         Commands::Serve(args) => {
             let registration =
                 SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
+            register_sync_root(&registration)?;
 
             let connection = resolve_connection_config(
                 &registration.root_path,

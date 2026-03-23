@@ -375,7 +375,10 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
         .icon(icon_resource, 0)
         .version(provider_version.as_ref())
         .hydration_type(HydrationType::Progressive)
-        .population_type(PopulationType::Full)
+        // The current adapter eagerly materializes the full namespace and does not
+        // implement on-demand FETCH_PLACEHOLDERS callbacks, so Explorer must treat
+        // the sync root as fully populated.
+        .population_type(PopulationType::AlwaysFull)
         .allow_pinning()
         .show_siblings_as_group()
         .register(&registration.root_path)

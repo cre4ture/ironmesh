@@ -4,7 +4,9 @@ use crate::adapter::WindowsCfapiAdapter;
 use crate::auth::{ClientEnrollmentOptions, resolve_or_enroll_client_identity};
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
 use crate::live::ServerNodeHydrator;
-use crate::runtime::{CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root};
+use crate::runtime::{
+    CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root, register_sync_root,
+};
 use clap::Parser;
 use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
 use std::path::PathBuf;
@@ -50,6 +52,7 @@ pub fn serve_main() -> anyhow::Result<()> {
     let args = Args::parse();
     let registration =
         SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
+    register_sync_root(&registration)?;
 
     let connection = resolve_connection_config(
         &registration.root_path,
