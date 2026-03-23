@@ -385,22 +385,31 @@ fn filter_refresh_action_plan(plan: FuseActionPlan, changed_paths: &[String]) ->
     }
 
     let mut planned_paths = std::collections::HashSet::new();
-    let mut actions: Vec<FuseAction> = plan
-        .actions
-        .into_iter()
-        .filter(|action| {
-            let path = match action {
-                FuseAction::EnsureDirectory { path }
-                | FuseAction::EnsurePlaceholder { path, .. }
-                | FuseAction::HydrateOnRead { path, .. }
-                | FuseAction::UploadOnFlush { path, .. }
-                | FuseAction::MarkConflict { path, .. }
-                | FuseAction::RemovePath { path } => path,
-            };
+    let mut actions = Vec::new();
+
+    for action in plan.actions {
+        let (path, keeps_remote_presence) = match &action {
+            FuseAction::EnsureDirectory { path }
+            | FuseAction::EnsurePlaceholder { path, .. }
+            | FuseAction::HydrateOnRead { path, .. }
+            | FuseAction::MarkConflict { path, .. }
+            | FuseAction::RemovePath { path } => (path, true),
+            FuseAction::UploadOnFlush { path, .. } => {
+                // Remote refresh is authoritative for missing remote paths. A local-only upload
+                // action here means the path disappeared remotely, so it must not suppress the
+                // synthetic RemovePath we emit below.
+                (path, false)
+            }
+        };
+
+        if keeps_remote_presence {
             planned_paths.insert(path.clone());
-            changed.contains(path.as_str())
-        })
-        .collect();
+        }
+
+        if changed.contains(path.as_str()) && keeps_remote_presence {
+            actions.push(action);
+        }
+    }
 
     for path in changed_paths {
         if planned_paths.contains(path) {
@@ -574,6 +583,45 @@ mod tests {
             vec![
                 FuseAction::EnsurePlaceholder {
                     path: "docs/new.txt".to_string(),
+                    remote_version: "v2".to_string(),
+                    remote_size: Some(14),
+                },
+                FuseAction::RemovePath {
+                    path: "docs/old.txt".to_string(),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn filter_refresh_action_plan_treats_upload_only_paths_as_removed() {
+        let plan = FuseActionPlan {
+            actions: vec![
+                FuseAction::UploadOnFlush {
+                    path: "docs/old.txt".to_string(),
+                    local_version: Some("v1".to_string()),
+                },
+                FuseAction::EnsureDirectory {
+                    path: "docs/sub".to_string(),
+                },
+                FuseAction::EnsurePlaceholder {
+                    path: "docs/sub/new.txt".to_string(),
+                    remote_version: "v2".to_string(),
+                    remote_size: Some(14),
+                },
+            ],
+        };
+
+        let filtered = filter_refresh_action_plan(
+            plan,
+            &["docs/old.txt".to_string(), "docs/sub/new.txt".to_string()],
+        );
+
+        assert_eq!(
+            filtered.actions,
+            vec![
+                FuseAction::EnsurePlaceholder {
+                    path: "docs/sub/new.txt".to_string(),
                     remote_version: "v2".to_string(),
                     remote_size: Some(14),
                 },

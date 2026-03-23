@@ -33,6 +33,9 @@ pub(crate) async fn execute_replication_repair_inner(
     batch_size_override: Option<usize>,
 ) -> ReplicationRepairReport {
     sync_availability_views_once(state).await;
+    if state.local_edge_mode {
+        sync_cluster_metadata_once(state).await;
+    }
     let keys = planning_replication_subjects(state).await;
 
     let (plan, nodes) = {
