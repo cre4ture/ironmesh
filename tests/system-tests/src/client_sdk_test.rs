@@ -774,4 +774,44 @@ mod tests {
         stop_server(&mut server).await;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn ironmesh_client_staged_writer_download_roundtrip() -> Result<()> {
+        let bind = "127.0.0.1:19240";
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "staged-writer-download-server",
+            "staged-writer-download-client",
+        )
+        .await?;
+        let working_dir = fresh_data_dir("staged-writer-download-work");
+        fs::create_dir_all(&working_dir)?;
+
+        let sdk = enrolled.build_client_async().await?;
+        let payload = vec![b'S'; (CHUNK_UPLOAD_THRESHOLD_BYTES * 2) + 211];
+        sdk.put_large_aware("staged-writer/file.bin", Bytes::from(payload.clone()))
+            .await?;
+
+        let staged_client = sdk.clone();
+        let working_dir_clone = working_dir.clone();
+        let downloaded = tokio::task::spawn_blocking(move || {
+            let mut buffer = Vec::new();
+            staged_client.download_to_writer_resumable_staged(
+                "staged-writer/file.bin",
+                None,
+                None,
+                &mut buffer,
+                &working_dir_clone,
+            )?;
+            Ok::<Vec<u8>, anyhow::Error>(buffer)
+        })
+        .await
+        .context("staged writer download task join failed")??;
+
+        assert_eq!(downloaded, payload);
+
+        stop_server(&mut server).await;
+        Ok(())
+    }
+
 }

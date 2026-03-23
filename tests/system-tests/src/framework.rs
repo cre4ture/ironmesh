@@ -4,18 +4,73 @@ use client_sdk::{
     ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, enroll_connection_input_blocking,
 };
 use reqwest::StatusCode;
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::process::{Child, Command};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::sleep;
 use uuid::Uuid;
 
 pub const TEST_ADMIN_TOKEN: &str = "system-test-admin";
+
+type ResourceMutex = Arc<AsyncMutex<()>>;
+
+static TEST_RESOURCE_REGISTRY: OnceLock<Mutex<BTreeMap<String, ResourceMutex>>> = OnceLock::new();
+
+fn test_resource_registry() -> &'static Mutex<BTreeMap<String, ResourceMutex>> {
+    TEST_RESOURCE_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn resource_mutex_for_key(key: &str) -> ResourceMutex {
+    let mut registry = test_resource_registry()
+        .lock()
+        .expect("test resource registry lock poisoned");
+    registry
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+#[derive(Debug)]
+pub struct TestResourceGuard {
+    _key: String,
+    _guard: OwnedMutexGuard<()>,
+}
+
+pub async fn lock_test_resources<I, S>(keys: I) -> Vec<TestResourceGuard>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut ordered = keys.into_iter().map(Into::into).collect::<Vec<_>>();
+    ordered.sort();
+    ordered.dedup();
+
+    let mut guards = Vec::with_capacity(ordered.len());
+    for key in ordered {
+        let mutex = resource_mutex_for_key(&key);
+        let guard = mutex.lock_owned().await;
+        guards.push(TestResourceGuard {
+            _key: key,
+            _guard: guard,
+        });
+    }
+    guards
+}
+
+pub fn tcp_resource_key(bind: &str) -> String {
+    format!("tcp:{bind}")
+}
+
+pub fn path_resource_key(path: &Path) -> String {
+    format!("path:{}", path.display())
+}
 
 #[derive(Debug, Clone)]
 pub struct EnrolledTestClient {
@@ -208,11 +263,15 @@ pub fn insecure_https_client() -> Result<reqwest::Client> {
 
 pub struct ChildGuard {
     child: Option<Child>,
+    _resource_guards: Vec<TestResourceGuard>,
 }
 
 impl ChildGuard {
-    pub fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+    pub fn with_resources(child: Child, resource_guards: Vec<TestResourceGuard>) -> Self {
+        Self {
+            child: Some(child),
+            _resource_guards: resource_guards,
+        }
     }
 
     pub async fn stop(&mut self) -> Result<()> {
@@ -224,6 +283,7 @@ impl ChildGuard {
                 .context("failed to wait for child process to exit")?;
             self.child = None;
         }
+        self._resource_guards.clear();
         Ok(())
     }
 }
@@ -290,6 +350,11 @@ pub async fn start_authenticated_server_with_env_options(
 pub async fn start_zero_touch_server(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
     let server_bin = binary_path("server-node")?;
     fs::create_dir_all(data_dir).context("failed creating zero-touch data dir")?;
+    let resource_guards = lock_test_resources([
+        tcp_resource_key(bind),
+        tcp_resource_key(&internal_bind_from_public_bind(bind)?),
+    ])
+    .await;
 
     let stdout_log = data_dir.join("server-node.setup.stdout.log");
     let stderr_log = data_dir.join("server-node.setup.stderr.log");
@@ -346,7 +411,7 @@ pub async fn start_zero_touch_server(bind: &str, data_dir: &Path) -> Result<Chil
         bail!("zero-touch server-node exited early on {bind} with status {status}");
     }
 
-    Ok(ChildGuard::new(child))
+    Ok(ChildGuard::with_resources(child, resource_guards))
 }
 
 pub async fn start_open_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
@@ -467,6 +532,8 @@ async fn start_server_with_env_options_inner(
     let public_url = format!("{public_scheme}://{bind}");
     let internal_bind = internal_bind_from_public_bind(bind)?;
     let internal_url = format!("https://{internal_bind}");
+    let resource_guards =
+        lock_test_resources([tcp_resource_key(bind), tcp_resource_key(&internal_bind)]).await;
 
     let tls_dir = data_dir.join("tls");
     fs::create_dir_all(&tls_dir).context("failed creating tls dir")?;
@@ -566,7 +633,7 @@ async fn start_server_with_env_options_inner(
     {
         bail!("server-node exited early on {bind} with status {status}");
     }
-    Ok(ChildGuard::new(child))
+    Ok(ChildGuard::with_resources(child, resource_guards))
 }
 
 pub async fn register_node(
@@ -801,6 +868,7 @@ pub async fn issue_bootstrap_claim(
 
 pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {
     let cli_bin = binary_path("cli-client")?;
+    let resource_guards = lock_test_resources([tcp_resource_key(bind)]).await;
 
     let child = Command::new(cli_bin)
         .arg("serve-web")
@@ -813,7 +881,7 @@ pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {
         .context("failed to spawn cli-client serve-web")?;
 
     wait_for_url_status(&format!("http://{bind}/api/ping"), StatusCode::OK, 40).await?;
-    Ok(ChildGuard::new(child))
+    Ok(ChildGuard::with_resources(child, resource_guards))
 }
 
 pub async fn start_rendezvous_service(bind: &str) -> Result<ChildGuard> {
@@ -825,6 +893,7 @@ pub async fn start_rendezvous_service_with_env(
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
     let rendezvous_bin = binary_path("rendezvous-service")?;
+    let resource_guards = lock_test_resources([tcp_resource_key(bind)]).await;
     let log_dir = fresh_data_dir("rendezvous-service");
     fs::create_dir_all(&log_dir).context("failed creating rendezvous log dir")?;
 
@@ -886,7 +955,7 @@ pub async fn start_rendezvous_service_with_env(
         bail!("rendezvous-service exited early on {bind} with status {status}");
     }
 
-    Ok(ChildGuard::new(child))
+    Ok(ChildGuard::with_resources(child, resource_guards))
 }
 
 pub async fn wait_for_server(bind: &str, retries: usize) -> Result<()> {

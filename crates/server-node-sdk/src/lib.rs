@@ -3230,8 +3230,12 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             post(node_heartbeat_public),
         )
         .route(
-            "/cluster/replication/subjects/local",
-            get(local_replication_subjects),
+            "/cluster/availability/subjects/local",
+            get(local_available_subjects),
+        )
+        .route(
+            "/cluster/metadata/subjects/local",
+            get(local_metadata_subjects),
         )
         .route(
             "/cluster/replication/export",
@@ -3361,8 +3365,12 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route(
-            "/cluster/replication/subjects/local",
-            get(local_replication_subjects),
+            "/cluster/availability/subjects/local",
+            get(local_available_subjects),
+        )
+        .route(
+            "/cluster/metadata/subjects/local",
+            get(local_metadata_subjects),
         )
         .route(
             "/cluster/replication/export",
@@ -4300,20 +4308,28 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LocalReplicationSubjectsResponse {
+struct LocalAvailableSubjectsResponse {
     node_id: NodeId,
     subject_count: usize,
     generated_at_unix: u64,
     subjects: Vec<String>,
 }
 
-pub(crate) async fn sync_replica_views_once(state: &ServerState) {
-    let local_subjects = local_cluster_replication_subjects(state).await;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalMetadataSubjectsResponse {
+    node_id: NodeId,
+    subject_count: usize,
+    generated_at_unix: u64,
+    subjects: Vec<String>,
+}
 
-    let mut changed = {
+pub(crate) async fn sync_availability_views_once(state: &ServerState) {
+    let local_subjects = local_cluster_available_subjects(state).await;
+
+    {
         let mut cluster = state.cluster.lock().await;
-        cluster.replace_node_replica_view(state.node_id, &local_subjects)
-    };
+        cluster.replace_node_available_view(state.node_id, &local_subjects);
+    }
 
     let peers = {
         let mut cluster = state.cluster.lock().await;
@@ -4332,25 +4348,23 @@ pub(crate) async fn sync_replica_views_once(state: &ServerState) {
             state,
             &peer,
             reqwest::Method::GET,
-            "/cluster/replication/subjects/local",
+            "/cluster/availability/subjects/local",
             Vec::new(),
             Vec::new(),
         )
         .await
         {
             Ok(response) if response.is_success() => {
-                match response.json::<LocalReplicationSubjectsResponse>() {
+                match response.json::<LocalAvailableSubjectsResponse>() {
                     Ok(payload) => {
                         let mut cluster = state.cluster.lock().await;
-                        if cluster.replace_node_replica_view(payload.node_id, &payload.subjects) {
-                            changed = true;
-                        }
+                        cluster.replace_node_available_view(payload.node_id, &payload.subjects);
                     }
                     Err(err) => {
                         tracing::debug!(
                             node_id = %peer.node_id,
                             error = %err,
-                            "failed decoding replica subject sync payload"
+                            "failed decoding availability subject sync payload"
                         );
                     }
                 }
@@ -4359,24 +4373,17 @@ pub(crate) async fn sync_replica_views_once(state: &ServerState) {
                 tracing::debug!(
                     node_id = %peer.node_id,
                     status = response.status,
-                    "replica subject sync request rejected"
+                    "availability subject sync request rejected"
                 );
             }
             Err(err) => {
                 tracing::debug!(
                     node_id = %peer.node_id,
                     error = %err,
-                    "failed replica subject sync request"
+                    "failed availability subject sync request"
                 );
             }
         }
-    }
-
-    if changed && let Err(err) = persist_cluster_replicas_state(state).await {
-        warn!(
-            error = %err,
-            "failed persisting cluster replicas after replica subject sync"
-        );
     }
 }
 
@@ -4410,14 +4417,14 @@ pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
             state,
             &peer,
             reqwest::Method::GET,
-            "/cluster/replication/subjects/local",
+            "/cluster/metadata/subjects/local",
             Vec::new(),
             Vec::new(),
         )
         .await
         {
             Ok(response) if response.is_success() => {
-                match response.json::<LocalReplicationSubjectsResponse>() {
+                match response.json::<LocalMetadataSubjectsResponse>() {
                     Ok(payload) => payload.subjects,
                     Err(err) => {
                         tracing::debug!(
@@ -4546,7 +4553,7 @@ fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
 
         loop {
             ticker.tick().await;
-            sync_replica_views_once(&state).await;
+            sync_availability_views_once(&state).await;
             sync_cluster_metadata_once(&state).await;
         }
     });
@@ -4627,7 +4634,7 @@ async fn track_inflight_requests(
 }
 
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
-    let local_subjects = local_cluster_replication_subjects(state).await;
+    let local_subjects = local_cluster_available_subjects(state).await;
     let cluster_subjects = {
         let cluster = state.cluster.lock().await;
         cluster.known_replication_subjects()
@@ -4639,24 +4646,14 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     subjects.into_iter().collect()
 }
 
-async fn local_cluster_replication_subjects(state: &ServerState) -> Vec<String> {
-    let readable_subjects = {
+async fn local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
+    let mut subjects = {
         let store = state.store.lock().await;
         store
             .list_replication_subjects()
             .await
             .unwrap_or_else(|_| store.current_keys())
     };
-    let declared_subjects = {
-        let cluster = state.cluster.lock().await;
-        cluster.subjects_for_node(state.node_id)
-    };
-
-    let readable: HashSet<String> = readable_subjects.into_iter().collect();
-    let mut subjects = declared_subjects
-        .into_iter()
-        .filter(|subject| readable.contains(subject))
-        .collect::<Vec<_>>();
     subjects.sort();
     subjects
 }
@@ -5145,6 +5142,7 @@ async fn rename_object_path(
         Ok(PathMutationResult::Applied) => {
             drop(store);
             publish_namespace_change(&state);
+            sync_availability_views_once(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),
@@ -5177,6 +5175,7 @@ async fn copy_object_path(
         Ok(PathMutationResult::Applied) => {
             drop(store);
             publish_namespace_change(&state);
+            sync_availability_views_once(&state).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),
@@ -6411,7 +6410,7 @@ fn read_through_replication_subject(
 async fn read_through_source_nodes(state: &ServerState, subject: &str) -> Vec<NodeDescriptor> {
     let cluster = state.cluster.lock().await;
     cluster
-        .replica_nodes_for_subject(subject)
+        .available_nodes_for_subject(subject)
         .into_iter()
         .filter(|node| node.node_id != state.node_id)
         .collect()
@@ -10210,12 +10209,34 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
     Json(plan)
 }
 
-async fn local_replication_subjects(State(state): State<ServerState>) -> impl IntoResponse {
-    let subjects = local_cluster_replication_subjects(&state).await;
+async fn local_available_subjects(State(state): State<ServerState>) -> impl IntoResponse {
+    let subjects = local_cluster_available_subjects(&state).await;
 
     (
         StatusCode::OK,
-        Json(LocalReplicationSubjectsResponse {
+        Json(LocalAvailableSubjectsResponse {
+            node_id: state.node_id,
+            subject_count: subjects.len(),
+            generated_at_unix: unix_ts(),
+            subjects,
+        }),
+    )
+        .into_response()
+}
+
+async fn local_metadata_subjects(State(state): State<ServerState>) -> impl IntoResponse {
+    let mut subjects = {
+        let store = state.store.lock().await;
+        store
+            .list_metadata_subjects()
+            .await
+            .unwrap_or_else(|_| store.current_keys())
+    };
+    subjects.sort();
+
+    (
+        StatusCode::OK,
+        Json(LocalMetadataSubjectsResponse {
             node_id: state.node_id,
             subject_count: subjects.len(),
             generated_at_unix: unix_ts(),
@@ -10284,8 +10305,10 @@ async fn drop_replication_subject(
         publish_namespace_change(&state);
         let mut cluster = state.cluster.lock().await;
         cluster.remove_replica(&query.key, state.node_id);
+        cluster.remove_available(&query.key, state.node_id);
         if let Some(version_id) = &query.version_id {
             cluster.remove_replica(&format!("{}@{}", query.key, version_id), state.node_id);
+            cluster.remove_available(&format!("{}@{}", query.key, version_id), state.node_id);
         }
         drop(cluster);
 
@@ -10441,7 +10464,12 @@ async fn execute_replication_cleanup(
 
                     let mut cluster = state.cluster.lock().await;
                     cluster.remove_replica(&candidate.subject, candidate.node_id);
+                    cluster.remove_available(&candidate.subject, candidate.node_id);
                     cluster.remove_replica(
+                        &format!("{}@{}", candidate.key, candidate.version_id),
+                        candidate.node_id,
+                    );
+                    cluster.remove_available(
                         &format!("{}@{}", candidate.key, candidate.version_id),
                         candidate.node_id,
                     );

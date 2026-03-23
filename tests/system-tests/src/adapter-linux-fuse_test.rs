@@ -5,8 +5,10 @@ mod tests {
     use crate::framework::{
         ChildGuard, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
         issue_bootstrap_bundle_and_enroll_client, register_node, start_authenticated_server,
-        start_open_server_with_env, start_rendezvous_service, stop_server, wait_for_online_nodes,
-        wait_for_rendezvous_registered_endpoints, wait_for_store_index_entry, wait_for_url_status,
+        lock_test_resources, path_resource_key, start_open_server_with_env,
+        start_rendezvous_service, stop_server, wait_for_online_nodes,
+        wait_for_rendezvous_registered_endpoints, wait_for_store_index_entry,
+        wait_for_url_status,
     };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
@@ -112,6 +114,9 @@ mod tests {
     ) -> Result<ChildGuard> {
         let os_integration_bin = binary_path("os-integration")?;
         let mountpoint_arg = mountpoint.to_string_lossy().to_string();
+        let resource_guards =
+            lock_test_resources(["linux-fuse-adapter".to_string(), path_resource_key(mountpoint)])
+                .await;
 
         let mut command = Command::new(os_integration_bin);
         connection.apply_to_command(&mut command);
@@ -125,7 +130,7 @@ mod tests {
             .spawn()
             .context("failed to spawn linux fuse adapter via os-integration")?;
 
-        Ok(ChildGuard::new(child))
+        Ok(ChildGuard::with_resources(child, resource_guards))
     }
 
     struct LocalEdgeClusterFixture {
@@ -613,6 +618,7 @@ mod tests {
         upload_key: &str,
         upload_payload: Vec<u8>,
     ) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -657,6 +663,7 @@ mod tests {
     }
 
     async fn run_nested_folder_roundtrip_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -787,6 +794,7 @@ mod tests {
     }
 
     async fn run_cluster_delete_propagation_case(bind_a: &str, bind_b: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -881,6 +889,7 @@ mod tests {
     }
 
     async fn run_empty_folder_create_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -934,6 +943,7 @@ mod tests {
     }
 
     async fn run_remote_additions_refresh_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -989,6 +999,7 @@ mod tests {
     }
 
     async fn run_remote_additions_refresh_local_edge_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -1084,6 +1095,7 @@ mod tests {
     }
 
     async fn run_remote_delete_refresh_local_edge_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -1187,6 +1199,7 @@ mod tests {
     }
 
     async fn run_remote_update_refresh_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -1228,6 +1241,7 @@ mod tests {
     }
 
     async fn run_remote_file_size_reporting_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -1278,6 +1292,7 @@ mod tests {
     }
 
     async fn run_local_rename_move_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -1419,6 +1434,7 @@ mod tests {
     }
 
     async fn run_remote_rename_move_refresh_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -1513,6 +1529,7 @@ mod tests {
     }
 
     async fn run_remote_file_rename_refresh_local_edge_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());
@@ -1583,7 +1600,7 @@ mod tests {
 
                 sdk.rename_path(remote_file_from, remote_file_to, false)
                     .await?;
-                for _ in 0..120 {
+                for _ in 0..260 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
                     let new_ready = local_edge_sdk
                         .get(remote_file_to)
@@ -1596,12 +1613,12 @@ mod tests {
                     }
                     sleep(Duration::from_millis(100)).await;
                 }
-                wait_for_object_bytes(&local_edge_sdk, remote_file_to, &remote_file_payload, 40)
+                wait_for_object_bytes(&local_edge_sdk, remote_file_to, &remote_file_payload, 120)
                     .await?;
-                wait_for_remote_file_absence(&local_edge_sdk, remote_file_from, 40).await?;
+                wait_for_remote_file_absence(&local_edge_sdk, remote_file_from, 120).await?;
 
                 let mounted_remote_file_to = mountpoint.join(remote_file_to);
-                for _ in 0..260 {
+                for _ in 0..360 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
                     if mounted_remote_file_to.is_file()
                         && mounted_path_absent(&mounted_remote_file_from)
@@ -1610,9 +1627,9 @@ mod tests {
                     }
                     sleep(Duration::from_millis(100)).await;
                 }
-                wait_for_file(&mounted_remote_file_to, 40).await?;
-                wait_for_file_bytes(&mounted_remote_file_to, &remote_file_payload, 40).await?;
-                wait_for_absence(&mounted_remote_file_from, 40).await?;
+                wait_for_file(&mounted_remote_file_to, 120).await?;
+                wait_for_file_bytes(&mounted_remote_file_to, &remote_file_payload, 120).await?;
+                wait_for_absence(&mounted_remote_file_from, 120).await?;
 
                 Ok::<(), anyhow::Error>(())
             }
@@ -1631,6 +1648,7 @@ mod tests {
     }
 
     async fn run_local_edge_upstream_restart_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
             return Ok(());

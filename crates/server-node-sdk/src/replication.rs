@@ -32,7 +32,7 @@ pub(crate) async fn execute_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ReplicationRepairReport {
-    sync_replica_views_once(state).await;
+    sync_availability_views_once(state).await;
     let keys = planning_replication_subjects(state).await;
 
     let (plan, nodes) = {

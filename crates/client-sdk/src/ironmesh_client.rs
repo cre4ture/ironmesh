@@ -1582,52 +1582,12 @@ impl IronMeshClient {
         let version_owned = version.map(ToString::to_string);
         let staging_root = staging_root.as_ref();
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for staged resumable download")?;
-        let head = runtime.block_on(self.head_object_response(
-            key,
-            snapshot_owned.as_deref(),
-            version_owned.as_deref(),
-        ))?;
-
-        if head.total_size_bytes == 0 {
-            writer
-                .flush()
-                .with_context(|| format!("failed to flush empty download output for key={key}"))?;
-            return Ok(());
-        }
-
         let (target_path, temp_path, state_path) = staged_download_paths(
             staging_root,
             key,
             snapshot_owned.as_deref(),
             version_owned.as_deref(),
         );
-        let expected_state = resumable_download_state_from_head(
-            key,
-            snapshot_owned.clone(),
-            version_owned.clone(),
-            &head,
-        );
-
-        if let Some(expected_state) = expected_state.as_ref()
-            && staged_download_matches_expected(&target_path, &state_path, expected_state)?
-        {
-            return stream_staged_download_and_cleanup(
-                &target_path,
-                &temp_path,
-                &state_path,
-                writer,
-                key,
-            );
-        }
-
-        remove_file_if_exists(&target_path)?;
-        remove_file_if_exists(&temp_path)?;
-        remove_file_if_exists(&state_path)?;
-
         self.download_file_resumable(
             key,
             snapshot_owned.as_deref(),
@@ -1636,11 +1596,6 @@ impl IronMeshClient {
             &temp_path,
             &state_path,
         )?;
-
-        if let Some(expected_state) = expected_state.as_ref() {
-            persist_json_file_atomic(&state_path, expected_state)?;
-        }
-
         stream_staged_download_and_cleanup(&target_path, &temp_path, &state_path, writer, key)
     }
 
@@ -2158,25 +2113,6 @@ fn upload_session_complete_info_from_response(
     }
 }
 
-fn resumable_download_state_from_head(
-    key: &str,
-    snapshot: Option<String>,
-    version: Option<String>,
-    head: &ObjectHeadResponse,
-) -> Option<ResumableDownloadFileState> {
-    if !head.accept_ranges {
-        return None;
-    }
-    let etag = head.etag.clone()?;
-    Some(ResumableDownloadFileState {
-        key: key.to_string(),
-        snapshot,
-        version,
-        expected_size_bytes: head.total_size_bytes,
-        etag,
-    })
-}
-
 fn staged_download_paths(
     staging_root: &Path,
     key: &str,
@@ -2199,27 +2135,6 @@ fn staged_download_stem(key: &str, snapshot: Option<&str>, version: Option<&str>
     hasher.update(&[0]);
     hasher.update(version.unwrap_or_default().as_bytes());
     hasher.finalize().to_hex().to_string()
-}
-
-fn staged_download_matches_expected(
-    target_path: &Path,
-    state_path: &Path,
-    expected_state: &ResumableDownloadFileState,
-) -> Result<bool> {
-    let metadata = match fs::metadata(target_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect {}", target_path.display()));
-        }
-    };
-
-    let Some(persisted) = load_json_file::<ResumableDownloadFileState>(state_path)? else {
-        return Ok(false);
-    };
-
-    Ok(persisted == *expected_state && metadata.len() == expected_state.expected_size_bytes)
 }
 
 fn stream_staged_download_and_cleanup(

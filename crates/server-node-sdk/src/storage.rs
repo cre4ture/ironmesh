@@ -1506,6 +1506,10 @@ impl PersistentStore {
         }
 
         let payload = fs::read(&chunk_path).await?;
+        let actual_hash = hash_hex(&payload);
+        if actual_hash != hash {
+            bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
+        }
         Ok(Some(Bytes::from(payload)))
     }
 
@@ -1769,11 +1773,37 @@ impl PersistentStore {
                 changed = true;
             }
 
-            let before_manifest = self.current_state.objects.get(&bundle.key).cloned();
-            let before_object_id = self.current_state.object_ids.get(&bundle.key).cloned();
-            self.sync_current_state_for_key_from_index(&bundle.key, &index)?;
-            if self.current_state.objects.get(&bundle.key).cloned() != before_manifest
-                || self.current_state.object_ids.get(&bundle.key).cloned() != before_object_id
+            let preferred_logical_path = index
+                .preferred_head_version_id
+                .as_ref()
+                .and_then(|version_id| index.versions.get(version_id))
+                .and_then(|record| record.logical_path.as_deref());
+            let current_key = preferred_logical_path.unwrap_or(bundle.key.as_str());
+            let before_manifest = self.current_state.objects.get(current_key).cloned();
+            let before_object_id = self.current_state.object_ids.get(current_key).cloned();
+            self.sync_current_state_for_key_from_index(current_key, &index)?;
+            let stale_keys: Vec<String> = self
+                .current_state
+                .object_ids
+                .iter()
+                .filter_map(|(key, current_object_id)| {
+                    if current_object_id != &object_id {
+                        return None;
+                    }
+                    if Some(key.as_str()) == preferred_logical_path {
+                        return None;
+                    }
+                    Some(key.clone())
+                })
+                .collect();
+            let removed_stale_keys = !stale_keys.is_empty();
+            for stale_key in stale_keys {
+                self.current_state.objects.remove(&stale_key);
+                self.current_state.object_ids.remove(&stale_key);
+            }
+            if self.current_state.objects.get(current_key).cloned() != before_manifest
+                || self.current_state.object_ids.get(current_key).cloned() != before_object_id
+                || removed_stale_keys
             {
                 current_state_changed = true;
             }
@@ -1920,6 +1950,18 @@ impl PersistentStore {
             return Ok(None);
         }
         Ok(Some(fs::read(&manifest_path).await?))
+    }
+
+    async fn local_chunk_matches_ref(&self, chunk: &ChunkRef) -> Result<bool> {
+        let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+        if !fs::try_exists(&chunk_path).await? {
+            return Ok(false);
+        }
+        let payload = fs::read(&chunk_path).await?;
+        if payload.len() != chunk.size_bytes {
+            return Ok(false);
+        }
+        Ok(hash_hex(&payload) == chunk.hash)
     }
 
     async fn manifest_is_fully_local(&self, manifest_hash: &str) -> Result<bool> {
@@ -2296,6 +2338,16 @@ impl PersistentStore {
                     metadata.len()
                 )));
             }
+            let is_valid = self
+                .local_chunk_matches_ref(&chunk)
+                .await
+                .map_err(StoreReadError::Internal)?;
+            if !is_valid {
+                return Err(StoreReadError::Corrupt(format!(
+                    "hash mismatch for chunk expected={}",
+                    chunk.hash
+                )));
+            }
 
             let slice_start = start.saturating_sub(offset);
             let slice_end = std::cmp::min(chunk.size_bytes, end_exclusive.saturating_sub(offset));
@@ -2367,7 +2419,11 @@ impl PersistentStore {
 
             let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
             let is_missing = match fs::metadata(&chunk_path).await {
-                Ok(metadata) => metadata.len() != chunk.size_bytes as u64,
+                Ok(metadata) if metadata.len() == chunk.size_bytes as u64 => !self
+                    .local_chunk_matches_ref(&chunk)
+                    .await
+                    .map_err(StoreReadError::Internal)?,
+                Ok(_) => true,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
                 Err(err) => return Err(StoreReadError::Internal(err.into())),
             };

@@ -229,9 +229,6 @@ impl RemoteSnapshotPoller {
                             ) {
                                 Ok(response) => {
                                     last_sequence = response.sequence;
-                                    if !response.changed {
-                                        continue;
-                                    }
                                 }
                                 Err(error) => {
                                     eprintln!(

@@ -2,7 +2,8 @@
 
 use crate::framework::{
     ChildGuard, EnrolledTestClient, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
-    issue_bootstrap_bundle_and_enroll_client, start_authenticated_server, stop_server,
+    issue_bootstrap_bundle_and_enroll_client, lock_test_resources, path_resource_key,
+    start_authenticated_server, stop_server,
 };
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -102,6 +103,11 @@ async fn start_folder_agent(
     no_watch_local: bool,
 ) -> Result<ChildGuard> {
     let agent_bin = binary_path("ironmesh-folder-agent")?;
+    let resource_guards = lock_test_resources([
+        "folder-agent-process".to_string(),
+        path_resource_key(root_dir),
+    ])
+    .await;
 
     let mut command = Command::new(agent_bin);
     command.arg("--root-dir").arg(root_dir);
@@ -135,7 +141,7 @@ async fn start_folder_agent(
         bail!("ironmesh-folder-agent exited early with status {status}");
     }
 
-    Ok(ChildGuard::new(child))
+    Ok(ChildGuard::with_resources(child, resource_guards))
 }
 
 async fn spawn_folder_agent_no_wait(
@@ -148,6 +154,11 @@ async fn spawn_folder_agent_no_wait(
     no_watch_local: bool,
 ) -> Result<ChildGuard> {
     let agent_bin = binary_path("ironmesh-folder-agent")?;
+    let resource_guards = lock_test_resources([
+        "folder-agent-process".to_string(),
+        path_resource_key(root_dir),
+    ])
+    .await;
 
     let mut command = Command::new(agent_bin);
     command.arg("--root-dir").arg(root_dir);
@@ -177,7 +188,7 @@ async fn spawn_folder_agent_no_wait(
         .spawn()
         .context("failed to spawn ironmesh-folder-agent")?;
 
-    Ok(ChildGuard::new(child))
+    Ok(ChildGuard::with_resources(child, resource_guards))
 }
 
 async fn run_folder_agent_once(
@@ -189,6 +200,11 @@ async fn run_folder_agent_once(
     no_watch_local: bool,
 ) -> Result<()> {
     let agent_bin = binary_path("ironmesh-folder-agent")?;
+    let _resource_guards = lock_test_resources([
+        "folder-agent-process".to_string(),
+        path_resource_key(root_dir),
+    ])
+    .await;
 
     let mut command = Command::new(agent_bin);
     command.arg("--run-once").arg("--root-dir").arg(root_dir);
@@ -1522,13 +1538,13 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
         .await?;
 
         let target = local_root.join("partial-download/target.bin");
-        let dir = local_root.join("partial-download");
+        let staged_download_dir = local_root.join(".ironmesh/transfers/downloads");
         let mut artifact: Option<PathBuf> = None;
         for _ in 0..400 {
             if let Ok(bytes) = fs::read(&target)
                 && bytes.as_slice() == b"remote-v1"
             {
-                let artifacts = local_files_in_dir_containing(&dir, "ironmesh-part-")?;
+                let artifacts = local_files_in_dir_containing(&staged_download_dir, ".part")?;
                 if let Some(path) = artifacts.first() {
                     artifact = Some(path.clone());
                     break;
@@ -1562,7 +1578,7 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
         )
         .await?;
         let scenario = async {
-            // Startup cleanup should remove leftover temp artifacts from the crash.
+            // Restart should resume or replace the hidden staged download and remove leftovers.
             for _ in 0..120 {
                 if !artifact.exists() {
                     break;

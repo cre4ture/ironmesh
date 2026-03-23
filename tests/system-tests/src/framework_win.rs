@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use crate::framework::{ChildGuard, binary_path};
+use crate::framework::{ChildGuard, binary_path, lock_test_resources, path_resource_key};
 use anyhow::Context;
 use anyhow::{Result, bail};
 use std::collections::hash_map::DefaultHasher;
@@ -125,6 +125,11 @@ async fn start_cfapi_adapter_with_resolved_inputs(
 ) -> Result<ChildGuard> {
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
+    let resource_guards = lock_test_resources([
+        "windows-cfapi-adapter".to_string(),
+        path_resource_key(root_path),
+    ])
+    .await;
     let unique_sync_root_id = {
         let mut hasher = DefaultHasher::new();
         root_path_arg.hash(&mut hasher);
@@ -183,7 +188,7 @@ async fn start_cfapi_adapter_with_resolved_inputs(
         .context("failed to spawn os-integration serve")?;
 
     sleep(Duration::from_secs(2)).await;
-    Ok(ChildGuard::new(child))
+    Ok(ChildGuard::with_resources(child, resource_guards))
 }
 
 pub async fn pin_cfapi_placeholder(

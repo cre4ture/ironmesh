@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
         }
         Commands::List { prefix, depth } => {
             let sdk = build_authenticated_sdk_from_cli(&cli).await?;
-            let value = sdk.store_index_blocking(prefix.as_deref(), (*depth).max(1), None)?;
+            let value = sdk.store_index(prefix.as_deref(), (*depth).max(1), None).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }

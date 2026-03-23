@@ -4,9 +4,10 @@
 mod tests {
     use crate::framework::{
         ChildGuard, EnrolledTestClient, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
-        issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client, run_cli,
-        start_authenticated_server, start_open_server_with_env, start_rendezvous_service,
-        stop_server, wait_for_rendezvous_registered_endpoints, wait_for_url_status,
+        issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client, lock_test_resources,
+        run_cli, start_authenticated_server, start_open_server_with_env, start_rendezvous_service,
+        stop_server, tcp_resource_key, wait_for_rendezvous_registered_endpoints,
+        wait_for_url_status,
     };
     use anyhow::{Context, Result};
     use client_sdk::BootstrapEndpointUse;
@@ -29,6 +30,7 @@ mod tests {
 
     async fn start_web_backend_with_args(bind: &str, cli_args: &[&str]) -> Result<ChildGuard> {
         let cli_bin = binary_path("cli-client")?;
+        let resource_guards = lock_test_resources([tcp_resource_key(bind)]).await;
         let child = Command::new(cli_bin)
             .args(cli_args)
             .arg("serve-web")
@@ -41,7 +43,7 @@ mod tests {
             .context("failed to spawn cli-client serve-web")?;
 
         wait_for_url_status(&format!("http://{bind}/api/ping"), StatusCode::OK, 40).await?;
-        Ok(ChildGuard::new(child))
+        Ok(ChildGuard::with_resources(child, resource_guards))
     }
 
     async fn start_authenticated_web_backend(

@@ -4158,7 +4158,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     }
 
     let before_subjects = axum::response::IntoResponse::into_response(
-        super::local_replication_subjects(axum::extract::State(target.clone())).await,
+        super::local_available_subjects(axum::extract::State(target.clone())).await,
     );
     let before_payload: serde_json::Value = serde_json::from_slice(
         &to_bytes(before_subjects.into_body(), usize::MAX)
@@ -4185,8 +4185,14 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.as_ref(), sample_png_bytes().as_slice());
 
+    {
+        let cluster = target.cluster.lock().await;
+        let cluster_subjects = cluster.subjects_for_node(target.node_id);
+        assert_eq!(cluster_subjects.len(), 0);
+    }
+
     let after_subjects = axum::response::IntoResponse::into_response(
-        super::local_replication_subjects(axum::extract::State(target.clone())).await,
+        super::local_available_subjects(axum::extract::State(target.clone())).await,
     );
     let after_payload: serde_json::Value = serde_json::from_slice(
         &to_bytes(after_subjects.into_body(), usize::MAX)
@@ -4194,7 +4200,15 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(after_payload["subject_count"].as_u64().unwrap(), 0);
+    assert_eq!(after_payload["subject_count"].as_u64().unwrap(), 2);
+    let after_subject_list = after_payload["subjects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    assert!(after_subject_list.contains(&"photos/cat.png"));
+    assert!(after_subject_list.contains(&format!("photos/cat.png@{}", put.version_id).as_str()));
 
     handle.abort();
     let _ = handle.await;
