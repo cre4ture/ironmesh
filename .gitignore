@@ -16,3 +16,4 @@ web/test-results
 !.vscode/extensions.json
 ironmesh-client-*.json
 map/maptiler-osm-2020-02-10-v3.11-planet.mbtiles
+start_node.sh
