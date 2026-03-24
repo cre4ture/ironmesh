@@ -1,7 +1,7 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
-  await installClientUiMocks(page);
+  const uploadMetrics = await installClientUiMocks(page);
 
   await page.goto("/");
 
@@ -20,17 +20,41 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
   await page.getByRole("button", { name: "Upload text object" }).click();
   await expect(page.getByText('"key": "docs/readme.txt"')).toBeVisible();
+  await page.locator('input[type="file"]').setInputFiles([
+    {
+      name: "alpha.bin",
+      mimeType: "application/octet-stream",
+      buffer: Buffer.alloc(40, 0x61)
+    },
+    {
+      name: "beta.bin",
+      mimeType: "application/octet-stream",
+      buffer: Buffer.alloc(32, 0x62)
+    }
+  ]);
+  await page.getByRole("button", { name: "Add files to queue" }).click();
+  await expect(page.getByText("images/alpha.bin", { exact: true })).toBeVisible();
+  await expect(page.getByText("images/beta.bin", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Uploads 0\/2|Uploads 1\/2|Uploads 2\/2/ })).toBeVisible();
+  await expect(page.getByText(/Starting|Uploading/).first()).toBeVisible();
   await page.locator('input[type="file"]').setInputFiles({
-    name: "sample.bin",
+    name: "gamma.bin",
     mimeType: "application/octet-stream",
-    buffer: Buffer.from("sample-binary-payload")
+    buffer: Buffer.alloc(16, 0x63)
   });
-  await page.getByRole("button", { name: "Upload binary file" }).click();
-  await expect(page.getByText('"key": "images/demo.bin"')).toBeVisible();
-  await expect(page.getByText('"upload_mode": "chunked"')).toBeVisible();
-  await expect(page.getByText("Upload progress")).toBeVisible();
-  await expect(page.getByText("21 B / 21 B")).toBeVisible();
-  await expect(page.getByText("6 / 6 chunks acknowledged")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Add files to queue" })).toBeEnabled();
+  await page.getByRole("button", { name: "Add files to queue" }).click();
+  await expect(page.getByText("images/gamma.bin", { exact: true })).toBeVisible();
+  await page.getByText("Cluster", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Uploads \d\/3/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Uploads 3\/3/ })).toBeVisible();
+  await page.getByRole("button", { name: /Uploads 3\/3/ }).click();
+  await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
+  await expect(page.getByText('"operation": "binary-upload-queue"')).toBeVisible();
+  await expect(page.getByText('"active_concurrency": 2')).toBeVisible();
+  await expect(page.getByText('"completed_files": 3')).toBeVisible();
+  expect(uploadMetrics.maxConcurrentUploadIds()).toBeGreaterThan(1);
   await page.getByRole("button", { name: "Download text object" }).click();
   await expect(page.getByLabel("Downloaded payload")).toHaveValue("hello from the mocked store");
 
@@ -94,6 +118,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 async function installClientUiMocks(page: Page) {
   const imageBody = tinyPngBuffer();
   let uploadSessionStartCount = 0;
+  const uploadSizes = new Map<string, number>();
+  let maxConcurrentUploadIds = 0;
+  const activeUploadIds = new Set<string>();
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -311,8 +338,10 @@ async function installClientUiMocks(page: Page) {
         key: string;
         total_size_bytes: number;
       };
+      const uploadId = `upload-${uploadSessionStartCount}`;
+      uploadSizes.set(uploadId, body.total_size_bytes);
       return json(route, {
-        upload_id: `upload-${uploadSessionStartCount}`,
+        upload_id: uploadId,
         key: body.key,
         total_size_bytes: body.total_size_bytes,
         chunk_size_bytes: 4,
@@ -323,23 +352,31 @@ async function installClientUiMocks(page: Page) {
     }
 
     if (/^\/api\/store\/uploads\/[^/]+\/chunk\/\d+$/.test(pathname) && method === "PUT") {
+      const uploadId = pathname.split("/")[4] ?? "upload-unknown";
       const index = Number(pathname.split("/").pop() ?? "0");
+      activeUploadIds.add(uploadId);
+      maxConcurrentUploadIds = Math.max(maxConcurrentUploadIds, activeUploadIds.size);
+      await new Promise((resolve) => setTimeout(resolve, 75));
       return json(route, {
         stored: true,
         received_index: index
+      }).finally(() => {
+        activeUploadIds.delete(uploadId);
       });
     }
 
     if (/^\/api\/store\/uploads\/[^/]+\/complete$/.test(pathname) && method === "POST") {
+      const uploadId = pathname.split("/")[4] ?? "upload-unknown";
+      const totalSizeBytes = uploadSizes.get(uploadId) ?? 21;
       return json(route, {
         snapshot_id: "snapshot-001",
         version_id: "version-002",
         manifest_hash: "manifest-upload",
         state: "ready",
-        new_chunks: 3,
+        new_chunks: Math.ceil(totalSizeBytes / 4),
         dedup_reused_chunks: 0,
         created_new_version: true,
-        total_size_bytes: 21
+        total_size_bytes: totalSizeBytes
       });
     }
 
@@ -369,6 +406,10 @@ async function installClientUiMocks(page: Page) {
 
     return route.continue();
   });
+
+  return {
+    maxConcurrentUploadIds: () => maxConcurrentUploadIds
+  };
 }
 
 async function json(route: Route, payload: unknown) {

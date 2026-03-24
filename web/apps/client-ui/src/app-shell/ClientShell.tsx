@@ -70,7 +70,51 @@ import { GalleryPage } from "../pages/GalleryPage";
 type PageId = "overview" | "rendezvous" | "store" | "explorer" | "gallery" | "cluster";
 type ExplorerSortField = "path" | "type" | "size" | "modified";
 type ExplorerSortDirection = "asc" | "desc";
+type BinaryUploadQueueStatus =
+  | "queued"
+  | "starting"
+  | "uploading"
+  | "finalizing"
+  | "complete"
+  | "failed";
+type BinaryUploadQueueItem = {
+  id: string;
+  file: File;
+  key: string;
+  progress: BinaryUploadProgress;
+  status: BinaryUploadQueueStatus;
+  error: string | null;
+};
+type BinaryUploadSummary = {
+  totalFiles: number;
+  totalBytes: number;
+  uploadedBytes: number;
+  queuedFiles: number;
+  activeFiles: number;
+  completedFiles: number;
+  failedFiles: number;
+  percent: number;
+};
+type BinaryUploadController = {
+  uploadKey: string;
+  setUploadKey: (value: string) => void;
+  selectedFiles: File[];
+  setSelectedFiles: (files: File[]) => void;
+  concurrency: number;
+  setConcurrency: (value: number | string | null | undefined) => void;
+  queue: BinaryUploadQueueItem[];
+  running: boolean;
+  summary: BinaryUploadSummary;
+  lastResult: unknown | null;
+  notice: string | null;
+  clearNotice: () => void;
+  queueFiles: () => void;
+  uploadQueuedFiles: () => Promise<void>;
+  clearQueue: () => void;
+};
 const EXPLORER_PREVIEW_BYTES = 1024;
+const DEFAULT_BINARY_UPLOAD_CONCURRENCY = 2;
+const MAX_BINARY_UPLOAD_CONCURRENCY = 8;
 
 const pages = [
   {
@@ -120,6 +164,7 @@ export function ClientShell() {
   const [connectionStatus, setConnectionStatus] = useState<ClientRendezvousView | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(true);
   const [overviewError, setOverviewError] = useState<string | null>(null);
+  const binaryUpload = useBinaryUploadQueue();
 
   useEffect(() => {
     void refreshOverview();
@@ -172,6 +217,17 @@ export function ClientShell() {
               <IronmeshBrand surfaceLabel="Client UI" />
             </Group>
             <Group gap="sm">
+              {binaryUpload.summary.totalFiles > 0 ? (
+                <Button
+                  variant="light"
+                  color={binaryUploadHeaderColor(binaryUpload.summary, binaryUpload.running)}
+                  size="xs"
+                  leftSection={<IconFiles size={14} />}
+                  onClick={() => setActivePageId("store")}
+                >
+                  {binaryUploadHeaderLabel(binaryUpload.summary, binaryUpload.running)}
+                </Button>
+              ) : null}
               {ping ? <Badge variant="light">{ping.service}</Badge> : null}
               <Badge color="teal" variant="filled">
                 Transport-aware
@@ -217,7 +273,7 @@ export function ClientShell() {
 
             {activePageId === "rendezvous" ? <RendezvousPage /> : null}
 
-            {activePageId === "store" ? <StorePage /> : null}
+            {activePageId === "store" ? <StorePage binaryUpload={binaryUpload} /> : null}
 
             {activePageId === "explorer" ? <ExplorerPage /> : null}
 
@@ -237,6 +293,264 @@ export function ClientShell() {
       {opened ? <div className="shell-backdrop" onClick={close} /> : null}
     </>
   );
+}
+
+function useBinaryUploadQueue(): BinaryUploadController {
+  const [uploadKey, setUploadKey] = useState("images/");
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [concurrency, setConcurrencyState] = useState(DEFAULT_BINARY_UPLOAD_CONCURRENCY);
+  const [queue, setQueue] = useState<BinaryUploadQueueItem[]>([]);
+  const [running, setRunning] = useState(false);
+  const [lastResult, setLastResult] = useState<unknown | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const queueRef = useRef<BinaryUploadQueueItem[]>([]);
+  const concurrencyRef = useRef(concurrency);
+  const activeWorkersRef = useRef(0);
+
+  const summary = useMemo<BinaryUploadSummary>(() => {
+    return summarizeBinaryUploadQueue(queue);
+  }, [queue]);
+
+  function setQueueAndRef(
+    updater: BinaryUploadQueueItem[] | ((current: BinaryUploadQueueItem[]) => BinaryUploadQueueItem[])
+  ) {
+    const next =
+      typeof updater === "function"
+        ? updater(queueRef.current)
+        : updater;
+    queueRef.current = next;
+    setQueue(next);
+  }
+
+  function finalizeUploadRun() {
+    const nextQueue = queueRef.current;
+    const nextSummary = summarizeBinaryUploadQueue(nextQueue);
+    setLastResult({
+      operation: "binary-upload-queue",
+      active_concurrency: Math.min(
+        clampBinaryUploadConcurrency(concurrencyRef.current),
+        nextSummary.totalFiles
+      ),
+      total_files: nextSummary.totalFiles,
+      completed_files: nextSummary.completedFiles,
+      failed_files: nextSummary.failedFiles,
+      files: nextQueue.map((item) => ({
+        key: item.key,
+        filename: item.file.name,
+        size_bytes: item.file.size,
+        status: item.status === "failed" ? "failed" : "complete",
+        error: item.error ?? undefined
+      }))
+    });
+
+    if (nextSummary.failedFiles > 0) {
+      setNotice(
+        `${nextSummary.failedFiles} binary upload${nextSummary.failedFiles === 1 ? "" : "s"} failed. Inspect the queue for details.`
+      );
+    }
+  }
+
+  function claimNextQueuedItem(): BinaryUploadQueueItem | null {
+    let claimed: BinaryUploadQueueItem | null = null;
+
+    setQueueAndRef((current) => {
+      const nextIndex = current.findIndex((item) => item.status === "queued");
+      if (nextIndex < 0) {
+        return current;
+      }
+
+      claimed = {
+        ...current[nextIndex],
+        progress: createBinaryUploadProgress(current[nextIndex].file.size),
+        status: "starting",
+        error: null
+      };
+
+      const next = [...current];
+      next[nextIndex] = claimed;
+      return next;
+    });
+
+    return claimed;
+  }
+
+  function ensureWorkersRunning() {
+    const desiredConcurrency = clampBinaryUploadConcurrency(concurrencyRef.current);
+
+    while (activeWorkersRef.current < desiredConcurrency) {
+      const item = claimNextQueuedItem();
+      if (!item) {
+        break;
+      }
+
+      activeWorkersRef.current += 1;
+      setRunning(true);
+
+      void (async () => {
+        try {
+          const payload = await putBinaryObject(item.key, item.file, (progress) => {
+            setQueueAndRef((current) =>
+              current.map((entry) =>
+                entry.id === item.id
+                  ? {
+                      ...entry,
+                      progress,
+                      status: binaryUploadQueueStatusFromProgress(progress),
+                      error: null
+                    }
+                  : entry
+              )
+            );
+          });
+
+          setQueueAndRef((current) =>
+            current.map((entry) =>
+              entry.id === item.id
+                ? {
+                    ...entry,
+                    progress: {
+                      ...entry.progress,
+                      uploadedBytes: payload.size_bytes,
+                      totalBytes: payload.size_bytes,
+                      uploadedChunks: entry.progress.totalChunks,
+                      totalChunks: entry.progress.totalChunks,
+                      percent: 100,
+                      phase: "complete"
+                    },
+                    status: "complete",
+                    error: null
+                  }
+                : entry
+            )
+          );
+        } catch (nextError) {
+          const message =
+            nextError instanceof Error ? nextError.message : "Binary upload failed";
+
+          setQueueAndRef((current) =>
+            current.map((entry) =>
+              entry.id === item.id
+                ? {
+                    ...entry,
+                    status: "failed",
+                    error: message
+                  }
+                : entry
+            )
+          );
+        } finally {
+          activeWorkersRef.current -= 1;
+          ensureWorkersRunning();
+
+          if (activeWorkersRef.current === 0) {
+            setRunning(false);
+            if (!queueRef.current.some((entry) => entry.status === "queued")) {
+              finalizeUploadRun();
+            }
+          }
+        }
+      })();
+    }
+  }
+
+  function queueFiles() {
+    if (selectedFiles.length === 0) {
+      setNotice("Select one or more binary files first.");
+      return;
+    }
+
+    const occupiedKeys = new Set(
+      queueRef.current
+        .filter((item) => item.status !== "complete" && item.status !== "failed")
+        .map((item) => item.key)
+    );
+    const duplicateKeys: string[] = [];
+    const nextQueueItems: BinaryUploadQueueItem[] = [];
+
+    for (const file of selectedFiles) {
+      const key = deriveBinaryUploadKey(file, uploadKey, selectedFiles.length > 1);
+      if (occupiedKeys.has(key)) {
+        duplicateKeys.push(key);
+        continue;
+      }
+      occupiedKeys.add(key);
+      nextQueueItems.push(buildBinaryUploadQueueItem(file, key));
+    }
+
+    if (nextQueueItems.length === 0) {
+      setNotice(
+        duplicateKeys.length === 1
+          ? `That upload key is already queued: ${duplicateKeys[0]}`
+          : "All selected files resolve to upload keys that are already queued."
+      );
+      return;
+    }
+
+    setQueueAndRef((current) => [...current, ...nextQueueItems]);
+    setSelectedFiles([]);
+    setNotice(
+      duplicateKeys.length > 0
+        ? `Queued ${nextQueueItems.length} file(s) and skipped ${duplicateKeys.length} duplicate upload key${duplicateKeys.length === 1 ? "" : "s"}.`
+        : null
+    );
+    setLastResult({
+      operation: "binary-upload-queue-add",
+      queued_files: nextQueueItems.map((item) => ({
+        key: item.key,
+        filename: item.file.name,
+        size_bytes: item.file.size
+      })),
+      skipped_duplicate_keys: duplicateKeys
+    });
+
+    ensureWorkersRunning();
+  }
+
+  function clearQueue() {
+    if (activeWorkersRef.current > 0) {
+      setQueueAndRef((current) =>
+        current.filter((item) => item.status !== "queued")
+      );
+      setSelectedFiles([]);
+      setNotice("Removed queued files. Uploads already in progress will continue.");
+      return;
+    }
+
+    setQueueAndRef([]);
+    setSelectedFiles([]);
+    setNotice(null);
+  }
+
+  async function uploadQueuedFiles() {
+    ensureWorkersRunning();
+  }
+
+  useEffect(() => {
+    queueRef.current = queue;
+  }, [queue]);
+
+  useEffect(() => {
+    concurrencyRef.current = concurrency;
+    ensureWorkersRunning();
+  }, [concurrency]);
+
+  return {
+    uploadKey,
+    setUploadKey,
+    selectedFiles,
+    setSelectedFiles,
+    concurrency,
+    setConcurrency: (value) => setConcurrencyState(clampBinaryUploadConcurrency(value)),
+    queue,
+    running,
+    summary,
+    lastResult,
+    notice,
+    clearNotice: () => setNotice(null),
+    queueFiles,
+    uploadQueuedFiles,
+    clearQueue
+  };
 }
 
 type OverviewPageProps = {
@@ -656,19 +970,31 @@ function RendezvousPage() {
   );
 }
 
-function StorePage() {
+function StorePage({ binaryUpload }: { binaryUpload: BinaryUploadController }) {
   const [textUploadKey, setTextUploadKey] = useState("docs/readme.txt");
   const [textUploadValue, setTextUploadValue] = useState("hello from the React client UI");
   const [textDownloadKey, setTextDownloadKey] = useState("docs/readme.txt");
   const [textDownloadValue, setTextDownloadValue] = useState("");
   const [deleteKey, setDeleteKey] = useState("");
-  const [binaryUploadKey, setBinaryUploadKey] = useState("images/demo.bin");
-  const [binaryFile, setBinaryFile] = useState<File | null>(null);
   const [binaryDownloadKey, setBinaryDownloadKey] = useState("images/demo.bin");
-  const [binaryUploadProgress, setBinaryUploadProgress] = useState<BinaryUploadProgress | null>(null);
-  const [result, setResult] = useState<unknown>({ message: "No operation run yet." });
+  const [result, setResult] = useState<unknown | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const {
+    uploadKey: binaryUploadKey,
+    setUploadKey: setBinaryUploadKey,
+    selectedFiles: binaryFiles,
+    setSelectedFiles: setBinaryFiles,
+    concurrency: binaryUploadConcurrency,
+    setConcurrency: setBinaryUploadConcurrency,
+    queue: binaryUploadQueue,
+    running: binaryUploadRunning,
+    summary: binaryUploadSummary,
+    lastResult: binaryUploadResult,
+    notice: binaryUploadNotice,
+    queueFiles: handleQueueBinaryFiles,
+    clearQueue: handleClearBinaryUploadQueue
+  } = binaryUpload;
 
   async function withAction<T>(action: string, run: () => Promise<T>): Promise<T | null> {
     setPendingAction(action);
@@ -706,33 +1032,6 @@ function StorePage() {
     }
   }
 
-  async function handleUploadBinary() {
-    if (!binaryFile) {
-      setError("Select a binary file first.");
-      return;
-    }
-    const key = binaryUploadKey.trim() || binaryFile.name;
-    setBinaryUploadProgress({
-      uploadedBytes: 0,
-      totalBytes: binaryFile.size,
-      uploadedChunks: 0,
-      totalChunks: 0,
-      percent: 0,
-      phase: "starting"
-    });
-    const payload = await withAction("upload-binary", () =>
-      putBinaryObject(key, binaryFile, setBinaryUploadProgress)
-    );
-    if (payload) {
-      setBinaryUploadKey(key);
-      setResult({
-        ...payload,
-        uploaded_filename: binaryFile.name,
-        uploaded_type: binaryFile.type || "application/octet-stream"
-      });
-    }
-  }
-
   async function handleDownloadBinary() {
     const key = binaryDownloadKey.trim();
     if (!key) {
@@ -761,6 +1060,11 @@ function StorePage() {
       />
 
       {error ? <Alert color="red">{error}</Alert> : null}
+      {binaryUploadNotice ? (
+        <Alert color={binaryUploadSummary.failedFiles > 0 ? "red" : "blue"}>
+          {binaryUploadNotice}
+        </Alert>
+      ) : null}
 
       <Grid>
         <Grid.Col span={{ base: 12, lg: 6 }}>
@@ -802,54 +1106,173 @@ function StorePage() {
         <Grid.Col span={{ base: 12, lg: 6 }}>
           <Card withBorder radius="md" padding="lg">
             <Stack gap="sm">
-              <Text fw={700}>Binary file upload</Text>
+              <Group justify="space-between" gap="sm" align="flex-start">
+                <div>
+                  <Text fw={700}>Binary file upload</Text>
+                  <Text size="sm" c="dimmed">
+                    Queue multiple files, then upload several sessions in parallel.
+                  </Text>
+                </div>
+                <Badge color={binaryUploadRunning ? "blue" : "gray"} variant="light">
+                  {binaryUploadRunning ? "queue running" : "queue idle"}
+                </Badge>
+              </Group>
               <TextInput
-                label="Object key"
+                label="Object key or prefix"
+                description="With one file selected, a value without a trailing slash is treated as the exact key. Multiple files are uploaded underneath the prefix."
                 value={binaryUploadKey}
                 onChange={(event) => setBinaryUploadKey(event.currentTarget.value)}
               />
               <FileInput
-                label="File"
-                value={binaryFile}
+                label="Files"
+                description="Selecting files and adding them to the queue starts uploading immediately."
+                value={binaryFiles.length > 0 ? binaryFiles : undefined}
+                multiple
+                clearable
                 onChange={(value) => {
-                  setBinaryFile(value);
-                  setBinaryUploadProgress(null);
+                  setBinaryFiles(value ?? []);
                 }}
               />
-              <Button loading={pendingAction === "upload-binary"} onClick={() => void handleUploadBinary()}>
-                Upload binary file
-              </Button>
-              {binaryUploadProgress ? (
+              <NumberInput
+                label="Parallel uploads"
+                description={`How many files to upload at once (1-${MAX_BINARY_UPLOAD_CONCURRENCY}).`}
+                value={binaryUploadConcurrency}
+                min={1}
+                max={MAX_BINARY_UPLOAD_CONCURRENCY}
+                step={1}
+                clampBehavior="strict"
+                onChange={(value) => setBinaryUploadConcurrency(value)}
+              />
+              <Group gap="sm">
+                <Button
+                  variant="light"
+                  onClick={() => {
+                    setResult(null);
+                    handleQueueBinaryFiles();
+                  }}
+                  disabled={binaryFiles.length === 0}
+                >
+                  Add files to queue
+                </Button>
+                <Button
+                  variant="subtle"
+                  color="gray"
+                  onClick={() => {
+                    setResult(null);
+                    handleClearBinaryUploadQueue();
+                  }}
+                  disabled={binaryUploadQueue.length === 0}
+                >
+                  {binaryUploadRunning ? "Remove queued files" : "Clear queue"}
+                </Button>
+              </Group>
+              {binaryUploadQueue.length > 0 ? (
                 <Stack gap={6}>
                   <Group justify="space-between" gap="sm">
                     <Text size="sm" fw={600}>
-                      Upload progress
+                      Queue progress
                     </Text>
-                    <Badge
-                      color={binaryUploadProgress.phase === "complete" ? "teal" : "blue"}
-                      variant="light"
-                    >
-                      {binaryUploadPhaseLabel(binaryUploadProgress.phase)}
+                    <Badge color={binaryUploadRunning ? "blue" : "gray"} variant="light">
+                      {binaryUploadSummary.totalFiles} file{binaryUploadSummary.totalFiles === 1 ? "" : "s"}
+                    </Badge>
+                  </Group>
+                  <Group gap="xs">
+                    <Badge color="gray" variant="light">
+                      {binaryUploadSummary.queuedFiles} queued
+                    </Badge>
+                    <Badge color="blue" variant="light">
+                      {binaryUploadSummary.activeFiles} active
+                    </Badge>
+                    <Badge color="teal" variant="light">
+                      {binaryUploadSummary.completedFiles} complete
+                    </Badge>
+                    <Badge color={binaryUploadSummary.failedFiles > 0 ? "red" : "gray"} variant="light">
+                      {binaryUploadSummary.failedFiles} failed
                     </Badge>
                   </Group>
                   <Progress
-                    value={binaryUploadProgress.percent}
-                    animated={
-                      pendingAction === "upload-binary" &&
-                      binaryUploadProgress.phase !== "complete"
-                    }
+                    value={binaryUploadSummary.percent}
+                    animated={binaryUploadRunning && binaryUploadSummary.activeFiles > 0}
                   />
                   <Group justify="space-between" gap="sm">
                     <Text size="sm">
-                      {formatExplorerSize(binaryUploadProgress.uploadedBytes)} / {formatExplorerSize(binaryUploadProgress.totalBytes)}
+                      {formatExplorerSize(binaryUploadSummary.uploadedBytes)} / {formatExplorerSize(binaryUploadSummary.totalBytes)}
                     </Text>
                     <Text size="sm" c="dimmed">
-                      {binaryUploadProgress.percent}%
+                      {binaryUploadSummary.percent}%
                     </Text>
                   </Group>
-                  <Text size="xs" c="dimmed">
-                    {binaryUploadProgress.uploadedChunks} / {binaryUploadProgress.totalChunks || 0} chunks acknowledged
-                  </Text>
+                  <Table.ScrollContainer minWidth={840}>
+                    <Table striped highlightOnHover withTableBorder>
+                      <Table.Thead>
+                        <Table.Tr>
+                          <Table.Th>File</Table.Th>
+                          <Table.Th>Object key</Table.Th>
+                          <Table.Th>Status</Table.Th>
+                          <Table.Th>Progress</Table.Th>
+                          <Table.Th>Size</Table.Th>
+                          <Table.Th>Error</Table.Th>
+                        </Table.Tr>
+                      </Table.Thead>
+                      <Table.Tbody>
+                        {binaryUploadQueue.map((item) => (
+                          <Table.Tr key={item.id}>
+                            <Table.Td>
+                              <Stack gap={0}>
+                                <Text size="sm" fw={600}>
+                                  {item.file.name}
+                                </Text>
+                                <Text size="xs" c="dimmed">
+                                  {item.file.type || "application/octet-stream"}
+                                </Text>
+                              </Stack>
+                            </Table.Td>
+                            <Table.Td>
+                              <Code>{item.key}</Code>
+                            </Table.Td>
+                            <Table.Td>
+                              <Badge
+                                color={binaryUploadStatusColor(item.status)}
+                                variant="light"
+                              >
+                                {binaryUploadPhaseLabel(item.status)}
+                              </Badge>
+                            </Table.Td>
+                            <Table.Td>
+                              <Stack gap={4}>
+                                <Group gap="xs" wrap="nowrap">
+                                  <Progress
+                                    value={item.progress.percent}
+                                    animated={
+                                      item.status === "starting" ||
+                                      item.status === "uploading" ||
+                                      item.status === "finalizing"
+                                    }
+                                    style={{ flex: 1 }}
+                                  />
+                                  <Text size="xs" c="dimmed" miw={44}>
+                                    {item.progress.percent}%
+                                  </Text>
+                                </Group>
+                                <Text size="xs" c="dimmed">
+                                  {formatExplorerSize(item.progress.uploadedBytes)} / {formatExplorerSize(item.progress.totalBytes)}
+                                </Text>
+                                <Text size="xs" c="dimmed">
+                                  {item.progress.uploadedChunks} / {item.progress.totalChunks || 0} chunks acknowledged
+                                </Text>
+                              </Stack>
+                            </Table.Td>
+                            <Table.Td>{formatExplorerSize(item.file.size)}</Table.Td>
+                            <Table.Td>
+                              <Text size="xs" c={item.error ? "red" : "dimmed"}>
+                                {item.error ?? "—"}
+                              </Text>
+                            </Table.Td>
+                          </Table.Tr>
+                        ))}
+                      </Table.Tbody>
+                    </Table>
+                  </Table.ScrollContainer>
                 </Stack>
               ) : null}
             </Stack>
@@ -888,7 +1311,7 @@ function StorePage() {
           <Card withBorder radius="md" padding="lg">
             <Stack gap="sm">
               <Text fw={700}>Last operation</Text>
-              <JsonBlock value={result} />
+              <JsonBlock value={result ?? binaryUploadResult ?? { message: "No operation run yet." }} />
             </Stack>
           </Card>
         </Grid.Col>
@@ -1391,7 +1814,155 @@ function formatExplorerSize(value: number | null | undefined): string {
   return `${rounded} ${units[unitIndex]}`;
 }
 
-function binaryUploadPhaseLabel(phase: BinaryUploadProgress["phase"]): string {
+function createBinaryUploadProgress(totalBytes: number): BinaryUploadProgress {
+  return {
+    uploadedBytes: 0,
+    totalBytes,
+    uploadedChunks: 0,
+    totalChunks: 0,
+    percent: 0,
+    phase: "starting"
+  };
+}
+
+function buildBinaryUploadQueueItem(file: File, key: string): BinaryUploadQueueItem {
+  return {
+    id: `${key}:${file.name}:${file.size}:${file.lastModified}`,
+    file,
+    key,
+    progress: createBinaryUploadProgress(file.size),
+    status: "queued",
+    error: null
+  };
+}
+
+function deriveBinaryUploadKey(file: File, rawTarget: string, multipleFiles: boolean): string {
+  const trimmedTarget = rawTarget.trim();
+  if (!trimmedTarget) {
+    return file.name;
+  }
+  if (!multipleFiles && !trimmedTarget.endsWith("/")) {
+    return trimmedTarget;
+  }
+
+  const normalizedPrefix = trimmedTarget.replace(/\/+$/, "");
+  return normalizedPrefix ? `${normalizedPrefix}/${file.name}` : file.name;
+}
+
+function clampBinaryUploadConcurrency(value: number | string | null | undefined): number {
+  const numericValue =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim()
+        ? Number(value)
+        : DEFAULT_BINARY_UPLOAD_CONCURRENCY;
+
+  if (!Number.isFinite(numericValue)) {
+    return DEFAULT_BINARY_UPLOAD_CONCURRENCY;
+  }
+
+  return Math.min(
+    MAX_BINARY_UPLOAD_CONCURRENCY,
+    Math.max(1, Math.round(numericValue))
+  );
+}
+
+function binaryUploadQueueStatusFromProgress(
+  progress: BinaryUploadProgress
+): BinaryUploadQueueStatus {
+  return progress.phase;
+}
+
+function summarizeBinaryUploadQueue(
+  queue: BinaryUploadQueueItem[]
+): BinaryUploadSummary {
+  let totalBytes = 0;
+  let uploadedBytes = 0;
+  let queuedFiles = 0;
+  let activeFiles = 0;
+  let completedFiles = 0;
+  let failedFiles = 0;
+
+  for (const item of queue) {
+    totalBytes += item.progress.totalBytes;
+    uploadedBytes += item.progress.uploadedBytes;
+
+    if (item.status === "queued") {
+      queuedFiles += 1;
+    } else if (item.status === "complete") {
+      completedFiles += 1;
+    } else if (item.status === "failed") {
+      failedFiles += 1;
+    } else {
+      activeFiles += 1;
+    }
+  }
+
+  return {
+    totalFiles: queue.length,
+    totalBytes,
+    uploadedBytes,
+    queuedFiles,
+    activeFiles,
+    completedFiles,
+    failedFiles,
+    percent:
+      totalBytes === 0 ? 0 : Math.round((uploadedBytes / Math.max(1, totalBytes)) * 100)
+  };
+}
+
+function binaryUploadHeaderColor(
+  summary: BinaryUploadSummary,
+  running: boolean
+): string {
+  if (summary.failedFiles > 0) {
+    return "red";
+  }
+  if (running || summary.activeFiles > 0) {
+    return "blue";
+  }
+  if (summary.completedFiles > 0 && summary.completedFiles === summary.totalFiles) {
+    return "teal";
+  }
+  return "gray";
+}
+
+function binaryUploadHeaderLabel(
+  summary: BinaryUploadSummary,
+  running: boolean
+): string {
+  const baseLabel = `Uploads ${summary.completedFiles}/${summary.totalFiles}`;
+  if (running || summary.activeFiles > 0 || summary.queuedFiles > 0) {
+    return `${baseLabel} · ${summary.percent}%`;
+  }
+  if (summary.failedFiles > 0) {
+    return `${baseLabel} · ${summary.failedFiles} failed`;
+  }
+  return `${baseLabel} · done`;
+}
+
+function binaryUploadStatusColor(status: BinaryUploadQueueStatus): string {
+  if (status === "queued") {
+    return "gray";
+  }
+  if (status === "complete") {
+    return "teal";
+  }
+  if (status === "failed") {
+    return "red";
+  }
+  if (status === "finalizing") {
+    return "violet";
+  }
+  return "blue";
+}
+
+function binaryUploadPhaseLabel(
+  phase: BinaryUploadProgress["phase"] | BinaryUploadQueueStatus
+): string {
+  if (phase === "queued") {
+    return "Queued";
+  }
   if (phase === "starting") {
     return "Starting";
   }
@@ -1400,6 +1971,9 @@ function binaryUploadPhaseLabel(phase: BinaryUploadProgress["phase"]): string {
   }
   if (phase === "finalizing") {
     return "Finalizing";
+  }
+  if (phase === "failed") {
+    return "Failed";
   }
   return "Complete";
 }
