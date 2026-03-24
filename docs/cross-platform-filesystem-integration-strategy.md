@@ -19,6 +19,8 @@
 
 - Integration API: Cloud Files API (CFAPI) sync root.
 - UX target: OneDrive-like placeholder files, hydration on open, pin/unpin semantics.
+- Future shell enhancement track: packaged Explorer thumbnail provider for dehydrated placeholders.
+  - See `docs/windows-cfapi-thumbnail-provider-plan.md`.
 - Adapter responsibilities:
   - Register/unregister sync root.
   - Map CFAPI callbacks to core operations.
