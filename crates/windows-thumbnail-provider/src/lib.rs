@@ -13,22 +13,19 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{CoTaskMemFree, IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::Shell::{
     IInitializeWithItem, IInitializeWithItem_Impl, IShellItem, IThumbnailProvider,
-    IThumbnailProvider_Impl, SIGDN_FILESYSPATH, WTSAT_ARGB, WTS_ALPHATYPE,
+    IThumbnailProvider_Impl, SIGDN_FILESYSPATH, WTS_ALPHATYPE, WTSAT_ARGB,
 };
 use windows_core::{BOOL, GUID, HRESULT, IUnknown, Interface, PWSTR, Ref, Result, implement};
 
-pub const THUMBNAIL_PROVIDER_CLSID: GUID =
-    GUID::from_u128(0xd2e0fd2a_1d7b_4be4_920a_8a6d019454cb);
+pub const THUMBNAIL_PROVIDER_CLSID: GUID = GUID::from_u128(0xd2e0fd2a_1d7b_4be4_920a_8a6d019454cb);
 pub const CUSTOM_STATE_HANDLER_CLSID: GUID =
     GUID::from_u128(0x2a69ab09_87fb_4af7_93c4_6ca7d4853fd0);
 pub const EXTENDED_PROPERTY_HANDLER_CLSID: GUID =
     GUID::from_u128(0x7d0f3be1_4d8f_4f40_b4fd_8c098d7b96a2);
-pub const BANNERS_HANDLER_CLSID: GUID =
-    GUID::from_u128(0x8a98e31d_1d95_4d26_9dd9_32e2bb3c652a);
+pub const BANNERS_HANDLER_CLSID: GUID = GUID::from_u128(0x8a98e31d_1d95_4d26_9dd9_32e2bb3c652a);
 pub const CONTEXT_MENU_HANDLER_CLSID: GUID =
     GUID::from_u128(0x8d3bf08a_6c23_40bf_9fcb_46bb6f6be13a);
-pub const CONTENT_URI_SOURCE_CLSID: GUID =
-    GUID::from_u128(0xf1aa7371_0c71_4519_8c04_a41dc77f6af1);
+pub const CONTENT_URI_SOURCE_CLSID: GUID = GUID::from_u128(0xf1aa7371_0c71_4519_8c04_a41dc77f6af1);
 pub const STATUS_UI_SOURCE_FACTORY_CLSID: GUID =
     GUID::from_u128(0x47e87ba5_1eb9_4f16_a944_4684850839b5);
 
@@ -51,8 +48,13 @@ impl IronmeshThumbnailProvider {
 #[allow(non_snake_case)]
 impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
     fn Initialize(&self, psi: Ref<'_, IShellItem>, _grfmode: u32) -> Result<()> {
-        let resolved = psi.as_ref().and_then(|item| unsafe { shell_item_path(item) });
-        *self.source_path.lock().expect("thumbnail path lock poisoned") = resolved;
+        let resolved = psi
+            .as_ref()
+            .and_then(|item| unsafe { shell_item_path(item) });
+        *self
+            .source_path
+            .lock()
+            .expect("thumbnail path lock poisoned") = resolved;
         Ok(())
     }
 }
@@ -69,7 +71,8 @@ impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
             return Err(E_POINTER.into());
         }
 
-        let bitmap = unsafe { create_prototype_bitmap(cx.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE))? };
+        let bitmap =
+            unsafe { create_prototype_bitmap(cx.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE))? };
         unsafe {
             *phbmp = bitmap;
             *pdwalpha = WTSAT_ARGB;
@@ -250,7 +253,15 @@ fn prototype_bgra_pixels(size: u32) -> Vec<u8> {
     let lower = size - upper;
 
     draw_line(&mut pixels, size, margin, upper, center, margin, mesh);
-    draw_line(&mut pixels, size, center, margin, size - margin, upper, mesh);
+    draw_line(
+        &mut pixels,
+        size,
+        center,
+        margin,
+        size - margin,
+        upper,
+        mesh,
+    );
     draw_line(&mut pixels, size, margin, upper, center, lower, mesh);
     draw_line(&mut pixels, size, size - margin, upper, center, lower, mesh);
     draw_line(&mut pixels, size, center, margin, center, lower, mesh);
@@ -270,7 +281,12 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
             .round()
             .clamp(0.0, 255.0) as u8
     };
-    [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]), mix(a[3], b[3])]
+    [
+        mix(a[0], b[0]),
+        mix(a[1], b[1]),
+        mix(a[2], b[2]),
+        mix(a[3], b[3]),
+    ]
 }
 
 fn put_pixel(buffer: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4]) {
@@ -356,10 +372,16 @@ mod tests {
     #[test]
     fn prototype_bitmap_respects_size_bounds() {
         let tiny = prototype_bgra_pixels(1);
-        assert_eq!(tiny.len(), (MIN_THUMBNAIL_SIZE * MIN_THUMBNAIL_SIZE * 4) as usize);
+        assert_eq!(
+            tiny.len(),
+            (MIN_THUMBNAIL_SIZE * MIN_THUMBNAIL_SIZE * 4) as usize
+        );
 
         let huge = prototype_bgra_pixels(10_000);
-        assert_eq!(huge.len(), (MAX_THUMBNAIL_SIZE * MAX_THUMBNAIL_SIZE * 4) as usize);
+        assert_eq!(
+            huge.len(),
+            (MAX_THUMBNAIL_SIZE * MAX_THUMBNAIL_SIZE * 4) as usize
+        );
     }
 
     #[test]

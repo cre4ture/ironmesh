@@ -4744,7 +4744,6 @@ async fn build_test_state(
             super::RendezvousEndpointRegistrationRuntime::default(),
         )]))),
         relay_mode: super::RelayMode::Fallback,
-        local_edge_mode: false,
         enrollment_issuer_url: None,
         node_enrollment_path: None,
         node_enrollment_auto_renew_enabled: false,
