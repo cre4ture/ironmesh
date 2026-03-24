@@ -3,9 +3,10 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
-  xmlns:cloudFiles="http://schemas.microsoft.com/appx/manifest/cloudfiles/windows10"
-  IgnorableNamespaces="uap desktop com cloudFiles">
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap desktop desktop3 com rescap">
   <Identity
     Name="Ironmesh.ThumbnailProvider.Prototype"
     Publisher="CN=Ironmesh Dev"
@@ -22,6 +23,9 @@
   <Dependencies>
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.22631.0" />
   </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
   <Applications>
     <Application
       Id="IronmeshThumbnailProvider"
@@ -38,17 +42,17 @@
           <com:ComServer>
             <com:SurrogateServer DisplayName="Ironmesh Thumbnail Provider">
               <com:Class
-                Id="{D2E0FD2A-1D7B-4BE4-920A-8A6D019454CB}"
+                Id="D2E0FD2A-1D7B-4BE4-920A-8A6D019454CB"
                 Path="windows_thumbnail_provider.dll"
                 ThreadingModel="STA" />
             </com:SurrogateServer>
           </com:ComServer>
         </com:Extension>
-        <cloudFiles:Extension Category="windows.cloudFiles">
-          <cloudFiles:CloudFiles>
-            <cloudFiles:ThumbnailProviderHandler Clsid="{D2E0FD2A-1D7B-4BE4-920A-8A6D019454CB}" />
-          </cloudFiles:CloudFiles>
-        </cloudFiles:Extension>
+        <desktop3:Extension Category="windows.cloudFiles">
+          <desktop3:CloudFiles IconResource="Assets/SmallLogo.png">
+            <desktop3:ThumbnailProviderHandler Clsid="D2E0FD2A-1D7B-4BE4-920A-8A6D019454CB" />
+          </desktop3:CloudFiles>
+        </desktop3:Extension>
       </Extensions>
     </Application>
   </Applications>

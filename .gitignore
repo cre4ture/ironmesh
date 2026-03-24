@@ -17,3 +17,4 @@ web/test-results
 ironmesh-client-*.json
 map/maptiler-osm-2020-02-10-v3.11-planet.mbtiles
 start_node.sh
+windows/thumbnail-provider/out/

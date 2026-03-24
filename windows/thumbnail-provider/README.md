@@ -59,3 +59,54 @@ That is intentional for this first slice:
 - first prove that Explorer loads the thumbnail handler at all,
 - then wire in real Ironmesh thumbnail fetching,
 - then automate packaging/install.
+
+## Helper script
+
+There is now a PowerShell helper at `windows/thumbnail-provider/Build-PrototypePackage.ps1`.
+
+Typical usage:
+
+1. Stage only:
+   - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -StageOnly`
+2. Build, pack, sign, and install:
+   - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install`
+
+The helper will:
+
+- build `windows-thumbnail-provider`
+- build `os-integration`
+- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, and `os-integration.exe`
+- if the Windows SDK tools are installed, also:
+  - create/reuse a self-signed developer certificate
+  - generate an `.msix`
+  - sign it
+  - optionally install it with `Add-AppxPackage`
+
+Notes:
+
+- the helper auto-discovers `MakeAppx.exe` and `SignTool.exe` under `C:\Program Files (x86)\Windows Kits\10\bin` even if they are not on `PATH`
+- `-StageOnly` is the safest way to verify the prototype package contents today
+- full `MakeAppx` validation for the thumbnail-provider manifest is still prototype-grade and may need another iteration before installation succeeds end to end
+
+## What you need installed for MSIX
+
+Already available on most Windows developer machines:
+
+- PowerShell `Add-AppxPackage`
+- PowerShell certificate cmdlets like `New-SelfSignedCertificate`
+
+Still required for packaging/signing if they are missing:
+
+- Windows 10 or Windows 11 SDK
+  - specifically the MSIX packaging tools:
+    - `MakeAppx.exe`
+    - `SignTool.exe`
+
+Useful official docs:
+
+- MakeAppx tool:
+  - <https://learn.microsoft.com/en-us/windows/msix/package/create-app-package-with-makeappx-tool>
+- Create a signing certificate:
+  - <https://learn.microsoft.com/en-us/windows/msix/package/create-certificate-package-signing>
+
+If the SDK tools are not installed yet, the helper still gives you a ready-to-package staging folder under `windows/thumbnail-provider/out/stage`.
