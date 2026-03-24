@@ -4,7 +4,9 @@ use std::ffi::c_void;
 use std::ptr::{copy_nonoverlapping, null_mut};
 use std::sync::Mutex;
 
-use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, S_FALSE};
+use windows::Win32::Foundation::{
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_POINTER, S_FALSE,
+};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, HBITMAP,
 };
@@ -17,7 +19,18 @@ use windows_core::{BOOL, GUID, HRESULT, IUnknown, Interface, PWSTR, Ref, Result,
 
 pub const THUMBNAIL_PROVIDER_CLSID: GUID =
     GUID::from_u128(0xd2e0fd2a_1d7b_4be4_920a_8a6d019454cb);
-pub const THUMBNAIL_PROVIDER_CLSID_TEXT: &str = "{D2E0FD2A-1D7B-4BE4-920A-8A6D019454CB}";
+pub const CUSTOM_STATE_HANDLER_CLSID: GUID =
+    GUID::from_u128(0x2a69ab09_87fb_4af7_93c4_6ca7d4853fd0);
+pub const EXTENDED_PROPERTY_HANDLER_CLSID: GUID =
+    GUID::from_u128(0x7d0f3be1_4d8f_4f40_b4fd_8c098d7b96a2);
+pub const BANNERS_HANDLER_CLSID: GUID =
+    GUID::from_u128(0x8a98e31d_1d95_4d26_9dd9_32e2bb3c652a);
+pub const CONTEXT_MENU_HANDLER_CLSID: GUID =
+    GUID::from_u128(0x8d3bf08a_6c23_40bf_9fcb_46bb6f6be13a);
+pub const CONTENT_URI_SOURCE_CLSID: GUID =
+    GUID::from_u128(0xf1aa7371_0c71_4519_8c04_a41dc77f6af1);
+pub const STATUS_UI_SOURCE_FACTORY_CLSID: GUID =
+    GUID::from_u128(0x47e87ba5_1eb9_4f16_a944_4684850839b5);
 
 const MIN_THUMBNAIL_SIZE: u32 = 32;
 const MAX_THUMBNAIL_SIZE: u32 = 512;
@@ -96,6 +109,29 @@ impl IClassFactory_Impl for IronmeshThumbnailProviderFactory_Impl {
     }
 }
 
+#[implement(IClassFactory)]
+struct UnsupportedHandlerFactory;
+
+#[allow(non_snake_case)]
+impl IClassFactory_Impl for UnsupportedHandlerFactory_Impl {
+    fn CreateInstance(
+        &self,
+        punkouter: Ref<'_, IUnknown>,
+        _riid: *const GUID,
+        _ppvobject: *mut *mut c_void,
+    ) -> Result<()> {
+        if !punkouter.is_null() {
+            return Err(CLASS_E_NOAGGREGATION.into());
+        }
+
+        Err(E_NOINTERFACE.into())
+    }
+
+    fn LockServer(&self, _flock: BOOL) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
 /// # Safety
@@ -116,11 +152,15 @@ pub unsafe extern "system" fn DllGetClassObject(
         *ppv = null_mut();
     }
 
-    if unsafe { *rclsid } != THUMBNAIL_PROVIDER_CLSID {
+    let clsid = unsafe { *rclsid };
+    let factory: IUnknown = if clsid == THUMBNAIL_PROVIDER_CLSID {
+        IronmeshThumbnailProviderFactory.into()
+    } else if is_unsupported_handler_clsid(clsid) {
+        UnsupportedHandlerFactory.into()
+    } else {
         return CLASS_E_CLASSNOTAVAILABLE;
-    }
+    };
 
-    let factory: IUnknown = IronmeshThumbnailProviderFactory.into();
     match unsafe { factory.query(riid, ppv.cast()).ok() } {
         Ok(()) => HRESULT(0),
         Err(error) => error.code(),
@@ -131,6 +171,15 @@ pub unsafe extern "system" fn DllGetClassObject(
 #[allow(non_snake_case)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_FALSE
+}
+
+fn is_unsupported_handler_clsid(clsid: GUID) -> bool {
+    clsid == CUSTOM_STATE_HANDLER_CLSID
+        || clsid == EXTENDED_PROPERTY_HANDLER_CLSID
+        || clsid == BANNERS_HANDLER_CLSID
+        || clsid == CONTEXT_MENU_HANDLER_CLSID
+        || clsid == CONTENT_URI_SOURCE_CLSID
+        || clsid == STATUS_UI_SOURCE_FACTORY_CLSID
 }
 
 unsafe fn shell_item_path(item: &IShellItem) -> Option<String> {
