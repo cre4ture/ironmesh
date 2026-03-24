@@ -269,6 +269,8 @@ struct UploadSessionRecord {
     created_at_unix: u64,
     updated_at_unix: u64,
     expires_at_unix: u64,
+    #[serde(default)]
+    finalizing: bool,
     completed: bool,
     completed_result: Option<UploadSessionCompleteResponse>,
 }
@@ -5462,6 +5464,7 @@ async fn start_upload_session(
         created_at_unix: now,
         updated_at_unix: now,
         expires_at_unix: now.saturating_add(UPLOAD_SESSION_TTL_SECS),
+        finalizing: false,
         completed: false,
         completed_result: None,
     };
@@ -5513,6 +5516,9 @@ async fn delete_upload_session(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if session.finalizing {
+        return StatusCode::CONFLICT.into_response();
+    }
 
     sessions.sessions.remove(&upload_id);
     if let Err(err) = persist_upload_session_store(&sessions).await {
@@ -5530,29 +5536,33 @@ async fn upload_session_chunk(
     payload: Bytes,
 ) -> impl IntoResponse {
     let requester_device_id = request_device_id(&headers);
-    let now = unix_ts();
+    let (total_size_bytes, chunk_size_bytes, chunk_count) = {
+        let now = unix_ts();
+        let mut sessions = state.upload_sessions.lock().await;
+        prune_expired_upload_sessions(&mut sessions, now);
 
-    let mut sessions = state.upload_sessions.lock().await;
-    prune_expired_upload_sessions(&mut sessions, now);
+        let Some(session) = sessions.sessions.get(&upload_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if let Some(owner_device_id) = session.owner_device_id.as_deref()
+            && requester_device_id.as_deref() != Some(owner_device_id)
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if session.completed || session.finalizing {
+            return StatusCode::CONFLICT.into_response();
+        }
 
-    let Some(session) = sessions.sessions.get_mut(&upload_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+        (
+            session.total_size_bytes,
+            session.chunk_size_bytes,
+            session.chunk_count,
+        )
     };
-    if let Some(owner_device_id) = session.owner_device_id.as_deref()
-        && requester_device_id.as_deref() != Some(owner_device_id)
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if session.completed {
-        return StatusCode::CONFLICT.into_response();
-    }
 
-    let Some(expected_size) = expected_upload_chunk_size(
-        session.total_size_bytes,
-        session.chunk_size_bytes,
-        session.chunk_count,
-        index,
-    ) else {
+    let Some(expected_size) =
+        expected_upload_chunk_size(total_size_bytes, chunk_size_bytes, chunk_count, index)
+    else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     if payload.len() != expected_size {
@@ -5573,6 +5583,22 @@ async fn upload_session_chunk(
         hash,
         size_bytes: payload.len(),
     };
+
+    let now = unix_ts();
+    let mut sessions = state.upload_sessions.lock().await;
+    prune_expired_upload_sessions(&mut sessions, now);
+
+    let Some(session) = sessions.sessions.get_mut(&upload_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(owner_device_id) = session.owner_device_id.as_deref()
+        && requester_device_id.as_deref() != Some(owner_device_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if session.completed || session.finalizing {
+        return StatusCode::CONFLICT.into_response();
+    }
 
     if let Some(existing) = session
         .received_chunks
@@ -5605,55 +5631,78 @@ async fn complete_upload_session_route(
     Path(upload_id): Path<String>,
 ) -> impl IntoResponse {
     let requester_device_id = request_device_id(&headers);
-    let now = unix_ts();
-    let mut sessions = state.upload_sessions.lock().await;
-    prune_expired_upload_sessions(&mut sessions, now);
+    let (key, total_size_bytes, parent_version_ids, version_state, explicit_version_id, chunk_refs) = {
+        let now = unix_ts();
+        let mut sessions = state.upload_sessions.lock().await;
+        prune_expired_upload_sessions(&mut sessions, now);
 
-    let Some(session) = sessions.sessions.get_mut(&upload_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+        let Some(session) = sessions.sessions.get_mut(&upload_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if let Some(owner_device_id) = session.owner_device_id.as_deref()
+            && requester_device_id.as_deref() != Some(owner_device_id)
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if session.completed
+            && let Some(result) = session.completed_result.clone()
+        {
+            return (StatusCode::OK, Json(result)).into_response();
+        }
+        if session.finalizing || session.received_chunks.iter().any(|entry| entry.is_none()) {
+            return StatusCode::CONFLICT.into_response();
+        }
+
+        session.finalizing = true;
+        session.updated_at_unix = now;
+        session.expires_at_unix = now.saturating_add(UPLOAD_SESSION_TTL_SECS);
+
+        (
+            session.key.clone(),
+            session.total_size_bytes,
+            session.parent_version_ids.clone(),
+            session.state.clone(),
+            session.explicit_version_id.clone(),
+            session
+                .received_chunks
+                .iter()
+                .filter_map(|entry| entry.clone())
+                .collect::<Vec<_>>(),
+        )
     };
-    if let Some(owner_device_id) = session.owner_device_id.as_deref()
-        && requester_device_id.as_deref() != Some(owner_device_id)
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if session.completed
-        && let Some(result) = session.completed_result.clone()
-    {
-        return (StatusCode::OK, Json(result)).into_response();
-    }
-    if session.received_chunks.iter().any(|entry| entry.is_none()) {
-        return StatusCode::CONFLICT.into_response();
-    }
-
-    let chunk_refs = session
-        .received_chunks
-        .iter()
-        .filter_map(|entry| entry.clone())
-        .collect::<Vec<_>>();
 
     let outcome = {
         let mut store = state.store.lock().await;
         match store
             .put_object_from_chunks(
-                &session.key,
-                session.total_size_bytes as usize,
+                &key,
+                total_size_bytes as usize,
                 &chunk_refs,
                 PutOptions {
-                    parent_version_ids: session.parent_version_ids.clone(),
-                    state: session.state.clone(),
+                    parent_version_ids: parent_version_ids.clone(),
+                    state: version_state.clone(),
                     inherit_preferred_parent: true,
                     create_snapshot: true,
-                    explicit_version_id: session.explicit_version_id.clone(),
+                    explicit_version_id: explicit_version_id.clone(),
                 },
             )
             .await
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                let mut sessions = state.upload_sessions.lock().await;
+                if let Some(session) = sessions.sessions.get_mut(&upload_id)
+                    && !session.completed
+                {
+                    session.finalizing = false;
+                    session.updated_at_unix = unix_ts();
+                    session.expires_at_unix = session
+                        .updated_at_unix
+                        .saturating_add(UPLOAD_SESSION_TTL_SECS);
+                }
                 tracing::error!(
                     error = %err,
-                    key = %session.key,
+                    key = %key,
                     upload_id = %upload_id,
                     "failed to finalize upload session"
                 );
@@ -5663,16 +5712,12 @@ async fn complete_upload_session_route(
     };
 
     publish_namespace_change(&state);
-    spawn_media_cache_warmup(
-        state.clone(),
-        session.key.clone(),
-        outcome.manifest_hash.clone(),
-    );
+    spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
     let mut cluster = state.cluster.lock().await;
-    cluster.note_replica(&session.key, state.node_id);
+    cluster.note_replica(&key, state.node_id);
     cluster.note_replica(
-        format!("{}@{}", session.key, outcome.version_id.as_str()),
+        format!("{}@{}", key, outcome.version_id.as_str()),
         state.node_id,
     );
     drop(cluster);
@@ -5714,12 +5759,24 @@ async fn complete_upload_session_route(
         new_chunks: outcome.new_chunks,
         dedup_reused_chunks: outcome.dedup_reused_chunks,
         created_new_version: outcome.created_new_version,
-        total_size_bytes: session.total_size_bytes,
+        total_size_bytes,
     };
-    session.completed = true;
-    session.completed_result = Some(response.clone());
-    session.updated_at_unix = now;
-    session.expires_at_unix = now.saturating_add(UPLOAD_SESSION_TTL_SECS);
+    let now = unix_ts();
+    let mut sessions = state.upload_sessions.lock().await;
+    if let Some(session) = sessions.sessions.get_mut(&upload_id) {
+        session.completed = true;
+        session.finalizing = false;
+        session.completed_result = Some(response.clone());
+        session.updated_at_unix = now;
+        session.expires_at_unix = now.saturating_add(UPLOAD_SESSION_TTL_SECS);
+    } else {
+        warn!(
+            upload_id = %upload_id,
+            key = %key,
+            "upload session disappeared before completion state could be persisted"
+        );
+        return (StatusCode::OK, Json(response)).into_response();
+    }
     if let Err(err) = persist_upload_session_store(&sessions).await {
         warn!(error = %err, "failed to persist completed upload session");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
