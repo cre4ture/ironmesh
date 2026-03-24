@@ -29,6 +29,12 @@ function Invoke-NativeChecked {
     }
 }
 
+function Test-IsElevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Get-RepoRoot {
     $scriptDir = Split-Path -Parent $PSCommandPath
     return (Resolve-Path (Join-Path $scriptDir "..\\..")).Path
@@ -105,6 +111,30 @@ function Ensure-CodeSigningCertificate {
     if (-not $trusted) {
         Import-Certificate -FilePath $CerPath -CertStoreLocation "Cert:\\CurrentUser\\TrustedPeople" | Out-Null
     }
+
+    return $existing
+}
+
+function Ensure-LocalMachineTrustedPeopleCertificate {
+    param(
+        [string]$PfxPath,
+        [string]$Password,
+        [string]$Thumbprint
+    )
+
+    $existing = Get-ChildItem Cert:\\LocalMachine\\TrustedPeople -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $Thumbprint } |
+        Select-Object -First 1
+    if ($existing) {
+        return
+    }
+
+    if (-not (Test-IsElevated)) {
+        throw "Installing the MSIX package requires the signing certificate to be imported into Cert:\\LocalMachine\\TrustedPeople. Re-run this script from an elevated PowerShell when using -Install."
+    }
+
+    $securePassword = ConvertTo-SecureString -String $Password -AsPlainText -Force
+    Import-PfxCertificate -FilePath $PfxPath -Password $securePassword -CertStoreLocation "Cert:\\LocalMachine\\TrustedPeople" | Out-Null
 }
 
 $repoRoot = Get-RepoRoot
@@ -183,7 +213,7 @@ if (Test-Path $packagePath) {
     Remove-Item -Force $packagePath
 }
 
-Ensure-CodeSigningCertificate `
+$certificate = Ensure-CodeSigningCertificate `
     -Subject $CertificateSubject `
     -PfxPath $pfxPath `
     -CerPath $cerPath `
@@ -196,6 +226,12 @@ Write-Step "Signing package with SignTool.exe"
 Invoke-NativeChecked -FilePath $signTool -Arguments @("sign", "/fd", "SHA256", "/f", $pfxPath, "/p", $CertificatePassword, $packagePath)
 
 if ($Install) {
+    Write-Step "Trusting development certificate for package installation"
+    Ensure-LocalMachineTrustedPeopleCertificate `
+        -PfxPath $pfxPath `
+        -Password $CertificatePassword `
+        -Thumbprint $certificate.Thumbprint
+
     Write-Step "Installing package"
     Add-AppxPackage -Path $packagePath
 }

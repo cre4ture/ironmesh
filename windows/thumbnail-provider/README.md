@@ -87,7 +87,7 @@ Notes:
 - the helper auto-discovers `MakeAppx.exe` and `SignTool.exe` under `C:\Program Files (x86)\Windows Kits\10\bin` even if they are not on `PATH`
 - `-StageOnly` is the safest way to verify the prototype package contents today
 - full `.msix` packing and signing now work on a machine with the Windows SDK tools available
-- `-Install` is optional and may require the usual Windows developer/sideloading settings for local package installation
+- `-Install` is optional and may require both the usual Windows developer/sideloading settings and an elevated PowerShell so the self-signed cert can be imported into `Cert:\LocalMachine\TrustedPeople`
 
 ## What you need installed for MSIX
 
