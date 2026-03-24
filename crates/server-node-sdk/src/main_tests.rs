@@ -4132,6 +4132,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
             labels: HashMap::new(),
             capacity_bytes: 1_000_000,
             free_bytes: 900_000,
+            storage_stats: None,
             last_heartbeat_unix: super::unix_ts(),
             status: super::cluster::NodeStatus::Online,
         });
@@ -4685,6 +4686,7 @@ async fn build_test_state(
         labels: HashMap::new(),
         capacity_bytes: 1_000_000,
         free_bytes: 900_000,
+        storage_stats: None,
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     });
@@ -4705,6 +4707,7 @@ async fn build_test_state(
             labels: HashMap::new(),
             capacity_bytes: 1_000_000,
             free_bytes: 800_000,
+            storage_stats: None,
             last_heartbeat_unix: 0,
             status: cluster::NodeStatus::Online,
         });
@@ -4954,6 +4957,7 @@ async fn register_node_uses_structured_reachability_payload() {
                 labels: HashMap::from([("dc".to_string(), "edge-a".to_string())]),
                 capacity_bytes: Some(100),
                 free_bytes: Some(40),
+                storage_stats: None,
             }),
         )
         .await,
@@ -5027,6 +5031,7 @@ async fn resolve_peer_base_url_prefers_internal_url() {
         labels: HashMap::new(),
         capacity_bytes: 0,
         free_bytes: 0,
+        storage_stats: None,
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     };
@@ -5049,6 +5054,7 @@ async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
         labels: HashMap::new(),
         capacity_bytes: 0,
         free_bytes: 0,
+        storage_stats: None,
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     };
@@ -5078,6 +5084,7 @@ async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() 
         labels: HashMap::new(),
         capacity_bytes: 0,
         free_bytes: 0,
+        storage_stats: None,
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     };
@@ -5115,6 +5122,7 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
         labels: HashMap::new(),
         capacity_bytes: 0,
         free_bytes: 0,
+        storage_stats: None,
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     };
@@ -5162,6 +5170,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
                 labels: HashMap::new(),
                 capacity_bytes: 1_000_000,
                 free_bytes: 800_000,
+                storage_stats: None,
                 last_heartbeat_unix: 0,
                 status: cluster::NodeStatus::Online,
             };

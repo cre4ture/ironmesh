@@ -31,6 +31,20 @@ pub struct NodeCapabilities {
     pub relay_tunnel: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeStorageStatsSummary {
+    pub collected_at_unix: u64,
+    pub latest_snapshot_id: Option<String>,
+    pub latest_snapshot_created_at_unix: Option<u64>,
+    pub latest_snapshot_object_count: usize,
+    pub chunk_store_bytes: u64,
+    pub manifest_store_bytes: u64,
+    pub metadata_db_bytes: u64,
+    pub media_cache_bytes: u64,
+    pub latest_snapshot_logical_bytes: u64,
+    pub latest_snapshot_unique_chunk_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDescriptor {
     pub node_id: NodeId,
@@ -39,6 +53,8 @@ pub struct NodeDescriptor {
     pub labels: HashMap<String, String>,
     pub capacity_bytes: u64,
     pub free_bytes: u64,
+    #[serde(default)]
+    pub storage_stats: Option<NodeStorageStatsSummary>,
     pub last_heartbeat_unix: u64,
     pub status: NodeStatus,
 }
@@ -157,6 +173,11 @@ impl ClusterService {
     }
 
     pub fn register_node(&mut self, mut descriptor: NodeDescriptor) {
+        if let Some(existing) = self.nodes.get(&descriptor.node_id)
+            && descriptor.storage_stats.is_none()
+        {
+            descriptor.storage_stats = existing.storage_stats.clone();
+        }
         descriptor.last_heartbeat_unix = unix_ts();
         descriptor.status = NodeStatus::Online;
         self.nodes.insert(descriptor.node_id, descriptor);
@@ -184,6 +205,7 @@ impl ClusterService {
         node_id: NodeId,
         free_bytes: Option<u64>,
         capacity_bytes: Option<u64>,
+        storage_stats: Option<NodeStorageStatsSummary>,
         labels: Option<HashMap<String, String>>,
     ) -> bool {
         if let Some(node) = self.nodes.get_mut(&node_id) {
@@ -194,6 +216,9 @@ impl ClusterService {
             }
             if let Some(capacity) = capacity_bytes {
                 node.capacity_bytes = capacity;
+            }
+            if let Some(storage_stats) = storage_stats {
+                node.storage_stats = Some(storage_stats);
             }
             if let Some(labels) = labels {
                 node.labels = labels;
@@ -209,10 +234,27 @@ impl ClusterService {
         node_id: NodeId,
         free_bytes: u64,
         capacity_bytes: u64,
+        storage_stats: Option<NodeStorageStatsSummary>,
     ) -> bool {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.free_bytes = free_bytes;
             node.capacity_bytes = capacity_bytes;
+            if let Some(storage_stats) = storage_stats {
+                node.storage_stats = Some(storage_stats);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn update_node_storage_stats(
+        &mut self,
+        node_id: NodeId,
+        storage_stats: NodeStorageStatsSummary,
+    ) -> bool {
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            node.storage_stats = Some(storage_stats);
             true
         } else {
             false
@@ -657,8 +699,24 @@ mod tests {
             labels,
             capacity_bytes: 1_000,
             free_bytes,
+            storage_stats: None,
             last_heartbeat_unix: unix_ts(),
             status: NodeStatus::Online,
+        }
+    }
+
+    fn sample_storage_stats(chunk_store_bytes: u64) -> NodeStorageStatsSummary {
+        NodeStorageStatsSummary {
+            collected_at_unix: 100,
+            latest_snapshot_id: Some("snapshot-a".to_string()),
+            latest_snapshot_created_at_unix: Some(90),
+            latest_snapshot_object_count: 3,
+            chunk_store_bytes,
+            manifest_store_bytes: 20,
+            metadata_db_bytes: 30,
+            media_cache_bytes: 40,
+            latest_snapshot_logical_bytes: 50,
+            latest_snapshot_unique_chunk_bytes: 60,
         }
     }
 
@@ -678,6 +736,62 @@ mod tests {
         let p1 = svc.placement_for_key("alpha");
         let p2 = svc.placement_for_key("alpha");
         assert_eq!(p1.selected_nodes, p2.selected_nodes);
+    }
+
+    #[test]
+    fn register_node_preserves_existing_storage_stats_when_refresh_descriptor_omits_them() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+        let node_id = NodeId::new_v4();
+
+        let mut initial = mk_node(node_id, "dc-a", "rack-a", 500);
+        initial.storage_stats = Some(sample_storage_stats(123));
+        svc.register_node(initial);
+
+        let replacement = mk_node(node_id, "dc-a", "rack-a", 400);
+        svc.register_node(replacement);
+
+        let node = svc
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .expect("expected registered node");
+        assert_eq!(
+            node.storage_stats
+                .as_ref()
+                .map(|stats| stats.chunk_store_bytes),
+            Some(123)
+        );
+        assert_eq!(node.free_bytes, 400);
+    }
+
+    #[test]
+    fn touch_heartbeat_updates_storage_stats_summary() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+        let node_id = NodeId::new_v4();
+
+        svc.register_node(mk_node(node_id, "dc-a", "rack-a", 500));
+        assert!(svc.touch_heartbeat(
+            node_id,
+            Some(450),
+            Some(1_000),
+            Some(sample_storage_stats(456)),
+            None,
+        ));
+
+        let node = svc
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .expect("expected registered node");
+        assert_eq!(node.free_bytes, 450);
+        assert_eq!(
+            node.storage_stats
+                .as_ref()
+                .map(|stats| stats.chunk_store_bytes),
+            Some(456)
+        );
     }
 
     #[test]

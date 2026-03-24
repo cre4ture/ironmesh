@@ -98,8 +98,8 @@ const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
 const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 
 use cluster::{
-    ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, ReplicationPlan,
-    ReplicationPolicy,
+    ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
+    ReplicationPlan, ReplicationPolicy,
 };
 use setup::{
     ManagedRendezvousFailoverPackage, ManagedSignerBackup,
@@ -2817,6 +2817,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         labels: config.labels.clone(),
         capacity_bytes: 0,
         free_bytes: 0,
+        storage_stats: None,
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     });
@@ -3506,6 +3507,21 @@ fn storage_stats_for_path(path: &FsPath) -> Result<(u64, u64)> {
     Ok((capacity_bytes, free_bytes.min(capacity_bytes)))
 }
 
+fn summarize_storage_stats(sample: &StorageStatsSample) -> NodeStorageStatsSummary {
+    NodeStorageStatsSummary {
+        collected_at_unix: sample.collected_at_unix,
+        latest_snapshot_id: sample.latest_snapshot_id.clone(),
+        latest_snapshot_created_at_unix: sample.latest_snapshot_created_at_unix,
+        latest_snapshot_object_count: sample.latest_snapshot_object_count,
+        chunk_store_bytes: sample.chunk_store_bytes,
+        manifest_store_bytes: sample.manifest_store_bytes,
+        metadata_db_bytes: sample.metadata_db_bytes,
+        media_cache_bytes: sample.media_cache_bytes,
+        latest_snapshot_logical_bytes: sample.latest_snapshot_logical_bytes,
+        latest_snapshot_unique_chunk_bytes: sample.latest_snapshot_unique_chunk_bytes,
+    }
+}
+
 async fn refresh_local_node_storage(state: &ServerState) {
     let (capacity_bytes, free_bytes) = match storage_stats_for_path(&state.data_dir) {
         Ok(stats) => stats,
@@ -3520,7 +3536,7 @@ async fn refresh_local_node_storage(state: &ServerState) {
     };
 
     let mut cluster = state.cluster.lock().await;
-    let _ = cluster.update_node_storage(state.node_id, free_bytes, capacity_bytes);
+    let _ = cluster.update_node_storage(state.node_id, free_bytes, capacity_bytes, None);
 }
 
 async fn refresh_storage_stats_once(state: &ServerState) {
@@ -3561,6 +3577,13 @@ async fn refresh_storage_stats_once(state: &ServerState) {
             runtime.collecting = false;
             match persist_result {
                 Ok(()) => {
+                    {
+                        let mut cluster = state.cluster.lock().await;
+                        let _ = cluster.update_node_storage_stats(
+                            state.node_id,
+                            summarize_storage_stats(&sample),
+                        );
+                    }
                     runtime.last_success_unix = Some(sample.collected_at_unix);
                     runtime.last_error = None;
                 }
@@ -3952,6 +3975,7 @@ fn node_descriptor_from_presence_entry(
         labels: entry.registration.labels.clone(),
         capacity_bytes: entry.registration.capacity_bytes.unwrap_or(0),
         free_bytes: entry.registration.free_bytes.unwrap_or(0),
+        storage_stats: None,
         last_heartbeat_unix: entry.updated_at_unix,
         status: cluster::NodeStatus::Online,
     })
@@ -4887,6 +4911,7 @@ fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
             let payload = OutboundNodeHeartbeatRequest {
                 free_bytes: Some(local_descriptor.free_bytes),
                 capacity_bytes: Some(local_descriptor.capacity_bytes),
+                storage_stats: local_descriptor.storage_stats,
                 labels: Some(local_descriptor.labels),
             };
 
@@ -6919,12 +6944,16 @@ struct RegisterNodeRequest {
     labels: HashMap<String, String>,
     capacity_bytes: Option<u64>,
     free_bytes: Option<u64>,
+    #[serde(default)]
+    storage_stats: Option<NodeStorageStatsSummary>,
 }
 
 #[derive(Debug, Deserialize)]
 struct NodeHeartbeatRequest {
     free_bytes: Option<u64>,
     capacity_bytes: Option<u64>,
+    #[serde(default)]
+    storage_stats: Option<NodeStorageStatsSummary>,
     labels: Option<HashMap<String, String>>,
 }
 
@@ -6932,6 +6961,8 @@ struct NodeHeartbeatRequest {
 struct OutboundNodeHeartbeatRequest {
     free_bytes: Option<u64>,
     capacity_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_stats: Option<NodeStorageStatsSummary>,
     labels: Option<HashMap<String, String>>,
 }
 
@@ -10231,6 +10262,7 @@ async fn apply_node_heartbeat(
         node_id,
         request.free_bytes,
         request.capacity_bytes,
+        request.storage_stats,
         request.labels,
     ) {
         StatusCode::NO_CONTENT
@@ -10277,6 +10309,7 @@ async fn register_node(
         labels: request.labels,
         capacity_bytes: request.capacity_bytes.unwrap_or(0),
         free_bytes: request.free_bytes.unwrap_or(0),
+        storage_stats: request.storage_stats,
         last_heartbeat_unix: 0,
         status: cluster::NodeStatus::Online,
     });

@@ -433,12 +433,23 @@ export function DashboardPage() {
                       <Table.Th>Reachability</Table.Th>
                       <Table.Th>Capacity</Table.Th>
                       <Table.Th>Free</Table.Th>
+                      <Table.Th>Chunk Store</Table.Th>
+                      <Table.Th>Metadata</Table.Th>
+                      <Table.Th>Snapshot</Table.Th>
                       <Table.Th>Last heartbeat</Table.Th>
                     </Table.Tr>
                   </Table.Thead>
                   <Table.Tbody>
                     {nodes.length > 0 ? (
-                      nodes.map((node) => (
+                      nodes.map((node) => {
+                        const nodeStorageStats = node.storage_stats ?? null;
+                        const metadataFootprintBytes = nodeStorageStats
+                          ? nodeStorageStats.metadata_db_bytes +
+                            nodeStorageStats.manifest_store_bytes +
+                            nodeStorageStats.media_cache_bytes
+                          : null;
+
+                        return (
                         <Table.Tr key={node.node_id}>
                           <Table.Td>{node.node_id}</Table.Td>
                           <Table.Td>
@@ -453,12 +464,45 @@ export function DashboardPage() {
                           </Table.Td>
                           <Table.Td>{formatBytes(node.capacity_bytes)}</Table.Td>
                           <Table.Td>{formatBytes(node.free_bytes)}</Table.Td>
+                          <Table.Td>
+                            {nodeStorageStats ? (
+                              <Stack gap={2}>
+                                <Text size="sm">{formatBytes(nodeStorageStats.chunk_store_bytes)}</Text>
+                                <Text size="xs" c="dimmed">
+                                  {formatUnixTs(nodeStorageStats.collected_at_unix)}
+                                </Text>
+                              </Stack>
+                            ) : (
+                              <Text size="sm" c="dimmed">pending</Text>
+                            )}
+                          </Table.Td>
+                          <Table.Td>
+                            {metadataFootprintBytes !== null ? (
+                              <Text size="sm">{formatBytes(metadataFootprintBytes)}</Text>
+                            ) : (
+                              <Text size="sm" c="dimmed">pending</Text>
+                            )}
+                          </Table.Td>
+                          <Table.Td>
+                            {nodeStorageStats ? (
+                              <Stack gap={2}>
+                                <Text size="sm">
+                                  {formatBytes(nodeStorageStats.latest_snapshot_unique_chunk_bytes)}
+                                </Text>
+                                <Text size="xs" c="dimmed">
+                                  logical {formatBytes(nodeStorageStats.latest_snapshot_logical_bytes)}
+                                </Text>
+                              </Stack>
+                            ) : (
+                              <Text size="sm" c="dimmed">pending</Text>
+                            )}
+                          </Table.Td>
                           <Table.Td>{formatUnixTs(node.last_heartbeat_unix)}</Table.Td>
                         </Table.Tr>
-                      ))
+                      )})
                     ) : (
                       <Table.Tr>
-                        <Table.Td colSpan={6}>
+                        <Table.Td colSpan={9}>
                           <Text c="dimmed">No nodes discovered yet.</Text>
                         </Table.Td>
                       </Table.Tr>

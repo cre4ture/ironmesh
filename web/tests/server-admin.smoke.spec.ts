@@ -14,8 +14,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
-  await expect(page.getByText("Chunk Store", { exact: true })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
   await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
+  await expect(page.locator("td").filter({ hasText: /logical/ }).first()).toBeVisible();
   await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
   await expect(page.getByText("Sign in or provide an admin token override to inspect the live rendezvous registration details here.")).toBeVisible();
 
@@ -360,6 +361,18 @@ async function installServerAdminMocks(
           },
           capacity_bytes: 2_000_000_000,
           free_bytes: 1_250_000_000,
+          storage_stats: {
+            collected_at_unix: 1_900_000_100,
+            latest_snapshot_id: "snapshot-node-alpha",
+            latest_snapshot_created_at_unix: 1_900_000_090,
+            latest_snapshot_object_count: 12,
+            chunk_store_bytes: 1_024,
+            manifest_store_bytes: 256,
+            metadata_db_bytes: 512,
+            media_cache_bytes: 256,
+            latest_snapshot_logical_bytes: 8_192,
+            latest_snapshot_unique_chunk_bytes: 4_096
+          },
           last_heartbeat_unix: 1_900_000_000,
           status: "online"
         },
@@ -380,6 +393,18 @@ async function installServerAdminMocks(
           },
           capacity_bytes: 2_500_000_000,
           free_bytes: 1_500_000_000,
+          storage_stats: {
+            collected_at_unix: 1_900_000_110,
+            latest_snapshot_id: "snapshot-node-beta",
+            latest_snapshot_created_at_unix: 1_900_000_095,
+            latest_snapshot_object_count: 14,
+            chunk_store_bytes: 2_048,
+            manifest_store_bytes: 512,
+            metadata_db_bytes: 1_024,
+            media_cache_bytes: 512,
+            latest_snapshot_logical_bytes: 16_384,
+            latest_snapshot_unique_chunk_bytes: 12_288
+          },
           last_heartbeat_unix: 1_900_000_010,
           status: "online"
         }

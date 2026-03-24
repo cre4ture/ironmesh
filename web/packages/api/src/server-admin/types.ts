@@ -44,6 +44,7 @@ export type NodeDescriptor = {
   labels: Record<string, string>;
   capacity_bytes: number;
   free_bytes: number;
+  storage_stats?: StorageStatsSample | null;
   last_heartbeat_unix: number;
   status: "online" | "offline";
 };
