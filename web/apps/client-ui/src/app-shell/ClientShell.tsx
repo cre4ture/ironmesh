@@ -79,7 +79,10 @@ type BinaryUploadQueueStatus =
   | "failed";
 type BinaryUploadQueueItem = {
   id: string;
-  file: File;
+  sourceFile: File | null;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
   key: string;
   progress: BinaryUploadProgress;
   status: BinaryUploadQueueStatus;
@@ -336,8 +339,8 @@ function useBinaryUploadQueue(): BinaryUploadController {
       failed_files: nextSummary.failedFiles,
       files: nextQueue.map((item) => ({
         key: item.key,
-        filename: item.file.name,
-        size_bytes: item.file.size,
+        filename: item.filename,
+        size_bytes: item.sizeBytes,
         status: item.status === "failed" ? "failed" : "complete",
         error: item.error ?? undefined
       }))
@@ -359,15 +362,31 @@ function useBinaryUploadQueue(): BinaryUploadController {
         return current;
       }
 
+      const nextItem = current[nextIndex];
+      if (!nextItem.sourceFile) {
+        return current.map((item, index) =>
+          index === nextIndex
+            ? {
+                ...item,
+                status: "failed",
+                error: "Queued file source is no longer available."
+              }
+            : item
+        );
+      }
+
       claimed = {
-        ...current[nextIndex],
-        progress: createBinaryUploadProgress(current[nextIndex].file.size),
+        ...nextItem,
+        progress: createBinaryUploadProgress(nextItem.sizeBytes),
         status: "starting",
         error: null
       };
 
       const next = [...current];
-      next[nextIndex] = claimed;
+      next[nextIndex] = {
+        ...claimed,
+        sourceFile: null
+      };
       return next;
     });
 
@@ -387,8 +406,13 @@ function useBinaryUploadQueue(): BinaryUploadController {
       setRunning(true);
 
       void (async () => {
+        const sourceFile = item.sourceFile;
         try {
-          const payload = await putBinaryObject(item.key, item.file, (progress) => {
+          if (!sourceFile) {
+            throw new Error("Queued file source is no longer available.");
+          }
+
+          const payload = await putBinaryObject(item.key, sourceFile, (progress) => {
             setQueueAndRef((current) =>
               current.map((entry) =>
                 entry.id === item.id
@@ -497,8 +521,8 @@ function useBinaryUploadQueue(): BinaryUploadController {
       operation: "binary-upload-queue-add",
       queued_files: nextQueueItems.map((item) => ({
         key: item.key,
-        filename: item.file.name,
-        size_bytes: item.file.size
+        filename: item.filename,
+        size_bytes: item.sizeBytes
       })),
       skipped_duplicate_keys: duplicateKeys
     });
@@ -1220,10 +1244,10 @@ function StorePage({ binaryUpload }: { binaryUpload: BinaryUploadController }) {
                             <Table.Td>
                               <Stack gap={0}>
                                 <Text size="sm" fw={600}>
-                                  {item.file.name}
+                                  {item.filename}
                                 </Text>
                                 <Text size="xs" c="dimmed">
-                                  {item.file.type || "application/octet-stream"}
+                                  {item.contentType}
                                 </Text>
                               </Stack>
                             </Table.Td>
@@ -1262,7 +1286,7 @@ function StorePage({ binaryUpload }: { binaryUpload: BinaryUploadController }) {
                                 </Text>
                               </Stack>
                             </Table.Td>
-                            <Table.Td>{formatExplorerSize(item.file.size)}</Table.Td>
+                            <Table.Td>{formatExplorerSize(item.sizeBytes)}</Table.Td>
                             <Table.Td>
                               <Text size="xs" c={item.error ? "red" : "dimmed"}>
                                 {item.error ?? "—"}
@@ -1828,7 +1852,10 @@ function createBinaryUploadProgress(totalBytes: number): BinaryUploadProgress {
 function buildBinaryUploadQueueItem(file: File, key: string): BinaryUploadQueueItem {
   return {
     id: `${key}:${file.name}:${file.size}:${file.lastModified}`,
-    file,
+    sourceFile: file,
+    filename: file.name,
+    contentType: file.type || "application/octet-stream",
+    sizeBytes: file.size,
     key,
     progress: createBinaryUploadProgress(file.size),
     status: "queued",
