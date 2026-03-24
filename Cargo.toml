@@ -9,6 +9,7 @@ members = [
     "crates/sync-agent-core",
     "crates/adapter-linux-fuse",
     "crates/adapter-windows-cfapi",
+    "crates/windows-thumbnail-provider",
     "apps/server-node",
     "apps/rendezvous-service",
     "apps/cli-client",

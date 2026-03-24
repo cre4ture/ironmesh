@@ -1,6 +1,6 @@
 # Windows CFAPI Thumbnail Provider Plan
 
-Status: Design note for Explorer thumbnails on dehydrated Ironmesh placeholders
+Status: Design note plus initial fixed-bitmap prototype scaffold for Explorer thumbnails on dehydrated Ironmesh placeholders
 
 ## Goal
 
@@ -116,6 +116,14 @@ Add a Windows shell thumbnail-provider project:
 
 - recommended shape:
   - `windows/thumbnail-provider/`
+
+Current prototype files now in place:
+
+- package scaffold:
+  - `windows/thumbnail-provider/AppxManifest.xml`
+  - `windows/thumbnail-provider/README.md`
+- Rust COM DLL prototype:
+  - `crates/windows-thumbnail-provider`
 
 Recommended implementation style:
 

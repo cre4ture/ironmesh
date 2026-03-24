@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:cloudFiles="http://schemas.microsoft.com/appx/manifest/cloudfiles/windows10"
+  IgnorableNamespaces="uap desktop com cloudFiles">
+  <Identity
+    Name="Ironmesh.ThumbnailProvider.Prototype"
+    Publisher="CN=Ironmesh Dev"
+    Version="0.1.0.0" />
+  <Properties>
+    <DisplayName>Ironmesh Thumbnail Provider Prototype</DisplayName>
+    <PublisherDisplayName>Ironmesh</PublisherDisplayName>
+    <Description>Prototype packaged thumbnail handler for dehydrated Ironmesh CFAPI placeholders.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.22631.0" />
+  </Dependencies>
+  <Applications>
+    <Application
+      Id="IronmeshThumbnailProvider"
+      Executable="os-integration.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Ironmesh Thumbnail Provider Prototype"
+        Description="Prototype packaged thumbnail handler for Ironmesh placeholders"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\StoreLogo.png"
+        Square44x44Logo="Assets\SmallLogo.png" />
+      <Extensions>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="Ironmesh Thumbnail Provider">
+              <com:Class
+                Id="{D2E0FD2A-1D7B-4BE4-920A-8A6D019454CB}"
+                Path="windows_thumbnail_provider.dll"
+                ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+        <cloudFiles:Extension Category="windows.cloudFiles">
+          <cloudFiles:CloudFiles>
+            <cloudFiles:ThumbnailProviderHandler Clsid="{D2E0FD2A-1D7B-4BE4-920A-8A6D019454CB}" />
+          </cloudFiles:CloudFiles>
+        </cloudFiles:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>
