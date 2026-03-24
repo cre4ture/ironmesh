@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::{
     AdminAuditEvent, CachedMediaMetadata, ClientCredentialState, CurrentState, FileVersionIndex,
     MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample,
+    StorageStatsSample, StorageStatsState,
 };
 
 pub(super) struct SqliteMetadataStore {
@@ -379,6 +379,38 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(snapshots)
     }
 
+    async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {
+        let db = self.metadata_conn()?;
+        let payload = db
+            .query_row(
+                "SELECT state_json
+                 FROM storage_stats_state
+                 WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        match payload {
+            Some(payload) => serde_json::from_slice::<StorageStatsState>(&payload)
+                .map(Some)
+                .context("invalid storage stats state in sqlite"),
+            None => Ok(None),
+        }
+    }
+
+    async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(state)?;
+        self.in_metadata_tx(|db| {
+            db.execute(
+                "INSERT INTO storage_stats_state (singleton, state_json)
+                 VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
+                params![payload],
+            )?;
+            Ok(())
+        })
+    }
+
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
         let db = self.metadata_conn()?;
         let payload = db
@@ -432,6 +464,17 @@ impl MetadataStore for SqliteMetadataStore {
                 "INSERT INTO storage_stats_history (collected_at_unix, sample_json)
                  VALUES (?1, ?2)",
                 params![u64_to_i64(sample.collected_at_unix)?, payload],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()> {
+        self.in_metadata_tx(|db| {
+            db.execute(
+                "DELETE FROM storage_stats_history
+                 WHERE collected_at_unix < ?1",
+                params![u64_to_i64(collected_before_unix)?],
             )?;
             Ok(())
         })
@@ -545,6 +588,11 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS storage_stats_current (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             sample_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS storage_stats_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            state_json BLOB NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS storage_stats_history (

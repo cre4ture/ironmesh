@@ -1739,3 +1739,93 @@ run_on_all_metadata_backends!(
     storage_stats_collect_and_persist_latest_snapshot_metrics,
     storage_stats_collect_and_persist_latest_snapshot_metrics_turso
 );
+
+async fn chunk_store_bytes_state_tracks_ingest_and_cleanup_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("chunk-store-state").await;
+    let payload = Bytes::from_static(b"orphaned-chunk-payload");
+
+    let (_, stored) = store.ingest_chunk_auto(&payload).await.unwrap();
+    assert!(stored);
+    assert_eq!(
+        store.current_chunk_store_bytes(None).await.unwrap(),
+        payload.len() as u64
+    );
+
+    let (_, stored_again) = store.ingest_chunk_auto(&payload).await.unwrap();
+    assert!(!stored_again);
+    assert_eq!(
+        store.current_chunk_store_bytes(None).await.unwrap(),
+        payload.len() as u64
+    );
+
+    let report = store.cleanup_unreferenced(0, false).await.unwrap();
+    assert!(report.deleted_chunks >= 1);
+    assert_eq!(store.current_chunk_store_bytes(None).await.unwrap(), 0);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    chunk_store_bytes_state_tracks_ingest_and_cleanup_impl,
+    chunk_store_bytes_state_tracks_ingest_and_cleanup,
+    chunk_store_bytes_state_tracks_ingest_and_cleanup_turso
+);
+
+async fn storage_stats_history_prune_drops_older_samples_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("storage-stats-prune").await;
+
+    let older = StorageStatsSample {
+        collected_at_unix: 1_000,
+        latest_snapshot_id: Some("snap-old".to_string()),
+        latest_snapshot_created_at_unix: Some(990),
+        latest_snapshot_object_count: 1,
+        chunk_store_bytes: 10,
+        manifest_store_bytes: 20,
+        metadata_db_bytes: 30,
+        media_cache_bytes: 40,
+        latest_snapshot_logical_bytes: 50,
+        latest_snapshot_unique_chunk_bytes: 60,
+    };
+    let newer = StorageStatsSample {
+        collected_at_unix: 2_000,
+        latest_snapshot_id: Some("snap-new".to_string()),
+        latest_snapshot_created_at_unix: Some(1_990),
+        latest_snapshot_object_count: 2,
+        chunk_store_bytes: 11,
+        manifest_store_bytes: 21,
+        metadata_db_bytes: 31,
+        media_cache_bytes: 41,
+        latest_snapshot_logical_bytes: 51,
+        latest_snapshot_unique_chunk_bytes: 61,
+    };
+
+    store.persist_storage_stats_sample(&older).await.unwrap();
+    store.persist_storage_stats_sample(&newer).await.unwrap();
+    store
+        .prune_storage_stats_history_before(1_500)
+        .await
+        .unwrap();
+
+    let history = store.list_storage_stats_history(8).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].collected_at_unix, newer.collected_at_unix);
+    assert_eq!(
+        history[0].latest_snapshot_unique_chunk_bytes,
+        newer.latest_snapshot_unique_chunk_bytes
+    );
+
+    let current = store
+        .load_current_storage_stats()
+        .await
+        .unwrap()
+        .expect("expected current sample to remain available");
+    assert_eq!(current.collected_at_unix, newer.collected_at_unix);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    storage_stats_history_prune_drops_older_samples_impl,
+    storage_stats_history_prune_drops_older_samples,
+    storage_stats_history_prune_drops_older_samples_turso
+);

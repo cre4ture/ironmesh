@@ -167,6 +167,12 @@ pub struct StorageStatsSample {
     pub latest_snapshot_unique_chunk_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageStatsState {
+    pub chunk_store_bytes: u64,
+    pub last_reconciled_unix: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CleanupReport {
     pub retention_secs: u64,
@@ -547,9 +553,12 @@ trait MetadataStore: Send + Sync {
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
+    async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>>;
+    async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()>;
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>>;
     async fn list_storage_stats_history(&self, limit: usize) -> Result<Vec<StorageStatsSample>>;
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()>;
+    async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()>;
     async fn has_version_index(&self, object_id: &str) -> Result<bool>;
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()>;
     async fn list_media_cache_fingerprints(&self) -> Result<Vec<String>>;
@@ -1546,6 +1555,7 @@ impl PersistentStore {
         }
 
         write_atomic(&chunk_path, payload).await?;
+        self.note_chunk_store_delta(payload.len() as i64).await?;
         Ok(true)
     }
 
@@ -2812,6 +2822,14 @@ impl PersistentStore {
         self.metadata_store.load_current_storage_stats().await
     }
 
+    async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {
+        self.metadata_store.load_storage_stats_state().await
+    }
+
+    async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()> {
+        self.metadata_store.persist_storage_stats_state(state).await
+    }
+
     pub async fn list_storage_stats_history(
         &self,
         limit: usize,
@@ -2825,9 +2843,67 @@ impl PersistentStore {
             .await
     }
 
+    pub async fn prune_storage_stats_history_before(
+        &self,
+        collected_before_unix: u64,
+    ) -> Result<()> {
+        self.metadata_store
+            .prune_storage_stats_history_before(collected_before_unix)
+            .await
+    }
+
+    async fn reconcile_chunk_store_bytes_state(&self) -> Result<StorageStatsState> {
+        let state = StorageStatsState {
+            chunk_store_bytes: directory_size_bytes(&self.chunks_dir).await?,
+            last_reconciled_unix: unix_ts(),
+        };
+        self.persist_storage_stats_state(&state).await?;
+        Ok(state)
+    }
+
+    pub async fn current_chunk_store_bytes(
+        &self,
+        reconcile_max_age_secs: Option<u64>,
+    ) -> Result<u64> {
+        let now = unix_ts();
+        if let Some(state) = self.load_storage_stats_state().await? {
+            let should_reconcile = reconcile_max_age_secs
+                .map(|max_age| now.saturating_sub(state.last_reconciled_unix) > max_age)
+                .unwrap_or(false);
+            if !should_reconcile {
+                return Ok(state.chunk_store_bytes);
+            }
+        }
+
+        Ok(self
+            .reconcile_chunk_store_bytes_state()
+            .await?
+            .chunk_store_bytes)
+    }
+
+    async fn note_chunk_store_delta(&self, delta_bytes: i64) -> Result<u64> {
+        let Some(mut state) = self.load_storage_stats_state().await? else {
+            return Ok(self
+                .reconcile_chunk_store_bytes_state()
+                .await?
+                .chunk_store_bytes);
+        };
+
+        if delta_bytes >= 0 {
+            state.chunk_store_bytes = state.chunk_store_bytes.saturating_add(delta_bytes as u64);
+        } else {
+            state.chunk_store_bytes = state
+                .chunk_store_bytes
+                .saturating_sub(delta_bytes.unsigned_abs());
+        }
+
+        self.persist_storage_stats_state(&state).await?;
+        Ok(state.chunk_store_bytes)
+    }
+
     pub async fn collect_storage_stats_sample(&self) -> Result<StorageStatsSample> {
         let metadata_db_bytes = file_size_bytes(&self.metadata_db_path).await?;
-        let chunk_store_bytes = directory_size_bytes(&self.chunks_dir).await?;
+        let chunk_store_bytes = self.current_chunk_store_bytes(None).await?;
         let manifest_store_bytes = directory_size_bytes(&self.manifests_dir).await?;
         let media_cache_root = self
             .media_thumbnails_dir
@@ -2974,7 +3050,10 @@ impl PersistentStore {
                 continue;
             }
 
+            let chunk_size_bytes = metadata.len();
             fs::remove_file(&chunk_path).await?;
+            self.note_chunk_store_delta(-(chunk_size_bytes as i64))
+                .await?;
             deleted_chunks += 1;
         }
 

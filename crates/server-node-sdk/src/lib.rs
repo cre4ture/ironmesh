@@ -94,6 +94,8 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
 const RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS: u64 = 1;
 const RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 5;
 const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
+const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
+const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, ReplicationPlan,
@@ -3528,16 +3530,31 @@ async fn refresh_storage_stats_once(state: &ServerState) {
         runtime.last_attempt_unix = Some(unix_ts());
     }
 
-    let result = {
+    let result: anyhow::Result<StorageStatsSample> = {
         let store = state.store.lock().await;
-        store.collect_storage_stats_sample().await
+        match store
+            .current_chunk_store_bytes(Some(STORAGE_STATS_RECONCILE_INTERVAL_SECS))
+            .await
+        {
+            Ok(_) => store.collect_storage_stats_sample().await,
+            Err(err) => Err(err),
+        }
     };
 
     match result {
         Ok(sample) => {
-            let persist_result = {
+            let persist_result: anyhow::Result<()> = {
                 let store = state.store.lock().await;
-                store.persist_storage_stats_sample(&sample).await
+                if let Err(err) = store.persist_storage_stats_sample(&sample).await {
+                    Err(err)
+                } else {
+                    let retention_cutoff = sample
+                        .collected_at_unix
+                        .saturating_sub(STORAGE_STATS_HISTORY_RETENTION_SECS);
+                    store
+                        .prune_storage_stats_history_before(retention_cutoff)
+                        .await
+                }
             };
 
             let mut runtime = state.storage_stats_runtime.lock().await;

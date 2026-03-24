@@ -46,6 +46,12 @@ Use a hybrid strategy instead of periodic full rescans as the primary mechanism.
 
 This gives cheap exact accounting for the heaviest part of storage.
 
+Current implementation status:
+
+- implemented via a small persisted `storage_stats_state`,
+- lazily seeded from a one-time chunk directory scan if the state is missing,
+- updated incrementally on chunk ingest and orphan chunk cleanup.
+
 ### 2. Event-driven recomputation where full counters are expensive
 
 - latest snapshot stats
@@ -77,6 +83,12 @@ reconciliation pass:
 - then every 30-60 minutes.
 
 This pass should recompute all byte fields from disk and overwrite the stored values if needed.
+
+Current implementation status:
+
+- chunk-store state is reconciled in the background before sampling when its last reconciliation is
+  older than the configured interval,
+- the current default reconciliation interval is 1 hour.
 
 ## Scheduling
 
@@ -123,6 +135,11 @@ History does not need to be high resolution. A practical start:
 - collect every few minutes,
 - prune old samples after a retention window such as 30-90 days.
 
+Current implementation status:
+
+- implemented with history pruning during background collection,
+- the current default retention window is 90 days.
+
 ## Admin/UI Shape
 
 ### Backend
@@ -149,6 +166,32 @@ Later, if broader observability is wanted:
 - export the same counters as Prometheus-compatible metrics,
 - optionally feed them into an external time-series backend.
 
+### GreptimeDB Note
+
+GreptimeDB remains interesting as a future external observability backend, but it is not the right
+frontend for the current storage-stats feature.
+
+- The current storage-stats history is stored directly in the node metadata backend
+  (`sqlite` / `turso`).
+- GreptimeDB's dashboard/frontend is coupled to a running GreptimeDB instance and cannot simply be
+  pointed at the existing Ironmesh SQLite or Turso data.
+- Running one GreptimeDB instance per node would also not automatically produce a cluster-wide
+  accumulated view. It would still require fan-in, cross-node querying, or a dedicated central
+  GreptimeDB deployment.
+
+Because of that, the current product direction stays:
+
+- use the directly integrated basic visualization in `server-admin`,
+- keep the node-local history in the existing metadata backend,
+- treat richer external dashboards as a later feature.
+
+If external dashboards are added later, the more realistic direction is:
+
+- keep the current node-local stats collection,
+- export the same values to a Prometheus-compatible sink,
+- use Grafana for advanced filtering and visualization,
+- optionally use GreptimeDB as a central time-series backend behind that flow.
+
 ## Rollout Plan
 
 1. Document the strategy.
@@ -158,6 +201,13 @@ Later, if broader observability is wanted:
 5. Expose current/history admin endpoints.
 6. Add server-admin UI cards and a simple history chart.
 7. Add pruning and reconciliation policy.
+8. Revisit external observability only after the integrated dashboard is sufficient for daily use.
+
+The current codebase has completed steps 1-7 with a first pragmatic implementation:
+
+- chunk-store bytes use incremental accounting plus periodic reconciliation,
+- snapshot and small-directory values still use the background collector,
+- history retention is enforced during successful sample persistence.
 
 ## Notes
 
@@ -166,3 +216,4 @@ Later, if broader observability is wanted:
 - "Metadata size" should stay explicitly split in the API so operators can tell whether growth is
   in the DB, manifests, or media cache.
 - A future Prometheus exporter can reuse exactly the same collected values.
+- GreptimeDB is considered a future backend option, not the current visualization layer.

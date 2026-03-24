@@ -8,7 +8,7 @@ use common::NodeId;
 use super::{
     AdminAuditEvent, CachedMediaMetadata, ClientCredentialState, CurrentState, FileVersionIndex,
     MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample,
+    StorageStatsSample, StorageStatsState,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -464,6 +464,37 @@ impl MetadataStore for TursoMetadataStore {
         Ok(snapshots)
     }
 
+    async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT state_json
+                 FROM storage_stats_state
+                 WHERE singleton = 1",
+                (),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let payload = row_blob(&row, 0, "storage_stats_state.state_json")?;
+        let state = self.decode_json::<StorageStatsState>(payload, "storage stats state")?;
+        Ok(Some(state))
+    }
+
+    async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(state)?;
+        self.connection
+            .execute(
+                "INSERT INTO storage_stats_state (singleton, state_json)
+                 VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
+                (payload,),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
         let mut rows = self
             .connection
@@ -534,6 +565,18 @@ impl MetadataStore for TursoMetadataStore {
             self.rollback().await;
         }
         result
+    }
+
+    async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM storage_stats_history
+                 WHERE collected_at_unix < ?1",
+                (i64::try_from(collected_before_unix)
+                    .context("storage stats prune timestamp overflow")?,),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn has_version_index(&self, object_id: &str) -> Result<bool> {
@@ -645,6 +688,11 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS storage_stats_current (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 sample_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS storage_stats_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                state_json BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS storage_stats_history (
