@@ -1,6 +1,8 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
-use crate::cfapi::cf_report_provider_progress2;
+use crate::cfapi::{
+    cf_report_provider_progress2, cf_set_in_sync, cf_set_not_in_sync, path_is_placeholder,
+};
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
 };
@@ -171,6 +173,21 @@ impl Uploader for DemoUploader {
 #[derive(Debug, Default)]
 pub struct CfapiRuntime {
     remote_versions_by_path: Mutex<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesiredSyncState {
+    InSync,
+    NotInSync,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SyncStateReconcileStats {
+    pub marked_in_sync: usize,
+    pub marked_not_in_sync: usize,
+    pub skipped_missing: usize,
+    pub skipped_non_placeholder: usize,
+    pub failed: usize,
 }
 
 impl CfapiRuntime {
@@ -556,6 +573,88 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
     }
 
     Ok(())
+}
+
+pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncStateReconcileStats {
+    let mut desired_states = BTreeMap::<String, DesiredSyncState>::new();
+    for action in &plan.actions {
+        match action {
+            CfapiAction::EnsurePlaceholder { path, .. }
+            | CfapiAction::HydrateOnDemand { path, .. } => {
+                desired_states.insert(normalize_path(path), DesiredSyncState::InSync);
+            }
+            CfapiAction::QueueUploadOnClose { path, .. }
+            | CfapiAction::MarkConflict { path, .. } => {
+                desired_states.insert(normalize_path(path), DesiredSyncState::NotInSync);
+            }
+            CfapiAction::EnsureDirectory { .. } => {}
+        }
+    }
+
+    let mut stats = SyncStateReconcileStats::default();
+    for (relative_path, desired_state) in desired_states {
+        let full_path = root_path.join(relative_path.replace('/', "\\"));
+        if !full_path.exists() {
+            stats.skipped_missing += 1;
+            continue;
+        }
+
+        let metadata = match std::fs::metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                stats.failed += 1;
+                eprintln!(
+                    "sync-state: failed to read metadata for {}: {}",
+                    full_path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        if metadata.is_dir() || !path_is_placeholder(&full_path) {
+            stats.skipped_non_placeholder += 1;
+            continue;
+        }
+
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&full_path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                stats.failed += 1;
+                eprintln!(
+                    "sync-state: failed to open {} for sync-state update: {}",
+                    full_path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        let result = match desired_state {
+            DesiredSyncState::InSync => cf_set_in_sync(&file).map(|_| {
+                stats.marked_in_sync += 1;
+            }),
+            DesiredSyncState::NotInSync => cf_set_not_in_sync(&file).map(|_| {
+                stats.marked_not_in_sync += 1;
+            }),
+        };
+
+        if let Err(err) = result {
+            stats.failed += 1;
+            eprintln!(
+                "sync-state: failed to set {:?} for {}: {:#}",
+                desired_state,
+                full_path.display(),
+                err
+            );
+        }
+    }
+
+    stats
 }
 
 pub fn connect_sync_root(
@@ -1074,5 +1173,46 @@ mod tests {
 
         let payload = String::from_utf8(hydrated).expect("demo hydrator emits utf8 payload");
         assert!(payload.contains("docs/notes.txt"));
+    }
+
+    #[test]
+    fn reconcile_sync_states_maps_plan_actions_to_expected_targets() {
+        let plan = CfapiActionPlan {
+            actions: vec![
+                CfapiAction::EnsureDirectory {
+                    path: "docs".to_string(),
+                },
+                CfapiAction::EnsurePlaceholder {
+                    path: "docs/readme.md".to_string(),
+                    remote_version: "v1".to_string(),
+                },
+                CfapiAction::HydrateOnDemand {
+                    path: "docs/photo.jpg".to_string(),
+                    remote_version: "v2".to_string(),
+                },
+                CfapiAction::QueueUploadOnClose {
+                    path: "draft.txt".to_string(),
+                    local_version: Some("local".to_string()),
+                },
+                CfapiAction::MarkConflict {
+                    path: "conflict.txt".to_string(),
+                    local_version: Some("local".to_string()),
+                    remote_version: Some("remote".to_string()),
+                },
+            ],
+        };
+
+        let temp_root =
+            std::env::temp_dir().join(format!("ironmesh-sync-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let stats = reconcile_sync_states(&temp_root, &plan);
+
+        assert_eq!(stats.marked_in_sync, 0);
+        assert_eq!(stats.marked_not_in_sync, 0);
+        assert_eq!(stats.skipped_missing, 4);
+        assert_eq!(stats.skipped_non_placeholder, 0);
+        assert_eq!(stats.failed, 0);
+
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 }

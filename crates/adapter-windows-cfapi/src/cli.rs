@@ -16,7 +16,8 @@ use crate::connection_config::{persist_connection_config, resolve_connection_con
 use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
 use crate::runtime::{
-    CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root, register_sync_root,
+    CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
+    reconcile_sync_states, register_sync_root,
 };
 use sync_core::SyncPolicy;
 
@@ -189,6 +190,11 @@ pub fn cli_main() -> anyhow::Result<()> {
 
             apply_action_plan(&registration.root_path, &action_plan)?;
             let _ = runtime.sync_from_action_plan(&action_plan);
+            let sync_state_stats = reconcile_sync_states(&registration.root_path, &action_plan);
+            eprintln!(
+                "sync-state: startup reconcile stats: {:?}",
+                sync_state_stats
+            );
             eprintln!(
                 "materialized {} planned entries under sync root",
                 action_plan.actions.len()
@@ -231,15 +237,18 @@ pub fn cli_main() -> anyhow::Result<()> {
                         return;
                     }
                     let reconciled_paths = refresh_runtime.sync_from_action_plan(&plan);
+                    let sync_state_stats =
+                        reconcile_sync_states(&refresh_registration.root_path, &plan);
                     if reconciled_paths > 0 {
                         eprintln!(
-                            "remote-refresh: reconciled {} changed paths",
-                            reconciled_paths
+                            "remote-refresh: reconciled {} changed paths; sync-state={:?}",
+                            reconciled_paths, sync_state_stats
                         );
                     } else {
                         eprintln!(
-                            "remote-refresh: detected {} changed remote paths; no local plan delta",
-                            update.changed_paths.len()
+                            "remote-refresh: detected {} changed remote paths; no local plan delta; sync-state={:?}",
+                            update.changed_paths.len(),
+                            sync_state_stats
                         );
                     }
                 },
