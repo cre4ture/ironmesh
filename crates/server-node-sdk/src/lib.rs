@@ -70,6 +70,8 @@ use uuid::Uuid;
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_REVISION: &str =
     git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+const STORAGE_STATS_REFRESH_INTERVAL_SECS: u64 = 300;
+const STORAGE_STATS_CHANGE_DEBOUNCE_SECS: u64 = 15;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
@@ -109,7 +111,8 @@ use storage::{
     MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
     PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    ReplicationChunkInfo, StoreReadError, UploadChunkRef, VersionConsistencyState,
+    ReplicationChunkInfo, StorageStatsSample, StoreReadError, UploadChunkRef,
+    VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -150,6 +153,7 @@ struct ServerState {
     log_buffer: Arc<LogBuffer>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
+    storage_stats_runtime: Arc<Mutex<StorageStatsRuntime>>,
     namespace_change_sequence: Arc<AtomicU64>,
     namespace_change_tx: watch::Sender<u64>,
     admin_control: AdminControl,
@@ -1011,6 +1015,14 @@ struct RepairExecutorState {
 struct RepairAttemptEntry {
     attempts: u32,
     last_failure_unix: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StorageStatsRuntime {
+    collecting: bool,
+    last_attempt_unix: Option<u64>,
+    last_success_unix: Option<u64>,
+    last_error: Option<String>,
 }
 
 impl MetadataCommitMode {
@@ -3032,6 +3044,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        storage_stats_runtime: Arc::new(Mutex::new(StorageStatsRuntime::default())),
         namespace_change_sequence: Arc::new(AtomicU64::new(0)),
         namespace_change_tx: watch::channel(0).0,
         admin_control,
@@ -3041,6 +3054,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     };
 
     refresh_local_node_storage(&state).await;
+    spawn_storage_stats_refresher(state.clone());
 
     let persisted_attempts = {
         let store = state.store.lock().await;
@@ -3272,6 +3286,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
+        .route("/storage/stats/current", get(storage_stats_current))
+        .route("/storage/stats/history", get(storage_stats_history))
         .route(
             "/cluster/nodes/{node_id}",
             put(register_node).delete(remove_node),
@@ -3327,6 +3343,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
+        .route("/storage/stats/current", get(storage_stats_current))
+        .route("/storage/stats/history", get(storage_stats_history))
         .route("/cluster/placement/{key}", get(placement_for_key))
         .route("/cluster/replication/plan", get(replication_plan))
         .route("/snapshots", get(list_snapshots))
@@ -3501,6 +3519,84 @@ async fn refresh_local_node_storage(state: &ServerState) {
 
     let mut cluster = state.cluster.lock().await;
     let _ = cluster.update_node_storage(state.node_id, free_bytes, capacity_bytes);
+}
+
+async fn refresh_storage_stats_once(state: &ServerState) {
+    {
+        let mut runtime = state.storage_stats_runtime.lock().await;
+        runtime.collecting = true;
+        runtime.last_attempt_unix = Some(unix_ts());
+    }
+
+    let result = {
+        let store = state.store.lock().await;
+        store.collect_storage_stats_sample().await
+    };
+
+    match result {
+        Ok(sample) => {
+            let persist_result = {
+                let store = state.store.lock().await;
+                store.persist_storage_stats_sample(&sample).await
+            };
+
+            let mut runtime = state.storage_stats_runtime.lock().await;
+            runtime.collecting = false;
+            match persist_result {
+                Ok(()) => {
+                    runtime.last_success_unix = Some(sample.collected_at_unix);
+                    runtime.last_error = None;
+                }
+                Err(err) => {
+                    runtime.last_error = Some(err.to_string());
+                    tracing::warn!(error = %err, "failed to persist storage stats sample");
+                }
+            }
+        }
+        Err(err) => {
+            let mut runtime = state.storage_stats_runtime.lock().await;
+            runtime.collecting = false;
+            runtime.last_error = Some(err.to_string());
+            tracing::warn!(error = %err, "failed to collect storage stats sample");
+        }
+    }
+}
+
+fn spawn_storage_stats_refresher(state: ServerState) {
+    tokio::spawn(async move {
+        refresh_storage_stats_once(&state).await;
+
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(STORAGE_STATS_REFRESH_INTERVAL_SECS));
+        let mut namespace_changes = state.namespace_change_tx.subscribe();
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    refresh_storage_stats_once(&state).await;
+                }
+                changed = namespace_changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(STORAGE_STATS_CHANGE_DEBOUNCE_SECS)).await;
+                        match namespace_changes.has_changed() {
+                            Ok(true) => {
+                                let _ = namespace_changes.borrow_and_update();
+                                continue;
+                            }
+                            Ok(false) => break,
+                            Err(_) => return,
+                        }
+                    }
+
+                    refresh_storage_stats_once(&state).await;
+                }
+            }
+        }
+    });
 }
 
 fn spawn_rendezvous_presence_heartbeat(
@@ -6830,6 +6926,20 @@ struct CleanupQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct StorageStatsHistoryQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageStatsCurrentResponse {
+    sample: Option<StorageStatsSample>,
+    collecting: bool,
+    last_attempt_unix: Option<u64>,
+    last_success_unix: Option<u64>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TombstoneRestoreQuery {
     object_id: String,
     archive_file: Option<String>,
@@ -10034,6 +10144,51 @@ async fn list_nodes(State(state): State<ServerState>) -> Json<Vec<NodeDescriptor
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
     Json(cluster.list_nodes())
+}
+
+async fn storage_stats_current(State(state): State<ServerState>) -> impl IntoResponse {
+    let sample = {
+        let store = state.store.lock().await;
+        match store.load_current_storage_stats().await {
+            Ok(sample) => sample,
+            Err(err) => {
+                tracing::error!(error = %err, "failed loading current storage stats");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    let runtime = state.storage_stats_runtime.lock().await.clone();
+    (
+        StatusCode::OK,
+        Json(StorageStatsCurrentResponse {
+            sample,
+            collecting: runtime.collecting,
+            last_attempt_unix: runtime.last_attempt_unix,
+            last_success_unix: runtime.last_success_unix,
+            last_error: runtime.last_error,
+        }),
+    )
+        .into_response()
+}
+
+async fn storage_stats_history(
+    State(state): State<ServerState>,
+    Query(query): Query<StorageStatsHistoryQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(120).clamp(1, 2000);
+    let samples = {
+        let store = state.store.lock().await;
+        match store.list_storage_stats_history(limit).await {
+            Ok(samples) => samples,
+            Err(err) => {
+                tracing::error!(error = %err, limit, "failed loading storage stats history");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    (StatusCode::OK, Json(samples)).into_response()
 }
 
 async fn local_public_enrollment_issuer_url(state: &ServerState) -> Option<String> {

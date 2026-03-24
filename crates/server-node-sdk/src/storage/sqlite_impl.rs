@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::{
     AdminAuditEvent, CachedMediaMetadata, ClientCredentialState, CurrentState, FileVersionIndex,
     MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo, SnapshotManifest,
+    StorageStatsSample,
 };
 
 pub(super) struct SqliteMetadataStore {
@@ -378,6 +379,64 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(snapshots)
     }
 
+    async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
+        let db = self.metadata_conn()?;
+        let payload = db
+            .query_row(
+                "SELECT sample_json
+                 FROM storage_stats_current
+                 WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        match payload {
+            Some(payload) => serde_json::from_slice::<StorageStatsSample>(&payload)
+                .map(Some)
+                .context("invalid current storage stats in sqlite"),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_storage_stats_history(&self, limit: usize) -> Result<Vec<StorageStatsSample>> {
+        let db = self.metadata_conn()?;
+        let limit = i64::try_from(limit).context("storage stats history limit overflow")?;
+        let mut stmt = db.prepare(
+            "SELECT sample_json
+             FROM storage_stats_history
+             ORDER BY collected_at_unix DESC, rowid DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut samples = Vec::new();
+        for row in rows {
+            let payload = row?;
+            samples.push(
+                serde_json::from_slice::<StorageStatsSample>(&payload)
+                    .context("invalid storage stats history sample in sqlite")?,
+            );
+        }
+        Ok(samples)
+    }
+
+    async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(sample)?;
+        self.in_metadata_tx(|db| {
+            db.execute(
+                "INSERT INTO storage_stats_current (singleton, sample_json)
+                 VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET sample_json = excluded.sample_json",
+                params![payload.clone()],
+            )?;
+            db.execute(
+                "INSERT INTO storage_stats_history (collected_at_unix, sample_json)
+                 VALUES (?1, ?2)",
+                params![u64_to_i64(sample.collected_at_unix)?, payload],
+            )?;
+            Ok(())
+        })
+    }
+
     async fn has_version_index(&self, object_id: &str) -> Result<bool> {
         let db = self.metadata_conn()?;
         Ok(db
@@ -483,6 +542,16 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             snapshot_json BLOB NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS storage_stats_current (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            sample_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS storage_stats_history (
+            collected_at_unix INTEGER NOT NULL,
+            sample_json BLOB NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS repair_attempts (
             subject TEXT PRIMARY KEY,
             attempts INTEGER NOT NULL,
@@ -524,6 +593,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON current_objects(object_id);
         CREATE INDEX IF NOT EXISTS idx_snapshots_created
             ON snapshots(created_at_unix DESC, snapshot_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected
+            ON storage_stats_history(collected_at_unix DESC);
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created
             ON admin_audit_events(created_at_unix DESC, event_id DESC);
         CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject

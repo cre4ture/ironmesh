@@ -1665,3 +1665,77 @@ run_on_all_metadata_backends!(
     metadata_roundtrips_media_cache_metadata,
     metadata_roundtrips_media_cache_metadata_turso
 );
+
+async fn storage_stats_collect_and_persist_latest_snapshot_metrics_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("storage-stats").await;
+    let payload = sample_png_bytes();
+
+    let first_put = store
+        .put_object_versioned(
+            "photos/a.png",
+            Bytes::from(payload.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "photos/b.png",
+            Bytes::from(payload.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .ensure_media_cache(&first_put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected media cache metadata");
+
+    let sample = store.collect_storage_stats_sample().await.unwrap();
+    assert!(sample.latest_snapshot_id.is_some());
+    assert_eq!(sample.latest_snapshot_object_count, 2);
+    assert_eq!(
+        sample.latest_snapshot_logical_bytes,
+        (payload.len() * 2) as u64
+    );
+    assert_eq!(
+        sample.latest_snapshot_unique_chunk_bytes,
+        payload.len() as u64
+    );
+    assert!(sample.chunk_store_bytes >= payload.len() as u64);
+    assert!(sample.manifest_store_bytes > 0);
+    assert!(sample.metadata_db_bytes > 0);
+    assert!(sample.media_cache_bytes > 0);
+
+    store.persist_storage_stats_sample(&sample).await.unwrap();
+
+    let current = store
+        .load_current_storage_stats()
+        .await
+        .unwrap()
+        .expect("expected current storage stats");
+    assert_eq!(current.latest_snapshot_id, sample.latest_snapshot_id);
+    assert_eq!(
+        current.latest_snapshot_unique_chunk_bytes,
+        sample.latest_snapshot_unique_chunk_bytes
+    );
+
+    let history = store.list_storage_stats_history(8).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].collected_at_unix, sample.collected_at_unix);
+    assert_eq!(
+        history[0].latest_snapshot_logical_bytes,
+        sample.latest_snapshot_logical_bytes
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    storage_stats_collect_and_persist_latest_snapshot_metrics_impl,
+    storage_stats_collect_and_persist_latest_snapshot_metrics,
+    storage_stats_collect_and_persist_latest_snapshot_metrics_turso
+);

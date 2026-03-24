@@ -12,6 +12,7 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("1 / 1", { exact: true })).toBeVisible();
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
+  await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "0 B", exact: true })).toHaveCount(0);
 
   await page.getByRole("button", { name: "Admin Access" }).click();

@@ -8,6 +8,7 @@ use common::NodeId;
 use super::{
     AdminAuditEvent, CachedMediaMetadata, ClientCredentialState, CurrentState, FileVersionIndex,
     MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo, SnapshotManifest,
+    StorageStatsSample,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -463,6 +464,78 @@ impl MetadataStore for TursoMetadataStore {
         Ok(snapshots)
     }
 
+    async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT sample_json
+                 FROM storage_stats_current
+                 WHERE singleton = 1",
+                (),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let payload = row_blob(&row, 0, "storage_stats_current.sample_json")?;
+        let sample = self.decode_json::<StorageStatsSample>(payload, "current storage stats")?;
+        Ok(Some(sample))
+    }
+
+    async fn list_storage_stats_history(&self, limit: usize) -> Result<Vec<StorageStatsSample>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT sample_json
+                 FROM storage_stats_history
+                 ORDER BY collected_at_unix DESC, rowid DESC
+                 LIMIT ?1",
+                (i64::try_from(limit).context("storage stats history limit overflow")?,),
+            )
+            .await?;
+        let mut samples = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload = row_blob(&row, 0, "storage_stats_history.sample_json")?;
+            samples.push(
+                self.decode_json::<StorageStatsSample>(payload, "storage stats history sample")?,
+            );
+        }
+        Ok(samples)
+    }
+
+    async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(sample)?;
+        self.connection.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: Result<()> = async {
+            self.connection
+                .execute(
+                    "INSERT INTO storage_stats_current (singleton, sample_json)
+                     VALUES (1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET sample_json = excluded.sample_json",
+                    (payload.clone(),),
+                )
+                .await?;
+            self.connection
+                .execute(
+                    "INSERT INTO storage_stats_history (collected_at_unix, sample_json)
+                     VALUES (?1, ?2)",
+                    (
+                        i64::try_from(sample.collected_at_unix)
+                            .context("storage stats collected timestamp overflow")?,
+                        payload,
+                    ),
+                )
+                .await?;
+            self.connection.execute_batch("COMMIT").await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.rollback().await;
+        }
+        result
+    }
+
     async fn has_version_index(&self, object_id: &str) -> Result<bool> {
         let mut rows = self
             .connection
@@ -569,6 +642,16 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 snapshot_json BLOB NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS storage_stats_current (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                sample_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS storage_stats_history (
+                collected_at_unix INTEGER NOT NULL,
+                sample_json BLOB NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS repair_attempts (
                 subject TEXT PRIMARY KEY,
                 attempts INTEGER NOT NULL,
@@ -610,6 +693,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 ON current_objects(object_id);
             CREATE INDEX IF NOT EXISTS idx_snapshots_created
                 ON snapshots(created_at_unix DESC, snapshot_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected
+                ON storage_stats_history(collected_at_unix DESC);
             CREATE INDEX IF NOT EXISTS idx_admin_audit_created
                 ON admin_audit_events(created_at_unix DESC, event_id DESC);
             CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject

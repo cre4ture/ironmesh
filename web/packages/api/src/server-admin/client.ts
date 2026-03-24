@@ -18,6 +18,8 @@ import type {
   RendezvousConfigView,
   ReplicationPlan,
   ServerHealthResponse,
+  StorageStatsCurrentResponse,
+  StorageStatsSample,
   StoreListView,
   SetupStatus,
   SetupTransitionResponse
@@ -142,6 +144,20 @@ export async function getRecentLogs(limit = 200): Promise<LogsResponse> {
 
 export async function getServerHealth(): Promise<ServerHealthResponse> {
   return fetchJson<ServerHealthResponse>("/health", {
+    credentials: "same-origin",
+    cache: "no-store"
+  });
+}
+
+export async function getStorageStatsCurrent(): Promise<StorageStatsCurrentResponse> {
+  return fetchJson<StorageStatsCurrentResponse>("/storage/stats/current", {
+    credentials: "same-origin",
+    cache: "no-store"
+  });
+}
+
+export async function getStorageStatsHistory(limit = 120): Promise<StorageStatsSample[]> {
+  return fetchJson<StorageStatsSample[]>(`/storage/stats/history?limit=${Math.max(1, limit)}`, {
     credentials: "same-origin",
     cache: "no-store"
   });

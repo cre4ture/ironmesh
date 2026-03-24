@@ -114,3 +114,5 @@ On every read:
 - Resumable upload session metadata persisted on disk (for crash-safe resume across restarts).
 - Cluster-wide metadata visibility and read-through chunk caching for non-replica reads.
   See `docs/read-through-chunk-cache-proposal.md`.
+- Node-local storage accounting and history for admin visibility.
+  See `docs/server-node-storage-stats-strategy.md`.

@@ -153,6 +153,20 @@ pub struct SnapshotObjectState {
     pub object_ids: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageStatsSample {
+    pub collected_at_unix: u64,
+    pub latest_snapshot_id: Option<String>,
+    pub latest_snapshot_created_at_unix: Option<u64>,
+    pub latest_snapshot_object_count: usize,
+    pub chunk_store_bytes: u64,
+    pub manifest_store_bytes: u64,
+    pub metadata_db_bytes: u64,
+    pub media_cache_bytes: u64,
+    pub latest_snapshot_logical_bytes: u64,
+    pub latest_snapshot_unique_chunk_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CleanupReport {
     pub retention_secs: u64,
@@ -533,6 +547,9 @@ trait MetadataStore: Send + Sync {
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
+    async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>>;
+    async fn list_storage_stats_history(&self, limit: usize) -> Result<Vec<StorageStatsSample>>;
+    async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()>;
     async fn has_version_index(&self, object_id: &str) -> Result<bool>;
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()>;
     async fn list_media_cache_fingerprints(&self) -> Result<Vec<String>>;
@@ -2791,6 +2808,87 @@ impl PersistentStore {
         self.metadata_store.list_snapshot_infos().await
     }
 
+    pub async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
+        self.metadata_store.load_current_storage_stats().await
+    }
+
+    pub async fn list_storage_stats_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StorageStatsSample>> {
+        self.metadata_store.list_storage_stats_history(limit).await
+    }
+
+    pub async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
+        self.metadata_store
+            .persist_storage_stats_sample(sample)
+            .await
+    }
+
+    pub async fn collect_storage_stats_sample(&self) -> Result<StorageStatsSample> {
+        let metadata_db_bytes = file_size_bytes(&self.metadata_db_path).await?;
+        let chunk_store_bytes = directory_size_bytes(&self.chunks_dir).await?;
+        let manifest_store_bytes = directory_size_bytes(&self.manifests_dir).await?;
+        let media_cache_root = self
+            .media_thumbnails_dir
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.root_dir.join("state").join("media_cache"));
+        let media_cache_bytes = directory_size_bytes(&media_cache_root).await?;
+
+        let latest_snapshot = self.list_snapshots().await?.into_iter().next();
+        let mut latest_snapshot_id = None;
+        let mut latest_snapshot_created_at_unix = None;
+        let mut latest_snapshot_object_count = 0usize;
+        let mut latest_snapshot_logical_bytes = 0u64;
+        let mut latest_snapshot_unique_chunk_bytes = 0u64;
+
+        if let Some(snapshot) = latest_snapshot {
+            latest_snapshot_id = Some(snapshot.id.clone());
+            latest_snapshot_created_at_unix = Some(snapshot.created_at_unix);
+            latest_snapshot_object_count = snapshot.object_count;
+
+            if let Some(snapshot_state) = self.snapshot_object_state(&snapshot.id).await? {
+                let mut seen_chunk_hashes = HashSet::new();
+                let mut manifest_cache = HashMap::<String, ObjectManifest>::new();
+
+                for manifest_hash in snapshot_state.objects.values() {
+                    let manifest = if let Some(existing) = manifest_cache.get(manifest_hash) {
+                        existing.clone()
+                    } else {
+                        let Some(loaded) = self.load_manifest_by_hash(manifest_hash).await? else {
+                            continue;
+                        };
+                        manifest_cache.insert(manifest_hash.clone(), loaded.clone());
+                        loaded
+                    };
+
+                    latest_snapshot_logical_bytes = latest_snapshot_logical_bytes
+                        .saturating_add(manifest.total_size_bytes as u64);
+                    for chunk in manifest.chunks {
+                        if seen_chunk_hashes.insert(chunk.hash) {
+                            latest_snapshot_unique_chunk_bytes = latest_snapshot_unique_chunk_bytes
+                                .saturating_add(chunk.size_bytes as u64);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(StorageStatsSample {
+            collected_at_unix: unix_ts(),
+            latest_snapshot_id,
+            latest_snapshot_created_at_unix,
+            latest_snapshot_object_count,
+            chunk_store_bytes,
+            manifest_store_bytes,
+            metadata_db_bytes,
+            media_cache_bytes,
+            latest_snapshot_logical_bytes,
+            latest_snapshot_unique_chunk_bytes,
+        })
+    }
+
     pub async fn cleanup_unreferenced(
         &self,
         retention_secs: u64,
@@ -3522,6 +3620,52 @@ fn content_fingerprint_from_manifest(manifest: &ObjectManifest) -> String {
         hasher.update(&(chunk.size_bytes as u64).to_le_bytes());
     }
     format!("cfp-{}", hasher.finalize().to_hex())
+}
+
+async fn file_size_bytes(path: &Path) -> Result<u64> {
+    match fs::metadata(path).await {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+async fn directory_size_bytes(root: &Path) -> Result<u64> {
+    match fs::metadata(root).await {
+        Ok(metadata) if metadata.is_file() => return Ok(metadata.len()),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", root.display()));
+        }
+    }
+
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = match fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read {}", dir.display()));
+            }
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .await
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+
+    Ok(total)
 }
 
 fn derive_image_media_cache(

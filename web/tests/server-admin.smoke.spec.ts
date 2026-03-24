@@ -13,6 +13,9 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("runtime ready")).toBeVisible();
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
+  await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
+  await expect(page.getByText("Chunk Store", { exact: true })).toBeVisible();
+  await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
   await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
   await expect(page.getByText("Sign in or provide an admin token override to inspect the live rendezvous registration details here.")).toBeVisible();
 
@@ -428,6 +431,68 @@ async function installServerAdminMocks(
         version: "0.1.0",
         revision: "v0.1.0-5-gmocked"
       });
+    }
+
+    if (pathname === "/storage/stats/current" && method === "GET") {
+      return json(route, {
+        sample: {
+          collected_at_unix: 1_900_000_120,
+          latest_snapshot_id: "snapshot-9",
+          latest_snapshot_created_at_unix: 1_900_000_100,
+          latest_snapshot_object_count: 42,
+          chunk_store_bytes: 1_234_000_000,
+          manifest_store_bytes: 12_000_000,
+          metadata_db_bytes: 4_000_000,
+          media_cache_bytes: 8_000_000,
+          latest_snapshot_logical_bytes: 2_468_000_000,
+          latest_snapshot_unique_chunk_bytes: 1_100_000_000
+        },
+        collecting: false,
+        last_attempt_unix: 1_900_000_120,
+        last_success_unix: 1_900_000_120,
+        last_error: null
+      });
+    }
+
+    if (pathname === "/storage/stats/history" && method === "GET") {
+      return json(route, [
+        {
+          collected_at_unix: 1_900_000_120,
+          latest_snapshot_id: "snapshot-9",
+          latest_snapshot_created_at_unix: 1_900_000_100,
+          latest_snapshot_object_count: 42,
+          chunk_store_bytes: 1_234_000_000,
+          manifest_store_bytes: 12_000_000,
+          metadata_db_bytes: 4_000_000,
+          media_cache_bytes: 8_000_000,
+          latest_snapshot_logical_bytes: 2_468_000_000,
+          latest_snapshot_unique_chunk_bytes: 1_100_000_000
+        },
+        {
+          collected_at_unix: 1_900_000_060,
+          latest_snapshot_id: "snapshot-8",
+          latest_snapshot_created_at_unix: 1_900_000_040,
+          latest_snapshot_object_count: 40,
+          chunk_store_bytes: 1_190_000_000,
+          manifest_store_bytes: 11_500_000,
+          metadata_db_bytes: 3_900_000,
+          media_cache_bytes: 7_500_000,
+          latest_snapshot_logical_bytes: 2_310_000_000,
+          latest_snapshot_unique_chunk_bytes: 1_070_000_000
+        },
+        {
+          collected_at_unix: 1_900_000_000,
+          latest_snapshot_id: "snapshot-7",
+          latest_snapshot_created_at_unix: 1_899_999_980,
+          latest_snapshot_object_count: 38,
+          chunk_store_bytes: 1_120_000_000,
+          manifest_store_bytes: 11_200_000,
+          metadata_db_bytes: 3_800_000,
+          media_cache_bytes: 7_200_000,
+          latest_snapshot_logical_bytes: 2_210_000_000,
+          latest_snapshot_unique_chunk_bytes: 1_020_000_000
+        }
+      ]);
     }
 
     if (pathname === "/setup/status" && method === "GET" && options?.setupMode) {

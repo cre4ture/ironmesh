@@ -80,6 +80,27 @@ export type ServerHealthResponse = {
   revision?: string;
 };
 
+export type StorageStatsSample = {
+  collected_at_unix: number;
+  latest_snapshot_id?: string | null;
+  latest_snapshot_created_at_unix?: number | null;
+  latest_snapshot_object_count: number;
+  chunk_store_bytes: number;
+  manifest_store_bytes: number;
+  metadata_db_bytes: number;
+  media_cache_bytes: number;
+  latest_snapshot_logical_bytes: number;
+  latest_snapshot_unique_chunk_bytes: number;
+};
+
+export type StorageStatsCurrentResponse = {
+  sample?: StorageStatsSample | null;
+  collecting: boolean;
+  last_attempt_unix?: number | null;
+  last_success_unix?: number | null;
+  last_error?: string | null;
+};
+
 export type SetupStatus = {
   state: "uninitialized" | "pending_join" | "online";
   data_dir: string;
