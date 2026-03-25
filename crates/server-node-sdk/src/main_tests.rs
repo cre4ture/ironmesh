@@ -4726,6 +4726,8 @@ async fn build_test_state(
             path: root.join("state").join("upload_sessions.json"),
             sessions: HashMap::new(),
         })),
+        upload_sessions_dirty: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        upload_sessions_persist_notify: Arc::new(tokio::sync::Notify::new()),
         public_ca_pem: None,
         public_ca_key_pem: None,
         cluster_ca_pem: None,

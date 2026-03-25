@@ -24,6 +24,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use axum_server::Handle;
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
@@ -43,7 +44,7 @@ use serde_json::json;
 use time::OffsetDateTime;
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tower::Service;
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
@@ -96,6 +97,7 @@ const RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 5;
 const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
 const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
 const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
+const UPLOAD_SESSION_PERSIST_INACTIVITY_SECS: u64 = 60;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -127,6 +129,8 @@ struct ServerState {
     cluster: Arc<Mutex<ClusterService>>,
     client_credentials: Arc<Mutex<ClientCredentialState>>,
     upload_sessions: Arc<Mutex<UploadSessionStore>>,
+    upload_sessions_dirty: Arc<AtomicUsize>,
+    upload_sessions_persist_notify: Arc<Notify>,
     public_ca_pem: Option<String>,
     public_ca_key_pem: Option<String>,
     cluster_ca_pem: Option<String>,
@@ -387,6 +391,59 @@ async fn persist_upload_session_store(store: &UploadSessionStore) -> Result<()> 
     })
     .context("failed encoding upload session state")?;
     write_json_atomic(&store.path, &payload).await
+}
+
+fn mark_upload_session_store_dirty(state: &ServerState) {
+    state.upload_sessions_dirty.fetch_add(1, Ordering::SeqCst);
+    state.upload_sessions_persist_notify.notify_one();
+}
+
+async fn persist_upload_session_store_now(state: &ServerState) -> Result<()> {
+    let now = unix_ts();
+    let mut sessions = state.upload_sessions.lock().await;
+    prune_expired_upload_sessions(&mut sessions, now);
+    persist_upload_session_store(&sessions).await
+}
+
+fn spawn_upload_session_store_persister(state: ServerState) {
+    tokio::spawn(async move {
+        let mut persisted_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
+
+        loop {
+            state.upload_sessions_persist_notify.notified().await;
+
+            loop {
+                let observed_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
+                let sleep =
+                    tokio::time::sleep(Duration::from_secs(UPLOAD_SESSION_PERSIST_INACTIVITY_SECS));
+                tokio::pin!(sleep);
+                tokio::select! {
+                    _ = &mut sleep => {}
+                    _ = state.upload_sessions_persist_notify.notified() => {
+                        continue;
+                    }
+                }
+                let stable_generation = state.upload_sessions_dirty.load(Ordering::SeqCst);
+                if stable_generation != observed_generation {
+                    continue;
+                }
+                if stable_generation == persisted_generation {
+                    break;
+                }
+
+                match persist_upload_session_store_now(&state).await {
+                    Ok(()) => {
+                        persisted_generation = stable_generation;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to persist debounced upload session state");
+                        state.upload_sessions_persist_notify.notify_one();
+                    }
+                }
+                break;
+            }
+        }
+    });
 }
 
 fn prune_expired_upload_sessions(store: &mut UploadSessionStore, now: u64) {
@@ -2686,6 +2743,48 @@ pub async fn run(config: ServerNodeConfig) -> Result<()> {
     run_inner(config, None).await
 }
 
+async fn wait_for_shutdown_trigger(mut shutdown_rx: watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(error = %err, "failed waiting for ctrl-c signal");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                let _ = signal.recv().await;
+            }
+            Err(err) => {
+                warn!(error = %err, "failed installing SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = if config.node_enrollment_auto_renew_enabled {
@@ -3008,6 +3107,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         cluster: Arc::new(Mutex::new(cluster)),
         client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
         upload_sessions: Arc::new(Mutex::new(upload_session_store)),
+        upload_sessions_dirty: Arc::new(AtomicUsize::new(0)),
+        upload_sessions_persist_notify: Arc::new(Notify::new()),
         public_ca_pem,
         public_ca_key_pem,
         cluster_ca_pem,
@@ -3058,6 +3159,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         client_auth_replay_cache: Arc::new(Mutex::new(ClientAuthReplayCache::default())),
     };
 
+    spawn_upload_session_store_persister(state.clone());
     refresh_local_node_storage(&state).await;
     spawn_storage_stats_refresher(state.clone());
 
@@ -3425,6 +3527,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             require_internal_caller,
         ));
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut internal_server_handle = None;
+    let mut internal_server_task = None;
+
     if let Some(internal_tls) = config.internal_tls.as_ref() {
         let internal_bind_addr = internal_tls.bind_addr;
         let internal_tls = state
@@ -3433,7 +3539,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             .map(|runtime| runtime.config.clone())
             .context("internal TLS runtime missing for configured internal listener")?;
         let internal_state = state.clone();
-        tokio::spawn(async move {
+        let handle = Handle::new();
+        internal_server_handle = Some(handle.clone());
+        internal_server_task = Some(tokio::spawn(async move {
             info!(
                 bind_addr = %internal_bind_addr,
                 node_id = %internal_state.node_id,
@@ -3441,14 +3549,13 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             );
 
             let acceptor = MtlsCallerAcceptor::new(internal_tls);
-            if let Err(err) = axum_server::Server::bind(internal_bind_addr)
+            axum_server::Server::bind(internal_bind_addr)
+                .handle(handle)
                 .acceptor(acceptor)
                 .serve(internal_app.into_make_service())
                 .await
-            {
-                warn!(error = %err, "internal server listener stopped");
-            }
-        });
+                .context("internal server listener stopped")
+        }));
     }
 
     if let Some(managed_rendezvous) = config.managed_rendezvous.clone() {
@@ -3484,18 +3591,69 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         "server node listening"
     );
 
-    if config.public_tls.is_some() {
+    let mut public_server_handle = None;
+    let mut public_server_task = if config.public_tls.is_some() {
         let tls_config = state
             .public_tls_runtime
             .as_ref()
             .map(|runtime| runtime.config.clone())
             .context("public TLS runtime missing for configured public listener")?;
-        axum_server::bind_rustls(config.bind_addr, tls_config)
-            .serve(public_app.into_make_service())
-            .await?;
+        let handle = Handle::new();
+        public_server_handle = Some(handle.clone());
+        tokio::spawn(async move {
+            axum_server::bind_rustls(config.bind_addr, tls_config)
+                .handle(handle)
+                .serve(public_app.into_make_service())
+                .await
+                .context("public TLS server listener stopped")
+        })
     } else {
-        let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
-        axum::serve(listener, public_app).await?;
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+            axum::serve(listener, public_app)
+                .with_graceful_shutdown(wait_for_shutdown_trigger(shutdown_rx))
+                .await
+                .context("public HTTP server listener stopped")
+        })
+    };
+
+    tokio::select! {
+        outcome = &mut public_server_task => {
+            outcome.context("public server task join failure")??;
+        }
+        _ = shutdown_signal() => {
+            info!(node_id = %state.node_id, "shutdown signal received");
+            let _ = shutdown_tx.send(true);
+            if let Some(handle) = public_server_handle.as_ref() {
+                handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            }
+            if let Some(handle) = internal_server_handle.as_ref() {
+                handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            }
+
+            public_server_task
+                .await
+                .context("public server task join failure")??;
+            if let Some(task) = internal_server_task.take() {
+                task.await.context("internal server task join failure")??;
+            }
+            if let Err(err) = persist_upload_session_store_now(&state).await {
+                warn!(error = %err, "failed to persist upload session state during shutdown");
+            }
+            return Ok(());
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = internal_server_handle.as_ref() {
+        handle.graceful_shutdown(Some(Duration::from_secs(0)));
+    }
+    if let Some(task) = internal_server_task {
+        task.await.context("internal server task join failure")??;
+    }
+    if let Err(err) = persist_upload_session_store_now(&state).await {
+        warn!(error = %err, "failed to persist upload session state during shutdown");
     }
 
     Ok(())
@@ -5470,10 +5628,8 @@ async fn start_upload_session(
     };
     let response = upload_session_view(&session);
     sessions.sessions.insert(session.upload_id.clone(), session);
-    if let Err(err) = persist_upload_session_store(&sessions).await {
-        warn!(error = %err, "failed to persist upload session state");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    drop(sessions);
+    mark_upload_session_store_dirty(&state);
 
     (StatusCode::CREATED, Json(response)).into_response()
 }
@@ -5521,10 +5677,8 @@ async fn delete_upload_session(
     }
 
     sessions.sessions.remove(&upload_id);
-    if let Err(err) = persist_upload_session_store(&sessions).await {
-        warn!(error = %err, "failed to persist upload session deletion");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    drop(sessions);
+    mark_upload_session_store_dirty(&state);
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -5617,10 +5771,8 @@ async fn upload_session_chunk(
         received_index: index,
     };
 
-    if let Err(err) = persist_upload_session_store(&sessions).await {
-        warn!(error = %err, "failed to persist upload session chunk state");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    drop(sessions);
+    mark_upload_session_store_dirty(&state);
 
     (StatusCode::OK, Json(response)).into_response()
 }
@@ -5700,6 +5852,8 @@ async fn complete_upload_session_route(
                         .updated_at_unix
                         .saturating_add(UPLOAD_SESSION_TTL_SECS);
                 }
+                drop(sessions);
+                mark_upload_session_store_dirty(&state);
                 tracing::error!(
                     error = %err,
                     key = %key,
@@ -5777,10 +5931,8 @@ async fn complete_upload_session_route(
         );
         return (StatusCode::OK, Json(response)).into_response();
     }
-    if let Err(err) = persist_upload_session_store(&sessions).await {
-        warn!(error = %err, "failed to persist completed upload session");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    drop(sessions);
+    mark_upload_session_store_dirty(&state);
 
     (StatusCode::OK, Json(response)).into_response()
 }
