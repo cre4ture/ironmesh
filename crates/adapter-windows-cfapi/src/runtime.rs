@@ -1,7 +1,7 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
-    cf_report_provider_progress2, cf_set_in_sync, cf_set_not_in_sync, path_is_placeholder,
+    cf_convert_to_placeholder, cf_report_provider_progress2, cf_set_in_sync, cf_set_not_in_sync, describe_path_state, path_placeholder_state
 };
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
@@ -591,30 +591,69 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
         }
     }
 
+    eprintln!(
+        "sync-state: reconciling {} desired paths under {}",
+        desired_states.len(),
+        root_path.display()
+    );
     let mut stats = SyncStateReconcileStats::default();
     for (relative_path, desired_state) in desired_states {
         let full_path = root_path.join(relative_path.replace('/', "\\"));
         if !full_path.exists() {
             stats.skipped_missing += 1;
+            eprintln!(
+                "sync-state: skipped missing path={} desired={:?} state={}",
+                relative_path,
+                desired_state,
+                describe_path_state(&full_path)
+            );
             continue;
         }
 
+        let state_before = describe_path_state(&full_path);
         let metadata = match std::fs::metadata(&full_path) {
             Ok(metadata) => metadata,
             Err(err) => {
                 stats.failed += 1;
                 eprintln!(
-                    "sync-state: failed to read metadata for {}: {}",
+                    "sync-state: failed to read metadata for {} desired={:?}: {} state_before={}",
                     full_path.display(),
-                    err
+                    desired_state,
+                    err,
+                    state_before
                 );
                 continue;
             }
         };
 
-        if metadata.is_dir() || !path_is_placeholder(&full_path) {
+        if metadata.is_dir() {
             stats.skipped_non_placeholder += 1;
+            eprintln!(
+                "sync-state: skipped non-placeholder path={} desired={:?} state_before={}",
+                relative_path, desired_state, state_before
+            );
             continue;
+        }
+
+        let placeholder_state = path_placeholder_state(&full_path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
+        match placeholder_state {
+            CF_PLACEHOLDER_STATE_INVALID | CF_PLACEHOLDER_STATE_NO_STATES => {
+                eprintln!(
+                    "sync-state: path is not a placeholder, attempting convert path={} desired={:?} state_before={}",
+                    relative_path, desired_state, state_before
+                );
+                cf_convert_to_placeholder(&std::fs::File::open(&full_path).unwrap()).unwrap_or_else(|err| {
+                    stats.failed += 1;
+                    eprintln!(
+                        "sync-state: failed to convert to placeholder {} desired={:?}: {} state_before={}",
+                        full_path.display(),
+                        desired_state,
+                        err,
+                        state_before
+                    );
+                });
+            }
+            _ => {}
         }
 
         let file = match std::fs::OpenOptions::new()
@@ -626,9 +665,11 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
             Err(err) => {
                 stats.failed += 1;
                 eprintln!(
-                    "sync-state: failed to open {} for sync-state update: {}",
+                    "sync-state: failed to open {} for sync-state update desired={:?}: {} state_before={}",
                     full_path.display(),
-                    err
+                    desired_state,
+                    err,
+                    state_before
                 );
                 continue;
             }
@@ -646,10 +687,19 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
         if let Err(err) = result {
             stats.failed += 1;
             eprintln!(
-                "sync-state: failed to set {:?} for {}: {:#}",
+                "sync-state: failed to set {:?} for {}: {:#} state_before={}",
                 desired_state,
                 full_path.display(),
-                err
+                err,
+                state_before
+            );
+        } else {
+            eprintln!(
+                "sync-state: applied desired={:?} path={} state_before={} state_after={}",
+                desired_state,
+                relative_path,
+                state_before,
+                describe_path_state(&full_path)
             );
         }
     }
@@ -891,6 +941,29 @@ unsafe extern "system" fn callback_fetch_data(
     let range_start = fetch_data.RequiredFileOffset.max(0) as u64;
     let range_length = fetch_data.RequiredLength.max(0) as u64;
     let request_identity = callback_request_identity(callback_info_ref);
+    let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
+    let already_hydrated_once = context
+        .hydrated_once_paths
+        .lock()
+        .map(|paths| paths.contains(&relative_path))
+        .unwrap_or(false);
+    let upload_snapshot = context
+        .upload_debounce
+        .debug_snapshot_for_path(&relative_path, 8);
+    eprintln!(
+        "cfapi fetch-data begin: request={} transfer={} file_id={} session={} path={} remote_version={} offset={} length={} already_hydrated_once={} upload_debounce={} state={}",
+        request_identity,
+        callback_info_ref.TransferKey,
+        callback_info_ref.FileId,
+        callback_target_session_id(callback_info_ref),
+        relative_path,
+        remote_version,
+        range_start,
+        range_length,
+        already_hydrated_once,
+        upload_snapshot.to_log_string(),
+        describe_path_state(&full_path)
+    );
     let cancel_flag = Arc::new(AtomicBool::new(false));
     if let Ok(mut fetch_cancellations) = context.fetch_cancellations.lock() {
         fetch_cancellations.insert(request_identity, cancel_flag.clone());
@@ -921,13 +994,37 @@ unsafe extern "system" fn callback_fetch_data(
     }
 
     match result {
-        Ok(_) => {
+        Ok(result) => {
             if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
-                hydrated_paths.insert(relative_path);
+                hydrated_paths.insert(relative_path.clone());
             }
+            eprintln!(
+                "cfapi fetch-data complete: request={} path={} object_size={} range_start={} range_length={} bytes_transferred={} state_after={} upload_debounce={}",
+                request_identity,
+                relative_path,
+                result.object_size_bytes,
+                result.range_start,
+                result.range_length,
+                result.bytes_transferred,
+                describe_path_state(&full_path),
+                context
+                    .upload_debounce
+                    .debug_snapshot_for_path(&relative_path, 8)
+                    .to_log_string()
+            );
         }
         Err(err) => {
-            eprintln!("cfapi fetch-data hydration error: {err}");
+            eprintln!(
+                "cfapi fetch-data hydration error: request={} path={} error={:#} state_after={} upload_debounce={}",
+                request_identity,
+                relative_path,
+                err,
+                describe_path_state(&full_path),
+                context
+                    .upload_debounce
+                    .debug_snapshot_for_path(&relative_path, 8)
+                    .to_log_string()
+            );
         }
     }
 }

@@ -1,6 +1,6 @@
 use crate::cfapi::{
     cf_convert_to_placeholder, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
-    cf_set_not_in_sync,
+    cf_set_not_in_sync, describe_path_state,
 };
 use crate::runtime::{CfapiRuntime, Uploader};
 use anyhow::Result;
@@ -22,6 +22,81 @@ pub(crate) struct UploadWorkerContext {
 pub(crate) struct UploadDebounceState {
     pending_generations: Mutex<std::collections::HashMap<String, u64>>,
     uploads_in_flight: Mutex<HashSet<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UploadDebounceSnapshot {
+    pub pending_count: usize,
+    pub uploads_in_flight_count: usize,
+    pub path_generation: Option<u64>,
+    pub path_in_flight: bool,
+    pub pending_paths_sample: Vec<String>,
+    pub uploads_in_flight_sample: Vec<String>,
+}
+
+impl UploadDebounceSnapshot {
+    pub(crate) fn to_log_string(&self) -> String {
+        format!(
+            "pending_count={} in_flight_count={} path_generation={:?} path_in_flight={} pending_sample={:?} in_flight_sample={:?}",
+            self.pending_count,
+            self.uploads_in_flight_count,
+            self.path_generation,
+            self.path_in_flight,
+            self.pending_paths_sample,
+            self.uploads_in_flight_sample
+        )
+    }
+}
+
+impl UploadDebounceState {
+    pub(crate) fn debug_snapshot_for_path(
+        &self,
+        relative_path: &str,
+        sample_limit: usize,
+    ) -> UploadDebounceSnapshot {
+        let sample_limit = sample_limit.max(1);
+        let (pending_count, path_generation, pending_paths_sample) = {
+            let pending = self
+                .pending_generations
+                .lock()
+                .expect("pending upload generations lock poisoned");
+            let mut pending_paths = pending.keys().cloned().collect::<Vec<_>>();
+            pending_paths.sort();
+            (
+                pending.len(),
+                pending.get(relative_path).copied(),
+                pending_paths
+                    .into_iter()
+                    .take(sample_limit)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (uploads_in_flight_count, path_in_flight, uploads_in_flight_sample) = {
+            let uploads_in_flight = self
+                .uploads_in_flight
+                .lock()
+                .expect("uploads_in_flight lock poisoned");
+            let mut in_flight_paths = uploads_in_flight.iter().cloned().collect::<Vec<_>>();
+            in_flight_paths.sort();
+            (
+                uploads_in_flight.len(),
+                uploads_in_flight.contains(relative_path),
+                in_flight_paths
+                    .into_iter()
+                    .take(sample_limit)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        UploadDebounceSnapshot {
+            pending_count,
+            uploads_in_flight_count,
+            path_generation,
+            path_in_flight,
+            pending_paths_sample,
+            uploads_in_flight_sample,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,10 +125,14 @@ pub(crate) fn schedule_debounced_close_upload(
         *entry += 1;
         *entry
     };
+    let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
 
     eprintln!(
-        "close-completion: scheduled upload for {} after {:?} quiet period (generation {})",
-        relative_path, CLOSE_UPLOAD_QUIET_PERIOD, generation
+        "close-completion: scheduled upload for {} after {:?} quiet period (generation {}, {})",
+        relative_path,
+        CLOSE_UPLOAD_QUIET_PERIOD,
+        generation,
+        snapshot.to_log_string()
     );
 
     spawn_debounced_close_upload(
@@ -83,6 +162,13 @@ fn spawn_debounced_close_upload(
             pending.get(&relative_path).copied() == Some(generation)
         };
         if !is_latest {
+            let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
+            eprintln!(
+                "close-completion: skipping stale upload worker for {} generation {} ({})",
+                relative_path,
+                generation,
+                snapshot.to_log_string()
+            );
             return;
         }
 
@@ -92,6 +178,14 @@ fn spawn_debounced_close_upload(
                 .lock()
                 .expect("uploads_in_flight lock poisoned");
             if !uploads_in_flight.insert(relative_path.clone()) {
+                drop(uploads_in_flight);
+                let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
+                eprintln!(
+                    "close-completion: upload already in flight for {} generation {} ({})",
+                    relative_path,
+                    generation,
+                    snapshot.to_log_string()
+                );
                 return;
             }
         }
@@ -115,6 +209,14 @@ fn spawn_debounced_close_upload(
         match (outcome, latest_generation) {
             (_, Some(latest)) if latest != generation => {}
             (UploadAttemptOutcome::Retry, Some(latest)) => {
+                let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
+                eprintln!(
+                    "close-completion: retrying upload for {} generation {} after {:?} ({})",
+                    relative_path,
+                    latest,
+                    CLOSE_UPLOAD_RETRY_DELAY,
+                    snapshot.to_log_string()
+                );
                 spawn_debounced_close_upload(
                     worker,
                     debounce,
@@ -141,7 +243,11 @@ fn process_debounced_close_upload(
 ) -> UploadAttemptOutcome {
     let full_path = worker.sync_root.join(relative_path);
 
-    eprintln!("close-completion: checking upload for {}", relative_path);
+    eprintln!(
+        "close-completion: checking upload for {} state_before={}",
+        relative_path,
+        describe_path_state(&full_path)
+    );
 
     let metadata = match std::fs::metadata(&full_path) {
         Ok(metadata) => metadata,
@@ -213,8 +319,9 @@ fn process_debounced_close_upload(
     match cf_get_placeholder_standard_info(&file) {
         Ok(placeholder_info) if placeholder_info.ModifiedDataSize == 0 => {
             eprintln!(
-                "close-completion: skipping upload for {} because ModifiedDataSize is zero",
-                relative_path
+                "close-completion: skipping upload for {} because ModifiedDataSize is zero state={}",
+                relative_path,
+                describe_path_state(&full_path)
             );
             return UploadAttemptOutcome::Settled;
         }
@@ -248,6 +355,13 @@ fn process_debounced_close_upload(
             return UploadAttemptOutcome::Retry;
         }
     };
+    eprintln!(
+        "close-completion: prepared {} for upload snapshot_before={:?} upload_usn={} state={}",
+        relative_path,
+        snapshot_before,
+        upload_usn,
+        describe_path_state(&full_path)
+    );
 
     if let Err(err) = upload_file_on_close(worker, relative_path, snapshot_before.len, file) {
         eprintln!(
@@ -277,11 +391,21 @@ fn process_debounced_close_upload(
 
     if snapshot_after != snapshot_before {
         eprintln!(
-            "close-completion: {} changed during upload, scheduling retry",
-            relative_path
+            "close-completion: {} changed during upload, scheduling retry snapshot_before={:?} snapshot_after={:?} state={}",
+            relative_path,
+            snapshot_before,
+            snapshot_after,
+            describe_path_state(&full_path)
         );
         return UploadAttemptOutcome::Retry;
     }
+    eprintln!(
+        "close-completion: upload finished for {} snapshot_after={:?} upload_usn={} state_before_in_sync={}",
+        relative_path,
+        snapshot_after,
+        upload_usn,
+        describe_path_state(&full_path)
+    );
 
     match std::fs::OpenOptions::new()
         .read(true)
@@ -307,8 +431,10 @@ fn process_debounced_close_upload(
     }
 
     eprintln!(
-        "cfapi uploaded local file: path={} bytes={}",
-        relative_path, snapshot_before.len
+        "cfapi uploaded local file: path={} bytes={} final_state={}",
+        relative_path,
+        snapshot_before.len,
+        describe_path_state(&full_path)
     );
     UploadAttemptOutcome::Settled
 }

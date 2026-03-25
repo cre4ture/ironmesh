@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::adapter::WindowsCfapiAdapter;
+use crate::adapter::{CfapiAction, CfapiActionPlan, WindowsCfapiAdapter};
 use crate::auth::{ClientEnrollmentOptions, resolve_or_enroll_client_identity};
 use crate::cfapi::{cf_get_placeholder_standard_info, cf_set_pin_state};
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
@@ -30,6 +30,63 @@ const LONG_VERSION: &str = git_version::git_version!(
     prefix = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: "),
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
+
+fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
+    let mut ensure_directories = 0usize;
+    let mut ensure_placeholders = 0usize;
+    let mut hydrate_on_demand = 0usize;
+    let mut queue_uploads = 0usize;
+    let mut conflicts = 0usize;
+    let mut hydrate_sample = Vec::new();
+    let mut dirty_sample = Vec::new();
+    let mut conflict_sample = Vec::new();
+
+    for action in &plan.actions {
+        match action {
+            CfapiAction::EnsureDirectory { .. } => {
+                ensure_directories += 1;
+            }
+            CfapiAction::EnsurePlaceholder { .. } => {
+                ensure_placeholders += 1;
+            }
+            CfapiAction::HydrateOnDemand { path, .. } => {
+                hydrate_on_demand += 1;
+                if hydrate_sample.len() < 8 {
+                    hydrate_sample.push(path.clone());
+                }
+            }
+            CfapiAction::QueueUploadOnClose { path, .. } => {
+                queue_uploads += 1;
+                if dirty_sample.len() < 8 {
+                    dirty_sample.push(path.clone());
+                }
+            }
+            CfapiAction::MarkConflict { path, .. } => {
+                conflicts += 1;
+                if conflict_sample.len() < 8 {
+                    conflict_sample.push(path.clone());
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "plan-summary: {} total={} directories={} placeholders={} hydrate_on_demand={} queue_uploads={} conflicts={}",
+        label,
+        plan.actions.len(),
+        ensure_directories,
+        ensure_placeholders,
+        hydrate_on_demand,
+        queue_uploads,
+        conflicts
+    );
+    if !hydrate_sample.is_empty() || !dirty_sample.is_empty() || !conflict_sample.is_empty() {
+        eprintln!(
+            "plan-summary: {} hydrate_sample={:?} dirty_sample={:?} conflict_sample={:?}",
+            label, hydrate_sample, dirty_sample, conflict_sample
+        );
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "adapter-windows-cfapi")]
@@ -173,6 +230,7 @@ pub fn cli_main() -> anyhow::Result<()> {
             );
             let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
             let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
+            log_action_plan_summary("startup", &action_plan);
 
             let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
             let download_stage_root =
@@ -232,6 +290,9 @@ pub fn cli_main() -> anyhow::Result<()> {
                 move |update| {
                     let plan =
                         refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
+                    let summary_label =
+                        format!("remote-refresh changed_paths={}", update.changed_paths.len());
+                    log_action_plan_summary(&summary_label, &plan);
                     if let Err(err) = apply_action_plan(&refresh_registration.root_path, &plan) {
                         eprintln!("remote-refresh: apply_action_plan error: {err}");
                         return;

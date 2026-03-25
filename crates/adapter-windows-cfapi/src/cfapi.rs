@@ -4,8 +4,7 @@ use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Storage::CloudFilters::{
-    CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE,
-    CF_PLACEHOLDER_STATE_PLACEHOLDER, CF_SET_PIN_FLAGS,
+    CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE, CF_PLACEHOLDER_STATE_INVALID, CF_SET_PIN_FLAGS
 };
 
 pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
@@ -206,8 +205,46 @@ pub fn path_placeholder_state(path: &Path) -> Result<CF_PLACEHOLDER_STATE> {
 
 pub fn path_is_placeholder(path: &Path) -> bool {
     path_placeholder_state(path)
-        .map(|state| (state & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0)
+        .map(|state| state != CF_PLACEHOLDER_STATE_INVALID)
         .unwrap_or(false)
+}
+
+pub fn describe_path_state(path: &Path) -> String {
+    let metadata_summary = match std::fs::metadata(path) {
+        Ok(metadata) => format!(
+            "exists=true dir={} len={} attrs=0x{:08x}",
+            metadata.is_dir(),
+            metadata.len(),
+            metadata.file_attributes()
+        ),
+        Err(err) => format!("exists=false metadata_error={err}"),
+    };
+
+    let placeholder_state_summary = match path_placeholder_state(path) {
+        Ok(state) => format!("placeholder_state=0x{state:08x}"),
+        Err(err) => format!("placeholder_state_error={err}"),
+    };
+
+    let placeholder_info_summary = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => match cf_get_placeholder_standard_info(&file) {
+            Ok(info) => format!(
+                "placeholder_info={{file_id={} on_disk={} validated={} modified={} in_sync={:?} pin={:?}}}",
+                info.FileId,
+                info.OnDiskDataSize,
+                info.ValidatedDataSize,
+                info.ModifiedDataSize,
+                info.InSyncState,
+                info.PinState
+            ),
+            Err(err) => format!("placeholder_info_error={err}"),
+        },
+        Err(err) => format!("open_error={err}"),
+    };
+
+    format!(
+        "{} {} {}",
+        metadata_summary, placeholder_state_summary, placeholder_info_summary
+    )
 }
 
 pub fn try_convert_materialized_file(
