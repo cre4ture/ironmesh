@@ -29,6 +29,10 @@ export type BinaryUploadProgress = {
   phase: "starting" | "uploading" | "finalizing" | "complete";
 };
 
+export type BinaryUploadOptions = {
+  signal?: AbortSignal;
+};
+
 export async function getClientPing(): Promise<ClientUiPingResponse> {
   return fetchJson<ClientUiPingResponse>("/api/ping");
 }
@@ -133,85 +137,102 @@ export async function deleteStoreValue(key: string): Promise<JsonObject> {
 export async function putBinaryObject(
   key: string,
   file: File,
-  onProgress?: (progress: BinaryUploadProgress) => void
+  onProgress?: (progress: BinaryUploadProgress) => void,
+  options?: BinaryUploadOptions
 ): Promise<StorePutResponse> {
-  const session = await startStoreUploadSession(key, file.size);
-  const receivedIndexes = new Set(session.received_indexes);
-  let uploadedBytes = byteCountForReceivedIndexes(
-    receivedIndexes,
-    session.chunk_size_bytes,
-    file.size
-  );
-  let uploadedChunks = receivedIndexes.size;
+  const signal = options?.signal;
+  let session: StoreUploadSessionStartResponse | null = null;
+  let completedUpload = false;
 
-  onProgress?.(
-    buildBinaryUploadProgress(
-      uploadedBytes,
-      file.size,
-      uploadedChunks,
-      session.chunk_count,
-      uploadedChunks === 0 ? "starting" : "uploading"
-    )
-  );
+  try {
+    session = await startStoreUploadSession(key, file.size, signal);
+    const receivedIndexes = new Set(session.received_indexes);
+    let uploadedBytes = byteCountForReceivedIndexes(
+      receivedIndexes,
+      session.chunk_size_bytes,
+      file.size
+    );
+    let uploadedChunks = receivedIndexes.size;
 
-  for (let index = 0; index < session.chunk_count; index += 1) {
-    if (receivedIndexes.has(index)) {
-      continue;
-    }
-
-    const start = index * session.chunk_size_bytes;
-    const end = Math.min(start + session.chunk_size_bytes, file.size);
-    const chunk = file.slice(start, end);
-    const response = await fetch(`/api/store/uploads/${encodeURIComponent(session.upload_id)}/chunk/${index}`, {
-      method: "PUT",
-      body: chunk,
-      headers: {
-        "content-type": file.type || "application/octet-stream"
-      }
-    });
-    const ack = await readJsonResponse<StoreUploadSessionChunkResponse>(response);
-    if (ack.received_index !== index) {
-      throw new Error(`Chunk upload desynchronized at index ${index}`);
-    }
-    uploadedBytes += end - start;
-    uploadedChunks += 1;
     onProgress?.(
       buildBinaryUploadProgress(
         uploadedBytes,
         file.size,
         uploadedChunks,
         session.chunk_count,
-        "uploading"
+        uploadedChunks === 0 ? "starting" : "uploading"
       )
     );
-  }
 
-  onProgress?.(
-    buildBinaryUploadProgress(
-      file.size,
-      file.size,
-      session.chunk_count,
-      session.chunk_count,
-      "finalizing"
-    )
-  );
-  const completed = await completeStoreUploadSession(session.upload_id);
-  onProgress?.(
-    buildBinaryUploadProgress(
-      completed.total_size_bytes,
-      completed.total_size_bytes,
-      session.chunk_count,
-      session.chunk_count,
-      "complete"
-    )
-  );
-  return {
-    key: session.key,
-    size_bytes: completed.total_size_bytes,
-    upload_mode: "chunked",
-    chunk_size_bytes: session.chunk_size_bytes,
-    chunk_count: session.chunk_count
-  };
+    for (let index = 0; index < session.chunk_count; index += 1) {
+      if (receivedIndexes.has(index)) {
+        continue;
+      }
+
+      const start = index * session.chunk_size_bytes;
+      const end = Math.min(start + session.chunk_size_bytes, file.size);
+      const chunk = file.slice(start, end);
+      const response = await fetch(
+        `/api/store/uploads/${encodeURIComponent(session.upload_id)}/chunk/${index}`,
+        {
+          method: "PUT",
+          body: chunk,
+          headers: {
+            "content-type": file.type || "application/octet-stream"
+          },
+          signal
+        }
+      );
+      const ack = await readJsonResponse<StoreUploadSessionChunkResponse>(response);
+      if (ack.received_index !== index) {
+        throw new Error(`Chunk upload desynchronized at index ${index}`);
+      }
+      uploadedBytes += end - start;
+      uploadedChunks += 1;
+      onProgress?.(
+        buildBinaryUploadProgress(
+          uploadedBytes,
+          file.size,
+          uploadedChunks,
+          session.chunk_count,
+          "uploading"
+        )
+      );
+    }
+
+    onProgress?.(
+      buildBinaryUploadProgress(
+        file.size,
+        file.size,
+        session.chunk_count,
+        session.chunk_count,
+        "finalizing"
+      )
+    );
+    const completed = await completeStoreUploadSession(session.upload_id, signal);
+    completedUpload = true;
+    onProgress?.(
+      buildBinaryUploadProgress(
+        completed.total_size_bytes,
+        completed.total_size_bytes,
+        session.chunk_count,
+        session.chunk_count,
+        "complete"
+      )
+    );
+    return {
+      key: session.key,
+      size_bytes: completed.total_size_bytes,
+      upload_mode: "chunked",
+      chunk_size_bytes: session.chunk_size_bytes,
+      chunk_count: session.chunk_count
+    };
+  } catch (error) {
+    if (session && !completedUpload && isAbortError(error)) {
+      await deleteStoreUploadSession(session.upload_id).catch(() => undefined);
+    }
+    throw error;
+  }
 }
 
 export function getBinaryObjectDownloadUrl(
@@ -261,7 +282,8 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
 
 async function startStoreUploadSession(
   key: string,
-  totalSizeBytes: number
+  totalSizeBytes: number,
+  signal?: AbortSignal
 ): Promise<StoreUploadSessionStartResponse> {
   return fetchJson<StoreUploadSessionStartResponse>("/api/store/uploads/start", {
     method: "POST",
@@ -271,19 +293,36 @@ async function startStoreUploadSession(
     body: JSON.stringify({
       key,
       total_size_bytes: totalSizeBytes
-    })
+    }),
+    signal
   });
 }
 
 async function completeStoreUploadSession(
-  uploadId: string
+  uploadId: string,
+  signal?: AbortSignal
 ): Promise<StoreUploadSessionCompleteResponse> {
   return fetchJson<StoreUploadSessionCompleteResponse>(
     `/api/store/uploads/${encodeURIComponent(uploadId)}/complete`,
     {
-      method: "POST"
+      method: "POST",
+      signal
     }
   );
+}
+
+async function deleteStoreUploadSession(
+  uploadId: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const response = await fetch(`/api/store/uploads/${encodeURIComponent(uploadId)}`, {
+    method: "DELETE",
+    signal
+  });
+  if (response.ok || response.status === 404 || response.status === 409) {
+    return;
+  }
+  throw new Error(await readErrorMessage(response));
 }
 
 function byteCountForReceivedIndexes(
@@ -327,4 +366,12 @@ async function readErrorMessage(response: Response): Promise<string> {
     return payload.error;
   }
   return `HTTP ${response.status}`;
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    error instanceof DOMException && error.name === "AbortError"
+  ) || (
+    error instanceof Error && error.name === "AbortError"
+  );
 }

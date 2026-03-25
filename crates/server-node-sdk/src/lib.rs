@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Body;
@@ -98,6 +98,9 @@ const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
 const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
 const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 const UPLOAD_SESSION_PERSIST_INACTIVITY_SECS: u64 = 60;
+const DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS: u64 = 30;
+const SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS: u128 = 250;
+const SLOW_UPLOAD_FINALIZE_LOG_THRESHOLD_MS: u128 = 500;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -2083,7 +2086,7 @@ impl ServerNodeConfig {
             )
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5),
+            .unwrap_or(DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS),
             replication_factor: std::env::var("IRONMESH_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -2400,7 +2403,7 @@ impl ServerNodeConfig {
             )
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5),
+            .unwrap_or(DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS),
             replication_factor: std::env::var("IRONMESH_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -2535,7 +2538,7 @@ impl ServerNodeConfig {
             node_enrollment_renewal_admin_token: None,
             heartbeat_timeout_secs: 90,
             audit_interval_secs: 3600,
-            replica_view_sync_interval_secs: 5,
+            replica_view_sync_interval_secs: DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS,
             replication_factor: 1,
             accepted_over_replication_items: 0,
             metadata_commit_mode: MetadataCommitMode::Local,
@@ -2723,6 +2726,7 @@ pub async fn run_from_env() -> Result<()> {
         .with(tracing_subscriber::EnvFilter::new("info"))
         .with(
             tracing_subscriber::fmt::layer()
+                .with_timer(tracing_subscriber::fmt::time::SystemTime)
                 .with_target(false)
                 .compact(),
         )
@@ -3161,6 +3165,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
     spawn_upload_session_store_persister(state.clone());
     refresh_local_node_storage(&state).await;
+    refresh_local_availability_view_once(&state).await;
     spawn_storage_stats_refresher(state.clone());
 
     let persisted_attempts = {
@@ -4623,13 +4628,11 @@ struct LocalMetadataSubjectsResponse {
 }
 
 pub(crate) async fn sync_availability_views_once(state: &ServerState) {
-    let local_subjects = local_cluster_available_subjects(state).await;
+    refresh_local_availability_view_once(state).await;
+    sync_remote_availability_views_once(state).await;
+}
 
-    {
-        let mut cluster = state.cluster.lock().await;
-        cluster.replace_node_available_view(state.node_id, &local_subjects);
-    }
-
+async fn sync_remote_availability_views_once(state: &ServerState) {
     let peers = {
         let mut cluster = state.cluster.lock().await;
         cluster.update_health_and_detect_offline_transition();
@@ -4852,7 +4855,7 @@ fn spawn_replica_view_synchronizer(state: ServerState, interval_secs: u64) {
 
         loop {
             ticker.tick().await;
-            sync_availability_views_once(&state).await;
+            sync_remote_availability_views_once(&state).await;
             sync_cluster_metadata_once(&state).await;
         }
     });
@@ -4933,7 +4936,7 @@ async fn track_inflight_requests(
 }
 
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
-    let local_subjects = local_cluster_available_subjects(state).await;
+    let local_subjects = cached_local_cluster_available_subjects(state).await;
     let cluster_subjects = {
         let cluster = state.cluster.lock().await;
         cluster.known_replication_subjects()
@@ -4945,7 +4948,7 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     subjects.into_iter().collect()
 }
 
-async fn local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
+async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
     let mut subjects = {
         let store = state.store.lock().await;
         store
@@ -4955,6 +4958,17 @@ async fn local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
     };
     subjects.sort();
     subjects
+}
+
+async fn cached_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
+    let cluster = state.cluster.lock().await;
+    cluster.available_subjects_for_node(state.node_id)
+}
+
+async fn refresh_local_availability_view_once(state: &ServerState) {
+    let local_subjects = recompute_local_cluster_available_subjects(state).await;
+    let mut cluster = state.cluster.lock().await;
+    cluster.replace_node_available_view(state.node_id, &local_subjects);
 }
 
 async fn await_repair_busy_threshold(state: &ServerState) {
@@ -5627,6 +5641,15 @@ async fn start_upload_session(
         completed_result: None,
     };
     let response = upload_session_view(&session);
+    info!(
+        upload_id = %session.upload_id,
+        key = %key,
+        total_size_bytes = request.total_size_bytes,
+        chunk_count,
+        chunk_size_bytes,
+        state = ?session.state,
+        "started upload session"
+    );
     sessions.sessions.insert(session.upload_id.clone(), session);
     drop(sessions);
     mark_upload_session_store_dirty(&state);
@@ -5689,6 +5712,7 @@ async fn upload_session_chunk(
     Path((upload_id, index)): Path<(String, usize)>,
     payload: Bytes,
 ) -> impl IntoResponse {
+    let request_started_at = Instant::now();
     let requester_device_id = request_device_id(&headers);
     let (total_size_bytes, chunk_size_bytes, chunk_count) = {
         let now = unix_ts();
@@ -5723,16 +5747,30 @@ async fn upload_session_chunk(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let (hash, stored) = {
-        let store = state.store.lock().await;
-        match store.ingest_chunk_auto(&payload).await {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(error = %err, upload_id = %upload_id, index, "failed to ingest upload session chunk");
-                return StatusCode::BAD_REQUEST.into_response();
-            }
+    let store_lock_started_at = Instant::now();
+    let store = state.store.lock().await;
+    let store_lock_wait_ms = store_lock_started_at.elapsed().as_millis();
+    let store_ingest_started_at = Instant::now();
+    let (hash, stored) = match store.ingest_chunk_auto(&payload).await {
+        Ok(result) => result,
+        Err(err) => {
+            let store_ingest_ms = store_ingest_started_at.elapsed().as_millis();
+            let total_ms = request_started_at.elapsed().as_millis();
+            tracing::warn!(
+                error = %err,
+                upload_id = %upload_id,
+                index,
+                size_bytes = payload.len(),
+                store_lock_wait_ms,
+                store_ingest_ms,
+                total_ms,
+                "failed to ingest upload session chunk"
+            );
+            return StatusCode::BAD_REQUEST.into_response();
         }
     };
+    let store_ingest_ms = store_ingest_started_at.elapsed().as_millis();
+    drop(store);
     let next_ref = UploadChunkRef {
         hash,
         size_bytes: payload.len(),
@@ -5773,6 +5811,22 @@ async fn upload_session_chunk(
 
     drop(sessions);
     mark_upload_session_store_dirty(&state);
+    let total_ms = request_started_at.elapsed().as_millis();
+    if total_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS
+        || store_lock_wait_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS
+        || store_ingest_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS
+    {
+        info!(
+            upload_id = %upload_id,
+            index,
+            size_bytes = payload.len(),
+            stored,
+            store_lock_wait_ms,
+            store_ingest_ms,
+            total_ms,
+            "stored upload session chunk"
+        );
+    }
 
     (StatusCode::OK, Json(response)).into_response()
 }
@@ -5782,6 +5836,7 @@ async fn complete_upload_session_route(
     headers: HeaderMap,
     Path(upload_id): Path<String>,
 ) -> impl IntoResponse {
+    let finalize_started_at = Instant::now();
     let requester_device_id = request_device_id(&headers);
     let (key, total_size_bytes, parent_version_ids, version_state, explicit_version_id, chunk_refs) = {
         let now = unix_ts();
@@ -5822,48 +5877,64 @@ async fn complete_upload_session_route(
                 .collect::<Vec<_>>(),
         )
     };
+    info!(
+        upload_id = %upload_id,
+        key = %key,
+        total_size_bytes,
+        chunk_count = chunk_refs.len(),
+        "finalizing upload session"
+    );
 
-    let outcome = {
-        let mut store = state.store.lock().await;
-        match store
-            .put_object_from_chunks(
-                &key,
-                total_size_bytes as usize,
-                &chunk_refs,
-                PutOptions {
-                    parent_version_ids: parent_version_ids.clone(),
-                    state: version_state.clone(),
-                    inherit_preferred_parent: true,
-                    create_snapshot: true,
-                    explicit_version_id: explicit_version_id.clone(),
-                },
-            )
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                let mut sessions = state.upload_sessions.lock().await;
-                if let Some(session) = sessions.sessions.get_mut(&upload_id)
-                    && !session.completed
-                {
-                    session.finalizing = false;
-                    session.updated_at_unix = unix_ts();
-                    session.expires_at_unix = session
-                        .updated_at_unix
-                        .saturating_add(UPLOAD_SESSION_TTL_SECS);
-                }
-                drop(sessions);
-                mark_upload_session_store_dirty(&state);
-                tracing::error!(
-                    error = %err,
-                    key = %key,
-                    upload_id = %upload_id,
-                    "failed to finalize upload session"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let store_lock_started_at = Instant::now();
+    let mut store = state.store.lock().await;
+    let store_lock_wait_ms = store_lock_started_at.elapsed().as_millis();
+    let store_finalize_started_at = Instant::now();
+    let outcome = match store
+        .put_object_from_chunks(
+            &key,
+            total_size_bytes as usize,
+            &chunk_refs,
+            PutOptions {
+                parent_version_ids: parent_version_ids.clone(),
+                state: version_state.clone(),
+                inherit_preferred_parent: true,
+                create_snapshot: true,
+                explicit_version_id: explicit_version_id.clone(),
+            },
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let store_finalize_ms = store_finalize_started_at.elapsed().as_millis();
+            drop(store);
+            let mut sessions = state.upload_sessions.lock().await;
+            if let Some(session) = sessions.sessions.get_mut(&upload_id)
+                && !session.completed
+            {
+                session.finalizing = false;
+                session.updated_at_unix = unix_ts();
+                session.expires_at_unix = session
+                    .updated_at_unix
+                    .saturating_add(UPLOAD_SESSION_TTL_SECS);
             }
+            drop(sessions);
+            mark_upload_session_store_dirty(&state);
+            tracing::error!(
+                error = %err,
+                key = %key,
+                upload_id = %upload_id,
+                chunk_count = chunk_refs.len(),
+                store_lock_wait_ms,
+                store_finalize_ms,
+                total_ms = finalize_started_at.elapsed().as_millis(),
+                "failed to finalize upload session"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let store_finalize_ms = store_finalize_started_at.elapsed().as_millis();
+    drop(store);
 
     publish_namespace_change(&state);
     spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
@@ -5933,6 +6004,23 @@ async fn complete_upload_session_route(
     }
     drop(sessions);
     mark_upload_session_store_dirty(&state);
+    let total_ms = finalize_started_at.elapsed().as_millis();
+    info!(
+        upload_id = %upload_id,
+        key = %key,
+        total_size_bytes,
+        chunk_count = chunk_refs.len(),
+        manifest_hash = %outcome.manifest_hash,
+        version_id = %outcome.version_id,
+        new_chunks = outcome.new_chunks,
+        dedup_reused_chunks = outcome.dedup_reused_chunks,
+        created_new_version = outcome.created_new_version,
+        store_lock_wait_ms,
+        store_finalize_ms,
+        total_ms,
+        slow = total_ms >= SLOW_UPLOAD_FINALIZE_LOG_THRESHOLD_MS,
+        "completed upload session"
+    );
 
     (StatusCode::OK, Json(response)).into_response()
 }
@@ -6914,20 +7002,36 @@ async fn get_object_response(
         }
     };
 
+    let mut refreshed_local_availability = false;
     if !missing_chunks.is_empty()
         && let Some(subject) = read_through_replication_subject(
             key,
             query.snapshot.as_deref(),
             query.version.as_deref(),
         )
-        && let Err(err) = hydrate_missing_chunks_for_range(state, &subject, &missing_chunks).await
     {
-        tracing::warn!(
+        match hydrate_missing_chunks_for_range(state, &subject, &missing_chunks).await {
+            Ok(()) => {
+                refresh_local_availability_view_once(state).await;
+                refreshed_local_availability = true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    key = %key,
+                    subject = %subject,
+                    missing_chunks = missing_chunks.len(),
+                    error = %err,
+                    "read-through chunk hydration failed"
+                );
+            }
+        }
+    }
+
+    if refreshed_local_availability {
+        tracing::debug!(
             key = %key,
-            subject = %subject,
-            missing_chunks = missing_chunks.len(),
-            error = %err,
-            "read-through chunk hydration failed"
+            manifest_hash = %manifest_hash,
+            "refreshed local availability view after read-through hydration"
         );
     }
 
@@ -10626,7 +10730,7 @@ async fn trigger_replication_audit(State(state): State<ServerState>) -> Json<Rep
 }
 
 async fn local_available_subjects(State(state): State<ServerState>) -> impl IntoResponse {
-    let subjects = local_cluster_available_subjects(&state).await;
+    let subjects = cached_local_cluster_available_subjects(&state).await;
 
     (
         StatusCode::OK,

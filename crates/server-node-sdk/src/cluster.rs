@@ -440,7 +440,6 @@ impl ClusterService {
         subjects
     }
 
-    #[cfg(test)]
     pub fn available_subjects_for_node(&self, node_id: NodeId) -> Vec<String> {
         let mut subjects = self
             .available_by_key

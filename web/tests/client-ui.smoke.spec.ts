@@ -37,6 +37,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("images/beta.bin", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /Uploads 0\/2|Uploads 1\/2|Uploads 2\/2/ })).toBeVisible();
   await expect(page.getByText(/Starting|Uploading/).first()).toBeVisible();
+  await page
+    .getByRole("row", { name: /alpha\.bin/ })
+    .getByRole("button", { name: "Cancel" })
+    .click();
+  await expect(page.getByRole("row", { name: /alpha\.bin/ })).toContainText("Canceled");
   await page.locator('input[type="file"]').setInputFiles({
     name: "gamma.bin",
     mimeType: "application/octet-stream",
@@ -48,13 +53,15 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByText("Cluster", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
   await expect(page.getByRole("button", { name: /Uploads \d\/3/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: /Uploads 3\/3/ })).toBeVisible();
-  await page.getByRole("button", { name: /Uploads 3\/3/ }).click();
+  await expect(page.getByRole("button", { name: /Uploads 2\/3.*1 canceled/ })).toBeVisible();
+  await page.getByRole("button", { name: /Uploads 2\/3.*1 canceled/ }).click();
   await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
   await expect(page.getByText('"operation": "binary-upload-queue"')).toBeVisible();
   await expect(page.getByText('"active_concurrency": 2')).toBeVisible();
-  await expect(page.getByText('"completed_files": 3')).toBeVisible();
+  await expect(page.getByText('"completed_files": 2')).toBeVisible();
+  await expect(page.getByText('"canceled_files": 1')).toBeVisible();
   expect(uploadMetrics.maxConcurrentUploadIds()).toBeGreaterThan(1);
+  expect(uploadMetrics.deletedUploadSessionIds()).toContain("upload-1");
   await page.getByRole("button", { name: "Download text object" }).click();
   await expect(page.getByLabel("Downloaded payload")).toHaveValue("hello from the mocked store");
 
@@ -121,6 +128,7 @@ async function installClientUiMocks(page: Page) {
   const uploadSizes = new Map<string, number>();
   let maxConcurrentUploadIds = 0;
   const activeUploadIds = new Set<string>();
+  const deletedUploadSessionIds = new Set<string>();
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -356,13 +364,18 @@ async function installClientUiMocks(page: Page) {
       const index = Number(pathname.split("/").pop() ?? "0");
       activeUploadIds.add(uploadId);
       maxConcurrentUploadIds = Math.max(maxConcurrentUploadIds, activeUploadIds.size);
-      await new Promise((resolve) => setTimeout(resolve, 75));
-      return json(route, {
-        stored: true,
-        received_index: index
-      }).finally(() => {
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        await json(route, {
+          stored: true,
+          received_index: index
+        });
+      } catch {
+        return;
+      } finally {
         activeUploadIds.delete(uploadId);
-      });
+      }
+      return;
     }
 
     if (/^\/api\/store\/uploads\/[^/]+\/complete$/.test(pathname) && method === "POST") {
@@ -378,6 +391,14 @@ async function installClientUiMocks(page: Page) {
         created_new_version: true,
         total_size_bytes: totalSizeBytes
       });
+    }
+
+    if (/^\/api\/store\/uploads\/[^/]+$/.test(pathname) && method === "DELETE") {
+      deletedUploadSessionIds.add(pathname.split("/")[4] ?? "upload-unknown");
+      await route.fulfill({
+        status: 204
+      });
+      return;
     }
 
     if (pathname === "/api/store/get-binary" && method === "GET") {
@@ -408,7 +429,8 @@ async function installClientUiMocks(page: Page) {
   });
 
   return {
-    maxConcurrentUploadIds: () => maxConcurrentUploadIds
+    maxConcurrentUploadIds: () => maxConcurrentUploadIds,
+    deletedUploadSessionIds: () => Array.from(deletedUploadSessionIds)
   };
 }
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use image::{GenericImageView, ImageFormat};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tracing::info;
 use uuid::Uuid;
 
 mod sqlite_impl;
@@ -28,6 +29,7 @@ pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
 const MEDIA_CACHE_SCHEMA_VERSION: u32 = 1;
 const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
+const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkRef {
@@ -1020,6 +1022,7 @@ impl PersistentStore {
         chunk_refs: &[UploadChunkRef],
         options: PutOptions,
     ) -> Result<PutResult> {
+        let total_started_at = Instant::now();
         let computed_total_size_bytes = chunk_refs.iter().try_fold(0usize, |acc, chunk_ref| {
             acc.checked_add(chunk_ref.size_bytes).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1035,6 +1038,7 @@ impl PersistentStore {
             );
         }
 
+        let chunk_validation_started_at = Instant::now();
         for chunk in chunk_refs {
             let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
             if !fs::try_exists(&chunk_path).await? {
@@ -1054,7 +1058,9 @@ impl PersistentStore {
                 );
             }
         }
+        let chunk_validation_ms = chunk_validation_started_at.elapsed().as_millis();
 
+        let manifest_build_started_at = Instant::now();
         let manifest = ObjectManifest {
             key: key.to_string(),
             total_size_bytes,
@@ -1070,13 +1076,37 @@ impl PersistentStore {
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_hash = hash_hex(&manifest_bytes);
         let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        let manifest_build_ms = manifest_build_started_at.elapsed().as_millis();
 
+        let manifest_store_started_at = Instant::now();
         if !fs::try_exists(&manifest_path).await? {
             write_atomic(&manifest_path, &manifest_bytes).await?;
         }
+        let manifest_store_ms = manifest_store_started_at.elapsed().as_millis();
 
-        self.finalize_put_from_manifest_hash(key, &manifest_hash, options, 0, 0)
-            .await
+        let finalize_started_at = Instant::now();
+        let result = self
+            .finalize_put_from_manifest_hash(key, &manifest_hash, options, 0, 0)
+            .await?;
+        let finalize_ms = finalize_started_at.elapsed().as_millis();
+
+        info!(
+            key = %key,
+            total_size_bytes,
+            chunk_count = chunk_refs.len(),
+            manifest_hash = %manifest_hash,
+            chunk_validation_ms,
+            manifest_build_ms,
+            manifest_store_ms,
+            finalize_ms,
+            total_ms = total_started_at.elapsed().as_millis(),
+            new_chunks = result.new_chunks,
+            dedup_reused_chunks = result.dedup_reused_chunks,
+            created_new_version = result.created_new_version,
+            "stored object from upload chunks"
+        );
+
+        Ok(result)
     }
 
     async fn finalize_put_from_manifest_hash(
@@ -4051,6 +4081,7 @@ fn unix_ts_nanos() -> u128 {
 }
 
 async fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
+    let total_started_at = Instant::now();
     let parent = path
         .parent()
         .with_context(|| format!("path has no parent: {}", path.display()))?;
@@ -4065,10 +4096,26 @@ async fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
             .unwrap_or(0)
     ));
 
+    let write_started_at = Instant::now();
     fs::write(&tmp, payload).await?;
+    let write_ms = write_started_at.elapsed().as_millis();
+    let rename_started_at = Instant::now();
     fs::rename(&tmp, path)
         .await
         .with_context(|| format!("failed to move {} -> {}", tmp.display(), path.display()))?;
+    let rename_ms = rename_started_at.elapsed().as_millis();
+
+    let total_ms = total_started_at.elapsed().as_millis();
+    if total_ms >= SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS {
+        info!(
+            path = %path.display(),
+            size_bytes = payload.len(),
+            write_ms,
+            rename_ms,
+            total_ms,
+            "slow atomic file write"
+        );
+    }
 
     Ok(())
 }
