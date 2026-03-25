@@ -19,6 +19,7 @@ mod tests {
     use std::io::Write;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -251,8 +252,18 @@ mod tests {
         }
     }
 
+    fn open_sync_item(path: &Path) -> anyhow::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(Into::into)
+    }
+
     fn placeholder_standard_info(path: &Path) -> anyhow::Result<CF_PLACEHOLDER_STANDARD_INFO> {
-        let file = File::open(path)?;
+        let file = open_sync_item(path)?;
         placeholder_standard_info_for_file(&file)
     }
 
@@ -302,10 +313,21 @@ mod tests {
         );
     }
 
-    async fn wait_for_placeholder_in_sync(path: &Path, retries: usize) {
-        let file = File::open(path).expect("failed to open placeholder while waiting for in-sync");
+    fn sync_item_state_summary(path: &Path) -> String {
+        placeholder_standard_info(path)
+            .map(|info| {
+                format!(
+                    "InSyncState={} ModifiedDataSize={} OnDiskDataSize={}",
+                    info.InSyncState, info.ModifiedDataSize, info.OnDiskDataSize
+                )
+            })
+            .unwrap_or_else(|err| err.to_string())
+    }
+
+    async fn wait_for_sync_item_in_sync(path: &Path, retries: usize) {
         for _ in 0..retries {
-            if let Ok(info) = placeholder_standard_info_for_file(&file)
+            if let Ok(file) = open_sync_item(path)
+                && let Ok(info) = placeholder_standard_info_for_file(&file)
                 && info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC
                 && info.ModifiedDataSize == 0
             {
@@ -315,44 +337,51 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        let final_state = placeholder_standard_info(path)
-            .map(|info| {
-                format!(
-                    "InSyncState={} ModifiedDataSize={} OnDiskDataSize={}",
-                    info.InSyncState, info.ModifiedDataSize, info.OnDiskDataSize
-                )
-            })
-            .unwrap_or_else(|err| err.to_string());
         panic!(
-            "placeholder never returned to in-sync state at {}: {}",
+            "sync item never returned to in-sync state at {}: {}",
             path.display(),
-            final_state
+            sync_item_state_summary(path)
         );
     }
 
-    async fn wait_for_placeholder_present(path: &Path, retries: usize) {
-        let file =
-            File::open(path).expect("failed to open placeholder while waiting for placeholder");
+    async fn wait_for_sync_item_not_in_sync(path: &Path, retries: usize) {
         for _ in 0..retries {
-            if placeholder_standard_info_for_file(&file).is_ok() {
+            if let Ok(file) = open_sync_item(path)
+                && let Ok(info) = placeholder_standard_info_for_file(&file)
+                && (info.InSyncState != CF_IN_SYNC_STATE_IN_SYNC || info.ModifiedDataSize != 0)
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        panic!(
+            "sync item never left in-sync state at {}: {}",
+            path.display(),
+            sync_item_state_summary(path)
+        );
+    }
+
+    async fn wait_for_placeholder_in_sync(path: &Path, retries: usize) {
+        wait_for_sync_item_in_sync(path, retries).await;
+    }
+
+    async fn wait_for_placeholder_present(path: &Path, retries: usize) {
+        for _ in 0..retries {
+            if let Ok(file) = open_sync_item(path)
+                && placeholder_standard_info_for_file(&file).is_ok()
+            {
                 return;
             }
 
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        let final_state = placeholder_standard_info_for_file(&file)
-            .map(|info| {
-                format!(
-                    "InSyncState={} ModifiedDataSize={} OnDiskDataSize={}",
-                    info.InSyncState, info.ModifiedDataSize, info.OnDiskDataSize
-                )
-            })
-            .unwrap_or_else(|err| err.to_string());
         panic!(
             "file never became a placeholder at {}: {}",
             path.display(),
-            final_state
+            sync_item_state_summary(path)
         );
     }
 
@@ -939,6 +968,71 @@ mod tests {
                 let _ = std::fs::remove_dir_all(sync_root);
             }
             Err(err) => panic!("CFAPI in-sync status flow failed: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_directory_sync_state_tracks_child_upload_activity() {
+        let bind = "127.0.0.1:19102";
+
+        let result = async {
+            let sync_root = fresh_data_dir("cfapi-directory-sync-state-sync-root");
+            std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+            let mut fixture =
+                start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-directory-sync-state")
+                    .await?;
+
+            fixture
+                .sdk
+                .put_large_aware("dir-sync/check.txt", Bytes::from_static(b"remote seed"))
+                .await
+                .expect("failed to seed remote object");
+
+            let _adapter = start_cfapi_adapter_with_bootstrap(
+                "ironmesh.systemtest.directory.sync.state",
+                "ironmesh System Test Directory Sync State",
+                &sync_root,
+                500,
+                &fixture.bootstrap_file,
+            )
+            .await
+            .expect("failed to register and serve CFAPI adapter");
+
+            let local_dir = sync_root.join("dir-sync");
+            let local_file = local_dir.join("check.txt");
+            wait_for_path(&local_dir, 220).await;
+            wait_for_path(&local_file, 220).await;
+            wait_for_hydrated_payload(&local_file, b"remote seed", 200).await;
+            wait_for_sync_item_in_sync(&local_dir, 220).await;
+
+            let modified_payload = format!("{}{}", "D".repeat(6 * 1024 * 1024), "\ndir-sync-tail");
+            std::fs::write(&local_file, modified_payload.as_bytes())
+                .expect("failed to modify hydrated placeholder");
+
+            wait_for_sync_item_not_in_sync(&local_file, 220).await;
+            wait_for_sync_item_not_in_sync(&local_dir, 220).await;
+            wait_for_remote_payload(
+                &fixture.sdk,
+                "dir-sync/check.txt",
+                modified_payload.as_bytes(),
+                260,
+            )
+            .await;
+            wait_for_sync_item_in_sync(&local_file, 220).await;
+            wait_for_sync_item_in_sync(&local_dir, 220).await;
+
+            stop_server(&mut fixture.server).await;
+            let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+
+            Ok::<std::path::PathBuf, anyhow::Error>(sync_root)
+        }
+        .await;
+
+        match result {
+            Ok(sync_root) => {
+                let _ = std::fs::remove_dir_all(sync_root);
+            }
+            Err(err) => panic!("CFAPI directory sync-state flow failed: {err:#}"),
         }
     }
 

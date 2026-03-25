@@ -2,7 +2,7 @@ use crate::cfapi::{
     cf_convert_to_placeholder, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
     cf_set_not_in_sync, describe_path_state,
 };
-use crate::runtime::{CfapiRuntime, Uploader};
+use crate::runtime::{CfapiRuntime, Uploader, reconcile_ancestor_directory_sync_states};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -362,6 +362,7 @@ fn process_debounced_close_upload(
         upload_usn,
         describe_path_state(&full_path)
     );
+    reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
 
     if let Err(err) = upload_file_on_close(worker, relative_path, snapshot_before.len, file) {
         eprintln!(
@@ -430,6 +431,7 @@ fn process_debounced_close_upload(
         }
     }
 
+    reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
     eprintln!(
         "cfapi uploaded local file: path={} bytes={} final_state={}",
         relative_path,

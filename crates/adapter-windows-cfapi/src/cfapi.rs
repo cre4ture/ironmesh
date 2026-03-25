@@ -1,11 +1,12 @@
 use crate::helpers::{hresult_nonneg, utf16_path};
 use anyhow::{Context, Result};
 use std::os::windows::fs::MetadataExt;
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Storage::CloudFilters::{
     CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE,
-    CF_PLACEHOLDER_STATE_INVALID, CF_SET_PIN_FLAGS,
+    CF_PLACEHOLDER_STATE_PLACEHOLDER, CF_SET_PIN_FLAGS,
 };
 
 pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
@@ -206,8 +207,19 @@ pub fn path_placeholder_state(path: &Path) -> Result<CF_PLACEHOLDER_STATE> {
 
 pub fn path_is_placeholder(path: &Path) -> bool {
     path_placeholder_state(path)
-        .map(|state| state != CF_PLACEHOLDER_STATE_INVALID)
+        .map(|state| (state & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0)
         .unwrap_or(false)
+}
+
+pub fn open_sync_path(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    if write {
+        options.write(true);
+    }
+    options.open(path)
 }
 
 pub fn describe_path_state(path: &Path) -> String {
@@ -226,7 +238,7 @@ pub fn describe_path_state(path: &Path) -> String {
         Err(err) => format!("placeholder_state_error={err}"),
     };
 
-    let placeholder_info_summary = match std::fs::OpenOptions::new().read(true).open(path) {
+    let placeholder_info_summary = match open_sync_path(path, false) {
         Ok(file) => match cf_get_placeholder_standard_info(&file) {
             Ok(info) => format!(
                 "placeholder_info={{file_id={} on_disk={} validated={} modified={} in_sync={:?} pin={:?}}}",

@@ -1,8 +1,9 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
-    cf_convert_to_placeholder, cf_report_provider_progress2, cf_set_in_sync, cf_set_not_in_sync,
-    describe_path_state, path_placeholder_state,
+    cf_convert_to_placeholder, cf_get_placeholder_standard_info, cf_report_provider_progress2,
+    cf_set_in_sync, cf_set_not_in_sync, describe_path_state, open_sync_path,
+    path_placeholder_state,
 };
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
@@ -10,12 +11,13 @@ use crate::close_upload::{
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
 use anyhow::{Context, Result, anyhow};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRootRegistration {
@@ -186,6 +188,8 @@ enum DesiredSyncState {
 pub struct SyncStateReconcileStats {
     pub marked_in_sync: usize,
     pub marked_not_in_sync: usize,
+    pub marked_directories_in_sync: usize,
+    pub marked_directories_not_in_sync: usize,
     pub skipped_missing: usize,
     pub skipped_non_placeholder: usize,
     pub failed: usize,
@@ -576,6 +580,205 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
     Ok(())
 }
 
+fn collect_directory_candidates(plan: &CfapiActionPlan) -> BTreeSet<String> {
+    let mut directories = BTreeSet::new();
+
+    for action in &plan.actions {
+        match action {
+            CfapiAction::EnsureDirectory { path } => {
+                record_ancestor_directories(&mut directories, path, true);
+            }
+            CfapiAction::EnsurePlaceholder { path, .. }
+            | CfapiAction::HydrateOnDemand { path, .. }
+            | CfapiAction::QueueUploadOnClose { path, .. }
+            | CfapiAction::MarkConflict { path, .. } => {
+                record_ancestor_directories(&mut directories, path, false);
+            }
+        }
+    }
+
+    directories
+}
+
+fn record_ancestor_directories(directories: &mut BTreeSet<String>, path: &str, include_self: bool) {
+    let normalized = normalize_path(path);
+    let segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return;
+    }
+
+    let limit = if include_self {
+        segments.len()
+    } else {
+        segments.len().saturating_sub(1)
+    };
+    for depth in 1..=limit {
+        directories.insert(segments[..depth].join("/"));
+    }
+}
+
+fn path_has_pending_sync_activity(root_path: &Path, path: &Path) -> bool {
+    let relative_path = path_to_relative(root_path, &path.to_string_lossy());
+    if relative_path.is_empty()
+        || is_internal_client_identity_relative_path(&relative_path)
+        || is_internal_connection_bootstrap_relative_path(&relative_path)
+    {
+        return false;
+    }
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return true,
+    };
+    let file = match open_sync_path(path, false) {
+        Ok(file) => file,
+        Err(_) => return true,
+    };
+    let info = match cf_get_placeholder_standard_info(&file) {
+        Ok(info) => info,
+        Err(_) => return !metadata.is_dir(),
+    };
+
+    info.InSyncState != CF_IN_SYNC_STATE_IN_SYNC || info.ModifiedDataSize != 0
+}
+
+fn directory_should_be_in_sync(root_path: &Path, relative_path: &str) -> bool {
+    let full_path = root_path.join(relative_path.replace('/', "\\"));
+    if !full_path.exists() {
+        return false;
+    }
+
+    for entry in WalkDir::new(&full_path).min_depth(1).into_iter().flatten() {
+        if path_has_pending_sync_activity(root_path, entry.path()) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn reconcile_directory_sync_states_for_candidates(
+    root_path: &Path,
+    directory_paths: &BTreeSet<String>,
+    stats: &mut SyncStateReconcileStats,
+) {
+    for relative_path in directory_paths.iter().rev() {
+        let full_path = root_path.join(relative_path.replace('/', "\\"));
+        if !full_path.exists() {
+            stats.skipped_missing += 1;
+            eprintln!(
+                "sync-state: skipped missing directory path={} state={}",
+                relative_path,
+                describe_path_state(&full_path)
+            );
+            continue;
+        }
+
+        let state_before = describe_path_state(&full_path);
+        let metadata = match std::fs::metadata(&full_path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                stats.failed += 1;
+                eprintln!(
+                    "sync-state: failed to read directory metadata for {}: {} state_before={}",
+                    full_path.display(),
+                    err,
+                    state_before
+                );
+                continue;
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let desired_state = if directory_should_be_in_sync(root_path, relative_path) {
+            DesiredSyncState::InSync
+        } else {
+            DesiredSyncState::NotInSync
+        };
+
+        let file = match open_sync_path(&full_path, true) {
+            Ok(file) => file,
+            Err(err) => {
+                stats.failed += 1;
+                eprintln!(
+                    "sync-state: failed to open directory {} for sync-state update desired={:?}: {} state_before={}",
+                    full_path.display(),
+                    desired_state,
+                    err,
+                    state_before
+                );
+                continue;
+            }
+        };
+
+        let placeholder_state =
+            path_placeholder_state(&full_path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
+        if matches!(
+            placeholder_state,
+            CF_PLACEHOLDER_STATE_INVALID | CF_PLACEHOLDER_STATE_NO_STATES
+        ) && let Err(err) = cf_convert_to_placeholder(&file)
+        {
+            stats.failed += 1;
+            eprintln!(
+                "sync-state: failed to convert directory {} to placeholder before sync-state update desired={:?}: {} state_before={}",
+                full_path.display(),
+                desired_state,
+                err,
+                state_before
+            );
+            continue;
+        }
+
+        let result = match desired_state {
+            DesiredSyncState::InSync => cf_set_in_sync(&file).map(|_| {
+                stats.marked_directories_in_sync += 1;
+            }),
+            DesiredSyncState::NotInSync => cf_set_not_in_sync(&file).map(|_| {
+                stats.marked_directories_not_in_sync += 1;
+            }),
+        };
+
+        if let Err(err) = result {
+            stats.failed += 1;
+            eprintln!(
+                "sync-state: failed to set directory {:?} for {}: {:#} state_before={}",
+                desired_state,
+                full_path.display(),
+                err,
+                state_before
+            );
+        } else {
+            eprintln!(
+                "sync-state: applied directory desired={:?} path={} state_before={} state_after={}",
+                desired_state,
+                relative_path,
+                state_before,
+                describe_path_state(&full_path)
+            );
+        }
+    }
+}
+
+pub(crate) fn reconcile_ancestor_directory_sync_states(root_path: &Path, relative_path: &str) {
+    let mut directory_paths = BTreeSet::new();
+    record_ancestor_directories(&mut directory_paths, relative_path, false);
+    if directory_paths.is_empty() {
+        return;
+    }
+
+    let mut stats = SyncStateReconcileStats::default();
+    reconcile_directory_sync_states_for_candidates(root_path, &directory_paths, &mut stats);
+    eprintln!(
+        "sync-state: ancestor directory reconcile for {} => {:?}",
+        relative_path, stats
+    );
+}
+
 pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncStateReconcileStats {
     let mut desired_states = BTreeMap::<String, DesiredSyncState>::new();
     for action in &plan.actions {
@@ -591,10 +794,12 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
             CfapiAction::EnsureDirectory { .. } => {}
         }
     }
+    let directory_candidates = collect_directory_candidates(plan);
 
     eprintln!(
-        "sync-state: reconciling {} desired paths under {}",
+        "sync-state: reconciling {} file paths and {} directories under {}",
         desired_states.len(),
+        directory_candidates.len(),
         root_path.display()
     );
     let mut stats = SyncStateReconcileStats::default();
@@ -644,25 +849,36 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
                     "sync-state: path is not a placeholder, attempting convert path={} desired={:?} state_before={}",
                     relative_path, desired_state, state_before
                 );
-                cf_convert_to_placeholder(&std::fs::File::open(&full_path).unwrap()).unwrap_or_else(|err| {
-                    stats.failed += 1;
-                    eprintln!(
-                        "sync-state: failed to convert to placeholder {} desired={:?}: {} state_before={}",
-                        full_path.display(),
-                        desired_state,
-                        err,
-                        state_before
-                    );
-                });
+                match open_sync_path(&full_path, true) {
+                    Ok(file) => {
+                        if let Err(err) = cf_convert_to_placeholder(&file) {
+                            stats.failed += 1;
+                            eprintln!(
+                                "sync-state: failed to convert to placeholder {} desired={:?}: {} state_before={}",
+                                full_path.display(),
+                                desired_state,
+                                err,
+                                state_before
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        stats.failed += 1;
+                        eprintln!(
+                            "sync-state: failed to open {} for placeholder conversion desired={:?}: {} state_before={}",
+                            full_path.display(),
+                            desired_state,
+                            err,
+                            state_before
+                        );
+                        continue;
+                    }
+                }
             }
             _ => {}
         }
 
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&full_path)
-        {
+        let file = match open_sync_path(&full_path, true) {
             Ok(file) => file,
             Err(err) => {
                 stats.failed += 1;
@@ -706,6 +922,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
         }
     }
 
+    reconcile_directory_sync_states_for_candidates(root_path, &directory_candidates, &mut stats);
     stats
 }
 
@@ -1308,7 +1525,9 @@ mod tests {
 
         assert_eq!(stats.marked_in_sync, 0);
         assert_eq!(stats.marked_not_in_sync, 0);
-        assert_eq!(stats.skipped_missing, 4);
+        assert_eq!(stats.marked_directories_in_sync, 0);
+        assert_eq!(stats.marked_directories_not_in_sync, 0);
+        assert_eq!(stats.skipped_missing, 5);
         assert_eq!(stats.skipped_non_placeholder, 0);
         assert_eq!(stats.failed, 0);
 
