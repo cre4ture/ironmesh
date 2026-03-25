@@ -1,7 +1,8 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
-    cf_convert_to_placeholder, cf_report_provider_progress2, cf_set_in_sync, cf_set_not_in_sync, describe_path_state, path_placeholder_state
+    cf_convert_to_placeholder, cf_report_provider_progress2, cf_set_in_sync, cf_set_not_in_sync,
+    describe_path_state, path_placeholder_state,
 };
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
@@ -635,7 +636,8 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
             continue;
         }
 
-        let placeholder_state = path_placeholder_state(&full_path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
+        let placeholder_state =
+            path_placeholder_state(&full_path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
         match placeholder_state {
             CF_PLACEHOLDER_STATE_INVALID | CF_PLACEHOLDER_STATE_NO_STATES => {
                 eprintln!(

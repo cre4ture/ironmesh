@@ -4,7 +4,8 @@ use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Storage::CloudFilters::{
-    CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE, CF_PLACEHOLDER_STATE_INVALID, CF_SET_PIN_FLAGS
+    CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE,
+    CF_PLACEHOLDER_STATE_INVALID, CF_SET_PIN_FLAGS,
 };
 
 pub fn cf_convert_to_placeholder(file: &std::fs::File) -> Result<()> {
