@@ -4,13 +4,36 @@ body,
   min-height: 100%;
 }
 
+:root[data-mantine-color-scheme="light"] {
+  --shell-body-background:
+    radial-gradient(circle at top left, rgba(18, 184, 134, 0.12), transparent 35%),
+    linear-gradient(180deg, #f7faf9 0%, #eef5f2 100%);
+  --shell-header-background: linear-gradient(180deg, #f8fbf9 0%, #f1f6f3 100%);
+  --shell-header-border: rgba(24, 39, 34, 0.08);
+  --shell-navbar-background: linear-gradient(180deg, #f8fbf9 0%, #eff5f2 100%);
+  --shell-navbar-border: rgba(24, 39, 34, 0.08);
+  --shell-navbar-shadow: 0 18px 40px rgba(34, 62, 51, 0.08);
+  --shell-backdrop-background: rgba(31, 45, 39, 0.4);
+}
+
+:root[data-mantine-color-scheme="dark"] {
+  --shell-body-background:
+    radial-gradient(circle at top left, rgba(18, 184, 134, 0.2), transparent 34%),
+    linear-gradient(180deg, #07110f 0%, #0a1713 46%, #0d1414 100%);
+  --shell-header-background: linear-gradient(180deg, rgba(10, 22, 18, 0.96) 0%, rgba(13, 28, 23, 0.92) 100%);
+  --shell-header-border: rgba(116, 228, 200, 0.12);
+  --shell-navbar-background: linear-gradient(180deg, rgba(9, 20, 17, 0.98) 0%, rgba(7, 17, 15, 0.94) 100%);
+  --shell-navbar-border: rgba(116, 228, 200, 0.1);
+  --shell-navbar-shadow: 0 22px 48px rgba(1, 10, 8, 0.42);
+  --shell-backdrop-background: rgba(3, 10, 8, 0.62);
+}
+
 body {
   margin: 0;
   min-height: 100dvh;
   overflow-x: hidden;
-  background:
-    radial-gradient(circle at top left, rgba(18, 184, 134, 0.12), transparent 35%),
-    linear-gradient(180deg, #f7faf9 0%, #eef5f2 100%);
+  background: var(--shell-body-background);
+  color: var(--mantine-color-text);
 }
 
 #root {
@@ -22,8 +45,8 @@ body {
 }
 
 .shell-header {
-  background: linear-gradient(180deg, #f8fbf9 0%, #f1f6f3 100%);
-  border-bottom: 1px solid rgba(24, 39, 34, 0.08);
+  background: var(--shell-header-background);
+  border-bottom: 1px solid var(--shell-header-border);
 }
 
 .shell-header-bar {
@@ -31,9 +54,9 @@ body {
 }
 
 .shell-navbar {
-  background: linear-gradient(180deg, #f8fbf9 0%, #eff5f2 100%);
-  border-inline-end: 1px solid rgba(24, 39, 34, 0.08);
-  box-shadow: 0 18px 40px rgba(34, 62, 51, 0.08);
+  background: var(--shell-navbar-background);
+  border-inline-end: 1px solid var(--shell-navbar-border);
+  box-shadow: var(--shell-navbar-shadow);
 }
 
 .shell-navbar .mantine-ScrollArea-root,
@@ -59,7 +82,7 @@ body {
     display: block;
     position: fixed;
     inset: 68px 0 0 0;
-    background: rgba(31, 45, 39, 0.4);
+    background: var(--shell-backdrop-background);
     z-index: 100;
   }
 

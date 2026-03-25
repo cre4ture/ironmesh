@@ -32,6 +32,7 @@ import {
   IconServer
 } from "@tabler/icons-react";
 import {
+  ColorSchemeControl,
   IronmeshBrand,
   JsonBlock,
   PageHeader,
@@ -210,17 +211,6 @@ export function ClientShell() {
         header={{ height: 68 }}
         navbar={{ width: 280, breakpoint: "sm", collapsed: { mobile: !opened } }}
         padding={{ base: "xs", sm: "md", lg: "lg" }}
-        styles={{
-          header: {
-            background: "linear-gradient(180deg, #f9fbfc 0%, #f2f6f8 100%)"
-          },
-          navbar: {
-            background: "linear-gradient(180deg, #f9fbfc 0%, #f0f5f7 100%)"
-          },
-          main: {
-            background: "transparent"
-          }
-        }}
       >
         <AppShell.Header className="shell-header">
           <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
@@ -240,6 +230,7 @@ export function ClientShell() {
                   {binaryUploadHeaderLabel(binaryUpload.summary, binaryUpload.running)}
                 </Button>
               ) : null}
+              <ColorSchemeControl />
               {ping ? <Badge variant="light">{ping.service}</Badge> : null}
               <Badge color="teal" variant="filled">
                 Transport-aware

@@ -3,6 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <script>
+      try {
+        const storageKey = "ironmesh-color-scheme";
+        const storedColorScheme = window.localStorage.getItem(storageKey);
+        const colorScheme =
+          storedColorScheme === "light" || storedColorScheme === "dark" || storedColorScheme === "auto"
+            ? storedColorScheme
+            : "auto";
+        const computedColorScheme =
+          colorScheme === "auto"
+            ? window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : colorScheme;
+        document.documentElement.setAttribute("data-mantine-color-scheme", computedColorScheme);
+      } catch {}
+    </script>
     <link rel="icon" type="image/svg+xml" href="/ironmesh-favicon.svg" />
     <title>ironmesh Client UI</title>
   </head>

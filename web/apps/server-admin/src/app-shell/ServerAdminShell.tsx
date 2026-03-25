@@ -1,5 +1,5 @@
 import { getSetupStatus } from "@ironmesh/api";
-import { IronmeshBrand, PageHeader } from "@ironmesh/ui";
+import { ColorSchemeControl, IronmeshBrand, PageHeader } from "@ironmesh/ui";
 import { Alert, AppShell, Badge, Burger, Button, Center, Group, Loader, NavLink, ScrollArea, Stack, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { useEffect, useState } from "react";
@@ -64,17 +64,6 @@ export function ServerAdminShell() {
         header={{ height: 68 }}
         navbar={{ width: 280, breakpoint: "sm", collapsed: { mobile: !opened } }}
         padding={{ base: "xs", sm: "md", lg: "lg" }}
-        styles={{
-          header: {
-            background: "linear-gradient(180deg, #f8fbf9 0%, #f1f6f3 100%)"
-          },
-          navbar: {
-            background: "linear-gradient(180deg, #f8fbf9 0%, #eff5f2 100%)"
-          },
-          main: {
-            background: "transparent"
-          }
-        }}
       >
         <AppShell.Header className="shell-header">
           <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
@@ -90,6 +79,7 @@ export function ServerAdminShell() {
                     ? "signed in"
                     : "sign in required"}
               </Badge>
+              <ColorSchemeControl />
               <Button variant="light" onClick={accessControls.open} disabled={surfaceMode === "setup"}>
                 Admin Access
               </Button>
