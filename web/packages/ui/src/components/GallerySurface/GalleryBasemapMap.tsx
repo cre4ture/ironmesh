@@ -54,9 +54,22 @@ type MbtilesSource = {
 
 type MbtilesMetadata = {
   attribution?: string;
+  format?: string;
   minzoom?: number;
   maxzoom?: number;
   center?: [number, number, number?];
+};
+
+type TileImagePayload = {
+  bytes: Uint8Array;
+  mimeType: string;
+};
+
+type TileCoordinates = {
+  zoomLevel: number;
+  tileColumn: number;
+  xyzTileRow: number;
+  tmsTileRow: number;
 };
 
 const mbtilesSourceCache = new Map<string, Promise<MbtilesSource>>();
@@ -145,6 +158,7 @@ export function GalleryBasemapMap({
     return () => {
       cancelled = true;
       setFitSignature("");
+      mbtilesConfigRegistry.delete(sourceId);
       if (map) {
         map.remove();
       }
@@ -394,7 +408,6 @@ function buildRasterStyle(
 ): StyleSpecification {
   return {
     version: 8,
-    glyphs: "",
     sources: {
       basemap: {
         type: "raster",
@@ -420,16 +433,30 @@ function ensureMbtilesProtocolRegistered() {
     return;
   }
 
-  maplibregl.addProtocol(MBTILES_PROTOCOL, async (request) => {
+  maplibregl.addProtocol(MBTILES_PROTOCOL, async (request, abortController) => {
     const sourceId = parseProtocolSourceId(request.url);
     const coordinates = parseProtocolTileCoordinates(request.url);
     const config = mbtilesConfigRegistry.get(sourceId);
     if (!config || !coordinates) {
-      return { data: copyToArrayBuffer(TRANSPARENT_PNG_BYTES) };
+      return {
+        data: await decodeTileImage(
+          {
+            bytes: copyToUint8Array(TRANSPARENT_PNG_BYTES),
+            mimeType: "image/png"
+          },
+          abortController.signal
+        )
+      };
     }
 
     const source = await loadMbtilesSource(sourceId, config);
-    const tileData = await queryMbtilesTile(source, coordinates.z, coordinates.x, coordinates.y);
+    const tileData = await queryMbtilesTile(
+      source,
+      coordinates.z,
+      coordinates.x,
+      coordinates.y,
+      abortController.signal
+    );
     return { data: tileData };
   });
 
@@ -507,28 +534,70 @@ async function queryMbtilesTile(
   source: MbtilesSource,
   zoomLevel: number,
   tileColumn: number,
-  xyzTileRow: number
-): Promise<ArrayBuffer> {
-  const tmsTileRow = (1 << zoomLevel) - 1 - xyzTileRow;
+  xyzTileRow: number,
+  abortSignal?: AbortSignal
+): Promise<HTMLImageElement | ImageBitmap> {
+  const coordinates = normalizeTileCoordinates(zoomLevel, tileColumn, xyzTileRow);
+  // sql.js-httpvfs parameter binding behaves inconsistently for this large MBTiles file.
+  // Use a fully validated literal query for the hot tile lookup path instead.
   const rows = (await source.worker.db.query(
-    "select tile_data as tile_data from tiles where zoom_level = ? and tile_column = ? and tile_row = ? limit 1",
+    buildTileLookupSql(coordinates)
+  )) as Array<{ tile_data?: Uint8Array | ArrayLike<number> | ArrayBufferLike }>;
+  const payload = payloadFromTileRow(rows[0]?.tile_data, source.metadata.format);
+
+  return decodeTileImage(payload, abortSignal);
+}
+
+function normalizeTileCoordinates(
+  zoomLevel: number,
+  tileColumn: number,
+  xyzTileRow: number
+): TileCoordinates {
+  if (
+    !Number.isInteger(zoomLevel) ||
+    !Number.isInteger(tileColumn) ||
+    !Number.isInteger(xyzTileRow)
+  ) {
+    throw new Error("Invalid tile coordinates for self-hosted basemap");
+  }
+
+  return {
     zoomLevel,
     tileColumn,
-    tmsTileRow
-  )) as Array<{ tile_data?: Uint8Array | ArrayLike<number> | ArrayBufferLike }>;
-  const tileData = rows[0]?.tile_data;
+    xyzTileRow,
+    tmsTileRow: (1 << zoomLevel) - 1 - xyzTileRow
+  };
+}
+
+function buildTileLookupSql(coordinates: TileCoordinates): string {
+  return `select tile_data as tile_data from tiles where zoom_level = ${coordinates.zoomLevel} and tile_column = ${coordinates.tileColumn} and tile_row = ${coordinates.tmsTileRow} limit 1`;
+}
+
+function payloadFromTileRow(
+  tileData: Uint8Array | ArrayLike<number> | ArrayBufferLike | undefined,
+  declaredFormat?: string
+): TileImagePayload {
   if (!tileData) {
-    return copyToArrayBuffer(TRANSPARENT_PNG_BYTES);
+    return {
+      bytes: copyToUint8Array(TRANSPARENT_PNG_BYTES),
+      mimeType: "image/png"
+    };
   }
+
   const normalized =
     tileData instanceof Uint8Array ? tileData : new Uint8Array(tileData as ArrayLike<number>);
-  return copyToArrayBuffer(normalized);
+  const bytes = copyToUint8Array(normalized);
+  return {
+    bytes,
+    mimeType: inferTileMimeType(bytes, declaredFormat)
+  };
 }
 
 function metadataFromRows(rows: Array<{ name: string; value: string }>): MbtilesMetadata {
   const metadata = Object.fromEntries(rows.map((row) => [row.name, row.value]));
   return {
     attribution: metadata.attribution,
+    format: metadata.format,
     minzoom: parseOptionalNumber(metadata.minzoom),
     maxzoom: parseOptionalNumber(metadata.maxzoom),
     center: parseCenter(metadata.center)
@@ -585,10 +654,196 @@ function sourceIdForLogicalFile(url: string): string {
   return `source-${Math.abs(hash >>> 0).toString(36)}`;
 }
 
-function copyToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+function copyToUint8Array(bytes: Uint8Array): Uint8Array {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
-  return copy.buffer;
+  return copy;
+}
+
+function inferTileMimeType(bytes: Uint8Array, declaredFormat?: string): string {
+  const normalizedDeclared = normalizeTileFormat(declaredFormat);
+  if (normalizedDeclared) {
+    return normalizedDeclared;
+  }
+
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+
+  if (bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+
+  if (
+    bytes.byteLength >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+
+  return "image/png";
+}
+
+function normalizeTileFormat(format: string | undefined): string | null {
+  if (!format) {
+    return null;
+  }
+
+  switch (format.trim().toLowerCase()) {
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "webp":
+      return "image/webp";
+    default:
+      return null;
+  }
+}
+
+async function decodeTileImage(
+  payload: TileImagePayload,
+  abortSignal?: AbortSignal
+): Promise<HTMLImageElement | ImageBitmap> {
+  const blobBytes = copyToUint8Array(payload.bytes);
+  const blobBuffer = new ArrayBuffer(blobBytes.byteLength);
+  new Uint8Array(blobBuffer).set(blobBytes);
+  const blob = new Blob([blobBuffer], { type: payload.mimeType });
+
+  if (typeof createImageBitmap === "function") {
+    try {
+      return await decodeTileImageBitmap(blob, abortSignal);
+    } catch {
+      // Some JPEG tiles decode successfully via <img> even when createImageBitmap rejects.
+      // Fall through to the HTMLImageElement path before surfacing an error.
+    }
+  }
+
+  return decodeTileImageElement(blob, payload.mimeType, abortSignal);
+}
+
+async function decodeTileImageBitmap(
+  blob: Blob,
+  abortSignal?: AbortSignal
+): Promise<ImageBitmap> {
+  if (abortSignal?.aborted) {
+    throw new DOMException("The operation was aborted.", "AbortError");
+  }
+
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(blob);
+  } catch (error) {
+    throw new Error(
+      error instanceof Error ? error.message : "ImageBitmap decode failed"
+    );
+  }
+  if (abortSignal?.aborted) {
+    bitmap.close();
+    throw new DOMException("The operation was aborted.", "AbortError");
+  }
+  return bitmap;
+}
+
+function decodeTileImageElement(
+  blob: Blob,
+  mimeType: string,
+  abortSignal?: AbortSignal
+): Promise<HTMLImageElement | ImageBitmap> {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(blob);
+    const image = new Image();
+    let settled = false;
+
+    const cleanup = () => {
+      image.onload = null;
+      image.onerror = null;
+      abortSignal?.removeEventListener("abort", handleAbort);
+    };
+
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+
+    const handleAbort = () => {
+      finish(() => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new DOMException("The operation was aborted.", "AbortError"));
+      });
+    };
+
+    image.onload = () => {
+      finish(() => {
+        void promoteDecodedImage(image, objectUrl)
+          .then(resolve)
+          .catch(() => {
+            image.width = image.naturalWidth;
+            image.height = image.naturalHeight;
+            resolve(image);
+          });
+      });
+    };
+    image.onerror = () => {
+      finish(() => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error(`Failed to decode basemap tile as ${mimeType}`));
+      });
+    };
+
+    if (abortSignal?.aborted) {
+      handleAbort();
+      return;
+    }
+
+    abortSignal?.addEventListener("abort", handleAbort, { once: true });
+    image.src = objectUrl;
+  });
+}
+
+async function promoteDecodedImage(
+  image: HTMLImageElement,
+  objectUrl: string
+): Promise<ImageBitmap> {
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("2d canvas context unavailable");
+  }
+
+  context.drawImage(image, 0, 0);
+
+  if (typeof createImageBitmap !== "function") {
+    throw new Error("ImageBitmap creation unavailable");
+  }
+
+  const bitmap = await createImageBitmap(canvas);
+  URL.revokeObjectURL(objectUrl);
+  return bitmap;
 }
 
 function useResolvedImageRequest(
