@@ -108,6 +108,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("2 markers")).toBeVisible();
+  await page.getByRole("button", { name: "Globe" }).click();
+  await expect(page.getByRole("button", { name: "Globe" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await page.getByRole("button", { name: "Flat" }).click();
+  await expect(page.getByRole("button", { name: "Flat" })).toHaveAttribute("aria-pressed", "true");
   await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();

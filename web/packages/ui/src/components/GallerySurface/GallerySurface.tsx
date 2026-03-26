@@ -31,7 +31,8 @@ import {
 import { useEffect, useState } from "react";
 import {
   GalleryBasemapMap,
-  type GalleryBasemapConfig
+  type GalleryBasemapConfig,
+  type GalleryMapProjection
 } from "./GalleryBasemapMap";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 
@@ -44,6 +45,7 @@ const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".web
 const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "ironmesh.gallery.thumbnails_per_row";
 const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
+const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
 
 export type GallerySnapshot = {
   id: string;
@@ -119,6 +121,7 @@ export function GallerySurface({
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
   const [viewMode, setViewMode] = useState(loadStoredViewMode);
   const [activeBasemapId, setActiveBasemapId] = useState(loadStoredBasemapId);
+  const [activeMapProjection, setActiveMapProjection] = useState(loadStoredMapProjection);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<GalleryPayload | null>(null);
@@ -142,6 +145,10 @@ export function GallerySurface({
   useEffect(() => {
     persistViewMode(viewMode);
   }, [viewMode]);
+
+  useEffect(() => {
+    persistMapProjection(activeMapProjection);
+  }, [activeMapProjection]);
 
   const imageEntries = sortGalleryEntries(
     (entriesPayload?.entries ?? []).filter(isGalleryImageEntry),
@@ -427,6 +434,8 @@ export function GallerySurface({
                   basemaps={availableBasemaps}
                   activeBasemap={activeBasemap}
                   onSelectBasemap={setActiveBasemapId}
+                  activeProjection={activeMapProjection}
+                  onSelectProjection={setActiveMapProjection}
                   entries={geotaggedEntries}
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selectedPath}
@@ -604,6 +613,8 @@ type GalleryMapPanelProps = {
   basemaps: GalleryBasemapConfig[];
   activeBasemap: GalleryBasemapConfig | null;
   onSelectBasemap: (id: string) => void;
+  activeProjection: GalleryMapProjection;
+  onSelectProjection: (projection: GalleryMapProjection) => void;
   entries: GalleryEntry[];
   hiddenOnMapCount: number;
   selectedPath: string | null;
@@ -615,6 +626,8 @@ function GalleryMapPanel({
   basemaps,
   activeBasemap,
   onSelectBasemap,
+  activeProjection,
+  onSelectProjection,
   entries,
   hiddenOnMapCount,
   selectedPath,
@@ -637,21 +650,42 @@ function GalleryMapPanel({
 
   return (
     <Stack gap="sm">
-      {basemaps.length > 1 ? (
+      {basemaps.length > 1 || activeBasemap ? (
         <Group gap="sm">
-          {basemaps.map((basemap) => (
-            <Button
-              key={basemap.id}
-              variant={basemap.id === activeBasemap.id ? "filled" : "default"}
-              onClick={() => onSelectBasemap(basemap.id)}
-            >
-              {basemap.modeLabel ?? basemap.label ?? basemap.id}
-            </Button>
-          ))}
+          {basemaps.length > 1
+            ? basemaps.map((basemap) => (
+                <Button
+                  key={basemap.id}
+                  variant={basemap.id === activeBasemap.id ? "filled" : "default"}
+                  onClick={() => onSelectBasemap(basemap.id)}
+                >
+                  {basemap.modeLabel ?? basemap.label ?? basemap.id}
+                </Button>
+              ))
+            : null}
+          {activeBasemap ? (
+            <Group gap="xs">
+              <Button
+                variant={activeProjection === "mercator" ? "filled" : "default"}
+                aria-pressed={activeProjection === "mercator"}
+                onClick={() => onSelectProjection("mercator")}
+              >
+                Flat
+              </Button>
+              <Button
+                variant={activeProjection === "globe" ? "filled" : "default"}
+                aria-pressed={activeProjection === "globe"}
+                onClick={() => onSelectProjection("globe")}
+              >
+                Globe
+              </Button>
+            </Group>
+          ) : null}
         </Group>
       ) : null}
       <GalleryBasemapMap
         basemap={activeBasemap}
+        projection={activeProjection}
         entries={entries}
         hiddenOnMapCount={hiddenOnMapCount}
         selectedPath={selectedPath}
@@ -1426,6 +1460,14 @@ function loadStoredBasemapId(): string {
   return window.localStorage.getItem(GALLERY_BASEMAP_ID_STORAGE_KEY) ?? "";
 }
 
+function loadStoredMapProjection(): GalleryMapProjection {
+  if (typeof window === "undefined") {
+    return "mercator";
+  }
+
+  return parseMapProjection(window.localStorage.getItem(GALLERY_MAP_PROJECTION_STORAGE_KEY));
+}
+
 function persistThumbnailsPerRow(value: number) {
   if (typeof window === "undefined") {
     return;
@@ -1458,6 +1500,17 @@ function persistBasemapId(value: string) {
   window.localStorage.removeItem(GALLERY_BASEMAP_ID_STORAGE_KEY);
 }
 
+function persistMapProjection(value: GalleryMapProjection) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(
+    GALLERY_MAP_PROJECTION_STORAGE_KEY,
+    parseMapProjection(value)
+  );
+}
+
 function parseThumbnailsPerRow(value: string | number | null | undefined): number {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) && parsed >= 1 && parsed <= 6 ? parsed : 3;
@@ -1465,6 +1518,10 @@ function parseThumbnailsPerRow(value: string | number | null | undefined): numbe
 
 function parseViewMode(value: string | null | undefined): GalleryViewMode {
   return value === "map" ? "map" : "grid";
+}
+
+function parseMapProjection(value: string | null | undefined): GalleryMapProjection {
+  return value === "globe" ? "globe" : "mercator";
 }
 
 function formatTakenAt(value: number): string {

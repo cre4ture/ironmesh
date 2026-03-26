@@ -53,9 +53,11 @@ export type GalleryVectorBasemapConfig = GalleryBasemapBaseConfig & {
 };
 
 export type GalleryBasemapConfig = GalleryRasterBasemapConfig | GalleryVectorBasemapConfig;
+export type GalleryMapProjection = "mercator" | "globe";
 
 type GalleryBasemapMapProps = {
   basemap: GalleryBasemapConfig;
+  projection: GalleryMapProjection;
   entries: GalleryBasemapMapEntry[];
   hiddenOnMapCount: number;
   selectedPath: string | null;
@@ -105,6 +107,7 @@ let mbtilesProtocolRegistered = false;
 
 export function GalleryBasemapMap({
   basemap,
+  projection,
   entries,
   hiddenOnMapCount,
   selectedPath,
@@ -156,13 +159,14 @@ export function GalleryBasemapMap({
           container: containerRef.current,
           style:
             basemap.kind === "vector"
-              ? buildVectorStyle(basemap, metadata)
+              ? buildVectorStyle(basemap, metadata, projection)
               : buildRasterStyle(
                   usesRasterServerTiles
                     ? basemap.tileUrlTemplate!
                     : `${MBTILES_PROTOCOL}://${sourceId}/{z}/{x}/{y}`,
                   metadata,
-                  basemap
+                  basemap,
+                  projection
                 ),
           center: preservedCamera
             ? ([preservedCamera.center[0], preservedCamera.center[1]] as LngLatLike)
@@ -199,6 +203,7 @@ export function GalleryBasemapMap({
         map.on("move", bumpViewport);
         map.on("zoom", bumpViewport);
         map.on("resize", bumpViewport);
+        map.on("projectiontransition", bumpViewport);
         mapRef.current = map;
         markReady();
       } catch (error) {
@@ -233,6 +238,23 @@ export function GalleryBasemapMap({
     sourceId,
     usesRasterServerTiles
   ]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!mapReady || !map) {
+      return;
+    }
+
+    if (map.getProjection().type === projection) {
+      return;
+    }
+
+    const currentCamera = snapshotMapCamera(map);
+    cameraStateRef.current = currentCamera;
+    map.setProjection({ type: projection });
+    map.jumpTo(currentCamera);
+    setViewportVersion((current) => current + 1);
+  }, [mapReady, projection]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -508,11 +530,13 @@ function GalleryBasemapMarker({
 function buildRasterStyle(
   tileUrlTemplate: string,
   metadata: MbtilesMetadata,
-  basemap: GalleryRasterBasemapConfig
+  basemap: GalleryRasterBasemapConfig,
+  projection: GalleryMapProjection
 ): StyleSpecification {
   const absoluteTileUrlTemplate = absolutizeStyleUrl(tileUrlTemplate);
   return {
     version: 8,
+    projection: { type: projection },
     sources: {
       basemap: {
         type: "raster",
@@ -535,12 +559,14 @@ function buildRasterStyle(
 
 function buildVectorStyle(
   basemap: GalleryVectorBasemapConfig,
-  metadata: MbtilesMetadata
+  metadata: MbtilesMetadata,
+  projection: GalleryMapProjection
 ): StyleSpecification {
   const absoluteTileUrlTemplate = absolutizeStyleUrl(basemap.vectorTileUrlTemplate);
   const absoluteGlyphsUrlTemplate = absolutizeStyleUrl(basemap.glyphsUrlTemplate);
   return {
     version: 8,
+    projection: { type: projection },
     glyphs: absoluteGlyphsUrlTemplate,
     sources: {
       basemap: {
