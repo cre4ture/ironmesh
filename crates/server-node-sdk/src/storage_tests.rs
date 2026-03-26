@@ -37,6 +37,11 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn sample_large_chunked_payload() -> Vec<u8> {
+    let size = 2 * 1024 * 1024 + 1536;
+    (0..size).map(|index| (index % 251) as u8).collect()
+}
+
 #[derive(Clone, Copy)]
 enum StorageTestBackend {
     Sqlite,
@@ -1769,6 +1774,186 @@ run_on_all_metadata_backends!(
     chunk_store_bytes_state_tracks_ingest_and_cleanup_impl,
     chunk_store_bytes_state_tracks_ingest_and_cleanup,
     chunk_store_bytes_state_tracks_ingest_and_cleanup_turso
+);
+
+async fn metadata_only_cached_chunks_are_evicted_by_cleanup_impl(backend: StorageTestBackend) {
+    let (source_root, mut source) = backend
+        .init_store("metadata-only-cached-chunks-source")
+        .await;
+    let (target_root, mut target) = backend
+        .init_store("metadata-only-cached-chunks-target")
+        .await;
+
+    source
+        .put_object_versioned(
+            "docs/cached-range.bin",
+            Bytes::from(sample_large_chunked_payload()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let bundle = source
+        .export_metadata_bundle("docs/cached-range.bin", None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+    target.import_metadata_bundle(&bundle).await.unwrap();
+
+    let manifest =
+        serde_json::from_slice::<ObjectManifest>(&bundle.manifests[0].manifest_bytes).unwrap();
+    let first_chunk = manifest.chunks.first().cloned().unwrap();
+    let first_chunk_payload = source
+        .read_chunk_payload(&first_chunk.hash)
+        .await
+        .unwrap()
+        .unwrap();
+    target
+        .ingest_chunk(&first_chunk.hash, first_chunk_payload.as_ref())
+        .await
+        .unwrap();
+    target
+        .note_cached_chunk_fetch(
+            &first_chunk.hash,
+            first_chunk.size_bytes,
+            Some("source-node"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        target
+            .list_cached_chunk_records_for_test()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        target
+            .list_locally_owned_manifests_for_test()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let report = target.cleanup_unreferenced(0, false).await.unwrap();
+    assert_eq!(report.deleted_cached_chunks, 1);
+    assert!(report.deleted_cached_chunk_records >= 1);
+    assert!(
+        target
+            .list_cached_chunk_records_for_test()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let first_chunk_path = chunk_path_for_hash(&target.chunks_dir, &first_chunk.hash);
+    assert!(!fs::try_exists(&first_chunk_path).await.unwrap());
+
+    let metadata_subjects = target.list_metadata_subjects().await.unwrap();
+    assert!(metadata_subjects.contains(&"docs/cached-range.bin".to_string()));
+
+    let replica_subjects = target.list_replication_subjects().await.unwrap();
+    assert!(!replica_subjects.contains(&"docs/cached-range.bin".to_string()));
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    metadata_only_cached_chunks_are_evicted_by_cleanup_impl,
+    metadata_only_cached_chunks_are_evicted_by_cleanup,
+    metadata_only_cached_chunks_are_evicted_by_cleanup_turso
+);
+
+async fn importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend.init_store("replica-manifest-owned-source").await;
+    let (target_root, mut target) = backend.init_store("replica-manifest-owned-target").await;
+
+    source
+        .put_object_versioned(
+            "docs/owned.bin",
+            Bytes::from_static(b"owned-manifest-payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let metadata_bundle = source
+        .export_metadata_bundle("docs/owned.bin", None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+    target
+        .import_metadata_bundle(&metadata_bundle)
+        .await
+        .unwrap();
+
+    let replication_bundle = source
+        .export_replication_bundle("docs/owned.bin", None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+    for chunk in &replication_bundle.manifest.chunks {
+        let payload = source
+            .read_chunk_payload(&chunk.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        target
+            .ingest_chunk(&chunk.hash, payload.as_ref())
+            .await
+            .unwrap();
+        target
+            .note_cached_chunk_fetch(&chunk.hash, chunk.size_bytes, Some("source-node"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        target
+            .list_cached_chunk_records_for_test()
+            .await
+            .unwrap()
+            .len(),
+        replication_bundle.manifest.chunks.len()
+    );
+
+    target
+        .import_replica_manifest(
+            &replication_bundle.key,
+            replication_bundle.version_id.as_deref(),
+            &replication_bundle.parent_version_ids,
+            replication_bundle.state.clone(),
+            &replication_bundle.manifest_hash,
+            &replication_bundle.manifest_bytes,
+        )
+        .await
+        .unwrap();
+
+    let owned_manifests = target
+        .list_locally_owned_manifests_for_test()
+        .await
+        .unwrap();
+    assert!(owned_manifests.contains(&replication_bundle.manifest_hash));
+    assert!(
+        target
+            .list_cached_chunk_records_for_test()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let _ = fs::remove_dir_all(source_root).await;
+    let _ = fs::remove_dir_all(target_root).await;
+}
+
+run_on_all_metadata_backends!(
+    importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl,
+    importing_replica_manifest_marks_manifest_owned_and_clears_cached_records,
+    importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_turso
 );
 
 async fn storage_stats_history_prune_drops_older_samples_impl(backend: StorageTestBackend) {

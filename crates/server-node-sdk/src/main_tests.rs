@@ -147,6 +147,11 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn sample_large_chunked_payload() -> Vec<u8> {
+    let size = 2 * 1024 * 1024 + 1536;
+    (0..size).map(|index| (index % 251) as u8).collect()
+}
+
 fn free_bind_addr() -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4221,6 +4226,209 @@ run_on_main_metadata_backends!(
     read_through_fetch_serves_object_without_declaring_local_replica_impl,
     read_through_fetch_serves_object_without_declaring_local_replica,
     read_through_fetch_serves_object_without_declaring_local_replica_turso
+);
+
+async fn read_through_range_fetch_serves_partial_content_without_declaring_local_replica_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let payload = sample_large_chunked_payload();
+    let range_start = 1024 * 1024 + 128;
+    let range_end_inclusive = range_start + 383;
+
+    let put = {
+        let mut locked = source.store.lock().await;
+        locked
+            .put_object_versioned(
+                "photos/range.bin",
+                bytes::Bytes::from(payload.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    {
+        let mut cluster = source.cluster.lock().await;
+        cluster.note_replica("photos/range.bin", source.node_id);
+        cluster.note_replica(
+            format!("photos/range.bin@{}", put.version_id),
+            source.node_id,
+        );
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route(
+            "/cluster/replication/chunk/{hash}",
+            get(super::get_replication_chunk),
+        )
+        .with_state(source.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("chunk route should serve");
+    });
+
+    {
+        let mut cluster = target.cluster.lock().await;
+        cluster.register_node(super::cluster::NodeDescriptor {
+            node_id: source.node_id,
+            reachability: super::cluster::NodeReachability {
+                public_api_url: Some(peer_base_url.clone()),
+                peer_api_url: Some(peer_base_url.clone()),
+                relay_required: false,
+            },
+            capabilities: super::cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: false,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 900_000,
+            storage_stats: None,
+            last_heartbeat_unix: super::unix_ts(),
+            status: super::cluster::NodeStatus::Online,
+        });
+        cluster.note_replica("photos/range.bin", source.node_id);
+        cluster.note_replica(
+            format!("photos/range.bin@{}", put.version_id),
+            source.node_id,
+        );
+    }
+
+    let bundle = {
+        let locked = source.store.lock().await;
+        locked
+            .export_metadata_bundle(
+                "photos/range.bin",
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    {
+        let mut locked = target.store.lock().await;
+        locked.import_metadata_bundle(&bundle).await.unwrap();
+    }
+
+    let before_subjects = axum::response::IntoResponse::into_response(
+        super::local_available_subjects(axum::extract::State(target.clone())).await,
+    );
+    let before_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(before_subjects.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(before_payload["subject_count"].as_u64().unwrap(), 0);
+
+    let head_response = axum::response::IntoResponse::into_response(
+        super::head_object(
+            axum::extract::State(target.clone()),
+            HeaderMap::new(),
+            axum::extract::Path("photos/range.bin".to_string()),
+            axum::extract::Query(super::ObjectGetQuery {
+                snapshot: None,
+                version: None,
+                read_mode: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(head_response.status(), StatusCode::OK);
+    let etag = head_response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let mut range_headers = HeaderMap::new();
+    range_headers.insert(
+        axum::http::header::RANGE,
+        format!("bytes={range_start}-{range_end_inclusive}")
+            .parse()
+            .unwrap(),
+    );
+    range_headers.insert(axum::http::header::IF_RANGE, etag.parse().unwrap());
+    let range_response = axum::response::IntoResponse::into_response(
+        super::get_object(
+            axum::extract::State(target.clone()),
+            range_headers,
+            axum::extract::Path("photos/range.bin".to_string()),
+            axum::extract::Query(super::ObjectGetQuery {
+                snapshot: None,
+                version: None,
+                read_mode: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        range_response
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(
+            format!(
+                "bytes {range_start}-{range_end_inclusive}/{}",
+                payload.len()
+            )
+            .as_str()
+        )
+    );
+    let range_body = to_bytes(range_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        range_body.as_ref(),
+        &payload[range_start..range_end_inclusive + 1]
+    );
+
+    let after_subjects = axum::response::IntoResponse::into_response(
+        super::local_available_subjects(axum::extract::State(target.clone())).await,
+    );
+    let after_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(after_subjects.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after_payload["subject_count"].as_u64().unwrap(), 0);
+
+    {
+        let cluster = target.cluster.lock().await;
+        let cluster_subjects = cluster.subjects_for_node(target.node_id);
+        assert!(cluster_subjects.is_empty());
+    }
+
+    {
+        let locked = target.store.lock().await;
+        let cached = locked.list_cached_chunk_records_for_test().await.unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].cache_class, "read_through");
+        assert!(cached[0].access_count >= 1);
+    }
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    read_through_range_fetch_serves_partial_content_without_declaring_local_replica_impl,
+    read_through_range_fetch_serves_partial_content_without_declaring_local_replica,
+    read_through_range_fetch_serves_partial_content_without_declaring_local_replica_turso
 );
 
 async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTestBackend) {

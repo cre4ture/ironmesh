@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use common::NodeId;
 
 use super::{
-    AdminAuditEvent, CachedMediaMetadata, ClientCredentialState, CurrentState, FileVersionIndex,
-    MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample, StorageStatsState,
+    AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
+    FileVersionIndex, MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo,
+    SnapshotManifest, StorageStatsSample, StorageStatsState,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -495,6 +495,112 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
+    async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT record_json
+                 FROM cached_chunks
+                 WHERE hash = ?1",
+                (hash,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let payload = row_blob(&row, 0, "cached_chunks.record_json")?;
+        let record = self.decode_json::<CachedChunkRecord>(payload, "cached chunk record")?;
+        Ok(Some(record))
+    }
+
+    async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(record)?;
+        self.connection
+            .execute(
+                "INSERT INTO cached_chunks (hash, record_json)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(hash) DO UPDATE SET record_json = excluded.record_json",
+                (record.hash.as_str(), payload),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM cached_chunks WHERE hash = ?1", (hash,))
+            .await?;
+        Ok(())
+    }
+
+    async fn list_cached_chunk_records(&self) -> Result<Vec<CachedChunkRecord>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT record_json
+                 FROM cached_chunks
+                 ORDER BY hash ASC",
+                (),
+            )
+            .await?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload = row_blob(&row, 0, "cached_chunks.record_json")?;
+            records.push(self.decode_json::<CachedChunkRecord>(payload, "cached chunk record")?);
+        }
+        Ok(records)
+    }
+
+    async fn mark_manifest_locally_owned(
+        &self,
+        manifest_hash: &str,
+        owned_at_unix: u64,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO locally_owned_manifests (manifest_hash, owned_at_unix)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(manifest_hash) DO UPDATE SET owned_at_unix = excluded.owned_at_unix",
+                (
+                    manifest_hash,
+                    i64::try_from(owned_at_unix).context("owned manifest timestamp overflow")?,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM locally_owned_manifests WHERE manifest_hash = ?1",
+                (manifest_hash,),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn list_locally_owned_manifests(&self) -> Result<Vec<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT manifest_hash
+                 FROM locally_owned_manifests
+                 ORDER BY manifest_hash ASC",
+                (),
+            )
+            .await?;
+        let mut manifests = Vec::new();
+        while let Some(row) = rows.next().await? {
+            manifests.push(row_string(
+                &row,
+                0,
+                "locally_owned_manifests.manifest_hash",
+            )?);
+        }
+        Ok(manifests)
+    }
+
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
         let mut rows = self
             .connection
@@ -726,6 +832,16 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS media_cache (
                 content_fingerprint TEXT PRIMARY KEY,
                 metadata_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cached_chunks (
+                hash TEXT PRIMARY KEY,
+                record_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS locally_owned_manifests (
+                manifest_hash TEXT PRIMARY KEY,
+                owned_at_unix INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS reconcile_markers (

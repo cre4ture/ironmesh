@@ -6896,6 +6896,13 @@ async fn hydrate_missing_chunks_for_range(
                 store
                     .ingest_chunk(&chunk.hash, response.body.as_ref())
                     .await?;
+                store
+                    .note_cached_chunk_fetch(
+                        &chunk.hash,
+                        chunk.size_bytes,
+                        Some(&source.node_id.to_string()),
+                    )
+                    .await?;
             }
             fetched = true;
             break;
@@ -7033,6 +7040,39 @@ async fn get_object_response(
             manifest_hash = %manifest_hash,
             "refreshed local availability view after read-through hydration"
         );
+    }
+
+    let touched_chunk_hashes = {
+        let store = state.store.lock().await;
+        match store
+            .chunk_hashes_for_manifest_range(&manifest_hash, range_start, range_end_exclusive)
+            .await
+        {
+            Ok(hashes) => hashes,
+            Err(StoreReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+            Err(StoreReadError::Corrupt(msg)) => {
+                tracing::error!(key = %key, error = %msg, "detected corrupt data while collecting object range chunk hashes");
+                return StatusCode::CONFLICT.into_response();
+            }
+            Err(StoreReadError::Internal(err)) => {
+                tracing::error!(key = %key, error = %err, "internal error while collecting object range chunk hashes");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    {
+        let store = state.store.lock().await;
+        if let Err(err) = store
+            .touch_cached_chunk_accesses(&touched_chunk_hashes)
+            .await
+        {
+            tracing::debug!(
+                key = %key,
+                error = %err,
+                "failed to update cached chunk access timestamps"
+            );
+        }
     }
 
     let read_result = {
@@ -11826,6 +11866,9 @@ async fn run_cleanup(
     };
     match result {
         Ok(report) => {
+            if !dry_run {
+                refresh_local_availability_view_once(&state).await;
+            }
             append_admin_audit(
                 &state,
                 action,

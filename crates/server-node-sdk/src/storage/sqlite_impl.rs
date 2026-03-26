@@ -7,9 +7,9 @@ use common::NodeId;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    AdminAuditEvent, CachedMediaMetadata, ClientCredentialState, CurrentState, FileVersionIndex,
-    MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo, SnapshotManifest,
-    StorageStatsSample, StorageStatsState,
+    AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
+    FileVersionIndex, MetadataStore, ReconcileMarker, RepairAttemptRecord, SnapshotInfo,
+    SnapshotManifest, StorageStatsSample, StorageStatsState,
 };
 
 pub(super) struct SqliteMetadataStore {
@@ -411,6 +411,101 @@ impl MetadataStore for SqliteMetadataStore {
         })
     }
 
+    async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>> {
+        let db = self.metadata_conn()?;
+        let payload = db
+            .query_row(
+                "SELECT record_json
+                 FROM cached_chunks
+                 WHERE hash = ?1",
+                params![hash],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        match payload {
+            Some(payload) => serde_json::from_slice::<CachedChunkRecord>(&payload)
+                .map(Some)
+                .context("invalid cached chunk record in sqlite"),
+            None => Ok(None),
+        }
+    }
+
+    async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(record)?;
+        let db = self.metadata_conn()?;
+        db.execute(
+            "INSERT INTO cached_chunks (hash, record_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(hash) DO UPDATE SET record_json = excluded.record_json",
+            params![record.hash, payload],
+        )?;
+        Ok(())
+    }
+
+    async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()> {
+        let db = self.metadata_conn()?;
+        db.execute("DELETE FROM cached_chunks WHERE hash = ?1", params![hash])?;
+        Ok(())
+    }
+
+    async fn list_cached_chunk_records(&self) -> Result<Vec<CachedChunkRecord>> {
+        let db = self.metadata_conn()?;
+        let mut stmt = db.prepare(
+            "SELECT record_json
+             FROM cached_chunks
+             ORDER BY hash ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut records = Vec::new();
+        for row in rows {
+            let payload = row?;
+            records.push(
+                serde_json::from_slice::<CachedChunkRecord>(&payload)
+                    .context("invalid cached chunk record in sqlite")?,
+            );
+        }
+        Ok(records)
+    }
+
+    async fn mark_manifest_locally_owned(
+        &self,
+        manifest_hash: &str,
+        owned_at_unix: u64,
+    ) -> Result<()> {
+        let db = self.metadata_conn()?;
+        db.execute(
+            "INSERT INTO locally_owned_manifests (manifest_hash, owned_at_unix)
+             VALUES (?1, ?2)
+             ON CONFLICT(manifest_hash) DO UPDATE SET owned_at_unix = excluded.owned_at_unix",
+            params![manifest_hash, u64_to_i64(owned_at_unix)?],
+        )?;
+        Ok(())
+    }
+
+    async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()> {
+        let db = self.metadata_conn()?;
+        db.execute(
+            "DELETE FROM locally_owned_manifests WHERE manifest_hash = ?1",
+            params![manifest_hash],
+        )?;
+        Ok(())
+    }
+
+    async fn list_locally_owned_manifests(&self) -> Result<Vec<String>> {
+        let db = self.metadata_conn()?;
+        let mut stmt = db.prepare(
+            "SELECT manifest_hash
+             FROM locally_owned_manifests
+             ORDER BY manifest_hash ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut manifests = Vec::new();
+        for row in rows {
+            manifests.push(row?);
+        }
+        Ok(manifests)
+    }
+
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
         let db = self.metadata_conn()?;
         let payload = db
@@ -626,6 +721,16 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS media_cache (
             content_fingerprint TEXT PRIMARY KEY,
             metadata_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS cached_chunks (
+            hash TEXT PRIMARY KEY,
+            record_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS locally_owned_manifests (
+            manifest_hash TEXT PRIMARY KEY,
+            owned_at_unix INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS reconcile_markers (

@@ -30,6 +30,7 @@ const MEDIA_CACHE_SCHEMA_VERSION: u32 = 1;
 const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
+const READ_THROUGH_CACHE_CLASS: &str = "read_through";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkRef {
@@ -175,16 +176,30 @@ pub struct StorageStatsState {
     pub last_reconciled_unix: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedChunkRecord {
+    pub(crate) hash: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) first_cached_unix: u64,
+    pub(crate) last_access_unix: u64,
+    pub(crate) access_count: u64,
+    pub(crate) last_source_node_id: Option<String>,
+    pub(crate) cache_class: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CleanupReport {
     pub retention_secs: u64,
     pub dry_run: bool,
     pub protected_manifests: usize,
     pub protected_chunks: usize,
+    pub tracked_cached_chunks: usize,
     pub skipped_recent_manifests: usize,
     pub skipped_recent_chunks: usize,
     pub deleted_manifests: usize,
     pub deleted_chunks: usize,
+    pub deleted_cached_chunks: usize,
+    pub deleted_cached_chunk_records: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -557,6 +572,17 @@ trait MetadataStore: Send + Sync {
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>>;
     async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()>;
+    async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>>;
+    async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()>;
+    async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()>;
+    async fn list_cached_chunk_records(&self) -> Result<Vec<CachedChunkRecord>>;
+    async fn mark_manifest_locally_owned(
+        &self,
+        manifest_hash: &str,
+        owned_at_unix: u64,
+    ) -> Result<()>;
+    async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()>;
+    async fn list_locally_owned_manifests(&self) -> Result<Vec<String>>;
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>>;
     async fn list_storage_stats_history(&self, limit: usize) -> Result<Vec<StorageStatsSample>>;
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()>;
@@ -685,6 +711,16 @@ impl PersistentStore {
 
     pub fn current_object_ids(&self) -> HashMap<String, String> {
         self.current_state.object_ids.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn list_cached_chunk_records_for_test(&self) -> Result<Vec<CachedChunkRecord>> {
+        self.metadata_store.list_cached_chunk_records().await
+    }
+
+    #[cfg(test)]
+    pub async fn list_locally_owned_manifests_for_test(&self) -> Result<Vec<String>> {
+        self.metadata_store.list_locally_owned_manifests().await
     }
 
     pub async fn object_sizes_by_key(
@@ -1153,6 +1189,8 @@ impl PersistentStore {
             }
         }
 
+        self.mark_manifest_locally_owned(manifest_hash).await?;
+
         let version_id = explicit_version_id
             .clone()
             .unwrap_or_else(|| format!("ver-{}-{}", unix_ts_nanos(), &manifest_hash[..12]));
@@ -1569,6 +1607,89 @@ impl PersistentStore {
         Ok(Some(Bytes::from(payload)))
     }
 
+    async fn mark_manifest_locally_owned(&self, manifest_hash: &str) -> Result<()> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(());
+        }
+
+        self.metadata_store
+            .mark_manifest_locally_owned(manifest_hash, unix_ts())
+            .await?;
+
+        if let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? {
+            for chunk in manifest.chunks {
+                self.metadata_store
+                    .delete_cached_chunk_record(&chunk.hash)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn note_cached_chunk_fetch(
+        &self,
+        hash: &str,
+        size_bytes: usize,
+        source_node_id: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ts();
+        let mut record = self
+            .metadata_store
+            .load_cached_chunk_record(hash)
+            .await?
+            .unwrap_or(CachedChunkRecord {
+                hash: hash.to_string(),
+                size_bytes: size_bytes as u64,
+                first_cached_unix: now,
+                last_access_unix: now,
+                access_count: 0,
+                last_source_node_id: source_node_id.map(ToString::to_string),
+                cache_class: READ_THROUGH_CACHE_CLASS.to_string(),
+            });
+        record.size_bytes = size_bytes as u64;
+        record.last_access_unix = now;
+        record.access_count = record.access_count.saturating_add(1);
+        if let Some(source_node_id) = source_node_id {
+            record.last_source_node_id = Some(source_node_id.to_string());
+        }
+        if record.cache_class.is_empty() {
+            record.cache_class = READ_THROUGH_CACHE_CLASS.to_string();
+        }
+        self.metadata_store
+            .persist_cached_chunk_record(&record)
+            .await
+    }
+
+    pub(crate) async fn touch_cached_chunk_accesses(&self, hashes: &[String]) -> Result<()> {
+        let now = unix_ts();
+        for hash in hashes {
+            let Some(mut record) = self.metadata_store.load_cached_chunk_record(hash).await? else {
+                continue;
+            };
+            record.last_access_unix = now;
+            record.access_count = record.access_count.saturating_add(1);
+            self.metadata_store
+                .persist_cached_chunk_record(&record)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn collect_owned_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
+        let referenced = self.collect_referenced_manifest_hashes().await?;
+        let owned = self
+            .metadata_store
+            .list_locally_owned_manifests()
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        Ok(referenced
+            .into_iter()
+            .filter(|manifest_hash| owned.contains(manifest_hash))
+            .collect())
+    }
+
     pub async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
         let actual_hash = hash_hex(payload);
         if actual_hash != hash {
@@ -1696,6 +1817,7 @@ impl PersistentStore {
         if !fs::try_exists(&manifest_path).await? {
             write_atomic(&manifest_path, manifest_payload).await?;
         }
+        self.mark_manifest_locally_owned(manifest_hash).await?;
 
         let object_id = self
             .object_id_for_key(key)
@@ -2059,6 +2181,8 @@ impl PersistentStore {
         if !fs::try_exists(&manifest_path).await? {
             write_atomic(&manifest_path, &manifest_bytes).await?;
         }
+        self.mark_manifest_locally_owned(&cloned_manifest_hash)
+            .await?;
 
         Ok(cloned_manifest_hash)
     }
@@ -2496,6 +2620,54 @@ impl PersistentStore {
         }
 
         Ok(missing)
+    }
+
+    pub async fn chunk_hashes_for_manifest_range(
+        &self,
+        manifest_hash: &str,
+        start: usize,
+        end_exclusive: usize,
+    ) -> std::result::Result<Vec<String>, StoreReadError> {
+        if start > end_exclusive {
+            return Err(StoreReadError::Internal(anyhow::anyhow!(
+                "invalid range start={start} end={end_exclusive}"
+            )));
+        }
+
+        let Some(manifest) = self
+            .load_manifest_by_hash(manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        if end_exclusive > manifest.total_size_bytes {
+            return Err(StoreReadError::Internal(anyhow::anyhow!(
+                "range end_exclusive={end_exclusive} exceeds object size={}",
+                manifest.total_size_bytes
+            )));
+        }
+
+        let mut hashes = Vec::new();
+        let mut offset = 0usize;
+
+        for chunk in manifest.chunks {
+            let chunk_end = offset.saturating_add(chunk.size_bytes);
+            if chunk_end <= start {
+                offset = chunk_end;
+                continue;
+            }
+            if offset >= end_exclusive {
+                break;
+            }
+            hashes.push(chunk.hash);
+            offset = chunk_end;
+        }
+
+        Ok(hashes)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3002,7 +3174,14 @@ impl PersistentStore {
     ) -> Result<CleanupReport> {
         let now = unix_ts();
         let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
+        let owned_referenced_manifests = self.collect_owned_referenced_manifest_hashes().await?;
         let all_manifests = self.load_all_manifests().await?;
+        let cached_chunk_records = self.metadata_store.list_cached_chunk_records().await?;
+        let tracked_cached_chunks = cached_chunk_records.len();
+        let cached_chunk_hashes = cached_chunk_records
+            .iter()
+            .map(|record| record.hash.clone())
+            .collect::<HashSet<_>>();
 
         let mut retained_manifests = referenced_manifests.clone();
         let mut skipped_recent_manifests = 0usize;
@@ -3035,6 +3214,9 @@ impl PersistentStore {
 
             if fs::try_exists(&manifest_path).await? {
                 fs::remove_file(&manifest_path).await?;
+                self.metadata_store
+                    .delete_locally_owned_manifest(manifest_hash)
+                    .await?;
                 deleted_manifests += 1;
             }
         }
@@ -3044,14 +3226,18 @@ impl PersistentStore {
         for manifest_hash in &retained_manifests {
             if let Some(manifest) = all_manifests.get(manifest_hash) {
                 protected_media_fingerprints.insert(content_fingerprint_from_manifest(manifest));
-                for chunk in &manifest.chunks {
-                    protected_chunks.insert(chunk.hash.clone());
+                if owned_referenced_manifests.contains(manifest_hash) {
+                    for chunk in &manifest.chunks {
+                        protected_chunks.insert(chunk.hash.clone());
+                    }
                 }
             }
         }
 
         let mut skipped_recent_chunks = 0usize;
         let mut deleted_chunks = 0usize;
+        let mut deleted_cached_chunks = 0usize;
+        let mut deleted_cached_chunk_records = 0usize;
 
         let chunk_files = self.collect_chunk_file_paths().await?;
         for chunk_path in chunk_files {
@@ -3084,7 +3270,34 @@ impl PersistentStore {
             fs::remove_file(&chunk_path).await?;
             self.note_chunk_store_delta(-(chunk_size_bytes as i64))
                 .await?;
+            if cached_chunk_hashes.contains(&chunk_hash) {
+                self.metadata_store
+                    .delete_cached_chunk_record(&chunk_hash)
+                    .await?;
+                deleted_cached_chunks += 1;
+                deleted_cached_chunk_records += 1;
+            }
             deleted_chunks += 1;
+        }
+
+        if !dry_run {
+            for record in cached_chunk_records {
+                if protected_chunks.contains(&record.hash) {
+                    self.metadata_store
+                        .delete_cached_chunk_record(&record.hash)
+                        .await?;
+                    deleted_cached_chunk_records += 1;
+                    continue;
+                }
+
+                let chunk_path = chunk_path_for_hash(&self.chunks_dir, &record.hash);
+                if !fs::try_exists(&chunk_path).await? {
+                    self.metadata_store
+                        .delete_cached_chunk_record(&record.hash)
+                        .await?;
+                    deleted_cached_chunk_records += 1;
+                }
+            }
         }
 
         for content_fingerprint in self.list_media_cache_fingerprints().await? {
@@ -3111,10 +3324,13 @@ impl PersistentStore {
             dry_run,
             protected_manifests: referenced_manifests.len(),
             protected_chunks: protected_chunks.len(),
+            tracked_cached_chunks,
             skipped_recent_manifests,
             skipped_recent_chunks,
             deleted_manifests,
             deleted_chunks,
+            deleted_cached_chunks,
+            deleted_cached_chunk_records,
         })
     }
 

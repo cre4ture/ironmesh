@@ -1336,6 +1336,99 @@ mod tests {
         })
     }
 
+    async fn wait_for_known_nodes(
+        client: &reqwest::Client,
+        base_url: &str,
+        expected_nodes: usize,
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(response) = client.get(format!("{base_url}/cluster/nodes")).send().await
+                && let Ok(response) = response.error_for_status()
+                && let Ok(nodes) = response.json::<serde_json::Value>().await
+                && let Some(entries) = nodes.as_array()
+                && entries.len() == expected_nodes
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("cluster did not converge to {expected_nodes} known nodes at {base_url}");
+    }
+
+    async fn wait_for_store_index_path_visible(
+        client: &reqwest::Client,
+        base_url: &str,
+        key: &str,
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(response) = client
+                .get(format!("{base_url}/store/index?prefix=&depth=4"))
+                .send()
+                .await
+                && let Ok(response) = response.error_for_status()
+                && let Ok(index) = response.json::<serde_json::Value>().await
+                && index
+                    .get("entries")
+                    .and_then(|entries| entries.as_array())
+                    .is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry.get("path").and_then(|value| value.as_str()) == Some(key)
+                        })
+                    })
+            {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("store index did not expose key={key} at {base_url}");
+    }
+
+    async fn local_available_subjects(
+        client: &reqwest::Client,
+        base_url: &str,
+    ) -> Result<HashSet<String>> {
+        let payload = client
+            .get(format!("{base_url}/cluster/availability/subjects/local"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        Ok(payload
+            .get("subjects")
+            .and_then(|subjects| subjects.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect())
+    }
+
+    async fn wait_for_local_available_subject(
+        client: &reqwest::Client,
+        base_url: &str,
+        subject: &str,
+        present: bool,
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            let subjects = local_available_subjects(client, base_url).await?;
+            if subjects.contains(subject) == present {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let expected = if present { "present" } else { "absent" };
+        bail!(
+            "subject={subject} did not become {expected} in local availability view at {base_url}"
+        );
+    }
+
     #[tokio::test]
     async fn autonomous_peer_heartbeat_updates_live_storage_stats_for_all_listed_nodes()
     -> Result<()> {
@@ -1395,6 +1488,136 @@ mod tests {
         stop_server(&mut node_b).await;
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn read_through_metadata_replication_allows_reads_from_all_five_nodes() -> Result<()> {
+        let bind_a = "127.0.0.1:19211";
+        let bind_b = "127.0.0.1:19212";
+        let bind_c = "127.0.0.1:19213";
+        let bind_d = "127.0.0.1:19214";
+        let bind_e = "127.0.0.1:19215";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000011a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000011b2";
+        let node_id_c = "00000000-0000-0000-0000-0000000011c3";
+        let node_id_d = "00000000-0000-0000-0000-0000000011d4";
+        let node_id_e = "00000000-0000-0000-0000-0000000011e5";
+
+        let data_a = fresh_data_dir("read-through-five-node-a");
+        let data_b = fresh_data_dir("read-through-five-node-b");
+        let data_c = fresh_data_dir("read-through-five-node-c");
+        let data_d = fresh_data_dir("read-through-five-node-d");
+        let data_e = fresh_data_dir("read-through-five-node-e");
+
+        let node_env = [
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+        ];
+
+        let mut node_a =
+            start_open_server_with_env(bind_a, &data_a, node_id_a, 3, &node_env).await?;
+        let mut node_b =
+            start_open_server_with_env(bind_b, &data_b, node_id_b, 3, &node_env).await?;
+        let mut node_c =
+            start_open_server_with_env(bind_c, &data_c, node_id_c, 3, &node_env).await?;
+        let mut node_d =
+            start_open_server_with_env(bind_d, &data_d, node_id_d, 3, &node_env).await?;
+        let mut node_e =
+            start_open_server_with_env(bind_e, &data_e, node_id_e, 3, &node_env).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let base_c = format!("http://{bind_c}");
+        let base_d = format!("http://{bind_d}");
+        let base_e = format!("http://{bind_e}");
+        let client = reqwest::Client::new();
+
+        let result = async {
+            let nodes = [
+                (&base_a, node_id_a, "dc-a", "rack-1"),
+                (&base_b, node_id_b, "dc-b", "rack-2"),
+                (&base_c, node_id_c, "dc-c", "rack-3"),
+                (&base_d, node_id_d, "dc-d", "rack-4"),
+                (&base_e, node_id_e, "dc-e", "rack-5"),
+            ];
+
+            for (controller_base, _, _, _) in &nodes {
+                for (peer_base, peer_node_id, dc, rack) in &nodes {
+                    if controller_base == peer_base {
+                        continue;
+                    }
+                    register_node(&client, controller_base, peer_node_id, peer_base, dc, rack)
+                        .await?;
+                }
+            }
+
+            for (base_url, _, _, _) in &nodes {
+                wait_for_known_nodes(&client, base_url, 5, 160).await?;
+                wait_for_online_nodes(&client, base_url, 5, 160).await?;
+            }
+
+            let key = "read-through-five-node.bin";
+            let payload = vec![b'R'; 256 * 1024 + 333];
+            client
+                .put(format!("{base_a}/store/{key}"))
+                .body(payload.clone())
+                .send()
+                .await?
+                .error_for_status()?;
+
+            for (base_url, _, _, _) in &nodes {
+                wait_for_store_index_path_visible(&client, base_url, key, 240).await?;
+            }
+
+            let mut missing_before_reads = Vec::new();
+            for (base_url, _, _, _) in &nodes {
+                let subjects = local_available_subjects(&client, base_url).await?;
+                if !subjects.contains(key) {
+                    missing_before_reads.push((*base_url).to_string());
+                }
+            }
+
+            assert!(
+                !missing_before_reads.is_empty(),
+                "expected at least one non-replica node before read-through, but all nodes already reported local availability"
+            );
+
+            for (base_url, _, _, _) in &nodes {
+                let body = client
+                    .get(format!("{base_url}/store/{key}"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .bytes()
+                    .await?;
+                assert_eq!(body.as_ref(), payload.as_slice());
+            }
+
+            for base_url in &missing_before_reads {
+                wait_for_local_available_subject(&client, base_url, key, true, 160).await?;
+            }
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        stop_server(&mut node_c).await;
+        stop_server(&mut node_d).await;
+        stop_server(&mut node_e).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&data_c);
+        let _ = fs::remove_dir_all(&data_d);
+        let _ = fs::remove_dir_all(&data_e);
 
         result
     }
