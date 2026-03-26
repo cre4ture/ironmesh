@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
@@ -101,6 +102,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("textbox", { name: "Thumbnails per row" })).toHaveValue("4 per row");
   await page.getByRole("button", { name: "Map" }).click();
+  await expect(
+    page.getByText("Using MapTiler Satellite 2017-11-02 Planet from your self-hosted basemap dataset.")
+  ).toBeVisible();
+  await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("2 markers")).toBeVisible();
   await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
@@ -128,6 +133,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
 async function installClientUiMocks(page: Page) {
   const imageBody = tinyPngBuffer();
+  const logicalMapBody = readFileSync("tests/fixtures/smoke.mbtiles");
   let uploadSessionStartCount = 0;
   const uploadSizes = new Map<string, number>();
   let maxConcurrentUploadIds = 0;
@@ -226,6 +232,59 @@ async function installClientUiMocks(page: Page) {
         key: searchParams.get("key"),
         deleted: true
       });
+    }
+
+    if (pathname === "/api/maps/logical-file") {
+      const rangeHeader = route.request().headers().range;
+      const commonHeaders = {
+        "accept-ranges": "bytes",
+        "content-type": "application/octet-stream",
+        etag: "\"client-ui-smoke-mbtiles\""
+      };
+
+      if (method === "HEAD") {
+        await route.fulfill({
+          status: 200,
+          headers: {
+            ...commonHeaders,
+            "content-length": String(logicalMapBody.length)
+          }
+        });
+        return;
+      }
+
+      if (method === "GET") {
+        if (!rangeHeader) {
+          await route.fulfill({
+            status: 200,
+            headers: {
+              ...commonHeaders,
+              "content-length": String(logicalMapBody.length)
+            },
+            body: logicalMapBody
+          });
+          return;
+        }
+
+        const match = /^bytes=(\d+)-(\d+)?$/i.exec(rangeHeader);
+        expect(match).not.toBeNull();
+        const start = Number(match?.[1] ?? "0");
+        const inclusiveEnd = Math.min(
+          Number(match?.[2] ?? String(logicalMapBody.length - 1)),
+          logicalMapBody.length - 1
+        );
+        const sliced = logicalMapBody.subarray(start, inclusiveEnd + 1);
+        await route.fulfill({
+          status: 206,
+          headers: {
+            ...commonHeaders,
+            "content-length": String(sliced.length),
+            "content-range": `bytes ${start}-${inclusiveEnd}/${logicalMapBody.length}`
+          },
+          body: sliced
+        });
+        return;
+      }
     }
 
     if (pathname === "/api/store/list" && method === "GET") {

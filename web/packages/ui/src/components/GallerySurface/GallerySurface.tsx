@@ -29,7 +29,13 @@ import {
   IconRefresh
 } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
+import {
+  GalleryBasemapMap,
+  type GalleryBasemapConfig
+} from "./GalleryBasemapMap";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
+
+export type { GalleryBasemapConfig } from "./GalleryBasemapMap";
 
 type GallerySortOrder = "captured_desc" | "path_asc";
 type GalleryViewMode = "grid" | "map";
@@ -93,6 +99,7 @@ type GalleryNavigationItem = {
 type GallerySurfaceProps = {
   intro?: string;
   previewHint: string;
+  basemap?: GalleryBasemapConfig | null;
   loadSnapshots: () => Promise<GallerySnapshot[]>;
   loadEntries: (prefix: string, depth: number, snapshotId: string | null) => Promise<GalleryPayload>;
   getImageRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryImageRequests;
@@ -101,6 +108,7 @@ type GallerySurfaceProps = {
 export function GallerySurface({
   intro,
   previewHint,
+  basemap,
   loadSnapshots,
   loadEntries,
   getImageRequests
@@ -404,7 +412,8 @@ export function GallerySurface({
                   </Stack>
                 </Card>
               ) : (
-                <GalleryWorldMap
+                <GalleryMapPanel
+                  basemap={basemap}
                   entries={geotaggedEntries}
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selectedPath}
@@ -575,6 +584,50 @@ export function GallerySurface({
         ) : null}
       </Modal>
     </Stack>
+  );
+}
+
+type GalleryMapPanelProps = {
+  basemap?: GalleryBasemapConfig | null;
+  entries: GalleryEntry[];
+  hiddenOnMapCount: number;
+  selectedPath: string | null;
+  getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest;
+  onSelectPath: (path: string) => void;
+};
+
+function GalleryMapPanel({
+  basemap,
+  entries,
+  hiddenOnMapCount,
+  selectedPath,
+  getMarkerRequest,
+  onSelectPath
+}: GalleryMapPanelProps) {
+  const fallback = (
+    <GalleryWorldMap
+      entries={entries}
+      hiddenOnMapCount={hiddenOnMapCount}
+      selectedPath={selectedPath}
+      getMarkerRequest={getMarkerRequest}
+      onSelectPath={onSelectPath}
+    />
+  );
+
+  if (!basemap) {
+    return fallback;
+  }
+
+  return (
+    <GalleryBasemapMap
+      basemap={basemap}
+      entries={entries}
+      hiddenOnMapCount={hiddenOnMapCount}
+      selectedPath={selectedPath}
+      getMarkerRequest={getMarkerRequest}
+      onSelectPath={onSelectPath}
+      fallback={fallback}
+    />
   );
 }
 
