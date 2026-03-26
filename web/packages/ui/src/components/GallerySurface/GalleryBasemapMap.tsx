@@ -492,12 +492,13 @@ function buildRasterStyle(
   metadata: MbtilesMetadata,
   basemap: GalleryRasterBasemapConfig
 ): StyleSpecification {
+  const absoluteTileUrlTemplate = absolutizeStyleUrl(tileUrlTemplate);
   return {
     version: 8,
     sources: {
       basemap: {
         type: "raster",
-        tiles: [tileUrlTemplate],
+        tiles: [absoluteTileUrlTemplate],
         tileSize: 256,
         attribution: basemap.attribution ?? metadata.attribution ?? "",
         minzoom: metadata.minzoom ?? 0,
@@ -518,13 +519,15 @@ function buildVectorStyle(
   basemap: GalleryVectorBasemapConfig,
   metadata: MbtilesMetadata
 ): StyleSpecification {
+  const absoluteTileUrlTemplate = absolutizeStyleUrl(basemap.vectorTileUrlTemplate);
+  const absoluteGlyphsUrlTemplate = absolutizeStyleUrl(basemap.glyphsUrlTemplate);
   return {
     version: 8,
-    glyphs: basemap.glyphsUrlTemplate,
+    glyphs: absoluteGlyphsUrlTemplate,
     sources: {
       basemap: {
         type: "vector",
-        tiles: [basemap.vectorTileUrlTemplate],
+        tiles: [absoluteTileUrlTemplate],
         attribution: basemap.attribution ?? metadata.attribution ?? "",
         minzoom: metadata.minzoom ?? 0,
         maxzoom: metadata.maxzoom ?? 14
@@ -765,6 +768,18 @@ function buildVectorStyle(
 
 function nameExpression(): unknown[] {
   return ["coalesce", ["get", "name:latin"], ["get", "name_en"], ["get", "name"]];
+}
+
+function absolutizeStyleUrl(urlValue: string): string {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(urlValue)) {
+    return urlValue;
+  }
+
+  if (typeof window === "undefined") {
+    return urlValue;
+  }
+
+  return new URL(urlValue, window.location.href).toString();
 }
 
 function ensureMbtilesProtocolRegistered() {
