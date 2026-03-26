@@ -4,6 +4,7 @@ use crate::framework::{ChildGuard, binary_path, lock_test_resources, path_resour
 use anyhow::Context;
 use anyhow::{Result, bail};
 use std::collections::hash_map::DefaultHasher;
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Stdio;
@@ -155,7 +156,9 @@ async fn start_cfapi_adapter_with_resolved_inputs(
         );
     }
 
-    let mut command = Command::new(os_integration_bin);
+    let unregister_args = cfapi_unregister_args(root_path);
+
+    let mut command = Command::new(&os_integration_bin);
     command
         .arg("serve")
         .arg("--sync-root-id")
@@ -181,14 +184,51 @@ async fn start_cfapi_adapter_with_resolved_inputs(
         command.arg("--bootstrap-file").arg(bootstrap_file);
     }
 
-    let child = command
+    let child = match command
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to spawn os-integration serve")?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            unregister_cfapi_sync_root(&os_integration_bin, root_path)
+                .await
+                .ok();
+            return Err(error).context("failed to spawn os-integration serve");
+        }
+    };
 
     sleep(Duration::from_secs(2)).await;
-    Ok(ChildGuard::with_resources(child, resource_guards))
+    Ok(
+        ChildGuard::with_resources(child, resource_guards).with_cleanup_command(
+            os_integration_bin,
+            unregister_args,
+            format!("os-integration unregister {}", root_path.display()),
+        ),
+    )
+}
+
+fn cfapi_unregister_args(root_path: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("unregister"),
+        OsString::from("--root-path"),
+        root_path.as_os_str().to_os_string(),
+    ]
+}
+
+async fn unregister_cfapi_sync_root(os_integration_bin: &Path, root_path: &Path) -> Result<()> {
+    let output = Command::new(os_integration_bin)
+        .args(cfapi_unregister_args(root_path))
+        .output()
+        .await
+        .context("failed to execute os-integration unregister")?;
+    if !output.status.success() {
+        bail!(
+            "os-integration unregister failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
 }
 
 pub async fn pin_cfapi_placeholder(

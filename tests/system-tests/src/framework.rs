@@ -5,6 +5,7 @@ use client_sdk::{
 };
 use reqwest::StatusCode;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -264,6 +265,97 @@ pub fn insecure_https_client() -> Result<reqwest::Client> {
 pub struct ChildGuard {
     child: Option<Child>,
     _resource_guards: Vec<TestResourceGuard>,
+    cleanup_commands: Vec<CleanupCommand>,
+}
+
+#[derive(Debug)]
+struct CleanupCommand {
+    program: PathBuf,
+    args: Vec<OsString>,
+    description: String,
+    max_attempts: usize,
+    retry_delay: Duration,
+}
+
+impl CleanupCommand {
+    fn new(
+        program: impl Into<PathBuf>,
+        args: Vec<OsString>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            description: description.into(),
+            max_attempts: 20,
+            retry_delay: Duration::from_millis(250),
+        }
+    }
+
+    async fn run_async(&self) -> Result<()> {
+        let mut last_error = None;
+
+        for attempt in 1..=self.max_attempts {
+            let output = Command::new(&self.program)
+                .args(&self.args)
+                .output()
+                .await
+                .with_context(|| {
+                    format!("failed to execute cleanup command {}", self.description)
+                })?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            last_error = Some(anyhow::anyhow!(
+                "cleanup command {} failed with status {:?}: {}",
+                self.description,
+                output.status.code(),
+                stderr
+            ));
+
+            if attempt < self.max_attempts {
+                sleep(self.retry_delay).await;
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("cleanup command {} failed", self.description)))
+    }
+
+    fn run_blocking(&self) -> Result<()> {
+        let mut last_error = None;
+
+        for attempt in 1..=self.max_attempts {
+            let output = std::process::Command::new(&self.program)
+                .args(&self.args)
+                .output()
+                .with_context(|| {
+                    format!("failed to execute cleanup command {}", self.description)
+                })?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            last_error = Some(anyhow::anyhow!(
+                "cleanup command {} failed with status {:?}: {}",
+                self.description,
+                output.status.code(),
+                stderr
+            ));
+
+            if attempt < self.max_attempts {
+                std::thread::sleep(self.retry_delay);
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("cleanup command {} failed", self.description)))
+    }
 }
 
 impl ChildGuard {
@@ -271,19 +363,50 @@ impl ChildGuard {
         Self {
             child: Some(child),
             _resource_guards: resource_guards,
+            cleanup_commands: Vec::new(),
         }
     }
 
+    pub fn with_cleanup_command(
+        mut self,
+        program: impl Into<PathBuf>,
+        args: Vec<OsString>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.cleanup_commands
+            .push(CleanupCommand::new(program, args, description));
+        self
+    }
+
     pub async fn stop(&mut self) -> Result<()> {
+        let mut stop_error = None;
+
         if let Some(child) = self.child.as_mut() {
-            child.kill().await.context("failed to kill child process")?;
-            child
-                .wait()
-                .await
-                .context("failed to wait for child process to exit")?;
+            if let Err(error) = child.kill().await {
+                stop_error =
+                    Some(anyhow::Error::new(error).context("failed to kill child process"));
+            } else if let Err(error) = child.wait().await {
+                stop_error = Some(
+                    anyhow::Error::new(error).context("failed to wait for child process to exit"),
+                );
+            }
             self.child = None;
         }
+
+        for cleanup in std::mem::take(&mut self.cleanup_commands) {
+            if let Err(error) = cleanup.run_async().await {
+                if stop_error.is_none() {
+                    stop_error = Some(error);
+                } else {
+                    eprintln!("cleanup warning: {error:#}");
+                }
+            }
+        }
+
         self._resource_guards.clear();
+        if let Some(error) = stop_error {
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -292,6 +415,11 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
+        }
+        for cleanup in std::mem::take(&mut self.cleanup_commands) {
+            if let Err(error) = cleanup.run_blocking() {
+                eprintln!("cleanup warning: {error:#}");
+            }
         }
     }
 }

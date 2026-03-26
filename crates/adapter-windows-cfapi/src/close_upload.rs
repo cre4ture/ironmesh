@@ -49,6 +49,13 @@ impl UploadDebounceSnapshot {
 }
 
 impl UploadDebounceState {
+    pub(crate) fn has_in_flight_upload_for_path(&self, relative_path: &str) -> bool {
+        self.uploads_in_flight
+            .lock()
+            .expect("uploads_in_flight lock poisoned")
+            .contains(relative_path)
+    }
+
     pub(crate) fn debug_snapshot_for_path(
         &self,
         relative_path: &str,

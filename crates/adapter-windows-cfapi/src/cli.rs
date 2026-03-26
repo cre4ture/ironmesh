@@ -17,7 +17,7 @@ use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
-    reconcile_sync_states, register_sync_root,
+    reconcile_sync_states, register_sync_root, unregister_sync_root,
 };
 use sync_core::SyncPolicy;
 
@@ -90,7 +90,7 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
 
 #[derive(Debug, Parser)]
 #[command(name = "adapter-windows-cfapi")]
-#[command(about = "Combined CLI for register and serve")]
+#[command(about = "Combined CLI for register, unregister, serve, and pin")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]
@@ -104,6 +104,7 @@ struct Cli {
 enum Commands {
     Serve(ServeArgs),
     Register(RegisterArgs),
+    Unregister(UnregisterArgs),
     Pin(PinArgs),
 }
 
@@ -148,6 +149,12 @@ struct RegisterArgs {
 }
 
 #[derive(Debug, Parser)]
+struct UnregisterArgs {
+    #[arg(long)]
+    root_path: String,
+}
+
+#[derive(Debug, Parser)]
 struct PinArgs {
     #[arg(long)]
     root_path: String,
@@ -170,6 +177,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                 SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
             register_sync_root(&registration)
         }
+        Commands::Unregister(args) => unregister_sync_root(&PathBuf::from(args.root_path)),
         Commands::Pin(args) => pin_placeholder_locally(args),
 
         Commands::Serve(args) => {

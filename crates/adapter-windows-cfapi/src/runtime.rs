@@ -18,6 +18,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
+use windows_sys::Win32::Foundation::{
+    NTSTATUS, STATUS_CLOUD_FILE_NOT_IN_SYNC, STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
+    STATUS_CLOUD_FILE_PINNED, STATUS_SUCCESS,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRootRegistration {
@@ -410,18 +414,21 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
 }
 
 pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
-    let sync_root_id = SyncRootId::from_path(root_path).map_err(|error| {
-        anyhow!(
-            "failed to resolve sync root registration for {}: {error}",
-            root_path.display()
-        )
-    })?;
-    sync_root_id.unregister().map_err(|error| {
-        anyhow!(
-            "failed to unregister sync root {}: {error}",
-            root_path.display()
-        )
-    })
+    if root_path.as_os_str().is_empty() {
+        return Err(anyhow!("root path cannot be empty"));
+    }
+
+    let root_path_utf16 = utf16_path(root_path);
+    let hr = unsafe { CfUnregisterSyncRoot(root_path_utf16.as_ptr()) };
+    if hr == 0 || hr == STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "failed to unregister sync root {}: HRESULT 0x{:08x}",
+        root_path.display(),
+        hr
+    ))
 }
 
 fn parse_size_from_remote_version(remote_version: &str) -> Option<i64> {
@@ -964,6 +971,14 @@ pub fn connect_sync_root(
             Callback: Some(callback_cancel_fetch_data),
         },
         CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE,
+            Callback: Some(callback_notify_dehydrate),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE_COMPLETION,
+            Callback: Some(callback_notify_dehydrate_completion),
+        },
+        CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
             Callback: Some(callback_file_close_completion),
         },
@@ -1088,6 +1103,52 @@ fn report_fetch_progress(
         completed as i64,
         callback_target_session_id(callback_info),
     )
+}
+
+fn dehydrate_completion_status(
+    placeholder_info: &CF_PLACEHOLDER_STANDARD_INFO,
+    has_in_flight_upload: bool,
+) -> NTSTATUS {
+    if placeholder_info.PinState == CF_PIN_STATE_PINNED {
+        STATUS_CLOUD_FILE_PINNED
+    } else if has_in_flight_upload
+        || placeholder_info.InSyncState != CF_IN_SYNC_STATE_IN_SYNC
+        || placeholder_info.ModifiedDataSize != 0
+    {
+        STATUS_CLOUD_FILE_NOT_IN_SYNC
+    } else {
+        STATUS_SUCCESS
+    }
+}
+
+fn execute_ack_dehydrate(
+    callback_info: &CF_CALLBACK_INFO,
+    completion_status: NTSTATUS,
+) -> Result<()> {
+    let mut op_params = CF_OPERATION_PARAMETERS {
+        ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            AckDehydrate: CF_OPERATION_PARAMETERS_0_5 {
+                Flags: CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE,
+                CompletionStatus: completion_status,
+                FileIdentity: callback_info.FileIdentity,
+                FileIdentityLength: callback_info.FileIdentityLength,
+            },
+        },
+    };
+
+    let op_info = CF_OPERATION_INFO {
+        StructSize: size_of::<CF_OPERATION_INFO>() as u32,
+        Type: CF_OPERATION_TYPE_ACK_DEHYDRATE,
+        ConnectionKey: callback_info.ConnectionKey,
+        TransferKey: callback_info.TransferKey,
+        CorrelationVector: callback_info.CorrelationVector,
+        SyncStatus: null(),
+        RequestKey: callback_info.RequestKey,
+    };
+
+    let hr = unsafe { CfExecute(&op_info, &mut op_params) };
+    hresult_to_result(hr, "CfExecute(AckDehydrate)")
 }
 
 struct CfapiTransferWriter<'a> {
@@ -1277,6 +1338,148 @@ unsafe extern "system" fn callback_cancel_fetch_data(
     eprintln!(
         "cfapi cancel-fetch-data: path={} offset={} length={}",
         relative_path, fetch.FileOffset, fetch.Length
+    );
+}
+
+unsafe extern "system" fn callback_notify_dehydrate(
+    callback_info: *const CF_CALLBACK_INFO,
+    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+) {
+    if callback_info.is_null() || callback_parameters.is_null() {
+        return;
+    }
+
+    let callback_info_ref = unsafe { &*callback_info };
+    let request_identity = callback_request_identity(callback_info_ref);
+    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
+    if context_ptr.is_null() {
+        let _ = execute_ack_dehydrate(callback_info_ref, STATUS_CLOUD_FILE_NOT_IN_SYNC);
+        return;
+    }
+    let context = unsafe { &*context_ptr };
+    let dehydrate = unsafe { (*callback_parameters).Anonymous.Dehydrate };
+
+    let relative_path = match resolve_relative_path_from_callback(callback_info_ref, context) {
+        Some(path) => path,
+        None => {
+            let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
+            eprintln!(
+                "cfapi notify-dehydrate: request={} could not resolve relative path normalized_path='{}' file_id={} flags=0x{:x} reason={}",
+                request_identity,
+                normalized_path,
+                callback_info_ref.FileId,
+                dehydrate.Flags,
+                dehydrate.Reason
+            );
+            if let Err(err) =
+                execute_ack_dehydrate(callback_info_ref, STATUS_CLOUD_FILE_NOT_IN_SYNC)
+            {
+                eprintln!("cfapi notify-dehydrate ack error: {err}");
+            }
+            return;
+        }
+    };
+
+    let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
+    let upload_snapshot = context
+        .upload_debounce
+        .debug_snapshot_for_path(&relative_path, 8);
+    let completion_status = match open_sync_path(&full_path, false) {
+        Ok(file) => match cf_get_placeholder_standard_info(&file) {
+            Ok(placeholder_info) => dehydrate_completion_status(
+                &placeholder_info,
+                context
+                    .upload_debounce
+                    .has_in_flight_upload_for_path(&relative_path),
+            ),
+            Err(err) => {
+                eprintln!(
+                    "cfapi notify-dehydrate: request={} path={} failed to read placeholder info: {} state={} upload_debounce={}",
+                    request_identity,
+                    relative_path,
+                    err,
+                    describe_path_state(&full_path),
+                    upload_snapshot.to_log_string()
+                );
+                STATUS_CLOUD_FILE_NOT_IN_SYNC
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "cfapi notify-dehydrate: request={} path={} failed to open target: {} state={} upload_debounce={}",
+                request_identity,
+                relative_path,
+                err,
+                describe_path_state(&full_path),
+                upload_snapshot.to_log_string()
+            );
+            STATUS_CLOUD_FILE_NOT_IN_SYNC
+        }
+    };
+
+    eprintln!(
+        "cfapi notify-dehydrate: request={} transfer={} file_id={} path={} flags=0x{:x} reason={} decision_status=0x{:08x} state={} upload_debounce={}",
+        request_identity,
+        callback_info_ref.TransferKey,
+        callback_info_ref.FileId,
+        relative_path,
+        dehydrate.Flags,
+        dehydrate.Reason,
+        completion_status as u32,
+        describe_path_state(&full_path),
+        upload_snapshot.to_log_string()
+    );
+
+    if let Err(err) = execute_ack_dehydrate(callback_info_ref, completion_status) {
+        eprintln!(
+            "cfapi notify-dehydrate ack error: request={} path={} status=0x{:08x} error={:#}",
+            request_identity, relative_path, completion_status as u32, err
+        );
+    }
+}
+
+unsafe extern "system" fn callback_notify_dehydrate_completion(
+    callback_info: *const CF_CALLBACK_INFO,
+    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+) {
+    if callback_info.is_null() || callback_parameters.is_null() {
+        return;
+    }
+
+    let callback_info_ref = unsafe { &*callback_info };
+    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
+    if context_ptr.is_null() {
+        return;
+    }
+    let context = unsafe { &*context_ptr };
+    let dehydrate = unsafe { (*callback_parameters).Anonymous.DehydrateCompletion };
+    let relative_path = resolve_relative_path_from_callback(callback_info_ref, context)
+        .unwrap_or_else(|| String::from("<unknown>"));
+
+    if relative_path != "<unknown>"
+        && (dehydrate.Flags & CF_CALLBACK_DEHYDRATE_COMPLETION_FLAG_DEHYDRATED) != 0
+        && let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock()
+    {
+        hydrated_paths.remove(&relative_path);
+    }
+
+    let full_path = if relative_path == "<unknown>" {
+        context.sync_root.clone()
+    } else {
+        context.sync_root.join(relative_path.replace('/', "\\"))
+    };
+
+    eprintln!(
+        "cfapi dehydrate-completion: file_id={} path={} flags=0x{:x} reason={} state={} upload_debounce={}",
+        callback_info_ref.FileId,
+        relative_path,
+        dehydrate.Flags,
+        dehydrate.Reason,
+        describe_path_state(&full_path),
+        context
+            .upload_debounce
+            .debug_snapshot_for_path(&relative_path, 8)
+            .to_log_string()
     );
 }
 
@@ -1489,6 +1692,60 @@ mod tests {
 
         let payload = String::from_utf8(hydrated).expect("demo hydrator emits utf8 payload");
         assert!(payload.contains("docs/notes.txt"));
+    }
+
+    #[test]
+    fn dehydrate_request_allows_clean_unpinned_in_sync_placeholder() {
+        let info = CF_PLACEHOLDER_STANDARD_INFO {
+            InSyncState: CF_IN_SYNC_STATE_IN_SYNC,
+            PinState: CF_PIN_STATE_UNSPECIFIED,
+            ModifiedDataSize: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(dehydrate_completion_status(&info, false), STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn dehydrate_request_rejects_pinned_placeholder() {
+        let info = CF_PLACEHOLDER_STANDARD_INFO {
+            InSyncState: CF_IN_SYNC_STATE_IN_SYNC,
+            PinState: CF_PIN_STATE_UNSPECIFIED,
+            ModifiedDataSize: 128,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            dehydrate_completion_status(&info, false),
+            STATUS_CLOUD_FILE_PINNED
+        );
+    }
+
+    #[test]
+    fn dehydrate_request_rejects_dirty_or_pending_placeholder() {
+        let mut info = CF_PLACEHOLDER_STANDARD_INFO {
+            InSyncState: CF_IN_SYNC_STATE_IN_SYNC,
+            PinState: CF_PIN_STATE_UNSPECIFIED,
+            ModifiedDataSize: 128,
+            ..Default::default()
+        };
+        assert_eq!(
+            dehydrate_completion_status(&info, false),
+            STATUS_CLOUD_FILE_NOT_IN_SYNC
+        );
+
+        info.ModifiedDataSize = 0;
+        info.InSyncState = CF_IN_SYNC_STATE_NOT_IN_SYNC;
+        assert_eq!(
+            dehydrate_completion_status(&info, false),
+            STATUS_CLOUD_FILE_NOT_IN_SYNC
+        );
+
+        info.InSyncState = CF_IN_SYNC_STATE_IN_SYNC;
+        assert_eq!(
+            dehydrate_completion_status(&info, true),
+            STATUS_CLOUD_FILE_NOT_IN_SYNC
+        );
     }
 
     #[test]
