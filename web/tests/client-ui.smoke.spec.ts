@@ -100,13 +100,17 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.reload();
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("textbox", { name: "Thumbnails per row" })).toHaveValue("4 per row");
-  await page.getByText("gallery/cat.png", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("2 markers")).toBeVisible();
+  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
   await page.getByRole("button", { name: "Next image" }).click();
   await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Grid" }).click();
   await page.getByLabel("Prefix").fill("docs/");
   await page.getByRole("button", { name: "Load" }).click();
   await expect(page.getByText("nested/", { exact: true }).first()).toBeVisible();
@@ -271,6 +275,10 @@ async function installClientUiMocks(page: Page) {
               width: 1024,
               height: 768,
               taken_at_unix: 1712345678,
+              gps: {
+                latitude: 47.3769,
+                longitude: 8.5417
+              },
               thumbnail: {
                 url: "/media/thumbnail?key=gallery%2Fcat.png",
                 profile: "grid",
@@ -291,6 +299,10 @@ async function installClientUiMocks(page: Page) {
               content_fingerprint: "fingerprint-dog",
               media_type: "image",
               mime_type: "image/jpeg",
+              gps: {
+                latitude: 40.7128,
+                longitude: -74.006
+              },
               thumbnail: {
                 url: "/media/thumbnail?key=gallery%2Fdog.jpg",
                 profile: "grid",

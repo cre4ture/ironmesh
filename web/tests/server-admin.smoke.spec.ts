@@ -64,7 +64,10 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
   await expect(page.getByText("2 images", { exact: true })).toBeVisible();
-  await page.getByText("gallery/cat.png", { exact: true }).click();
+  await page.getByRole("button", { name: "Map" }).click();
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("2 markers")).toBeVisible();
+  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
@@ -275,6 +278,10 @@ async function installServerAdminMocks(
               width: 1024,
               height: 768,
               taken_at_unix: 1_712_345_678,
+              gps: {
+                latitude: 47.3769,
+                longitude: 8.5417
+              },
               thumbnail: {
                 url: "/auth/media/thumbnail?key=gallery%2Fcat.png",
                 profile: "grid",
@@ -293,6 +300,10 @@ async function installServerAdminMocks(
               content_fingerprint: "fingerprint-dog",
               media_type: "image",
               mime_type: "image/jpeg",
+              gps: {
+                latitude: 40.7128,
+                longitude: -74.006
+              },
               thumbnail: {
                 url: "/auth/media/thumbnail?key=gallery%2Fdog.jpg",
                 profile: "grid",

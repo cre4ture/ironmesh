@@ -23,15 +23,20 @@ import {
   IconChevronLeft,
   IconChevronRight,
   IconFolder,
+  IconLayoutGrid,
+  IconMap2,
+  IconMapPin,
   IconRefresh
 } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
 
 type GallerySortOrder = "captured_desc" | "path_asc";
+type GalleryViewMode = "grid" | "map";
 
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
 const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "ironmesh.gallery.thumbnails_per_row";
+const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 
 export type GallerySnapshot = {
   id: string;
@@ -48,6 +53,10 @@ export type GalleryEntry = {
     width?: number | null;
     height?: number | null;
     taken_at_unix?: number | null;
+    gps?: {
+      latitude: number;
+      longitude: number;
+    } | null;
     thumbnail?: {
       url: string;
     } | null;
@@ -99,6 +108,7 @@ export function GallerySurface({
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(4);
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
+  const [viewMode, setViewMode] = useState(loadStoredViewMode);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<GalleryPayload | null>(null);
@@ -119,10 +129,15 @@ export function GallerySurface({
     persistThumbnailsPerRow(thumbnailsPerRow);
   }, [thumbnailsPerRow]);
 
+  useEffect(() => {
+    persistViewMode(viewMode);
+  }, [viewMode]);
+
   const imageEntries = sortGalleryEntries(
     (entriesPayload?.entries ?? []).filter(isGalleryImageEntry),
     sortOrder
   );
+  const geotaggedEntries = imageEntries.filter(hasGalleryGpsCoordinates);
   const currentGalleryPrefix = normalizeGalleryPrefix(entriesPayload?.prefix ?? prefix);
   const navigationItems = buildGalleryNavigationItems(
     entriesPayload?.entries ?? [],
@@ -130,6 +145,7 @@ export function GallerySurface({
   );
   const readyCount = imageEntries.filter((entry) => entry.media?.status === "ready").length;
   const pendingCount = imageEntries.filter((entry) => entry.media?.status === "pending").length;
+  const hiddenOnMapCount = imageEntries.length - geotaggedEntries.length;
   const selectedIndex = selectedPath
     ? imageEntries.findIndex((entry) => entry.path === selectedPath)
     : -1;
@@ -286,6 +302,22 @@ export function GallerySurface({
                   setSortOrder(value === "path_asc" ? "path_asc" : "captured_desc")
                 }
               />
+              <Group grow>
+                <Button
+                  variant={viewMode === "grid" ? "filled" : "default"}
+                  leftSection={<IconLayoutGrid size={14} />}
+                  onClick={() => setViewMode("grid")}
+                >
+                  Grid
+                </Button>
+                <Button
+                  variant={viewMode === "map" ? "filled" : "default"}
+                  leftSection={<IconMap2 size={14} />}
+                  onClick={() => setViewMode("map")}
+                >
+                  Map
+                </Button>
+              </Group>
               <Select
                 label="Thumbnails per row"
                 data={[
@@ -312,6 +344,9 @@ export function GallerySurface({
               </Group>
               <Group gap="xs">
                 <Badge variant="light">{imageEntries.length} images</Badge>
+                <Badge color="grape" variant="light">
+                  {geotaggedEntries.length} geo-tagged
+                </Badge>
                 <Badge color="blue" variant="light">
                   {navigationItems.filter((item) => item.kind === "prefix").length} folders
                 </Badge>
@@ -339,7 +374,46 @@ export function GallerySurface({
         </Grid.Col>
 
         <Grid.Col span={{ base: 12, xl: 8 }}>
-          {imageEntries.length === 0 && navigationItems.length === 0 ? (
+          {viewMode === "map" ? (
+            <Stack gap="md">
+              {navigationItems.length > 0 ? (
+                <Group gap="sm">
+                  {navigationItems.map((item) => (
+                    <Button
+                      key={item.key}
+                      variant={item.kind === "up" ? "default" : "light"}
+                      leftSection={
+                        item.kind === "up" ? <IconArrowUp size={16} /> : <IconFolder size={16} />
+                      }
+                      onClick={() => void refreshEntries(item.targetPrefix)}
+                    >
+                      {item.label}
+                    </Button>
+                  ))}
+                </Group>
+              ) : null}
+
+              {geotaggedEntries.length === 0 ? (
+                <Card withBorder radius="md" padding="xl">
+                  <Stack gap="xs" align="center">
+                    <Text fw={700}>No geo-tagged images in view</Text>
+                    <Text c="dimmed" ta="center">
+                      The current gallery scope has {imageEntries.length} image
+                      {imageEntries.length === 1 ? "" : "s"}, but none with GPS coordinates yet.
+                    </Text>
+                  </Stack>
+                </Card>
+              ) : (
+                <GalleryWorldMap
+                  entries={geotaggedEntries}
+                  hiddenOnMapCount={hiddenOnMapCount}
+                  selectedPath={selectedPath}
+                  getMarkerRequest={(entry) => getImageRequests(entry, snapshotId).thumbnail}
+                  onSelectPath={setSelectedPath}
+                />
+              )}
+            </Stack>
+          ) : imageEntries.length === 0 && navigationItems.length === 0 ? (
             <Card withBorder radius="md" padding="xl">
               <Stack gap="xs" align="center">
                 <Text fw={700}>No image objects in view</Text>
@@ -430,6 +504,7 @@ export function GallerySurface({
                         {entry.media?.mime_type ? (
                           <Badge variant="dot">{entry.media.mime_type}</Badge>
                         ) : null}
+                        {entry.media?.gps ? <Badge color="grape" variant="dot">GPS</Badge> : null}
                       </Group>
                       {entry.media?.taken_at_unix ? (
                         <Text size="sm" c="dimmed">
@@ -500,6 +575,259 @@ export function GallerySurface({
         ) : null}
       </Modal>
     </Stack>
+  );
+}
+
+type GalleryWorldMapProps = {
+  entries: GalleryEntry[];
+  hiddenOnMapCount: number;
+  selectedPath: string | null;
+  getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest;
+  onSelectPath: (path: string) => void;
+};
+
+function GalleryWorldMap({
+  entries,
+  hiddenOnMapCount,
+  selectedPath,
+  getMarkerRequest,
+  onSelectPath
+}: GalleryWorldMapProps) {
+  return (
+    <Card withBorder radius="md" padding="lg">
+      <Stack gap="md">
+        <Group justify="space-between" align="flex-start">
+          <div>
+            <Text fw={700}>Geo-tagged world map</Text>
+            <Text size="sm" c="dimmed">
+              Click a thumbnail marker to open the fullscreen image viewer.
+            </Text>
+          </div>
+          <Group gap="xs">
+            <Badge color="grape" variant="light">
+              {entries.length} markers
+            </Badge>
+            {hiddenOnMapCount > 0 ? (
+              <Badge color="gray" variant="light">
+                {hiddenOnMapCount} without GPS
+              </Badge>
+            ) : null}
+          </Group>
+        </Group>
+
+        <div
+          aria-label="Geotagged gallery map"
+          style={{
+            position: "relative",
+            aspectRatio: "16 / 9",
+            overflow: "hidden",
+            borderRadius: "calc(var(--mantine-radius-md) - 2px)",
+            background:
+              "radial-gradient(circle at 18% 16%, rgba(255, 255, 255, 0.32), transparent 28%), linear-gradient(180deg, #0c3348 0%, #144e6c 48%, #0d2f44 100%)",
+            boxShadow: "inset 0 0 0 1px rgba(255, 255, 255, 0.08)"
+          }}
+        >
+          <svg
+            viewBox="0 0 1000 560"
+            preserveAspectRatio="none"
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%"
+            }}
+          >
+            <defs>
+              <linearGradient id="ironmesh-gallery-map-land" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor="#335c49" />
+                <stop offset="100%" stopColor="#244739" />
+              </linearGradient>
+            </defs>
+            {[1, 2, 3, 4, 5].map((index) => (
+              <line
+                key={`parallel:${index}`}
+                x1="0"
+                x2="1000"
+                y1={index * (560 / 6)}
+                y2={index * (560 / 6)}
+                stroke="rgba(255, 255, 255, 0.14)"
+                strokeWidth="1"
+              />
+            ))}
+            {[1, 2, 3, 4, 5, 6, 7].map((index) => (
+              <line
+                key={`meridian:${index}`}
+                y1="0"
+                y2="560"
+                x1={index * (1000 / 8)}
+                x2={index * (1000 / 8)}
+                stroke="rgba(255, 255, 255, 0.12)"
+                strokeWidth="1"
+              />
+            ))}
+            <line
+              x1="0"
+              x2="1000"
+              y1="280"
+              y2="280"
+              stroke="rgba(255, 255, 255, 0.22)"
+              strokeWidth="1.5"
+            />
+            <line
+              y1="0"
+              y2="560"
+              x1="500"
+              x2="500"
+              stroke="rgba(255, 255, 255, 0.18)"
+              strokeWidth="1.5"
+            />
+            <path
+              d="M101 125c28-31 79-50 120-42 43 8 66 33 96 46 25 11 60 8 74 35 14 27-13 63-27 92-16 33-15 68-37 92-26 28-72 20-111 7-42-14-80-37-104-71-22-32-28-78-19-114 8-35-10-82 8-105z"
+              fill="url(#ironmesh-gallery-map-land)"
+              opacity="0.78"
+            />
+            <path
+              d="M247 330c32-8 51 19 63 43 13 28 15 64-3 88-17 23-48 38-77 31-27-7-47-34-50-62-3-23 12-43 23-63 11-20 18-32 44-37z"
+              fill="url(#ironmesh-gallery-map-land)"
+              opacity="0.72"
+            />
+            <path
+              d="M474 108c33-22 84-25 118-12 28 11 39 33 61 49 26 20 67 16 87 43 25 33 26 87 8 126-21 46-70 77-120 82-43 5-91-9-126-35-34-26-60-67-57-111 2-34 26-64 27-98 0-20-14-30 2-44z"
+              fill="url(#ironmesh-gallery-map-land)"
+              opacity="0.82"
+            />
+            <path
+              d="M542 352c23-20 63-24 92-16 27 8 41 31 52 54 12 24 21 53 8 77-15 29-52 46-85 43-31-3-59-24-71-53-13-32-20-78 4-105z"
+              fill="url(#ironmesh-gallery-map-land)"
+              opacity="0.74"
+            />
+            <path
+              d="M770 352c23-13 51-12 76-4 24 8 49 25 56 50 7 22-7 48-26 60-23 15-53 15-79 11-21-3-44-10-56-28-11-17-10-42 2-58 7-10 15-22 27-31z"
+              fill="url(#ironmesh-gallery-map-land)"
+              opacity="0.8"
+            />
+          </svg>
+
+          {entries.map((entry) => {
+            const gps = entry.media?.gps;
+            if (!gps) {
+              return null;
+            }
+
+            const projection = projectGpsToWorldMap(gps.latitude, gps.longitude);
+            return (
+              <GalleryMapMarker
+                key={entry.path}
+                entry={entry}
+                request={getMarkerRequest(entry)}
+                projectedX={projection.x}
+                projectedY={projection.y}
+                selected={selectedPath === entry.path}
+                onClick={() => onSelectPath(entry.path)}
+              />
+            );
+          })}
+
+          <div
+            style={{
+              position: "absolute",
+              left: 16,
+              bottom: 12,
+              display: "flex",
+              gap: 12,
+              color: "rgba(255, 255, 255, 0.72)",
+              fontSize: "0.78rem",
+              letterSpacing: "0.04em",
+              textTransform: "uppercase"
+            }}
+          >
+            <span>180W</span>
+            <span>Prime meridian</span>
+            <span>180E</span>
+          </div>
+        </div>
+      </Stack>
+    </Card>
+  );
+}
+
+type GalleryMapMarkerProps = {
+  entry: GalleryEntry;
+  request: GalleryPreviewRequest;
+  projectedX: number;
+  projectedY: number;
+  selected: boolean;
+  onClick: () => void;
+};
+
+function GalleryMapMarker({
+  entry,
+  request,
+  projectedX,
+  projectedY,
+  selected,
+  onClick
+}: GalleryMapMarkerProps) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const { resolvedSrc, failed } = useResolvedImageRequest(request);
+  const signature = requestSignature(request);
+  const gps = entry.media?.gps;
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [signature]);
+
+  return (
+    <button
+      type="button"
+      aria-label={`Open map marker for ${entry.path}`}
+      title={
+        gps
+          ? `${entry.path} (${gps.latitude.toFixed(4)}, ${gps.longitude.toFixed(4)})`
+          : entry.path
+      }
+      onClick={onClick}
+      style={{
+        position: "absolute",
+        left: `${projectedX * 100}%`,
+        top: `${projectedY * 100}%`,
+        width: selected ? 58 : 50,
+        height: selected ? 58 : 50,
+        padding: 0,
+        borderRadius: "50%",
+        border: selected
+          ? "3px solid rgba(255, 255, 255, 0.98)"
+          : "2px solid rgba(255, 255, 255, 0.72)",
+        outline: 0,
+        overflow: "hidden",
+        transform: "translate(-50%, -50%)",
+        background: failed || imageFailed ? "rgba(18, 48, 64, 0.92)" : "rgba(255, 255, 255, 0.16)",
+        boxShadow: selected
+          ? "0 0 0 6px rgba(164, 80, 255, 0.24), 0 18px 34px rgba(0, 0, 0, 0.42)"
+          : "0 12px 28px rgba(0, 0, 0, 0.34)",
+        cursor: "pointer"
+      }}
+    >
+      {failed || imageFailed || !resolvedSrc ? (
+        <Center style={{ width: "100%", height: "100%" }}>
+          <IconMapPin size={18} color="white" />
+        </Center>
+      ) : (
+        <img
+          src={resolvedSrc}
+          alt={entry.path}
+          loading="lazy"
+          decoding="async"
+          onError={() => setImageFailed(true)}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover"
+          }}
+        />
+      )}
+    </button>
   );
 }
 
@@ -866,6 +1194,17 @@ function isGalleryPrefixEntry(entry: GalleryEntry): boolean {
   return entry.entry_type === "prefix" || entry.path.endsWith("/");
 }
 
+function hasGalleryGpsCoordinates(entry: GalleryEntry): boolean {
+  const latitude = entry.media?.gps?.latitude;
+  const longitude = entry.media?.gps?.longitude;
+  return (
+    typeof latitude === "number" &&
+    Number.isFinite(latitude) &&
+    typeof longitude === "number" &&
+    Number.isFinite(longitude)
+  );
+}
+
 function sortGalleryEntries(entries: GalleryEntry[], sortOrder: GallerySortOrder): GalleryEntry[] {
   return [...entries].sort((left, right) => {
     if (sortOrder === "path_asc") {
@@ -986,6 +1325,14 @@ function loadStoredThumbnailsPerRow(): number {
   return parseThumbnailsPerRow(window.localStorage.getItem(GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY));
 }
 
+function loadStoredViewMode(): GalleryViewMode {
+  if (typeof window === "undefined") {
+    return "grid";
+  }
+
+  return parseViewMode(window.localStorage.getItem(GALLERY_VIEW_MODE_STORAGE_KEY));
+}
+
 function persistThumbnailsPerRow(value: number) {
   if (typeof window === "undefined") {
     return;
@@ -997,9 +1344,21 @@ function persistThumbnailsPerRow(value: number) {
   );
 }
 
+function persistViewMode(value: GalleryViewMode) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(GALLERY_VIEW_MODE_STORAGE_KEY, parseViewMode(value));
+}
+
 function parseThumbnailsPerRow(value: string | number | null | undefined): number {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) && parsed >= 1 && parsed <= 6 ? parsed : 3;
+}
+
+function parseViewMode(value: string | null | undefined): GalleryViewMode {
+  return value === "map" ? "map" : "grid";
 }
 
 function formatTakenAt(value: number): string {
@@ -1016,4 +1375,14 @@ function parentPrefix(path: string): string {
     return "";
   }
   return `${normalized.split("/").slice(0, -1).join("/")}/`;
+}
+
+function projectGpsToWorldMap(latitude: number, longitude: number): { x: number; y: number } {
+  const clampedLatitude = Math.max(-85, Math.min(85, latitude));
+  const wrappedLongitude = ((((longitude + 180) % 360) + 360) % 360) - 180;
+
+  return {
+    x: Math.max(0.028, Math.min(0.972, (wrappedLongitude + 180) / 360)),
+    y: Math.max(0.04, Math.min(0.96, (90 - clampedLatitude) / 180))
+  };
 }
