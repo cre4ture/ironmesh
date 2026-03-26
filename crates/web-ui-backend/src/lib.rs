@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    ETAG, RANGE,
+};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -10,7 +13,7 @@ use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, RelayMode,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
     RendezvousEndpointStatus, StoreIndexView, UploadMode, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem,
+    build_http_client_with_identity_from_pem, ironmesh_client::DownloadRangeRequest,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -20,6 +23,7 @@ use tokio::sync::RwLock;
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKEND_REVISION: &str =
     git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 
 pub mod assets {
     pub fn app_html() -> String {
@@ -213,6 +217,7 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/", get(web_static_index))
         .route("/ironmesh-favicon.svg", get(web_static_favicon))
         .route("/media/thumbnail", get(web_media_thumbnail))
+        .route("/api/maps/logical-file", get(web_map_logical_file))
         .route("/api/health", get(web_health))
         .route("/api/snapshots", get(web_snapshots))
         .route("/api/versions", get(web_versions))
@@ -295,6 +300,43 @@ struct WebMediaThumbnailQuery {
     snapshot: Option<String>,
     version: Option<String>,
     read_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebMapLogicalFileQuery {
+    manifest_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SplitLogicalFileManifest {
+    manifest_version: u32,
+    #[serde(rename = "type")]
+    manifest_type: String,
+    logical_format: String,
+    logical_key: String,
+    logical_size_bytes: u64,
+    parts_count: usize,
+    parts: Vec<SplitLogicalFilePart>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SplitLogicalFilePart {
+    part_id: String,
+    key: String,
+    offset_bytes: u64,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedSplitLogicalFileManifest {
+    manifest: SplitLogicalFileManifest,
+    etag: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicalFileByteRange {
+    start: u64,
+    end_inclusive: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -619,6 +661,182 @@ fn build_media_thumbnail_request_path(query: &WebMediaThumbnailQuery) -> Result<
     build_relative_path(&["media", "thumbnail"], &query_pairs)
 }
 
+fn parse_logical_file_range(value: &str, total_size_bytes: u64) -> Option<LogicalFileByteRange> {
+    if total_size_bytes == 0 {
+        return None;
+    }
+
+    let trimmed = value.trim();
+    let range_spec = trimmed.strip_prefix("bytes=")?.trim();
+    if range_spec.contains(',') {
+        return None;
+    }
+
+    let (start_raw, end_raw) = range_spec.split_once('-')?;
+    if start_raw.is_empty() {
+        let suffix_length = end_raw.parse::<u64>().ok()?;
+        if suffix_length == 0 {
+            return None;
+        }
+
+        let start = total_size_bytes.saturating_sub(suffix_length);
+        return Some(LogicalFileByteRange {
+            start,
+            end_inclusive: total_size_bytes.saturating_sub(1),
+        });
+    }
+
+    let start = start_raw.parse::<u64>().ok()?;
+    if start >= total_size_bytes {
+        return None;
+    }
+
+    let end_inclusive = if end_raw.is_empty() {
+        total_size_bytes.saturating_sub(1)
+    } else {
+        let end = end_raw.parse::<u64>().ok()?;
+        if end < start {
+            return None;
+        }
+        end.min(total_size_bytes.saturating_sub(1))
+    };
+
+    Some(LogicalFileByteRange {
+        start,
+        end_inclusive,
+    })
+}
+
+fn logical_file_content_type(logical_format: &str) -> &'static str {
+    if logical_format.eq_ignore_ascii_case("mbtiles") {
+        "application/vnd.sqlite3"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn file_name_from_key(key: &str) -> &str {
+    key.rsplit('/').next().unwrap_or(key)
+}
+
+fn validate_split_logical_file_manifest(
+    mut manifest: SplitLogicalFileManifest,
+) -> Result<SplitLogicalFileManifest> {
+    if manifest.manifest_version != 1 {
+        return Err(anyhow!(
+            "unsupported split logical file manifest version: {}",
+            manifest.manifest_version
+        ));
+    }
+    if manifest.manifest_type != "split_file_manifest" {
+        return Err(anyhow!(
+            "unsupported split logical file manifest type: {}",
+            manifest.manifest_type
+        ));
+    }
+    if manifest.logical_key.trim().is_empty() {
+        return Err(anyhow!("logical_key must not be empty"));
+    }
+    if manifest.parts_count != manifest.parts.len() {
+        return Err(anyhow!(
+            "parts_count mismatch: declared={} actual={}",
+            manifest.parts_count,
+            manifest.parts.len()
+        ));
+    }
+    if manifest.parts.is_empty() {
+        return Err(anyhow!(
+            "split logical file manifest must contain at least one part"
+        ));
+    }
+
+    manifest.parts.sort_by_key(|part| part.offset_bytes);
+    let mut expected_offset = 0_u64;
+    for part in &manifest.parts {
+        if part.part_id.trim().is_empty() {
+            return Err(anyhow!("manifest part_id must not be empty"));
+        }
+        if part.key.trim().is_empty() {
+            return Err(anyhow!("manifest part key must not be empty"));
+        }
+        if part.size_bytes == 0 {
+            return Err(anyhow!("manifest part {} has zero size", part.part_id));
+        }
+        if part.offset_bytes != expected_offset {
+            return Err(anyhow!(
+                "manifest part {} offset mismatch: expected={} actual={}",
+                part.part_id,
+                expected_offset,
+                part.offset_bytes
+            ));
+        }
+        expected_offset = expected_offset
+            .checked_add(part.size_bytes)
+            .ok_or_else(|| anyhow!("manifest logical size overflow"))?;
+    }
+
+    if expected_offset != manifest.logical_size_bytes {
+        return Err(anyhow!(
+            "manifest logical_size_bytes mismatch: declared={} actual={}",
+            manifest.logical_size_bytes,
+            expected_offset
+        ));
+    }
+
+    Ok(manifest)
+}
+
+async fn load_split_logical_file_manifest(
+    state: &WebState,
+    manifest_key: &str,
+) -> Result<LoadedSplitLogicalFileManifest> {
+    let manifest_payload = current_client(state)
+        .await
+        .get_with_selector(manifest_key, None, None)
+        .await
+        .with_context(|| format!("failed to fetch split logical file manifest {manifest_key}"))?;
+    let manifest = serde_json::from_slice::<SplitLogicalFileManifest>(&manifest_payload)
+        .with_context(|| format!("failed to parse split logical file manifest {manifest_key}"))?;
+    let manifest = validate_split_logical_file_manifest(manifest)?;
+
+    Ok(LoadedSplitLogicalFileManifest {
+        manifest,
+        etag: format!("\"{}\"", blake3::hash(&manifest_payload).to_hex()),
+    })
+}
+
+async fn download_object_range_bytes(
+    sdk: IronMeshClient,
+    key: String,
+    start: u64,
+    length: u64,
+) -> Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
+        let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
+        sdk.download_range_to_writer_with_progress_blocking(
+            DownloadRangeRequest {
+                key: key.as_str(),
+                snapshot: None,
+                version: None,
+                start,
+                length,
+            },
+            &mut body,
+            &mut on_progress,
+            &|| false,
+        )
+        .with_context(|| {
+            format!(
+                "failed to download logical file segment key={key} start={start} length={length}"
+            )
+        })?;
+        Ok::<Vec<u8>, anyhow::Error>(body)
+    })
+    .await
+    .context("logical file range download task join failed")?
+}
+
 fn content_type_for(path: &str) -> &'static str {
     if path.ends_with(".css") {
         "text/css; charset=utf-8"
@@ -756,6 +974,168 @@ async fn web_media_thumbnail(
     }
 
     (response.status, headers, response.body).into_response()
+}
+
+async fn web_map_logical_file(
+    State(state): State<WebState>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<WebMapLogicalFileQuery>,
+) -> impl IntoResponse {
+    if query.manifest_key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "manifest_key must not be empty");
+    }
+
+    let loaded_manifest =
+        match load_split_logical_file_manifest(&state, query.manifest_key.trim()).await {
+            Ok(manifest) => manifest,
+            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        };
+
+    let total_size_bytes = loaded_manifest.manifest.logical_size_bytes;
+    let selected_range = match headers
+        .get(RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| parse_logical_file_range(value, total_size_bytes))
+    {
+        Some(Some(range)) => Some(range),
+        Some(None) => {
+            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            let headers = response.headers_mut();
+            headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            headers.insert(
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{total_size_bytes}"))
+                    .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+            );
+            headers.insert(
+                ETAG,
+                HeaderValue::from_str(&loaded_manifest.etag)
+                    .unwrap_or_else(|_| HeaderValue::from_static("\"invalid-etag\"")),
+            );
+            return response;
+        }
+        None => None,
+    };
+
+    if method != Method::HEAD
+        && selected_range.is_none()
+        && total_size_bytes > MAX_FULL_LOGICAL_FILE_GET_BYTES
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "full logical file GET is disabled for files larger than {MAX_FULL_LOGICAL_FILE_GET_BYTES} bytes; use range requests"
+            ),
+        );
+    }
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response_headers.insert(
+        ETAG,
+        HeaderValue::from_str(&loaded_manifest.etag)
+            .unwrap_or_else(|_| HeaderValue::from_static("\"invalid-etag\"")),
+    );
+    response_headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(logical_file_content_type(
+            &loaded_manifest.manifest.logical_format,
+        )),
+    );
+    response_headers.insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "inline; filename=\"{}\"",
+            file_name_from_key(&loaded_manifest.manifest.logical_key)
+        ))
+        .unwrap_or_else(|_| HeaderValue::from_static("inline")),
+    );
+
+    let content_length = selected_range
+        .map(|range| range.end_inclusive - range.start + 1)
+        .unwrap_or(total_size_bytes);
+    response_headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+
+    if let Some(range) = selected_range {
+        response_headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&format!(
+                "bytes {}-{}/{}",
+                range.start, range.end_inclusive, total_size_bytes
+            ))
+            .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+        );
+    }
+
+    if method == Method::HEAD {
+        return (
+            selected_range
+                .map(|_| StatusCode::PARTIAL_CONTENT)
+                .unwrap_or(StatusCode::OK),
+            response_headers,
+            Vec::<u8>::new(),
+        )
+            .into_response();
+    }
+
+    let range_start = selected_range.map(|range| range.start).unwrap_or(0);
+    let range_end_exclusive = selected_range
+        .map(|range| range.end_inclusive.saturating_add(1))
+        .unwrap_or(total_size_bytes);
+    let sdk = current_sdk(&state).await;
+    let mut body = Vec::with_capacity(content_length.min(1024 * 1024) as usize);
+
+    for part in &loaded_manifest.manifest.parts {
+        let part_start = part.offset_bytes;
+        let part_end_exclusive = part.offset_bytes + part.size_bytes;
+        if part_end_exclusive <= range_start || part_start >= range_end_exclusive {
+            continue;
+        }
+
+        let segment_start = range_start.max(part_start);
+        let segment_end_exclusive = range_end_exclusive.min(part_end_exclusive);
+        let local_start = segment_start - part_start;
+        let segment_length = segment_end_exclusive - segment_start;
+        if segment_length == 0 {
+            continue;
+        }
+
+        match download_object_range_bytes(
+            sdk.clone(),
+            part.key.clone(),
+            local_start,
+            segment_length,
+        )
+        .await
+        {
+            Ok(bytes) => body.extend_from_slice(&bytes),
+            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        }
+    }
+
+    if body.len() as u64 != content_length {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "logical file reconstruction produced {} bytes, expected {content_length}",
+                body.len()
+            ),
+        );
+    }
+
+    (
+        selected_range
+            .map(|_| StatusCode::PARTIAL_CONTENT)
+            .unwrap_or(StatusCode::OK),
+        response_headers,
+        body,
+    )
+        .into_response()
 }
 
 async fn web_cluster_status(State(state): State<WebState>) -> impl IntoResponse {

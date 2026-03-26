@@ -28,6 +28,39 @@ mod tests {
         cursor.into_inner()
     }
 
+    fn sample_split_manifest_json(
+        manifest_key: &str,
+        logical_key: &str,
+        parts: &[(&str, &str, &[u8])],
+    ) -> serde_json::Value {
+        let mut offset_bytes = 0_u64;
+        let entries = parts
+            .iter()
+            .map(|(part_id, key, payload)| {
+                let size_bytes = payload.len() as u64;
+                let entry = serde_json::json!({
+                    "part_id": part_id,
+                    "key": *key,
+                    "offset_bytes": offset_bytes,
+                    "size_bytes": size_bytes
+                });
+                offset_bytes += size_bytes;
+                entry
+            })
+            .collect::<Vec<_>>();
+
+        serde_json::json!({
+            "manifest_version": 1,
+            "type": "split_file_manifest",
+            "logical_format": "mbtiles",
+            "logical_key": logical_key,
+            "manifest_key": manifest_key,
+            "logical_size_bytes": offset_bytes,
+            "parts_count": entries.len(),
+            "parts": entries
+        })
+    }
+
     async fn start_web_backend_with_args(bind: &str, cli_args: &[&str]) -> Result<ChildGuard> {
         let cli_bin = binary_path("cli-client")?;
         let resource_guards = lock_test_resources([tcp_resource_key(bind)]).await;
@@ -524,6 +557,131 @@ mod tests {
 
             let body = response.bytes().await?;
             assert!(!body.is_empty(), "thumbnail body should not be empty");
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn web_ui_backend_serves_split_logical_file_ranges() -> Result<()> {
+        let server_bind = "127.0.0.1:19388";
+        let web_bind = "127.0.0.1:19389";
+        let web_base = format!("http://{web_bind}");
+        let client = reqwest::Client::new();
+
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-map-logical-server",
+            "web-ui-map-logical-client",
+        )
+        .await?;
+
+        let manifest_key = "sys/maps/test-map.mbtiles.manifest.json";
+        let logical_key = "sys/maps/test-map.mbtiles";
+        let part_aa_key = "sys/maps/test-map.mbtiles-part-aa";
+        let part_ab_key = "sys/maps/test-map.mbtiles-part-ab";
+        let part_ac_key = "sys/maps/test-map.mbtiles-part-ac";
+        let part_aa = b"hello ".to_vec();
+        let part_ab = b"world".to_vec();
+        let part_ac = b" !!!".to_vec();
+        let expected = [part_aa.clone(), part_ab.clone(), part_ac.clone()].concat();
+
+        let result = async {
+            let expected_content_length = expected.len().to_string();
+            let expected_content_range = format!("bytes 3-10/{}", expected.len());
+            for (key, payload) in [
+                (part_aa_key, part_aa.clone()),
+                (part_ab_key, part_ab.clone()),
+                (part_ac_key, part_ac.clone()),
+            ] {
+                client
+                    .post(format!("{web_base}/api/store/put-binary"))
+                    .query(&[("key", key)])
+                    .body(payload)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            let manifest_payload = sample_split_manifest_json(
+                manifest_key,
+                logical_key,
+                &[
+                    ("aa", part_aa_key, part_aa.as_slice()),
+                    ("ab", part_ab_key, part_ab.as_slice()),
+                    ("ac", part_ac_key, part_ac.as_slice()),
+                ],
+            );
+            client
+                .post(format!("{web_base}/api/store/put"))
+                .json(&serde_json::json!({
+                    "key": manifest_key,
+                    "value": serde_json::to_string(&manifest_payload)?,
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let head_response = client
+                .head(format!("{web_base}/api/maps/logical-file"))
+                .query(&[("manifest_key", manifest_key)])
+                .send()
+                .await?
+                .error_for_status()?;
+            assert_eq!(
+                head_response
+                    .headers()
+                    .get(reqwest::header::ACCEPT_RANGES)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bytes")
+            );
+            assert_eq!(
+                head_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_content_length.as_str())
+            );
+
+            let full_response = client
+                .get(format!("{web_base}/api/maps/logical-file"))
+                .query(&[("manifest_key", manifest_key)])
+                .send()
+                .await?
+                .error_for_status()?;
+            assert_eq!(
+                full_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/vnd.sqlite3")
+            );
+            let full_body = full_response.bytes().await?;
+            assert_eq!(full_body.as_ref(), expected.as_slice());
+
+            let range_response = client
+                .get(format!("{web_base}/api/maps/logical-file"))
+                .query(&[("manifest_key", manifest_key)])
+                .header(reqwest::header::RANGE, "bytes=3-10")
+                .send()
+                .await?
+                .error_for_status()?;
+            assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                range_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_content_range.as_str())
+            );
+            let range_body = range_response.bytes().await?;
+            assert_eq!(range_body.as_ref(), &expected[3..11]);
 
             Ok::<(), anyhow::Error>(())
         }

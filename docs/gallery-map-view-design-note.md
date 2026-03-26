@@ -142,6 +142,14 @@ This packaging therefore implies one additional service layer that reconstructs 
 file or otherwise serves map tiles from the manifest-defined parts. The manifest is only the
 storage-side description of the split artifact.
 
+The first backend slice of that service layer now exists in `web-ui-backend` as a logical,
+range-capable file endpoint:
+
+- `/api/maps/logical-file?manifest_key=<cluster-key>`
+
+That endpoint is intended as the transport foundation for a future browser-side MBTiles reader.
+It does not yet render tiles by itself.
+
 ## Remaining Map-Specific Decisions
 
 The main open questions are now product and UI questions rather than storage questions:

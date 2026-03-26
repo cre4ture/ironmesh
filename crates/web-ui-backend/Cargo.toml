@@ -9,6 +9,7 @@ build = "build.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 client-sdk = { path = "../client-sdk" }
 git-version.workspace = true
