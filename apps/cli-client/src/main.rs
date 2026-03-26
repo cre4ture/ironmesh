@@ -9,6 +9,11 @@ use client_sdk::{
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
+use tracing_subscriber::filter::Directive;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use web_ui_backend::{WebUiBootstrapPersistence, WebUiConfig};
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -20,6 +25,7 @@ const LONG_VERSION: &str = git_version::git_version!(
     prefix = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: "),
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
+static CLI_TRACING_INIT: Once = Once::new();
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
@@ -76,6 +82,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_cli_tracing();
     let cli = Cli::parse();
 
     match &cli.command {
@@ -168,6 +175,42 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn init_cli_tracing() {
+    CLI_TRACING_INIT.call_once(|| {
+        let perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
+        let mut env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+        if perf_logging_enabled {
+            env_filter = env_filter.add_directive(
+                "info"
+                    .parse::<Directive>()
+                    .expect("valid info tracing directive"),
+            );
+        }
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_timer(tracing_subscriber::fmt::time::SystemTime)
+                    .with_target(false)
+                    .compact(),
+            )
+            .init();
+    });
+}
+
+fn env_flag_is_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 async fn enroll_from_bootstrap(
