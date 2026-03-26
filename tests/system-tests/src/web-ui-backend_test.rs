@@ -61,6 +61,13 @@ mod tests {
         })
     }
 
+    fn extract_referenced_asset_path(bundle: &str, needle: &str) -> Option<String> {
+        let start = bundle.find(needle)?;
+        let quoted_start = bundle[..start].rfind('"')?;
+        let quoted_end = bundle[start..].find('"')? + start;
+        Some(bundle[quoted_start + 1..quoted_end].to_string())
+    }
+
     async fn start_web_backend_with_args(bind: &str, cli_args: &[&str]) -> Result<ChildGuard> {
         let cli_bin = binary_path("cli-client")?;
         let resource_guards = lock_test_resources([tcp_resource_key(bind)]).await;
@@ -143,6 +150,40 @@ mod tests {
                 .text()
                 .await?;
             assert!(js.contains("Transport-aware"));
+
+            let worker_asset_path = extract_referenced_asset_path(&js, "/assets/sqlite.worker-")
+                .context("client bundle should reference sqlite.worker asset")?;
+            let worker_response = client
+                .get(format!("{web_base}{worker_asset_path}"))
+                .send()
+                .await?
+                .error_for_status()?;
+            let worker_content_type = worker_response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let worker_body = worker_response.bytes().await?;
+            assert!(worker_content_type.starts_with("application/javascript"));
+            assert!(worker_body.starts_with(b"!function"));
+
+            let wasm_asset_path = extract_referenced_asset_path(&js, "/assets/sql-wasm-")
+                .context("client bundle should reference sql-wasm asset")?;
+            let wasm_response = client
+                .get(format!("{web_base}{wasm_asset_path}"))
+                .send()
+                .await?
+                .error_for_status()?;
+            let wasm_content_type = wasm_response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let wasm_body = wasm_response.bytes().await?;
+            assert_eq!(wasm_content_type, "application/wasm");
+            assert!(!wasm_body.is_empty());
 
             let css = client
                 .get(format!("{web_base}/app.css"))

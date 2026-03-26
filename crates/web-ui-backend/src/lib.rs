@@ -26,6 +26,10 @@ const BACKEND_REVISION: &str =
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 
 pub mod assets {
+    mod generated_assets {
+        include!(concat!(env!("OUT_DIR"), "/client_ui_assets.rs"));
+    }
+
     pub fn app_html() -> String {
         include_str!(concat!(env!("OUT_DIR"), "/client_ui_index.html")).to_string()
     }
@@ -44,6 +48,10 @@ pub mod assets {
 
     pub(crate) fn favicon_svg() -> &'static str {
         include_str!("../../../docs/assets/ironmesh-favicon.svg")
+    }
+
+    pub(crate) fn extra_asset(path: &str) -> Option<(&'static [u8], &'static str)> {
+        generated_assets::asset(path)
     }
 }
 
@@ -880,7 +888,15 @@ async fn web_static_file(Path(path): Path<String>) -> Response {
             bytes,
         )
             .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => match assets::extra_asset(&path) {
+            Some((bytes, content_type)) => (
+                StatusCode::OK,
+                [("content-type", content_type)],
+                bytes.to_vec(),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
     }
 }
 

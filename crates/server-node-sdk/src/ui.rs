@@ -2,6 +2,10 @@ use super::*;
 use axum::http::header::{CONTENT_TYPE, HeaderValue};
 use axum::response::Html;
 
+mod generated_assets {
+    include!(concat!(env!("OUT_DIR"), "/server_admin_assets.rs"));
+}
+
 const INDEX_HTML_TEMPLATE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/server_admin_index.html"));
 const INDEX_CSS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.css"));
@@ -67,4 +71,17 @@ pub(crate) async fn app_js() -> impl IntoResponse {
         )],
         INDEX_JS,
     )
+}
+
+pub(crate) async fn static_asset(Path(path): Path<String>) -> impl IntoResponse {
+    let logical_path = format!("assets/{path}");
+    match generated_assets::asset(&logical_path) {
+        Some((bytes, content_type)) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, HeaderValue::from_static(content_type))],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
