@@ -150,6 +150,80 @@ range-capable file endpoint:
 That endpoint is intended as the transport foundation for a future browser-side MBTiles reader.
 It does not yet render tiles by itself.
 
+## MBTiles Performance Note
+
+For browser-side MBTiles reading, SQLite page size matters a lot.
+
+The currently tested `maptiler-satellite-2017-11-02-planet.mbtiles` artifact has a very small
+SQLite page size (`512` bytes). With `sql.js-httpvfs`, that causes many tiny HTTP range reads and
+therefore poor startup and pan/zoom performance.
+
+This is not mainly a gallery UI problem. It is primarily a packaging problem of the MBTiles file
+used as the basemap artifact.
+
+### Recommended repack procedure
+
+Before splitting and uploading a large MBTiles basemap for browser-side use:
+
+1. Repack the MBTiles file with a larger SQLite page size.
+2. Verify the repacked file still opens correctly in a normal MBTiles viewer.
+3. Split the repacked file into parts.
+4. Regenerate the split-file manifest, because the logical size may change after `VACUUM`.
+5. Upload the repacked parts and the new manifest to the cluster.
+
+Example SQLite repack procedure:
+
+```sql
+PRAGMA journal_mode = delete;
+PRAGMA page_size = 4096;
+VACUUM;
+```
+
+The important part is that `VACUUM` must run after changing `page_size`, otherwise the new page
+size is not actually applied to the database file.
+
+### Preferred page-size experiment order
+
+Use the smallest page size that gives acceptable browser performance.
+
+Recommended experiment order:
+
+1. `4096`
+2. `8192`
+3. `16384`
+4. `32768` only if the previous sizes are still too slow
+
+Why:
+
+- larger pages reduce the number of HTTP range requests,
+- but larger pages also increase overfetch for point lookups and cache footprint,
+- so the right answer is not "largest possible", but "smallest size that performs well enough".
+
+For the currently observed `512`-byte file, even moving to `4096` should already be a large
+improvement, and `8192` or `16384` are likely the most practical targets for the current gallery
+map implementation.
+
+### Operational reminder
+
+Whenever the MBTiles file is repacked:
+
+- the part boundaries will likely change,
+- the total logical file size may change,
+- the split manifest must therefore be regenerated,
+- and the cluster should be updated as one coherent basemap artifact, not part-by-part against the
+  old manifest.
+
+### If browser-side MBTiles remains too slow
+
+If acceptable performance cannot be reached even after repacking:
+
+1. keep the current self-hosted data layout,
+2. move tile lookup and JPEG serving to a server-side XYZ tile endpoint,
+3. let the browser consume ordinary raster tile URLs instead of querying SQLite in WebAssembly.
+
+That would remove the browser-side SQLite lookup cost entirely, at the expense of a more
+specialized map-serving backend.
+
 ## Remaining Map-Specific Decisions
 
 The main open questions are now product and UI questions rather than storage questions:
