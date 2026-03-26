@@ -779,7 +779,23 @@ function absolutizeStyleUrl(urlValue: string): string {
     return urlValue;
   }
 
-  return new URL(urlValue, window.location.href).toString();
+  const tokenMatches = [...urlValue.matchAll(/\{[^}]+\}/g)];
+  let normalizedUrl = urlValue;
+  const placeholderMap = new Map<string, string>();
+
+  for (const [index, match] of tokenMatches.entries()) {
+    const token = match[0];
+    const placeholder = `__ironmesh_style_token_${index}__`;
+    normalizedUrl = normalizedUrl.replace(token, placeholder);
+    placeholderMap.set(placeholder, token);
+  }
+
+  let absoluteUrl = new URL(normalizedUrl, window.location.href).toString();
+  for (const [placeholder, token] of placeholderMap) {
+    absoluteUrl = absoluteUrl.replace(placeholder, token);
+  }
+
+  return absoluteUrl;
 }
 
 function ensureMbtilesProtocolRegistered() {
