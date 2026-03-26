@@ -92,6 +92,13 @@ type TileCoordinates = {
   tmsTileRow: number;
 };
 
+type MapCameraState = {
+  center: [number, number];
+  zoom: number;
+  bearing: number;
+  pitch: number;
+};
+
 const mbtilesSourceCache = new Map<string, Promise<MbtilesSource>>();
 const mbtilesConfigRegistry = new Map<string, GalleryBasemapConfig>();
 let mbtilesProtocolRegistered = false;
@@ -108,6 +115,7 @@ export function GalleryBasemapMap({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const markerOverlayRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
+  const cameraStateRef = useRef<MapCameraState | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [viewportVersion, setViewportVersion] = useState(0);
@@ -143,6 +151,7 @@ export function GalleryBasemapMap({
           mbtilesConfigRegistry.set(sourceId, basemap);
           ensureMbtilesProtocolRegistered();
         }
+        const preservedCamera = cameraStateRef.current;
         map = new maplibregl.Map({
           container: containerRef.current,
           style:
@@ -155,13 +164,22 @@ export function GalleryBasemapMap({
                   metadata,
                   basemap
                 ),
-          center: metadata.center
-            ? ([metadata.center[0], metadata.center[1]] as LngLatLike)
-            : ([0, 20] as LngLatLike),
-          zoom: metadata.center?.[2] ?? 1.2
+          center: preservedCamera
+            ? ([preservedCamera.center[0], preservedCamera.center[1]] as LngLatLike)
+            : metadata.center
+              ? ([metadata.center[0], metadata.center[1]] as LngLatLike)
+              : ([0, 20] as LngLatLike),
+          zoom: preservedCamera?.zoom ?? metadata.center?.[2] ?? 1.2,
+          bearing: preservedCamera?.bearing ?? 0,
+          pitch: preservedCamera?.pitch ?? 0
         });
 
-        const bumpViewport = () => setViewportVersion((current) => current + 1);
+        const bumpViewport = () => {
+          if (map) {
+            cameraStateRef.current = snapshotMapCamera(map);
+          }
+          setViewportVersion((current) => current + 1);
+        };
         let ready = false;
         const markReady = () => {
           if (cancelled || ready) {
@@ -194,11 +212,11 @@ export function GalleryBasemapMap({
 
     return () => {
       cancelled = true;
-      setFitSignature("");
       if (basemap.kind === "raster" && !usesRasterServerTiles) {
         mbtilesConfigRegistry.delete(sourceId);
       }
       if (map) {
+        cameraStateRef.current = snapshotMapCamera(map);
         map.remove();
       }
       mapRef.current = null;
@@ -768,6 +786,16 @@ function buildVectorStyle(
 
 function nameExpression(): unknown[] {
   return ["coalesce", ["get", "name:latin"], ["get", "name_en"], ["get", "name"]];
+}
+
+function snapshotMapCamera(map: maplibregl.Map): MapCameraState {
+  const center = map.getCenter();
+  return {
+    center: [center.lng, center.lat],
+    zoom: map.getZoom(),
+    bearing: map.getBearing(),
+    pitch: map.getPitch()
+  };
 }
 
 function absolutizeStyleUrl(urlValue: string): string {
