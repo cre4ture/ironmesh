@@ -734,6 +734,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ui_backend_serves_mbtiles_metadata_and_xyz_tiles() -> Result<()> {
+        let server_bind = "127.0.0.1:19388";
+        let web_bind = "127.0.0.1:19389";
+        let web_base = format!("http://{web_bind}");
+        let client = reqwest::Client::new();
+
+        let fixture_dir = fresh_data_dir("web-ui-map-tiles-fixture");
+        let fixture_path = fixture_dir.join("smoke.mbtiles");
+        let expected_tile_bytes = sample_png_bytes();
+        let zoom_level = 0_u32;
+        let tile_column = 0_u32;
+        let tile_row_tms = 0_u32;
+        let fixture_format = "png".to_string();
+        let fixture_db = rusqlite::Connection::open(&fixture_path)
+            .context("failed creating synthetic smoke.mbtiles fixture")?;
+        fixture_db
+            .execute_batch(
+                "create table metadata (name text, value text);
+                 create table tiles (
+                   zoom_level integer,
+                   tile_column integer,
+                   tile_row integer,
+                   tile_data blob
+                 );",
+            )
+            .context("failed creating synthetic MBTiles schema")?;
+        for (name, value) in [
+            ("name", "Synthetic Smoke MBTiles"),
+            ("format", fixture_format.as_str()),
+            ("minzoom", "0"),
+            ("maxzoom", "2"),
+            ("center", "0,20,1"),
+            ("bounds", "-180,-85,180,85"),
+        ] {
+            fixture_db
+                .execute(
+                    "insert into metadata (name, value) values (?1, ?2)",
+                    rusqlite::params![name, value],
+                )
+                .with_context(|| format!("failed inserting metadata row {name}"))?;
+        }
+        fixture_db
+            .execute(
+                "insert into tiles (zoom_level, tile_column, tile_row, tile_data) values (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    i64::from(zoom_level),
+                    i64::from(tile_column),
+                    i64::from(tile_row_tms),
+                    expected_tile_bytes.as_slice()
+                ],
+            )
+            .context("failed inserting synthetic MBTiles tile")?;
+        drop(fixture_db);
+        let fixture_bytes =
+            fs::read(&fixture_path).context("failed reading synthetic smoke.mbtiles fixture")?;
+        let expected_xyz_y = (1_u32 << zoom_level) - 1 - tile_row_tms;
+
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-map-tiles-server",
+            "web-ui-map-tiles-client",
+        )
+        .await?;
+
+        let manifest_key = "sys/maps/smoke.mbtiles.manifest.json";
+        let logical_key = "sys/maps/smoke.mbtiles";
+        let part_aa_key = "sys/maps/smoke.mbtiles-part-aa";
+        let part_ab_key = "sys/maps/smoke.mbtiles-part-ab";
+        let part_ac_key = "sys/maps/smoke.mbtiles-part-ac";
+        let split_one = fixture_bytes.len() / 3;
+        let split_two = (fixture_bytes.len() * 2) / 3;
+        let part_aa = fixture_bytes[..split_one].to_vec();
+        let part_ab = fixture_bytes[split_one..split_two].to_vec();
+        let part_ac = fixture_bytes[split_two..].to_vec();
+
+        let result = async {
+            for (key, payload) in [
+                (part_aa_key, part_aa.clone()),
+                (part_ab_key, part_ab.clone()),
+                (part_ac_key, part_ac.clone()),
+            ] {
+                client
+                    .post(format!("{web_base}/api/store/put-binary"))
+                    .query(&[("key", key)])
+                    .body(payload)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            let manifest_payload = sample_split_manifest_json(
+                manifest_key,
+                logical_key,
+                &[
+                    ("aa", part_aa_key, part_aa.as_slice()),
+                    ("ab", part_ab_key, part_ab.as_slice()),
+                    ("ac", part_ac_key, part_ac.as_slice()),
+                ],
+            );
+            client
+                .post(format!("{web_base}/api/store/put"))
+                .json(&serde_json::json!({
+                    "key": manifest_key,
+                    "value": serde_json::to_string(&manifest_payload)?,
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let metadata: serde_json::Value = client
+                .get(format!("{web_base}/api/maps/mbtiles-metadata"))
+                .query(&[("manifest_key", manifest_key)])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                metadata.get("format").and_then(|value| value.as_str()),
+                Some(fixture_format.as_str())
+            );
+            assert!(
+                metadata
+                    .get("minzoom")
+                    .and_then(|value| value.as_u64())
+                    .is_some()
+            );
+            assert!(
+                metadata
+                    .get("maxzoom")
+                    .and_then(|value| value.as_u64())
+                    .is_some()
+            );
+
+            let tile_response = client
+                .get(format!(
+                    "{web_base}/api/maps/tiles/{zoom_level}/{tile_column}/{expected_xyz_y}"
+                ))
+                .query(&[("manifest_key", manifest_key)])
+                .send()
+                .await?
+                .error_for_status()?;
+            assert_eq!(
+                tile_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("image/png")
+            );
+            let tile_body = tile_response.bytes().await?;
+            assert_eq!(tile_body.as_ref(), expected_tile_bytes.as_slice());
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
     async fn web_ui_backend_bootstrap_enroll_default_identity_supports_relay_only_serve_web()
     -> Result<()> {
         let rendezvous_bind = "127.0.0.1:19390";

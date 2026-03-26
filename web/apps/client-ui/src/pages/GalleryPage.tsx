@@ -12,6 +12,8 @@ const CLIENT_GALLERY_BASEMAP_MANIFEST_KEY =
   "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json";
 const CLIENT_GALLERY_BASEMAP: GalleryBasemapConfig = {
   logicalFileUrl: logicalMapFileUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
+  metadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
+  tileUrlTemplate: logicalMapTileUrlTemplate(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
   label: "MapTiler Satellite 2017-11-02 Planet",
   attribution:
     "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors."
@@ -64,4 +66,14 @@ function binaryObjectUrl(key: string, snapshotId: string | null): string {
 function logicalMapFileUrl(manifestKey: string): string {
   const query = new URLSearchParams({ manifest_key: manifestKey });
   return `/api/maps/logical-file?${query.toString()}`;
+}
+
+function logicalMapMetadataUrl(manifestKey: string): string {
+  const query = new URLSearchParams({ manifest_key: manifestKey });
+  return `/api/maps/mbtiles-metadata?${query.toString()}`;
+}
+
+function logicalMapTileUrlTemplate(manifestKey: string): string {
+  const query = new URLSearchParams({ manifest_key: manifestKey });
+  return `/api/maps/tiles/{z}/{x}/{y}?${query.toString()}`;
 }

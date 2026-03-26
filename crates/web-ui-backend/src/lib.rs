@@ -17,6 +17,7 @@ use client_sdk::{
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -24,6 +25,8 @@ const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKEND_REVISION: &str =
     git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
+
+mod mbtiles;
 
 pub mod assets {
     mod generated_assets {
@@ -156,6 +159,7 @@ impl WebUiConfig {
 #[derive(Clone)]
 struct WebState {
     service_name: String,
+    mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
     runtime: Arc<RwLock<WebRuntime>>,
 }
 
@@ -206,6 +210,7 @@ pub fn router(config: WebUiConfig) -> Router {
     };
     let state = WebState {
         service_name: config.service_name,
+        mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         runtime: Arc::new(RwLock::new(WebRuntime {
             sdk: sdk.clone(),
             client: ClientNode::with_client(sdk),
@@ -225,7 +230,9 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/", get(web_static_index))
         .route("/ironmesh-favicon.svg", get(web_static_favicon))
         .route("/media/thumbnail", get(web_media_thumbnail))
+        .route("/api/maps/mbtiles-metadata", get(web_map_mbtiles_metadata))
         .route("/api/maps/logical-file", get(web_map_logical_file))
+        .route("/api/maps/tiles/{z}/{x}/{y}", get(web_map_xyz_tile))
         .route("/api/health", get(web_health))
         .route("/api/snapshots", get(web_snapshots))
         .route("/api/versions", get(web_versions))
@@ -313,6 +320,15 @@ struct WebMediaThumbnailQuery {
 #[derive(Debug, Deserialize)]
 struct WebMapLogicalFileQuery {
     manifest_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WebMapMbtilesMetadataResponse {
+    attribution: Option<String>,
+    center: Option<[f64; 3]>,
+    format: Option<String>,
+    minzoom: Option<u8>,
+    maxzoom: Option<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -813,6 +829,38 @@ async fn load_split_logical_file_manifest(
     })
 }
 
+async fn get_or_create_mbtiles_source(
+    state: &WebState,
+    manifest_key: &str,
+) -> Result<Arc<mbtiles::LogicalMbtilesSource>> {
+    if let Some(source) = state
+        .mbtiles_sources
+        .read()
+        .await
+        .get(manifest_key)
+        .cloned()
+    {
+        return Ok(source);
+    }
+
+    let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
+    let sdk = current_sdk(state).await;
+    let manifest_key_owned = manifest_key.to_string();
+    let source = tokio::task::spawn_blocking(move || {
+        mbtiles::LogicalMbtilesSource::new(manifest_key_owned, sdk, loaded_manifest)
+    })
+    .await
+    .context("MBTiles source construction task join failed")??;
+    let source = Arc::new(source);
+
+    let mut sources = state.mbtiles_sources.write().await;
+    if let Some(existing) = sources.get(manifest_key) {
+        return Ok(existing.clone());
+    }
+    sources.insert(manifest_key.to_string(), source.clone());
+    Ok(source)
+}
+
 async fn download_object_range_bytes(
     sdk: IronMeshClient,
     key: String,
@@ -992,6 +1040,33 @@ async fn web_media_thumbnail(
     (response.status, headers, response.body).into_response()
 }
 
+async fn web_map_mbtiles_metadata(
+    State(state): State<WebState>,
+    Query(query): Query<WebMapLogicalFileQuery>,
+) -> impl IntoResponse {
+    if query.manifest_key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "manifest_key must not be empty");
+    }
+
+    let source = match get_or_create_mbtiles_source(&state, query.manifest_key.trim()).await {
+        Ok(source) => source,
+        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    };
+    let metadata = source.metadata();
+
+    (
+        StatusCode::OK,
+        Json(WebMapMbtilesMetadataResponse {
+            attribution: metadata.attribution.clone(),
+            center: metadata.center,
+            format: metadata.format.clone(),
+            minzoom: metadata.minzoom,
+            maxzoom: metadata.maxzoom,
+        }),
+    )
+        .into_response()
+}
+
 async fn web_map_logical_file(
     State(state): State<WebState>,
     method: Method,
@@ -1152,6 +1227,37 @@ async fn web_map_logical_file(
         body,
     )
         .into_response()
+}
+
+async fn web_map_xyz_tile(
+    State(state): State<WebState>,
+    Path((z, x, y)): Path<(u32, u32, u32)>,
+    Query(query): Query<WebMapLogicalFileQuery>,
+) -> impl IntoResponse {
+    if query.manifest_key.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let source = match get_or_create_mbtiles_source(&state, query.manifest_key.trim()).await {
+        Ok(source) => source,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+
+    let tile_lookup = tokio::task::spawn_blocking(move || source.lookup_tile(z, x, y)).await;
+    let tile = match tile_lookup {
+        Ok(Ok(Some(tile))) => tile,
+        Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.mime_type));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
+    );
+
+    (StatusCode::OK, headers, tile.bytes).into_response()
 }
 
 async fn web_cluster_status(State(state): State<WebState>) -> impl IntoResponse {

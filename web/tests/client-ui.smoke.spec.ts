@@ -287,6 +287,28 @@ async function installClientUiMocks(page: Page) {
       }
     }
 
+    if (pathname === "/api/maps/mbtiles-metadata" && method === "GET") {
+      return json(route, {
+        attribution: "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors.",
+        center: [0, 20, 1],
+        format: "png",
+        minzoom: 0,
+        maxzoom: 2
+      });
+    }
+
+    if (pathname.startsWith("/api/maps/tiles/") && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "cache-control": "public, max-age=3600"
+        },
+        body: imageBody
+      });
+      return;
+    }
+
     if (pathname === "/api/store/list" && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       const prefix = searchParams.get("prefix") ?? "";

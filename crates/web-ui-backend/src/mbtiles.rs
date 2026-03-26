@@ -1,0 +1,540 @@
+use anyhow::{Context, Result, anyhow};
+use client_sdk::{IronMeshClient, ironmesh_client::DownloadRangeRequest};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vfs};
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
+use std::io::{Error, ErrorKind};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::LoadedSplitLogicalFileManifest;
+
+const SQLITE_RANGE_CACHE_CHUNK_BYTES: u64 = 64 * 1024;
+const SQLITE_RANGE_CACHE_MAX_CHUNKS: usize = 1024;
+
+static NEXT_VFS_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug)]
+pub(crate) struct MbtilesMetadata {
+    pub(crate) attribution: Option<String>,
+    pub(crate) center: Option<[f64; 3]>,
+    pub(crate) format: Option<String>,
+    pub(crate) minzoom: Option<u8>,
+    pub(crate) maxzoom: Option<u8>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LogicalMbtilesSource {
+    manifest_key: String,
+    vfs_name: String,
+    metadata: MbtilesMetadata,
+}
+
+impl LogicalMbtilesSource {
+    pub(crate) fn new(
+        manifest_key: String,
+        sdk: IronMeshClient,
+        loaded_manifest: LoadedSplitLogicalFileManifest,
+    ) -> Result<Self> {
+        let shared = Arc::new(LogicalFileSharedState {
+            sdk,
+            loaded_manifest,
+            chunk_size_bytes: SQLITE_RANGE_CACHE_CHUNK_BYTES,
+            cache: Mutex::new(LogicalFileChunkCache::default()),
+        });
+        let vfs_name = format!(
+            "ironmesh-mbtiles-{}",
+            NEXT_VFS_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        sqlite_vfs::register(
+            &vfs_name,
+            LogicalFileVfs {
+                manifest_key: manifest_key.clone(),
+                shared: Arc::clone(&shared),
+            },
+            false,
+        )
+        .with_context(|| format!("failed registering SQLite VFS {vfs_name}"))?;
+
+        let source = Self {
+            manifest_key,
+            vfs_name,
+            metadata: MbtilesMetadata {
+                attribution: None,
+                center: None,
+                format: None,
+                minzoom: None,
+                maxzoom: None,
+            },
+        };
+
+        let metadata = source.load_metadata()?;
+        Ok(Self { metadata, ..source })
+    }
+
+    pub(crate) fn metadata(&self) -> &MbtilesMetadata {
+        &self.metadata
+    }
+
+    pub(crate) fn lookup_tile(&self, zoom: u32, x: u32, y_xyz: u32) -> Result<Option<TilePayload>> {
+        let tms_y = xyz_row_to_tms(zoom, y_xyz)?;
+        let connection = self.open_connection()?;
+        let maybe_tile = connection
+            .query_row(
+                "select tile_data from tiles where zoom_level = ?1 and tile_column = ?2 and tile_row = ?3 limit 1",
+                params![i64::from(zoom), i64::from(x), i64::from(tms_y)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .context("failed querying MBTiles tile")?;
+
+        Ok(maybe_tile.map(|bytes| TilePayload {
+            mime_type: infer_tile_mime_type(&bytes, self.metadata.format.as_deref()),
+            bytes,
+        }))
+    }
+
+    fn load_metadata(&self) -> Result<MbtilesMetadata> {
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare("select name, value from metadata")
+            .context("failed preparing MBTiles metadata query")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("failed executing MBTiles metadata query")?;
+
+        let mut raw = HashMap::new();
+        for row in rows {
+            let (name, value) = row.context("failed reading MBTiles metadata row")?;
+            raw.insert(name, value);
+        }
+
+        Ok(MbtilesMetadata {
+            attribution: raw.get("attribution").cloned(),
+            center: raw.get("center").and_then(|value| parse_center(value)),
+            format: raw.get("format").cloned(),
+            minzoom: raw
+                .get("minzoom")
+                .and_then(|value| value.parse::<u8>().ok()),
+            maxzoom: raw
+                .get("maxzoom")
+                .and_then(|value| value.parse::<u8>().ok()),
+        })
+    }
+
+    fn open_connection(&self) -> Result<Connection> {
+        Connection::open_with_flags_and_vfs(
+            &self.manifest_key,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            &self.vfs_name,
+        )
+        .with_context(|| {
+            format!(
+                "failed opening MBTiles connection via VFS {} for {}",
+                self.vfs_name, self.manifest_key
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TilePayload {
+    pub(crate) mime_type: &'static str,
+    pub(crate) bytes: Vec<u8>,
+}
+
+struct LogicalFileSharedState {
+    sdk: IronMeshClient,
+    loaded_manifest: LoadedSplitLogicalFileManifest,
+    chunk_size_bytes: u64,
+    cache: Mutex<LogicalFileChunkCache>,
+}
+
+impl LogicalFileSharedState {
+    fn file_size_bytes(&self) -> u64 {
+        self.loaded_manifest.manifest.logical_size_bytes
+    }
+
+    fn read_exact_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error> {
+        let read_end = offset.checked_add(buffer.len() as u64).ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnexpectedEof,
+                "requested logical-file read overflowed",
+            )
+        })?;
+        if read_end > self.file_size_bytes() {
+            return Err(Error::from(ErrorKind::UnexpectedEof));
+        }
+
+        let mut copied = 0usize;
+        while copied < buffer.len() {
+            let absolute_offset = offset + copied as u64;
+            let chunk_index = absolute_offset / self.chunk_size_bytes;
+            let chunk = self.cached_chunk(chunk_index)?;
+            let chunk_offset = (absolute_offset % self.chunk_size_bytes) as usize;
+            if chunk_offset >= chunk.len() {
+                return Err(Error::from(ErrorKind::UnexpectedEof));
+            }
+            let available = chunk.len() - chunk_offset;
+            let remaining = buffer.len() - copied;
+            let to_copy = available.min(remaining);
+            buffer[copied..copied + to_copy]
+                .copy_from_slice(&chunk[chunk_offset..chunk_offset + to_copy]);
+            copied += to_copy;
+        }
+
+        Ok(())
+    }
+
+    fn cached_chunk(&self, chunk_index: u64) -> Result<Arc<Vec<u8>>, Error> {
+        {
+            let mut cache = self.cache.lock().map_err(|_| {
+                Error::new(ErrorKind::Other, "logical-file chunk cache lock poisoned")
+            })?;
+            if let Some(bytes) = cache.chunks.get(&chunk_index).cloned() {
+                cache.touch(chunk_index);
+                return Ok(bytes);
+            }
+        }
+
+        let chunk_start = chunk_index
+            .checked_mul(self.chunk_size_bytes)
+            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "chunk offset overflowed"))?;
+        let chunk_len = self
+            .chunk_size_bytes
+            .min(self.file_size_bytes().saturating_sub(chunk_start));
+        let bytes = download_logical_range_blocking(
+            &self.sdk,
+            &self.loaded_manifest,
+            chunk_start,
+            chunk_len,
+        )
+        .map_err(other_io_error)?;
+        let bytes = Arc::new(bytes);
+
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other, "logical-file chunk cache lock poisoned"))?;
+        cache.insert(chunk_index, Arc::clone(&bytes));
+        Ok(bytes)
+    }
+}
+
+#[derive(Default)]
+struct LogicalFileChunkCache {
+    chunks: HashMap<u64, Arc<Vec<u8>>>,
+    access_order: VecDeque<u64>,
+}
+
+impl LogicalFileChunkCache {
+    fn insert(&mut self, chunk_index: u64, bytes: Arc<Vec<u8>>) {
+        self.chunks.insert(chunk_index, bytes);
+        self.touch(chunk_index);
+
+        while self.chunks.len() > SQLITE_RANGE_CACHE_MAX_CHUNKS {
+            let Some(oldest) = self.access_order.pop_front() else {
+                break;
+            };
+            if self.chunks.remove(&oldest).is_some() {
+                break;
+            }
+        }
+    }
+
+    fn touch(&mut self, chunk_index: u64) {
+        self.access_order.push_back(chunk_index);
+    }
+}
+
+struct LogicalFileVfs {
+    manifest_key: String,
+    shared: Arc<LogicalFileSharedState>,
+}
+
+impl Vfs for LogicalFileVfs {
+    type Handle = LogicalFileHandle;
+
+    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, Error> {
+        if db != self.manifest_key {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("unknown logical MBTiles database {db}"),
+            ));
+        }
+        if opts.kind != OpenKind::MainDb {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("unsupported logical MBTiles open kind {:?}", opts.kind),
+            ));
+        }
+        if opts.access != OpenAccess::Read {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "logical MBTiles VFS is read-only",
+            ));
+        }
+
+        Ok(LogicalFileHandle {
+            shared: Arc::clone(&self.shared),
+            current_lock: LockKind::None,
+        })
+    }
+
+    fn delete(&self, _db: &str) -> Result<(), Error> {
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "logical MBTiles VFS is read-only",
+        ))
+    }
+
+    fn exists(&self, db: &str) -> Result<bool, Error> {
+        Ok(db == self.manifest_key)
+    }
+
+    fn temporary_name(&self) -> String {
+        format!("{}-temp", self.manifest_key)
+    }
+
+    fn random(&self, buffer: &mut [i8]) {
+        for (index, value) in buffer.iter_mut().enumerate() {
+            *value = ((index as i32 * 31) & 0x7f) as i8;
+        }
+    }
+
+    fn sleep(&self, duration: Duration) -> Duration {
+        std::thread::sleep(duration);
+        duration
+    }
+
+    fn access(&self, db: &str, write: bool) -> Result<bool, Error> {
+        Ok(db == self.manifest_key && !write)
+    }
+
+    fn full_pathname<'a>(&self, db: &'a str) -> Result<Cow<'a, str>, Error> {
+        Ok(Cow::Borrowed(db))
+    }
+}
+
+struct LogicalFileHandle {
+    shared: Arc<LogicalFileSharedState>,
+    current_lock: LockKind,
+}
+
+impl DatabaseHandle for LogicalFileHandle {
+    type WalIndex = DisabledWalIndex;
+
+    fn size(&self) -> Result<u64, Error> {
+        Ok(self.shared.file_size_bytes())
+    }
+
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), Error> {
+        self.shared.read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&mut self, _buf: &[u8], _offset: u64) -> Result<(), Error> {
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "logical MBTiles VFS is read-only",
+        ))
+    }
+
+    fn sync(&mut self, _data_only: bool) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn set_len(&mut self, _size: u64) -> Result<(), Error> {
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "logical MBTiles VFS is read-only",
+        ))
+    }
+
+    fn lock(&mut self, lock: LockKind) -> Result<bool, Error> {
+        match lock {
+            LockKind::None => {
+                self.current_lock = LockKind::None;
+                Ok(true)
+            }
+            LockKind::Shared => {
+                self.current_lock = LockKind::Shared;
+                Ok(true)
+            }
+            LockKind::Reserved | LockKind::Pending | LockKind::Exclusive => Ok(false),
+        }
+    }
+
+    fn reserved(&mut self) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    fn current_lock(&self) -> Result<LockKind, Error> {
+        Ok(self.current_lock)
+    }
+
+    fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, Error> {
+        Ok(DisabledWalIndex)
+    }
+}
+
+struct DisabledWalIndex;
+
+impl sqlite_vfs::wip::WalIndex for DisabledWalIndex {
+    fn enabled() -> bool {
+        false
+    }
+
+    fn map(&mut self, _region: u32) -> Result<[u8; 32768], Error> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "logical MBTiles VFS does not support WAL",
+        ))
+    }
+
+    fn lock(
+        &mut self,
+        _locks: std::ops::Range<u8>,
+        _lock: sqlite_vfs::wip::WalIndexLock,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    fn delete(self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+fn download_logical_range_blocking(
+    sdk: &IronMeshClient,
+    loaded_manifest: &LoadedSplitLogicalFileManifest,
+    start: u64,
+    length: u64,
+) -> Result<Vec<u8>> {
+    let end_exclusive = start
+        .checked_add(length)
+        .ok_or_else(|| anyhow!("logical MBTiles range overflow"))?;
+    let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
+
+    for part in &loaded_manifest.manifest.parts {
+        let part_start = part.offset_bytes;
+        let part_end_exclusive = part
+            .offset_bytes
+            .checked_add(part.size_bytes)
+            .ok_or_else(|| anyhow!("manifest part end overflow for {}", part.part_id))?;
+        if part_end_exclusive <= start || part_start >= end_exclusive {
+            continue;
+        }
+
+        let segment_start = start.max(part_start);
+        let segment_end_exclusive = end_exclusive.min(part_end_exclusive);
+        let local_start = segment_start - part_start;
+        let segment_length = segment_end_exclusive - segment_start;
+        if segment_length == 0 {
+            continue;
+        }
+
+        let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
+        sdk.download_range_to_writer_with_progress_blocking(
+            DownloadRangeRequest {
+                key: part.key.as_str(),
+                snapshot: None,
+                version: None,
+                start: local_start,
+                length: segment_length,
+            },
+            &mut body,
+            &mut on_progress,
+            &|| false,
+        )
+        .with_context(|| {
+            format!(
+                "failed downloading logical MBTiles segment key={} start={} length={}",
+                part.key, local_start, segment_length
+            )
+        })?;
+    }
+
+    if body.len() as u64 != length {
+        return Err(anyhow!(
+            "logical MBTiles segment reconstruction produced {} bytes, expected {}",
+            body.len(),
+            length
+        ));
+    }
+
+    Ok(body)
+}
+
+fn xyz_row_to_tms(zoom: u32, y_xyz: u32) -> Result<u32> {
+    let row_count = 1_u32
+        .checked_shl(zoom)
+        .ok_or_else(|| anyhow!("zoom level {zoom} is too large for MBTiles lookup"))?;
+    if y_xyz >= row_count {
+        return Err(anyhow!(
+            "y tile coordinate {} is out of range for zoom {}",
+            y_xyz,
+            zoom
+        ));
+    }
+    Ok(row_count - 1 - y_xyz)
+}
+
+fn parse_center(value: &str) -> Option<[f64; 3]> {
+    let parts = value
+        .split(',')
+        .map(|part| part.trim().parse::<f64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if parts.len() < 2 {
+        return None;
+    }
+    Some([parts[0], parts[1], parts.get(2).copied().unwrap_or(0.0)])
+}
+
+fn infer_tile_mime_type(bytes: &[u8], declared_format: Option<&str>) -> &'static str {
+    match declared_format.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(format) if format == "jpg" || format == "jpeg" => return "image/jpeg",
+        Some(format) if format == "png" => return "image/png",
+        Some(format) if format == "webp" => return "image/webp",
+        _ => {}
+    }
+
+    if bytes.len() >= 8
+        && bytes[0] == 0x89
+        && bytes[1] == 0x50
+        && bytes[2] == 0x4e
+        && bytes[3] == 0x47
+        && bytes[4] == 0x0d
+        && bytes[5] == 0x0a
+        && bytes[6] == 0x1a
+        && bytes[7] == 0x0a
+    {
+        return "image/png";
+    }
+
+    if bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff {
+        return "image/jpeg";
+    }
+
+    if bytes.len() >= 12
+        && bytes[0] == 0x52
+        && bytes[1] == 0x49
+        && bytes[2] == 0x46
+        && bytes[3] == 0x46
+        && bytes[8] == 0x57
+        && bytes[9] == 0x45
+        && bytes[10] == 0x42
+        && bytes[11] == 0x50
+    {
+        return "image/webp";
+    }
+
+    "application/octet-stream"
+}
+
+fn other_io_error(error: anyhow::Error) -> Error {
+    Error::new(ErrorKind::Other, error.to_string())
+}

@@ -33,6 +33,8 @@ type GalleryBasemapPreviewRequest = {
 
 export type GalleryBasemapConfig = {
   logicalFileUrl: string;
+  metadataUrl?: string;
+  tileUrlTemplate?: string;
   attribution?: string;
   label?: string;
 };
@@ -92,6 +94,7 @@ export function GalleryBasemapMap({
   const [mapError, setMapError] = useState<string | null>(null);
   const [viewportVersion, setViewportVersion] = useState(0);
   const [fitSignature, setFitSignature] = useState("");
+  const useServerTileEndpoint = Boolean(basemap.metadataUrl && basemap.tileUrlTemplate);
   const sourceId = sourceIdForLogicalFile(basemap.logicalFileUrl);
   const entrySignature = entries
     .map((entry) => {
@@ -106,23 +109,33 @@ export function GalleryBasemapMap({
 
     setMapReady(false);
     setMapError(null);
-    mbtilesConfigRegistry.set(sourceId, basemap);
-    ensureMbtilesProtocolRegistered();
 
     async function start() {
       try {
-        const source = await loadMbtilesSource(sourceId, basemap);
+        const metadata = useServerTileEndpoint
+          ? await fetchMbtilesMetadata(basemap.metadataUrl!)
+          : (await loadMbtilesSource(sourceId, basemap)).metadata;
         if (cancelled || !containerRef.current) {
           return;
         }
 
+        if (!useServerTileEndpoint) {
+          mbtilesConfigRegistry.set(sourceId, basemap);
+          ensureMbtilesProtocolRegistered();
+        }
         map = new maplibregl.Map({
           container: containerRef.current,
-          style: buildRasterStyle(sourceId, source.metadata, basemap),
-          center: source.metadata.center
-            ? ([source.metadata.center[0], source.metadata.center[1]] as LngLatLike)
+          style: buildRasterStyle(
+            useServerTileEndpoint
+              ? basemap.tileUrlTemplate!
+              : `${MBTILES_PROTOCOL}://${sourceId}/{z}/{x}/{y}`,
+            metadata,
+            basemap
+          ),
+          center: metadata.center
+            ? ([metadata.center[0], metadata.center[1]] as LngLatLike)
             : ([0, 20] as LngLatLike),
-          zoom: source.metadata.center?.[2] ?? 1.2
+          zoom: metadata.center?.[2] ?? 1.2
         });
 
         const bumpViewport = () => setViewportVersion((current) => current + 1);
@@ -159,13 +172,23 @@ export function GalleryBasemapMap({
     return () => {
       cancelled = true;
       setFitSignature("");
-      mbtilesConfigRegistry.delete(sourceId);
+      if (!useServerTileEndpoint) {
+        mbtilesConfigRegistry.delete(sourceId);
+      }
       if (map) {
         map.remove();
       }
       mapRef.current = null;
     };
-  }, [basemap.attribution, basemap.logicalFileUrl, basemap.label, sourceId]);
+  }, [
+    basemap.attribution,
+    basemap.label,
+    basemap.logicalFileUrl,
+    basemap.metadataUrl,
+    basemap.tileUrlTemplate,
+    sourceId,
+    useServerTileEndpoint
+  ]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -439,7 +462,7 @@ function GalleryBasemapMarker({
 }
 
 function buildRasterStyle(
-  sourceId: string,
+  tileUrlTemplate: string,
   metadata: MbtilesMetadata,
   basemap: GalleryBasemapConfig
 ): StyleSpecification {
@@ -448,7 +471,7 @@ function buildRasterStyle(
     sources: {
       basemap: {
         type: "raster",
-        tiles: [`${MBTILES_PROTOCOL}://${sourceId}/{z}/{x}/{y}`],
+        tiles: [tileUrlTemplate],
         tileSize: 256,
         attribution: basemap.attribution ?? metadata.attribution ?? "",
         minzoom: metadata.minzoom ?? 0,
@@ -536,6 +559,30 @@ async function createMbtilesSource(basemap: GalleryBasemapConfig): Promise<Mbtil
   return {
     worker,
     metadata: metadataFromRows(metadataRows)
+  };
+}
+
+async function fetchMbtilesMetadata(metadataUrl: string): Promise<MbtilesMetadata> {
+  const response = await fetch(metadataUrl, {
+    credentials: "same-origin"
+  });
+  if (!response.ok) {
+    throw new Error(`failed to load self-hosted basemap metadata: HTTP ${response.status}`);
+  }
+
+  const payload = (await response.json()) as Partial<{
+    attribution: string;
+    center: [number, number, number?];
+    format: string;
+    minzoom: number;
+    maxzoom: number;
+  }>;
+  return {
+    attribution: payload.attribution,
+    center: payload.center,
+    format: payload.format,
+    minzoom: payload.minzoom,
+    maxzoom: payload.maxzoom
   };
 }
 
