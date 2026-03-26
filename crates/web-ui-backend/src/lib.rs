@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
+use tracing::info;
 
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKEND_REVISION: &str =
@@ -167,6 +169,7 @@ impl WebUiConfig {
 
 #[derive(Clone)]
 struct WebState {
+    map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     service_name: String,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
@@ -218,7 +221,12 @@ pub fn router(config: WebUiConfig) -> Router {
             }
         }
     };
+    let map_perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
+    if map_perf_logging_enabled {
+        info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
+    }
     let state = WebState {
+        map_perf_logging_enabled,
         map_glyphs_root: resolve_map_glyphs_root(config.map_glyphs_root),
         service_name: config.service_name,
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -301,6 +309,18 @@ fn resolve_map_glyphs_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn env_flag_is_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -856,6 +876,7 @@ async fn load_split_logical_file_manifest(
     state: &WebState,
     manifest_key: &str,
 ) -> Result<LoadedSplitLogicalFileManifest> {
+    let started = Instant::now();
     let manifest_payload = current_client(state)
         .await
         .get_with_selector(manifest_key, None, None)
@@ -864,6 +885,16 @@ async fn load_split_logical_file_manifest(
     let manifest = serde_json::from_slice::<SplitLogicalFileManifest>(&manifest_payload)
         .with_context(|| format!("failed to parse split logical file manifest {manifest_key}"))?;
     let manifest = validate_split_logical_file_manifest(manifest)?;
+
+    if state.map_perf_logging_enabled {
+        info!(
+            manifest_key = %manifest_key,
+            parts = manifest.parts.len(),
+            logical_size_bytes = manifest.logical_size_bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "map perf: loaded split logical file manifest"
+        );
+    }
 
     Ok(LoadedSplitLogicalFileManifest {
         manifest,
@@ -875,6 +906,7 @@ async fn get_or_create_mbtiles_source(
     state: &WebState,
     manifest_key: &str,
 ) -> Result<Arc<mbtiles::LogicalMbtilesSource>> {
+    let started = Instant::now();
     if let Some(source) = state
         .mbtiles_sources
         .read()
@@ -882,14 +914,28 @@ async fn get_or_create_mbtiles_source(
         .get(manifest_key)
         .cloned()
     {
+        if state.map_perf_logging_enabled {
+            info!(
+                manifest_key = %manifest_key,
+                cache = "hit",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: reusing cached MBTiles source"
+            );
+        }
         return Ok(source);
     }
 
     let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
     let sdk = current_sdk(state).await;
     let manifest_key_owned = manifest_key.to_string();
+    let perf_logging_enabled = state.map_perf_logging_enabled;
     let source = tokio::task::spawn_blocking(move || {
-        mbtiles::LogicalMbtilesSource::new(manifest_key_owned, sdk, loaded_manifest)
+        mbtiles::LogicalMbtilesSource::new(
+            manifest_key_owned,
+            sdk,
+            loaded_manifest,
+            perf_logging_enabled,
+        )
     })
     .await
     .context("MBTiles source construction task join failed")??;
@@ -897,9 +943,25 @@ async fn get_or_create_mbtiles_source(
 
     let mut sources = state.mbtiles_sources.write().await;
     if let Some(existing) = sources.get(manifest_key) {
+        if state.map_perf_logging_enabled {
+            info!(
+                manifest_key = %manifest_key,
+                cache = "race-hit",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: reusing concurrently initialized MBTiles source"
+            );
+        }
         return Ok(existing.clone());
     }
     sources.insert(manifest_key.to_string(), source.clone());
+    if state.map_perf_logging_enabled {
+        info!(
+            manifest_key = %manifest_key,
+            cache = "miss",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "map perf: initialized MBTiles source"
+        );
+    }
     Ok(source)
 }
 
@@ -908,8 +970,10 @@ async fn download_object_range_bytes(
     key: String,
     start: u64,
     length: u64,
+    perf_logging_enabled: bool,
 ) -> Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
         let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
         let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
         sdk.download_range_to_writer_with_progress_blocking(
@@ -929,6 +993,16 @@ async fn download_object_range_bytes(
                 "failed to download logical file segment key={key} start={start} length={length}"
             )
         })?;
+        if perf_logging_enabled {
+            info!(
+                key = %key,
+                start,
+                length,
+                bytes = body.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: downloaded logical file segment"
+            );
+        }
         Ok::<Vec<u8>, anyhow::Error>(body)
     })
     .await
@@ -1086,6 +1160,7 @@ async fn web_map_mbtiles_metadata(
     State(state): State<WebState>,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
+    let started = Instant::now();
     if query.manifest_key.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "manifest_key must not be empty");
     }
@@ -1095,6 +1170,15 @@ async fn web_map_mbtiles_metadata(
         Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     };
     let metadata = source.metadata();
+    if state.map_perf_logging_enabled {
+        info!(
+            manifest_key = %query.manifest_key.trim(),
+            minzoom = metadata.minzoom.unwrap_or_default(),
+            maxzoom = metadata.maxzoom.unwrap_or_default(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "map perf: served MBTiles metadata"
+        );
+    }
 
     (
         StatusCode::OK,
@@ -1118,6 +1202,7 @@ async fn web_map_logical_file(
     headers: HeaderMap,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
+    let started = Instant::now();
     if query.manifest_key.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "manifest_key must not be empty");
     }
@@ -1246,6 +1331,7 @@ async fn web_map_logical_file(
             part.key.clone(),
             local_start,
             segment_length,
+            state.map_perf_logging_enabled,
         )
         .await
         {
@@ -1264,6 +1350,18 @@ async fn web_map_logical_file(
         );
     }
 
+    if state.map_perf_logging_enabled {
+        info!(
+            manifest_key = %query.manifest_key.trim(),
+            method = %method,
+            range_start,
+            range_end_exclusive,
+            content_length,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "map perf: served logical file bytes"
+        );
+    }
+
     (
         selected_range
             .map(|_| StatusCode::PARTIAL_CONTENT)
@@ -1279,6 +1377,7 @@ async fn web_map_xyz_tile(
     Path((z, x, y)): Path<(u32, u32, u32)>,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
+    let started = Instant::now();
     if query.manifest_key.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -1294,6 +1393,18 @@ async fn web_map_xyz_tile(
         Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
         Ok(Err(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+    if state.map_perf_logging_enabled {
+        info!(
+            manifest_key = %query.manifest_key.trim(),
+            z,
+            x,
+            y,
+            bytes = tile.bytes.len(),
+            content_type = tile.content_type,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "map perf: served raster XYZ tile"
+        );
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.content_type));
@@ -1310,6 +1421,7 @@ async fn web_map_vector_tile(
     Path((z, x, y)): Path<(u32, u32, u32)>,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
+    let started = Instant::now();
     if query.manifest_key.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -1325,6 +1437,18 @@ async fn web_map_vector_tile(
         Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
         Ok(Err(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+    if state.map_perf_logging_enabled {
+        info!(
+            manifest_key = %query.manifest_key.trim(),
+            z,
+            x,
+            y,
+            bytes = tile.bytes.len(),
+            content_encoding = tile.content_encoding.unwrap_or("identity"),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "map perf: served vector XYZ tile"
+        );
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.content_type));

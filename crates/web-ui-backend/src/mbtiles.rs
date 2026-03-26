@@ -7,7 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Error, ErrorKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::info;
 
 use crate::LoadedSplitLogicalFileManifest;
 
@@ -31,6 +32,7 @@ pub(crate) struct MbtilesMetadata {
 #[derive(Clone)]
 pub(crate) struct LogicalMbtilesSource {
     manifest_key: String,
+    perf_logging_enabled: bool,
     vfs_name: String,
     metadata: MbtilesMetadata,
 }
@@ -40,8 +42,11 @@ impl LogicalMbtilesSource {
         manifest_key: String,
         sdk: IronMeshClient,
         loaded_manifest: LoadedSplitLogicalFileManifest,
+        perf_logging_enabled: bool,
     ) -> Result<Self> {
         let shared = Arc::new(LogicalFileSharedState {
+            manifest_key: manifest_key.clone(),
+            perf_logging_enabled,
             sdk,
             loaded_manifest,
             chunk_size_bytes: SQLITE_RANGE_CACHE_CHUNK_BYTES,
@@ -63,6 +68,7 @@ impl LogicalMbtilesSource {
 
         let source = Self {
             manifest_key,
+            perf_logging_enabled,
             vfs_name,
             metadata: MbtilesMetadata {
                 attribution: None,
@@ -110,6 +116,7 @@ impl LogicalMbtilesSource {
     }
 
     fn load_metadata(&self) -> Result<MbtilesMetadata> {
+        let started = Instant::now();
         let connection = self.open_connection()?;
         let mut statement = connection
             .prepare("select name, value from metadata")
@@ -126,7 +133,7 @@ impl LogicalMbtilesSource {
             raw.insert(name, value);
         }
 
-        Ok(MbtilesMetadata {
+        let metadata = MbtilesMetadata {
             attribution: raw.get("attribution").cloned(),
             center: raw.get("center").and_then(|value| parse_center(value)),
             format: raw.get("format").cloned(),
@@ -139,20 +146,61 @@ impl LogicalMbtilesSource {
                 .and_then(|value| value.parse::<u8>().ok()),
             name: raw.get("name").cloned(),
             version: raw.get("version").cloned(),
-        })
+        };
+        if self.perf_logging_enabled {
+            info!(
+                manifest_key = %self.manifest_key,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                metadata_rows = raw.len(),
+                "map perf: loaded MBTiles metadata table"
+            );
+        }
+        Ok(metadata)
     }
 
     fn lookup_tile_bytes(&self, zoom: u32, x: u32, y_xyz: u32) -> Result<Option<Vec<u8>>> {
+        let started = Instant::now();
         let tms_y = xyz_row_to_tms(zoom, y_xyz)?;
         let connection = self.open_connection()?;
-        connection
+        let result = connection
             .query_row(
                 "select tile_data from tiles where zoom_level = ?1 and tile_column = ?2 and tile_row = ?3 limit 1",
                 params![i64::from(zoom), i64::from(x), i64::from(tms_y)],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()
-            .context("failed querying MBTiles tile")
+            .context("failed querying MBTiles tile");
+        if self.perf_logging_enabled {
+            match &result {
+                Ok(Some(bytes)) => info!(
+                    manifest_key = %self.manifest_key,
+                    z = zoom,
+                    x,
+                    y = y_xyz,
+                    bytes = bytes.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "map perf: looked up MBTiles tile"
+                ),
+                Ok(None) => info!(
+                    manifest_key = %self.manifest_key,
+                    z = zoom,
+                    x,
+                    y = y_xyz,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "map perf: MBTiles tile lookup missed"
+                ),
+                Err(error) => info!(
+                    manifest_key = %self.manifest_key,
+                    z = zoom,
+                    x,
+                    y = y_xyz,
+                    error = %error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "map perf: MBTiles tile lookup failed"
+                ),
+            }
+        }
+        result
     }
 
     fn open_connection(&self) -> Result<Connection> {
@@ -178,6 +226,8 @@ pub(crate) struct TilePayload {
 }
 
 struct LogicalFileSharedState {
+    manifest_key: String,
+    perf_logging_enabled: bool,
     sdk: IronMeshClient,
     loaded_manifest: LoadedSplitLogicalFileManifest,
     chunk_size_bytes: u64,
@@ -190,6 +240,7 @@ impl LogicalFileSharedState {
     }
 
     fn read_exact_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error> {
+        let started = Instant::now();
         let read_end = offset.checked_add(buffer.len() as u64).ok_or_else(|| {
             Error::new(
                 ErrorKind::UnexpectedEof,
@@ -201,10 +252,17 @@ impl LogicalFileSharedState {
         }
 
         let mut copied = 0usize;
+        let mut cache_hits = 0usize;
+        let mut cache_misses = 0usize;
         while copied < buffer.len() {
             let absolute_offset = offset + copied as u64;
             let chunk_index = absolute_offset / self.chunk_size_bytes;
-            let chunk = self.cached_chunk(chunk_index)?;
+            let (chunk, cache_hit) = self.cached_chunk(chunk_index)?;
+            if cache_hit {
+                cache_hits += 1;
+            } else {
+                cache_misses += 1;
+            }
             let chunk_offset = (absolute_offset % self.chunk_size_bytes) as usize;
             if chunk_offset >= chunk.len() {
                 return Err(Error::from(ErrorKind::UnexpectedEof));
@@ -217,17 +275,29 @@ impl LogicalFileSharedState {
             copied += to_copy;
         }
 
+        if self.perf_logging_enabled {
+            info!(
+                manifest_key = %self.manifest_key,
+                offset,
+                bytes = buffer.len(),
+                cache_hits,
+                cache_misses,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: SQLite VFS logical read"
+            );
+        }
+
         Ok(())
     }
 
-    fn cached_chunk(&self, chunk_index: u64) -> Result<Arc<Vec<u8>>, Error> {
+    fn cached_chunk(&self, chunk_index: u64) -> Result<(Arc<Vec<u8>>, bool), Error> {
         {
             let mut cache = self.cache.lock().map_err(|_| {
                 Error::new(ErrorKind::Other, "logical-file chunk cache lock poisoned")
             })?;
             if let Some(bytes) = cache.chunks.get(&chunk_index).cloned() {
                 cache.touch(chunk_index);
-                return Ok(bytes);
+                return Ok((bytes, true));
             }
         }
 
@@ -237,11 +307,14 @@ impl LogicalFileSharedState {
         let chunk_len = self
             .chunk_size_bytes
             .min(self.file_size_bytes().saturating_sub(chunk_start));
+        let started = Instant::now();
         let bytes = download_logical_range_blocking(
             &self.sdk,
             &self.loaded_manifest,
+            &self.manifest_key,
             chunk_start,
             chunk_len,
+            self.perf_logging_enabled,
         )
         .map_err(other_io_error)?;
         let bytes = Arc::new(bytes);
@@ -251,7 +324,18 @@ impl LogicalFileSharedState {
             .lock()
             .map_err(|_| Error::new(ErrorKind::Other, "logical-file chunk cache lock poisoned"))?;
         cache.insert(chunk_index, Arc::clone(&bytes));
-        Ok(bytes)
+        if self.perf_logging_enabled {
+            info!(
+                manifest_key = %self.manifest_key,
+                chunk_index,
+                chunk_start,
+                chunk_len = bytes.len(),
+                cache_entries = cache.chunks.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: logical-file chunk cache miss"
+            );
+        }
+        Ok((bytes, false))
     }
 }
 
@@ -441,13 +525,17 @@ impl sqlite_vfs::wip::WalIndex for DisabledWalIndex {
 fn download_logical_range_blocking(
     sdk: &IronMeshClient,
     loaded_manifest: &LoadedSplitLogicalFileManifest,
+    manifest_key: &str,
     start: u64,
     length: u64,
+    perf_logging_enabled: bool,
 ) -> Result<Vec<u8>> {
+    let started = Instant::now();
     let end_exclusive = start
         .checked_add(length)
         .ok_or_else(|| anyhow!("logical MBTiles range overflow"))?;
     let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
+    let mut segments = 0usize;
 
     for part in &loaded_manifest.manifest.parts {
         let part_start = part.offset_bytes;
@@ -467,6 +555,8 @@ fn download_logical_range_blocking(
             continue;
         }
 
+        segments += 1;
+        let segment_started = Instant::now();
         let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
         sdk.download_range_to_writer_with_progress_blocking(
             DownloadRangeRequest {
@@ -486,6 +576,17 @@ fn download_logical_range_blocking(
                 part.key, local_start, segment_length
             )
         })?;
+        if perf_logging_enabled {
+            info!(
+                manifest_key = %manifest_key,
+                part_id = %part.part_id,
+                part_key = %part.key,
+                local_start,
+                segment_length,
+                elapsed_ms = segment_started.elapsed().as_millis() as u64,
+                "map perf: downloaded logical MBTiles segment"
+            );
+        }
     }
 
     if body.len() as u64 != length {
@@ -494,6 +595,17 @@ fn download_logical_range_blocking(
             body.len(),
             length
         ));
+    }
+
+    if perf_logging_enabled {
+        info!(
+            manifest_key = %manifest_key,
+            start,
+            length,
+            segments,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "map perf: downloaded logical MBTiles range"
+        );
     }
 
     Ok(body)
