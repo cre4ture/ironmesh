@@ -86,6 +86,7 @@ export function GalleryBasemapMap({
   fallback
 }: GalleryBasemapMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const markerOverlayRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
@@ -195,6 +196,41 @@ export function GalleryBasemapMap({
     }
   }, [entries, entrySignature, fitSignature, mapReady]);
 
+  useEffect(() => {
+    const markerOverlay = markerOverlayRef.current;
+    const map = mapRef.current;
+    if (!markerOverlay || !map) {
+      return;
+    }
+    const mapCanvasContainer = map.getCanvasContainer();
+
+    function handleMarkerWheel(event: WheelEvent) {
+      event.preventDefault();
+      event.stopPropagation();
+      mapCanvasContainer.dispatchEvent(
+        new WheelEvent("wheel", {
+          bubbles: true,
+          cancelable: true,
+          deltaMode: event.deltaMode,
+          deltaX: event.deltaX,
+          deltaY: event.deltaY,
+          deltaZ: event.deltaZ,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          screenX: event.screenX,
+          screenY: event.screenY,
+          ctrlKey: event.ctrlKey,
+          shiftKey: event.shiftKey,
+          altKey: event.altKey,
+          metaKey: event.metaKey
+        })
+      );
+    }
+
+    markerOverlay.addEventListener("wheel", handleMarkerWheel, { passive: false });
+    return () => markerOverlay.removeEventListener("wheel", handleMarkerWheel);
+  }, [mapReady]);
+
   if (mapError) {
     return (
       <Stack gap="md">
@@ -260,6 +296,7 @@ export function GalleryBasemapMap({
 
           {mapReady && map ? (
             <div
+              ref={markerOverlayRef}
               style={{
                 position: "absolute",
                 inset: 0,
