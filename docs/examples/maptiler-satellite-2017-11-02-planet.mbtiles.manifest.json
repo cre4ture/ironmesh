@@ -1,0 +1,127 @@
+{
+  "manifest_version": 1,
+  "type": "split_file_manifest",
+  "logical_format": "mbtiles",
+  "logical_key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles",
+  "manifest_key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json",
+  "storage_root": "sys/maps",
+  "logical_size_bytes": 200226432000,
+  "last_part_size_bytes": 6952903680,
+  "parts_count": 19,
+  "parts": [
+    {
+      "part_id": "aa",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-aa",
+      "offset_bytes": 0,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ab",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ab",
+      "offset_bytes": 10737418240,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ac",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ac",
+      "offset_bytes": 21474836480,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ad",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ad",
+      "offset_bytes": 32212254720,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ae",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ae",
+      "offset_bytes": 42949672960,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "af",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-af",
+      "offset_bytes": 53687091200,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ag",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ag",
+      "offset_bytes": 64424509440,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ah",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ah",
+      "offset_bytes": 75161927680,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ai",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ai",
+      "offset_bytes": 85899345920,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "aj",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-aj",
+      "offset_bytes": 96636764160,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ak",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ak",
+      "offset_bytes": 107374182400,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "al",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-al",
+      "offset_bytes": 118111600640,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "am",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-am",
+      "offset_bytes": 128849018880,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "an",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-an",
+      "offset_bytes": 139586437120,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ao",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ao",
+      "offset_bytes": 150323855360,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ap",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ap",
+      "offset_bytes": 161061273600,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "aq",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-aq",
+      "offset_bytes": 171798691840,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ar",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-ar",
+      "offset_bytes": 182536110080,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "as",
+      "key": "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles-part-as",
+      "offset_bytes": 193273528320,
+      "size_bytes": 6952903680
+    }
+  ]
+}

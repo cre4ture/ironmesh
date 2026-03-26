@@ -57,6 +57,10 @@ Unsupported or undecodable media still get a cache record with status:
 
 This prevents repeated expensive decode attempts on every listing.
 
+Related design note:
+
+- `docs/gallery-map-view-design-note.md`
+
 ## API
 
 ### `GET /store/index`
