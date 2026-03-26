@@ -2,7 +2,15 @@
 
 ## Status
 
-Idea, not implemented.
+Partially implemented.
+
+Current state:
+
+- the shared `Grid` / `Map` gallery switch exists,
+- the gallery already supports a self-hosted satellite raster basemap,
+- server-side raster XYZ serving from split MBTiles already exists,
+- a first self-hosted vector `Street` basemap path now exists,
+- hybrid composition remains the next major map slice after the standalone vector mode.
 
 This note assumes the general storage-layer solution for cluster-wide metadata visibility and
 read-through chunk caching is already the accepted foundation for large self-hosted map data.
@@ -95,6 +103,24 @@ Keep the existing part objects as they are:
 An example manifest matching the current uploaded files is included in the repo at:
 
 - `docs/examples/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json`
+
+For the prepared OpenMapTiles vector dataset, the corresponding cluster location should be:
+
+- `sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json`
+
+with part objects:
+
+- `sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-aa`
+- `sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ab`
+- `sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ac`
+- `sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ad`
+- `sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ae`
+- `sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-af`
+- `sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ag`
+
+An example manifest matching the current local split files is included in the repo at:
+
+- `docs/examples/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json`
 
 ### Preferred long-term layout
 
@@ -224,6 +250,93 @@ If acceptable performance cannot be reached even after repacking:
 That would remove the browser-side SQLite lookup cost entirely, at the expense of a more
 specialized map-serving backend.
 
+## Vector Street Basemap First
+
+The preferred rollout is now:
+
+1. make a full vector `Street` basemap work first,
+2. keep the existing satellite raster mode,
+3. combine them later into a `Hybrid` mode once the vector label stack is proven.
+
+Why this order:
+
+- a standalone street map is useful by itself,
+- labels, country names, roads, and borders naturally belong to the vector stack,
+- hybrid mode then becomes a composition problem instead of a first-principles rendering problem.
+
+### Minimal first vector slice
+
+The first vector slice should stay intentionally small:
+
+- serve vector tiles from the split OpenMapTiles MBTiles via server-side tile endpoints,
+- serve glyph PBFs from a configured font directory,
+- use an Ironmesh-owned minimal MapLibre style,
+- avoid sprite/icon dependencies in the first pass,
+- expose `Satellite` and `Street` as separate basemap choices in the gallery.
+
+This first style should rely on a single OpenMapTiles-compatible vector source and cover only:
+
+- background,
+- water,
+- landcover / landuse,
+- roads,
+- administrative borders,
+- buildings,
+- place labels.
+
+### Asset assumptions
+
+The local `maptiler-server-map-styles-and-samples-3.15` bundle is useful as a reference for:
+
+- style structure,
+- glyph directory layout,
+- sprite layout,
+- expected OpenMapTiles layer names.
+
+However, the sample bundle should not be treated as a drop-in Ironmesh deployment artifact.
+It contains MapTiler-Server-specific placeholders and may carry license restrictions that differ
+from Ironmesh deployment needs.
+
+The first implementation should therefore:
+
+- own the actual style JSON in Ironmesh,
+- treat sprite usage as optional and deferred,
+- treat the font directory as an external/configured asset root.
+
+### Backend shape
+
+The backend side of the vector slice should expose:
+
+- an MBTiles metadata endpoint,
+- a vector tile endpoint,
+- a glyph endpoint.
+
+The vector tile endpoint should:
+
+- resolve split logical-file manifests the same way as raster MBTiles,
+- query the MBTiles database server-side,
+- return protobuf vector tile bytes,
+- preserve gzip content encoding when tiles are stored compressed in MBTiles.
+
+The glyph endpoint should:
+
+- serve `{fontstack}/{range}.pbf`,
+- validate path segments conservatively,
+- read from a configured font root,
+- avoid baking sample-bundle assumptions into the frontend.
+
+### Frontend shape
+
+The frontend side should:
+
+- allow multiple self-hosted basemap definitions,
+- persist the selected basemap choice locally in the browser,
+- render raster and vector basemaps through the same shared gallery map surface,
+- keep marker overlay behavior identical across basemap modes.
+
+The first vector style should live in Ironmesh frontend code rather than depend on an external
+style JSON server.
+
 ## Remaining Map-Specific Decisions
 
 The main open questions are now product and UI questions rather than storage questions:
@@ -251,9 +364,9 @@ Treat the storage-layer foundation as an existing dependency, not as part of thi
 
 The next design and implementation work for the gallery map should focus on:
 
-- shared gallery UX,
+- vector street basemap delivery,
+- shared gallery UX for switching between self-hosted basemap modes,
 - marker rendering and clustering,
 - fullscreen-view integration,
 - practical basemap packaging and deployment for self-hosted use,
-- the service layer that consumes the split-manifest format when a large basemap is manually
-  distributed across the cluster.
+- hybrid composition once both raster and vector basemap modes are stable.

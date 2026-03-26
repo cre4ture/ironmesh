@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
-    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-    ETAG, RANGE,
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -18,6 +18,7 @@ use client_sdk::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -67,6 +68,7 @@ pub struct WebUiConfig {
     pub connection_bootstrap: Option<ConnectionBootstrap>,
     pub connection_bootstrap_persistence: Option<WebUiBootstrapPersistence>,
     pub transport_client: Option<IronMeshClient>,
+    pub map_glyphs_root: Option<PathBuf>,
 }
 
 type PersistBootstrapFn = dyn Fn(&ConnectionBootstrap) -> Result<()> + Send + Sync;
@@ -107,6 +109,7 @@ impl WebUiConfig {
             connection_bootstrap: None,
             connection_bootstrap_persistence: None,
             transport_client: None,
+            map_glyphs_root: None,
         }
     }
 
@@ -119,6 +122,7 @@ impl WebUiConfig {
             connection_bootstrap: None,
             connection_bootstrap_persistence: None,
             transport_client: Some(client),
+            map_glyphs_root: None,
         }
     }
 
@@ -154,10 +158,16 @@ impl WebUiConfig {
         self.transport_client = Some(client);
         self
     }
+
+    pub fn with_map_glyphs_root(mut self, map_glyphs_root: impl Into<PathBuf>) -> Self {
+        self.map_glyphs_root = Some(map_glyphs_root.into());
+        self
+    }
 }
 
 #[derive(Clone)]
 struct WebState {
+    map_glyphs_root: Option<PathBuf>,
     service_name: String,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
     runtime: Arc<RwLock<WebRuntime>>,
@@ -209,6 +219,7 @@ pub fn router(config: WebUiConfig) -> Router {
         }
     };
     let state = WebState {
+        map_glyphs_root: resolve_map_glyphs_root(config.map_glyphs_root),
         service_name: config.service_name,
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         runtime: Arc::new(RwLock::new(WebRuntime {
@@ -233,6 +244,14 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/maps/mbtiles-metadata", get(web_map_mbtiles_metadata))
         .route("/api/maps/logical-file", get(web_map_logical_file))
         .route("/api/maps/tiles/{z}/{x}/{y}", get(web_map_xyz_tile))
+        .route(
+            "/api/maps/vector-tiles/{z}/{x}/{y}",
+            get(web_map_vector_tile),
+        )
+        .route(
+            "/api/maps/fonts/{fontstack}/{range}",
+            get(web_map_font_range),
+        )
         .route("/api/health", get(web_health))
         .route("/api/snapshots", get(web_snapshots))
         .route("/api/versions", get(web_versions))
@@ -262,6 +281,26 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/ping", get(web_ping))
         .route("/{*path}", get(web_static_file))
         .with_state(state)
+}
+
+fn resolve_map_glyphs_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = explicit.filter(|path| path.is_dir()) {
+        return Some(path);
+    }
+
+    if let Ok(value) = std::env::var("IRONMESH_MAP_GLYPHS_DIR") {
+        let path = PathBuf::from(value);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+
+    let repo_relative = PathBuf::from("map/maptiler-server-map-styles-and-samples-3.15/fonts");
+    if repo_relative.is_dir() {
+        return Some(repo_relative);
+    }
+
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,8 +366,11 @@ struct WebMapMbtilesMetadataResponse {
     attribution: Option<String>,
     center: Option<[f64; 3]>,
     format: Option<String>,
+    id: Option<String>,
     minzoom: Option<u8>,
     maxzoom: Option<u8>,
+    name: Option<String>,
+    version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1060,8 +1102,11 @@ async fn web_map_mbtiles_metadata(
             attribution: metadata.attribution.clone(),
             center: metadata.center,
             format: metadata.format.clone(),
+            id: metadata.id.clone(),
             minzoom: metadata.minzoom,
             maxzoom: metadata.maxzoom,
+            name: metadata.name.clone(),
+            version: metadata.version.clone(),
         }),
     )
         .into_response()
@@ -1251,13 +1296,108 @@ async fn web_map_xyz_tile(
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.mime_type));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.content_type));
     headers.insert(
         CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
     );
 
     (StatusCode::OK, headers, tile.bytes).into_response()
+}
+
+async fn web_map_vector_tile(
+    State(state): State<WebState>,
+    Path((z, x, y)): Path<(u32, u32, u32)>,
+    Query(query): Query<WebMapLogicalFileQuery>,
+) -> impl IntoResponse {
+    if query.manifest_key.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let source = match get_or_create_mbtiles_source(&state, query.manifest_key.trim()).await {
+        Ok(source) => source,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+
+    let tile_lookup = tokio::task::spawn_blocking(move || source.lookup_vector_tile(z, x, y)).await;
+    let tile = match tile_lookup {
+        Ok(Ok(Some(tile))) => tile,
+        Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.content_type));
+    if let Some(content_encoding) = tile.content_encoding {
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static(content_encoding));
+    }
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
+    );
+
+    (StatusCode::OK, headers, tile.bytes).into_response()
+}
+
+async fn web_map_font_range(
+    State(state): State<WebState>,
+    Path((fontstack, range)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(glyphs_root) = state.map_glyphs_root.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if !is_safe_fontstack_segment(&fontstack) || !is_safe_glyph_range_segment(&range) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let path = glyphs_root.join(&fontstack).join(&range);
+    if !path.starts_with(&glyphs_root) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/x-protobuf"),
+            );
+            headers.insert(
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400, stale-while-revalidate=604800"),
+            );
+            (StatusCode::OK, headers, bytes).into_response()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+fn is_safe_fontstack_segment(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains('\0')
+        && !value.split('.').any(|segment| segment == "..")
+}
+
+fn is_safe_glyph_range_segment(value: &str) -> bool {
+    if value.contains('/') || value.contains('\\') || value.contains('\0') {
+        return false;
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return false;
+    };
+    let Some(end) = end.strip_suffix(".pbf") else {
+        return false;
+    };
+    !start.is_empty()
+        && !end.is_empty()
+        && start.chars().all(|ch| ch.is_ascii_digit())
+        && end.chars().all(|ch| ch.is_ascii_digit())
 }
 
 async fn web_cluster_status(State(state): State<WebState>) -> impl IntoResponse {

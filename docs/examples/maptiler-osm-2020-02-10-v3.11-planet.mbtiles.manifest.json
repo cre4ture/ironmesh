@@ -1,0 +1,53 @@
+{
+  "manifest_version": 1,
+  "type": "split_file_manifest",
+  "logical_format": "mbtiles",
+  "logical_key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles",
+  "manifest_key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json",
+  "logical_size_bytes": 75031430656,
+  "parts_count": 7,
+  "parts": [
+    {
+      "part_id": "aa",
+      "key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-aa",
+      "offset_bytes": 0,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ab",
+      "key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ab",
+      "offset_bytes": 10737418240,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ac",
+      "key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ac",
+      "offset_bytes": 21474836480,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ad",
+      "key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ad",
+      "offset_bytes": 32212254720,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ae",
+      "key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ae",
+      "offset_bytes": 42949672960,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "af",
+      "key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-af",
+      "offset_bytes": 53687091200,
+      "size_bytes": 10737418240
+    },
+    {
+      "part_id": "ag",
+      "key": "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles-part-ag",
+      "offset_bytes": 64424509440,
+      "size_bytes": 10606921216
+    }
+  ]
+}

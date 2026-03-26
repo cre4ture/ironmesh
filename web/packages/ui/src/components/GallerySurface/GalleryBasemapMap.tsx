@@ -31,13 +31,28 @@ type GalleryBasemapPreviewRequest = {
   headers?: Record<string, string>;
 };
 
-export type GalleryBasemapConfig = {
+type GalleryBasemapBaseConfig = {
+  id: string;
+  modeLabel?: string;
   logicalFileUrl: string;
-  metadataUrl?: string;
-  tileUrlTemplate?: string;
   attribution?: string;
   label?: string;
 };
+
+export type GalleryRasterBasemapConfig = GalleryBasemapBaseConfig & {
+  kind: "raster";
+  metadataUrl?: string;
+  tileUrlTemplate?: string;
+};
+
+export type GalleryVectorBasemapConfig = GalleryBasemapBaseConfig & {
+  kind: "vector";
+  metadataUrl: string;
+  vectorTileUrlTemplate: string;
+  glyphsUrlTemplate: string;
+};
+
+export type GalleryBasemapConfig = GalleryRasterBasemapConfig | GalleryVectorBasemapConfig;
 
 type GalleryBasemapMapProps = {
   basemap: GalleryBasemapConfig;
@@ -57,8 +72,11 @@ type MbtilesSource = {
 type MbtilesMetadata = {
   attribution?: string;
   format?: string;
+  id?: string;
   minzoom?: number;
   maxzoom?: number;
+  name?: string;
+  version?: string;
   center?: [number, number, number?];
 };
 
@@ -94,7 +112,8 @@ export function GalleryBasemapMap({
   const [mapError, setMapError] = useState<string | null>(null);
   const [viewportVersion, setViewportVersion] = useState(0);
   const [fitSignature, setFitSignature] = useState("");
-  const useServerTileEndpoint = Boolean(basemap.metadataUrl && basemap.tileUrlTemplate);
+  const usesRasterServerTiles =
+    basemap.kind === "raster" && Boolean(basemap.metadataUrl && basemap.tileUrlTemplate);
   const sourceId = sourceIdForLogicalFile(basemap.logicalFileUrl);
   const entrySignature = entries
     .map((entry) => {
@@ -112,26 +131,30 @@ export function GalleryBasemapMap({
 
     async function start() {
       try {
-        const metadata = useServerTileEndpoint
-          ? await fetchMbtilesMetadata(basemap.metadataUrl!)
-          : (await loadMbtilesSource(sourceId, basemap)).metadata;
+        const metadata =
+          basemap.kind === "vector" || usesRasterServerTiles
+            ? await fetchMbtilesMetadata(basemap.metadataUrl)
+            : (await loadMbtilesSource(sourceId, basemap)).metadata;
         if (cancelled || !containerRef.current) {
           return;
         }
 
-        if (!useServerTileEndpoint) {
+        if (basemap.kind === "raster" && !usesRasterServerTiles) {
           mbtilesConfigRegistry.set(sourceId, basemap);
           ensureMbtilesProtocolRegistered();
         }
         map = new maplibregl.Map({
           container: containerRef.current,
-          style: buildRasterStyle(
-            useServerTileEndpoint
-              ? basemap.tileUrlTemplate!
-              : `${MBTILES_PROTOCOL}://${sourceId}/{z}/{x}/{y}`,
-            metadata,
-            basemap
-          ),
+          style:
+            basemap.kind === "vector"
+              ? buildVectorStyle(basemap, metadata)
+              : buildRasterStyle(
+                  usesRasterServerTiles
+                    ? basemap.tileUrlTemplate!
+                    : `${MBTILES_PROTOCOL}://${sourceId}/{z}/{x}/{y}`,
+                  metadata,
+                  basemap
+                ),
           center: metadata.center
             ? ([metadata.center[0], metadata.center[1]] as LngLatLike)
             : ([0, 20] as LngLatLike),
@@ -172,7 +195,7 @@ export function GalleryBasemapMap({
     return () => {
       cancelled = true;
       setFitSignature("");
-      if (!useServerTileEndpoint) {
+      if (basemap.kind === "raster" && !usesRasterServerTiles) {
         mbtilesConfigRegistry.delete(sourceId);
       }
       if (map) {
@@ -185,9 +208,12 @@ export function GalleryBasemapMap({
     basemap.label,
     basemap.logicalFileUrl,
     basemap.metadataUrl,
-    basemap.tileUrlTemplate,
+    basemap.kind,
+    basemap.kind === "raster" ? basemap.tileUrlTemplate : null,
+    basemap.kind === "vector" ? basemap.vectorTileUrlTemplate : null,
+    basemap.kind === "vector" ? basemap.glyphsUrlTemplate : null,
     sourceId,
-    useServerTileEndpoint
+    usesRasterServerTiles
   ]);
 
   useEffect(() => {
@@ -464,7 +490,7 @@ function GalleryBasemapMarker({
 function buildRasterStyle(
   tileUrlTemplate: string,
   metadata: MbtilesMetadata,
-  basemap: GalleryBasemapConfig
+  basemap: GalleryRasterBasemapConfig
 ): StyleSpecification {
   return {
     version: 8,
@@ -486,6 +512,259 @@ function buildRasterStyle(
       }
     ]
   };
+}
+
+function buildVectorStyle(
+  basemap: GalleryVectorBasemapConfig,
+  metadata: MbtilesMetadata
+): StyleSpecification {
+  return {
+    version: 8,
+    glyphs: basemap.glyphsUrlTemplate,
+    sources: {
+      basemap: {
+        type: "vector",
+        tiles: [basemap.vectorTileUrlTemplate],
+        attribution: basemap.attribution ?? metadata.attribution ?? "",
+        minzoom: metadata.minzoom ?? 0,
+        maxzoom: metadata.maxzoom ?? 14
+      }
+    },
+    layers: [
+      {
+        id: "background",
+        type: "background",
+        paint: {
+          "background-color": "#f4f1ea"
+        }
+      },
+      {
+        id: "landcover",
+        type: "fill",
+        source: "basemap",
+        "source-layer": "landcover",
+        paint: {
+          "fill-color": "#dfe8d2",
+          "fill-opacity": 0.85
+        }
+      },
+      {
+        id: "landuse",
+        type: "fill",
+        source: "basemap",
+        "source-layer": "landuse",
+        paint: {
+          "fill-color": "#ebe7da",
+          "fill-opacity": 0.72
+        }
+      },
+      {
+        id: "water",
+        type: "fill",
+        source: "basemap",
+        "source-layer": "water",
+        paint: {
+          "fill-color": "#8cbdd9"
+        }
+      },
+      {
+        id: "waterway",
+        type: "line",
+        source: "basemap",
+        "source-layer": "waterway",
+        paint: {
+          "line-color": "#6ea9cf",
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            4,
+            0.4,
+            10,
+            1.4,
+            14,
+            2.4
+          ]
+        }
+      },
+      {
+        id: "roads",
+        type: "line",
+        source: "basemap",
+        "source-layer": "transportation",
+        paint: {
+          "line-color": "#ffffff",
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            5,
+            0.4,
+            10,
+            1.3,
+            14,
+            3.2
+          ]
+        }
+      },
+      {
+        id: "buildings",
+        type: "fill",
+        source: "basemap",
+        "source-layer": "building",
+        minzoom: 12,
+        paint: {
+          "fill-color": "#d9d2c3",
+          "fill-opacity": 0.75
+        }
+      },
+      {
+        id: "boundaries",
+        type: "line",
+        source: "basemap",
+        "source-layer": "boundary",
+        paint: {
+          "line-color": "#8c7f73",
+          "line-dasharray": [2, 2],
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            2,
+            0.4,
+            6,
+            0.8,
+            10,
+            1.4
+          ]
+        }
+      },
+      {
+        id: "water-labels",
+        type: "symbol",
+        source: "basemap",
+        "source-layer": "water_name",
+        layout: {
+          "text-field": nameExpression(),
+          "text-font": ["Noto Sans Regular"],
+          "text-size": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            3,
+            10,
+            8,
+            12,
+            12,
+            14
+          ]
+        },
+        paint: {
+          "text-color": "#4f7b95",
+          "text-halo-color": "rgba(255,255,255,0.9)",
+          "text-halo-width": 1
+        }
+      },
+      {
+        id: "place-country-labels",
+        type: "symbol",
+        source: "basemap",
+        "source-layer": "place",
+        filter: ["==", ["get", "class"], "country"],
+        layout: {
+          "text-field": nameExpression(),
+          "text-font": ["Noto Sans Regular"],
+          "text-letter-spacing": 0.08,
+          "text-size": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            1,
+            11,
+            4,
+            15,
+            8,
+            18
+          ]
+        },
+        paint: {
+          "text-color": "#5b5248",
+          "text-halo-color": "rgba(255,255,255,0.92)",
+          "text-halo-width": 1.2
+        }
+      },
+      {
+        id: "place-region-labels",
+        type: "symbol",
+        source: "basemap",
+        "source-layer": "place",
+        filter: [
+          "match",
+          ["get", "class"],
+          ["state", "province", "region"],
+          true,
+          false
+        ],
+        layout: {
+          "text-field": nameExpression(),
+          "text-font": ["Noto Sans Regular"],
+          "text-size": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            3,
+            10,
+            6,
+            12,
+            10,
+            14
+          ]
+        },
+        paint: {
+          "text-color": "#6b6257",
+          "text-halo-color": "rgba(255,255,255,0.92)",
+          "text-halo-width": 1.1
+        }
+      },
+      {
+        id: "place-city-labels",
+        type: "symbol",
+        source: "basemap",
+        "source-layer": "place",
+        filter: [
+          "match",
+          ["get", "class"],
+          ["city", "town", "village"],
+          true,
+          false
+        ],
+        layout: {
+          "text-field": nameExpression(),
+          "text-font": ["Noto Sans Regular"],
+          "text-size": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            4,
+            10,
+            8,
+            12,
+            11,
+            15
+          ]
+        },
+        paint: {
+          "text-color": "#2f2a25",
+          "text-halo-color": "rgba(255,255,255,0.96)",
+          "text-halo-width": 1.25
+        }
+      }
+    ]
+  } as StyleSpecification;
+}
+
+function nameExpression(): unknown[] {
+  return ["coalesce", ["get", "name:latin"], ["get", "name_en"], ["get", "name"]];
 }
 
 function ensureMbtilesProtocolRegistered() {
@@ -562,7 +841,11 @@ async function createMbtilesSource(basemap: GalleryBasemapConfig): Promise<Mbtil
   };
 }
 
-async function fetchMbtilesMetadata(metadataUrl: string): Promise<MbtilesMetadata> {
+async function fetchMbtilesMetadata(metadataUrl: string | undefined): Promise<MbtilesMetadata> {
+  if (!metadataUrl) {
+    throw new Error("missing self-hosted basemap metadata URL");
+  }
+
   const response = await fetch(metadataUrl, {
     credentials: "same-origin"
   });
@@ -574,15 +857,21 @@ async function fetchMbtilesMetadata(metadataUrl: string): Promise<MbtilesMetadat
     attribution: string;
     center: [number, number, number?];
     format: string;
+    id: string;
     minzoom: number;
     maxzoom: number;
+    name: string;
+    version: string;
   }>;
   return {
     attribution: payload.attribution,
     center: payload.center,
     format: payload.format,
+    id: payload.id,
     minzoom: payload.minzoom,
-    maxzoom: payload.maxzoom
+    maxzoom: payload.maxzoom,
+    name: payload.name,
+    version: payload.version
   };
 }
 

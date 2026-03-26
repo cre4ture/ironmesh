@@ -14,10 +14,12 @@ mod tests {
     use reqwest::StatusCode;
     use std::fs;
     use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
     use uuid::Uuid;
 
     const CHUNK_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
+    const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 
     fn sample_png_bytes() -> Vec<u8> {
         let image = image::DynamicImage::new_rgba8(4, 3);
@@ -68,21 +70,101 @@ mod tests {
         Some(bundle[quoted_start + 1..quoted_end].to_string())
     }
 
+    async fn upload_binary_via_web(
+        client: &reqwest::Client,
+        web_base: &str,
+        key: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        if payload.len() <= CHUNK_UPLOAD_THRESHOLD_BYTES {
+            client
+                .post(format!("{web_base}/api/store/put-binary"))
+                .query(&[("key", key)])
+                .body(payload.to_vec())
+                .send()
+                .await?
+                .error_for_status()?;
+            return Ok(());
+        }
+
+        let start_response: serde_json::Value = client
+            .post(format!("{web_base}/api/store/uploads/start"))
+            .json(&serde_json::json!({
+                "key": key,
+                "total_size_bytes": payload.len(),
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let upload_id = start_response
+            .get("upload_id")
+            .and_then(|value| value.as_str())
+            .context("upload session start response missing upload_id")?;
+
+        for (index, chunk) in payload.chunks(CHUNK_UPLOAD_SIZE_BYTES).enumerate() {
+            client
+                .put(format!(
+                    "{web_base}/api/store/uploads/{upload_id}/chunk/{index}"
+                ))
+                .body(chunk.to_vec())
+                .send()
+                .await?
+                .error_for_status()?;
+        }
+
+        client
+            .post(format!("{web_base}/api/store/uploads/{upload_id}/complete"))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
+    }
+
     async fn start_web_backend_with_args(bind: &str, cli_args: &[&str]) -> Result<ChildGuard> {
+        start_web_backend_with_args_and_env(bind, cli_args, &[]).await
+    }
+
+    async fn start_web_backend_with_args_and_env(
+        bind: &str,
+        cli_args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<ChildGuard> {
         let cli_bin = binary_path("cli-client")?;
         let resource_guards = lock_test_resources([tcp_resource_key(bind)]).await;
-        let child = Command::new(cli_bin)
+        let mut command = Command::new(cli_bin);
+        command
             .args(cli_args)
             .arg("serve-web")
             .arg("--bind")
             .arg(bind)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command
             .spawn()
             .context("failed to spawn cli-client serve-web")?;
 
-        wait_for_url_status(&format!("http://{bind}/api/ping"), StatusCode::OK, 40).await?;
+        if let Err(error) =
+            wait_for_url_status(&format!("http://{bind}/api/ping"), StatusCode::OK, 40).await
+        {
+            let mut stderr_output = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_output).await;
+            }
+            let _ = child.kill().await;
+            return Err(error).with_context(|| {
+                format!(
+                    "serve-web failed to become ready on {bind}; stderr: {}",
+                    stderr_output.trim()
+                )
+            });
+        }
         Ok(ChildGuard::with_resources(child, resource_guards))
     }
 
@@ -112,6 +194,39 @@ mod tests {
         let web =
             start_web_backend_with_args(web_bind, &["--bootstrap-file", bootstrap_arg.as_str()])
                 .await?;
+        Ok((server, web, enrolled))
+    }
+
+    async fn start_authenticated_web_backend_with_env(
+        server_bind: &str,
+        web_bind: &str,
+        server_name: &str,
+        client_name: &str,
+        web_env: &[(&str, &str)],
+    ) -> Result<(ChildGuard, ChildGuard, EnrolledTestClient)> {
+        let data_dir = fresh_data_dir(server_name);
+        let client_dir = fresh_data_dir(client_name);
+        let node_id = Uuid::new_v4().to_string();
+        let server = start_authenticated_server(server_bind, &data_dir, &node_id, 1).await?;
+        let base_url = format!("http://{server_bind}");
+        let http = reqwest::Client::new();
+        let enrolled = issue_bootstrap_bundle_and_enroll_client(
+            &http,
+            &base_url,
+            TEST_ADMIN_TOKEN,
+            &client_dir,
+            "web-ui.bootstrap.json",
+            Some(client_name),
+            Some(3600),
+        )
+        .await?;
+        let bootstrap_arg = enrolled.bootstrap_path.to_string_lossy().into_owned();
+        let web = start_web_backend_with_args_and_env(
+            web_bind,
+            &["--bootstrap-file", bootstrap_arg.as_str()],
+            web_env,
+        )
+        .await?;
         Ok((server, web, enrolled))
     }
 
@@ -816,13 +931,7 @@ mod tests {
                 (part_ab_key, part_ab.clone()),
                 (part_ac_key, part_ac.clone()),
             ] {
-                client
-                    .post(format!("{web_base}/api/store/put-binary"))
-                    .query(&[("key", key)])
-                    .body(payload)
-                    .send()
-                    .await?
-                    .error_for_status()?;
+                upload_binary_via_web(&client, &web_base, key, &payload).await?;
             }
 
             let manifest_payload = sample_split_manifest_json(
@@ -886,6 +995,161 @@ mod tests {
             );
             let tile_body = tile_response.bytes().await?;
             assert_eq!(tile_body.as_ref(), expected_tile_bytes.as_slice());
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn web_ui_backend_serves_vector_tiles_and_glyphs() -> Result<()> {
+        let server_bind = "127.0.0.1:19393";
+        let web_bind = "127.0.0.1:19394";
+        let web_base = format!("http://{web_bind}");
+        let client = reqwest::Client::new();
+
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../map/maptiler-server-map-styles-and-samples-3.15/maptiler-openmaptiles.mbtiles",
+        );
+        let fixture_db = rusqlite::Connection::open(&fixture_path)
+            .context("failed opening sample vector MBTiles fixture")?;
+        let (zoom_level, tile_column, tile_row_tms, expected_tile_bytes): (u32, u32, u32, Vec<u8>) =
+            fixture_db
+                .query_row(
+                    "select zoom_level, tile_column, tile_row, tile_data from tiles limit 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? as u32,
+                            row.get::<_, i64>(1)? as u32,
+                            row.get::<_, i64>(2)? as u32,
+                            row.get::<_, Vec<u8>>(3)?,
+                        ))
+                    },
+                )
+                .context("failed selecting sample vector tile")?;
+        let expected_xyz_y = (1_u32 << zoom_level) - 1 - tile_row_tms;
+        let fixture_bytes =
+            fs::read(&fixture_path).context("failed reading sample vector MBTiles fixture")?;
+        let split_one = fixture_bytes.len() / 3;
+        let split_two = (fixture_bytes.len() * 2) / 3;
+        let part_aa = fixture_bytes[..split_one].to_vec();
+        let part_ab = fixture_bytes[split_one..split_two].to_vec();
+        let part_ac = fixture_bytes[split_two..].to_vec();
+
+        let glyphs_dir = fresh_data_dir("web-ui-vector-glyph-fixture");
+        let font_dir = glyphs_dir.join("Noto Sans Regular");
+        fs::create_dir_all(&font_dir).context("failed creating test glyph directory")?;
+        let glyph_bytes = b"synthetic-glyph-range".to_vec();
+        fs::write(font_dir.join("0-255.pbf"), &glyph_bytes)
+            .context("failed writing test glyph file")?;
+        let glyphs_dir_env = glyphs_dir.to_string_lossy().into_owned();
+
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend_with_env(
+            server_bind,
+            web_bind,
+            "web-ui-vector-server",
+            "web-ui-vector-client",
+            &[("IRONMESH_MAP_GLYPHS_DIR", glyphs_dir_env.as_str())],
+        )
+        .await?;
+
+        let manifest_key = "sys/maps/openmaptiles.mbtiles.manifest.json";
+        let logical_key = "sys/maps/openmaptiles.mbtiles";
+        let part_aa_key = "sys/maps/openmaptiles.mbtiles-part-aa";
+        let part_ab_key = "sys/maps/openmaptiles.mbtiles-part-ab";
+        let part_ac_key = "sys/maps/openmaptiles.mbtiles-part-ac";
+
+        let result = async {
+            for (key, payload) in [
+                (part_aa_key, part_aa.clone()),
+                (part_ab_key, part_ab.clone()),
+                (part_ac_key, part_ac.clone()),
+            ] {
+                upload_binary_via_web(&client, &web_base, key, &payload).await?;
+            }
+
+            let manifest_payload = sample_split_manifest_json(
+                manifest_key,
+                logical_key,
+                &[
+                    ("aa", part_aa_key, part_aa.as_slice()),
+                    ("ab", part_ab_key, part_ab.as_slice()),
+                    ("ac", part_ac_key, part_ac.as_slice()),
+                ],
+            );
+            client
+                .post(format!("{web_base}/api/store/put"))
+                .json(&serde_json::json!({
+                    "key": manifest_key,
+                    "value": serde_json::to_string(&manifest_payload)?,
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let metadata: serde_json::Value = client
+                .get(format!("{web_base}/api/maps/mbtiles-metadata"))
+                .query(&[("manifest_key", manifest_key)])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                metadata.get("format").and_then(|value| value.as_str()),
+                Some("pbf")
+            );
+            assert_eq!(
+                metadata.get("name").and_then(|value| value.as_str()),
+                Some("OpenMapTiles")
+            );
+
+            let tile_response = client
+                .get(format!(
+                    "{web_base}/api/maps/vector-tiles/{zoom_level}/{tile_column}/{expected_xyz_y}"
+                ))
+                .query(&[("manifest_key", manifest_key)])
+                .send()
+                .await?
+                .error_for_status()?;
+            assert_eq!(
+                tile_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/vnd.mapbox-vector-tile")
+            );
+            assert_eq!(
+                tile_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                Some("gzip")
+            );
+            let tile_body = tile_response.bytes().await?;
+            assert_eq!(tile_body.as_ref(), expected_tile_bytes.as_slice());
+
+            let glyph_response = client
+                .get(format!(
+                    "{web_base}/api/maps/fonts/Noto%20Sans%20Regular/0-255.pbf"
+                ))
+                .send()
+                .await?
+                .error_for_status()?;
+            assert_eq!(
+                glyph_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/x-protobuf")
+            );
+            let glyph_body = glyph_response.bytes().await?;
+            assert_eq!(glyph_body.as_ref(), glyph_bytes.as_slice());
 
             Ok::<(), anyhow::Error>(())
         }

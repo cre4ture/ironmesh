@@ -10,14 +10,32 @@ import { useCallback } from "react";
 
 const CLIENT_GALLERY_BASEMAP_MANIFEST_KEY =
   "sys/maps/maptiler-satellite-2017-11-02-planet.mbtiles.manifest.json";
-const CLIENT_GALLERY_BASEMAP: GalleryBasemapConfig = {
-  logicalFileUrl: logicalMapFileUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
-  metadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
-  tileUrlTemplate: logicalMapTileUrlTemplate(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
-  label: "MapTiler Satellite 2017-11-02 Planet",
-  attribution:
-    "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors."
-};
+const CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY =
+  "sys/maps/maptiler-osm-2020-02-10-v3.11-planet.mbtiles.manifest.json";
+const CLIENT_GALLERY_BASEMAPS: GalleryBasemapConfig[] = [
+  {
+    id: "satellite",
+    kind: "raster",
+    modeLabel: "Satellite",
+    logicalFileUrl: logicalMapFileUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
+    metadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
+    tileUrlTemplate: logicalMapTileUrlTemplate(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
+    label: "MapTiler Satellite 2017-11-02 Planet",
+    attribution:
+      "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors."
+  },
+  {
+    id: "street",
+    kind: "vector",
+    modeLabel: "Street",
+    logicalFileUrl: logicalMapFileUrl(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
+    metadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
+    vectorTileUrlTemplate: logicalMapVectorTileUrlTemplate(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
+    glyphsUrlTemplate: logicalMapGlyphUrlTemplate(),
+    label: "OpenMapTiles Street 2020-02-10 v3.11 Planet",
+    attribution: "Data Copyright OpenStreetMap contributors."
+  }
+];
 
 export function GalleryPage() {
   const loadSnapshots = useCallback(() => listSnapshots(), []);
@@ -46,7 +64,7 @@ export function GalleryPage() {
       />
       <GallerySurface
         previewHint="Thumbnail URLs are used when the media index provides them, with full-object downloads as a fallback."
-        basemap={CLIENT_GALLERY_BASEMAP}
+        basemaps={CLIENT_GALLERY_BASEMAPS}
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
         getImageRequests={getImageRequests}
@@ -76,4 +94,13 @@ function logicalMapMetadataUrl(manifestKey: string): string {
 function logicalMapTileUrlTemplate(manifestKey: string): string {
   const query = new URLSearchParams({ manifest_key: manifestKey });
   return `/api/maps/tiles/{z}/{x}/{y}?${query.toString()}`;
+}
+
+function logicalMapVectorTileUrlTemplate(manifestKey: string): string {
+  const query = new URLSearchParams({ manifest_key: manifestKey });
+  return `/api/maps/vector-tiles/{z}/{x}/{y}?${query.toString()}`;
+}
+
+function logicalMapGlyphUrlTemplate(): string {
+  return "/api/maps/fonts/{fontstack}/{range}.pbf";
 }

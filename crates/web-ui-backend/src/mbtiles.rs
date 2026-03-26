@@ -21,8 +21,11 @@ pub(crate) struct MbtilesMetadata {
     pub(crate) attribution: Option<String>,
     pub(crate) center: Option<[f64; 3]>,
     pub(crate) format: Option<String>,
+    pub(crate) id: Option<String>,
     pub(crate) minzoom: Option<u8>,
     pub(crate) maxzoom: Option<u8>,
+    pub(crate) name: Option<String>,
+    pub(crate) version: Option<String>,
 }
 
 #[derive(Clone)]
@@ -65,8 +68,11 @@ impl LogicalMbtilesSource {
                 attribution: None,
                 center: None,
                 format: None,
+                id: None,
                 minzoom: None,
                 maxzoom: None,
+                name: None,
+                version: None,
             },
         };
 
@@ -79,21 +85,28 @@ impl LogicalMbtilesSource {
     }
 
     pub(crate) fn lookup_tile(&self, zoom: u32, x: u32, y_xyz: u32) -> Result<Option<TilePayload>> {
-        let tms_y = xyz_row_to_tms(zoom, y_xyz)?;
-        let connection = self.open_connection()?;
-        let maybe_tile = connection
-            .query_row(
-                "select tile_data from tiles where zoom_level = ?1 and tile_column = ?2 and tile_row = ?3 limit 1",
-                params![i64::from(zoom), i64::from(x), i64::from(tms_y)],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .context("failed querying MBTiles tile")?;
+        Ok(self
+            .lookup_tile_bytes(zoom, x, y_xyz)?
+            .map(|bytes| TilePayload {
+                content_type: infer_tile_mime_type(&bytes, self.metadata.format.as_deref()),
+                content_encoding: None,
+                bytes,
+            }))
+    }
 
-        Ok(maybe_tile.map(|bytes| TilePayload {
-            mime_type: infer_tile_mime_type(&bytes, self.metadata.format.as_deref()),
-            bytes,
-        }))
+    pub(crate) fn lookup_vector_tile(
+        &self,
+        zoom: u32,
+        x: u32,
+        y_xyz: u32,
+    ) -> Result<Option<TilePayload>> {
+        Ok(self
+            .lookup_tile_bytes(zoom, x, y_xyz)?
+            .map(|bytes| TilePayload {
+                content_type: "application/vnd.mapbox-vector-tile",
+                content_encoding: infer_vector_tile_content_encoding(&bytes),
+                bytes,
+            }))
     }
 
     fn load_metadata(&self) -> Result<MbtilesMetadata> {
@@ -117,13 +130,29 @@ impl LogicalMbtilesSource {
             attribution: raw.get("attribution").cloned(),
             center: raw.get("center").and_then(|value| parse_center(value)),
             format: raw.get("format").cloned(),
+            id: raw.get("id").cloned(),
             minzoom: raw
                 .get("minzoom")
                 .and_then(|value| value.parse::<u8>().ok()),
             maxzoom: raw
                 .get("maxzoom")
                 .and_then(|value| value.parse::<u8>().ok()),
+            name: raw.get("name").cloned(),
+            version: raw.get("version").cloned(),
         })
+    }
+
+    fn lookup_tile_bytes(&self, zoom: u32, x: u32, y_xyz: u32) -> Result<Option<Vec<u8>>> {
+        let tms_y = xyz_row_to_tms(zoom, y_xyz)?;
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "select tile_data from tiles where zoom_level = ?1 and tile_column = ?2 and tile_row = ?3 limit 1",
+                params![i64::from(zoom), i64::from(x), i64::from(tms_y)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .context("failed querying MBTiles tile")
     }
 
     fn open_connection(&self) -> Result<Connection> {
@@ -143,7 +172,8 @@ impl LogicalMbtilesSource {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TilePayload {
-    pub(crate) mime_type: &'static str,
+    pub(crate) content_encoding: Option<&'static str>,
+    pub(crate) content_type: &'static str,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -533,6 +563,13 @@ fn infer_tile_mime_type(bytes: &[u8], declared_format: Option<&str>) -> &'static
     }
 
     "application/octet-stream"
+}
+
+fn infer_vector_tile_content_encoding(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        return Some("gzip");
+    }
+    None
 }
 
 fn other_io_error(error: anyhow::Error) -> Error {

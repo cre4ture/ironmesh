@@ -43,6 +43,7 @@ type GalleryViewMode = "grid" | "map";
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
 const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "ironmesh.gallery.thumbnails_per_row";
 const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
+const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 
 export type GallerySnapshot = {
   id: string;
@@ -99,7 +100,7 @@ type GalleryNavigationItem = {
 type GallerySurfaceProps = {
   intro?: string;
   previewHint: string;
-  basemap?: GalleryBasemapConfig | null;
+  basemaps?: GalleryBasemapConfig[] | null;
   loadSnapshots: () => Promise<GallerySnapshot[]>;
   loadEntries: (prefix: string, depth: number, snapshotId: string | null) => Promise<GalleryPayload>;
   getImageRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryImageRequests;
@@ -108,7 +109,7 @@ type GallerySurfaceProps = {
 export function GallerySurface({
   intro,
   previewHint,
-  basemap,
+  basemaps,
   loadSnapshots,
   loadEntries,
   getImageRequests
@@ -117,6 +118,7 @@ export function GallerySurface({
   const [depth, setDepth] = useState(4);
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
   const [viewMode, setViewMode] = useState(loadStoredViewMode);
+  const [activeBasemapId, setActiveBasemapId] = useState(loadStoredBasemapId);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<GallerySnapshot[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<GalleryPayload | null>(null);
@@ -146,6 +148,11 @@ export function GallerySurface({
     sortOrder
   );
   const geotaggedEntries = imageEntries.filter(hasGalleryGpsCoordinates);
+  const availableBasemaps = basemaps ?? [];
+  const activeBasemap =
+    availableBasemaps.find((candidate) => candidate.id === activeBasemapId) ??
+    availableBasemaps[0] ??
+    null;
   const currentGalleryPrefix = normalizeGalleryPrefix(entriesPayload?.prefix ?? prefix);
   const navigationItems = buildGalleryNavigationItems(
     entriesPayload?.entries ?? [],
@@ -163,6 +170,10 @@ export function GallerySurface({
     : null;
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < imageEntries.length - 1;
+
+  useEffect(() => {
+    persistBasemapId(activeBasemap?.id ?? "");
+  }, [activeBasemap?.id]);
 
   useEffect(() => {
     if (selectedPath && selectedIndex === -1) {
@@ -413,7 +424,9 @@ export function GallerySurface({
                 </Card>
               ) : (
                 <GalleryMapPanel
-                  basemap={basemap}
+                  basemaps={availableBasemaps}
+                  activeBasemap={activeBasemap}
+                  onSelectBasemap={setActiveBasemapId}
                   entries={geotaggedEntries}
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selectedPath}
@@ -588,7 +601,9 @@ export function GallerySurface({
 }
 
 type GalleryMapPanelProps = {
-  basemap?: GalleryBasemapConfig | null;
+  basemaps: GalleryBasemapConfig[];
+  activeBasemap: GalleryBasemapConfig | null;
+  onSelectBasemap: (id: string) => void;
   entries: GalleryEntry[];
   hiddenOnMapCount: number;
   selectedPath: string | null;
@@ -597,7 +612,9 @@ type GalleryMapPanelProps = {
 };
 
 function GalleryMapPanel({
-  basemap,
+  basemaps,
+  activeBasemap,
+  onSelectBasemap,
   entries,
   hiddenOnMapCount,
   selectedPath,
@@ -614,20 +631,35 @@ function GalleryMapPanel({
     />
   );
 
-  if (!basemap) {
+  if (!activeBasemap) {
     return fallback;
   }
 
   return (
-    <GalleryBasemapMap
-      basemap={basemap}
-      entries={entries}
-      hiddenOnMapCount={hiddenOnMapCount}
-      selectedPath={selectedPath}
-      getMarkerRequest={getMarkerRequest}
-      onSelectPath={onSelectPath}
-      fallback={fallback}
-    />
+    <Stack gap="sm">
+      {basemaps.length > 1 ? (
+        <Group gap="sm">
+          {basemaps.map((basemap) => (
+            <Button
+              key={basemap.id}
+              variant={basemap.id === activeBasemap.id ? "filled" : "default"}
+              onClick={() => onSelectBasemap(basemap.id)}
+            >
+              {basemap.modeLabel ?? basemap.label ?? basemap.id}
+            </Button>
+          ))}
+        </Group>
+      ) : null}
+      <GalleryBasemapMap
+        basemap={activeBasemap}
+        entries={entries}
+        hiddenOnMapCount={hiddenOnMapCount}
+        selectedPath={selectedPath}
+        getMarkerRequest={getMarkerRequest}
+        onSelectPath={onSelectPath}
+        fallback={fallback}
+      />
+    </Stack>
   );
 }
 
@@ -1386,6 +1418,14 @@ function loadStoredViewMode(): GalleryViewMode {
   return parseViewMode(window.localStorage.getItem(GALLERY_VIEW_MODE_STORAGE_KEY));
 }
 
+function loadStoredBasemapId(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  return window.localStorage.getItem(GALLERY_BASEMAP_ID_STORAGE_KEY) ?? "";
+}
+
 function persistThumbnailsPerRow(value: number) {
   if (typeof window === "undefined") {
     return;
@@ -1403,6 +1443,19 @@ function persistViewMode(value: GalleryViewMode) {
   }
 
   window.localStorage.setItem(GALLERY_VIEW_MODE_STORAGE_KEY, parseViewMode(value));
+}
+
+function persistBasemapId(value: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  if (value.trim()) {
+    window.localStorage.setItem(GALLERY_BASEMAP_ID_STORAGE_KEY, value.trim());
+    return;
+  }
+
+  window.localStorage.removeItem(GALLERY_BASEMAP_ID_STORAGE_KEY);
 }
 
 function parseThumbnailsPerRow(value: string | number | null | undefined): number {
