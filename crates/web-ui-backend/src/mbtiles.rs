@@ -3,8 +3,10 @@ use client_sdk::{IronMeshClient, ironmesh_client::DownloadRangeRequest};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vfs};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Error, ErrorKind};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,10 +14,65 @@ use tracing::info;
 
 use crate::LoadedSplitLogicalFileManifest;
 
-const SQLITE_RANGE_CACHE_CHUNK_BYTES: u64 = 64 * 1024;
+const SQLITE_RANGE_CACHE_CHUNK_BYTES: u64 = 1024 * 1024;
 const SQLITE_RANGE_CACHE_MAX_CHUNKS: usize = 1024;
 
 static NEXT_VFS_ID: AtomicU64 = AtomicU64::new(1);
+
+std::thread_local! {
+    static ACTIVE_TILE_LOOKUP_PERF_STATS: RefCell<Option<Rc<RefCell<MbtilesTileLookupPerfStats>>>> =
+        RefCell::new(None);
+}
+
+#[derive(Clone, Debug, Default)]
+struct MbtilesTileLookupPerfStats {
+    vfs_reads: u64,
+    vfs_bytes: u64,
+    vfs_read_elapsed_ms: u64,
+    chunk_cache_hits: u64,
+    chunk_cache_misses: u64,
+    logical_range_requests: u64,
+    logical_range_bytes: u64,
+    logical_range_elapsed_ms: u64,
+    segment_downloads: u64,
+    segment_bytes: u64,
+    segment_download_elapsed_ms: u64,
+}
+
+struct ActiveTileLookupPerfGuard {
+    previous: Option<Rc<RefCell<MbtilesTileLookupPerfStats>>>,
+}
+
+impl ActiveTileLookupPerfGuard {
+    fn install(
+        current: Option<Rc<RefCell<MbtilesTileLookupPerfStats>>>,
+    ) -> ActiveTileLookupPerfGuard {
+        let previous = ACTIVE_TILE_LOOKUP_PERF_STATS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let previous = slot.take();
+            *slot = current;
+            previous
+        });
+        ActiveTileLookupPerfGuard { previous }
+    }
+}
+
+impl Drop for ActiveTileLookupPerfGuard {
+    fn drop(&mut self) {
+        ACTIVE_TILE_LOOKUP_PERF_STATS.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+fn record_active_tile_lookup_perf_stats(update: impl FnOnce(&mut MbtilesTileLookupPerfStats)) {
+    ACTIVE_TILE_LOOKUP_PERF_STATS.with(|slot| {
+        let stats = slot.borrow().as_ref().cloned();
+        if let Some(stats) = stats {
+            update(&mut stats.borrow_mut());
+        }
+    });
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct MbtilesMetadata {
@@ -159,9 +216,50 @@ impl LogicalMbtilesSource {
     }
 
     fn lookup_tile_bytes(&self, zoom: u32, x: u32, y_xyz: u32) -> Result<Option<Vec<u8>>> {
-        let started = Instant::now();
+        let total_started = Instant::now();
         let tms_y = xyz_row_to_tms(zoom, y_xyz)?;
-        let connection = self.open_connection()?;
+        let perf_stats = self
+            .perf_logging_enabled
+            .then(|| Rc::new(RefCell::new(MbtilesTileLookupPerfStats::default())));
+        let _perf_guard = ActiveTileLookupPerfGuard::install(perf_stats.clone());
+
+        let open_started = Instant::now();
+        let connection = match self.open_connection() {
+            Ok(connection) => connection,
+            Err(error) => {
+                if self.perf_logging_enabled {
+                    let perf_stats = perf_stats
+                        .as_ref()
+                        .map(|stats| stats.borrow().clone())
+                        .unwrap_or_default();
+                    info!(
+                        manifest_key = %self.manifest_key,
+                        z = zoom,
+                        x,
+                        y = y_xyz,
+                        error = %error,
+                        elapsed_ms = total_started.elapsed().as_millis() as u64,
+                        sqlite_open_ms = open_started.elapsed().as_millis() as u64,
+                        sqlite_query_ms = 0_u64,
+                        vfs_reads = perf_stats.vfs_reads,
+                        vfs_bytes = perf_stats.vfs_bytes,
+                        vfs_read_elapsed_ms = perf_stats.vfs_read_elapsed_ms,
+                        chunk_cache_hits = perf_stats.chunk_cache_hits,
+                        chunk_cache_misses = perf_stats.chunk_cache_misses,
+                        logical_range_requests = perf_stats.logical_range_requests,
+                        logical_range_bytes = perf_stats.logical_range_bytes,
+                        logical_range_elapsed_ms = perf_stats.logical_range_elapsed_ms,
+                        segment_downloads = perf_stats.segment_downloads,
+                        segment_bytes = perf_stats.segment_bytes,
+                        segment_download_elapsed_ms = perf_stats.segment_download_elapsed_ms,
+                        "map perf: MBTiles tile lookup failed"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let sqlite_open_ms = open_started.elapsed().as_millis() as u64;
+        let query_started = Instant::now();
         let result = connection
             .query_row(
                 "select tile_data from tiles where zoom_level = ?1 and tile_column = ?2 and tile_row = ?3 limit 1",
@@ -170,7 +268,12 @@ impl LogicalMbtilesSource {
             )
             .optional()
             .context("failed querying MBTiles tile");
+        let sqlite_query_ms = query_started.elapsed().as_millis() as u64;
         if self.perf_logging_enabled {
+            let perf_stats = perf_stats
+                .as_ref()
+                .map(|stats| stats.borrow().clone())
+                .unwrap_or_default();
             match &result {
                 Ok(Some(bytes)) => info!(
                     manifest_key = %self.manifest_key,
@@ -178,7 +281,20 @@ impl LogicalMbtilesSource {
                     x,
                     y = y_xyz,
                     bytes = bytes.len(),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms = total_started.elapsed().as_millis() as u64,
+                    sqlite_open_ms,
+                    sqlite_query_ms,
+                    vfs_reads = perf_stats.vfs_reads,
+                    vfs_bytes = perf_stats.vfs_bytes,
+                    vfs_read_elapsed_ms = perf_stats.vfs_read_elapsed_ms,
+                    chunk_cache_hits = perf_stats.chunk_cache_hits,
+                    chunk_cache_misses = perf_stats.chunk_cache_misses,
+                    logical_range_requests = perf_stats.logical_range_requests,
+                    logical_range_bytes = perf_stats.logical_range_bytes,
+                    logical_range_elapsed_ms = perf_stats.logical_range_elapsed_ms,
+                    segment_downloads = perf_stats.segment_downloads,
+                    segment_bytes = perf_stats.segment_bytes,
+                    segment_download_elapsed_ms = perf_stats.segment_download_elapsed_ms,
                     "map perf: looked up MBTiles tile"
                 ),
                 Ok(None) => info!(
@@ -186,7 +302,20 @@ impl LogicalMbtilesSource {
                     z = zoom,
                     x,
                     y = y_xyz,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms = total_started.elapsed().as_millis() as u64,
+                    sqlite_open_ms,
+                    sqlite_query_ms,
+                    vfs_reads = perf_stats.vfs_reads,
+                    vfs_bytes = perf_stats.vfs_bytes,
+                    vfs_read_elapsed_ms = perf_stats.vfs_read_elapsed_ms,
+                    chunk_cache_hits = perf_stats.chunk_cache_hits,
+                    chunk_cache_misses = perf_stats.chunk_cache_misses,
+                    logical_range_requests = perf_stats.logical_range_requests,
+                    logical_range_bytes = perf_stats.logical_range_bytes,
+                    logical_range_elapsed_ms = perf_stats.logical_range_elapsed_ms,
+                    segment_downloads = perf_stats.segment_downloads,
+                    segment_bytes = perf_stats.segment_bytes,
+                    segment_download_elapsed_ms = perf_stats.segment_download_elapsed_ms,
                     "map perf: MBTiles tile lookup missed"
                 ),
                 Err(error) => info!(
@@ -195,7 +324,20 @@ impl LogicalMbtilesSource {
                     x,
                     y = y_xyz,
                     error = %error,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms = total_started.elapsed().as_millis() as u64,
+                    sqlite_open_ms,
+                    sqlite_query_ms,
+                    vfs_reads = perf_stats.vfs_reads,
+                    vfs_bytes = perf_stats.vfs_bytes,
+                    vfs_read_elapsed_ms = perf_stats.vfs_read_elapsed_ms,
+                    chunk_cache_hits = perf_stats.chunk_cache_hits,
+                    chunk_cache_misses = perf_stats.chunk_cache_misses,
+                    logical_range_requests = perf_stats.logical_range_requests,
+                    logical_range_bytes = perf_stats.logical_range_bytes,
+                    logical_range_elapsed_ms = perf_stats.logical_range_elapsed_ms,
+                    segment_downloads = perf_stats.segment_downloads,
+                    segment_bytes = perf_stats.segment_bytes,
+                    segment_download_elapsed_ms = perf_stats.segment_download_elapsed_ms,
                     "map perf: MBTiles tile lookup failed"
                 ),
             }
@@ -275,6 +417,15 @@ impl LogicalFileSharedState {
             copied += to_copy;
         }
 
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        record_active_tile_lookup_perf_stats(|stats| {
+            stats.vfs_reads += 1;
+            stats.vfs_bytes += buffer.len() as u64;
+            stats.vfs_read_elapsed_ms += elapsed_ms;
+            stats.chunk_cache_hits += cache_hits as u64;
+            stats.chunk_cache_misses += cache_misses as u64;
+        });
+
         if self.perf_logging_enabled {
             info!(
                 manifest_key = %self.manifest_key,
@@ -282,7 +433,7 @@ impl LogicalFileSharedState {
                 bytes = buffer.len(),
                 cache_hits,
                 cache_misses,
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms,
                 "map perf: SQLite VFS logical read"
             );
         }
@@ -318,6 +469,12 @@ impl LogicalFileSharedState {
         )
         .map_err(other_io_error)?;
         let bytes = Arc::new(bytes);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        record_active_tile_lookup_perf_stats(|stats| {
+            stats.logical_range_requests += 1;
+            stats.logical_range_bytes += bytes.len() as u64;
+            stats.logical_range_elapsed_ms += elapsed_ms;
+        });
 
         let mut cache = self
             .cache
@@ -331,7 +488,7 @@ impl LogicalFileSharedState {
                 chunk_start,
                 chunk_len = bytes.len(),
                 cache_entries = cache.chunks.len(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms,
                 "map perf: logical-file chunk cache miss"
             );
         }
@@ -576,6 +733,12 @@ fn download_logical_range_blocking(
                 part.key, local_start, segment_length
             )
         })?;
+        let segment_elapsed_ms = segment_started.elapsed().as_millis() as u64;
+        record_active_tile_lookup_perf_stats(|stats| {
+            stats.segment_downloads += 1;
+            stats.segment_bytes += segment_length;
+            stats.segment_download_elapsed_ms += segment_elapsed_ms;
+        });
         if perf_logging_enabled {
             info!(
                 manifest_key = %manifest_key,
@@ -583,7 +746,7 @@ fn download_logical_range_blocking(
                 part_key = %part.key,
                 local_start,
                 segment_length,
-                elapsed_ms = segment_started.elapsed().as_millis() as u64,
+                elapsed_ms = segment_elapsed_ms,
                 "map perf: downloaded logical MBTiles segment"
             );
         }
