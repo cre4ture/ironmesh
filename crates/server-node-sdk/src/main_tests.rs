@@ -4024,7 +4024,11 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
         assert!(metadata_subjects.contains(&"photos/cat.png".to_string()));
         assert!(metadata_subjects.contains(&format!("photos/cat.png@{}", put.version_id)));
 
-        let replica_subjects = locked.list_replication_subjects().await.unwrap();
+        let replica_subjects = locked
+            .replication_subject_inspector()
+            .list_replication_subjects()
+            .await
+            .unwrap();
         assert!(!replica_subjects.contains(&"photos/cat.png".to_string()));
         assert!(!replica_subjects.contains(&format!("photos/cat.png@{}", put.version_id)));
     }
@@ -4869,6 +4873,10 @@ async fn build_test_state(
             .await
             .unwrap(),
     ));
+    let upload_chunk_ingestor = {
+        let store_guard = store.lock().await;
+        store_guard.chunk_ingestor()
+    };
 
     let mut service = cluster::ClusterService::new(
         local_node_id,
@@ -4928,6 +4936,8 @@ async fn build_test_state(
         node_id: local_node_id,
         local_edge_mode: false,
         store: store.clone(),
+        store_lock_trace: Arc::new(std::sync::Mutex::new(None)),
+        upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(service)),
         client_credentials: Arc::new(Mutex::new(super::storage::ClientCredentialState::default())),
         upload_sessions: Arc::new(Mutex::new(super::UploadSessionStore {
@@ -5021,6 +5031,65 @@ async fn build_test_state(
     }
 
     state
+}
+
+#[tokio::test]
+async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let upload_id = "upload-chunk-lock-bypass".to_string();
+    let payload = vec![b'U'; 1024];
+    let now = super::unix_ts();
+
+    {
+        let mut sessions = state.upload_sessions.lock().await;
+        sessions.sessions.insert(
+            upload_id.clone(),
+            super::UploadSessionRecord {
+                upload_id: upload_id.clone(),
+                owner_device_id: None,
+                key: "uploads/test.bin".to_string(),
+                total_size_bytes: payload.len() as u64,
+                chunk_size_bytes: payload.len(),
+                chunk_count: 1,
+                state: VersionConsistencyState::Confirmed,
+                parent_version_ids: Vec::new(),
+                explicit_version_id: None,
+                received_chunks: vec![None],
+                created_at_unix: now,
+                updated_at_unix: now,
+                expires_at_unix: now + 300,
+                finalizing: false,
+                completed: false,
+                completed_result: None,
+            },
+        );
+    }
+
+    let _store_guard = state.store.lock().await;
+    let response = tokio::time::timeout(
+        Duration::from_millis(250),
+        super::upload_session_chunk(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((upload_id.clone(), 0)),
+            Bytes::from(payload.clone()),
+        ),
+    )
+    .await
+    .expect("chunk upload should not wait on the global store lock")
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sessions = state.upload_sessions.lock().await;
+    let session = sessions
+        .sessions
+        .get(&upload_id)
+        .expect("upload session should remain present");
+    let chunk = session.received_chunks[0]
+        .as_ref()
+        .expect("chunk should be recorded");
+    assert_eq!(chunk.size_bytes, payload.len());
 }
 
 #[tokio::test]

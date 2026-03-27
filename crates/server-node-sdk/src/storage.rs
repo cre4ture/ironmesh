@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -13,6 +14,7 @@ use image::{GenericImageView, ImageFormat};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 use uuid::Uuid;
 
@@ -514,7 +516,31 @@ pub struct PersistentStore {
     metadata_db_path: PathBuf,
     media_thumbnails_dir: PathBuf,
     current_state: CurrentState,
-    metadata_store: Box<dyn MetadataStore>,
+    metadata_store: Arc<dyn MetadataStore>,
+    chunk_ingestor: ChunkIngestor,
+}
+
+#[derive(Clone)]
+pub(crate) struct ChunkIngestor {
+    chunks_dir: PathBuf,
+    metadata_store: Arc<dyn MetadataStore>,
+    storage_stats_lock: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MediaCacheWorker {
+    manifests_dir: PathBuf,
+    chunks_dir: PathBuf,
+    media_thumbnails_dir: PathBuf,
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReplicationSubjectInspector {
+    current_state: CurrentState,
+    manifests_dir: PathBuf,
+    chunks_dir: PathBuf,
+    metadata_store: Arc<dyn MetadataStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,6 +625,443 @@ trait MetadataStore: Send + Sync {
     async fn mark_reconciled(&self, marker: &ReconcileMarker) -> Result<()>;
 }
 
+impl ChunkIngestor {
+    fn new(chunks_dir: PathBuf, metadata_store: Arc<dyn MetadataStore>) -> Self {
+        Self {
+            chunks_dir,
+            metadata_store,
+            storage_stats_lock: Arc::new(AsyncMutex::new(())),
+        }
+    }
+
+    pub(crate) async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
+        let actual_hash = hash_hex(payload);
+        if actual_hash != hash {
+            bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
+        }
+
+        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash);
+        if fs::try_exists(&chunk_path).await? {
+            return Ok(false);
+        }
+
+        if let Some(parent) = chunk_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        write_atomic(&chunk_path, payload).await?;
+        self.note_chunk_store_delta(payload.len() as i64).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn ingest_chunk_auto(&self, payload: &[u8]) -> Result<(String, bool)> {
+        let hash = hash_hex(payload);
+        let stored = self.ingest_chunk(&hash, payload).await?;
+        Ok((hash, stored))
+    }
+
+    async fn reconcile_chunk_store_bytes_state(&self) -> Result<StorageStatsState> {
+        let state = StorageStatsState {
+            chunk_store_bytes: directory_size_bytes(&self.chunks_dir).await?,
+            last_reconciled_unix: unix_ts(),
+        };
+        self.metadata_store
+            .persist_storage_stats_state(&state)
+            .await?;
+        Ok(state)
+    }
+
+    async fn note_chunk_store_delta(&self, delta_bytes: i64) -> Result<u64> {
+        let _guard = self.storage_stats_lock.lock().await;
+
+        let Some(mut state) = self.metadata_store.load_storage_stats_state().await? else {
+            return Ok(self
+                .reconcile_chunk_store_bytes_state()
+                .await?
+                .chunk_store_bytes);
+        };
+
+        if delta_bytes >= 0 {
+            state.chunk_store_bytes = state.chunk_store_bytes.saturating_add(delta_bytes as u64);
+        } else {
+            state.chunk_store_bytes = state
+                .chunk_store_bytes
+                .saturating_sub(delta_bytes.unsigned_abs());
+        }
+
+        self.metadata_store
+            .persist_storage_stats_state(&state)
+            .await?;
+        Ok(state.chunk_store_bytes)
+    }
+}
+
+impl MediaCacheWorker {
+    fn new(
+        manifests_dir: PathBuf,
+        chunks_dir: PathBuf,
+        media_thumbnails_dir: PathBuf,
+        metadata_store: Arc<dyn MetadataStore>,
+    ) -> Self {
+        Self {
+            manifests_dir,
+            chunks_dir,
+            media_thumbnails_dir,
+            metadata_store,
+        }
+    }
+
+    pub(crate) async fn ensure_media_cache(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Option<CachedMediaMetadata>> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            return Ok(None);
+        };
+        let content_fingerprint = content_fingerprint_from_manifest(&manifest);
+        if let Some(existing) = self
+            .load_cached_media_metadata(&content_fingerprint)
+            .await?
+        {
+            return Ok(Some(existing));
+        }
+
+        let payload = self.read_object_by_manifest_hash(manifest_hash).await?;
+        let metadata = self.build_media_cache_record(
+            manifest_hash,
+            &content_fingerprint,
+            manifest.total_size_bytes,
+            &payload,
+        );
+        self.persist_media_cache_record(&metadata).await?;
+        Ok(Some(metadata))
+    }
+
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
+        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn read_object_by_manifest_hash(
+        &self,
+        manifest_hash: &str,
+    ) -> std::result::Result<Bytes, StoreReadError> {
+        let Some(manifest) = self
+            .load_manifest_by_hash(manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        let mut assembled = BytesMut::with_capacity(manifest.total_size_bytes);
+
+        for chunk in manifest.chunks {
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            if !fs::try_exists(&chunk_path)
+                .await
+                .map_err(|err| StoreReadError::Internal(err.into()))?
+            {
+                return Err(StoreReadError::Corrupt(format!(
+                    "missing chunk hash={}",
+                    chunk.hash
+                )));
+            }
+
+            let payload = fs::read(&chunk_path)
+                .await
+                .map_err(|err| StoreReadError::Internal(err.into()))?;
+
+            if payload.len() != chunk.size_bytes {
+                return Err(StoreReadError::Corrupt(format!(
+                    "size mismatch for chunk hash={} expected={} actual={}",
+                    chunk.hash,
+                    chunk.size_bytes,
+                    payload.len()
+                )));
+            }
+
+            let actual_hash = hash_hex(&payload);
+            if actual_hash != chunk.hash {
+                return Err(StoreReadError::Corrupt(format!(
+                    "hash mismatch for chunk expected={} actual={}",
+                    chunk.hash, actual_hash
+                )));
+            }
+
+            assembled.extend_from_slice(&payload);
+        }
+
+        if assembled.len() != manifest.total_size_bytes {
+            return Err(StoreReadError::Corrupt(format!(
+                "assembled payload size mismatch key={} expected={} actual={}",
+                manifest.key,
+                manifest.total_size_bytes,
+                assembled.len()
+            )));
+        }
+
+        Ok(assembled.freeze())
+    }
+
+    async fn load_cached_media_metadata(
+        &self,
+        content_fingerprint: &str,
+    ) -> Result<Option<CachedMediaMetadata>> {
+        self.metadata_store
+            .load_cached_media_metadata(content_fingerprint)
+            .await
+    }
+
+    fn build_media_cache_record(
+        &self,
+        manifest_hash: &str,
+        content_fingerprint: &str,
+        source_size_bytes: usize,
+        payload: &[u8],
+    ) -> CachedMediaMetadata {
+        let generated_at_unix = unix_ts();
+        match derive_image_media_cache(
+            manifest_hash,
+            content_fingerprint,
+            source_size_bytes,
+            payload,
+        ) {
+            Ok(derived) => derived,
+            Err(err) => CachedMediaMetadata {
+                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                content_fingerprint: content_fingerprint.to_string(),
+                source_manifest_hash: manifest_hash.to_string(),
+                status: MediaCacheStatus::Failed,
+                media_type: None,
+                mime_type: None,
+                width: None,
+                height: None,
+                orientation: None,
+                taken_at_unix: None,
+                gps: None,
+                thumbnail: None,
+                source_size_bytes,
+                generated_at_unix,
+                error: Some(err.to_string()),
+            },
+        }
+    }
+
+    async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
+        if let Some(thumbnail) = &metadata.thumbnail {
+            let thumbnail_path =
+                self.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
+            let payload = self
+                .render_thumbnail_payload(
+                    &metadata.source_manifest_hash,
+                    GRID_THUMBNAIL_MAX_DIMENSION,
+                )
+                .await?;
+            write_atomic(&thumbnail_path, &payload).await?;
+        }
+        self.metadata_store
+            .persist_media_cache_record(metadata)
+            .await
+    }
+
+    async fn render_thumbnail_payload(
+        &self,
+        manifest_hash: &str,
+        max_dimension: u32,
+    ) -> Result<Vec<u8>> {
+        let payload = self
+            .read_object_by_manifest_hash(manifest_hash)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to read object for thumbnail render: {err}"))?;
+        let image = image::load_from_memory(&payload)
+            .context("failed to decode image while rendering thumbnail")?;
+        let thumbnail = image.thumbnail(max_dimension, max_dimension);
+        let mut encoded = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut encoded, 82);
+        encoder
+            .encode_image(&thumbnail)
+            .context("failed to encode thumbnail")?;
+        Ok(encoded)
+    }
+
+    fn media_thumbnail_path(&self, content_fingerprint: &str, profile: &str) -> PathBuf {
+        self.media_thumbnails_dir
+            .join(content_fingerprint)
+            .join(format!("{profile}.jpg"))
+    }
+}
+
+impl ReplicationSubjectInspector {
+    fn new(
+        current_state: CurrentState,
+        manifests_dir: PathBuf,
+        chunks_dir: PathBuf,
+        metadata_store: Arc<dyn MetadataStore>,
+    ) -> Self {
+        Self {
+            current_state,
+            manifests_dir,
+            chunks_dir,
+            metadata_store,
+        }
+    }
+
+    pub(crate) async fn list_replication_subjects(&self) -> Result<Vec<String>> {
+        let mut subjects: HashSet<String> = HashSet::new();
+        let mut indexed_object_ids = HashSet::new();
+
+        for (key, manifest_hash) in &self.current_state.objects {
+            if self.manifest_is_fully_local(manifest_hash).await? {
+                subjects.insert(key.clone());
+            }
+        }
+
+        for (path, object_id) in &self.current_state.object_ids {
+            if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
+                indexed_object_ids.insert(object_id.clone());
+                for head_version_id in &index.head_version_ids {
+                    let Some(record) = index.versions.get(head_version_id) else {
+                        continue;
+                    };
+                    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
+                        || self.manifest_is_fully_local(&record.manifest_hash).await?
+                    {
+                        subjects.insert(format!("{path}@{head_version_id}"));
+                    }
+                }
+            }
+        }
+
+        for index in self.load_all_version_indexes().await? {
+            if indexed_object_ids.contains(&index.object_id) {
+                continue;
+            }
+
+            let Some(key) = self.resolve_key_for_version_index(&index).await? else {
+                continue;
+            };
+
+            for head_version_id in &index.head_version_ids {
+                let Some(record) = index.versions.get(head_version_id) else {
+                    continue;
+                };
+                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
+                    || self.manifest_is_fully_local(&record.manifest_hash).await?
+                {
+                    subjects.insert(format!("{key}@{head_version_id}"));
+                }
+            }
+        }
+
+        let mut output: Vec<String> = subjects.into_iter().collect();
+        output.sort();
+        Ok(output)
+    }
+
+    pub(crate) fn current_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.current_state.objects.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    async fn manifest_is_fully_local(&self, manifest_hash: &str) -> Result<bool> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(true);
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            return Ok(false);
+        };
+
+        for chunk in &manifest.chunks {
+            let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
+            let metadata = match fs::metadata(&chunk_path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(err) => return Err(err.into()),
+            };
+            if metadata.len() != chunk.size_bytes as u64 {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
+        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn load_version_index_by_object_id(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<FileVersionIndex>> {
+        self.metadata_store
+            .load_version_index_by_object_id(object_id)
+            .await
+    }
+
+    async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
+        self.metadata_store.load_all_version_indexes().await
+    }
+
+    async fn resolve_key_for_version_index(
+        &self,
+        index: &FileVersionIndex,
+    ) -> Result<Option<String>> {
+        if let Some(preferred_head) = index
+            .preferred_head_version_id
+            .as_ref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .and_then(|record| record.logical_path.clone())
+        {
+            return Ok(Some(preferred_head));
+        }
+
+        if let Some(any_logical_path) = index
+            .versions
+            .values()
+            .find_map(|record| record.logical_path.clone())
+        {
+            return Ok(Some(any_logical_path));
+        }
+
+        for record in index.versions.values() {
+            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            if let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await? {
+                return Ok(Some(manifest.key));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
 impl PersistentStore {
     #[allow(dead_code)]
     pub async fn init_with_sqlite_metadata(root_dir: impl Into<PathBuf>) -> Result<Self> {
@@ -627,10 +1090,10 @@ impl PersistentStore {
         fs::create_dir_all(&state_dir).await?;
         fs::create_dir_all(&media_thumbnails_dir).await?;
 
-        let (metadata_db_path, metadata_store): (PathBuf, Box<dyn MetadataStore>) = match backend {
+        let (metadata_db_path, metadata_store): (PathBuf, Arc<dyn MetadataStore>) = match backend {
             MetadataBackendKind::Sqlite => (
                 state_dir.join("metadata.sqlite"),
-                Box::new(SqliteMetadataStore::open(
+                Arc::new(SqliteMetadataStore::open(
                     &state_dir.join("metadata.sqlite"),
                 )?),
             ),
@@ -639,11 +1102,12 @@ impl PersistentStore {
                 let turso_path = state_dir.join("metadata.turso.db");
                 (
                     turso_path.clone(),
-                    Box::new(TursoMetadataStore::open(&turso_path).await?),
+                    Arc::new(TursoMetadataStore::open(&turso_path).await?),
                 )
             }
         };
         let current_state = metadata_store.load_current_state().await?;
+        let chunk_ingestor = ChunkIngestor::new(chunks_dir.clone(), metadata_store.clone());
 
         Ok(Self {
             root_dir,
@@ -653,7 +1117,30 @@ impl PersistentStore {
             media_thumbnails_dir,
             current_state,
             metadata_store,
+            chunk_ingestor,
         })
+    }
+
+    pub(crate) fn chunk_ingestor(&self) -> ChunkIngestor {
+        self.chunk_ingestor.clone()
+    }
+
+    pub(crate) fn media_cache_worker(&self) -> MediaCacheWorker {
+        MediaCacheWorker::new(
+            self.manifests_dir.clone(),
+            self.chunks_dir.clone(),
+            self.media_thumbnails_dir.clone(),
+            self.metadata_store.clone(),
+        )
+    }
+
+    pub(crate) fn replication_subject_inspector(&self) -> ReplicationSubjectInspector {
+        ReplicationSubjectInspector::new(
+            self.current_state.clone(),
+            self.manifests_dir.clone(),
+            self.chunks_dir.clone(),
+            self.metadata_store.clone(),
+        )
     }
 
     pub async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
@@ -945,6 +1432,7 @@ impl PersistentStore {
         Ok(output)
     }
 
+    #[cfg(test)]
     pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
         let mut subjects: HashSet<String> = HashSet::new();
         let mut indexed_object_ids = HashSet::new();
@@ -1691,29 +2179,12 @@ impl PersistentStore {
     }
 
     pub async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
-        let actual_hash = hash_hex(payload);
-        if actual_hash != hash {
-            bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
-        }
-
-        let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash);
-        if fs::try_exists(&chunk_path).await? {
-            return Ok(false);
-        }
-
-        if let Some(parent) = chunk_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        write_atomic(&chunk_path, payload).await?;
-        self.note_chunk_store_delta(payload.len() as i64).await?;
-        Ok(true)
+        self.chunk_ingestor.ingest_chunk(hash, payload).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn ingest_chunk_auto(&self, payload: &[u8]) -> Result<(String, bool)> {
-        let hash = hash_hex(payload);
-        let stored = self.ingest_chunk(&hash, payload).await?;
-        Ok((hash, stored))
+        self.chunk_ingestor.ingest_chunk_auto(payload).await
     }
 
     pub async fn import_replica_manifest(
@@ -2143,6 +2614,7 @@ impl PersistentStore {
         Ok(hash_hex(&payload) == chunk.hash)
     }
 
+    #[cfg(test)]
     async fn manifest_is_fully_local(&self, manifest_hash: &str) -> Result<bool> {
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
             return Ok(true);

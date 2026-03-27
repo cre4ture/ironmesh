@@ -101,6 +101,8 @@ const UPLOAD_SESSION_PERSIST_INACTIVITY_SECS: u64 = 60;
 const DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS: u64 = 30;
 const SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_UPLOAD_FINALIZE_LOG_THRESHOLD_MS: u128 = 500;
+const SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS: u128 = 500;
+const SLOW_STORE_LOCK_HOLD_LOG_THRESHOLD_MS: u128 = 500;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -114,12 +116,12 @@ use setup::{
     managed_rendezvous_key_path, managed_signer_ca_cert_path,
 };
 use storage::{
-    AdminAuditEvent, ClientCredentialRecord, ClientCredentialState, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataExportBundle,
-    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, PairingAuthorizationRecord,
-    PathMutationResult, PersistentStore, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    ReplicationChunkInfo, StorageStatsSample, StoreReadError, UploadChunkRef,
-    VersionConsistencyState,
+    AdminAuditEvent, ChunkIngestor, ClientCredentialRecord, ClientCredentialState,
+    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
+    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
+    ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo, StorageStatsSample,
+    StoreReadError, UploadChunkRef, VersionConsistencyState,
 };
 
 #[derive(Clone)]
@@ -129,6 +131,8 @@ struct ServerState {
     node_id: NodeId,
     local_edge_mode: bool,
     store: Arc<Mutex<PersistentStore>>,
+    store_lock_trace: Arc<StdMutex<Option<StoreLockOwner>>>,
+    upload_chunk_ingestor: ChunkIngestor,
     cluster: Arc<Mutex<ClusterService>>,
     client_credentials: Arc<Mutex<ClientCredentialState>>,
     upload_sessions: Arc<Mutex<UploadSessionStore>>,
@@ -169,6 +173,100 @@ struct ServerState {
     admin_sessions: Arc<Mutex<AdminSessionStore>>,
     client_auth_control: ClientAuthControl,
     client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
+}
+
+#[derive(Clone, Copy)]
+struct StoreLockOwner {
+    operation: &'static str,
+    acquired_at: Instant,
+}
+
+struct TracedStoreGuard<'a> {
+    operation: &'static str,
+    waited_ms: u128,
+    acquired_at: Instant,
+    owner: Arc<StdMutex<Option<StoreLockOwner>>>,
+    guard: tokio::sync::MutexGuard<'a, PersistentStore>,
+}
+
+impl TracedStoreGuard<'_> {
+    fn waited_ms(&self) -> u128 {
+        self.waited_ms
+    }
+}
+
+impl std::ops::Deref for TracedStoreGuard<'_> {
+    type Target = PersistentStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for TracedStoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for TracedStoreGuard<'_> {
+    fn drop(&mut self) {
+        let hold_ms = self.acquired_at.elapsed().as_millis();
+        {
+            let mut owner = self.owner.lock().unwrap();
+            if owner.as_ref().is_some_and(|current| {
+                current.operation == self.operation && current.acquired_at == self.acquired_at
+            }) {
+                *owner = None;
+            }
+        }
+
+        if hold_ms >= SLOW_STORE_LOCK_HOLD_LOG_THRESHOLD_MS {
+            warn!(
+                operation = self.operation,
+                waited_ms = self.waited_ms,
+                hold_ms,
+                "slow store lock hold"
+            );
+        }
+    }
+}
+
+async fn lock_store<'a>(state: &'a ServerState, operation: &'static str) -> TracedStoreGuard<'a> {
+    let wait_started_at = Instant::now();
+    let blocking_owner = { *state.store_lock_trace.lock().unwrap() };
+    let guard = state.store.lock().await;
+    let waited_ms = wait_started_at.elapsed().as_millis();
+    if waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS {
+        if let Some(owner) = blocking_owner {
+            warn!(
+                operation,
+                waited_ms,
+                blocking_operation = owner.operation,
+                blocking_observed_hold_ms = owner.acquired_at.elapsed().as_millis(),
+                "slow store lock wait"
+            );
+        } else {
+            warn!(operation, waited_ms, "slow store lock wait");
+        }
+    }
+
+    let acquired_at = Instant::now();
+    {
+        let mut owner = state.store_lock_trace.lock().unwrap();
+        *owner = Some(StoreLockOwner {
+            operation,
+            acquired_at,
+        });
+    }
+
+    TracedStoreGuard {
+        operation,
+        waited_ms,
+        acquired_at,
+        owner: state.store_lock_trace.clone(),
+        guard,
+    }
 }
 
 #[derive(Clone)]
@@ -399,6 +497,13 @@ async fn persist_upload_session_store(store: &UploadSessionStore) -> Result<()> 
 fn mark_upload_session_store_dirty(state: &ServerState) {
     state.upload_sessions_dirty.fetch_add(1, Ordering::SeqCst);
     state.upload_sessions_persist_notify.notify_one();
+}
+
+async fn persist_upload_session_store_after_mutation(state: &ServerState, context: &'static str) {
+    if let Err(err) = persist_upload_session_store_now(state).await {
+        warn!(error = %err, context, "failed to persist upload session state");
+        mark_upload_session_store_dirty(state);
+    }
 }
 
 async fn persist_upload_session_store_now(state: &ServerState) -> Result<()> {
@@ -2934,6 +3039,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         )
         .await?,
     ));
+    let upload_chunk_ingestor = {
+        let store_guard = store.lock().await;
+        store_guard.chunk_ingestor()
+    };
     info!(
         data_dir = %config.data_dir.display(),
         metadata_backend = ?config.metadata_backend(),
@@ -3108,6 +3217,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         node_id: config.node_id,
         local_edge_mode: config.mode == ServerNodeMode::LocalEdge,
         store,
+        store_lock_trace: Arc::new(StdMutex::new(None)),
+        upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(cluster)),
         client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
         upload_sessions: Arc::new(Mutex::new(upload_session_store)),
@@ -3714,7 +3825,7 @@ async fn refresh_storage_stats_once(state: &ServerState) {
     }
 
     let result: anyhow::Result<StorageStatsSample> = {
-        let store = state.store.lock().await;
+        let store = lock_store(state, "storage_stats.collect").await;
         match store
             .current_chunk_store_bytes(Some(STORAGE_STATS_RECONCILE_INTERVAL_SECS))
             .await
@@ -3727,7 +3838,7 @@ async fn refresh_storage_stats_once(state: &ServerState) {
     match result {
         Ok(sample) => {
             let persist_result: anyhow::Result<()> = {
-                let store = state.store.lock().await;
+                let store = lock_store(state, "storage_stats.persist").await;
                 if let Err(err) = store.persist_storage_stats_sample(&sample).await {
                     Err(err)
                 } else {
@@ -4951,13 +5062,14 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
 }
 
 async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
-    let mut subjects = {
-        let store = state.store.lock().await;
-        store
-            .list_replication_subjects()
-            .await
-            .unwrap_or_else(|_| store.current_keys())
+    let inspector = {
+        let store = lock_store(state, "availability.recompute_local_subjects.snapshot").await;
+        store.replication_subject_inspector()
     };
+    let mut subjects = inspector
+        .list_replication_subjects()
+        .await
+        .unwrap_or_else(|_| inspector.current_keys());
     subjects.sort();
     subjects
 }
@@ -5407,8 +5519,11 @@ fn should_trigger_autonomous_post_write_replication(
 
 fn spawn_media_cache_warmup(state: ServerState, key: String, manifest_hash: String) {
     tokio::spawn(async move {
-        let store = state.store.lock().await;
-        if let Err(err) = store.ensure_media_cache(&manifest_hash).await {
+        let media_cache_worker = {
+            let store = lock_store(&state, "media_cache_warmup.clone_worker").await;
+            store.media_cache_worker()
+        };
+        if let Err(err) = media_cache_worker.ensure_media_cache(&manifest_hash).await {
             warn!(
                 key = %key,
                 manifest_hash = %manifest_hash,
@@ -5654,7 +5769,7 @@ async fn start_upload_session(
     );
     sessions.sessions.insert(session.upload_id.clone(), session);
     drop(sessions);
-    mark_upload_session_store_dirty(&state);
+    persist_upload_session_store_after_mutation(&state, "start_upload_session").await;
 
     (StatusCode::CREATED, Json(response)).into_response()
 }
@@ -5703,7 +5818,7 @@ async fn delete_upload_session(
 
     sessions.sessions.remove(&upload_id);
     drop(sessions);
-    mark_upload_session_store_dirty(&state);
+    persist_upload_session_store_after_mutation(&state, "delete_upload_session").await;
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -5749,11 +5864,12 @@ async fn upload_session_chunk(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let store_lock_started_at = Instant::now();
-    let store = state.store.lock().await;
-    let store_lock_wait_ms = store_lock_started_at.elapsed().as_millis();
     let store_ingest_started_at = Instant::now();
-    let (hash, stored) = match store.ingest_chunk_auto(&payload).await {
+    let (hash, stored) = match state
+        .upload_chunk_ingestor
+        .ingest_chunk_auto(&payload)
+        .await
+    {
         Ok(result) => result,
         Err(err) => {
             let store_ingest_ms = store_ingest_started_at.elapsed().as_millis();
@@ -5763,7 +5879,7 @@ async fn upload_session_chunk(
                 upload_id = %upload_id,
                 index,
                 size_bytes = payload.len(),
-                store_lock_wait_ms,
+                store_lock_wait_ms = 0,
                 store_ingest_ms,
                 total_ms,
                 "failed to ingest upload session chunk"
@@ -5772,7 +5888,7 @@ async fn upload_session_chunk(
         }
     };
     let store_ingest_ms = store_ingest_started_at.elapsed().as_millis();
-    drop(store);
+    let store_lock_wait_ms = 0;
     let next_ref = UploadChunkRef {
         hash,
         size_bytes: payload.len(),
@@ -5812,7 +5928,7 @@ async fn upload_session_chunk(
     };
 
     drop(sessions);
-    mark_upload_session_store_dirty(&state);
+    persist_upload_session_store_after_mutation(&state, "upload_session_chunk").await;
     let total_ms = request_started_at.elapsed().as_millis();
     if total_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS
         || store_lock_wait_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS
@@ -5887,9 +6003,8 @@ async fn complete_upload_session_route(
         "finalizing upload session"
     );
 
-    let store_lock_started_at = Instant::now();
-    let mut store = state.store.lock().await;
-    let store_lock_wait_ms = store_lock_started_at.elapsed().as_millis();
+    let mut store = lock_store(&state, "upload_session.complete.put_object_from_chunks").await;
+    let store_lock_wait_ms = store.waited_ms();
     let store_finalize_started_at = Instant::now();
     let outcome = match store
         .put_object_from_chunks(
@@ -5921,7 +6036,8 @@ async fn complete_upload_session_route(
                     .saturating_add(UPLOAD_SESSION_TTL_SECS);
             }
             drop(sessions);
-            mark_upload_session_store_dirty(&state);
+            persist_upload_session_store_after_mutation(&state, "complete_upload_session_error")
+                .await;
             tracing::error!(
                 error = %err,
                 key = %key,
@@ -6005,7 +6121,7 @@ async fn complete_upload_session_route(
         return (StatusCode::OK, Json(response)).into_response();
     }
     drop(sessions);
-    mark_upload_session_store_dirty(&state);
+    persist_upload_session_store_after_mutation(&state, "complete_upload_session").await;
     let total_ms = finalize_started_at.elapsed().as_millis();
     info!(
         upload_id = %upload_id,
@@ -6188,7 +6304,7 @@ async fn list_store_index_response(
     let depth = query.depth.unwrap_or(1).max(1);
 
     let (keys, key_hashes, key_sizes, key_modified_times) = {
-        let store = state.store.lock().await;
+        let store = lock_store(state, "store_index.snapshot_scan").await;
         if let Some(snapshot_id) = query.snapshot.as_deref() {
             match store.snapshot_object_state(snapshot_id).await {
                 Ok(Some(snapshot_state)) => {
@@ -6263,7 +6379,7 @@ async fn list_store_index_response(
         Some(&key_modified_times),
     );
     {
-        let store = state.store.lock().await;
+        let store = lock_store(state, "store_index.media_lookup").await;
         for entry in &mut entries {
             if entry.entry_type != "key" || !looks_like_image_path(&entry.path) {
                 continue;
@@ -7151,7 +7267,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
     };
 
     let metadata = {
-        let store = state.store.lock().await;
+        let store = lock_store(state, "media_thumbnail.resolve_and_ensure").await;
         let manifest_hash = match store
             .resolve_manifest_hash_for_key(
                 &query.key,
@@ -7192,7 +7308,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
     };
 
     let payload = {
-        let store = state.store.lock().await;
+        let store = lock_store(state, "media_thumbnail.path_lookup").await;
         let thumbnail_path =
             store.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
         match tokio::fs::read(&thumbnail_path).await {
