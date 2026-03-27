@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { gzipSync } from "node:zlib";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
@@ -108,6 +109,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("2 markers")).toBeVisible();
+  await page.getByRole("button", { name: "Hybrid" }).click();
+  await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await page.getByRole("button", { name: "Globe" }).click();
   await expect(page.getByRole("button", { name: "Globe" })).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
@@ -139,6 +143,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 async function installClientUiMocks(page: Page) {
   const imageBody = tinyPngBuffer();
   const logicalMapBody = readFileSync("tests/fixtures/smoke.mbtiles");
+  const emptyVectorTileBody = gzipSync(Buffer.alloc(0));
+  const glyphRangeBody = readFileSync(
+    "../map/maptiler-server-map-styles-and-samples-3.15/fonts/Noto Sans Regular/0-255.pbf"
+  );
   let uploadSessionStartCount = 0;
   const uploadSizes = new Map<string, number>();
   let maxConcurrentUploadIds = 0;
@@ -310,6 +318,31 @@ async function installClientUiMocks(page: Page) {
           "cache-control": "public, max-age=3600"
         },
         body: imageBody
+      });
+      return;
+    }
+
+    if (pathname.startsWith("/api/maps/vector-tiles/") && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "application/vnd.mapbox-vector-tile",
+          "content-encoding": "gzip",
+          "cache-control": "public, max-age=3600"
+        },
+        body: emptyVectorTileBody
+      });
+      return;
+    }
+
+    if (pathname.startsWith("/api/maps/fonts/") && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "application/x-protobuf",
+          "cache-control": "public, max-age=3600"
+        },
+        body: glyphRangeBody
       });
       return;
     }

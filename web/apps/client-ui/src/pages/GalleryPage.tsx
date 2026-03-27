@@ -25,10 +25,22 @@ const CLIENT_GALLERY_BASEMAPS: GalleryBasemapConfig[] = [
       "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors."
   },
   {
+    id: "hybrid",
+    kind: "hybrid",
+    modeLabel: "Hybrid",
+    rasterMetadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
+    rasterTileUrlTemplate: logicalMapTileUrlTemplate(CLIENT_GALLERY_BASEMAP_MANIFEST_KEY),
+    vectorMetadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
+    vectorTileUrlTemplate: logicalMapVectorTileUrlTemplate(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
+    glyphsUrlTemplate: logicalMapGlyphUrlTemplate(),
+    label: "Satellite with city and border overlay",
+    attribution:
+      "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors."
+  },
+  {
     id: "street",
     kind: "vector",
     modeLabel: "Street",
-    logicalFileUrl: logicalMapFileUrl(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
     metadataUrl: logicalMapMetadataUrl(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
     vectorTileUrlTemplate: logicalMapVectorTileUrlTemplate(CLIENT_GALLERY_VECTOR_BASEMAP_MANIFEST_KEY),
     glyphsUrlTemplate: logicalMapGlyphUrlTemplate(),

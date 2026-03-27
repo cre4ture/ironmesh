@@ -34,13 +34,13 @@ type GalleryBasemapPreviewRequest = {
 type GalleryBasemapBaseConfig = {
   id: string;
   modeLabel?: string;
-  logicalFileUrl: string;
   attribution?: string;
   label?: string;
 };
 
 export type GalleryRasterBasemapConfig = GalleryBasemapBaseConfig & {
   kind: "raster";
+  logicalFileUrl: string;
   metadataUrl?: string;
   tileUrlTemplate?: string;
 };
@@ -52,7 +52,19 @@ export type GalleryVectorBasemapConfig = GalleryBasemapBaseConfig & {
   glyphsUrlTemplate: string;
 };
 
-export type GalleryBasemapConfig = GalleryRasterBasemapConfig | GalleryVectorBasemapConfig;
+export type GalleryHybridBasemapConfig = GalleryBasemapBaseConfig & {
+  kind: "hybrid";
+  rasterMetadataUrl: string;
+  rasterTileUrlTemplate: string;
+  vectorMetadataUrl: string;
+  vectorTileUrlTemplate: string;
+  glyphsUrlTemplate: string;
+};
+
+export type GalleryBasemapConfig =
+  | GalleryRasterBasemapConfig
+  | GalleryVectorBasemapConfig
+  | GalleryHybridBasemapConfig;
 export type GalleryMapProjection = "mercator" | "globe";
 
 type GalleryBasemapMapProps = {
@@ -101,8 +113,13 @@ type MapCameraState = {
   pitch: number;
 };
 
+type LoadedBasemapStyle = {
+  style: StyleSpecification;
+  viewMetadata: MbtilesMetadata;
+};
+
 const mbtilesSourceCache = new Map<string, Promise<MbtilesSource>>();
-const mbtilesConfigRegistry = new Map<string, GalleryBasemapConfig>();
+const mbtilesConfigRegistry = new Map<string, GalleryRasterBasemapConfig>();
 let mbtilesProtocolRegistered = false;
 
 export function GalleryBasemapMap({
@@ -123,9 +140,13 @@ export function GalleryBasemapMap({
   const [mapError, setMapError] = useState<string | null>(null);
   const [viewportVersion, setViewportVersion] = useState(0);
   const [fitSignature, setFitSignature] = useState("");
-  const usesRasterServerTiles =
-    basemap.kind === "raster" && Boolean(basemap.metadataUrl && basemap.tileUrlTemplate);
-  const sourceId = sourceIdForLogicalFile(basemap.logicalFileUrl);
+  const serverRasterBasemap = isServerRasterBasemap(basemap) ? basemap : null;
+  const localRasterBasemap = isLocalRasterBasemap(basemap) ? basemap : null;
+  const usesRasterServerTiles = serverRasterBasemap !== null;
+  const usesLocalRasterMbtiles = localRasterBasemap !== null;
+  const localRasterSourceId = localRasterBasemap
+    ? sourceIdForLogicalFile(localRasterBasemap.logicalFileUrl)
+    : null;
   const entrySignature = entries
     .map((entry) => {
       const gps = entry.media?.gps;
@@ -142,38 +163,31 @@ export function GalleryBasemapMap({
 
     async function start() {
       try {
-        const metadata =
-          basemap.kind === "vector" || usesRasterServerTiles
-            ? await fetchMbtilesMetadata(basemap.metadataUrl)
-            : (await loadMbtilesSource(sourceId, basemap)).metadata;
+        const { style, viewMetadata } = await loadBasemapStyle(
+          basemap,
+          projection,
+          serverRasterBasemap,
+          localRasterBasemap,
+          localRasterSourceId
+        );
         if (cancelled || !containerRef.current) {
           return;
         }
 
-        if (basemap.kind === "raster" && !usesRasterServerTiles) {
-          mbtilesConfigRegistry.set(sourceId, basemap);
+        if (localRasterBasemap && localRasterSourceId) {
+          mbtilesConfigRegistry.set(localRasterSourceId, localRasterBasemap);
           ensureMbtilesProtocolRegistered();
         }
         const preservedCamera = cameraStateRef.current;
         map = new maplibregl.Map({
           container: containerRef.current,
-          style:
-            basemap.kind === "vector"
-              ? buildVectorStyle(basemap, metadata, projection)
-              : buildRasterStyle(
-                  usesRasterServerTiles
-                    ? basemap.tileUrlTemplate!
-                    : `${MBTILES_PROTOCOL}://${sourceId}/{z}/{x}/{y}`,
-                  metadata,
-                  basemap,
-                  projection
-                ),
+          style,
           center: preservedCamera
             ? ([preservedCamera.center[0], preservedCamera.center[1]] as LngLatLike)
-            : metadata.center
-              ? ([metadata.center[0], metadata.center[1]] as LngLatLike)
+            : viewMetadata.center
+              ? ([viewMetadata.center[0], viewMetadata.center[1]] as LngLatLike)
               : ([0, 20] as LngLatLike),
-          zoom: preservedCamera?.zoom ?? metadata.center?.[2] ?? 1.2,
+          zoom: preservedCamera?.zoom ?? viewMetadata.center?.[2] ?? 1.2,
           bearing: preservedCamera?.bearing ?? 0,
           pitch: preservedCamera?.pitch ?? 0
         });
@@ -217,8 +231,8 @@ export function GalleryBasemapMap({
 
     return () => {
       cancelled = true;
-      if (basemap.kind === "raster" && !usesRasterServerTiles) {
-        mbtilesConfigRegistry.delete(sourceId);
+      if (localRasterBasemap && localRasterSourceId) {
+        mbtilesConfigRegistry.delete(localRasterSourceId);
       }
       if (map) {
         cameraStateRef.current = snapshotMapCamera(map);
@@ -229,14 +243,23 @@ export function GalleryBasemapMap({
   }, [
     basemap.attribution,
     basemap.label,
-    basemap.logicalFileUrl,
-    basemap.metadataUrl,
     basemap.kind,
-    basemap.kind === "raster" ? basemap.tileUrlTemplate : null,
+    usesRasterServerTiles,
+    usesLocalRasterMbtiles,
+    serverRasterBasemap,
+    localRasterBasemap,
+    localRasterSourceId,
+    basemap.kind === "raster" ? basemap.logicalFileUrl : null,
+    basemap.kind === "raster" ? basemap.metadataUrl ?? null : null,
+    basemap.kind === "raster" ? basemap.tileUrlTemplate ?? null : null,
+    basemap.kind === "vector" ? basemap.metadataUrl : null,
     basemap.kind === "vector" ? basemap.vectorTileUrlTemplate : null,
     basemap.kind === "vector" ? basemap.glyphsUrlTemplate : null,
-    sourceId,
-    usesRasterServerTiles
+    basemap.kind === "hybrid" ? basemap.rasterMetadataUrl : null,
+    basemap.kind === "hybrid" ? basemap.rasterTileUrlTemplate : null,
+    basemap.kind === "hybrid" ? basemap.vectorMetadataUrl : null,
+    basemap.kind === "hybrid" ? basemap.vectorTileUrlTemplate : null,
+    basemap.kind === "hybrid" ? basemap.glyphsUrlTemplate : null
   ]);
 
   useEffect(() => {
@@ -527,6 +550,69 @@ function GalleryBasemapMarker({
   );
 }
 
+function isServerRasterBasemap(basemap: GalleryBasemapConfig): basemap is GalleryRasterBasemapConfig {
+  return basemap.kind === "raster" && Boolean(basemap.metadataUrl && basemap.tileUrlTemplate);
+}
+
+function isLocalRasterBasemap(basemap: GalleryBasemapConfig): basemap is GalleryRasterBasemapConfig {
+  return basemap.kind === "raster" && !isServerRasterBasemap(basemap);
+}
+
+async function loadBasemapStyle(
+  basemap: GalleryBasemapConfig,
+  projection: GalleryMapProjection,
+  serverRasterBasemap: GalleryRasterBasemapConfig | null,
+  localRasterBasemap: GalleryRasterBasemapConfig | null,
+  localRasterSourceId: string | null
+): Promise<LoadedBasemapStyle> {
+  if (basemap.kind === "vector") {
+    const metadata = await fetchMbtilesMetadata(basemap.metadataUrl);
+    return {
+      style: buildVectorStyle(basemap, metadata, projection),
+      viewMetadata: metadata
+    };
+  }
+
+  if (basemap.kind === "hybrid") {
+    const [rasterMetadata, vectorMetadata] = await Promise.all([
+      fetchMbtilesMetadata(basemap.rasterMetadataUrl),
+      fetchMbtilesMetadata(basemap.vectorMetadataUrl)
+    ]);
+    return {
+      style: buildHybridStyle(basemap, rasterMetadata, vectorMetadata, projection),
+      viewMetadata: rasterMetadata.center ? rasterMetadata : vectorMetadata
+    };
+  }
+
+  if (serverRasterBasemap) {
+    const metadata = await fetchMbtilesMetadata(serverRasterBasemap.metadataUrl);
+    return {
+      style: buildRasterStyle(
+        serverRasterBasemap.tileUrlTemplate!,
+        metadata,
+        serverRasterBasemap,
+        projection
+      ),
+      viewMetadata: metadata
+    };
+  }
+
+  if (!localRasterBasemap || !localRasterSourceId) {
+    throw new Error("missing self-hosted raster basemap source id");
+  }
+
+  const metadata = (await loadMbtilesSource(localRasterSourceId, localRasterBasemap)).metadata;
+  return {
+    style: buildRasterStyle(
+      `${MBTILES_PROTOCOL}://${localRasterSourceId}/{z}/{x}/{y}`,
+      metadata,
+      localRasterBasemap,
+      projection
+    ),
+    viewMetadata: metadata
+  };
+}
+
 function buildRasterStyle(
   tileUrlTemplate: string,
   metadata: MbtilesMetadata,
@@ -810,6 +896,177 @@ function buildVectorStyle(
   } as StyleSpecification;
 }
 
+function buildHybridStyle(
+  basemap: GalleryHybridBasemapConfig,
+  rasterMetadata: MbtilesMetadata,
+  vectorMetadata: MbtilesMetadata,
+  projection: GalleryMapProjection
+): StyleSpecification {
+  const absoluteRasterTileUrlTemplate = absolutizeStyleUrl(basemap.rasterTileUrlTemplate);
+  const absoluteVectorTileUrlTemplate = absolutizeStyleUrl(basemap.vectorTileUrlTemplate);
+  const absoluteGlyphsUrlTemplate = absolutizeStyleUrl(basemap.glyphsUrlTemplate);
+
+  return {
+    version: 8,
+    projection: { type: projection },
+    glyphs: absoluteGlyphsUrlTemplate,
+    sources: {
+      satellite: {
+        type: "raster",
+        tiles: [absoluteRasterTileUrlTemplate],
+        tileSize: 256,
+        attribution: basemap.attribution ?? rasterMetadata.attribution ?? vectorMetadata.attribution ?? "",
+        minzoom: rasterMetadata.minzoom ?? 0,
+        maxzoom: rasterMetadata.maxzoom ?? 18
+      },
+      overlay: {
+        type: "vector",
+        tiles: [absoluteVectorTileUrlTemplate],
+        attribution: "",
+        minzoom: vectorMetadata.minzoom ?? 0,
+        maxzoom: vectorMetadata.maxzoom ?? 14
+      }
+    },
+    layers: [
+      {
+        id: "satellite-base",
+        type: "raster",
+        source: "satellite"
+      },
+      {
+        id: "hybrid-boundaries",
+        type: "line",
+        source: "overlay",
+        "source-layer": "boundary",
+        paint: {
+          "line-color": "#f6e8bb",
+          "line-opacity": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            1,
+            0.42,
+            6,
+            0.58,
+            10,
+            0.74
+          ],
+          "line-dasharray": [3, 2],
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            1,
+            0.5,
+            5,
+            0.8,
+            9,
+            1.4,
+            13,
+            2.1
+          ]
+        }
+      },
+      {
+        id: "hybrid-country-labels",
+        type: "symbol",
+        source: "overlay",
+        "source-layer": "place",
+        filter: ["==", ["get", "class"], "country"],
+        layout: {
+          "text-field": nameExpression(),
+          "text-font": ["Noto Sans Regular"],
+          "text-letter-spacing": 0.1,
+          "text-size": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            1,
+            10,
+            4,
+            14,
+            7,
+            17
+          ]
+        },
+        paint: {
+          "text-color": "#fff6dd",
+          "text-halo-color": "rgba(12, 17, 24, 0.88)",
+          "text-halo-width": 1.4
+        }
+      },
+      {
+        id: "hybrid-region-labels",
+        type: "symbol",
+        source: "overlay",
+        "source-layer": "place",
+        minzoom: 3,
+        filter: [
+          "match",
+          ["get", "class"],
+          ["state", "province", "region"],
+          true,
+          false
+        ],
+        layout: {
+          "text-field": nameExpression(),
+          "text-font": ["Noto Sans Regular"],
+          "text-size": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            3,
+            9,
+            6,
+            11,
+            10,
+            13
+          ]
+        },
+        paint: {
+          "text-color": "#f8f1de",
+          "text-halo-color": "rgba(10, 14, 20, 0.86)",
+          "text-halo-width": 1.25
+        }
+      },
+      {
+        id: "hybrid-city-labels",
+        type: "symbol",
+        source: "overlay",
+        "source-layer": "place",
+        minzoom: 5,
+        filter: [
+          "match",
+          ["get", "class"],
+          ["city", "town"],
+          true,
+          false
+        ],
+        layout: {
+          "text-field": nameExpression(),
+          "text-font": ["Noto Sans Regular"],
+          "text-size": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            5,
+            10,
+            8,
+            12,
+            11,
+            14
+          ]
+        },
+        paint: {
+          "text-color": "#ffffff",
+          "text-halo-color": "rgba(8, 12, 18, 0.9)",
+          "text-halo-width": 1.35
+        }
+      }
+    ]
+  } as StyleSpecification;
+}
+
 function nameExpression(): unknown[] {
   return ["coalesce", ["get", "name:latin"], ["get", "name_en"], ["get", "name"]];
 }
@@ -889,7 +1146,7 @@ function ensureMbtilesProtocolRegistered() {
 
 async function loadMbtilesSource(
   sourceId: string,
-  basemap: GalleryBasemapConfig
+  basemap: GalleryRasterBasemapConfig
 ): Promise<MbtilesSource> {
   let existing = mbtilesSourceCache.get(sourceId);
   if (!existing) {
@@ -899,7 +1156,7 @@ async function loadMbtilesSource(
   return existing;
 }
 
-async function createMbtilesSource(basemap: GalleryBasemapConfig): Promise<MbtilesSource> {
+async function createMbtilesSource(basemap: GalleryRasterBasemapConfig): Promise<MbtilesSource> {
   const pageSize = await detectSqlitePageSize(basemap.logicalFileUrl);
   const worker = await createDbWorker(
     [
