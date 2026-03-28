@@ -195,6 +195,10 @@ export function GallerySurface({
   const selectedMediaRequests = selectedEntry
     ? getMediaRequests(selectedEntry, snapshotId)
     : null;
+  const selectedMediaViewerKey =
+    selectedEntry && selectedMediaRequests
+      ? `${selectedEntry.path}::${requestSignature(selectedMediaRequests.thumbnail)}::${requestSignature(selectedMediaRequests.original)}`
+      : null;
   const canNavigatePrevious = selectedIndex > 0;
   const canNavigateNext = selectedIndex >= 0 && selectedIndex < mediaEntries.length - 1;
 
@@ -629,6 +633,7 @@ export function GallerySurface({
             <div style={{ height: "calc(100vh - 17rem)", minHeight: "24rem" }}>
               {selectedMediaKind === "video" ? (
                 <GalleryLightboxVideo
+                  key={selectedMediaViewerKey ?? selectedEntry.path}
                   request={selectedMediaRequests.original}
                   posterRequest={selectedMediaRequests.thumbnail ?? null}
                   alt={selectedEntry.path}
@@ -639,6 +644,7 @@ export function GallerySurface({
                 />
               ) : (
                 <GalleryLightboxImage
+                  key={selectedMediaViewerKey ?? selectedEntry.path}
                   requests={selectedMediaRequests}
                   alt={selectedEntry.path}
                   canNavigatePrevious={canNavigatePrevious}
