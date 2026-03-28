@@ -37,6 +37,77 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn sample_oriented_jpeg_bytes(orientation: u16) -> Vec<u8> {
+    let mut image = image::RgbImage::new(40, 30);
+    for y in 0..30 {
+        for x in 0..40 {
+            let pixel = match (x < 20, y < 15) {
+                (true, true) => image::Rgb([255, 0, 0]),
+                (false, true) => image::Rgb([0, 255, 0]),
+                (true, false) => image::Rgb([0, 0, 255]),
+                (false, false) => image::Rgb([255, 255, 0]),
+            };
+            image.put_pixel(x, y, pixel);
+        }
+    }
+
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100);
+    encoder
+        .encode_image(&image::DynamicImage::ImageRgb8(image))
+        .unwrap();
+    jpeg_with_exif_orientation(jpeg, orientation)
+}
+
+fn jpeg_with_exif_orientation(jpeg: Vec<u8>, orientation: u16) -> Vec<u8> {
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+    let mut encoded = Vec::with_capacity(jpeg.len() + 36);
+    encoded.extend_from_slice(&jpeg[..2]);
+    encoded.extend_from_slice(&exif_orientation_app1_segment(orientation));
+    encoded.extend_from_slice(&jpeg[2..]);
+    encoded
+}
+
+fn exif_orientation_app1_segment(orientation: u16) -> Vec<u8> {
+    assert!((1..=8).contains(&orientation));
+
+    let mut segment = vec![0xff, 0xe1, 0x00, 0x22];
+    segment.extend_from_slice(b"Exif\0\0");
+    segment.extend_from_slice(&[
+        0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08, 0x00, 0x01, 0x01, 0x12, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x01,
+    ]);
+    segment.extend_from_slice(&orientation.to_be_bytes());
+    segment.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    segment
+}
+
+fn assert_dominant_color(pixel: &image::Rgb<u8>, expected: [u8; 3]) {
+    match expected {
+        [255, 0, 0] => {
+            assert!(pixel[0] > 180, "expected red pixel, got {pixel:?}");
+            assert!(pixel[1] < 90, "expected low green channel, got {pixel:?}");
+            assert!(pixel[2] < 90, "expected low blue channel, got {pixel:?}");
+        }
+        [0, 255, 0] => {
+            assert!(pixel[1] > 180, "expected green pixel, got {pixel:?}");
+            assert!(pixel[0] < 90, "expected low red channel, got {pixel:?}");
+            assert!(pixel[2] < 90, "expected low blue channel, got {pixel:?}");
+        }
+        [0, 0, 255] => {
+            assert!(pixel[2] > 180, "expected blue pixel, got {pixel:?}");
+            assert!(pixel[0] < 90, "expected low red channel, got {pixel:?}");
+            assert!(pixel[1] < 90, "expected low green channel, got {pixel:?}");
+        }
+        [255, 255, 0] => {
+            assert!(pixel[0] > 180, "expected yellow pixel, got {pixel:?}");
+            assert!(pixel[1] > 180, "expected yellow pixel, got {pixel:?}");
+            assert!(pixel[2] < 90, "expected low blue channel, got {pixel:?}");
+        }
+        _ => panic!("unsupported expected color: {expected:?}"),
+    }
+}
+
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
@@ -1502,6 +1573,107 @@ run_on_all_metadata_backends!(
     ensure_media_cache_generates_thumbnail_and_dimensions_for_png_impl,
     ensure_media_cache_generates_thumbnail_and_dimensions_for_png,
     ensure_media_cache_generates_thumbnail_and_dimensions_for_png_turso
+);
+
+async fn ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-oriented-jpeg").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/portrait.jpg",
+            Bytes::from(sample_oriented_jpeg_bytes(6)),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert_eq!(metadata.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(metadata.width, Some(40));
+    assert_eq!(metadata.height, Some(30));
+    assert_eq!(metadata.orientation, Some(6));
+
+    let thumb = metadata.thumbnail.as_ref().expect("expected thumbnail");
+    assert_eq!((thumb.width, thumb.height), (192, 256));
+
+    let thumb_path = store.media_thumbnail_path(&metadata.content_fingerprint, &thumb.profile);
+    let rendered = image::load_from_memory(&fs::read(&thumb_path).await.unwrap())
+        .unwrap()
+        .to_rgb8();
+    assert_eq!(rendered.dimensions(), (192, 256));
+    assert_dominant_color(rendered.get_pixel(0, 0), [0, 0, 255]);
+    assert_dominant_color(rendered.get_pixel(191, 0), [255, 0, 0]);
+    assert_dominant_color(rendered.get_pixel(0, 255), [255, 255, 0]);
+    assert_dominant_color(rendered.get_pixel(191, 255), [0, 255, 0]);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail_impl,
+    ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail,
+    ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail_turso
+);
+
+async fn ensure_media_cache_rebuilds_stale_schema_records_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-schema-refresh").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/portrait.jpg",
+            Bytes::from(sample_oriented_jpeg_bytes(6)),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stale = metadata.clone();
+    stale.schema_version = MEDIA_CACHE_SCHEMA_VERSION.saturating_sub(1);
+    let stale_thumb = stale.thumbnail.as_mut().expect("expected thumbnail");
+    stale_thumb.width = 256;
+    stale_thumb.height = 256;
+    store.persist_media_cache_record(&stale).await.unwrap();
+
+    let lookup = store
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lookup.metadata.is_none());
+
+    let rebuilt = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let rebuilt_thumb = rebuilt.thumbnail.as_ref().expect("expected thumbnail");
+    assert_eq!(rebuilt.schema_version, MEDIA_CACHE_SCHEMA_VERSION);
+    assert_eq!((rebuilt_thumb.width, rebuilt_thumb.height), (192, 256));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_cache_rebuilds_stale_schema_records_impl,
+    ensure_media_cache_rebuilds_stale_schema_records,
+    ensure_media_cache_rebuilds_stale_schema_records_turso
 );
 
 async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes_impl(

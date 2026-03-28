@@ -10,7 +10,8 @@ use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use exif::{In, Reader as ExifReader, Tag, Value};
 use image::codecs::jpeg::JpegEncoder;
-use image::{GenericImageView, ImageFormat};
+use image::metadata::Orientation;
+use image::{DynamicImage, GenericImageView, ImageFormat};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -28,7 +29,7 @@ use self::turso_impl::TursoMetadataStore;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
-const MEDIA_CACHE_SCHEMA_VERSION: u32 = 1;
+const MEDIA_CACHE_SCHEMA_VERSION: u32 = 2;
 const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
@@ -501,6 +502,12 @@ pub struct MediaCacheLookup {
     pub metadata: Option<CachedMediaMetadata>,
 }
 
+struct RenderedThumbnail {
+    payload: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataBackendKind {
@@ -723,10 +730,10 @@ impl MediaCacheWorker {
             return Ok(None);
         };
         let content_fingerprint = content_fingerprint_from_manifest(&manifest);
-        if let Some(existing) = self
-            .load_cached_media_metadata(&content_fingerprint)
-            .await?
-        {
+        if let Some(existing) = current_media_cache_metadata(
+            self.load_cached_media_metadata(&content_fingerprint)
+                .await?,
+        ) {
             return Ok(Some(existing));
         }
 
@@ -887,15 +894,8 @@ impl MediaCacheWorker {
             .read_object_by_manifest_hash(manifest_hash)
             .await
             .map_err(|err| anyhow::anyhow!("failed to read object for thumbnail render: {err}"))?;
-        let image = image::load_from_memory(&payload)
-            .context("failed to decode image while rendering thumbnail")?;
-        let thumbnail = image.thumbnail(max_dimension, max_dimension);
-        let mut encoded = Vec::new();
-        let mut encoder = JpegEncoder::new_with_quality(&mut encoded, 82);
-        encoder
-            .encode_image(&thumbnail)
-            .context("failed to encode thumbnail")?;
-        Ok(encoded)
+        render_thumbnail_from_payload(&payload, extract_exif_orientation(&payload), max_dimension)
+            .map(|rendered| rendered.payload)
     }
 
     fn media_thumbnail_path(&self, content_fingerprint: &str, profile: &str) -> PathBuf {
@@ -1354,9 +1354,10 @@ impl PersistentStore {
             return Ok(None);
         };
         let content_fingerprint = content_fingerprint_from_manifest(&manifest);
-        let metadata = self
-            .load_cached_media_metadata(&content_fingerprint)
-            .await?;
+        let metadata = current_media_cache_metadata(
+            self.load_cached_media_metadata(&content_fingerprint)
+                .await?,
+        );
 
         Ok(Some(MediaCacheLookup {
             content_fingerprint,
@@ -1376,10 +1377,10 @@ impl PersistentStore {
             return Ok(None);
         };
         let content_fingerprint = content_fingerprint_from_manifest(&manifest);
-        if let Some(existing) = self
-            .load_cached_media_metadata(&content_fingerprint)
-            .await?
-        {
+        if let Some(existing) = current_media_cache_metadata(
+            self.load_cached_media_metadata(&content_fingerprint)
+                .await?,
+        ) {
             return Ok(Some(existing));
         }
 
@@ -2793,15 +2794,8 @@ impl PersistentStore {
             .read_object_by_manifest_hash(manifest_hash)
             .await
             .map_err(|err| anyhow::anyhow!("failed to read object for thumbnail render: {err}"))?;
-        let image = image::load_from_memory(&payload)
-            .context("failed to decode image while rendering thumbnail")?;
-        let thumbnail = image.thumbnail(max_dimension, max_dimension);
-        let mut encoded = Vec::new();
-        let mut encoder = JpegEncoder::new_with_quality(&mut encoded, 82);
-        encoder
-            .encode_image(&thumbnail)
-            .context("failed to encode thumbnail")?;
-        Ok(encoded)
+        render_thumbnail_from_payload(&payload, extract_exif_orientation(&payload), max_dimension)
+            .map(|rendered| rendered.payload)
     }
 
     pub fn media_thumbnail_path(&self, content_fingerprint: &str, profile: &str) -> PathBuf {
@@ -4521,14 +4515,8 @@ fn derive_image_media_cache(
     let image = image::load_from_memory_with_format(payload, format)
         .context("failed to decode image payload")?;
     let (width, height) = image.dimensions();
-    let thumbnail = image.thumbnail(GRID_THUMBNAIL_MAX_DIMENSION, GRID_THUMBNAIL_MAX_DIMENSION);
-    let mut thumbnail_payload = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut thumbnail_payload, 82);
-    encoder
-        .encode_image(&thumbnail)
-        .context("failed to encode thumbnail")?;
-
     let (orientation, gps) = extract_exif_fields(payload);
+    let rendered_thumbnail = render_thumbnail(image, orientation, GRID_THUMBNAIL_MAX_DIMENSION)?;
 
     Ok(CachedMediaMetadata {
         schema_version: MEDIA_CACHE_SCHEMA_VERSION,
@@ -4545,9 +4533,9 @@ fn derive_image_media_cache(
         thumbnail: Some(CachedThumbnailInfo {
             profile: GRID_THUMBNAIL_PROFILE.to_string(),
             format: "jpeg".to_string(),
-            width: thumbnail.width(),
-            height: thumbnail.height(),
-            size_bytes: thumbnail_payload.len() as u64,
+            width: rendered_thumbnail.width,
+            height: rendered_thumbnail.height,
+            size_bytes: rendered_thumbnail.payload.len() as u64,
         }),
         source_size_bytes,
         generated_at_unix,
@@ -4564,6 +4552,55 @@ fn image_format_mime_type(format: ImageFormat) -> Option<&'static str> {
         ImageFormat::WebP => Some("image/webp"),
         _ => None,
     }
+}
+
+fn current_media_cache_metadata(
+    metadata: Option<CachedMediaMetadata>,
+) -> Option<CachedMediaMetadata> {
+    metadata.filter(|metadata| metadata.schema_version == MEDIA_CACHE_SCHEMA_VERSION)
+}
+
+fn extract_exif_orientation(payload: &[u8]) -> Option<u16> {
+    extract_exif_fields(payload).0
+}
+
+fn render_thumbnail_from_payload(
+    payload: &[u8],
+    orientation: Option<u16>,
+    max_dimension: u32,
+) -> Result<RenderedThumbnail> {
+    let image = image::load_from_memory(payload)
+        .context("failed to decode image while rendering thumbnail")?;
+    render_thumbnail(image, orientation, max_dimension)
+}
+
+fn render_thumbnail(
+    mut image: DynamicImage,
+    orientation: Option<u16>,
+    max_dimension: u32,
+) -> Result<RenderedThumbnail> {
+    apply_exif_orientation(&mut image, orientation);
+    let thumbnail = image.thumbnail(max_dimension, max_dimension);
+    let mut encoded = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut encoded, 82);
+    encoder
+        .encode_image(&thumbnail)
+        .context("failed to encode thumbnail")?;
+    Ok(RenderedThumbnail {
+        payload: encoded,
+        width: thumbnail.width(),
+        height: thumbnail.height(),
+    })
+}
+
+fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {
+    let Some(orientation) = orientation
+        .and_then(|value| u8::try_from(value).ok())
+        .and_then(Orientation::from_exif)
+    else {
+        return;
+    };
+    image.apply_orientation(orientation);
 }
 
 fn extract_exif_fields(payload: &[u8]) -> (Option<u16>, Option<MediaGpsCoordinates>) {
