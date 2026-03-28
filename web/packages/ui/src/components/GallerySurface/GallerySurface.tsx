@@ -1290,6 +1290,7 @@ function GalleryLightboxVideo({
       canNavigateNext={canNavigateNext}
       onNavigatePrevious={onNavigatePrevious}
       onNavigateNext={onNavigateNext}
+      navigationPlacement="below"
     >
       {video.resolvedSrc ? (
         <video
@@ -1334,6 +1335,7 @@ type GalleryLightboxFrameProps = {
   canNavigateNext: boolean;
   onNavigatePrevious: () => void;
   onNavigateNext: () => void;
+  navigationPlacement?: "overlay" | "below";
 };
 
 function GalleryLightboxFrame({
@@ -1341,65 +1343,100 @@ function GalleryLightboxFrame({
   canNavigatePrevious,
   canNavigateNext,
   onNavigatePrevious,
-  onNavigateNext
+  onNavigateNext,
+  navigationPlacement = "overlay"
 }: GalleryLightboxFrameProps) {
   const [touchStart, setTouchStart] = useState<{ x: number; y: number } | null>(null);
+  const useFooterNavigation = navigationPlacement === "below";
 
   return (
     <div
       style={{
-        position: "relative",
         width: "100%",
         height: "100%",
-        overflow: "hidden",
-        borderRadius: "var(--mantine-radius-md)",
-        background: "var(--mantine-color-dark-9)",
-        touchAction: "pan-y"
-      }}
-      onTouchStart={(event) => {
-        const touch = event.touches[0];
-        if (!touch) {
-          return;
-        }
-        setTouchStart({ x: touch.clientX, y: touch.clientY });
-      }}
-      onTouchEnd={(event) => {
-        if (!touchStart) {
-          return;
-        }
-
-        const touch = event.changedTouches[0];
-        setTouchStart(null);
-        if (!touch) {
-          return;
-        }
-
-        const deltaX = touch.clientX - touchStart.x;
-        const deltaY = touch.clientY - touchStart.y;
-        if (Math.abs(deltaX) < 48 || Math.abs(deltaX) <= Math.abs(deltaY)) {
-          return;
-        }
-
-        if (deltaX < 0 && canNavigateNext) {
-          onNavigateNext();
-        }
-
-        if (deltaX > 0 && canNavigatePrevious) {
-          onNavigatePrevious();
-        }
+        display: "flex",
+        flexDirection: "column",
+        gap: useFooterNavigation ? "0.75rem" : 0
       }}
     >
-      {children}
-      <GalleryLightboxEdgeButton
-        direction="previous"
-        enabled={canNavigatePrevious}
-        onClick={onNavigatePrevious}
-      />
-      <GalleryLightboxEdgeButton
-        direction="next"
-        enabled={canNavigateNext}
-        onClick={onNavigateNext}
-      />
+      <div
+        style={{
+          position: "relative",
+          flex: 1,
+          overflow: "hidden",
+          borderRadius: "var(--mantine-radius-md)",
+          background: "var(--mantine-color-dark-9)",
+          touchAction: "pan-y"
+        }}
+        onTouchStart={(event) => {
+          const touch = event.touches[0];
+          if (!touch) {
+            return;
+          }
+          setTouchStart({ x: touch.clientX, y: touch.clientY });
+        }}
+        onTouchEnd={(event) => {
+          if (!touchStart) {
+            return;
+          }
+
+          const touch = event.changedTouches[0];
+          setTouchStart(null);
+          if (!touch) {
+            return;
+          }
+
+          const deltaX = touch.clientX - touchStart.x;
+          const deltaY = touch.clientY - touchStart.y;
+          if (Math.abs(deltaX) < 48 || Math.abs(deltaX) <= Math.abs(deltaY)) {
+            return;
+          }
+
+          if (deltaX < 0 && canNavigateNext) {
+            onNavigateNext();
+          }
+
+          if (deltaX > 0 && canNavigatePrevious) {
+            onNavigatePrevious();
+          }
+        }}
+      >
+        {children}
+        {!useFooterNavigation ? (
+          <>
+            <GalleryLightboxEdgeButton
+              direction="previous"
+              enabled={canNavigatePrevious}
+              onClick={onNavigatePrevious}
+            />
+            <GalleryLightboxEdgeButton
+              direction="next"
+              enabled={canNavigateNext}
+              onClick={onNavigateNext}
+            />
+          </>
+        ) : null}
+      </div>
+      {useFooterNavigation ? (
+        <Group grow wrap="nowrap">
+          <Button
+            variant="default"
+            leftSection={<IconChevronLeft size={16} />}
+            disabled={!canNavigatePrevious}
+            onClick={onNavigatePrevious}
+          >
+            Previous item
+          </Button>
+          <Button
+            variant="default"
+            rightSection={<IconChevronRight size={16} />}
+            disabled={!canNavigateNext}
+            onClick={onNavigateNext}
+          >
+            Next item
+          </Button>
+        </Group>
+      ) : null}
     </div>
   );
 }
