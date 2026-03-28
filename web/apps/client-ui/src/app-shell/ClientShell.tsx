@@ -161,7 +161,7 @@ const pages = [
     id: "gallery" as const,
     label: "Gallery",
     icon: IconPhoto,
-    description: "Browse image objects through the shared media-aware store index."
+    description: "Browse photo and movie objects through the shared media-aware store index."
   },
   {
     id: "cluster" as const,

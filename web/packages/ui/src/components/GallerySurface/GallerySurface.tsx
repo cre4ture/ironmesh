@@ -26,9 +26,10 @@ import {
   IconLayoutGrid,
   IconMap2,
   IconMapPin,
+  IconPlayerPlay,
   IconRefresh
 } from "@tabler/icons-react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   GalleryBasemapMap,
   type GalleryBasemapConfig,
@@ -39,9 +40,12 @@ import { JsonBlock } from "../JsonBlock/JsonBlock";
 export type { GalleryBasemapConfig } from "./GalleryBasemapMap";
 
 type GallerySortOrder = "captured_desc" | "path_asc";
+type GalleryMediaKind = "image" | "video";
+type GalleryMediaFilter = "all" | GalleryMediaKind;
 type GalleryViewMode = "grid" | "map";
 
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
+const videoExtensions = [".m4v", ".mkv", ".mov", ".mp4", ".ogv", ".webm"];
 const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "ironmesh.gallery.thumbnails_per_row";
 const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
@@ -86,9 +90,9 @@ export type GalleryPreviewRequest = {
   headers?: Record<string, string>;
 };
 
-export type GalleryImageRequests = {
-  thumbnail: GalleryPreviewRequest;
-  original?: GalleryPreviewRequest | null;
+export type GalleryMediaRequests = {
+  thumbnail?: GalleryPreviewRequest | null;
+  original: GalleryPreviewRequest;
 };
 
 type GalleryNavigationItem = {
@@ -103,18 +107,20 @@ type GallerySurfaceProps = {
   intro?: string;
   previewHint: string;
   basemaps?: GalleryBasemapConfig[] | null;
+  allowedMediaKinds?: GalleryMediaKind[];
   loadSnapshots: () => Promise<GallerySnapshot[]>;
   loadEntries: (prefix: string, depth: number, snapshotId: string | null) => Promise<GalleryPayload>;
-  getImageRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryImageRequests;
+  getMediaRequests: (entry: GalleryEntry, snapshotId: string | null) => GalleryMediaRequests;
 };
 
 export function GallerySurface({
   intro,
   previewHint,
   basemaps,
+  allowedMediaKinds,
   loadSnapshots,
   loadEntries,
-  getImageRequests
+  getMediaRequests
 }: GallerySurfaceProps) {
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(4);
@@ -127,6 +133,9 @@ export function GallerySurface({
   const [entriesPayload, setEntriesPayload] = useState<GalleryPayload | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [sortOrder, setSortOrder] = useState<GallerySortOrder>("captured_desc");
+  const [mediaFilter, setMediaFilter] = useState<GalleryMediaFilter>(
+    allowedMediaKinds && allowedMediaKinds.length > 1 ? "all" : allowedMediaKinds?.[0] ?? "image"
+  );
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -150,11 +159,19 @@ export function GallerySurface({
     persistMapProjection(activeMapProjection);
   }, [activeMapProjection]);
 
-  const imageEntries = sortGalleryEntries(
-    (entriesPayload?.entries ?? []).filter(isGalleryImageEntry),
+  const enabledMediaKinds: GalleryMediaKind[] = allowedMediaKinds?.length
+    ? [...allowedMediaKinds]
+    : ["image"];
+  const allMediaEntries = sortGalleryEntries(
+    (entriesPayload?.entries ?? []).filter((entry) =>
+      isGalleryMediaEntry(entry, enabledMediaKinds as GalleryMediaKind[])
+    ),
     sortOrder
   );
-  const geotaggedEntries = imageEntries.filter(hasGalleryGpsCoordinates);
+  const mediaEntries = allMediaEntries.filter((entry) =>
+    matchesGalleryMediaFilter(galleryMediaKind(entry), mediaFilter)
+  );
+  const geotaggedEntries = mediaEntries.filter(hasGalleryGpsCoordinates);
   const availableBasemaps = basemaps ?? [];
   const activeBasemap =
     availableBasemaps.find((candidate) => candidate.id === activeBasemapId) ??
@@ -165,18 +182,21 @@ export function GallerySurface({
     entriesPayload?.entries ?? [],
     currentGalleryPrefix
   );
-  const readyCount = imageEntries.filter((entry) => entry.media?.status === "ready").length;
-  const pendingCount = imageEntries.filter((entry) => entry.media?.status === "pending").length;
-  const hiddenOnMapCount = imageEntries.length - geotaggedEntries.length;
+  const readyCount = mediaEntries.filter((entry) => entry.media?.status === "ready").length;
+  const pendingCount = mediaEntries.filter((entry) => entry.media?.status === "pending").length;
+  const imageCount = mediaEntries.filter((entry) => galleryMediaKind(entry) === "image").length;
+  const videoCount = mediaEntries.filter((entry) => galleryMediaKind(entry) === "video").length;
+  const hiddenOnMapCount = mediaEntries.length - geotaggedEntries.length;
   const selectedIndex = selectedPath
-    ? imageEntries.findIndex((entry) => entry.path === selectedPath)
+    ? mediaEntries.findIndex((entry) => entry.path === selectedPath)
     : -1;
-  const selectedEntry = selectedIndex >= 0 ? imageEntries[selectedIndex] ?? null : null;
-  const selectedImageRequests = selectedEntry
-    ? getImageRequests(selectedEntry, snapshotId)
+  const selectedEntry = selectedIndex >= 0 ? mediaEntries[selectedIndex] ?? null : null;
+  const selectedMediaKind = selectedEntry ? galleryMediaKind(selectedEntry) : null;
+  const selectedMediaRequests = selectedEntry
+    ? getMediaRequests(selectedEntry, snapshotId)
     : null;
   const canNavigatePrevious = selectedIndex > 0;
-  const canNavigateNext = selectedIndex >= 0 && selectedIndex < imageEntries.length - 1;
+  const canNavigateNext = selectedIndex >= 0 && selectedIndex < mediaEntries.length - 1;
 
   useEffect(() => {
     persistBasemapId(activeBasemap?.id ?? "");
@@ -196,18 +216,18 @@ export function GallerySurface({
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "ArrowLeft" && canNavigatePrevious) {
         event.preventDefault();
-        setSelectedPath(imageEntries[selectedIndex - 1]?.path ?? null);
+        setSelectedPath(mediaEntries[selectedIndex - 1]?.path ?? null);
       }
 
       if (event.key === "ArrowRight" && canNavigateNext) {
         event.preventDefault();
-        setSelectedPath(imageEntries[selectedIndex + 1]?.path ?? null);
+        setSelectedPath(mediaEntries[selectedIndex + 1]?.path ?? null);
       }
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canNavigateNext, canNavigatePrevious, imageEntries, selectedIndex]);
+  }, [canNavigateNext, canNavigatePrevious, mediaEntries, selectedIndex]);
 
   async function refreshSnapshots() {
     setLoading("snapshots");
@@ -251,11 +271,11 @@ export function GallerySurface({
     }
 
     const nextIndex = selectedIndex + delta;
-    if (nextIndex < 0 || nextIndex >= imageEntries.length) {
+    if (nextIndex < 0 || nextIndex >= mediaEntries.length) {
       return;
     }
 
-    setSelectedPath(imageEntries[nextIndex]?.path ?? null);
+    setSelectedPath(mediaEntries[nextIndex]?.path ?? null);
   }
 
   return (
@@ -328,6 +348,26 @@ export function GallerySurface({
                   setSortOrder(value === "path_asc" ? "path_asc" : "captured_desc")
                 }
               />
+              {enabledMediaKinds.length > 1 ? (
+                <Select
+                  label="Media"
+                  data={[
+                    { value: "all", label: "Photos and movies" },
+                    ...(enabledMediaKinds.includes("image")
+                      ? [{ value: "image", label: "Photos only" }]
+                      : []),
+                    ...(enabledMediaKinds.includes("video")
+                      ? [{ value: "video", label: "Movies only" }]
+                      : [])
+                  ]}
+                  value={mediaFilter}
+                  onChange={(value) => {
+                    setMediaFilter(
+                      value === "image" || value === "video" || value === "all" ? value : "all"
+                    );
+                  }}
+                />
+              ) : null}
               <Group grow>
                 <Button
                   variant={viewMode === "grid" ? "filled" : "default"}
@@ -369,7 +409,19 @@ export function GallerySurface({
                 </Button>
               </Group>
               <Group gap="xs">
-                <Badge variant="light">{imageEntries.length} images</Badge>
+                <Badge variant="light">
+                  {mediaEntries.length} {mediaEntries.length === 1 ? "item" : "items"}
+                </Badge>
+                {imageCount > 0 ? (
+                  <Badge color="blue" variant="light">
+                    {imageCount} {imageCount === 1 ? "photo" : "photos"}
+                  </Badge>
+                ) : null}
+                {videoCount > 0 ? (
+                  <Badge color="violet" variant="light">
+                    {videoCount} {videoCount === 1 ? "movie" : "movies"}
+                  </Badge>
+                ) : null}
                 <Badge color="grape" variant="light">
                   {geotaggedEntries.length} geo-tagged
                 </Badge>
@@ -422,10 +474,11 @@ export function GallerySurface({
               {geotaggedEntries.length === 0 ? (
                 <Card withBorder radius="md" padding="xl">
                   <Stack gap="xs" align="center">
-                    <Text fw={700}>No geo-tagged images in view</Text>
+                    <Text fw={700}>No geo-tagged media in view</Text>
                     <Text c="dimmed" ta="center">
-                      The current gallery scope has {imageEntries.length} image
-                      {imageEntries.length === 1 ? "" : "s"}, but none with GPS coordinates yet.
+                      The current gallery scope has {mediaEntries.length} media
+                      {mediaEntries.length === 1 ? " item" : " items"}, but none with GPS
+                      coordinates yet.
                     </Text>
                   </Stack>
                 </Card>
@@ -439,17 +492,18 @@ export function GallerySurface({
                   entries={geotaggedEntries}
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selectedPath}
-                  getMarkerRequest={(entry) => getImageRequests(entry, snapshotId).thumbnail}
+                  getMarkerRequest={(entry) => getMediaRequests(entry, snapshotId).thumbnail ?? null}
                   onSelectPath={setSelectedPath}
                 />
               )}
             </Stack>
-          ) : imageEntries.length === 0 && navigationItems.length === 0 ? (
+          ) : mediaEntries.length === 0 && navigationItems.length === 0 ? (
             <Card withBorder radius="md" padding="xl">
               <Stack gap="xs" align="center">
-                <Text fw={700}>No image objects in view</Text>
+                <Text fw={700}>No media objects in view</Text>
                 <Text c="dimmed" ta="center">
-                  Load a different prefix or increase the depth to include nested image keys.
+                  Load a different prefix or increase the depth to include nested photo or movie
+                  keys.
                 </Text>
               </Stack>
             </Card>
@@ -495,8 +549,9 @@ export function GallerySurface({
                 </Card>
               ))}
 
-              {imageEntries.map((entry) => {
-                const imageRequests = getImageRequests(entry, snapshotId);
+              {mediaEntries.map((entry) => {
+                const mediaRequests = getMediaRequests(entry, snapshotId);
+                const mediaKind = galleryMediaKind(entry) ?? "image";
                 return (
                   <Card
                     key={entry.path}
@@ -508,10 +563,10 @@ export function GallerySurface({
                   >
                     <Card.Section>
                       <AspectRatio ratio={1}>
-                        <GalleryImagePreview
-                          request={imageRequests.thumbnail}
+                        <GalleryGridPreview
+                          kind={mediaKind}
+                          request={mediaRequests.thumbnail ?? null}
                           alt={entry.path}
-                          fit="cover"
                         />
                       </AspectRatio>
                     </Card.Section>
@@ -527,6 +582,9 @@ export function GallerySurface({
                       </Group>
                       <Code>{entry.path}</Code>
                       <Group gap={6}>
+                        <Badge color={mediaKind === "video" ? "violet" : "blue"} variant="dot">
+                          {mediaKind === "video" ? "movie" : "photo"}
+                        </Badge>
                         {entry.media?.width && entry.media?.height ? (
                           <Badge variant="dot">
                             {entry.media.width} x {entry.media.height}
@@ -556,8 +614,8 @@ export function GallerySurface({
         onClose={() => setSelectedPath(null)}
         title={
           selectedEntry
-            ? `${fileName(selectedEntry.path)} (${selectedIndex + 1} of ${imageEntries.length})`
-            : "Image preview"
+            ? `${fileName(selectedEntry.path)} (${selectedIndex + 1} of ${mediaEntries.length})`
+            : "Media preview"
         }
         fullScreen
         styles={{
@@ -566,21 +624,36 @@ export function GallerySurface({
           }
         }}
       >
-        {selectedEntry && selectedImageRequests ? (
+        {selectedEntry && selectedMediaRequests && selectedMediaKind ? (
           <Stack gap="md">
             <div style={{ height: "calc(100vh - 17rem)", minHeight: "24rem" }}>
-              <GalleryLightboxImage
-                requests={selectedImageRequests}
-                alt={selectedEntry.path}
-                canNavigatePrevious={canNavigatePrevious}
-                canNavigateNext={canNavigateNext}
-                onNavigatePrevious={() => showRelativeEntry(-1)}
-                onNavigateNext={() => showRelativeEntry(1)}
-              />
+              {selectedMediaKind === "video" ? (
+                <GalleryLightboxVideo
+                  request={selectedMediaRequests.original}
+                  posterRequest={selectedMediaRequests.thumbnail ?? null}
+                  alt={selectedEntry.path}
+                  canNavigatePrevious={canNavigatePrevious}
+                  canNavigateNext={canNavigateNext}
+                  onNavigatePrevious={() => showRelativeEntry(-1)}
+                  onNavigateNext={() => showRelativeEntry(1)}
+                />
+              ) : (
+                <GalleryLightboxImage
+                  requests={selectedMediaRequests}
+                  alt={selectedEntry.path}
+                  canNavigatePrevious={canNavigatePrevious}
+                  canNavigateNext={canNavigateNext}
+                  onNavigatePrevious={() => showRelativeEntry(-1)}
+                  onNavigateNext={() => showRelativeEntry(1)}
+                />
+              )}
             </div>
             <Group gap="xs">
               <Badge variant="light">
-                {selectedIndex + 1} / {imageEntries.length}
+                {selectedIndex + 1} / {mediaEntries.length}
+              </Badge>
+              <Badge color={selectedMediaKind === "video" ? "violet" : "blue"} variant="light">
+                {selectedMediaKind === "video" ? "movie" : "photo"}
               </Badge>
               <Badge color={mediaStatusColor(selectedEntry.media?.status)} variant="light">
                 {selectedEntry.media?.status ?? "uncached"}
@@ -618,7 +691,7 @@ type GalleryMapPanelProps = {
   entries: GalleryEntry[];
   hiddenOnMapCount: number;
   selectedPath: string | null;
-  getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest;
+  getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
   onSelectPath: (path: string) => void;
 };
 
@@ -701,7 +774,7 @@ type GalleryWorldMapProps = {
   entries: GalleryEntry[];
   hiddenOnMapCount: number;
   selectedPath: string | null;
-  getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest;
+  getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
   onSelectPath: (path: string) => void;
 };
 
@@ -719,7 +792,7 @@ function GalleryWorldMap({
           <div>
             <Text fw={700}>Geo-tagged world map</Text>
             <Text size="sm" c="dimmed">
-              Click a thumbnail marker to open the fullscreen image viewer.
+              Click a marker to open the fullscreen media viewer.
             </Text>
           </div>
           <Group gap="xs">
@@ -873,7 +946,7 @@ function GalleryWorldMap({
 
 type GalleryMapMarkerProps = {
   entry: GalleryEntry;
-  request: GalleryPreviewRequest;
+  request: GalleryPreviewRequest | null;
   projectedX: number;
   projectedY: number;
   selected: boolean;
@@ -889,7 +962,7 @@ function GalleryMapMarker({
   onClick
 }: GalleryMapMarkerProps) {
   const [imageFailed, setImageFailed] = useState(false);
-  const { resolvedSrc, failed } = useResolvedImageRequest(request);
+  const { resolvedSrc, failed } = useResolvedPreviewRequest(request);
   const signature = requestSignature(request);
   const gps = entry.media?.gps;
 
@@ -958,7 +1031,7 @@ type GalleryImagePreviewProps = {
 
 function GalleryImagePreview({ request, alt, fit }: GalleryImagePreviewProps) {
   const [imageFailed, setImageFailed] = useState(false);
-  const { resolvedSrc, failed: requestFailed } = useResolvedImageRequest(request);
+  const { resolvedSrc, failed: requestFailed } = useResolvedPreviewRequest(request);
   const signature = requestSignature(request);
 
   useEffect(() => {
@@ -1000,8 +1073,60 @@ function GalleryImagePreview({ request, alt, fit }: GalleryImagePreviewProps) {
   );
 }
 
+type GalleryGridPreviewProps = {
+  kind: GalleryMediaKind;
+  request: GalleryPreviewRequest | null;
+  alt: string;
+};
+
+function GalleryGridPreview({ kind, request, alt }: GalleryGridPreviewProps) {
+  if (!request) {
+    return (
+      <Center
+        style={{
+          width: "100%",
+          height: "100%",
+          background:
+            kind === "video"
+              ? "linear-gradient(180deg, rgba(30, 41, 59, 1) 0%, rgba(15, 23, 42, 1) 100%)"
+              : "var(--mantine-color-gray-0)"
+        }}
+      >
+        <Text size="sm" c={kind === "video" ? "gray.4" : "dimmed"}>
+          {kind === "video" ? "Movie preview" : "Preview unavailable"}
+        </Text>
+      </Center>
+    );
+  }
+
+  if (kind === "video") {
+    return (
+      <div style={{ position: "relative", width: "100%", height: "100%" }}>
+        <GalleryImagePreview request={request} alt={alt} fit="cover" />
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "linear-gradient(180deg, rgba(0, 0, 0, 0.02), rgba(0, 0, 0, 0.34))",
+            pointerEvents: "none"
+          }}
+        >
+          <ThemeIcon size={56} radius="xl" color="dark" variant="filled">
+            <IconPlayerPlay size={28} />
+          </ThemeIcon>
+        </div>
+      </div>
+    );
+  }
+
+  return <GalleryImagePreview request={request} alt={alt} fit="cover" />;
+}
+
 type GalleryLightboxImageProps = {
-  requests: GalleryImageRequests;
+  requests: GalleryMediaRequests;
   alt: string;
   canNavigatePrevious: boolean;
   canNavigateNext: boolean;
@@ -1017,17 +1142,17 @@ function GalleryLightboxImage({
   onNavigatePrevious,
   onNavigateNext
 }: GalleryLightboxImageProps) {
-  const thumbnail = useResolvedImageRequest(requests.thumbnail);
+  const thumbnailRequest = requests.thumbnail ?? requests.original;
+  const thumbnail = useResolvedPreviewRequest(thumbnailRequest);
   const originalRequest =
-    requests.original && !sameImageRequest(requests.thumbnail, requests.original)
+    requests.original && !sameImageRequest(thumbnailRequest, requests.original)
       ? requests.original
       : null;
-  const original = useResolvedImageRequest(originalRequest);
+  const original = useResolvedPreviewRequest(originalRequest);
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const [originalFailed, setOriginalFailed] = useState(false);
   const [originalLoaded, setOriginalLoaded] = useState(false);
-  const [touchStart, setTouchStart] = useState<{ x: number; y: number } | null>(null);
-  const thumbnailSignature = requestSignature(requests.thumbnail);
+  const thumbnailSignature = requestSignature(thumbnailRequest);
   const originalSignature = requestSignature(originalRequest);
   const showingOriginal = Boolean(originalRequest);
 
@@ -1046,48 +1171,11 @@ function GalleryLightboxImage({
   const originalPending = showingOriginal && !fullImageUnavailable && !originalLoaded;
 
   return (
-    <div
-      style={{
-        position: "relative",
-        width: "100%",
-        height: "100%",
-        overflow: "hidden",
-        borderRadius: "var(--mantine-radius-md)",
-        background: "var(--mantine-color-dark-9)",
-        touchAction: "pan-y"
-      }}
-      onTouchStart={(event) => {
-        const touch = event.touches[0];
-        if (!touch) {
-          return;
-        }
-        setTouchStart({ x: touch.clientX, y: touch.clientY });
-      }}
-      onTouchEnd={(event) => {
-        if (!touchStart) {
-          return;
-        }
-
-        const touch = event.changedTouches[0];
-        setTouchStart(null);
-        if (!touch) {
-          return;
-        }
-
-        const deltaX = touch.clientX - touchStart.x;
-        const deltaY = touch.clientY - touchStart.y;
-        if (Math.abs(deltaX) < 48 || Math.abs(deltaX) <= Math.abs(deltaY)) {
-          return;
-        }
-
-        if (deltaX < 0 && canNavigateNext) {
-          onNavigateNext();
-        }
-
-        if (deltaX > 0 && canNavigatePrevious) {
-          onNavigatePrevious();
-        }
-      }}
+    <GalleryLightboxFrame
+      canNavigatePrevious={canNavigatePrevious}
+      canNavigateNext={canNavigateNext}
+      onNavigatePrevious={onNavigatePrevious}
+      onNavigateNext={onNavigateNext}
     >
       {thumbnailVisible ? (
         <img
@@ -1170,7 +1258,138 @@ function GalleryLightboxImage({
           </Badge>
         </div>
       ) : null}
+    </GalleryLightboxFrame>
+  );
+}
 
+type GalleryLightboxVideoProps = {
+  request: GalleryPreviewRequest;
+  posterRequest: GalleryPreviewRequest | null;
+  alt: string;
+  canNavigatePrevious: boolean;
+  canNavigateNext: boolean;
+  onNavigatePrevious: () => void;
+  onNavigateNext: () => void;
+};
+
+function GalleryLightboxVideo({
+  request,
+  posterRequest,
+  alt,
+  canNavigatePrevious,
+  canNavigateNext,
+  onNavigatePrevious,
+  onNavigateNext
+}: GalleryLightboxVideoProps) {
+  const video = useResolvedPreviewRequest(request);
+  const poster = useResolvedPreviewRequest(posterRequest);
+
+  return (
+    <GalleryLightboxFrame
+      canNavigatePrevious={canNavigatePrevious}
+      canNavigateNext={canNavigateNext}
+      onNavigatePrevious={onNavigatePrevious}
+      onNavigateNext={onNavigateNext}
+    >
+      {video.resolvedSrc ? (
+        <video
+          key={requestSignature(request)}
+          src={video.resolvedSrc}
+          poster={poster.resolvedSrc ?? undefined}
+          controls
+          playsInline
+          preload="metadata"
+          aria-label={alt}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            background: "var(--mantine-color-dark-9)"
+          }}
+        />
+      ) : (
+        <Center
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: "var(--mantine-color-dark-9)"
+          }}
+        >
+          {video.failed ? (
+            <Badge color="yellow" variant="filled">
+              Movie unavailable
+            </Badge>
+          ) : (
+            <Loader size="sm" color="gray" />
+          )}
+        </Center>
+      )}
+    </GalleryLightboxFrame>
+  );
+}
+
+type GalleryLightboxFrameProps = {
+  children: ReactNode;
+  canNavigatePrevious: boolean;
+  canNavigateNext: boolean;
+  onNavigatePrevious: () => void;
+  onNavigateNext: () => void;
+};
+
+function GalleryLightboxFrame({
+  children,
+  canNavigatePrevious,
+  canNavigateNext,
+  onNavigatePrevious,
+  onNavigateNext
+}: GalleryLightboxFrameProps) {
+  const [touchStart, setTouchStart] = useState<{ x: number; y: number } | null>(null);
+
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: "100%",
+        height: "100%",
+        overflow: "hidden",
+        borderRadius: "var(--mantine-radius-md)",
+        background: "var(--mantine-color-dark-9)",
+        touchAction: "pan-y"
+      }}
+      onTouchStart={(event) => {
+        const touch = event.touches[0];
+        if (!touch) {
+          return;
+        }
+        setTouchStart({ x: touch.clientX, y: touch.clientY });
+      }}
+      onTouchEnd={(event) => {
+        if (!touchStart) {
+          return;
+        }
+
+        const touch = event.changedTouches[0];
+        setTouchStart(null);
+        if (!touch) {
+          return;
+        }
+
+        const deltaX = touch.clientX - touchStart.x;
+        const deltaY = touch.clientY - touchStart.y;
+        if (Math.abs(deltaX) < 48 || Math.abs(deltaX) <= Math.abs(deltaY)) {
+          return;
+        }
+
+        if (deltaX < 0 && canNavigateNext) {
+          onNavigateNext();
+        }
+
+        if (deltaX > 0 && canNavigatePrevious) {
+          onNavigatePrevious();
+        }
+      }}
+    >
+      {children}
       <GalleryLightboxEdgeButton
         direction="previous"
         enabled={canNavigatePrevious}
@@ -1201,7 +1420,7 @@ function GalleryLightboxEdgeButton({
   return (
     <button
       type="button"
-      aria-label={isPrevious ? "Previous image" : "Next image"}
+      aria-label={isPrevious ? "Previous item" : "Next item"}
       onClick={onClick}
       disabled={!enabled}
       style={{
@@ -1228,7 +1447,7 @@ function GalleryLightboxEdgeButton({
   );
 }
 
-function useResolvedImageRequest(
+function useResolvedPreviewRequest(
   request: GalleryPreviewRequest | null | undefined
 ): { resolvedSrc: string | null; failed: boolean } {
   const [failed, setFailed] = useState(false);
@@ -1292,21 +1511,51 @@ function useResolvedImageRequest(
   return { resolvedSrc, failed };
 }
 
-function isGalleryImageEntry(entry: GalleryEntry): boolean {
+function galleryMediaKind(entry: GalleryEntry): GalleryMediaKind | null {
   if (entry.entry_type !== "key") {
-    return false;
+    return null;
   }
 
   if (entry.media?.mime_type?.startsWith("image/")) {
-    return true;
+    return "image";
+  }
+
+  if (entry.media?.mime_type?.startsWith("video/")) {
+    return "video";
   }
 
   if (entry.media?.media_type === "image") {
-    return true;
+    return "image";
+  }
+
+  if (entry.media?.media_type === "video") {
+    return "video";
   }
 
   const lowerPath = entry.path.toLowerCase();
-  return imageExtensions.some((extension) => lowerPath.endsWith(extension));
+  if (imageExtensions.some((extension) => lowerPath.endsWith(extension))) {
+    return "image";
+  }
+  if (videoExtensions.some((extension) => lowerPath.endsWith(extension))) {
+    return "video";
+  }
+  return null;
+}
+
+function isGalleryMediaEntry(entry: GalleryEntry, allowedKinds: GalleryMediaKind[]): boolean {
+  const kind = galleryMediaKind(entry);
+  return kind !== null && allowedKinds.includes(kind);
+}
+
+function matchesGalleryMediaFilter(
+  kind: GalleryMediaKind | null,
+  filter: GalleryMediaFilter
+): boolean {
+  if (kind === null) {
+    return false;
+  }
+
+  return filter === "all" ? true : kind === filter;
 }
 
 function isGalleryPrefixEntry(entry: GalleryEntry): boolean {

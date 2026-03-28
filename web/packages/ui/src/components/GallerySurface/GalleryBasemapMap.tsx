@@ -73,7 +73,7 @@ type GalleryBasemapMapProps = {
   entries: GalleryBasemapMapEntry[];
   hiddenOnMapCount: number;
   selectedPath: string | null;
-  getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest;
+  getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
   onSelectPath: (path: string) => void;
   fallback: ReactNode;
 };
@@ -472,7 +472,7 @@ export function GalleryBasemapMap({
 
 type GalleryBasemapMarkerProps = {
   entry: GalleryBasemapMapEntry;
-  request: GalleryBasemapPreviewRequest;
+  request: GalleryBasemapPreviewRequest | null;
   left: number;
   top: number;
   selected: boolean;

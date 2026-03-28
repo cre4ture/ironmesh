@@ -2,7 +2,7 @@ import { listAdminSnapshots, listAdminStoreEntries } from "@ironmesh/api";
 import {
   GallerySurface,
   type GalleryEntry,
-  type GalleryImageRequests
+  type GalleryMediaRequests
 } from "@ironmesh/ui";
 import { useCallback } from "react";
 import { useAdminAccess } from "../lib/admin-access";
@@ -24,8 +24,8 @@ export function GalleryPage() {
       listAdminStoreEntries(prefix, depth, snapshotId, adminTokenOverride),
     [adminTokenOverride]
   );
-  const getImageRequests = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null): GalleryImageRequests => ({
+  const getMediaRequests = useCallback(
+    (entry: GalleryEntry, snapshotId: string | null): GalleryMediaRequests => ({
       thumbnail: {
         url: entry.media?.thumbnail?.url || adminBinaryObjectUrl(entry.path, snapshotId),
         headers: previewHeaders
@@ -44,7 +44,7 @@ export function GalleryPage() {
       previewHint="Admin thumbnail URLs are preferred when indexed media is ready, with authenticated full-object fetches as a fallback."
       loadSnapshots={loadSnapshots}
       loadEntries={loadEntries}
-      getImageRequests={getImageRequests}
+      getMediaRequests={getMediaRequests}
     />
   );
 }

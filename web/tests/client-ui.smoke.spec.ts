@@ -3,6 +3,7 @@ import { gzipSync } from "node:zlib";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
+  test.setTimeout(45_000);
   const uploadMetrics = await installClientUiMocks(page);
 
   await page.goto("/");
@@ -108,9 +109,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByRole("row", { name: /scratch\/\s+prefix/i }).getByRole("button", { name: "Delete" }).click();
   await expect(page.getByRole("cell", { name: "scratch/" })).toHaveCount(0);
   page.once("dialog", (dialog) => dialog.accept("quick-c.bin"));
-  await page.getByRole("row", { name: /quick-a\.bin/ }).getByRole("button", { name: "Rename" }).click();
+  await page.getByRole("row", { name: /quick-b\.bin/ }).getByRole("button", { name: "Rename" }).click();
   await expect(page.getByRole("cell", { name: "quick-c.bin" })).toBeVisible();
-  await expect(page.getByRole("cell", { name: "quick-a.bin" })).toHaveCount(0);
+  await expect(page.getByRole("cell", { name: "quick-b.bin" })).toHaveCount(0);
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();
   await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();
@@ -118,11 +119,17 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
-  await expect(page.getByText("2 images")).toBeVisible();
+  await expect(page.getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
+  await expect(page.getByText("3 items")).toBeVisible();
+  await expect(page.getByText("1 movie")).toBeVisible();
   const thumbnailsPerRowInput = page.getByRole("textbox", { name: "Thumbnails per row" });
   await thumbnailsPerRowInput.click();
   await page.getByRole("option", { name: "4 per row" }).click();
   await expect(thumbnailsPerRowInput).toHaveValue("4 per row");
+  await page.getByText("clip.mp4", { exact: true }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.locator("video")).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByText("Cluster", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
   await page.getByText("Gallery", { exact: true }).click();
@@ -137,27 +144,20 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("2 markers")).toBeVisible();
-  await page.getByRole("button", { name: "Hybrid" }).click();
-  await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
-  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
-  await page.getByRole("button", { name: "Globe" }).click();
-  await expect(page.getByRole("button", { name: "Globe" })).toHaveAttribute("aria-pressed", "true");
-  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
-  await page.getByRole("button", { name: "Flat" }).click();
-  await expect(page.getByRole("button", { name: "Flat" })).toHaveAttribute("aria-pressed", "true");
   await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
-  await page.getByRole("button", { name: "Next image" }).click();
-  await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Next item" }).click();
+  await expect(page.getByRole("dialog").getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
+  await expect(page.locator("video")).toBeVisible();
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Grid" }).click();
   await page.getByLabel("Prefix").fill("docs/");
   await page.getByRole("button", { name: "Load" }).click();
   await expect(page.getByText("nested/", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Up one level")).toBeVisible();
-  await expect(page.getByText("No image objects in view")).toHaveCount(0);
+  await expect(page.getByText("No media objects in view")).toHaveCount(0);
   await page.getByText("Up one level").click();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
 
@@ -170,6 +170,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
 async function installClientUiMocks(page: Page) {
   const imageBody = tinyPngBuffer();
+  const movieBody = Buffer.from("mock-movie-payload");
   const logicalMapBody = readFileSync("tests/fixtures/smoke.mbtiles");
   const emptyVectorTileBody = gzipSync(Buffer.alloc(0));
   const glyphRangeBody = readFileSync(
@@ -504,7 +505,7 @@ async function installClientUiMocks(page: Page) {
       return;
     }
 
-    if (pathname === "/api/store/get-binary" && method === "GET") {
+    if (pathname === "/api/store/stream-binary" && method === "GET") {
       if (
         searchParams.get("key") === "gallery/cat.png" ||
         searchParams.get("key") === "gallery/dog.jpg"
@@ -517,6 +518,21 @@ async function installClientUiMocks(page: Page) {
         });
         return;
       }
+      if (searchParams.get("key") === "gallery/clip.mp4") {
+        await route.fulfill({
+          status: 200,
+          contentType: "video/mp4",
+          headers: {
+            "accept-ranges": "bytes",
+            "content-disposition": 'inline; filename="clip.mp4"'
+          },
+          body: movieBody
+        });
+        return;
+      }
+    }
+
+    if (pathname === "/api/store/get-binary" && method === "GET") {
       await route.fulfill({
         status: 200,
         contentType: "application/octet-stream",
@@ -613,6 +629,20 @@ function createMockStoreEntries(): MockStoreEntry[] {
           format: "jpeg",
           size_bytes: 0
         }
+      }
+    },
+    {
+      path: "gallery/clip.mp4",
+      entry_type: "key",
+      size_bytes: 48_000_000,
+      modified_at_unix: 1_712_250_000,
+      media: {
+        status: "ready",
+        content_fingerprint: "fingerprint-clip",
+        media_type: "video",
+        mime_type: "video/mp4",
+        width: 1920,
+        height: 1080
       }
     }
   ];

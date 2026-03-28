@@ -1,10 +1,10 @@
-import { listSnapshots, listStoreEntries } from "@ironmesh/api";
+import { getBinaryObjectStreamUrl, listSnapshots, listStoreEntries } from "@ironmesh/api";
 import {
   GallerySurface,
   PageHeader,
   type GalleryBasemapConfig,
   type GalleryEntry,
-  type GalleryImageRequests
+  type GalleryMediaRequests
 } from "@ironmesh/ui";
 import { useCallback } from "react";
 
@@ -56,13 +56,19 @@ export function GalleryPage() {
       listStoreEntries(prefix, depth, snapshotId),
     []
   );
-  const getImageRequests = useCallback(
-    (entry: GalleryEntry, snapshotId: string | null): GalleryImageRequests => ({
-      thumbnail: {
-        url: entry.media?.thumbnail?.url || binaryObjectUrl(entry.path, snapshotId)
-      },
+  const getMediaRequests = useCallback(
+    (entry: GalleryEntry, snapshotId: string | null): GalleryMediaRequests => ({
+      thumbnail: entry.media?.thumbnail?.url
+        ? {
+            url: entry.media.thumbnail.url
+          }
+        : entry.media?.media_type === "video" || entry.media?.mime_type?.startsWith("video/")
+          ? null
+          : {
+              url: binaryMediaUrl(entry.path, snapshotId)
+            },
       original: {
-        url: binaryObjectUrl(entry.path, snapshotId)
+        url: binaryMediaUrl(entry.path, snapshotId)
       }
     }),
     []
@@ -72,25 +78,22 @@ export function GalleryPage() {
     <>
       <PageHeader
         title="Gallery"
-        description="A first shared web gallery surface for browsing image objects through the client web backend."
+        description="Browse photo and movie objects through the client web backend with shared media-aware gallery tooling."
       />
       <GallerySurface
-        previewHint="Thumbnail URLs are used when the media index provides them, with full-object downloads as a fallback."
+        previewHint="Thumbnail URLs are used when indexed media is ready, and original images or movies fall back to the inline stream route when needed."
+        allowedMediaKinds={["image", "video"]}
         basemaps={CLIENT_GALLERY_BASEMAPS}
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
-        getImageRequests={getImageRequests}
+        getMediaRequests={getMediaRequests}
       />
     </>
   );
 }
 
-function binaryObjectUrl(key: string, snapshotId: string | null): string {
-  const query = new URLSearchParams({ key });
-  if (snapshotId) {
-    query.set("snapshot", snapshotId);
-  }
-  return `/api/store/get-binary?${query.toString()}`;
+function binaryMediaUrl(key: string, snapshotId: string | null): string {
+  return getBinaryObjectStreamUrl(key, snapshotId);
 }
 
 function logicalMapFileUrl(manifestKey: string): string {
