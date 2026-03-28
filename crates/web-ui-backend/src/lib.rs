@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -30,6 +31,37 @@ const BACKEND_REVISION: &str =
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 
 mod mbtiles;
+
+#[derive(Clone, Default)]
+struct RequestCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RequestCancellation {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    fn guard(&self) -> RequestCancellationGuard {
+        RequestCancellationGuard {
+            cancelled: Arc::clone(&self.cancelled),
+        }
+    }
+}
+
+struct RequestCancellationGuard {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for RequestCancellationGuard {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
 
 pub mod assets {
     mod generated_assets {
@@ -971,11 +1003,13 @@ async fn download_object_range_bytes(
     start: u64,
     length: u64,
     perf_logging_enabled: bool,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
         let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
+        let should_cancel = || cancelled.load(Ordering::Relaxed);
         sdk.download_range_to_writer_with_progress_blocking(
             DownloadRangeRequest {
                 key: key.as_str(),
@@ -986,7 +1020,7 @@ async fn download_object_range_bytes(
             },
             &mut body,
             &mut on_progress,
-            &|| false,
+            &should_cancel,
         )
         .with_context(|| {
             format!(
@@ -1202,6 +1236,8 @@ async fn web_map_logical_file(
     headers: HeaderMap,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
+    let request_cancellation = RequestCancellation::new();
+    let _request_cancellation_guard = request_cancellation.guard();
     let started = Instant::now();
     if query.manifest_key.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "manifest_key must not be empty");
@@ -1332,6 +1368,7 @@ async fn web_map_logical_file(
             local_start,
             segment_length,
             state.map_perf_logging_enabled,
+            request_cancellation.flag(),
         )
         .await
         {
@@ -1377,6 +1414,8 @@ async fn web_map_xyz_tile(
     Path((z, x, y)): Path<(u32, u32, u32)>,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
+    let request_cancellation = RequestCancellation::new();
+    let _request_cancellation_guard = request_cancellation.guard();
     let started = Instant::now();
     if query.manifest_key.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1387,7 +1426,11 @@ async fn web_map_xyz_tile(
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
 
-    let tile_lookup = tokio::task::spawn_blocking(move || source.lookup_tile(z, x, y)).await;
+    let tile_lookup = tokio::task::spawn_blocking({
+        let cancelled = request_cancellation.flag();
+        move || source.lookup_tile_with_cancellation(z, x, y, cancelled)
+    })
+    .await;
     let tile = match tile_lookup {
         Ok(Ok(Some(tile))) => tile,
         Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
@@ -1421,6 +1464,8 @@ async fn web_map_vector_tile(
     Path((z, x, y)): Path<(u32, u32, u32)>,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
+    let request_cancellation = RequestCancellation::new();
+    let _request_cancellation_guard = request_cancellation.guard();
     let started = Instant::now();
     if query.manifest_key.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1431,7 +1476,11 @@ async fn web_map_vector_tile(
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
 
-    let tile_lookup = tokio::task::spawn_blocking(move || source.lookup_vector_tile(z, x, y)).await;
+    let tile_lookup = tokio::task::spawn_blocking({
+        let cancelled = request_cancellation.flag();
+        move || source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
+    })
+    .await;
     let tile = match tile_lookup {
         Ok(Ok(Some(tile))) => tile,
         Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),

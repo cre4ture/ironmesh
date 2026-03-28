@@ -826,6 +826,45 @@ struct InflightRelayRequest {
     expected_responder: transport_sdk::PeerIdentity,
 }
 
+struct SubmitAwaitCleanup {
+    inner: Arc<RelayBrokerInner>,
+    request_id: String,
+    active: bool,
+}
+
+impl SubmitAwaitCleanup {
+    fn new(inner: Arc<RelayBrokerInner>, request_id: String) -> Self {
+        Self {
+            inner,
+            request_id,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for SubmitAwaitCleanup {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        let inner = self.inner.clone();
+        let request_id = self.request_id.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let mut state = inner.state.lock().await;
+            state.inflight.remove(&request_id);
+            remove_pending_request(&mut state.pending_by_target, &request_id);
+        });
+    }
+}
+
 impl RelayBroker {
     fn new() -> Self {
         Self::default()
@@ -878,17 +917,26 @@ impl RelayBroker {
             );
         }
         self.inner.notify.notify_waiters();
+        let mut cleanup = SubmitAwaitCleanup::new(self.inner.clone(), request_id.clone());
 
         match tokio::time::timeout(Duration::from_secs(wait_timeout), rx).await {
             Ok(Ok(response)) => {
+                cleanup.disarm();
                 response.validate()?;
                 Ok(response)
             }
-            Ok(Err(_)) => Err(anyhow!("relay response channel closed before completion")),
+            Ok(Err(_)) => {
+                let mut state = self.inner.state.lock().await;
+                state.inflight.remove(&request_id);
+                remove_pending_request(&mut state.pending_by_target, &request_id);
+                cleanup.disarm();
+                Err(anyhow!("relay response channel closed before completion"))
+            }
             Err(_) => {
                 let mut state = self.inner.state.lock().await;
                 state.inflight.remove(&request_id);
                 remove_pending_request(&mut state.pending_by_target, &request_id);
+                cleanup.disarm();
                 bail!("timed out waiting for relayed HTTP response")
             }
         }
@@ -992,4 +1040,58 @@ fn unix_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use transport_sdk::peer::PeerIdentity;
+
+    #[tokio::test]
+    async fn relay_broker_removes_pending_request_when_submitter_is_dropped() {
+        let broker = RelayBroker::new();
+        let cluster_id = uuid::Uuid::now_v7();
+        let source = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let now = unix_ts();
+        let ticket = RelayTicket {
+            cluster_id,
+            session_id: uuid::Uuid::now_v7().to_string(),
+            source,
+            target: target.clone(),
+            relay_urls: vec!["https://relay.example".to_string()],
+            issued_at_unix: now,
+            expires_at_unix: now + 60,
+        };
+
+        let broker_for_submit = broker.clone();
+        let submit = tokio::spawn(async move {
+            broker_for_submit
+                .submit_and_await(RelayHttpRequest {
+                    ticket,
+                    request_id: "req-drop".to_string(),
+                    method: "GET".to_string(),
+                    path_and_query: "/health".to_string(),
+                    headers: Vec::new(),
+                    body_base64: None,
+                })
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        submit.abort();
+        let _ = submit.await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let pending = broker
+            .poll(RelayHttpPollRequest {
+                cluster_id,
+                target,
+                wait_timeout_ms: Some(50),
+            })
+            .await
+            .expect("relay poll should succeed")
+            .request;
+        assert!(pending.is_none(), "abandoned request should be removed");
+    }
 }

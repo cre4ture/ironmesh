@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Error, ErrorKind};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -21,6 +21,8 @@ static NEXT_VFS_ID: AtomicU64 = AtomicU64::new(1);
 
 std::thread_local! {
     static ACTIVE_TILE_LOOKUP_PERF_STATS: RefCell<Option<Rc<RefCell<MbtilesTileLookupPerfStats>>>> =
+        RefCell::new(None);
+    static ACTIVE_TILE_LOOKUP_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> =
         RefCell::new(None);
 }
 
@@ -65,6 +67,30 @@ impl Drop for ActiveTileLookupPerfGuard {
     }
 }
 
+struct ActiveTileLookupCancellationGuard {
+    previous: Option<Arc<AtomicBool>>,
+}
+
+impl ActiveTileLookupCancellationGuard {
+    fn install(current: Option<Arc<AtomicBool>>) -> ActiveTileLookupCancellationGuard {
+        let previous = ACTIVE_TILE_LOOKUP_CANCELLATION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let previous = slot.take();
+            *slot = current;
+            previous
+        });
+        ActiveTileLookupCancellationGuard { previous }
+    }
+}
+
+impl Drop for ActiveTileLookupCancellationGuard {
+    fn drop(&mut self) {
+        ACTIVE_TILE_LOOKUP_CANCELLATION.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
 fn record_active_tile_lookup_perf_stats(update: impl FnOnce(&mut MbtilesTileLookupPerfStats)) {
     ACTIVE_TILE_LOOKUP_PERF_STATS.with(|slot| {
         let stats = slot.borrow().as_ref().cloned();
@@ -72,6 +98,29 @@ fn record_active_tile_lookup_perf_stats(update: impl FnOnce(&mut MbtilesTileLook
             update(&mut stats.borrow_mut());
         }
     });
+}
+
+fn active_tile_lookup_is_cancelled() -> bool {
+    ACTIVE_TILE_LOOKUP_CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|cancelled| cancelled.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    })
+}
+
+fn ensure_active_tile_lookup_not_cancelled() -> Result<(), Error> {
+    if active_tile_lookup_is_cancelled() {
+        return Err(Error::new(
+            ErrorKind::Interrupted,
+            "logical MBTiles tile lookup canceled",
+        ));
+    }
+    Ok(())
+}
+
+fn canceled_anyhow(message: &'static str) -> anyhow::Error {
+    anyhow::Error::new(Error::new(ErrorKind::Interrupted, message))
 }
 
 #[derive(Clone, Debug)]
@@ -147,9 +196,25 @@ impl LogicalMbtilesSource {
         &self.metadata
     }
 
-    pub(crate) fn lookup_tile(&self, zoom: u32, x: u32, y_xyz: u32) -> Result<Option<TilePayload>> {
+    pub(crate) fn lookup_tile_with_cancellation(
+        &self,
+        zoom: u32,
+        x: u32,
+        y_xyz: u32,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Option<TilePayload>> {
+        self.lookup_tile_with_optional_cancellation(zoom, x, y_xyz, Some(cancelled))
+    }
+
+    fn lookup_tile_with_optional_cancellation(
+        &self,
+        zoom: u32,
+        x: u32,
+        y_xyz: u32,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<TilePayload>> {
         Ok(self
-            .lookup_tile_bytes(zoom, x, y_xyz)?
+            .lookup_tile_bytes(zoom, x, y_xyz, cancelled)?
             .map(|bytes| TilePayload {
                 content_type: infer_tile_mime_type(&bytes, self.metadata.format.as_deref()),
                 content_encoding: None,
@@ -157,14 +222,25 @@ impl LogicalMbtilesSource {
             }))
     }
 
-    pub(crate) fn lookup_vector_tile(
+    pub(crate) fn lookup_vector_tile_with_cancellation(
         &self,
         zoom: u32,
         x: u32,
         y_xyz: u32,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Option<TilePayload>> {
+        self.lookup_vector_tile_with_optional_cancellation(zoom, x, y_xyz, Some(cancelled))
+    }
+
+    fn lookup_vector_tile_with_optional_cancellation(
+        &self,
+        zoom: u32,
+        x: u32,
+        y_xyz: u32,
+        cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<Option<TilePayload>> {
         Ok(self
-            .lookup_tile_bytes(zoom, x, y_xyz)?
+            .lookup_tile_bytes(zoom, x, y_xyz, cancelled)?
             .map(|bytes| TilePayload {
                 content_type: "application/vnd.mapbox-vector-tile",
                 content_encoding: infer_vector_tile_content_encoding(&bytes),
@@ -215,13 +291,20 @@ impl LogicalMbtilesSource {
         Ok(metadata)
     }
 
-    fn lookup_tile_bytes(&self, zoom: u32, x: u32, y_xyz: u32) -> Result<Option<Vec<u8>>> {
+    fn lookup_tile_bytes(
+        &self,
+        zoom: u32,
+        x: u32,
+        y_xyz: u32,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<Vec<u8>>> {
         let total_started = Instant::now();
         let tms_y = xyz_row_to_tms(zoom, y_xyz)?;
         let perf_stats = self
             .perf_logging_enabled
             .then(|| Rc::new(RefCell::new(MbtilesTileLookupPerfStats::default())));
         let _perf_guard = ActiveTileLookupPerfGuard::install(perf_stats.clone());
+        let _cancellation_guard = ActiveTileLookupCancellationGuard::install(cancelled);
 
         let open_started = Instant::now();
         let connection = match self.open_connection() {
@@ -382,6 +465,7 @@ impl LogicalFileSharedState {
     }
 
     fn read_exact_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error> {
+        ensure_active_tile_lookup_not_cancelled()?;
         let started = Instant::now();
         let read_end = offset.checked_add(buffer.len() as u64).ok_or_else(|| {
             Error::new(
@@ -397,6 +481,7 @@ impl LogicalFileSharedState {
         let mut cache_hits = 0usize;
         let mut cache_misses = 0usize;
         while copied < buffer.len() {
+            ensure_active_tile_lookup_not_cancelled()?;
             let absolute_offset = offset + copied as u64;
             let chunk_index = absolute_offset / self.chunk_size_bytes;
             let (chunk, cache_hit) = self.cached_chunk(chunk_index)?;
@@ -442,6 +527,7 @@ impl LogicalFileSharedState {
     }
 
     fn cached_chunk(&self, chunk_index: u64) -> Result<(Arc<Vec<u8>>, bool), Error> {
+        ensure_active_tile_lookup_not_cancelled()?;
         {
             let mut cache = self.cache.lock().map_err(|_| {
                 Error::new(ErrorKind::Other, "logical-file chunk cache lock poisoned")
@@ -687,6 +773,9 @@ fn download_logical_range_blocking(
     length: u64,
     perf_logging_enabled: bool,
 ) -> Result<Vec<u8>> {
+    if active_tile_lookup_is_cancelled() {
+        return Err(canceled_anyhow("logical MBTiles range download canceled"));
+    }
     let started = Instant::now();
     let end_exclusive = start
         .checked_add(length)
@@ -695,6 +784,9 @@ fn download_logical_range_blocking(
     let mut segments = 0usize;
 
     for part in &loaded_manifest.manifest.parts {
+        if active_tile_lookup_is_cancelled() {
+            return Err(canceled_anyhow("logical MBTiles range download canceled"));
+        }
         let part_start = part.offset_bytes;
         let part_end_exclusive = part
             .offset_bytes
@@ -715,6 +807,7 @@ fn download_logical_range_blocking(
         segments += 1;
         let segment_started = Instant::now();
         let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
+        let should_cancel = || active_tile_lookup_is_cancelled();
         sdk.download_range_to_writer_with_progress_blocking(
             DownloadRangeRequest {
                 key: part.key.as_str(),
@@ -725,7 +818,7 @@ fn download_logical_range_blocking(
             },
             &mut body,
             &mut on_progress,
-            &|| false,
+            &should_cancel,
         )
         .with_context(|| {
             format!(
@@ -848,5 +941,8 @@ fn infer_vector_tile_content_encoding(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn other_io_error(error: anyhow::Error) -> Error {
-    Error::new(ErrorKind::Other, error.to_string())
+    match error.downcast::<Error>() {
+        Ok(error) => error,
+        Err(error) => Error::new(ErrorKind::Other, error.to_string()),
+    }
 }

@@ -433,7 +433,7 @@ export function GalleryBasemapMap({
 
                 return (
                   <GalleryBasemapMarker
-                    key={`${entry.path}:${viewportVersion}`}
+                    key={entry.path}
                     entry={entry}
                     request={getMarkerRequest(entry)}
                     left={projected.x}

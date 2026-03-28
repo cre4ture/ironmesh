@@ -12,9 +12,10 @@ use reqwest::header::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     ClientIdentityMaterial, PeerIdentity, RelayHttpHeader, RelayHttpRequest, RelayHttpResponse,
@@ -1087,7 +1088,12 @@ impl IronMeshClient {
         let key = request.key;
         let snapshot = request.snapshot;
         let version = request.version;
-        let head = self.head_object_response(key, snapshot, version).await?;
+        let head = await_download_with_cancellation(
+            self.head_object_response(key, snapshot, version),
+            should_cancel,
+            format!("download canceled for key={key}"),
+        )
+        .await?;
         let range_start = request.start.min(head.total_size_bytes);
         let range_end_exclusive = range_start
             .saturating_add(request.length)
@@ -1124,7 +1130,12 @@ impl IronMeshClient {
                 bail!("download canceled for key={key}");
             }
 
-            let payload = self.get_with_selector(key, snapshot, version).await?;
+            let payload = await_download_with_cancellation(
+                self.get_with_selector(key, snapshot, version),
+                should_cancel,
+                format!("download canceled for key={key}"),
+            )
+            .await?;
             writer
                 .write_all(payload.as_ref())
                 .with_context(|| format!("failed to write payload chunk for key={key}"))?;
@@ -1159,16 +1170,19 @@ impl IronMeshClient {
                 offset + DOWNLOAD_SEGMENT_SIZE_BYTES as u64 - 1,
                 range_end_exclusive - 1,
             );
-            let response = self
-                .get_object_range_response(
+            let response = await_download_with_cancellation(
+                self.get_object_range_response(
                     key,
                     snapshot,
                     version,
                     offset,
                     end_inclusive,
                     head.etag.as_deref(),
-                )
-                .await?;
+                ),
+                should_cancel,
+                format!("download canceled for key={key}"),
+            )
+            .await?;
 
             match response.status {
                 StatusCode::PARTIAL_CONTENT => {
@@ -1990,6 +2004,33 @@ impl IronMeshClient {
         }
 
         Ok(url)
+    }
+}
+
+async fn await_download_with_cancellation<T, F>(
+    future: F,
+    should_cancel: &dyn Fn() -> bool,
+    cancel_message: String,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    if should_cancel() {
+        bail!("{cancel_message}");
+    }
+
+    tokio::select! {
+        result = future => result,
+        _ = wait_for_download_cancellation(should_cancel) => bail!("{cancel_message}"),
+    }
+}
+
+async fn wait_for_download_cancellation(should_cancel: &dyn Fn() -> bool) {
+    loop {
+        if should_cancel() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
