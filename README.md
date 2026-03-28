@@ -4,7 +4,18 @@
 
 # ironmesh
 
-Rust workspace for a distributed file storage platform with server, client SDK, CLI + web UI, and mobile app shells.
+Rust workspace for a distributed file and media storage platform with server, client SDK, CLI + web UI, and mobile app shells.
+
+Ironmesh is building toward a private, self-hosted storage system that makes clustered files, folders, and media feel as approachable as a consumer cloud drive, while keeping deployment, trust, and data ownership in your hands. The project combines secure multi-node storage, offline-friendly sync and conflict handling, and native filesystem access paths so the same data can surface cleanly in web, mobile, and OS file-manager workflows.
+
+Current direction highlights:
+
+- Cluster-aware storage with deterministic placement, asynchronous replication and repair, and a no-loss version model for offline or concurrent edits.
+- Native access paths across the web UI, CLI, Android, Linux FUSE, and Windows CFAPI placeholder integration, with on-demand hydration where the platform supports it.
+- Secure onboarding and connectivity through guided zero-touch cluster setup, certificate-backed identities, and rendezvous/relay paths for harder network topologies.
+- Media-aware browsing with cached thumbnails and metadata designed to support gallery-style experiences without downloading original files first.
+
+Ironmesh draws inspiration from [PicApport](https://www.picapport.de/de/index.php) on the self-hosted media/gallery side and [Syncthing](https://syncthing.net/) on the private, direct-first synchronization side.
 
 ## Workspace layout
 
