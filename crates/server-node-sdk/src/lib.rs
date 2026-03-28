@@ -11560,8 +11560,11 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
         cluster.export_replicas_by_key()
     };
 
-    let store = lock_store(state, "cluster_replicas.persist").await;
-    store.persist_cluster_replicas(&replicas).await
+    let persister = {
+        let store = read_store(state, "cluster_replicas.clone_persister").await;
+        store.cluster_replicas_persister()
+    };
+    persister.persist_cluster_replicas(&replicas).await
 }
 
 fn build_http_client_from_optional_pem(server_ca_pem: Option<&str>) -> Result<reqwest::Client> {

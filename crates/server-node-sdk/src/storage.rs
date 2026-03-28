@@ -34,7 +34,7 @@ const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
 const SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS: u128 = 250;
-const SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS: u128 = 5000;
+const SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS: u128 = 20000;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,6 +560,11 @@ pub(crate) struct StorageStatsCollector {
 pub(crate) struct StoreIndexInspector {
     current_state: CurrentState,
     manifests_dir: PathBuf,
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClusterReplicasPersister {
     metadata_store: Arc<dyn MetadataStore>,
 }
 
@@ -1318,6 +1323,19 @@ impl StoreIndexInspector {
     }
 }
 
+impl ClusterReplicasPersister {
+    fn new(metadata_store: Arc<dyn MetadataStore>) -> Self {
+        Self { metadata_store }
+    }
+
+    pub(crate) async fn persist_cluster_replicas(
+        &self,
+        replicas: &HashMap<String, Vec<NodeId>>,
+    ) -> Result<()> {
+        self.metadata_store.persist_cluster_replicas(replicas).await
+    }
+}
+
 impl ReplicationSubjectInspector {
     fn new(
         current_state: CurrentState,
@@ -1573,6 +1591,10 @@ impl PersistentStore {
         )
     }
 
+    pub(crate) fn cluster_replicas_persister(&self) -> ClusterReplicasPersister {
+        ClusterReplicasPersister::new(self.metadata_store.clone())
+    }
+
     pub(crate) fn replication_subject_inspector(&self) -> ReplicationSubjectInspector {
         ReplicationSubjectInspector::new(
             self.current_state.clone(),
@@ -1597,6 +1619,7 @@ impl PersistentStore {
         self.metadata_store.load_cluster_replicas().await
     }
 
+    #[cfg(test)]
     pub async fn persist_cluster_replicas(
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
