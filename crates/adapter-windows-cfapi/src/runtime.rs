@@ -352,7 +352,8 @@ use std::ptr::null;
 
 use widestring::U16String;
 use wincs::{
-    HydrationType, PopulationType, Registration, SecurityId, SyncRootId, SyncRootIdBuilder,
+    HydrationPolicy, HydrationType, PopulationType, Registration, SecurityId, SyncRootId,
+    SyncRootIdBuilder,
 };
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
@@ -397,12 +398,17 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
     let display_name = U16String::from_str(&registration.display_name);
     let provider_version = U16String::from_str(env!("CARGO_PKG_VERSION"));
     let icon_resource = current_executable_icon_resource()?;
+    eprintln!(
+        "sync-root registration: path={} hydration_type=Progressive hydration_policy=allow_platform_dehydration population_type=AlwaysFull allow_pinning=true",
+        registration.root_path.display()
+    );
 
     Registration::from_sync_root_id(&sync_root_id)
         .display_name(display_name.as_ref())
         .icon(icon_resource, 0)
         .version(provider_version.as_ref())
         .hydration_type(HydrationType::Progressive)
+        .hydration_policy(HydrationPolicy::default().allow_platform_dehydration())
         // The current adapter eagerly materializes the full namespace and does not
         // implement on-demand FETCH_PLACEHOLDERS callbacks, so Explorer must treat
         // the sync root as fully populated.
@@ -1710,8 +1716,8 @@ mod tests {
     fn dehydrate_request_rejects_pinned_placeholder() {
         let info = CF_PLACEHOLDER_STANDARD_INFO {
             InSyncState: CF_IN_SYNC_STATE_IN_SYNC,
-            PinState: CF_PIN_STATE_UNSPECIFIED,
-            ModifiedDataSize: 128,
+            PinState: CF_PIN_STATE_PINNED,
+            ModifiedDataSize: 0,
             ..Default::default()
         };
 

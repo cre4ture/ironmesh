@@ -19,8 +19,9 @@ mod tests {
     use std::io::Write;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use uuid::Uuid;
@@ -30,7 +31,12 @@ mod tests {
         CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE_PLACEHOLDER, CfGetPlaceholderInfo,
         CfGetPlaceholderStateFromAttributeTag,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_UNPINNED, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FindClose, FindFirstFileW, FindFirstStreamW, FindNextStreamW,
+        FindStreamInfoStandard, OPEN_EXISTING, WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
+    };
 
     const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".ironmesh-connection.json";
     const DEFAULT_CLIENT_IDENTITY_FILE_NAME: &str = ".ironmesh-client-identity.json";
@@ -253,13 +259,31 @@ mod tests {
     }
 
     fn open_sync_item(path: &Path) -> anyhow::Result<File> {
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            anyhow::bail!(
+                "CreateFileW failed for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
 
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .map_err(Into::into)
+        Ok(unsafe { File::from_raw_handle(handle as _) })
     }
 
     fn placeholder_standard_info(path: &Path) -> anyhow::Result<CF_PLACEHOLDER_STANDARD_INFO> {
@@ -317,11 +341,124 @@ mod tests {
         placeholder_standard_info(path)
             .map(|info| {
                 format!(
-                    "InSyncState={} ModifiedDataSize={} OnDiskDataSize={}",
-                    info.InSyncState, info.ModifiedDataSize, info.OnDiskDataSize
+                    "attrs=0x{:08x} InSyncState={} ModifiedDataSize={} OnDiskDataSize={}",
+                    std::fs::metadata(path)
+                        .map(|metadata| metadata.file_attributes())
+                        .unwrap_or_default(),
+                    info.InSyncState,
+                    info.ModifiedDataSize,
+                    info.OnDiskDataSize
                 )
             })
             .unwrap_or_else(|err| err.to_string())
+    }
+
+    fn file_attributes(path: &Path) -> anyhow::Result<u32> {
+        Ok(std::fs::metadata(path)?.file_attributes())
+    }
+
+    fn file_stream_names(path: &Path) -> anyhow::Result<Vec<String>> {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut stream_data = WIN32_FIND_STREAM_DATA::default();
+        let handle = unsafe {
+            FindFirstStreamW(
+                wide.as_ptr(),
+                FindStreamInfoStandard,
+                (&mut stream_data as *mut WIN32_FIND_STREAM_DATA).cast(),
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            anyhow::bail!(
+                "FindFirstStreamW failed for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let mut streams = Vec::new();
+        loop {
+            let nul = stream_data
+                .cStreamName
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(stream_data.cStreamName.len());
+            streams.push(String::from_utf16_lossy(&stream_data.cStreamName[..nul]));
+            let has_next = unsafe {
+                FindNextStreamW(
+                    handle,
+                    (&mut stream_data as *mut WIN32_FIND_STREAM_DATA).cast(),
+                )
+            } != 0;
+            if !has_next {
+                break;
+            }
+        }
+        unsafe {
+            FindClose(handle);
+        }
+        Ok(streams)
+    }
+
+    async fn wait_for_file_attribute_unpinned(path: &Path, retries: usize) {
+        for _ in 0..retries {
+            if let Ok(attributes) = file_attributes(path)
+                && (attributes & FILE_ATTRIBUTE_UNPINNED) != 0
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        panic!(
+            "file never became unpinned at {}: {}",
+            path.display(),
+            sync_item_state_summary(path)
+        );
+    }
+
+    async fn wait_for_placeholder_dehydrated(path: &Path, retries: usize) {
+        for _ in 0..retries {
+            if let Ok(info) = placeholder_standard_info(path)
+                && info.OnDiskDataSize == 0
+                && info.ModifiedDataSize == 0
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let streams = file_stream_names(path)
+            .map(|value| format!("{value:?}"))
+            .unwrap_or_else(|err| format!("stream-enum-error={err}"));
+        panic!(
+            "placeholder never dehydrated at {}: {} streams={}",
+            path.display(),
+            sync_item_state_summary(path),
+            streams
+        );
+    }
+
+    fn request_online_only_via_attrib(path: &Path) -> anyhow::Result<()> {
+        let output = std::process::Command::new("attrib")
+            .arg("+u")
+            .arg(path)
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "attrib +u failed for {}: stdout={} stderr={}",
+                path.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     async fn wait_for_sync_item_in_sync(path: &Path, retries: usize) {
@@ -721,6 +858,80 @@ mod tests {
             payload.as_bytes(),
         )
         .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual reproduction test for access-hydrated placeholder free-up-space dehydration"]
+    async fn manual_cfapi_access_hydrated_placeholder_becomes_online_only_after_attrib_u() {
+        let payload = format!(
+            "{}{}",
+            "D".repeat(2 * 1024 * 1024),
+            "\nmanual-free-up-space-tail"
+        );
+        let sync_root = fresh_data_dir("cfapi-manual-free-up-space-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture("127.0.0.1:19111", &sync_root, "cfapi-free-space")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
+
+        let key = "free-up-space/access-hydrated.bin";
+        fixture
+            .sdk
+            .put("free-up-space/", Bytes::new())
+            .await
+            .expect("failed to seed remote folder marker");
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from(payload.clone().into_bytes()))
+            .await
+            .expect("failed to seed remote object");
+
+        let sync_root_id = "ironmesh.systemtest.manual.free_up_space";
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            sync_root_id,
+            "ironmesh Manual Free Up Space Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let local_file = sync_root.join(key.replace('/', "\\"));
+        wait_for_path(&local_file, 220).await;
+        wait_for_placeholder_present(&local_file, 220).await;
+        wait_for_placeholder_in_sync(&local_file, 220).await;
+
+        let before_access = placeholder_standard_info(&local_file)
+            .expect("failed to read placeholder info before access");
+        assert_eq!(
+            file_attributes(&local_file).expect("failed to read file attributes before access")
+                & FILE_ATTRIBUTE_UNPINNED,
+            0,
+            "expected placeholder to start without the unpinned attribute"
+        );
+
+        wait_for_hydrated_payload(&local_file, payload.as_bytes(), 200).await;
+
+        let after_access = placeholder_standard_info(&local_file)
+            .expect("failed to read placeholder after access");
+        assert!(
+            after_access.OnDiskDataSize >= before_access.OnDiskDataSize,
+            "expected placeholder to remain or become hydrated before online-only request, got before_on_disk={} after_on_disk={}",
+            before_access.OnDiskDataSize,
+            after_access.OnDiskDataSize,
+        );
+
+        request_online_only_via_attrib(&local_file)
+            .expect("failed to request online-only via attrib +u");
+        wait_for_file_attribute_unpinned(&local_file, 80).await;
+        wait_for_placeholder_dehydrated(&local_file, 120).await;
+
+        drop(_adapter);
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
     }
 
     #[tokio::test]

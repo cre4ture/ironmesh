@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Storage::CloudFilters::{
     CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE,
@@ -87,6 +88,28 @@ pub fn cf_set_pin_state(
         )
     };
     hresult_nonneg(hr, "CfSetPinState")
+}
+
+pub fn cf_dehydrate_placeholder(file: &std::fs::File) -> Result<()> {
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CF_DEHYDRATE_FLAG_NONE, CfDehydratePlaceholder,
+    };
+
+    eprintln!("cfapi dehydrate-placeholder: issuing CfDehydratePlaceholder");
+    let hr = unsafe {
+        CfDehydratePlaceholder(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            0,
+            -1,
+            CF_DEHYDRATE_FLAG_NONE,
+            std::ptr::null_mut(),
+        )
+    };
+    eprintln!(
+        "cfapi dehydrate-placeholder: CfDehydratePlaceholder returned HRESULT 0x{:08x}",
+        hr as u32
+    );
+    hresult_nonneg(hr, "CfDehydratePlaceholder")
 }
 
 pub fn cf_report_provider_progress2(
@@ -212,14 +235,39 @@ pub fn path_is_placeholder(path: &Path) -> bool {
 }
 
 pub fn open_sync_path(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
 
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     if write {
-        options.write(true);
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        return options.open(path);
     }
-    options.open(path)
+
+    let wide_path = utf16_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+    Ok(file)
 }
 
 pub fn describe_path_state(path: &Path) -> String {
