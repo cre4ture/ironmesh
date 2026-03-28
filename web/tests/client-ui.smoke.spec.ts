@@ -83,6 +83,30 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("cell", { name: "nested/" })).toBeVisible();
   await expect(page.getByRole("cell", { name: "docs/" })).toHaveCount(0);
   await expect(page.getByRole("cell", { name: "gallery/" })).toHaveCount(0);
+  await page.getByLabel("New folder name").fill("scratch");
+  await page.getByRole("button", { name: "New folder" }).click();
+  await expect(page.getByRole("cell", { name: "scratch/" })).toBeVisible();
+  await page.locator('[data-explorer-upload-input="true"]').setInputFiles([
+    {
+      name: "quick-a.bin",
+      mimeType: "application/octet-stream",
+      buffer: Buffer.alloc(24, 0x71)
+    },
+    {
+      name: "quick-b.bin",
+      mimeType: "application/octet-stream",
+      buffer: Buffer.alloc(12, 0x72)
+    }
+  ]);
+  await expect(page.getByRole("heading", { name: "Store" })).toBeVisible();
+  await expect(page.getByText("docs/quick-a.bin", { exact: true })).toBeVisible();
+  await expect(page.getByText("docs/quick-b.bin", { exact: true })).toBeVisible();
+  await page.getByText("Explorer", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await page.getByRole("row", { name: /^docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("row", { name: /scratch\/\s+prefix/i }).getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByRole("cell", { name: "scratch/" })).toHaveCount(0);
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();
   await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();
@@ -149,9 +173,11 @@ async function installClientUiMocks(page: Page) {
   );
   let uploadSessionStartCount = 0;
   const uploadSizes = new Map<string, number>();
+  const uploadKeys = new Map<string, string>();
   let maxConcurrentUploadIds = 0;
   const activeUploadIds = new Set<string>();
   const deletedUploadSessionIds = new Set<string>();
+  const storeEntries = createMockStoreEntries();
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -213,6 +239,9 @@ async function installClientUiMocks(page: Page) {
 
     if (pathname === "/api/store/put" && method === "POST") {
       const body = route.request().postDataJSON() as { key: string; value: string };
+      if (body.key.endsWith("/")) {
+        upsertMockFolderEntry(storeEntries, body.key);
+      }
       return json(route, {
         key: body.key,
         size_bytes: body.value.length
@@ -241,6 +270,7 @@ async function installClientUiMocks(page: Page) {
     }
 
     if (pathname === "/api/store/delete" && method === "DELETE") {
+      deleteMockStorePath(storeEntries, searchParams.get("key") ?? "");
       return json(route, {
         key: searchParams.get("key"),
         deleted: true
@@ -350,89 +380,11 @@ async function installClientUiMocks(page: Page) {
     if (pathname === "/api/store/list" && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       const prefix = searchParams.get("prefix") ?? "";
-      if (prefix === "docs/") {
-        return json(route, {
-          prefix,
-          depth: Number(searchParams.get("depth") ?? "1"),
-          entry_count: 4,
-          entries: [
-            { path: "docs/", entry_type: "prefix" },
-            {
-              path: "docs/readme.txt",
-              entry_type: "key",
-              size_bytes: 23,
-              modified_at_unix: 1_712_345_600
-            },
-            { path: "docs/nested/", entry_type: "prefix" },
-            { path: "gallery/", entry_type: "prefix" }
-          ]
-        });
-      }
       return json(route, {
         prefix,
         depth: Number(searchParams.get("depth") ?? "1"),
-        entry_count: 5,
-        entries: [
-          { path: "docs/", entry_type: "prefix" },
-          {
-            path: "docs/readme.txt",
-            entry_type: "key",
-            size_bytes: 23,
-            modified_at_unix: 1_712_345_600
-          },
-          { path: "media/", entry_type: "prefix" },
-          {
-            path: "gallery/cat.png",
-            entry_type: "key",
-            size_bytes: 3_145_728,
-            modified_at_unix: 1_712_345_678,
-            media: {
-              status: "ready",
-              content_fingerprint: "fingerprint-cat",
-              media_type: "image",
-              mime_type: "image/png",
-              width: 1024,
-              height: 768,
-              taken_at_unix: 1712345678,
-              gps: {
-                latitude: 47.3769,
-                longitude: 8.5417
-              },
-              thumbnail: {
-                url: "/media/thumbnail?key=gallery%2Fcat.png",
-                profile: "grid",
-                width: 256,
-                height: 192,
-                format: "jpeg",
-                size_bytes: 1234
-              }
-            }
-          },
-          {
-            path: "gallery/dog.jpg",
-            entry_type: "key",
-            size_bytes: 2_048,
-            modified_at_unix: 1_712_300_000,
-            media: {
-              status: "pending",
-              content_fingerprint: "fingerprint-dog",
-              media_type: "image",
-              mime_type: "image/jpeg",
-              gps: {
-                latitude: 40.7128,
-                longitude: -74.006
-              },
-              thumbnail: {
-                url: "/media/thumbnail?key=gallery%2Fdog.jpg",
-                profile: "grid",
-                width: 256,
-                height: 256,
-                format: "jpeg",
-                size_bytes: 0
-              }
-            }
-          }
-        ]
+        entry_count: storeEntries.length,
+        entries: storeEntries
       });
     }
 
@@ -479,6 +431,7 @@ async function installClientUiMocks(page: Page) {
       };
       const uploadId = `upload-${uploadSessionStartCount}`;
       uploadSizes.set(uploadId, body.total_size_bytes);
+      uploadKeys.set(uploadId, body.key);
       return json(route, {
         upload_id: uploadId,
         key: body.key,
@@ -511,7 +464,9 @@ async function installClientUiMocks(page: Page) {
 
     if (/^\/api\/store\/uploads\/[^/]+\/complete$/.test(pathname) && method === "POST") {
       const uploadId = pathname.split("/")[4] ?? "upload-unknown";
+      const key = uploadKeys.get(uploadId) ?? `uploads/${uploadId}.bin`;
       const totalSizeBytes = uploadSizes.get(uploadId) ?? 21;
+      upsertMockBinaryEntry(storeEntries, key, totalSizeBytes);
       return json(route, {
         snapshot_id: "snapshot-001",
         version_id: "version-002",
@@ -571,6 +526,139 @@ async function json(route: Route, payload: unknown) {
     contentType: "application/json; charset=utf-8",
     body: JSON.stringify(payload)
   });
+}
+
+type MockStoreEntry = {
+  path: string;
+  entry_type: "prefix" | "key";
+  size_bytes?: number;
+  modified_at_unix?: number;
+  media?: Record<string, unknown>;
+};
+
+function createMockStoreEntries(): MockStoreEntry[] {
+  return [
+    { path: "docs/", entry_type: "prefix" },
+    {
+      path: "docs/readme.txt",
+      entry_type: "key",
+      size_bytes: 23,
+      modified_at_unix: 1_712_345_600
+    },
+    { path: "docs/nested/", entry_type: "prefix" },
+    { path: "media/", entry_type: "prefix" },
+    {
+      path: "gallery/cat.png",
+      entry_type: "key",
+      size_bytes: 3_145_728,
+      modified_at_unix: 1_712_345_678,
+      media: {
+        status: "ready",
+        content_fingerprint: "fingerprint-cat",
+        media_type: "image",
+        mime_type: "image/png",
+        width: 1024,
+        height: 768,
+        taken_at_unix: 1712345678,
+        gps: {
+          latitude: 47.3769,
+          longitude: 8.5417
+        },
+        thumbnail: {
+          url: "/media/thumbnail?key=gallery%2Fcat.png",
+          profile: "grid",
+          width: 256,
+          height: 192,
+          format: "jpeg",
+          size_bytes: 1234
+        }
+      }
+    },
+    {
+      path: "gallery/dog.jpg",
+      entry_type: "key",
+      size_bytes: 2_048,
+      modified_at_unix: 1_712_300_000,
+      media: {
+        status: "pending",
+        content_fingerprint: "fingerprint-dog",
+        media_type: "image",
+        mime_type: "image/jpeg",
+        gps: {
+          latitude: 40.7128,
+          longitude: -74.006
+        },
+        thumbnail: {
+          url: "/media/thumbnail?key=gallery%2Fdog.jpg",
+          profile: "grid",
+          width: 256,
+          height: 256,
+          format: "jpeg",
+          size_bytes: 0
+        }
+      }
+    }
+  ];
+}
+
+function upsertMockFolderEntry(entries: MockStoreEntry[], key: string) {
+  const normalized = normalizeMockFolderKey(key);
+  if (!normalized) {
+    return;
+  }
+  const existing = entries.find((entry) => entry.path === normalized);
+  if (existing) {
+    existing.entry_type = "prefix";
+    return;
+  }
+  entries.push({
+    path: normalized,
+    entry_type: "prefix"
+  });
+}
+
+function upsertMockBinaryEntry(entries: MockStoreEntry[], key: string, sizeBytes: number) {
+  const normalized = key.trim();
+  if (!normalized) {
+    return;
+  }
+  const existing = entries.find((entry) => entry.path === normalized);
+  if (existing) {
+    existing.entry_type = "key";
+    existing.size_bytes = sizeBytes;
+    existing.modified_at_unix = 1_712_345_900;
+    delete existing.media;
+    return;
+  }
+  entries.push({
+    path: normalized,
+    entry_type: "key",
+    size_bytes: sizeBytes,
+    modified_at_unix: 1_712_345_900
+  });
+}
+
+function deleteMockStorePath(entries: MockStoreEntry[], key: string) {
+  const normalized = key.trim();
+  if (!normalized) {
+    return;
+  }
+  if (normalized.endsWith("/")) {
+    const survivors = entries.filter((entry) => !entry.path.startsWith(normalized));
+    entries.splice(0, entries.length, ...survivors);
+    return;
+  }
+  const survivors = entries.filter((entry) => entry.path !== normalized);
+  entries.splice(0, entries.length, ...survivors);
+}
+
+function normalizeMockFolderKey(key: string): string {
+  const normalized = key
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .join("/");
+  return normalized ? `${normalized}/` : "";
 }
 
 function tinyPngBuffer(): Buffer {

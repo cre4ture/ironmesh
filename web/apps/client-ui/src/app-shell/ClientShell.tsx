@@ -119,6 +119,7 @@ type BinaryUploadController = {
   notice: string | null;
   clearNotice: () => void;
   queueFiles: () => void;
+  enqueueFiles: (files: File[], rawTarget: string) => boolean;
   cancelItem: (id: string) => void;
   uploadQueuedFiles: () => Promise<void>;
   clearQueue: () => void;
@@ -278,7 +279,7 @@ export function ClientShell() {
 
             {activePageId === "store" ? <StorePage binaryUpload={binaryUpload} /> : null}
 
-            {activePageId === "explorer" ? <ExplorerPage /> : null}
+            {activePageId === "explorer" ? <ExplorerPage binaryUpload={binaryUpload} onOpenStore={() => setActivePageId("store")} /> : null}
 
             {activePageId === "gallery" ? <GalleryPage /> : null}
 
@@ -498,10 +499,17 @@ function useBinaryUploadQueue(): BinaryUploadController {
   }
 
   function queueFiles() {
-    if (selectedFiles.length === 0) {
+    enqueueFiles(selectedFiles, uploadKey);
+    setSelectedFiles([]);
+  }
+
+  function enqueueFiles(files: File[], rawTarget: string): boolean {
+    if (files.length === 0) {
       setNotice("Select one or more binary files first.");
-      return;
+      return false;
     }
+
+    setUploadKey(rawTarget);
 
     const occupiedKeys = new Set(
       queueRef.current
@@ -516,8 +524,8 @@ function useBinaryUploadQueue(): BinaryUploadController {
     const duplicateKeys: string[] = [];
     const nextQueueItems: BinaryUploadQueueItem[] = [];
 
-    for (const file of selectedFiles) {
-      const key = deriveBinaryUploadKey(file, uploadKey, selectedFiles.length > 1);
+    for (const file of files) {
+      const key = deriveBinaryUploadKey(file, rawTarget, files.length > 1);
       if (occupiedKeys.has(key)) {
         duplicateKeys.push(key);
         continue;
@@ -532,11 +540,10 @@ function useBinaryUploadQueue(): BinaryUploadController {
           ? `That upload key is already queued: ${duplicateKeys[0]}`
           : "All selected files resolve to upload keys that are already queued."
       );
-      return;
+      return false;
     }
 
     setQueueAndRef((current) => [...current, ...nextQueueItems]);
-    setSelectedFiles([]);
     setNotice(
       duplicateKeys.length > 0
         ? `Queued ${nextQueueItems.length} file(s) and skipped ${duplicateKeys.length} duplicate upload key${duplicateKeys.length === 1 ? "" : "s"}.`
@@ -553,6 +560,7 @@ function useBinaryUploadQueue(): BinaryUploadController {
     });
 
     ensureWorkersRunning();
+    return true;
   }
 
   function cancelItem(id: string) {
@@ -654,6 +662,7 @@ function useBinaryUploadQueue(): BinaryUploadController {
     notice,
     clearNotice: () => setNotice(null),
     queueFiles,
+    enqueueFiles,
     cancelItem,
     uploadQueuedFiles,
     clearQueue
@@ -1464,19 +1473,28 @@ function StorePage({ binaryUpload }: { binaryUpload: BinaryUploadController }) {
   );
 }
 
-function ExplorerPage() {
+function ExplorerPage({
+  binaryUpload,
+  onOpenStore
+}: {
+  binaryUpload: BinaryUploadController;
+  onOpenStore: () => void;
+}) {
   const [prefix, setPrefix] = useState("");
   const [depth, setDepth] = useState(1);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<StoreListResponse | null>(null);
   const [selectedPayload, setSelectedPayload] = useState<unknown>({ message: "Select an object or version to preview it." });
+  const [newFolderName, setNewFolderName] = useState("");
   const [versionKey, setVersionKey] = useState("");
   const [versionsPayload, setVersionsPayload] = useState<VersionGraphResponse | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sortField, setSortField] = useState<ExplorerSortField>("path");
   const [sortDirection, setSortDirection] = useState<ExplorerSortDirection>("asc");
+  const canMutateCurrentStore = snapshotId == null;
+  const quickUploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const sortedEntries = useMemo(() => {
     const entries = (entriesPayload?.entries ?? []).filter((entry) =>
@@ -1499,9 +1517,9 @@ function ExplorerPage() {
     try {
       const payload = await listSnapshots();
       setSnapshots(payload);
-      if (!snapshotId && payload.length > 0) {
-        setSnapshotId(payload[0]?.id ?? null);
-      }
+      setSnapshotId((current) =>
+        current && payload.some((snapshot) => snapshot.id === current) ? current : null
+      );
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed to load snapshots");
     } finally {
@@ -1556,6 +1574,106 @@ function ExplorerPage() {
 
     setError(null);
     triggerBrowserDownloadFromUrl(getBinaryObjectDownloadUrl(entry.path, snapshotId));
+  }
+
+  async function createFolder() {
+    if (!canMutateCurrentStore) {
+      setError("Switch Snapshot to Current data before creating folders.");
+      return;
+    }
+
+    const folderPath = joinExplorerPath(prefix, newFolderName);
+    const markerKey = folderMarkerKey(folderPath);
+    if (!markerKey) {
+      setError("Folder name must not be empty.");
+      return;
+    }
+
+    setLoading("create-folder");
+    setError(null);
+    try {
+      const payload = await putStoreValue(markerKey, "");
+      setNewFolderName("");
+      setSelectedPayload({
+        action: "created_folder_marker",
+        folder_path: normalizeExplorerPath(markerKey, true),
+        marker_key: markerKey,
+        response: payload
+      });
+      await refreshEntries();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed creating folder");
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  function queueFilesToCurrentPrefix(files: File[]) {
+    if (!canMutateCurrentStore) {
+      setError("Switch Snapshot to Current data before uploading files.");
+      return;
+    }
+    if (files.length === 0) {
+      return;
+    }
+    setError(null);
+
+    const targetPrefix = normalizeExplorerPrefix(prefix);
+    const queued = binaryUpload.enqueueFiles(files, targetPrefix);
+    if (!queued) {
+      return;
+    }
+    onOpenStore();
+  }
+
+  function openQuickUploadPicker() {
+    if (!canMutateCurrentStore) {
+      setError("Switch Snapshot to Current data before uploading files.");
+      return;
+    }
+    quickUploadInputRef.current?.click();
+  }
+
+  async function deleteEntry(entry: StoreEntry) {
+    if (!canMutateCurrentStore) {
+      setError("Switch Snapshot to Current data before deleting entries.");
+      return;
+    }
+
+    const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const targetKey = isPrefix ? normalizeExplorerPath(entry.path, true) : normalizeExplorerPath(entry.path, false);
+    if (!targetKey) {
+      setError("Path must not be empty.");
+      return;
+    }
+
+    const confirmed =
+      typeof window === "undefined"
+        || window.confirm(
+          isPrefix
+            ? `Delete "${targetKey}" and everything under it from current data?`
+            : `Delete "${targetKey}" from current data?`
+        );
+    if (!confirmed) {
+      return;
+    }
+
+    setLoading(`delete-entry:${targetKey}`);
+    setError(null);
+    try {
+      const payload = await deleteStoreValue(targetKey);
+      setSelectedPayload({
+        action: "deleted_path",
+        path: targetKey,
+        recursive: isPrefix,
+        response: payload
+      });
+      await refreshEntries();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed deleting entry");
+    } finally {
+      setLoading(null);
+    }
   }
 
   async function loadVersions() {
@@ -1662,6 +1780,59 @@ function ExplorerPage() {
                   Root
                 </Button>
               </Group>
+              <Grid>
+                <Grid.Col span={{ base: 12, md: 8 }}>
+                  <TextInput
+                    label="New folder name"
+                    value={newFolderName}
+                    onChange={(event) => setNewFolderName(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void createFolder();
+                      }
+                    }}
+                    placeholder="new-folder"
+                    disabled={!canMutateCurrentStore}
+                  />
+                </Grid.Col>
+                <Grid.Col span={{ base: 12, md: 4 }}>
+                  <Group grow wrap="nowrap" mt="xl">
+                    <Button
+                      loading={loading === "create-folder"}
+                      disabled={!canMutateCurrentStore}
+                      onClick={() => void createFolder()}
+                    >
+                      New folder
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="default"
+                      disabled={!canMutateCurrentStore}
+                      onClick={openQuickUploadPicker}
+                    >
+                      Upload
+                    </Button>
+                  </Group>
+                  <input
+                    ref={quickUploadInputRef}
+                    type="file"
+                    multiple
+                    hidden
+                    data-explorer-upload-input="true"
+                    onChange={(event) => {
+                      const files = Array.from(event.currentTarget.files ?? []);
+                      event.currentTarget.value = "";
+                      queueFilesToCurrentPrefix(files);
+                    }}
+                  />
+                </Grid.Col>
+              </Grid>
+              <Text c="dimmed" size="sm">
+                {canMutateCurrentStore
+                  ? "Delete on a prefix removes that whole subtree from current data."
+                  : "Create and delete are disabled while browsing a historical snapshot."}
+              </Text>
               <Table.ScrollContainer minWidth={720}>
                 <Table striped highlightOnHover withTableBorder>
                   <Table.Thead>
@@ -1687,9 +1858,21 @@ function ExplorerPage() {
                           <Table.Td>{formatExplorerModifiedAt(entry.modified_at_unix)}</Table.Td>
                           <Table.Td>
                             {isPrefix ? (
-                              <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
-                                Open
-                              </Button>
+                              <Group gap="xs" wrap="nowrap">
+                                <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
+                                  Open
+                                </Button>
+                                <Button
+                                  size="xs"
+                                  color="red"
+                                  variant="default"
+                                  disabled={!canMutateCurrentStore}
+                                  loading={loading === `delete-entry:${normalizeExplorerPath(entry.path, true)}`}
+                                  onClick={() => void deleteEntry(entry)}
+                                >
+                                  Delete
+                                </Button>
+                              </Group>
                             ) : (
                               <Group gap="xs" wrap="nowrap">
                                 <Button
@@ -1702,6 +1885,16 @@ function ExplorerPage() {
                                 </Button>
                                 <Button size="xs" variant="default" onClick={() => downloadEntry(entry)}>
                                   Download
+                                </Button>
+                                <Button
+                                  size="xs"
+                                  color="red"
+                                  variant="default"
+                                  disabled={!canMutateCurrentStore}
+                                  loading={loading === `delete-entry:${normalizeExplorerPath(entry.path, false)}`}
+                                  onClick={() => void deleteEntry(entry)}
+                                >
+                                  Delete
                                 </Button>
                               </Group>
                             )}
@@ -2496,6 +2689,31 @@ function parentPrefix(path: string): string {
     return "";
   }
   return normalized.split("/").slice(0, -1).join("/") + "/";
+}
+
+function normalizeExplorerSegments(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .join("/");
+}
+
+function joinExplorerPath(basePath: string, childPath: string): string {
+  const base = normalizeExplorerSegments(basePath);
+  const child = normalizeExplorerSegments(childPath);
+  if (!base) {
+    return child;
+  }
+  if (!child) {
+    return base;
+  }
+  return `${base}/${child}`;
+}
+
+function folderMarkerKey(path: string): string {
+  const normalized = normalizeExplorerSegments(path);
+  return normalized ? `${normalized}/` : "";
 }
 
 function triggerBrowserDownloadFromUrl(url: string) {
