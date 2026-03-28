@@ -6,6 +6,7 @@ pub mod identity;
 pub mod peer;
 pub mod relay;
 pub mod rendezvous;
+pub mod rendezvous_runtime;
 pub mod request_auth;
 pub mod session;
 
@@ -36,6 +37,10 @@ pub use rendezvous::{
     PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
     RendezvousEndpointStatus, RendezvousRuntimeState, TransportCapability,
+};
+pub use rendezvous_runtime::{
+    BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayBroker, RelayBrokerStats,
+    issue_relay_ticket,
 };
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,

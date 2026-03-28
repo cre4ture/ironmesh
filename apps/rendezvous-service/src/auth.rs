@@ -47,13 +47,6 @@ where
     }
 }
 
-pub fn peer_identity_key(identity: &PeerIdentity) -> String {
-    match identity {
-        PeerIdentity::Node(node_id) => format!("node:{node_id}"),
-        PeerIdentity::Device(device_id) => format!("device:{device_id}"),
-    }
-}
-
 pub fn require_authenticated_node(
     mtls_enabled: bool,
     authenticated_peer: &MaybeAuthenticatedPeer,

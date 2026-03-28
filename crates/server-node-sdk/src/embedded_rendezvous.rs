@@ -1,13 +1,11 @@
-use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::FromRequestParts;
 use axum::extract::State;
@@ -21,22 +19,19 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify, oneshot};
 use tokio_rustls::server::TlsStream;
 use tower::Service;
 use tracing::info;
 use transport_sdk::peer::PeerIdentity;
-use transport_sdk::relay::{
-    PendingRelayHttpRequest, RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest,
-    RelayHttpResponse, RelayTicket, RelayTicketRequest,
-};
 use transport_sdk::rendezvous::{
-    PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
+    PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
 };
 use transport_sdk::{
-    ClientBootstrap, ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
+    BootstrapClaimBroker, ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, ClientEnrollmentRequest,
-    RELAY_HTTP_JSON_BODY_LIMIT_BYTES, encode_optional_body_base64,
+    PresenceRegistry, RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayBroker, RelayHttpPollRequest,
+    RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket, RelayTicketRequest,
+    encode_optional_body_base64, issue_relay_ticket as issue_runtime_relay_ticket,
 };
 use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
@@ -66,67 +61,6 @@ impl AppState {
             presence: PresenceRegistry::new(),
             relay: RelayBroker::new(),
             bootstrap_claims: BootstrapClaimBroker::new(),
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct BootstrapClaimBroker {
-    inner: Arc<Mutex<HashMap<String, BootstrapClaimRecord>>>,
-}
-
-#[derive(Debug, Clone)]
-struct BootstrapClaimRecord {
-    issuer: PeerIdentity,
-    target_node_id: NodeId,
-    expires_at_unix: u64,
-    bootstrap: ClientBootstrap,
-}
-
-impl BootstrapClaimBroker {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    async fn publish(
-        &self,
-        request: ClientBootstrapClaimPublishRequest,
-    ) -> Result<ClientBootstrapClaimPublishResponse> {
-        request.validate()?;
-        let mut state = self.inner.lock().await;
-        retain_active_claims(&mut state);
-        state.insert(
-            request.claim_secret_hash.clone(),
-            BootstrapClaimRecord {
-                issuer: request.issuer,
-                target_node_id: request.target_node_id,
-                expires_at_unix: request.expires_at_unix,
-                bootstrap: request.bootstrap,
-            },
-        );
-        Ok(ClientBootstrapClaimPublishResponse {
-            accepted: true,
-            expires_at_unix: request.expires_at_unix,
-        })
-    }
-
-    async fn take_for_redeem(&self, claim_token: &str) -> Result<BootstrapClaimRecord> {
-        let claim_token = claim_token.trim();
-        if claim_token.is_empty() {
-            bail!("bootstrap claim token must not be empty");
-        }
-
-        let mut state = self.inner.lock().await;
-        retain_active_claims(&mut state);
-        state
-            .remove(&hash_token(claim_token))
-            .ok_or_else(|| anyhow!("bootstrap claim was not found or has expired"))
-    }
-
-    async fn restore(&self, claim_token: &str, record: BootstrapClaimRecord) {
-        let mut state = self.inner.lock().await;
-        if record.expires_at_unix > unix_ts() {
-            state.insert(hash_token(claim_token), record);
         }
     }
 }
@@ -243,7 +177,8 @@ async fn issue_relay_ticket(
     ensure_authenticated_peer_identity(&authenticated_peer, &request.source, "relay ticket source")
         .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
 
-    let ticket = issue_relay_ticket_impl(request, std::slice::from_ref(&state.config.public_url));
+    let ticket =
+        issue_runtime_relay_ticket(request, std::slice::from_ref(&state.config.public_url));
     ticket
         .validate()
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -337,7 +272,7 @@ async fn redeem_bootstrap_claim(
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let relay_request = RelayHttpRequest {
-        ticket: issue_relay_ticket_impl(
+        ticket: issue_runtime_relay_ticket(
             RelayTicketRequest {
                 cluster_id: claim.bootstrap.cluster_id,
                 source: claim.issuer.clone(),
@@ -511,13 +446,6 @@ where
     ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
         let authenticated = parts.extensions.get::<AuthenticatedPeer>().cloned();
         std::future::ready(Ok(Self(authenticated)))
-    }
-}
-
-fn peer_identity_key(identity: &PeerIdentity) -> String {
-    match identity {
-        PeerIdentity::Node(node_id) => format!("node:{node_id}"),
-        PeerIdentity::Device(device_id) => format!("device:{device_id}"),
     }
 }
 
@@ -732,366 +660,4 @@ fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
             .map(PeerIdentity::Device);
     }
     None
-}
-
-#[derive(Clone, Default)]
-struct PresenceRegistry {
-    entries: Arc<StdMutex<HashMap<String, PresenceEntry>>>,
-}
-
-impl PresenceRegistry {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn register(&self, registration: PresenceRegistration) -> PresenceEntry {
-        let entry = PresenceEntry {
-            updated_at_unix: registration.connected_at_unix,
-            registration,
-        };
-        let key = peer_identity_key(&entry.registration.identity);
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("presence registry lock poisoned");
-        entries.insert(key, entry.clone());
-        entry
-    }
-
-    fn list(&self) -> Vec<PresenceEntry> {
-        let entries = self
-            .entries
-            .lock()
-            .expect("presence registry lock poisoned");
-        let mut values = entries.values().cloned().collect::<Vec<_>>();
-        values.sort_by(|left, right| {
-            peer_identity_key(&left.registration.identity)
-                .cmp(&peer_identity_key(&right.registration.identity))
-        });
-        values
-    }
-
-    fn len(&self) -> usize {
-        let entries = self
-            .entries
-            .lock()
-            .expect("presence registry lock poisoned");
-        entries.len()
-    }
-}
-
-fn issue_relay_ticket_impl(
-    request: RelayTicketRequest,
-    relay_public_urls: &[String],
-) -> RelayTicket {
-    let now = unix_ts();
-    let expires_at_unix = now
-        + request
-            .requested_expires_in_secs
-            .unwrap_or(300)
-            .clamp(60, 60 * 60);
-
-    RelayTicket {
-        cluster_id: request.cluster_id,
-        session_id: Uuid::now_v7().to_string(),
-        source: request.source,
-        target: request.target,
-        relay_urls: relay_public_urls.to_vec(),
-        issued_at_unix: now,
-        expires_at_unix,
-    }
-}
-
-#[derive(Clone, Default)]
-struct RelayBroker {
-    inner: Arc<RelayBrokerInner>,
-}
-
-#[derive(Default)]
-struct RelayBrokerInner {
-    state: Mutex<RelayBrokerState>,
-    notify: Notify,
-}
-
-#[derive(Default)]
-struct RelayBrokerState {
-    pending_by_target: HashMap<String, VecDeque<PendingRelayHttpRequest>>,
-    inflight: HashMap<String, InflightRelayRequest>,
-}
-
-struct InflightRelayRequest {
-    response_tx: oneshot::Sender<RelayHttpResponse>,
-    cluster_id: uuid::Uuid,
-    session_id: String,
-    expected_responder: transport_sdk::PeerIdentity,
-}
-
-struct SubmitAwaitCleanup {
-    inner: Arc<RelayBrokerInner>,
-    request_id: String,
-    active: bool,
-}
-
-impl SubmitAwaitCleanup {
-    fn new(inner: Arc<RelayBrokerInner>, request_id: String) -> Self {
-        Self {
-            inner,
-            request_id,
-            active: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for SubmitAwaitCleanup {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-
-        let inner = self.inner.clone();
-        let request_id = self.request_id.clone();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async move {
-            let mut state = inner.state.lock().await;
-            state.inflight.remove(&request_id);
-            remove_pending_request(&mut state.pending_by_target, &request_id);
-        });
-    }
-}
-
-impl RelayBroker {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    async fn submit_and_await(&self, request: RelayHttpRequest) -> Result<RelayHttpResponse> {
-        request.validate()?;
-        request.ticket.validate()?;
-        if request.ticket.expires_at_unix <= unix_ts() {
-            bail!("relay ticket has expired");
-        }
-
-        let target_key = relay_target_key(request.ticket.cluster_id, &request.ticket.target);
-        let request_id = request.request_id.clone();
-        let pending = PendingRelayHttpRequest {
-            cluster_id: request.ticket.cluster_id,
-            session_id: request.ticket.session_id.clone(),
-            request_id: request.request_id.clone(),
-            source: request.ticket.source.clone(),
-            target: request.ticket.target.clone(),
-            method: request.method,
-            path_and_query: request.path_and_query,
-            headers: request.headers,
-            body_base64: request.body_base64,
-        };
-        pending.validate()?;
-
-        let wait_timeout = request
-            .ticket
-            .expires_at_unix
-            .saturating_sub(unix_ts())
-            .clamp(5, 60);
-        let (tx, rx) = oneshot::channel();
-
-        {
-            let mut state = self.inner.state.lock().await;
-            state
-                .pending_by_target
-                .entry(target_key)
-                .or_default()
-                .push_back(pending);
-            state.inflight.insert(
-                request_id.clone(),
-                InflightRelayRequest {
-                    response_tx: tx,
-                    cluster_id: request.ticket.cluster_id,
-                    session_id: request.ticket.session_id.clone(),
-                    expected_responder: request.ticket.target.clone(),
-                },
-            );
-        }
-        self.inner.notify.notify_waiters();
-        let mut cleanup = SubmitAwaitCleanup::new(self.inner.clone(), request_id.clone());
-
-        match tokio::time::timeout(Duration::from_secs(wait_timeout), rx).await {
-            Ok(Ok(response)) => {
-                cleanup.disarm();
-                response.validate()?;
-                Ok(response)
-            }
-            Ok(Err(_)) => {
-                let mut state = self.inner.state.lock().await;
-                state.inflight.remove(&request_id);
-                remove_pending_request(&mut state.pending_by_target, &request_id);
-                cleanup.disarm();
-                Err(anyhow!("relay response channel closed before completion"))
-            }
-            Err(_) => {
-                let mut state = self.inner.state.lock().await;
-                state.inflight.remove(&request_id);
-                remove_pending_request(&mut state.pending_by_target, &request_id);
-                cleanup.disarm();
-                bail!("timed out waiting for relayed HTTP response")
-            }
-        }
-    }
-
-    async fn poll(&self, request: RelayHttpPollRequest) -> Result<RelayHttpPollResponse> {
-        request.validate()?;
-        let target_key = relay_target_key(request.cluster_id, &request.target);
-        let timeout =
-            Duration::from_millis(request.wait_timeout_ms.unwrap_or(15_000).clamp(100, 30_000));
-
-        if let Some(pending) = self.try_pop_pending(&target_key).await? {
-            return Ok(RelayHttpPollResponse {
-                request: Some(pending),
-            });
-        }
-
-        let notified = self.inner.notify.notified();
-        let _ = tokio::time::timeout(timeout, notified).await;
-
-        Ok(RelayHttpPollResponse {
-            request: self.try_pop_pending(&target_key).await?,
-        })
-    }
-
-    async fn respond(&self, response: RelayHttpResponse) -> Result<bool> {
-        response.validate()?;
-        let inflight = {
-            let mut state = self.inner.state.lock().await;
-            state.inflight.remove(&response.request_id)
-        };
-        match inflight {
-            Some(inflight) => {
-                if inflight.cluster_id != response.cluster_id {
-                    bail!("relay response cluster_id does not match the in-flight request");
-                }
-                if inflight.session_id != response.session_id {
-                    bail!("relay response session_id does not match the in-flight request");
-                }
-                if inflight.expected_responder != response.responder {
-                    bail!("relay response responder does not match the in-flight request target");
-                }
-                let _ = inflight.response_tx.send(response);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn try_pop_pending(&self, target_key: &str) -> Result<Option<PendingRelayHttpRequest>> {
-        let mut state = self.inner.state.lock().await;
-        let pending = state
-            .pending_by_target
-            .get_mut(target_key)
-            .and_then(|queue| queue.pop_front());
-        if state
-            .pending_by_target
-            .get(target_key)
-            .map(|queue| queue.is_empty())
-            .unwrap_or(false)
-        {
-            state.pending_by_target.remove(target_key);
-        }
-        if let Some(pending) = pending.as_ref() {
-            pending.validate()?;
-        }
-        Ok(pending)
-    }
-}
-
-fn remove_pending_request(
-    pending_by_target: &mut HashMap<String, VecDeque<PendingRelayHttpRequest>>,
-    request_id: &str,
-) {
-    let keys = pending_by_target.keys().cloned().collect::<Vec<_>>();
-    for key in keys {
-        if let Some(queue) = pending_by_target.get_mut(&key) {
-            queue.retain(|request| request.request_id != request_id);
-            if queue.is_empty() {
-                pending_by_target.remove(&key);
-            }
-        }
-    }
-}
-
-fn relay_target_key(cluster_id: uuid::Uuid, target: &transport_sdk::PeerIdentity) -> String {
-    format!("{cluster_id}:{}", peer_identity_key(target))
-}
-
-fn retain_active_claims(state: &mut HashMap<String, BootstrapClaimRecord>) {
-    let now = unix_ts();
-    state.retain(|_, record| record.expires_at_unix > now);
-}
-
-fn hash_token(token: &str) -> String {
-    blake3::hash(token.as_bytes()).to_hex().to_string()
-}
-
-fn unix_ts() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use transport_sdk::peer::PeerIdentity;
-
-    #[tokio::test]
-    async fn relay_broker_removes_pending_request_when_submitter_is_dropped() {
-        let broker = RelayBroker::new();
-        let cluster_id = uuid::Uuid::now_v7();
-        let source = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let now = unix_ts();
-        let ticket = RelayTicket {
-            cluster_id,
-            session_id: uuid::Uuid::now_v7().to_string(),
-            source,
-            target: target.clone(),
-            relay_urls: vec!["https://relay.example".to_string()],
-            issued_at_unix: now,
-            expires_at_unix: now + 60,
-        };
-
-        let broker_for_submit = broker.clone();
-        let submit = tokio::spawn(async move {
-            broker_for_submit
-                .submit_and_await(RelayHttpRequest {
-                    ticket,
-                    request_id: "req-drop".to_string(),
-                    method: "GET".to_string(),
-                    path_and_query: "/health".to_string(),
-                    headers: Vec::new(),
-                    body_base64: None,
-                })
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        submit.abort();
-        let _ = submit.await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let pending = broker
-            .poll(RelayHttpPollRequest {
-                cluster_id,
-                target,
-                wait_timeout_ms: Some(50),
-            })
-            .await
-            .expect("relay poll should succeed")
-            .request;
-        assert!(pending.is_none(), "abandoned request should be removed");
-    }
 }
