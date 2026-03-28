@@ -313,6 +313,7 @@ pub fn router(config: WebUiConfig) -> Router {
             post(web_store_upload_complete),
         )
         .route("/api/store/get-binary", get(web_store_get_binary))
+        .route("/api/store/stream-binary", get(web_store_stream_binary))
         .route("/api/store/put-binary", post(web_store_put_binary))
         .route(
             "/api/rendezvous",
@@ -846,6 +847,17 @@ fn file_name_from_key(key: &str) -> &str {
     key.rsplit('/').next().unwrap_or(key)
 }
 
+fn inline_binary_content_type_for(key: &str) -> &str {
+    mime_guess::from_path(key)
+        .first_raw()
+        .unwrap_or("application/octet-stream")
+}
+
+fn build_inline_content_disposition(key: &str) -> String {
+    let filename = file_name_from_key(key).replace('"', "_");
+    format!("inline; filename=\"{filename}\"")
+}
+
 fn validate_split_logical_file_manifest(
     mut manifest: SplitLogicalFileManifest,
 ) -> Result<SplitLogicalFileManifest> {
@@ -1009,6 +1021,8 @@ async fn get_or_create_mbtiles_source(
 async fn download_object_range_bytes(
     sdk: IronMeshClient,
     key: String,
+    snapshot: Option<String>,
+    version: Option<String>,
     start: u64,
     length: u64,
     perf_logging_enabled: bool,
@@ -1022,8 +1036,8 @@ async fn download_object_range_bytes(
         sdk.download_range_to_writer_with_progress_blocking(
             DownloadRangeRequest {
                 key: key.as_str(),
-                snapshot: None,
-                version: None,
+                snapshot: snapshot.as_deref(),
+                version: version.as_deref(),
                 start,
                 length,
             },
@@ -1039,6 +1053,8 @@ async fn download_object_range_bytes(
         if perf_logging_enabled {
             info!(
                 key = %key,
+                snapshot = snapshot.as_deref().unwrap_or("<current>"),
+                version = version.as_deref().unwrap_or("<latest>"),
                 start,
                 length,
                 bytes = body.len(),
@@ -1374,6 +1390,8 @@ async fn web_map_logical_file(
         match download_object_range_bytes(
             sdk.clone(),
             part.key.clone(),
+            None,
+            None,
             local_start,
             segment_length,
             state.map_perf_logging_enabled,
@@ -1909,6 +1927,186 @@ async fn web_store_get_binary(
     }
 
     (StatusCode::OK, headers, payload).into_response()
+}
+
+async fn web_store_stream_binary(
+    State(state): State<WebState>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<WebStoreBinaryGetQuery>,
+) -> impl IntoResponse {
+    if query.key.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
+    }
+
+    let sdk = current_sdk(&state).await;
+    let head = match sdk
+        .head_object(
+            &query.key,
+            query.snapshot.as_deref(),
+            query.version.as_deref(),
+        )
+        .await
+    {
+        Ok(head) => head,
+        Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    };
+
+    let total_size_bytes = head.total_size_bytes;
+    let selected_range = match headers
+        .get(RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| parse_logical_file_range(value, total_size_bytes))
+    {
+        Some(Some(range)) => Some(range),
+        Some(None) => {
+            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            let response_headers = response.headers_mut();
+            response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            response_headers.insert(
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{total_size_bytes}"))
+                    .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+            );
+            if let Some(etag) = head.etag.as_deref()
+                && let Ok(value) = HeaderValue::from_str(etag)
+            {
+                response_headers.insert(ETAG, value);
+            }
+            return response;
+        }
+        None => None,
+    };
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(etag) = head.etag.as_deref()
+        && let Ok(value) = HeaderValue::from_str(etag)
+    {
+        response_headers.insert(ETAG, value);
+    }
+
+    match HeaderValue::from_str(inline_binary_content_type_for(&query.key)) {
+        Ok(value) => {
+            response_headers.insert(CONTENT_TYPE, value);
+        }
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid content-type header: {err}"),
+            );
+        }
+    }
+
+    match HeaderValue::from_str(&build_inline_content_disposition(&query.key)) {
+        Ok(value) => {
+            response_headers.insert(CONTENT_DISPOSITION, value);
+        }
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid content-disposition header: {err}"),
+            );
+        }
+    }
+
+    let content_length = selected_range
+        .map(|range| {
+            range
+                .end_inclusive
+                .saturating_sub(range.start)
+                .saturating_add(1)
+        })
+        .unwrap_or(total_size_bytes);
+    response_headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+
+    if let Some(range) = selected_range {
+        response_headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&format!(
+                "bytes {}-{}/{}",
+                range.start, range.end_inclusive, total_size_bytes
+            ))
+            .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+        );
+    }
+
+    if method == Method::HEAD {
+        return (
+            selected_range
+                .map(|_| StatusCode::PARTIAL_CONTENT)
+                .unwrap_or(StatusCode::OK),
+            response_headers,
+            Vec::<u8>::new(),
+        )
+            .into_response();
+    }
+
+    let payload = if let Some(range) = selected_range {
+        let range_length = range
+            .end_inclusive
+            .saturating_sub(range.start)
+            .saturating_add(1);
+        if head.accept_ranges {
+            let request_cancellation = RequestCancellation::new();
+            let _request_cancellation_guard = request_cancellation.guard();
+            match download_object_range_bytes(
+                sdk,
+                query.key.clone(),
+                query.snapshot.clone(),
+                query.version.clone(),
+                range.start,
+                range_length,
+                false,
+                request_cancellation.flag(),
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            }
+        } else {
+            let full_payload = match current_client(&state)
+                .await
+                .get_with_selector(
+                    &query.key,
+                    query.snapshot.as_deref(),
+                    query.version.as_deref(),
+                )
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            };
+            full_payload[range.start as usize..=range.end_inclusive as usize].to_vec()
+        }
+    } else {
+        match current_client(&state)
+            .await
+            .get_with_selector(
+                &query.key,
+                query.snapshot.as_deref(),
+                query.version.as_deref(),
+            )
+            .await
+        {
+            Ok(bytes) => bytes.to_vec(),
+            Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        }
+    };
+
+    (
+        selected_range
+            .map(|_| StatusCode::PARTIAL_CONTENT)
+            .unwrap_or(StatusCode::OK),
+        response_headers,
+        payload,
+    )
+        .into_response()
 }
 
 async fn web_rendezvous(State(state): State<WebState>) -> impl IntoResponse {

@@ -258,6 +258,23 @@ export function getBinaryObjectDownloadUrl(
   snapshot?: string | null,
   version?: string | null
 ): string {
+  return buildBinaryObjectUrl("/api/store/get-binary", key, snapshot, version);
+}
+
+export function getBinaryObjectStreamUrl(
+  key: string,
+  snapshot?: string | null,
+  version?: string | null
+): string {
+  return buildBinaryObjectUrl("/api/store/stream-binary", key, snapshot, version);
+}
+
+function buildBinaryObjectUrl(
+  basePath: string,
+  key: string,
+  snapshot?: string | null,
+  version?: string | null
+): string {
   const query = new URLSearchParams({ key });
   if (snapshot?.trim()) {
     query.set("snapshot", snapshot.trim());
@@ -265,7 +282,7 @@ export function getBinaryObjectDownloadUrl(
   if (version?.trim()) {
     query.set("version", version.trim());
   }
-  return `/api/store/get-binary?${query.toString()}`;
+  return `${basePath}?${query.toString()}`;
 }
 
 export async function downloadBinaryObject(

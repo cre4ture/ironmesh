@@ -524,6 +524,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ui_backend_binary_stream_supports_inline_ranges() -> Result<()> {
+        let server_bind = "127.0.0.1:19420";
+        let web_bind = "127.0.0.1:19421";
+        let web_base = format!("http://{web_bind}");
+        let key = "gallery/clip.mp4";
+        let payload = b"0123456789abcdef".to_vec();
+        let client = reqwest::Client::new();
+
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-binary-stream-server",
+            "web-ui-binary-stream-client",
+        )
+        .await?;
+
+        let result = async {
+            client
+                .post(format!("{web_base}/api/store/put-binary"))
+                .query(&[("key", key)])
+                .body(payload.clone())
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let head_response = client
+                .head(format!("{web_base}/api/store/stream-binary"))
+                .query(&[("key", key)])
+                .send()
+                .await?
+                .error_for_status()?;
+            assert_eq!(
+                head_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("video/mp4")
+            );
+            assert_eq!(
+                head_response
+                    .headers()
+                    .get(reqwest::header::ACCEPT_RANGES)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bytes")
+            );
+            assert_eq!(
+                head_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok()),
+                Some("16")
+            );
+            let disposition = head_response
+                .headers()
+                .get(reqwest::header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(disposition.contains("inline;"));
+            assert!(disposition.contains("filename=\"clip.mp4\""));
+
+            let response = client
+                .get(format!("{web_base}/api/store/stream-binary"))
+                .query(&[("key", key)])
+                .send()
+                .await?
+                .error_for_status()?;
+            let body = response.bytes().await?;
+            assert_eq!(body.as_ref(), payload.as_slice());
+
+            let range_response = client
+                .get(format!("{web_base}/api/store/stream-binary"))
+                .query(&[("key", key)])
+                .header(reqwest::header::RANGE, "bytes=3-10")
+                .send()
+                .await?
+                .error_for_status()?;
+            assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                range_response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bytes 3-10/16")
+            );
+            let range_body = range_response.bytes().await?;
+            assert_eq!(range_body.as_ref(), &payload[3..11]);
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
     async fn web_ui_backend_store_list_and_delete_flow() -> Result<()> {
         let server_bind = "127.0.0.1:19384";
         let web_bind = "127.0.0.1:19385";
