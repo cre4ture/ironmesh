@@ -4997,6 +4997,8 @@ async fn build_test_state(
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        local_availability_refresh_lock: Arc::new(Mutex::new(())),
+        local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),
         storage_stats_runtime: Arc::new(Mutex::new(super::StorageStatsRuntime::default())),
         namespace_change_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         namespace_change_tx,

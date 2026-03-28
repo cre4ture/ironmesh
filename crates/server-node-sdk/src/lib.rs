@@ -107,6 +107,7 @@ const SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_UPLOAD_FINALIZE_LOG_THRESHOLD_MS: u128 = 500;
 const SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS: u128 = 500;
 const SLOW_STORE_LOCK_HOLD_LOG_THRESHOLD_MS: u128 = 500;
+const SLOW_SERVER_STARTUP_PHASE_LOG_THRESHOLD_MS: u128 = 500;
 const SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS: u128 = 250;
 
@@ -170,6 +171,8 @@ struct ServerState {
     log_buffer: Arc<LogBuffer>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
+    local_availability_refresh_lock: Arc<Mutex<()>>,
+    local_availability_refresh_notify: Arc<Notify>,
     storage_stats_runtime: Arc<Mutex<StorageStatsRuntime>>,
     namespace_change_sequence: Arc<AtomicU64>,
     namespace_change_tx: watch::Sender<u64>,
@@ -230,6 +233,91 @@ async fn read_upload_sessions<'a>(
     operation: &'static str,
 ) -> TracedRwLockReadGuard<'a, UploadSessionStore> {
     state.upload_sessions.read(operation).await
+}
+
+fn log_server_startup_phase_begin(phase: &'static str, startup_started_at: Instant) -> Instant {
+    info!(
+        phase,
+        since_metadata_init_ms = startup_started_at.elapsed().as_millis(),
+        "server startup phase begin"
+    );
+    Instant::now()
+}
+
+fn log_server_startup_phase_end(
+    phase: &'static str,
+    startup_started_at: Instant,
+    phase_started_at: Instant,
+) {
+    let phase_ms = phase_started_at.elapsed().as_millis();
+    let since_metadata_init_ms = startup_started_at.elapsed().as_millis();
+    if phase_ms >= SLOW_SERVER_STARTUP_PHASE_LOG_THRESHOLD_MS {
+        warn!(
+            phase,
+            phase_ms, since_metadata_init_ms, "slow server startup phase"
+        );
+    } else {
+        info!(
+            phase,
+            phase_ms, since_metadata_init_ms, "server startup phase complete"
+        );
+    }
+}
+
+fn request_local_availability_refresh(state: &ServerState) {
+    state.local_availability_refresh_notify.notify_one();
+}
+
+async fn run_local_availability_refresh(
+    state: &ServerState,
+    trigger: &'static str,
+    startup_started_at: Option<Instant>,
+) {
+    let refresh_started_at = Instant::now();
+    let subject_count = refresh_local_availability_view_once(state).await;
+    let total_ms = refresh_started_at.elapsed().as_millis();
+
+    if let Some(startup_started_at) = startup_started_at {
+        let since_metadata_init_ms = startup_started_at.elapsed().as_millis();
+        if total_ms >= SLOW_SERVER_STARTUP_PHASE_LOG_THRESHOLD_MS {
+            warn!(
+                trigger,
+                subject_count,
+                total_ms,
+                since_metadata_init_ms,
+                "slow background local availability refresh"
+            );
+        } else {
+            info!(
+                trigger,
+                subject_count,
+                total_ms,
+                since_metadata_init_ms,
+                "background local availability refresh complete"
+            );
+        }
+    } else if total_ms >= SLOW_SERVER_STARTUP_PHASE_LOG_THRESHOLD_MS {
+        warn!(
+            trigger,
+            subject_count, total_ms, "slow background local availability refresh"
+        );
+    } else {
+        info!(
+            trigger,
+            subject_count, total_ms, "background local availability refresh complete"
+        );
+    }
+}
+
+fn spawn_local_availability_refresher(state: ServerState, startup_started_at: Instant) {
+    tokio::spawn(async move {
+        run_local_availability_refresh(&state, "startup", Some(startup_started_at)).await;
+
+        loop {
+            state.local_availability_refresh_notify.notified().await;
+            run_local_availability_refresh(&state, "queued", None).await;
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -3012,6 +3100,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         metadata_backend = ?config.metadata_backend(),
         "server node metadata backend initialized"
     );
+    let startup_phase_anchor = Instant::now();
 
     let internal_http = if let Some(internal_tls) = config.internal_tls.as_ref() {
         build_internal_mtls_http_client(
@@ -3023,6 +3112,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         reqwest::Client::new()
     };
 
+    let load_cluster_replicas_phase_started_at =
+        log_server_startup_phase_begin("load_cluster_replicas", startup_phase_anchor);
     let persisted_cluster_replicas = {
         let store_guard = store.read("server.init.load_cluster_replicas").await;
         match store_guard.load_cluster_replicas().await {
@@ -3033,8 +3124,15 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             }
         }
     };
+    log_server_startup_phase_end(
+        "load_cluster_replicas",
+        startup_phase_anchor,
+        load_cluster_replicas_phase_started_at,
+    );
     cluster.import_replicas_by_key(persisted_cluster_replicas);
 
+    let load_client_credentials_phase_started_at =
+        log_server_startup_phase_begin("load_client_credentials", startup_phase_anchor);
     let persisted_client_credentials = {
         let store_guard = store.read("server.init.load_client_credentials").await;
         match store_guard.load_client_credential_state().await {
@@ -3048,7 +3146,14 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             }
         }
     };
+    log_server_startup_phase_end(
+        "load_client_credentials",
+        startup_phase_anchor,
+        load_client_credentials_phase_started_at,
+    );
 
+    let load_trust_and_rendezvous_phase_started_at =
+        log_server_startup_phase_begin("load_trust_and_rendezvous", startup_phase_anchor);
     let embedded_trust_roots =
         config
             .bootstrap_trust_roots
@@ -3158,6 +3263,14 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             .map(|url| (url, RendezvousEndpointRegistrationRuntime::default()))
             .collect(),
     ));
+    log_server_startup_phase_end(
+        "load_trust_and_rendezvous",
+        startup_phase_anchor,
+        load_trust_and_rendezvous_phase_started_at,
+    );
+
+    let load_upload_sessions_phase_started_at =
+        log_server_startup_phase_begin("load_upload_sessions", startup_phase_anchor);
     let upload_session_store = match load_upload_session_store(&config.data_dir).await {
         Ok(mut store) => {
             prune_expired_upload_sessions(&mut store, unix_ts());
@@ -3174,6 +3287,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             }
         }
     };
+    log_server_startup_phase_end(
+        "load_upload_sessions",
+        startup_phase_anchor,
+        load_upload_sessions_phase_started_at,
+    );
 
     let state = ServerState {
         data_dir: config.data_dir.clone(),
@@ -3228,6 +3346,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         log_buffer: log_buffer.unwrap_or_else(|| Arc::new(LogBuffer::new(500))),
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        local_availability_refresh_lock: Arc::new(Mutex::new(())),
+        local_availability_refresh_notify: Arc::new(Notify::new()),
         storage_stats_runtime: Arc::new(Mutex::new(StorageStatsRuntime::default())),
         namespace_change_sequence: Arc::new(AtomicU64::new(0)),
         namespace_change_tx: watch::channel(0).0,
@@ -3238,10 +3358,24 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     };
 
     spawn_upload_session_store_persister(state.clone());
+    let refresh_local_node_storage_phase_started_at =
+        log_server_startup_phase_begin("refresh_local_node_storage", startup_phase_anchor);
     refresh_local_node_storage(&state).await;
-    refresh_local_availability_view_once(&state).await;
+    log_server_startup_phase_end(
+        "refresh_local_node_storage",
+        startup_phase_anchor,
+        refresh_local_node_storage_phase_started_at,
+    );
+    info!(
+        phase = "refresh_local_availability",
+        since_metadata_init_ms = startup_phase_anchor.elapsed().as_millis(),
+        "server startup phase deferred to background"
+    );
+    spawn_local_availability_refresher(state.clone(), startup_phase_anchor);
     spawn_storage_stats_refresher(state.clone());
 
+    let load_repair_attempts_phase_started_at =
+        log_server_startup_phase_begin("load_repair_attempts", startup_phase_anchor);
     let persisted_attempts = {
         let store = read_store(&state, "server.init.load_repair_attempts").await;
         match store.load_repair_attempts().await {
@@ -3252,6 +3386,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             }
         }
     };
+    log_server_startup_phase_end(
+        "load_repair_attempts",
+        startup_phase_anchor,
+        load_repair_attempts_phase_started_at,
+    );
 
     {
         let mut repair_state = state.repair_state.lock().await;
@@ -3325,6 +3464,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         );
     }
 
+    let build_http_routers_phase_started_at =
+        log_server_startup_phase_begin("build_http_routers", startup_phase_anchor);
     let public_client_api = Router::new()
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
@@ -3607,6 +3748,11 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             state.clone(),
             require_internal_caller,
         ));
+    log_server_startup_phase_end(
+        "build_http_routers",
+        startup_phase_anchor,
+        build_http_routers_phase_started_at,
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut internal_server_handle = None;
@@ -5074,10 +5220,13 @@ async fn cached_local_cluster_available_subjects(state: &ServerState) -> Vec<Str
     cluster.available_subjects_for_node(state.node_id)
 }
 
-async fn refresh_local_availability_view_once(state: &ServerState) {
+async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
+    let _refresh_guard = state.local_availability_refresh_lock.lock().await;
     let local_subjects = recompute_local_cluster_available_subjects(state).await;
+    let subject_count = local_subjects.len();
     let mut cluster = state.cluster.lock().await;
     cluster.replace_node_available_view(state.node_id, &local_subjects);
+    subject_count
 }
 
 async fn await_repair_busy_threshold(state: &ServerState) {
@@ -7210,7 +7359,7 @@ async fn get_object_response(
     {
         match hydrate_missing_chunks_for_range(state, &subject, &missing_chunks).await {
             Ok(()) => {
-                refresh_local_availability_view_once(state).await;
+                request_local_availability_refresh(state);
                 refreshed_local_availability = true;
             }
             Err(err) => {
@@ -7229,7 +7378,7 @@ async fn get_object_response(
         tracing::debug!(
             key = %key,
             manifest_hash = %manifest_hash,
-            "refreshed local availability view after read-through hydration"
+            "queued local availability refresh after read-through hydration"
         );
     }
 
@@ -12139,7 +12288,7 @@ async fn run_cleanup(
     match result {
         Ok(report) => {
             if !dry_run {
-                refresh_local_availability_view_once(&state).await;
+                request_local_availability_refresh(&state);
             }
             append_admin_audit(
                 &state,
