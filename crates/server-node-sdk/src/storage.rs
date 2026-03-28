@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 mod sqlite_impl;
@@ -33,6 +33,8 @@ const MEDIA_CACHE_SCHEMA_VERSION: u32 = 2;
 const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
+const SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS: u128 = 250;
+const SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS: u128 = 250;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -524,6 +526,7 @@ pub struct PersistentStore {
     media_thumbnails_dir: PathBuf,
     current_state: CurrentState,
     metadata_store: Arc<dyn MetadataStore>,
+    storage_stats_lock: Arc<AsyncMutex<()>>,
     chunk_ingestor: ChunkIngestor,
 }
 
@@ -539,6 +542,24 @@ pub(crate) struct MediaCacheWorker {
     manifests_dir: PathBuf,
     chunks_dir: PathBuf,
     media_thumbnails_dir: PathBuf,
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StorageStatsCollector {
+    root_dir: PathBuf,
+    chunks_dir: PathBuf,
+    manifests_dir: PathBuf,
+    metadata_db_path: PathBuf,
+    media_thumbnails_dir: PathBuf,
+    metadata_store: Arc<dyn MetadataStore>,
+    storage_stats_lock: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StoreIndexInspector {
+    current_state: CurrentState,
+    manifests_dir: PathBuf,
     metadata_store: Arc<dyn MetadataStore>,
 }
 
@@ -633,11 +654,15 @@ trait MetadataStore: Send + Sync {
 }
 
 impl ChunkIngestor {
-    fn new(chunks_dir: PathBuf, metadata_store: Arc<dyn MetadataStore>) -> Self {
+    fn new(
+        chunks_dir: PathBuf,
+        metadata_store: Arc<dyn MetadataStore>,
+        storage_stats_lock: Arc<AsyncMutex<()>>,
+    ) -> Self {
         Self {
             chunks_dir,
             metadata_store,
-            storage_stats_lock: Arc::new(AsyncMutex::new(())),
+            storage_stats_lock,
         }
     }
 
@@ -722,6 +747,7 @@ impl MediaCacheWorker {
         &self,
         manifest_hash: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
+        let ensure_started_at = Instant::now();
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
             return Ok(None);
         }
@@ -734,17 +760,67 @@ impl MediaCacheWorker {
             self.load_cached_media_metadata(&content_fingerprint)
                 .await?,
         ) {
+            let total_ms = ensure_started_at.elapsed().as_millis();
+            if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
+                warn!(
+                    manifest_hash,
+                    content_fingerprint = %content_fingerprint,
+                    total_ms,
+                    cache_hit = true,
+                    status = ?existing.status,
+                    has_thumbnail = existing.thumbnail.is_some(),
+                    "slow media cache ensure"
+                );
+            }
             return Ok(Some(existing));
         }
 
+        info!(
+            manifest_hash,
+            content_fingerprint = %content_fingerprint,
+            source_size_bytes = manifest.total_size_bytes,
+            "media cache miss; generating thumbnail"
+        );
+
+        let read_started_at = Instant::now();
         let payload = self.read_object_by_manifest_hash(manifest_hash).await?;
+        let read_object_ms = read_started_at.elapsed().as_millis();
+        let build_started_at = Instant::now();
         let metadata = self.build_media_cache_record(
             manifest_hash,
             &content_fingerprint,
             manifest.total_size_bytes,
             &payload,
         );
+        let build_record_ms = build_started_at.elapsed().as_millis();
+        let persist_started_at = Instant::now();
         self.persist_media_cache_record(&metadata).await?;
+        let persist_ms = persist_started_at.elapsed().as_millis();
+        let total_ms = ensure_started_at.elapsed().as_millis();
+        info!(
+            manifest_hash,
+            content_fingerprint = %content_fingerprint,
+            total_ms,
+            read_object_ms,
+            build_record_ms,
+            persist_ms,
+            status = ?metadata.status,
+            has_thumbnail = metadata.thumbnail.is_some(),
+            "media cache generation finished"
+        );
+        if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
+            warn!(
+                manifest_hash,
+                content_fingerprint = %content_fingerprint,
+                total_ms,
+                read_object_ms,
+                build_record_ms,
+                persist_ms,
+                status = ?metadata.status,
+                has_thumbnail = metadata.thumbnail.is_some(),
+                "slow media cache generation"
+            );
+        }
         Ok(Some(metadata))
     }
 
@@ -902,6 +978,343 @@ impl MediaCacheWorker {
         self.media_thumbnails_dir
             .join(content_fingerprint)
             .join(format!("{profile}.jpg"))
+    }
+}
+
+impl StorageStatsCollector {
+    fn new(
+        root_dir: PathBuf,
+        chunks_dir: PathBuf,
+        manifests_dir: PathBuf,
+        metadata_db_path: PathBuf,
+        media_thumbnails_dir: PathBuf,
+        metadata_store: Arc<dyn MetadataStore>,
+        storage_stats_lock: Arc<AsyncMutex<()>>,
+    ) -> Self {
+        Self {
+            root_dir,
+            chunks_dir,
+            manifests_dir,
+            metadata_db_path,
+            media_thumbnails_dir,
+            metadata_store,
+            storage_stats_lock,
+        }
+    }
+
+    async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {
+        self.metadata_store.load_storage_stats_state().await
+    }
+
+    async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()> {
+        self.metadata_store.persist_storage_stats_state(state).await
+    }
+
+    async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
+        self.metadata_store
+            .load_snapshot_manifest(snapshot_id)
+            .await
+    }
+
+    async fn snapshot_object_state(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<SnapshotObjectState>> {
+        Ok(self
+            .load_snapshot_manifest(snapshot_id)
+            .await?
+            .map(|manifest| SnapshotObjectState {
+                created_at_unix: manifest.created_at_unix,
+                objects: manifest.objects,
+                object_ids: manifest.object_ids,
+            }))
+    }
+
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
+        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn reconcile_chunk_store_bytes_state(&self) -> Result<StorageStatsState> {
+        let _guard = self.storage_stats_lock.lock().await;
+        let state = StorageStatsState {
+            chunk_store_bytes: directory_size_bytes(&self.chunks_dir).await?,
+            last_reconciled_unix: unix_ts(),
+        };
+        self.persist_storage_stats_state(&state).await?;
+        Ok(state)
+    }
+
+    pub(crate) async fn current_chunk_store_bytes(
+        &self,
+        reconcile_max_age_secs: Option<u64>,
+    ) -> Result<u64> {
+        let now = unix_ts();
+        let cached_bytes = {
+            let _guard = self.storage_stats_lock.lock().await;
+            self.load_storage_stats_state().await?.and_then(|state| {
+                let should_reconcile = reconcile_max_age_secs
+                    .map(|max_age| now.saturating_sub(state.last_reconciled_unix) > max_age)
+                    .unwrap_or(false);
+                (!should_reconcile).then_some(state.chunk_store_bytes)
+            })
+        };
+
+        if let Some(bytes) = cached_bytes {
+            return Ok(bytes);
+        }
+
+        Ok(self
+            .reconcile_chunk_store_bytes_state()
+            .await?
+            .chunk_store_bytes)
+    }
+
+    pub(crate) async fn collect_storage_stats_sample(&self) -> Result<StorageStatsSample> {
+        let metadata_db_bytes = file_size_bytes(&self.metadata_db_path).await?;
+        let chunk_store_bytes = self.current_chunk_store_bytes(None).await?;
+        let manifest_store_bytes = directory_size_bytes(&self.manifests_dir).await?;
+        let media_cache_root = self
+            .media_thumbnails_dir
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.root_dir.join("state").join("media_cache"));
+        let media_cache_bytes = directory_size_bytes(&media_cache_root).await?;
+
+        let latest_snapshot = self
+            .metadata_store
+            .list_snapshot_infos()
+            .await?
+            .into_iter()
+            .next();
+        let mut latest_snapshot_id = None;
+        let mut latest_snapshot_created_at_unix = None;
+        let mut latest_snapshot_object_count = 0usize;
+        let mut latest_snapshot_logical_bytes = 0u64;
+        let mut latest_snapshot_unique_chunk_bytes = 0u64;
+
+        if let Some(snapshot) = latest_snapshot {
+            latest_snapshot_id = Some(snapshot.id.clone());
+            latest_snapshot_created_at_unix = Some(snapshot.created_at_unix);
+            latest_snapshot_object_count = snapshot.object_count;
+
+            if let Some(snapshot_state) = self.snapshot_object_state(&snapshot.id).await? {
+                let mut seen_chunk_hashes = HashSet::new();
+                let mut manifest_cache = HashMap::<String, ObjectManifest>::new();
+
+                for manifest_hash in snapshot_state.objects.values() {
+                    let manifest = if let Some(existing) = manifest_cache.get(manifest_hash) {
+                        existing.clone()
+                    } else {
+                        let Some(loaded) = self.load_manifest_by_hash(manifest_hash).await? else {
+                            continue;
+                        };
+                        manifest_cache.insert(manifest_hash.clone(), loaded.clone());
+                        loaded
+                    };
+
+                    latest_snapshot_logical_bytes = latest_snapshot_logical_bytes
+                        .saturating_add(manifest.total_size_bytes as u64);
+                    for chunk in manifest.chunks {
+                        if seen_chunk_hashes.insert(chunk.hash) {
+                            latest_snapshot_unique_chunk_bytes = latest_snapshot_unique_chunk_bytes
+                                .saturating_add(chunk.size_bytes as u64);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(StorageStatsSample {
+            collected_at_unix: unix_ts(),
+            latest_snapshot_id,
+            latest_snapshot_created_at_unix,
+            latest_snapshot_object_count,
+            chunk_store_bytes,
+            manifest_store_bytes,
+            metadata_db_bytes,
+            media_cache_bytes,
+            latest_snapshot_logical_bytes,
+            latest_snapshot_unique_chunk_bytes,
+        })
+    }
+
+    pub(crate) async fn persist_storage_stats_sample(
+        &self,
+        sample: &StorageStatsSample,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_storage_stats_sample(sample)
+            .await
+    }
+
+    pub(crate) async fn prune_storage_stats_history_before(
+        &self,
+        collected_before_unix: u64,
+    ) -> Result<()> {
+        self.metadata_store
+            .prune_storage_stats_history_before(collected_before_unix)
+            .await
+    }
+}
+
+impl StoreIndexInspector {
+    fn new(
+        current_state: CurrentState,
+        manifests_dir: PathBuf,
+        metadata_store: Arc<dyn MetadataStore>,
+    ) -> Self {
+        Self {
+            current_state,
+            manifests_dir,
+            metadata_store,
+        }
+    }
+
+    pub(crate) fn current_object_hashes(&self) -> HashMap<String, String> {
+        self.current_state.objects.clone()
+    }
+
+    pub(crate) fn current_object_ids(&self) -> HashMap<String, String> {
+        self.current_state.object_ids.clone()
+    }
+
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
+        let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn load_version_index_by_object_id(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<FileVersionIndex>> {
+        self.metadata_store
+            .load_version_index_by_object_id(object_id)
+            .await
+    }
+
+    async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
+        self.metadata_store
+            .load_snapshot_manifest(snapshot_id)
+            .await
+    }
+
+    pub(crate) async fn snapshot_object_state(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<SnapshotObjectState>> {
+        Ok(self
+            .load_snapshot_manifest(snapshot_id)
+            .await?
+            .map(|manifest| SnapshotObjectState {
+                created_at_unix: manifest.created_at_unix,
+                objects: manifest.objects,
+                object_ids: manifest.object_ids,
+            }))
+    }
+
+    pub(crate) async fn object_sizes_by_key(
+        &self,
+        object_hashes: &HashMap<String, String>,
+    ) -> Result<HashMap<String, u64>> {
+        let mut sizes = HashMap::with_capacity(object_hashes.len());
+        for (key, manifest_hash) in object_hashes {
+            if let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? {
+                sizes.insert(key.clone(), manifest.total_size_bytes as u64);
+            }
+        }
+        Ok(sizes)
+    }
+
+    pub(crate) async fn object_modified_at_by_key(
+        &self,
+        object_hashes: &HashMap<String, String>,
+        object_ids: &HashMap<String, String>,
+        max_created_at_unix: Option<u64>,
+    ) -> Result<HashMap<String, u64>> {
+        let mut modified = HashMap::with_capacity(object_hashes.len());
+        for (key, manifest_hash) in object_hashes {
+            let Some(object_id) = object_ids.get(key) else {
+                continue;
+            };
+            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+                continue;
+            };
+
+            let matching_created_at = index
+                .versions
+                .values()
+                .filter(|record| record.manifest_hash == *manifest_hash)
+                .filter(|record| {
+                    max_created_at_unix
+                        .map(|limit| record.created_at_unix <= limit)
+                        .unwrap_or(true)
+                })
+                .map(|record| record.created_at_unix)
+                .max()
+                .or_else(|| {
+                    index
+                        .versions
+                        .values()
+                        .filter(|record| record.manifest_hash == *manifest_hash)
+                        .map(|record| record.created_at_unix)
+                        .max()
+                });
+
+            if let Some(created_at_unix) = matching_created_at {
+                modified.insert(key.clone(), created_at_unix);
+            }
+        }
+        Ok(modified)
+    }
+
+    pub(crate) async fn lookup_media_cache(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Option<MediaCacheLookup>> {
+        let lookup_started_at = Instant::now();
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
+            return Ok(None);
+        };
+        let content_fingerprint = content_fingerprint_from_manifest(&manifest);
+        let metadata = current_media_cache_metadata(
+            self.metadata_store
+                .load_cached_media_metadata(&content_fingerprint)
+                .await?,
+        );
+        let total_ms = lookup_started_at.elapsed().as_millis();
+        if total_ms >= SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS {
+            warn!(
+                manifest_hash,
+                content_fingerprint = %content_fingerprint,
+                total_ms,
+                metadata_present = metadata.is_some(),
+                "slow media cache lookup"
+            );
+        }
+
+        Ok(Some(MediaCacheLookup {
+            content_fingerprint,
+            metadata,
+        }))
     }
 }
 
@@ -1107,7 +1520,12 @@ impl PersistentStore {
             }
         };
         let current_state = metadata_store.load_current_state().await?;
-        let chunk_ingestor = ChunkIngestor::new(chunks_dir.clone(), metadata_store.clone());
+        let storage_stats_lock = Arc::new(AsyncMutex::new(()));
+        let chunk_ingestor = ChunkIngestor::new(
+            chunks_dir.clone(),
+            metadata_store.clone(),
+            storage_stats_lock.clone(),
+        );
 
         Ok(Self {
             root_dir,
@@ -1117,6 +1535,7 @@ impl PersistentStore {
             media_thumbnails_dir,
             current_state,
             metadata_store,
+            storage_stats_lock,
             chunk_ingestor,
         })
     }
@@ -1131,6 +1550,26 @@ impl PersistentStore {
             self.chunks_dir.clone(),
             self.media_thumbnails_dir.clone(),
             self.metadata_store.clone(),
+        )
+    }
+
+    pub(crate) fn store_index_inspector(&self) -> StoreIndexInspector {
+        StoreIndexInspector::new(
+            self.current_state.clone(),
+            self.manifests_dir.clone(),
+            self.metadata_store.clone(),
+        )
+    }
+
+    pub(crate) fn storage_stats_collector(&self) -> StorageStatsCollector {
+        StorageStatsCollector::new(
+            self.root_dir.clone(),
+            self.chunks_dir.clone(),
+            self.manifests_dir.clone(),
+            self.metadata_db_path.clone(),
+            self.media_thumbnails_dir.clone(),
+            self.metadata_store.clone(),
+            self.storage_stats_lock.clone(),
         )
     }
 
@@ -1192,14 +1631,6 @@ impl PersistentStore {
         self.current_state.objects.keys().cloned().collect()
     }
 
-    pub fn current_object_hashes(&self) -> HashMap<String, String> {
-        self.current_state.objects.clone()
-    }
-
-    pub fn current_object_ids(&self) -> HashMap<String, String> {
-        self.current_state.object_ids.clone()
-    }
-
     #[cfg(test)]
     pub async fn list_cached_chunk_records_for_test(&self) -> Result<Vec<CachedChunkRecord>> {
         self.metadata_store.list_cached_chunk_records().await
@@ -1208,75 +1639,6 @@ impl PersistentStore {
     #[cfg(test)]
     pub async fn list_locally_owned_manifests_for_test(&self) -> Result<Vec<String>> {
         self.metadata_store.list_locally_owned_manifests().await
-    }
-
-    pub async fn object_sizes_by_key(
-        &self,
-        object_hashes: &HashMap<String, String>,
-    ) -> Result<HashMap<String, u64>> {
-        let mut sizes = HashMap::with_capacity(object_hashes.len());
-        for (key, manifest_hash) in object_hashes {
-            if let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? {
-                sizes.insert(key.clone(), manifest.total_size_bytes as u64);
-            }
-        }
-        Ok(sizes)
-    }
-
-    pub async fn object_modified_at_by_key(
-        &self,
-        object_hashes: &HashMap<String, String>,
-        object_ids: &HashMap<String, String>,
-        max_created_at_unix: Option<u64>,
-    ) -> Result<HashMap<String, u64>> {
-        let mut modified = HashMap::with_capacity(object_hashes.len());
-        for (key, manifest_hash) in object_hashes {
-            let Some(object_id) = object_ids.get(key) else {
-                continue;
-            };
-            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
-                continue;
-            };
-
-            let matching_created_at = index
-                .versions
-                .values()
-                .filter(|record| record.manifest_hash == *manifest_hash)
-                .filter(|record| {
-                    max_created_at_unix
-                        .map(|limit| record.created_at_unix <= limit)
-                        .unwrap_or(true)
-                })
-                .map(|record| record.created_at_unix)
-                .max()
-                .or_else(|| {
-                    index
-                        .versions
-                        .values()
-                        .filter(|record| record.manifest_hash == *manifest_hash)
-                        .map(|record| record.created_at_unix)
-                        .max()
-                });
-
-            if let Some(created_at_unix) = matching_created_at {
-                modified.insert(key.clone(), created_at_unix);
-            }
-        }
-        Ok(modified)
-    }
-
-    pub async fn snapshot_object_state(
-        &self,
-        snapshot_id: &str,
-    ) -> Result<Option<SnapshotObjectState>> {
-        Ok(self
-            .read_snapshot(snapshot_id)
-            .await?
-            .map(|manifest| SnapshotObjectState {
-                created_at_unix: manifest.created_at_unix,
-                objects: manifest.objects,
-                object_ids: manifest.object_ids,
-            }))
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
@@ -1342,29 +1704,17 @@ impl PersistentStore {
         Ok(manifest_hash)
     }
 
+    #[cfg(test)]
     pub async fn lookup_media_cache(
         &self,
         manifest_hash: &str,
     ) -> Result<Option<MediaCacheLookup>> {
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(None);
-        }
-
-        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
-            return Ok(None);
-        };
-        let content_fingerprint = content_fingerprint_from_manifest(&manifest);
-        let metadata = current_media_cache_metadata(
-            self.load_cached_media_metadata(&content_fingerprint)
-                .await?,
-        );
-
-        Ok(Some(MediaCacheLookup {
-            content_fingerprint,
-            metadata,
-        }))
+        self.store_index_inspector()
+            .lookup_media_cache(manifest_hash)
+            .await
     }
 
+    #[cfg(test)]
     pub async fn ensure_media_cache(
         &self,
         manifest_hash: &str,
@@ -2724,6 +3074,7 @@ impl PersistentStore {
         Ok(assembled.freeze())
     }
 
+    #[cfg(test)]
     async fn load_cached_media_metadata(
         &self,
         content_fingerprint: &str,
@@ -2733,6 +3084,7 @@ impl PersistentStore {
             .await
     }
 
+    #[cfg(test)]
     fn build_media_cache_record(
         &self,
         manifest_hash: &str,
@@ -2768,6 +3120,7 @@ impl PersistentStore {
         }
     }
 
+    #[cfg(test)]
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
         if let Some(thumbnail) = &metadata.thumbnail {
             let thumbnail_path =
@@ -2785,6 +3138,7 @@ impl PersistentStore {
             .await
     }
 
+    #[cfg(test)]
     async fn render_thumbnail_payload(
         &self,
         manifest_hash: &str,
@@ -3505,17 +3859,19 @@ impl PersistentStore {
         self.metadata_store.list_storage_stats_history(limit).await
     }
 
+    #[cfg(test)]
     pub async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
-        self.metadata_store
+        self.storage_stats_collector()
             .persist_storage_stats_sample(sample)
             .await
     }
 
+    #[cfg(test)]
     pub async fn prune_storage_stats_history_before(
         &self,
         collected_before_unix: u64,
     ) -> Result<()> {
-        self.metadata_store
+        self.storage_stats_collector()
             .prune_storage_stats_history_before(collected_before_unix)
             .await
     }
@@ -3529,27 +3885,19 @@ impl PersistentStore {
         Ok(state)
     }
 
+    #[cfg(test)]
     pub async fn current_chunk_store_bytes(
         &self,
         reconcile_max_age_secs: Option<u64>,
     ) -> Result<u64> {
-        let now = unix_ts();
-        if let Some(state) = self.load_storage_stats_state().await? {
-            let should_reconcile = reconcile_max_age_secs
-                .map(|max_age| now.saturating_sub(state.last_reconciled_unix) > max_age)
-                .unwrap_or(false);
-            if !should_reconcile {
-                return Ok(state.chunk_store_bytes);
-            }
-        }
-
-        Ok(self
-            .reconcile_chunk_store_bytes_state()
-            .await?
-            .chunk_store_bytes)
+        self.storage_stats_collector()
+            .current_chunk_store_bytes(reconcile_max_age_secs)
+            .await
     }
 
     async fn note_chunk_store_delta(&self, delta_bytes: i64) -> Result<u64> {
+        let _guard = self.storage_stats_lock.lock().await;
+
         let Some(mut state) = self.load_storage_stats_state().await? else {
             return Ok(self
                 .reconcile_chunk_store_bytes_state()
@@ -3569,68 +3917,11 @@ impl PersistentStore {
         Ok(state.chunk_store_bytes)
     }
 
+    #[cfg(test)]
     pub async fn collect_storage_stats_sample(&self) -> Result<StorageStatsSample> {
-        let metadata_db_bytes = file_size_bytes(&self.metadata_db_path).await?;
-        let chunk_store_bytes = self.current_chunk_store_bytes(None).await?;
-        let manifest_store_bytes = directory_size_bytes(&self.manifests_dir).await?;
-        let media_cache_root = self
-            .media_thumbnails_dir
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.root_dir.join("state").join("media_cache"));
-        let media_cache_bytes = directory_size_bytes(&media_cache_root).await?;
-
-        let latest_snapshot = self.list_snapshots().await?.into_iter().next();
-        let mut latest_snapshot_id = None;
-        let mut latest_snapshot_created_at_unix = None;
-        let mut latest_snapshot_object_count = 0usize;
-        let mut latest_snapshot_logical_bytes = 0u64;
-        let mut latest_snapshot_unique_chunk_bytes = 0u64;
-
-        if let Some(snapshot) = latest_snapshot {
-            latest_snapshot_id = Some(snapshot.id.clone());
-            latest_snapshot_created_at_unix = Some(snapshot.created_at_unix);
-            latest_snapshot_object_count = snapshot.object_count;
-
-            if let Some(snapshot_state) = self.snapshot_object_state(&snapshot.id).await? {
-                let mut seen_chunk_hashes = HashSet::new();
-                let mut manifest_cache = HashMap::<String, ObjectManifest>::new();
-
-                for manifest_hash in snapshot_state.objects.values() {
-                    let manifest = if let Some(existing) = manifest_cache.get(manifest_hash) {
-                        existing.clone()
-                    } else {
-                        let Some(loaded) = self.load_manifest_by_hash(manifest_hash).await? else {
-                            continue;
-                        };
-                        manifest_cache.insert(manifest_hash.clone(), loaded.clone());
-                        loaded
-                    };
-
-                    latest_snapshot_logical_bytes = latest_snapshot_logical_bytes
-                        .saturating_add(manifest.total_size_bytes as u64);
-                    for chunk in manifest.chunks {
-                        if seen_chunk_hashes.insert(chunk.hash) {
-                            latest_snapshot_unique_chunk_bytes = latest_snapshot_unique_chunk_bytes
-                                .saturating_add(chunk.size_bytes as u64);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(StorageStatsSample {
-            collected_at_unix: unix_ts(),
-            latest_snapshot_id,
-            latest_snapshot_created_at_unix,
-            latest_snapshot_object_count,
-            chunk_store_bytes,
-            manifest_store_bytes,
-            metadata_db_bytes,
-            media_cache_bytes,
-            latest_snapshot_logical_bytes,
-            latest_snapshot_unique_chunk_bytes,
-        })
+        self.storage_stats_collector()
+            .collect_storage_stats_sample()
+            .await
     }
 
     pub async fn cleanup_unreferenced(

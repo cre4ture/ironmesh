@@ -86,7 +86,7 @@ pub(crate) async fn execute_replication_repair_inner(
         };
 
         let mut bundle = {
-            let store = state.store.lock().await;
+            let store = read_store(state, "replication_repair.export_bundle").await;
 
             match store
                 .export_replication_bundle(&key, version_id.as_deref(), ObjectReadMode::Preferred)
@@ -148,7 +148,7 @@ pub(crate) async fn execute_replication_repair_inner(
                     repair_state_dirty = true;
 
                     bundle = {
-                        let store = state.store.lock().await;
+                        let store = read_store(state, "replication_repair.reload_bundle").await;
                         store
                             .export_replication_bundle(
                                 &key,
@@ -223,8 +223,7 @@ pub(crate) async fn execute_replication_repair_inner(
             await_repair_busy_threshold(state).await;
 
             attempted_transfers += 1;
-            let transfer_result =
-                replicate_bundle_to_target(node, &bundle, &state.store, state).await;
+            let transfer_result = replicate_bundle_to_target(node, &bundle, state).await;
 
             match transfer_result {
                 Ok(remote_version_id) => {
@@ -321,12 +320,12 @@ async fn pull_bundle_from_source(
             .await?
             .body;
 
-            let store = state.store.lock().await;
+            let store = lock_store(state, "replication_pull.ingest_chunk").await;
             store.ingest_chunk(&chunk.hash, payload.as_ref()).await?;
         }
     }
 
-    let mut store = state.store.lock().await;
+    let mut store = lock_store(state, "replication_pull.import_manifest").await;
     store
         .import_replica_manifest(
             &bundle.key,
@@ -342,7 +341,6 @@ async fn pull_bundle_from_source(
 async fn replicate_bundle_to_target(
     target_node: &NodeDescriptor,
     bundle: &ReplicationExportBundle,
-    store: &Arc<Mutex<PersistentStore>>,
     state: &ServerState,
 ) -> Result<String> {
     if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
@@ -388,7 +386,7 @@ async fn replicate_bundle_to_target(
     if bundle.version_id.is_some() {
         for chunk in &bundle.manifest.chunks {
             let payload = {
-                let guard = store.lock().await;
+                let guard = read_store(state, "replication_push.read_chunk").await;
                 guard
                     .read_chunk_payload(&chunk.hash)
                     .await?
@@ -426,7 +424,7 @@ async fn replicate_bundle_to_target(
 
         for chunk in &bundle.manifest.chunks {
             let payload = {
-                let guard = store.lock().await;
+                let guard = read_store(state, "replication_push.read_chunk_inline").await;
                 guard
                     .read_chunk_payload(&chunk.hash)
                     .await?

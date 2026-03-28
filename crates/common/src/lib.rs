@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod traced_mutex;
+pub mod traced_rwlock;
+
 pub type NodeId = Uuid;
 pub type ClusterId = Uuid;
 pub type DeviceId = Uuid;

@@ -2,9 +2,10 @@ use super::{
     AdminControl, LocalNodeHandle, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig,
     RepairExecutorState, ServerNodeConfig, ServerState, StartupRepairStatus,
     await_repair_busy_threshold, build_rendezvous_presence_registration, build_store_index_entries,
-    cluster, constant_time_eq, jittered_backoff_secs, node_descriptor_from_presence_entry,
-    plan_peer_transport, replication::build_internal_replication_put_url, resolve_peer_base_url,
-    run, run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
+    cluster, constant_time_eq, jittered_backoff_secs, lock_store, new_store_rwlock,
+    node_descriptor_from_presence_entry, plan_peer_transport,
+    replication::build_internal_replication_put_url, resolve_peer_base_url, run,
+    run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
     token_matches,
 };
 use axum::Extension;
@@ -3771,7 +3772,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
     // put an object into underlying store
     let key = "handler-delete-key".to_string();
     {
-        let mut locked = state.store.lock().await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked
             .put_object_versioned(
                 &key,
@@ -3803,7 +3804,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
 
     // ensure underlying store current keys no longer include the key
     let keys = {
-        let store = state.store.lock().await;
+        let store = lock_store(&state, "tests.state.store").await;
         store.current_keys()
     };
     assert!(!keys.contains(&key));
@@ -3823,7 +3824,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
     let state = build_test_state(1, false, backend).await;
 
     {
-        let mut locked = state.store.lock().await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         for (key, payload) in [
             ("docs/", bytes::Bytes::from_static(b"")),
             ("docs/a.txt", bytes::Bytes::from_static(b"a")),
@@ -3857,7 +3858,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
     assert_eq!(response.status(), axum::http::StatusCode::CREATED);
 
     let keys = {
-        let store = state.store.lock().await;
+        let store = lock_store(&state, "tests.state.store").await;
         store.current_keys()
     };
     assert!(
@@ -3882,7 +3883,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
     let state = build_test_state(1, false, backend).await;
 
     {
-        let mut locked = state.store.lock().await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked
             .put_object_versioned(
                 "docs/",
@@ -3912,7 +3913,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
     assert_eq!(response.status(), axum::http::StatusCode::CREATED);
 
     let keys = {
-        let store = state.store.lock().await;
+        let store = lock_store(&state, "tests.state.store").await;
         store.current_keys()
     };
     assert!(!keys.contains(&"docs/".to_string()));
@@ -3929,7 +3930,7 @@ run_on_main_metadata_backends!(
 async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let put = {
-        let mut locked = state.store.lock().await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked
             .put_object_versioned(
                 "gallery/cat.png",
@@ -3940,7 +3941,7 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
             .unwrap()
     };
     {
-        let locked = state.store.lock().await;
+        let locked = lock_store(&state, "tests.state.store").await;
         locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
     }
 
@@ -3991,7 +3992,7 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
     let target = build_test_state(1, false, backend).await;
 
     let put = {
-        let mut locked = source.store.lock().await;
+        let mut locked = lock_store(&source, "tests.source.store").await;
         locked
             .put_object_versioned(
                 "photos/cat.png",
@@ -4003,7 +4004,7 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
     };
 
     let bundle = {
-        let locked = source.store.lock().await;
+        let locked = lock_store(&source, "tests.source.store").await;
         locked
             .export_metadata_bundle(
                 "photos/cat.png",
@@ -4016,7 +4017,7 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
     };
 
     {
-        let mut locked = target.store.lock().await;
+        let mut locked = lock_store(&target, "tests.target.store").await;
         let changed = locked.import_metadata_bundle(&bundle).await.unwrap();
         assert!(changed);
 
@@ -4060,7 +4061,7 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
     assert!(entries[0]["modified_at_unix"].as_u64().unwrap() > 0);
 
     let read_error = {
-        let locked = target.store.lock().await;
+        let locked = lock_store(&target, "tests.target.store").await;
         locked
             .get_object(
                 "photos/cat.png",
@@ -4093,7 +4094,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     let target = build_test_state(1, false, backend).await;
 
     let put = {
-        let mut locked = source.store.lock().await;
+        let mut locked = lock_store(&source, "tests.source.store").await;
         locked
             .put_object_versioned(
                 "photos/cat.png",
@@ -4150,7 +4151,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     }
 
     let bundle = {
-        let locked = source.store.lock().await;
+        let locked = lock_store(&source, "tests.source.store").await;
         locked
             .export_metadata_bundle(
                 "photos/cat.png",
@@ -4163,7 +4164,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     };
 
     {
-        let mut locked = target.store.lock().await;
+        let mut locked = lock_store(&target, "tests.target.store").await;
         locked.import_metadata_bundle(&bundle).await.unwrap();
     }
 
@@ -4242,7 +4243,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
     let range_end_inclusive = range_start + 383;
 
     let put = {
-        let mut locked = source.store.lock().await;
+        let mut locked = lock_store(&source, "tests.source.store").await;
         locked
             .put_object_versioned(
                 "photos/range.bin",
@@ -4305,7 +4306,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
     }
 
     let bundle = {
-        let locked = source.store.lock().await;
+        let locked = lock_store(&source, "tests.source.store").await;
         locked
             .export_metadata_bundle(
                 "photos/range.bin",
@@ -4318,7 +4319,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
     };
 
     {
-        let mut locked = target.store.lock().await;
+        let mut locked = lock_store(&target, "tests.target.store").await;
         locked.import_metadata_bundle(&bundle).await.unwrap();
     }
 
@@ -4416,7 +4417,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
     }
 
     {
-        let locked = target.store.lock().await;
+        let locked = lock_store(&target, "tests.target.store").await;
         let cached = locked.list_cached_chunk_records_for_test().await.unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].cache_class, "read_through");
@@ -4439,7 +4440,7 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
     let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
     let put = {
-        let mut locked = state.store.lock().await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked
             .put_object_versioned(
                 "gallery/cat.png",
@@ -4450,7 +4451,7 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
             .unwrap()
     };
     {
-        let locked = state.store.lock().await;
+        let locked = lock_store(&state, "tests.state.store").await;
         locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
     }
 
@@ -4493,7 +4494,7 @@ async fn get_media_thumbnail_admin_requires_auth_and_serves_image_impl(backend: 
     let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
     let put = {
-        let mut locked = state.store.lock().await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked
             .put_object_versioned(
                 "gallery/cat.png",
@@ -4504,7 +4505,7 @@ async fn get_media_thumbnail_admin_requires_auth_and_serves_image_impl(backend: 
             .unwrap()
     };
     {
-        let locked = state.store.lock().await;
+        let locked = lock_store(&state, "tests.state.store").await;
         locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
     }
 
@@ -4562,7 +4563,7 @@ async fn get_object_admin_returns_bytes_with_admin_token_impl(backend: MainTestB
     state.admin_control.admin_token = Some("admin-secret".to_string());
     let payload = bytes::Bytes::from(sample_png_bytes());
     {
-        let mut locked = state.store.lock().await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked
             .put_object_versioned("gallery/cat.png", payload.clone(), PutOptions::default())
             .await
@@ -4607,7 +4608,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             .collect::<Vec<_>>(),
     );
     {
-        let mut locked = state.store.lock().await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked
             .put_object_versioned("docs/range.txt", payload.clone(), PutOptions::default())
             .await
@@ -4868,13 +4869,13 @@ async fn build_test_state(
     let root = fresh_test_dir(&format!("startup-repair-main-{}", backend.suffix()));
     let local_node_id = NodeId::new_v4();
 
-    let store = Arc::new(Mutex::new(
+    let store = new_store_rwlock(
         PersistentStore::init_with_metadata_backend(root.clone(), backend.kind())
             .await
             .unwrap(),
-    ));
+    );
     let upload_chunk_ingestor = {
-        let store_guard = store.lock().await;
+        let store_guard = store.read("test.build_state.chunk_ingestor").await;
         store_guard.chunk_ingestor()
     };
 
@@ -4936,7 +4937,6 @@ async fn build_test_state(
         node_id: local_node_id,
         local_edge_mode: false,
         store: store.clone(),
-        store_lock_trace: Arc::new(std::sync::Mutex::new(None)),
         upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(service)),
         client_credentials: Arc::new(Mutex::new(super::storage::ClientCredentialState::default())),
@@ -5008,7 +5008,7 @@ async fn build_test_state(
 
     if seed_gap {
         let put = {
-            let mut locked = store.lock().await;
+            let mut locked = store.write("tests.store").await;
             locked
                 .put_object_versioned(
                     "startup-gap-key",
@@ -5065,7 +5065,7 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
         );
     }
 
-    let _store_guard = state.store.lock().await;
+    let _store_guard = lock_store(&state, "tests.state.store").await;
     let response = tokio::time::timeout(
         Duration::from_millis(250),
         super::upload_session_chunk(
@@ -5568,7 +5568,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     };
 
     {
-        let mut store = state.store.lock().await;
+        let mut store = lock_store(&state, "tests.state.store").await;
         store
             .put_object_versioned(
                 key,
@@ -5897,7 +5897,7 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
 
 async fn cleanup_test_state(state: &ServerState) {
     let root = {
-        let store = state.store.lock().await;
+        let store = lock_store(&state, "tests.state.store").await;
         store.root_dir().to_path_buf()
     };
     let _ = tokio::fs::remove_dir_all(root).await;

@@ -29,6 +29,9 @@ use axum_server::accept::Accept;
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use bytes::Bytes;
+use common::traced_rwlock::{
+    TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
+};
 use common::{ClusterId, HealthStatus, NodeId};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rcgen::{
@@ -104,6 +107,8 @@ const SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_UPLOAD_FINALIZE_LOG_THRESHOLD_MS: u128 = 500;
 const SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS: u128 = 500;
 const SLOW_STORE_LOCK_HOLD_LOG_THRESHOLD_MS: u128 = 500;
+const SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS: u128 = 250;
+const SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS: u128 = 250;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -124,15 +129,13 @@ use storage::{
     ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo, StorageStatsSample,
     StoreReadError, UploadChunkRef, VersionConsistencyState,
 };
-
 #[derive(Clone)]
 struct ServerState {
     data_dir: PathBuf,
     cluster_id: ClusterId,
     node_id: NodeId,
     local_edge_mode: bool,
-    store: Arc<Mutex<PersistentStore>>,
-    store_lock_trace: Arc<StdMutex<Option<StoreLockOwner>>>,
+    store: Arc<TracedRwLock<PersistentStore>>,
     upload_chunk_ingestor: ChunkIngestor,
     cluster: Arc<Mutex<ClusterService>>,
     client_credentials: Arc<Mutex<ClientCredentialState>>,
@@ -176,98 +179,30 @@ struct ServerState {
     client_auth_replay_cache: Arc<Mutex<ClientAuthReplayCache>>,
 }
 
-#[derive(Clone, Copy)]
-struct StoreLockOwner {
+fn new_store_rwlock(store: PersistentStore) -> Arc<TracedRwLock<PersistentStore>> {
+    Arc::new(TracedRwLock::new(
+        "store",
+        store,
+        TracedRwLockConfig::new(
+            Duration::from_millis(SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS as u64),
+            Duration::from_secs(1),
+            Duration::from_millis(SLOW_STORE_LOCK_HOLD_LOG_THRESHOLD_MS as u64),
+        ),
+    ))
+}
+
+async fn lock_store<'a>(
+    state: &'a ServerState,
     operation: &'static str,
-    acquired_at: Instant,
+) -> TracedRwLockWriteGuard<'a, PersistentStore> {
+    state.store.write(operation).await
 }
 
-struct TracedStoreGuard<'a> {
+async fn read_store<'a>(
+    state: &'a ServerState,
     operation: &'static str,
-    waited_ms: u128,
-    acquired_at: Instant,
-    owner: Arc<StdMutex<Option<StoreLockOwner>>>,
-    guard: tokio::sync::MutexGuard<'a, PersistentStore>,
-}
-
-impl TracedStoreGuard<'_> {
-    fn waited_ms(&self) -> u128 {
-        self.waited_ms
-    }
-}
-
-impl std::ops::Deref for TracedStoreGuard<'_> {
-    type Target = PersistentStore;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl std::ops::DerefMut for TracedStoreGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
-}
-
-impl Drop for TracedStoreGuard<'_> {
-    fn drop(&mut self) {
-        let hold_ms = self.acquired_at.elapsed().as_millis();
-        {
-            let mut owner = self.owner.lock().unwrap();
-            if owner.as_ref().is_some_and(|current| {
-                current.operation == self.operation && current.acquired_at == self.acquired_at
-            }) {
-                *owner = None;
-            }
-        }
-
-        if hold_ms >= SLOW_STORE_LOCK_HOLD_LOG_THRESHOLD_MS {
-            warn!(
-                operation = self.operation,
-                waited_ms = self.waited_ms,
-                hold_ms,
-                "slow store lock hold"
-            );
-        }
-    }
-}
-
-async fn lock_store<'a>(state: &'a ServerState, operation: &'static str) -> TracedStoreGuard<'a> {
-    let wait_started_at = Instant::now();
-    let blocking_owner = { *state.store_lock_trace.lock().unwrap() };
-    let guard = state.store.lock().await;
-    let waited_ms = wait_started_at.elapsed().as_millis();
-    if waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS {
-        if let Some(owner) = blocking_owner {
-            warn!(
-                operation,
-                waited_ms,
-                blocking_operation = owner.operation,
-                blocking_observed_hold_ms = owner.acquired_at.elapsed().as_millis(),
-                "slow store lock wait"
-            );
-        } else {
-            warn!(operation, waited_ms, "slow store lock wait");
-        }
-    }
-
-    let acquired_at = Instant::now();
-    {
-        let mut owner = state.store_lock_trace.lock().unwrap();
-        *owner = Some(StoreLockOwner {
-            operation,
-            acquired_at,
-        });
-    }
-
-    TracedStoreGuard {
-        operation,
-        waited_ms,
-        acquired_at,
-        owner: state.store_lock_trace.clone(),
-        guard,
-    }
+) -> TracedRwLockReadGuard<'a, PersistentStore> {
+    state.store.read(operation).await
 }
 
 #[derive(Clone)]
@@ -3033,15 +2968,15 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         status: cluster::NodeStatus::Online,
     });
 
-    let store = Arc::new(Mutex::new(
+    let store = new_store_rwlock(
         PersistentStore::init_with_metadata_backend(
             config.data_dir.clone(),
             config.metadata_backend(),
         )
         .await?,
-    ));
+    );
     let upload_chunk_ingestor = {
-        let store_guard = store.lock().await;
+        let store_guard = store.read("server.init.chunk_ingestor").await;
         store_guard.chunk_ingestor()
     };
     info!(
@@ -3061,7 +2996,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     };
 
     let persisted_cluster_replicas = {
-        let store_guard = store.lock().await;
+        let store_guard = store.read("server.init.load_cluster_replicas").await;
         match store_guard.load_cluster_replicas().await {
             Ok(replicas) => replicas,
             Err(err) => {
@@ -3073,7 +3008,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     cluster.import_replicas_by_key(persisted_cluster_replicas);
 
     let persisted_client_credentials = {
-        let store_guard = store.lock().await;
+        let store_guard = store.read("server.init.load_client_credentials").await;
         match store_guard.load_client_credential_state().await {
             Ok(state) => state,
             Err(err) => {
@@ -3218,7 +3153,6 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         node_id: config.node_id,
         local_edge_mode: config.mode == ServerNodeMode::LocalEdge,
         store,
-        store_lock_trace: Arc::new(StdMutex::new(None)),
         upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(cluster)),
         client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
@@ -3281,7 +3215,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     spawn_storage_stats_refresher(state.clone());
 
     let persisted_attempts = {
-        let store = state.store.lock().await;
+        let store = read_store(&state, "server.init.load_repair_attempts").await;
         match store.load_repair_attempts().await {
             Ok(attempts) => attempts,
             Err(err) => {
@@ -3825,13 +3759,17 @@ async fn refresh_storage_stats_once(state: &ServerState) {
         runtime.last_attempt_unix = Some(unix_ts());
     }
 
+    let storage_stats_collector = {
+        let store = read_store(state, "storage_stats.clone_worker").await;
+        store.storage_stats_collector()
+    };
+
     let result: anyhow::Result<StorageStatsSample> = {
-        let store = lock_store(state, "storage_stats.collect").await;
-        match store
+        match storage_stats_collector
             .current_chunk_store_bytes(Some(STORAGE_STATS_RECONCILE_INTERVAL_SECS))
             .await
         {
-            Ok(_) => store.collect_storage_stats_sample().await,
+            Ok(_) => storage_stats_collector.collect_storage_stats_sample().await,
             Err(err) => Err(err),
         }
     };
@@ -3839,14 +3777,16 @@ async fn refresh_storage_stats_once(state: &ServerState) {
     match result {
         Ok(sample) => {
             let persist_result: anyhow::Result<()> = {
-                let store = lock_store(state, "storage_stats.persist").await;
-                if let Err(err) = store.persist_storage_stats_sample(&sample).await {
+                if let Err(err) = storage_stats_collector
+                    .persist_storage_stats_sample(&sample)
+                    .await
+                {
                     Err(err)
                 } else {
                     let retention_cutoff = sample
                         .collected_at_unix
                         .saturating_sub(STORAGE_STATS_HISTORY_RETENTION_SECS);
-                    store
+                    storage_stats_collector
                         .prune_storage_stats_history_before(retention_cutoff)
                         .await
                 }
@@ -4831,7 +4771,7 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
 
 pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
     let mut local_metadata_subjects = {
-        let store = state.store.lock().await;
+        let store = read_store(state, "cluster_metadata.list_local_subjects").await;
         store
             .list_metadata_subjects()
             .await
@@ -4954,7 +4894,7 @@ pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
             };
 
             let import_changed = {
-                let mut store = state.store.lock().await;
+                let mut store = lock_store(state, "cluster_metadata.import_bundle").await;
                 match store.import_metadata_bundle(&bundle).await {
                     Ok(changed) => changed,
                     Err(err) => {
@@ -5090,7 +5030,7 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
 
 async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
     let inspector = {
-        let store = lock_store(state, "availability.recompute_local_subjects.snapshot").await;
+        let store = read_store(state, "availability.recompute_local_subjects.snapshot").await;
         store.replication_subject_inspector()
     };
     let mut subjects = inspector
@@ -5389,7 +5329,7 @@ async fn list_snapshots_admin(
 }
 
 async fn list_snapshots_response(state: &ServerState) -> Response {
-    let store = state.store.lock().await;
+    let store = read_store(state, "snapshots.list").await;
     match store.list_snapshots().await {
         Ok(snapshots) => (StatusCode::OK, Json(snapshots)).into_response(),
         Err(err) => {
@@ -5547,7 +5487,7 @@ fn should_trigger_autonomous_post_write_replication(
 fn spawn_media_cache_warmup(state: ServerState, key: String, manifest_hash: String) {
     tokio::spawn(async move {
         let media_cache_worker = {
-            let store = lock_store(&state, "media_cache_warmup.clone_worker").await;
+            let store = read_store(&state, "media_cache_warmup.clone_worker").await;
             store.media_cache_worker()
         };
         if let Err(err) = media_cache_worker.ensure_media_cache(&manifest_hash).await {
@@ -5592,7 +5532,7 @@ async fn rename_object_path(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let mut store = state.store.lock().await;
+    let mut store = lock_store(&state, "store_path.rename").await;
     match store
         .rename_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
@@ -5625,7 +5565,7 @@ async fn copy_object_path(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let mut store = state.store.lock().await;
+    let mut store = lock_store(&state, "store_path.copy").await;
     match store
         .copy_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
@@ -5666,7 +5606,7 @@ async fn put_object(
         Some(_) => return StatusCode::BAD_REQUEST,
     };
 
-    let mut store = state.store.lock().await;
+    let mut store = lock_store(&state, "store_object.put").await;
     match store
         .put_object_versioned(
             &key,
@@ -6193,7 +6133,7 @@ async fn delete_object(
         return StatusCode::BAD_REQUEST;
     }
 
-    let mut store = state.store.lock().await;
+    let mut store = lock_store(&state, "store_object.tombstone").await;
     let delete_result = if recursive {
         store
             .tombstone_subtree(
@@ -6327,75 +6267,108 @@ async fn list_store_index_response(
     query: StoreIndexQuery,
     thumbnail_route: &str,
 ) -> Response {
+    let request_id = Uuid::new_v4();
     let prefix = query.prefix.unwrap_or_default();
     let depth = query.depth.unwrap_or(1).max(1);
+    let snapshot_label = query.snapshot.as_deref().unwrap_or("<current>");
 
-    let (keys, key_hashes, key_sizes, key_modified_times) = {
-        let store = lock_store(state, "store_index.snapshot_scan").await;
-        if let Some(snapshot_id) = query.snapshot.as_deref() {
-            match store.snapshot_object_state(snapshot_id).await {
-                Ok(Some(snapshot_state)) => {
-                    let object_hashes = snapshot_state.objects;
-                    let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
-                    keys.sort();
-                    let sizes = match store.object_sizes_by_key(&object_hashes).await {
-                        Ok(sizes) => sizes,
-                        Err(err) => {
-                            tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to compute snapshot key sizes");
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                        }
-                    };
-                    let modified_times = match store
-                        .object_modified_at_by_key(
-                            &object_hashes,
-                            &snapshot_state.object_ids,
-                            Some(snapshot_state.created_at_unix),
-                        )
-                        .await
-                    {
-                        Ok(modified_times) => modified_times,
-                        Err(err) => {
-                            tracing::error!(
-                                snapshot_id = %snapshot_id,
-                                error = %err,
-                                "failed to compute snapshot key modified times"
-                            );
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                        }
-                    };
-                    (keys, object_hashes, sizes, modified_times)
-                }
-                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-                Err(err) => {
-                    tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to list snapshot key index");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            }
-        } else {
-            let object_hashes = store.current_object_hashes();
-            let object_ids = store.current_object_ids();
-            let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
-            keys.sort();
-            let sizes = match store.object_sizes_by_key(&object_hashes).await {
-                Ok(sizes) => sizes,
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to compute current key sizes");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
-            let modified_times = match store
-                .object_modified_at_by_key(&object_hashes, &object_ids, None)
-                .await
-            {
-                Ok(modified_times) => modified_times,
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to compute current key modified times");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
-            (keys, object_hashes, sizes, modified_times)
-        }
+    let snapshot_scan_started_at = Instant::now();
+    let (store_index_inspector, snapshot_scan_waited_ms) = {
+        let store = read_store(state, "store_index.clone_worker").await;
+        (store.store_index_inspector(), store.waited_ms())
     };
+    let (keys, key_hashes, key_sizes, key_modified_times): (
+        Vec<String>,
+        HashMap<String, String>,
+        HashMap<String, u64>,
+        HashMap<String, u64>,
+    ) = if let Some(snapshot_id) = query.snapshot.as_deref() {
+        match store_index_inspector
+            .snapshot_object_state(snapshot_id)
+            .await
+        {
+            Ok(Some(snapshot_state)) => {
+                let object_hashes = snapshot_state.objects;
+                let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
+                keys.sort();
+                let sizes = match store_index_inspector
+                    .object_sizes_by_key(&object_hashes)
+                    .await
+                {
+                    Ok(sizes) => sizes,
+                    Err(err) => {
+                        tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to compute snapshot key sizes");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                let modified_times = match store_index_inspector
+                    .object_modified_at_by_key(
+                        &object_hashes,
+                        &snapshot_state.object_ids,
+                        Some(snapshot_state.created_at_unix),
+                    )
+                    .await
+                {
+                    Ok(modified_times) => modified_times,
+                    Err(err) => {
+                        tracing::error!(
+                            snapshot_id = %snapshot_id,
+                            error = %err,
+                            "failed to compute snapshot key modified times"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                (keys, object_hashes, sizes, modified_times)
+            }
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to list snapshot key index");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    } else {
+        let object_hashes = store_index_inspector.current_object_hashes();
+        let object_ids = store_index_inspector.current_object_ids();
+        let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
+        keys.sort();
+        let sizes = match store_index_inspector
+            .object_sizes_by_key(&object_hashes)
+            .await
+        {
+            Ok(sizes) => sizes,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to compute current key sizes");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let modified_times = match store_index_inspector
+            .object_modified_at_by_key(&object_hashes, &object_ids, None)
+            .await
+        {
+            Ok(modified_times) => modified_times,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to compute current key modified times");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        (keys, object_hashes, sizes, modified_times)
+    };
+    let snapshot_scan_ms = snapshot_scan_started_at.elapsed().as_millis();
+    if snapshot_scan_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
+        || snapshot_scan_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+    {
+        warn!(
+            request_id = %request_id,
+            prefix = %prefix,
+            snapshot = snapshot_label,
+            depth,
+            key_count = keys.len(),
+            lock_waited_ms = snapshot_scan_waited_ms,
+            phase_ms = snapshot_scan_ms,
+            "slow store index snapshot scan"
+        );
+    }
 
     let mut entries = build_store_index_entries_with_hashes(
         &keys,
@@ -6405,38 +6378,82 @@ async fn list_store_index_response(
         Some(&key_sizes),
         Some(&key_modified_times),
     );
-    {
-        let store = lock_store(state, "store_index.media_lookup").await;
-        for entry in &mut entries {
-            if entry.entry_type != "key" || !looks_like_image_path(&entry.path) {
-                continue;
+    let image_entry_count = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key" && looks_like_image_path(&entry.path))
+        .count();
+    let media_lookup_started_at = Instant::now();
+    let mut media_ready_count = 0;
+    let mut media_pending_count = 0;
+    let mut media_unsupported_count = 0;
+    let mut media_failed_count = 0;
+    let mut media_missing_count = 0;
+    let mut media_error_count = 0;
+    let media_lookup_waited_ms = 0;
+    for entry in &mut entries {
+        if entry.entry_type != "key" || !looks_like_image_path(&entry.path) {
+            continue;
+        }
+
+        let Some(manifest_hash) = entry.content_hash.as_deref() else {
+            continue;
+        };
+
+        match store_index_inspector
+            .lookup_media_cache(manifest_hash)
+            .await
+        {
+            Ok(Some(lookup)) => {
+                match lookup.metadata.as_ref().map(|metadata| &metadata.status) {
+                    Some(MediaCacheStatus::Ready) => media_ready_count += 1,
+                    Some(MediaCacheStatus::Unsupported) => media_unsupported_count += 1,
+                    Some(MediaCacheStatus::Failed) => media_failed_count += 1,
+                    None => media_pending_count += 1,
+                }
+                entry.content_fingerprint = Some(lookup.content_fingerprint.clone());
+                entry.media = Some(build_media_index_response(
+                    &entry.path,
+                    query.snapshot.as_deref(),
+                    &lookup,
+                    thumbnail_route,
+                ));
             }
-
-            let Some(manifest_hash) = entry.content_hash.as_deref() else {
-                continue;
-            };
-
-            match store.lookup_media_cache(manifest_hash).await {
-                Ok(Some(lookup)) => {
-                    entry.content_fingerprint = Some(lookup.content_fingerprint.clone());
-                    entry.media = Some(build_media_index_response(
-                        &entry.path,
-                        query.snapshot.as_deref(),
-                        &lookup,
-                        thumbnail_route,
-                    ));
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(
-                        key = %entry.path,
-                        manifest_hash = %manifest_hash,
-                        error = %err,
-                        "failed to read cached media metadata for store index"
-                    );
-                }
+            Ok(None) => {
+                media_missing_count += 1;
+            }
+            Err(err) => {
+                media_error_count += 1;
+                warn!(
+                    key = %entry.path,
+                    manifest_hash = %manifest_hash,
+                    error = %err,
+                    "failed to read cached media metadata for store index"
+                );
             }
         }
+    }
+    let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
+    if image_entry_count > 0
+        && (media_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
+            || media_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS)
+    {
+        warn!(
+            request_id = %request_id,
+            prefix = %prefix,
+            snapshot = snapshot_label,
+            depth,
+            entry_count = entries.len(),
+            image_entry_count,
+            lock_waited_ms = media_lookup_waited_ms,
+            phase_ms = media_lookup_ms,
+            ready_count = media_ready_count,
+            pending_count = media_pending_count,
+            unsupported_count = media_unsupported_count,
+            failed_count = media_failed_count,
+            missing_count = media_missing_count,
+            error_count = media_error_count,
+            "slow store index media lookup"
+        );
     }
 
     if matches!(query.view, Some(StoreIndexView::Tree)) {
@@ -7037,7 +7054,7 @@ async fn hydrate_missing_chunks_for_range(
             };
 
             {
-                let store = state.store.lock().await;
+                let store = lock_store(state, "object_read.hydrate_missing_chunk").await;
                 store
                     .ingest_chunk(&chunk.hash, response.body.as_ref())
                     .await?;
@@ -7077,7 +7094,7 @@ async fn get_object_response(
     };
 
     let descriptor = {
-        let store = state.store.lock().await;
+        let store = read_store(state, "object_read.describe").await;
         store
             .describe_object(
                 key,
@@ -7136,7 +7153,7 @@ async fn get_object_response(
         .unwrap_or((0, total_size_bytes));
 
     let missing_chunks = {
-        let store = state.store.lock().await;
+        let store = read_store(state, "object_read.plan_missing_chunks").await;
         match store
             .missing_chunks_for_manifest_range(&manifest_hash, range_start, range_end_exclusive)
             .await
@@ -7188,7 +7205,7 @@ async fn get_object_response(
     }
 
     let touched_chunk_hashes = {
-        let store = state.store.lock().await;
+        let store = read_store(state, "object_read.list_range_chunk_hashes").await;
         match store
             .chunk_hashes_for_manifest_range(&manifest_hash, range_start, range_end_exclusive)
             .await
@@ -7207,7 +7224,7 @@ async fn get_object_response(
     };
 
     {
-        let store = state.store.lock().await;
+        let store = lock_store(state, "object_read.touch_cached_chunks").await;
         if let Err(err) = store
             .touch_cached_chunk_accesses(&touched_chunk_hashes)
             .await
@@ -7221,7 +7238,7 @@ async fn get_object_response(
     }
 
     let read_result = {
-        let store = state.store.lock().await;
+        let store = read_store(state, "object_read.plan_stream").await;
         match selected_range {
             Some(range) => store
                 .plan_object_range_by_manifest_hash(
@@ -7288,13 +7305,19 @@ async fn get_media_thumbnail_admin(
 }
 
 async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnailQuery) -> Response {
+    let request_id = Uuid::new_v4();
     let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
         Some(value) => value,
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
+    let snapshot_label = query.snapshot.as_deref().unwrap_or("<current>");
+    let version_label = query.version.as_deref().unwrap_or("<latest>");
 
-    let metadata = {
-        let store = lock_store(state, "media_thumbnail.resolve_and_ensure").await;
+    let request_started_at = Instant::now();
+    let resolve_started_at = Instant::now();
+    let (manifest_hash, media_cache_worker, resolve_waited_ms) = {
+        let store = read_store(state, "media_thumbnail.resolve_and_ensure").await;
+        let waited_ms = store.waited_ms();
         let manifest_hash = match store
             .resolve_manifest_hash_for_key(
                 &query.key,
@@ -7315,16 +7338,48 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
+        (manifest_hash, store.media_cache_worker(), waited_ms)
+    };
+    let resolve_ms = resolve_started_at.elapsed().as_millis();
+    if resolve_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
+        || resolve_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
+    {
+        warn!(
+            request_id = %request_id,
+            key = %query.key,
+            snapshot = snapshot_label,
+            version = version_label,
+            read_mode = ?read_mode,
+            manifest_hash = %manifest_hash,
+            lock_waited_ms = resolve_waited_ms,
+            phase_ms = resolve_ms,
+            "slow media thumbnail resolve"
+        );
+    }
 
-        match store.ensure_media_cache(&manifest_hash).await {
-            Ok(Some(metadata)) => metadata,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(err) => {
-                tracing::error!(key = %query.key, error = %err, "failed to build media thumbnail cache");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+    let ensure_started_at = Instant::now();
+    let metadata = match media_cache_worker.ensure_media_cache(&manifest_hash).await {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(key = %query.key, error = %err, "failed to build media thumbnail cache");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let ensure_ms = ensure_started_at.elapsed().as_millis();
+    if ensure_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS {
+        warn!(
+            request_id = %request_id,
+            key = %query.key,
+            snapshot = snapshot_label,
+            version = version_label,
+            manifest_hash = %manifest_hash,
+            phase_ms = ensure_ms,
+            status = ?metadata.status,
+            has_thumbnail = metadata.thumbnail.is_some(),
+            "slow media thumbnail cache ensure"
+        );
+    }
 
     if metadata.status != MediaCacheStatus::Ready {
         return StatusCode::NOT_FOUND.into_response();
@@ -7334,26 +7389,66 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let payload = {
-        let store = lock_store(state, "media_thumbnail.path_lookup").await;
-        let thumbnail_path =
-            store.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
-        match tokio::fs::read(&thumbnail_path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            Err(err) => {
-                tracing::error!(
-                    key = %query.key,
-                    path = %thumbnail_path.display(),
-                    error = %err,
-                    "failed to read generated thumbnail"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+    let path_lookup_started_at = Instant::now();
+    let (thumbnail_path, path_lookup_waited_ms) = {
+        let store = read_store(state, "media_thumbnail.path_lookup").await;
+        (
+            store.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile),
+            store.waited_ms(),
+        )
+    };
+    let path_lookup_ms = path_lookup_started_at.elapsed().as_millis();
+    if path_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
+        || path_lookup_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
+    {
+        warn!(
+            request_id = %request_id,
+            key = %query.key,
+            snapshot = snapshot_label,
+            version = version_label,
+            content_fingerprint = %metadata.content_fingerprint,
+            thumbnail_profile = %thumbnail.profile,
+            lock_waited_ms = path_lookup_waited_ms,
+            phase_ms = path_lookup_ms,
+            "slow media thumbnail path lookup"
+        );
+    }
+
+    let file_read_started_at = Instant::now();
+    let payload = match tokio::fs::read(&thumbnail_path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(err) => {
+            tracing::error!(
+                key = %query.key,
+                path = %thumbnail_path.display(),
+                error = %err,
+                "failed to read generated thumbnail"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let file_read_ms = file_read_started_at.elapsed().as_millis();
+    let total_ms = request_started_at.elapsed().as_millis();
+    if file_read_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
+        || total_ms >= SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS
+    {
+        warn!(
+            request_id = %request_id,
+            key = %query.key,
+            snapshot = snapshot_label,
+            version = version_label,
+            manifest_hash = %manifest_hash,
+            content_fingerprint = %metadata.content_fingerprint,
+            thumbnail_profile = %thumbnail.profile,
+            file_read_ms,
+            total_ms,
+            payload_bytes = payload.len(),
+            "slow media thumbnail response"
+        );
+    }
 
     (
         [
@@ -7378,7 +7473,7 @@ async fn list_versions(
     State(state): State<ServerState>,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().await;
+    let store = read_store(&state, "versions.list").await;
     match store.list_versions(&key).await {
         Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -7423,7 +7518,7 @@ async fn commit_version_inner(state: ServerState, key: String, version_id: Strin
         }
     }
 
-    let mut store = state.store.lock().await;
+    let mut store = lock_store(&state, "versions.commit").await;
     match store.commit_version(&key, &version_id).await {
         Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => StatusCode::NOT_FOUND,
@@ -7758,7 +7853,7 @@ async fn persist_client_credential_state(state: &ServerState) -> Result<()> {
         let auth = state.client_credentials.lock().await;
         auth.clone()
     };
-    let store = state.store.lock().await;
+    let store = lock_store(state, "client_credentials.persist").await;
     store.persist_client_credential_state(&snapshot).await
 }
 
@@ -10694,7 +10789,7 @@ async fn list_nodes(State(state): State<ServerState>) -> Json<Vec<NodeDescriptor
 
 async fn storage_stats_current(State(state): State<ServerState>) -> impl IntoResponse {
     let sample = {
-        let store = state.store.lock().await;
+        let store = read_store(&state, "storage_stats.load_current").await;
         match store.load_current_storage_stats().await {
             Ok(sample) => sample,
             Err(err) => {
@@ -10724,7 +10819,7 @@ async fn storage_stats_history(
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(120).clamp(1, 2000);
     let samples = {
-        let store = state.store.lock().await;
+        let store = read_store(&state, "storage_stats.load_history").await;
         match store.list_storage_stats_history(limit).await {
             Ok(samples) => samples,
             Err(err) => {
@@ -10931,7 +11026,7 @@ async fn local_available_subjects(State(state): State<ServerState>) -> impl Into
 
 async fn local_metadata_subjects(State(state): State<ServerState>) -> impl IntoResponse {
     let mut subjects = {
-        let store = state.store.lock().await;
+        let store = read_store(&state, "metadata_subjects.list").await;
         store
             .list_metadata_subjects()
             .await
@@ -10988,7 +11083,7 @@ async fn drop_replication_subject(
     Query(query): Query<ReplicationDropQuery>,
 ) -> impl IntoResponse {
     let dropped = {
-        let mut store = state.store.lock().await;
+        let mut store = lock_store(&state, "replication.drop_subject").await;
         match store
             .drop_replica_subject(&query.key, query.version_id.as_deref())
             .await
@@ -11081,7 +11176,7 @@ async fn execute_replication_cleanup(
         };
 
         let bundle = {
-            let store = state.store.lock().await;
+            let store = read_store(&state, "replication_cleanup.export_bundle").await;
             match store
                 .export_replication_bundle(&key, Some(&version_id), ObjectReadMode::Preferred)
                 .await
@@ -11248,7 +11343,7 @@ async fn export_replication_bundle(
     State(state): State<ServerState>,
     Query(query): Query<ReplicationExportQuery>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().await;
+    let store = read_store(&state, "replication.export_bundle").await;
     match store
         .export_replication_bundle(
             &query.key,
@@ -11287,7 +11382,7 @@ async fn export_metadata_bundle(
     State(state): State<ServerState>,
     Query(query): Query<MetadataExportQuery>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().await;
+    let store = read_store(&state, "metadata.export_bundle").await;
     match store
         .export_metadata_bundle(
             &query.key,
@@ -11314,7 +11409,7 @@ async fn get_replication_chunk(
     State(state): State<ServerState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().await;
+    let store = read_store(&state, "replication.read_chunk").await;
     match store.read_chunk_payload(&hash).await {
         Ok(Some(payload)) => (StatusCode::OK, payload).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -11330,7 +11425,7 @@ async fn push_replication_chunk(
     Path(hash): Path<String>,
     payload: Bytes,
 ) -> impl IntoResponse {
-    let store = state.store.lock().await;
+    let store = lock_store(&state, "replication.ingest_chunk").await;
     match store.ingest_chunk(&hash, &payload).await {
         Ok(stored) => (StatusCode::OK, Json(ReplicationChunkPushReport { stored })).into_response(),
         Err(err) => {
@@ -11362,7 +11457,7 @@ async fn push_replication_manifest(
     };
 
     let import_result = {
-        let mut store = state.store.lock().await;
+        let mut store = lock_store(&state, "replication.import_manifest").await;
         store
             .import_replica_manifest(
                 &query.key,
@@ -11426,7 +11521,7 @@ async fn persist_repair_state(state: &ServerState) -> Result<()> {
             .collect::<HashMap<_, _>>()
     };
 
-    let store = state.store.lock().await;
+    let store = lock_store(state, "repair_state.persist").await;
     store.persist_repair_attempts(&attempts).await
 }
 
@@ -11436,7 +11531,7 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
         cluster.export_replicas_by_key()
     };
 
-    let store = state.store.lock().await;
+    let store = lock_store(state, "cluster_replicas.persist").await;
     store.persist_cluster_replicas(&replicas).await
 }
 
@@ -11660,7 +11755,7 @@ async fn append_admin_audit(
         details_json: serde_json::to_string(&details).unwrap_or_else(|_| "{}".to_string()),
         created_at_unix: unix_ts(),
     };
-    let store = state.store.lock().await;
+    let store = lock_store(state, "admin_audit.append").await;
     if let Err(err) = store.append_admin_audit_event(&event).await {
         warn!(error = %err, action = %action, "failed to append admin audit event");
     }
@@ -12006,7 +12101,7 @@ async fn run_cleanup(
     };
 
     let result = {
-        let store = state.store.lock().await;
+        let store = lock_store(&state, "maintenance.cleanup").await;
         store.cleanup_unreferenced(retention_secs, dry_run).await
     };
     match result {
@@ -12083,7 +12178,7 @@ async fn run_tombstone_compaction(
     };
 
     let result = {
-        let store = state.store.lock().await;
+        let store = lock_store(&state, "maintenance.tombstones.compact").await;
         store
             .compact_tombstone_indexes(retention_secs, dry_run)
             .await
@@ -12152,7 +12247,7 @@ async fn list_tombstone_archives(
     };
 
     let result = {
-        let store = state.store.lock().await;
+        let store = read_store(&state, "maintenance.tombstones.archive_list").await;
         store.list_tombstone_archives().await
     };
     match result {
@@ -12224,7 +12319,7 @@ async fn run_tombstone_archive_restore(
     };
 
     let result = {
-        let store = state.store.lock().await;
+        let store = lock_store(&state, "maintenance.tombstones.restore").await;
         store
             .restore_tombstone_index_from_archive(
                 object_id,
@@ -12308,7 +12403,7 @@ async fn run_tombstone_archive_purge(
     };
 
     let result = {
-        let store = state.store.lock().await;
+        let store = lock_store(&state, "maintenance.tombstones.archive_purge").await;
         store
             .purge_tombstone_archives(retention_secs, dry_run)
             .await
@@ -12365,7 +12460,7 @@ struct ReconcileReport {
 }
 
 async fn export_provisional_versions(State(state): State<ServerState>) -> impl IntoResponse {
-    let store = state.store.lock().await;
+    let store = read_store(&state, "reconcile.export_provisional_versions").await;
     match store.list_provisional_versions().await {
         Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
         Err(err) => {
@@ -12447,7 +12542,7 @@ async fn reconcile_from_node(
 
     for entry in remote_entries {
         let replayed = {
-            let store = state.store.lock().await;
+            let store = read_store(&state, "reconcile.check_marker").await;
             match store
                 .has_reconcile_marker(&source_node_id_string, &entry.key, &entry.version_id)
                 .await
@@ -12473,7 +12568,7 @@ async fn reconcile_from_node(
         }
 
         let already_present = {
-            let store = state.store.lock().await;
+            let store = read_store(&state, "reconcile.check_manifest").await;
             match store
                 .has_manifest_for_key(&entry.key, &entry.manifest_hash)
                 .await
@@ -12495,7 +12590,7 @@ async fn reconcile_from_node(
         if already_present {
             skipped_existing += 1;
             let mark_result = {
-                let store = state.store.lock().await;
+                let store = lock_store(&state, "reconcile.mark_existing").await;
                 store
                     .mark_reconciled(&source_node_id_string, &entry.key, &entry.version_id, None)
                     .await
@@ -12550,7 +12645,7 @@ async fn reconcile_from_node(
         };
 
         let put_result = {
-            let mut store = state.store.lock().await;
+            let mut store = lock_store(&state, "reconcile.import_object").await;
             store
                 .put_object_versioned(
                     &entry.key,
@@ -12571,7 +12666,7 @@ async fn reconcile_from_node(
                 imported += 1;
 
                 let mark_result = {
-                    let store = state.store.lock().await;
+                    let store = lock_store(&state, "reconcile.mark_imported").await;
                     store
                         .mark_reconciled(
                             &source_node_id_string,
