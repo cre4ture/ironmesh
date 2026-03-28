@@ -671,7 +671,7 @@ mod tests {
                 target: target.clone(),
                 requested_expires_in_secs: Some(60),
             },
-            &[state.config.public_url.clone()],
+            std::slice::from_ref(&state.config.public_url),
         );
 
         let relay = state.relay.clone();

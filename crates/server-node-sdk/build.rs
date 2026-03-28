@@ -310,22 +310,19 @@ fn extract_tag_attr(
 
     while let Some(tag_offset) = html[search_start..].find(&tag_start) {
         let tag_start_index = search_start + tag_offset;
-        let Some(tag_end_offset) = html[tag_start_index..].find('>') else {
-            return None;
-        };
+        let tag_end_offset = html[tag_start_index..].find('>')?;
         let tag_end_index = tag_end_offset + tag_start_index;
         let tag = &html[tag_start_index..=tag_end_index];
 
         if required_snippets
             .iter()
             .all(|snippet| tag.contains(snippet))
+            && let Some(attr_offset) = tag.find(&attr_needle)
         {
-            if let Some(attr_offset) = tag.find(&attr_needle) {
-                let attr_start = attr_offset + attr_needle.len();
-                if let Some(attr_end_offset) = tag[attr_start..].find('"') {
-                    let attr_end = attr_end_offset + attr_start;
-                    return Some(tag[attr_start..attr_end].to_string());
-                }
+            let attr_start = attr_offset + attr_needle.len();
+            if let Some(attr_end_offset) = tag[attr_start..].find('"') {
+                let attr_end = attr_end_offset + attr_start;
+                return Some(tag[attr_start..attr_end].to_string());
             }
         }
 

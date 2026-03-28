@@ -21,9 +21,9 @@ static NEXT_VFS_ID: AtomicU64 = AtomicU64::new(1);
 
 std::thread_local! {
     static ACTIVE_TILE_LOOKUP_PERF_STATS: RefCell<Option<Rc<RefCell<MbtilesTileLookupPerfStats>>>> =
-        RefCell::new(None);
+        const { RefCell::new(None) };
     static ACTIVE_TILE_LOOKUP_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> =
-        RefCell::new(None);
+        const { RefCell::new(None) };
 }
 
 #[derive(Clone, Debug, Default)]
@@ -529,9 +529,10 @@ impl LogicalFileSharedState {
     fn cached_chunk(&self, chunk_index: u64) -> Result<(Arc<Vec<u8>>, bool), Error> {
         ensure_active_tile_lookup_not_cancelled()?;
         {
-            let mut cache = self.cache.lock().map_err(|_| {
-                Error::new(ErrorKind::Other, "logical-file chunk cache lock poisoned")
-            })?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| Error::other("logical-file chunk cache lock poisoned"))?;
             if let Some(bytes) = cache.chunks.get(&chunk_index).cloned() {
                 cache.touch(chunk_index);
                 return Ok((bytes, true));
@@ -565,7 +566,7 @@ impl LogicalFileSharedState {
         let mut cache = self
             .cache
             .lock()
-            .map_err(|_| Error::new(ErrorKind::Other, "logical-file chunk cache lock poisoned"))?;
+            .map_err(|_| Error::other("logical-file chunk cache lock poisoned"))?;
         cache.insert(chunk_index, Arc::clone(&bytes));
         if self.perf_logging_enabled {
             info!(
@@ -943,6 +944,6 @@ fn infer_vector_tile_content_encoding(bytes: &[u8]) -> Option<&'static str> {
 fn other_io_error(error: anyhow::Error) -> Error {
     match error.downcast::<Error>() {
         Ok(error) => error,
-        Err(error) => Error::new(ErrorKind::Other, error.to_string()),
+        Err(error) => Error::other(error.to_string()),
     }
 }

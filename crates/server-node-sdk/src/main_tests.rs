@@ -5899,7 +5899,7 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
 
 async fn cleanup_test_state(state: &ServerState) {
     let root = {
-        let store = lock_store(&state, "tests.state.store").await;
+        let store = lock_store(state, "tests.state.store").await;
         store.root_dir().to_path_buf()
     };
     let _ = tokio::fs::remove_dir_all(root).await;

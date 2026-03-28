@@ -618,6 +618,54 @@ mod tests {
                 Some("prefix")
             );
 
+            let rename_resp: serde_json::Value = client
+                .post(format!("{web_base}/api/store/rename"))
+                .json(&serde_json::json!({
+                    "from_path": "docs/api/v1.json",
+                    "to_path": "docs/api/v2.json",
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                rename_resp.get("renamed").and_then(|v| v.as_bool()),
+                Some(true)
+            );
+            assert_eq!(
+                rename_resp.get("from_path").and_then(|v| v.as_str()),
+                Some("docs/api/v1.json")
+            );
+            assert_eq!(
+                rename_resp.get("to_path").and_then(|v| v.as_str()),
+                Some("docs/api/v2.json")
+            );
+
+            let get_renamed: serde_json::Value = client
+                .get(format!("{web_base}/api/store/get"))
+                .query(&[("key", "docs/api/v2.json")])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                get_renamed.get("value").and_then(|v| v.as_str()),
+                Some("api")
+            );
+
+            let get_old_path = client
+                .get(format!("{web_base}/api/store/get"))
+                .query(&[("key", "docs/api/v1.json")])
+                .send()
+                .await?;
+            assert_eq!(get_old_path.status(), StatusCode::BAD_GATEWAY);
+
+            let renamed_bytes = upstream_client.get("docs/api/v2.json").await?;
+            assert_eq!(std::str::from_utf8(&renamed_bytes)?, "api");
+            assert!(upstream_client.get("docs/api/v1.json").await.is_err());
+
             let delete_key = "web-delete.txt";
             let delete_payload = serde_json::json!({
                 "key": delete_key,

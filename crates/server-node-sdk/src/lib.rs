@@ -5621,6 +5621,13 @@ struct StoreIndexResponse {
     entries: Vec<StoreIndexEntry>,
 }
 
+type StoreIndexSnapshotScan = (
+    Vec<String>,
+    HashMap<String, String>,
+    HashMap<String, u64>,
+    HashMap<String, u64>,
+);
+
 #[derive(Debug, Deserialize)]
 struct PutObjectQuery {
     state: Option<String>,
@@ -6455,12 +6462,11 @@ async fn list_store_index_response(
         let store = read_store(state, "store_index.clone_worker").await;
         (store.store_index_inspector(), store.waited_ms())
     };
-    let (keys, key_hashes, key_sizes, key_modified_times): (
-        Vec<String>,
-        HashMap<String, String>,
-        HashMap<String, u64>,
-        HashMap<String, u64>,
-    ) = if let Some(snapshot_id) = query.snapshot.as_deref() {
+    let (keys, key_hashes, key_sizes, key_modified_times): StoreIndexSnapshotScan = if let Some(
+        snapshot_id,
+    ) =
+        query.snapshot.as_deref()
+    {
         match store_index_inspector
             .snapshot_object_state(snapshot_id)
             .await

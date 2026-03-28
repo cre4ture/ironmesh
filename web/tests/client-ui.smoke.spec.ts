@@ -107,6 +107,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("row", { name: /scratch\/\s+prefix/i }).getByRole("button", { name: "Delete" }).click();
   await expect(page.getByRole("cell", { name: "scratch/" })).toHaveCount(0);
+  page.once("dialog", (dialog) => dialog.accept("quick-c.bin"));
+  await page.getByRole("row", { name: /quick-a\.bin/ }).getByRole("button", { name: "Rename" }).click();
+  await expect(page.getByRole("cell", { name: "quick-c.bin" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "quick-a.bin" })).toHaveCount(0);
   await page.getByLabel("Key").fill("docs/readme.txt");
   await page.getByRole("button", { name: "Load versions" }).click();
   await expect(page.getByRole("cell", { name: "version-001" })).toBeVisible();
@@ -274,6 +278,19 @@ async function installClientUiMocks(page: Page) {
       return json(route, {
         key: searchParams.get("key"),
         deleted: true
+      });
+    }
+
+    if (pathname === "/api/store/rename" && method === "POST") {
+      const body = route.request().postDataJSON() as {
+        from_path: string;
+        to_path: string;
+      };
+      renameMockStorePath(storeEntries, body.from_path, body.to_path);
+      return json(route, {
+        from_path: body.from_path,
+        to_path: body.to_path,
+        renamed: true
       });
     }
 
@@ -650,6 +667,19 @@ function deleteMockStorePath(entries: MockStoreEntry[], key: string) {
   }
   const survivors = entries.filter((entry) => entry.path !== normalized);
   entries.splice(0, entries.length, ...survivors);
+}
+
+function renameMockStorePath(entries: MockStoreEntry[], fromPath: string, toPath: string) {
+  const normalizedFrom = fromPath.trim();
+  const normalizedTo = toPath.trim();
+  if (!normalizedFrom || !normalizedTo) {
+    return;
+  }
+
+  const entry = entries.find((candidate) => candidate.path === normalizedFrom);
+  if (entry) {
+    entry.path = normalizedTo;
+  }
 }
 
 function normalizeMockFolderKey(key: string): string {

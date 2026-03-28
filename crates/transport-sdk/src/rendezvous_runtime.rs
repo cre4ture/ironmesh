@@ -64,6 +64,14 @@ impl PresenceRegistry {
             .expect("presence registry lock poisoned");
         entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        let entries = self
+            .entries
+            .lock()
+            .expect("presence registry lock poisoned");
+        entries.is_empty()
+    }
 }
 
 #[derive(Clone, Default)]

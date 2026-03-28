@@ -54,6 +54,7 @@ import {
   putBinaryObject,
   putStoreValue,
   refreshClientRendezvous,
+  renameStorePath,
   updateClientRendezvous,
   type BinaryUploadProgress,
   type ClientRendezvousView,
@@ -125,6 +126,7 @@ type BinaryUploadController = {
   clearQueue: () => void;
 };
 const EXPLORER_PREVIEW_BYTES = 1024;
+const EXPLORER_RENAME_SCAN_DEPTH = 1024;
 const DEFAULT_BINARY_UPLOAD_CONCURRENCY = 2;
 const MAX_BINARY_UPLOAD_CONCURRENCY = 8;
 const BINARY_UPLOAD_SPEED_STALE_AFTER_MS = 4000;
@@ -1676,6 +1678,119 @@ function ExplorerPage({
     }
   }
 
+  async function renamePrefixSubtree(fromPath: string, toPath: string): Promise<number> {
+    const sourcePayload = await listStoreEntries(fromPath, EXPLORER_RENAME_SCAN_DEPTH, null, "raw");
+    const concreteSourcePaths = sourcePayload.entries
+      .filter((candidate) => candidate.entry_type !== "prefix")
+      .map((candidate) => normalizeExplorerPath(candidate.path, candidate.path.endsWith("/")))
+      .filter((candidatePath) => candidatePath === fromPath || candidatePath.startsWith(fromPath))
+      .sort((left, right) => left.length - right.length);
+    if (concreteSourcePaths.length === 0) {
+      throw new Error(`No stored objects were found under "${fromPath}" to rename.`);
+    }
+
+    const targetPayload = await listStoreEntries(toPath, EXPLORER_RENAME_SCAN_DEPTH, null, "raw");
+    const blockingTargetPaths = targetPayload.entries
+      .filter((candidate) => candidate.entry_type !== "prefix")
+      .map((candidate) => normalizeExplorerPath(candidate.path, candidate.path.endsWith("/")))
+      .filter((candidatePath) => candidatePath === toPath || candidatePath.startsWith(toPath));
+    if (blockingTargetPaths.length > 0) {
+      throw new Error(`Target prefix "${toPath}" already contains data.`);
+    }
+
+    for (const candidatePath of concreteSourcePaths) {
+      const suffix = candidatePath.slice(fromPath.length);
+      await renameStorePath(candidatePath, suffix ? `${toPath}${suffix}` : toPath);
+    }
+    return concreteSourcePaths.length;
+  }
+
+  async function renameEntry(entry: StoreEntry) {
+    if (!canMutateCurrentStore) {
+      setError("Switch Snapshot to Current data before renaming entries.");
+      return;
+    }
+
+    const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const fromPath = normalizeExplorerPath(entry.path, isPrefix);
+    if (!fromPath) {
+      setError("Path must not be empty.");
+      return;
+    }
+
+    const currentName = explorerEntryName(entry.path, isPrefix);
+    const requestedName =
+      typeof window === "undefined"
+        ? currentName
+        : window.prompt(
+            isPrefix ? `Rename folder "${currentName}" to:` : `Rename "${currentName}" to:`,
+            currentName
+          );
+    if (requestedName == null) {
+      return;
+    }
+
+    const nextName = normalizeExplorerSegments(requestedName);
+    if (!nextName) {
+      setError("Name must not be empty.");
+      return;
+    }
+    if (nextName.includes("/")) {
+      setError("Rename expects a single new name, not a full path.");
+      return;
+    }
+
+    const targetParent = parentPrefix(fromPath);
+    const toPath = isPrefix
+      ? folderMarkerKey(joinExplorerPath(targetParent, nextName))
+      : joinExplorerPath(targetParent, nextName);
+    if (!toPath) {
+      setError("Name must not be empty.");
+      return;
+    }
+    if (toPath === fromPath) {
+      return;
+    }
+
+    const confirmed =
+      !isPrefix
+      || typeof window === "undefined"
+      || window.confirm(
+        `Rename "${fromPath}" to "${toPath}"? This rewrites each stored path under that prefix.`
+      );
+    if (!confirmed) {
+      return;
+    }
+
+    setLoading(`rename-entry:${fromPath}`);
+    setError(null);
+    try {
+      if (isPrefix) {
+        const renamedCount = await renamePrefixSubtree(fromPath, toPath);
+        setSelectedPayload({
+          action: "renamed_prefix",
+          from_path: fromPath,
+          to_path: toPath,
+          renamed_count: renamedCount
+        });
+      } else {
+        const response = await renameStorePath(fromPath, toPath);
+        setSelectedPayload({
+          action: "renamed_path",
+          from_path: fromPath,
+          to_path: toPath,
+          renamed_count: 1,
+          response
+        });
+      }
+      await refreshEntries();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed renaming entry");
+    } finally {
+      setLoading(null);
+    }
+  }
+
   async function loadVersions() {
     if (!versionKey.trim()) {
       setError("Enter a key to load version history.");
@@ -1830,8 +1945,8 @@ function ExplorerPage({
               </Grid>
               <Text c="dimmed" size="sm">
                 {canMutateCurrentStore
-                  ? "Delete on a prefix removes that whole subtree from current data."
-                  : "Create and delete are disabled while browsing a historical snapshot."}
+                  ? "Delete on a prefix removes that whole subtree from current data. Rename on a prefix rewrites each stored path under it."
+                  : "Create, rename, and delete are disabled while browsing a historical snapshot."}
               </Text>
               <Table.ScrollContainer minWidth={720}>
                 <Table striped highlightOnHover withTableBorder>
@@ -1864,6 +1979,15 @@ function ExplorerPage({
                                 </Button>
                                 <Button
                                   size="xs"
+                                  variant="default"
+                                  disabled={!canMutateCurrentStore}
+                                  loading={loading === `rename-entry:${normalizeExplorerPath(entry.path, true)}`}
+                                  onClick={() => void renameEntry(entry)}
+                                >
+                                  Rename
+                                </Button>
+                                <Button
+                                  size="xs"
                                   color="red"
                                   variant="default"
                                   disabled={!canMutateCurrentStore}
@@ -1885,6 +2009,15 @@ function ExplorerPage({
                                 </Button>
                                 <Button size="xs" variant="default" onClick={() => downloadEntry(entry)}>
                                   Download
+                                </Button>
+                                <Button
+                                  size="xs"
+                                  variant="default"
+                                  disabled={!canMutateCurrentStore}
+                                  loading={loading === `rename-entry:${normalizeExplorerPath(entry.path, false)}`}
+                                  onClick={() => void renameEntry(entry)}
+                                >
+                                  Rename
                                 </Button>
                                 <Button
                                   size="xs"
@@ -2602,6 +2735,14 @@ function explorerDisplayPath(entry: StoreEntry, prefix: string): string {
 
   const relativePath = normalizedPath.slice(normalizedPrefix.length);
   return relativePath || normalizedPath;
+}
+
+function explorerEntryName(path: string, isPrefix: boolean): string {
+  const normalizedPath = normalizeExplorerPath(path, isPrefix).replace(/\/+$/, "");
+  if (!normalizedPath) {
+    return "";
+  }
+  return normalizedPath.split("/").pop() ?? normalizedPath;
 }
 
 function normalizeExplorerPrefix(prefix: string): string {

@@ -127,6 +127,24 @@ export async function putStoreValue(key: string, value: string): Promise<StorePu
   });
 }
 
+export async function renameStorePath(
+  fromPath: string,
+  toPath: string,
+  overwrite = false
+): Promise<JsonObject> {
+  return fetchJson<JsonObject>("/api/store/rename", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      from_path: fromPath,
+      to_path: toPath,
+      overwrite
+    })
+  });
+}
+
 export async function deleteStoreValue(key: string): Promise<JsonObject> {
   const query = new URLSearchParams({ key });
   return fetchJson<JsonObject>(`/api/store/delete?${query.toString()}`, {

@@ -301,6 +301,7 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/store/list", get(web_store_list))
         .route("/api/store/get", get(web_store_get))
         .route("/api/store/put", post(web_store_put))
+        .route("/api/store/rename", post(web_store_rename))
         .route("/api/store/delete", delete(web_store_delete))
         .route("/api/store/uploads/start", post(web_store_upload_start))
         .route(
@@ -375,6 +376,14 @@ struct WebStoreGetQuery {
 struct WebStorePutRequest {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreRenameRequest {
+    from_path: String,
+    to_path: String,
+    #[serde(default)]
+    overwrite: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1699,6 +1708,36 @@ async fn web_store_put(
             Json(serde_json::json!({
                 "key": meta.key,
                 "size_bytes": meta.size_bytes
+            })),
+        )
+            .into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+async fn web_store_rename(
+    State(state): State<WebState>,
+    Json(request): Json<WebStoreRenameRequest>,
+) -> impl IntoResponse {
+    if request.from_path.trim().is_empty() || request.to_path.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "paths must not be empty");
+    }
+
+    match current_client(&state)
+        .await
+        .rename_path(
+            request.from_path.clone(),
+            request.to_path.clone(),
+            request.overwrite,
+        )
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "from_path": request.from_path,
+                "to_path": request.to_path,
+                "renamed": true
             })),
         )
             .into_response(),
