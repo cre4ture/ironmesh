@@ -4940,10 +4940,10 @@ async fn build_test_state(
         upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(service)),
         client_credentials: Arc::new(Mutex::new(super::storage::ClientCredentialState::default())),
-        upload_sessions: Arc::new(Mutex::new(super::UploadSessionStore {
+        upload_sessions: super::new_upload_sessions_rwlock(super::UploadSessionStore {
             path: root.join("state").join("upload_sessions.json"),
             sessions: HashMap::new(),
-        })),
+        }),
         upload_sessions_dirty: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         upload_sessions_persist_notify: Arc::new(tokio::sync::Notify::new()),
         public_ca_pem: None,
@@ -5041,7 +5041,7 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
     let now = super::unix_ts();
 
     {
-        let mut sessions = state.upload_sessions.lock().await;
+        let mut sessions = super::write_upload_sessions(&state, "tests.upload_sessions.seed").await;
         sessions.sessions.insert(
             upload_id.clone(),
             super::UploadSessionRecord {
@@ -5081,7 +5081,7 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    let sessions = state.upload_sessions.lock().await;
+    let sessions = super::read_upload_sessions(&state, "tests.upload_sessions.assert").await;
     let session = sessions
         .sessions
         .get(&upload_id)

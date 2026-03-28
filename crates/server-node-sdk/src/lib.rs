@@ -139,7 +139,7 @@ struct ServerState {
     upload_chunk_ingestor: ChunkIngestor,
     cluster: Arc<Mutex<ClusterService>>,
     client_credentials: Arc<Mutex<ClientCredentialState>>,
-    upload_sessions: Arc<Mutex<UploadSessionStore>>,
+    upload_sessions: Arc<TracedRwLock<UploadSessionStore>>,
     upload_sessions_dirty: Arc<AtomicUsize>,
     upload_sessions_persist_notify: Arc<Notify>,
     public_ca_pem: Option<String>,
@@ -203,6 +203,33 @@ async fn read_store<'a>(
     operation: &'static str,
 ) -> TracedRwLockReadGuard<'a, PersistentStore> {
     state.store.read(operation).await
+}
+
+fn new_upload_sessions_rwlock(store: UploadSessionStore) -> Arc<TracedRwLock<UploadSessionStore>> {
+    Arc::new(TracedRwLock::new(
+        "upload_sessions",
+        store,
+        TracedRwLockConfig::new(
+            Duration::from_millis(SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS as u64),
+            Duration::from_secs(1),
+            Duration::from_millis(SLOW_STORE_LOCK_HOLD_LOG_THRESHOLD_MS as u64),
+        ),
+    ))
+}
+
+async fn write_upload_sessions<'a>(
+    state: &'a ServerState,
+    operation: &'static str,
+) -> TracedRwLockWriteGuard<'a, UploadSessionStore> {
+    state.upload_sessions.write(operation).await
+}
+
+#[cfg(test)]
+async fn read_upload_sessions<'a>(
+    state: &'a ServerState,
+    operation: &'static str,
+) -> TracedRwLockReadGuard<'a, UploadSessionStore> {
+    state.upload_sessions.read(operation).await
 }
 
 #[derive(Clone)]
@@ -444,7 +471,8 @@ async fn persist_upload_session_store_after_mutation(state: &ServerState, contex
 
 async fn persist_upload_session_store_now(state: &ServerState) -> Result<()> {
     let now = unix_ts();
-    let mut sessions = state.upload_sessions.lock().await;
+    let mut sessions =
+        write_upload_sessions(state, "upload_sessions.persist_now.prune_and_persist").await;
     prune_expired_upload_sessions(&mut sessions, now);
     persist_upload_session_store(&sessions).await
 }
@@ -3156,7 +3184,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(cluster)),
         client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
-        upload_sessions: Arc::new(Mutex::new(upload_session_store)),
+        upload_sessions: new_upload_sessions_rwlock(upload_session_store),
         upload_sessions_dirty: Arc::new(AtomicUsize::new(0)),
         upload_sessions_persist_notify: Arc::new(Notify::new()),
         public_ca_pem,
@@ -5703,7 +5731,7 @@ async fn start_upload_session(
     };
     let now = unix_ts();
 
-    let mut sessions = state.upload_sessions.lock().await;
+    let mut sessions = write_upload_sessions(&state, "upload_sessions.start").await;
     prune_expired_upload_sessions(&mut sessions, now);
 
     let session = UploadSessionRecord {
@@ -5748,7 +5776,7 @@ async fn get_upload_session(
 ) -> impl IntoResponse {
     let requester_device_id = request_device_id(&headers);
     let now = unix_ts();
-    let mut sessions = state.upload_sessions.lock().await;
+    let mut sessions = write_upload_sessions(&state, "upload_sessions.get").await;
     prune_expired_upload_sessions(&mut sessions, now);
     let Some(session) = sessions.sessions.get(&upload_id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -5768,7 +5796,7 @@ async fn delete_upload_session(
 ) -> impl IntoResponse {
     let requester_device_id = request_device_id(&headers);
     let now = unix_ts();
-    let mut sessions = state.upload_sessions.lock().await;
+    let mut sessions = write_upload_sessions(&state, "upload_sessions.delete").await;
     prune_expired_upload_sessions(&mut sessions, now);
 
     let Some(session) = sessions.sessions.get(&upload_id) else {
@@ -5800,7 +5828,7 @@ async fn upload_session_chunk(
     let requester_device_id = request_device_id(&headers);
     let (total_size_bytes, chunk_size_bytes, chunk_count) = {
         let now = unix_ts();
-        let mut sessions = state.upload_sessions.lock().await;
+        let mut sessions = write_upload_sessions(&state, "upload_sessions.chunk.preflight").await;
         prune_expired_upload_sessions(&mut sessions, now);
 
         let Some(session) = sessions.sessions.get(&upload_id) else {
@@ -5862,7 +5890,7 @@ async fn upload_session_chunk(
     };
 
     let now = unix_ts();
-    let mut sessions = state.upload_sessions.lock().await;
+    let mut sessions = write_upload_sessions(&state, "upload_sessions.chunk.commit").await;
     prune_expired_upload_sessions(&mut sessions, now);
 
     let Some(session) = sessions.sessions.get_mut(&upload_id) else {
@@ -5925,7 +5953,7 @@ async fn complete_upload_session_route(
     let requester_device_id = request_device_id(&headers);
     let (key, total_size_bytes, parent_version_ids, version_state, explicit_version_id, chunk_refs) = {
         let now = unix_ts();
-        let mut sessions = state.upload_sessions.lock().await;
+        let mut sessions = write_upload_sessions(&state, "upload_sessions.complete.prepare").await;
         prune_expired_upload_sessions(&mut sessions, now);
 
         let Some(session) = sessions.sessions.get_mut(&upload_id) else {
@@ -5992,7 +6020,8 @@ async fn complete_upload_session_route(
         Err(err) => {
             let store_finalize_ms = store_finalize_started_at.elapsed().as_millis();
             drop(store);
-            let mut sessions = state.upload_sessions.lock().await;
+            let mut sessions =
+                write_upload_sessions(&state, "upload_sessions.complete.rollback").await;
             if let Some(session) = sessions.sessions.get_mut(&upload_id)
                 && !session.completed
             {
@@ -6072,7 +6101,7 @@ async fn complete_upload_session_route(
         total_size_bytes,
     };
     let now = unix_ts();
-    let mut sessions = state.upload_sessions.lock().await;
+    let mut sessions = write_upload_sessions(&state, "upload_sessions.complete.finish").await;
     if let Some(session) = sessions.sessions.get_mut(&upload_id) {
         session.completed = true;
         session.finalizing = false;
