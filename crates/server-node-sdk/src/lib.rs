@@ -73,6 +73,7 @@ const BUILD_REVISION: &str =
     git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
 const STORAGE_STATS_REFRESH_INTERVAL_SECS: u64 = 300;
 const STORAGE_STATS_CHANGE_DEBOUNCE_SECS: u64 = 15;
+const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
@@ -4574,28 +4575,47 @@ fn spawn_rendezvous_relay_http_agent(state: ServerState, local_base_url: String)
                         polls.abort_all();
                         let local_http = current_internal_http(&state).await;
 
-                        let relay_response = match execute_local_relay_http_request(
-                            &local_http,
-                            &local_base_url,
-                            &request,
-                        )
-                        .await
+                        let (relay_response, relay_response_body_bytes) =
+                            match execute_local_relay_http_request(
+                                &local_http,
+                                &local_base_url,
+                                &request,
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(err) => {
+                                    let body = format!("relay execution failed: {err:#}");
+                                    (
+                                        RelayHttpResponse {
+                                            cluster_id: request.cluster_id,
+                                            session_id: request.session_id.clone(),
+                                            request_id: request.request_id.clone(),
+                                            responder: request.target.clone(),
+                                            status: 502,
+                                            headers: vec![RelayHttpHeader {
+                                                name: "content-type".to_string(),
+                                                value: "text/plain; charset=utf-8".to_string(),
+                                            }],
+                                            body_base64: encode_optional_body_base64(
+                                                body.as_bytes(),
+                                            ),
+                                        },
+                                        body.len(),
+                                    )
+                                }
+                            };
+
+                        if relay_response_body_bytes
+                            >= LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES
                         {
-                            Ok(response) => response,
-                            Err(err) => RelayHttpResponse {
-                                cluster_id: request.cluster_id,
-                                session_id: request.session_id.clone(),
-                                request_id: request.request_id.clone(),
-                                responder: request.target.clone(),
-                                status: 502,
-                                headers: vec![RelayHttpHeader {
-                                    name: "content-type".to_string(),
-                                    value: "text/plain; charset=utf-8".to_string(),
-                                }],
-                                body_base64: encode_optional_body_base64(
-                                    format!("relay execution failed: {err:#}").as_bytes(),
-                                ),
-                            },
+                            info!(
+                                request_id = %request.request_id,
+                                path_and_query = %request.path_and_query,
+                                relay_status = relay_response.status,
+                                relay_response_body_bytes,
+                                "large relayed HTTP response"
+                            );
                         };
 
                         if let Err(err) = endpoint
@@ -4607,6 +4627,9 @@ fn spawn_rendezvous_relay_http_agent(state: ServerState, local_base_url: String)
                                 error = %err,
                                 rendezvous_url = %endpoint.url,
                                 request_id = %request.request_id,
+                                path_and_query = %request.path_and_query,
+                                relay_status = relay_response.status,
+                                relay_response_body_bytes,
                                 "failed to submit relayed HTTP response"
                             );
                         }
@@ -4633,7 +4656,7 @@ async fn execute_local_relay_http_request(
     local_http: &reqwest::Client,
     local_base_url: &str,
     request: &transport_sdk::PendingRelayHttpRequest,
-) -> Result<RelayHttpResponse> {
+) -> Result<(RelayHttpResponse, usize)> {
     let url = join_peer_url(local_base_url, &request.path_and_query)?;
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("invalid relayed HTTP method {}", request.method))?;
@@ -4670,16 +4693,20 @@ async fn execute_local_relay_http_request(
         .bytes()
         .await
         .context("failed reading local relayed HTTP response body")?;
+    let response_body_bytes = body.len();
 
-    Ok(RelayHttpResponse {
-        cluster_id: request.cluster_id,
-        session_id: request.session_id.clone(),
-        request_id: request.request_id.clone(),
-        responder: request.target.clone(),
-        status,
-        headers,
-        body_base64: encode_optional_body_base64(&body),
-    })
+    Ok((
+        RelayHttpResponse {
+            cluster_id: request.cluster_id,
+            session_id: request.session_id.clone(),
+            request_id: request.request_id.clone(),
+            responder: request.target.clone(),
+            status,
+            headers,
+            body_base64: encode_optional_body_base64(&body),
+        },
+        response_body_bytes,
+    ))
 }
 
 fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {

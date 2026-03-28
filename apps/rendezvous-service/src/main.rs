@@ -8,7 +8,7 @@ mod relay;
 mod state;
 
 use anyhow::Result;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
@@ -25,7 +25,7 @@ use transport_sdk::rendezvous::PresenceRegistration;
 use transport_sdk::{
     ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, ClientEnrollmentRequest,
-    encode_optional_body_base64,
+    RELAY_HTTP_JSON_BODY_LIMIT_BYTES, encode_optional_body_base64,
 };
 
 use crate::auth::{
@@ -57,6 +57,12 @@ async fn main() -> Result<()> {
 }
 
 fn build_router(state: AppState) -> Router {
+    let relay_router = Router::new()
+        .route("/relay/http/request", post(submit_relay_http_request))
+        .route("/relay/http/poll", post(poll_relay_http_request))
+        .route("/relay/http/respond", post(complete_relay_http_request))
+        .layer(DefaultBodyLimit::max(RELAY_HTTP_JSON_BODY_LIMIT_BYTES));
+
     Router::new()
         .route("/health", get(health))
         .route("/control/presence", get(list_presence))
@@ -67,9 +73,7 @@ fn build_router(state: AppState) -> Router {
             post(publish_bootstrap_claim),
         )
         .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
-        .route("/relay/http/request", post(submit_relay_http_request))
-        .route("/relay/http/poll", post(poll_relay_http_request))
-        .route("/relay/http/respond", post(complete_relay_http_request))
+        .merge(relay_router)
         .with_state(state)
 }
 
@@ -432,6 +436,8 @@ async fn complete_relay_http_request(
 mod tests {
     use super::*;
     use anyhow::Context;
+    use axum::body::Body;
+    use axum::http::Request;
     use axum::http::StatusCode;
     use client_sdk::{
         BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
@@ -443,6 +449,7 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
     use transport_sdk::RelayMode;
     use uuid::Uuid;
 
@@ -640,6 +647,92 @@ mod tests {
         let _ = rendezvous_handle.await;
         let _ = std::fs::remove_dir_all(&source_dir);
         let _ = std::fs::remove_dir_all(&target_dir);
+    }
+
+    #[tokio::test]
+    async fn relay_http_respond_route_accepts_large_json_bodies() {
+        let bind_addr = free_bind_addr();
+        let public_url = format!("http://{bind_addr}");
+        let state = AppState::new(RendezvousServiceConfig {
+            bind_addr,
+            public_url: public_url.clone(),
+            relay_public_urls: vec![public_url],
+            mtls: None,
+            allow_insecure_http: true,
+            failover_package: None,
+        });
+        let cluster_id = Uuid::now_v7();
+        let source = transport_sdk::PeerIdentity::Node(Uuid::now_v7());
+        let target = transport_sdk::PeerIdentity::Node(Uuid::now_v7());
+        let ticket = crate::relay::issue_relay_ticket(
+            transport_sdk::RelayTicketRequest {
+                cluster_id,
+                source,
+                target: target.clone(),
+                requested_expires_in_secs: Some(60),
+            },
+            &[state.config.public_url.clone()],
+        );
+
+        let relay = state.relay.clone();
+        let submit = tokio::spawn(async move {
+            relay
+                .submit_and_await(transport_sdk::RelayHttpRequest {
+                    ticket,
+                    request_id: "large-relay-response".to_string(),
+                    method: "GET".to_string(),
+                    path_and_query: "/store/list".to_string(),
+                    headers: Vec::new(),
+                    body_base64: None,
+                })
+                .await
+        });
+
+        let pending = state
+            .relay
+            .poll(transport_sdk::RelayHttpPollRequest {
+                cluster_id,
+                target: target.clone(),
+                wait_timeout_ms: Some(100),
+            })
+            .await
+            .expect("relay poll should succeed")
+            .request
+            .expect("relay request should be pending");
+
+        let large_body = vec![b'x'; 2 * 1024 * 1024];
+        let payload = serde_json::to_vec(&transport_sdk::RelayHttpResponse {
+            cluster_id,
+            session_id: pending.session_id,
+            request_id: pending.request_id,
+            responder: target,
+            status: 200,
+            headers: vec![transport_sdk::RelayHttpHeader {
+                name: "content-type".to_string(),
+                value: "application/octet-stream".to_string(),
+            }],
+            body_base64: transport_sdk::encode_optional_body_base64(&large_body),
+        })
+        .expect("relay response should serialize");
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/relay/http/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let relayed = submit.await.expect("submit task should join").unwrap();
+        assert_eq!(
+            relayed.body_bytes().expect("relayed body should decode"),
+            large_body
+        );
     }
 
     #[tokio::test]

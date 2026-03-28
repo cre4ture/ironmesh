@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use axum::extract::DefaultBodyLimit;
 use axum::extract::FromRequestParts;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -35,7 +36,7 @@ use transport_sdk::rendezvous::{
 use transport_sdk::{
     ClientBootstrap, ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, ClientEnrollmentRequest,
-    encode_optional_body_base64,
+    RELAY_HTTP_JSON_BODY_LIMIT_BYTES, encode_optional_body_base64,
 };
 use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
@@ -151,6 +152,11 @@ struct RelayedEnrollmentResponse {
 
 pub(crate) async fn run_listener(config: EmbeddedRendezvousConfig) -> Result<()> {
     let state = AppState::new(config.clone());
+    let relay_router = Router::new()
+        .route("/relay/http/request", post(submit_relay_http_request))
+        .route("/relay/http/poll", post(poll_relay_http_request))
+        .route("/relay/http/respond", post(complete_relay_http_request))
+        .layer(DefaultBodyLimit::max(RELAY_HTTP_JSON_BODY_LIMIT_BYTES));
     let app = Router::new()
         .route("/health", get(health))
         .route("/control/presence", get(list_presence))
@@ -161,9 +167,7 @@ pub(crate) async fn run_listener(config: EmbeddedRendezvousConfig) -> Result<()>
             post(publish_bootstrap_claim),
         )
         .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
-        .route("/relay/http/request", post(submit_relay_http_request))
-        .route("/relay/http/poll", post(poll_relay_http_request))
-        .route("/relay/http/respond", post(complete_relay_http_request))
+        .merge(relay_router)
         .with_state(state);
 
     info!(

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::peer::PeerIdentity;
 
+pub const RELAY_HTTP_JSON_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayTicketRequest {
     pub cluster_id: ClusterId,

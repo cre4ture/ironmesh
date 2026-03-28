@@ -28,9 +28,9 @@ pub use identity::{
 };
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
 pub use relay::{
-    PendingRelayHttpRequest, RelayHttpHeader, RelayHttpPollRequest, RelayHttpPollResponse,
-    RelayHttpRequest, RelayHttpResponse, RelayTicket, RelayTicketRequest,
-    encode_optional_body_base64,
+    PendingRelayHttpRequest, RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayHttpHeader,
+    RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
+    RelayTicketRequest, encode_optional_body_base64,
 };
 pub use rendezvous::{
     PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
