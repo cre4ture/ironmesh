@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod logging;
 pub mod traced_mutex;
 pub mod traced_rwlock;
 

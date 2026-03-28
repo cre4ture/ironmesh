@@ -43,7 +43,7 @@ pub fn local_paths_to_preserve_on_startup(
                     Ok(local_hash) if local_hash == *remote_hash => continue,
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "startup-state: failed to hash local file {path}: {error}; preserving local bytes"
                         );
                     }
@@ -59,7 +59,7 @@ pub fn local_paths_to_preserve_on_startup(
                     Ok(local_hash) if local_hash == *remote_hash => continue,
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "startup-state: failed to hash local file {path}: {error}; preserving local bytes"
                         );
                     }
@@ -162,7 +162,7 @@ pub fn startup_remote_delete_wins_paths(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "startup-state: failed to hash local file {path} for remote-delete check: {error}; preserving local bytes"
                     );
                 }
@@ -246,7 +246,7 @@ pub fn materialize_remote_conflict_copies(
         if let Err(error) = fs::create_dir_all(parent)
             .with_context(|| format!("failed to create conflict directory {}", parent.display()))
         {
-            eprintln!("startup-state: {error}");
+            tracing::warn!("startup-state: {error}");
             continue;
         }
 
@@ -266,7 +266,7 @@ pub fn materialize_remote_conflict_copies(
         let file = match File::create(&temp_path) {
             Ok(file) => file,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "startup-state: failed to create conflict temp file {}: {error}",
                     temp_path.display()
                 );
@@ -314,7 +314,7 @@ pub fn materialize_remote_conflict_copies(
             &staged_temp,
             &staged_state,
         ) {
-            eprintln!(
+            tracing::warn!(
                 "startup-state: failed to download remote conflict copy for {}: {error}",
                 conflict.path
             );
@@ -354,7 +354,7 @@ pub fn materialize_remote_conflict_copies(
         })();
 
         if let Err(error) = copy_result {
-            eprintln!(
+            tracing::warn!(
                 "startup-state: failed to materialize staged remote conflict copy for {}: {error}",
                 conflict.path
             );
@@ -363,7 +363,7 @@ pub fn materialize_remote_conflict_copies(
         }
 
         if let Err(error) = writer.sync_all() {
-            eprintln!(
+            tracing::warn!(
                 "startup-state: failed to flush conflict temp file {}: {error}",
                 temp_path.display()
             );
@@ -372,7 +372,7 @@ pub fn materialize_remote_conflict_copies(
         }
 
         if let Err(error) = fs::rename(&temp_path, &conflict_target) {
-            eprintln!(
+            tracing::warn!(
                 "startup-state: failed to write conflict copy {}: {error}",
                 conflict_target.display()
             );
@@ -465,7 +465,7 @@ pub fn startup_dual_modify_conflicts(
         let local_hash = match local_file_content_hash(root_dir, path) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "startup-state: failed to hash local file {path} for dual-modify check: {error}; treating as conflict"
                 );
                 let stored_baseline = baseline.and_then(|state| state.get(path));

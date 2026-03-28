@@ -34,6 +34,8 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
         return Ok(rt);
     }
 
+    common::logging::init_compact_tracing_default("info");
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

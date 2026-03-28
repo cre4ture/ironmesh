@@ -2881,12 +2881,7 @@ pub async fn run_from_env() -> Result<()> {
     let log_buffer = Arc::new(LogBuffer::new(500));
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new("info"))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(tracing_subscriber::fmt::time::SystemTime)
-                .with_target(false)
-                .compact(),
-        )
+        .with(common::logging::compact_fmt_layer())
         .with(LogCaptureLayer::new(log_buffer.clone()))
         .init();
 

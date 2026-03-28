@@ -76,6 +76,7 @@ struct ResolvedUpstreamTarget {
 }
 
 pub fn mount_main() -> Result<()> {
+    common::logging::init_compact_tracing_default("info");
     let args = Args::parse();
     let client_identity = read_optional_client_identity(args.client_identity_file.as_deref())?;
 
@@ -196,7 +197,7 @@ pub fn mount_main() -> Result<()> {
                     refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
                 let plan = filter_refresh_action_plan(full_plan, &update.changed_paths);
                 if plan.actions.is_empty() {
-                    eprintln!(
+                    tracing::info!(
                         "remote-refresh: detected {} changed remote paths; no local plan delta",
                         update.changed_paths.len()
                     );
@@ -207,7 +208,7 @@ pub fn mount_main() -> Result<()> {
                     refresh_stop_signal.store(false, Ordering::SeqCst);
                     return;
                 }
-                eprintln!(
+                tracing::info!(
                     "remote-refresh: reconciled {} changed paths",
                     update.changed_paths.len()
                 );

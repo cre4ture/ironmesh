@@ -66,6 +66,7 @@ pub fn run_folder_agent_with_control(
     install_signal_handler: bool,
     status_callback: Option<FolderAgentStatusCallback>,
 ) -> Result<()> {
+    common::logging::init_compact_tracing_default("info");
     let prefix_label = options.prefix.as_deref().unwrap_or("<root>");
     emit_status(
         status_callback.as_ref(),
@@ -131,7 +132,7 @@ fn run_folder_agent_inner(
         let addr = listener
             .local_addr()
             .context("ui: failed to determine bound address")?;
-        eprintln!("ui: listening on http://{addr}");
+        tracing::info!("ui: listening on http://{addr}");
 
         let ui_state = FolderAgentUiState::new(
             options.root_dir.clone(),
@@ -149,7 +150,7 @@ fn run_folder_agent_inner(
     };
 
     if let Err(error) = cleanup_ironmesh_part_files(&options.root_dir, false) {
-        eprintln!("startup-state: failed to cleanup partial download artifacts: {error}");
+        tracing::warn!("startup-state: failed to cleanup partial download artifacts: {error}");
     }
 
     emit_status(
@@ -175,7 +176,7 @@ fn run_folder_agent_inner(
         match load_local_baseline_with_retries(&state_store, 6, Duration::from_millis(100)) {
             Ok(state) => Some(state),
             Err(error) => {
-                eprintln!("startup-state: failed to load sqlite baseline: {error}");
+                tracing::warn!("startup-state: failed to load sqlite baseline: {error}");
                 state_store.quarantine_corrupt().ok();
                 None
             }
@@ -184,7 +185,7 @@ fn run_folder_agent_inner(
         match load_local_baseline_hashes_with_retries(&state_store, 6, Duration::from_millis(100)) {
             Ok(hashes) => hashes,
             Err(error) => {
-                eprintln!("startup-state: failed to load sqlite baseline hashes: {error}");
+                tracing::warn!("startup-state: failed to load sqlite baseline hashes: {error}");
                 BTreeMap::new()
             }
         }
@@ -239,7 +240,7 @@ fn run_folder_agent_inner(
     if let Err(error) =
         materialize_remote_conflict_copies(&options.root_dir, &client, &scope, &startup_conflicts)
     {
-        eprintln!("startup-state: failed to materialize conflict copies: {error}");
+        tracing::warn!("startup-state: failed to materialize conflict copies: {error}");
     }
 
     let mut remote_index = RemoteTreeIndex::default();
@@ -470,7 +471,7 @@ fn start_local_watcher(
                 }
             },
             Err(error) => {
-                eprintln!("local-watch: event error: {error}");
+                tracing::warn!("local-watch: event error: {error}");
             }
         })
         .context("failed to create local filesystem watcher")?;
@@ -510,7 +511,7 @@ fn sync_local_changes(
                     format!("failed to persist baseline directory entry for {path}")
                 })?;
         }
-        eprintln!("local-sync: uploaded directory marker {path}/");
+        tracing::info!("local-sync: uploaded directory marker {path}/");
     }
 
     for path in &diff.created_or_modified_files {
@@ -536,7 +537,7 @@ fn sync_local_changes(
                 .upsert_baseline_entry_with_hash(path, entry_state, Some(content_hash.as_str()))
                 .with_context(|| format!("failed to persist baseline file entry for {path}"))?;
         }
-        eprintln!("local-sync: uploaded file {path}");
+        tracing::info!("local-sync: uploaded file {path}");
     }
 
     if !diff.deleted_paths.is_empty() {
@@ -573,7 +574,7 @@ fn sync_local_changes(
                     .remove_baseline_entry(&path)
                     .with_context(|| format!("failed to remove baseline entry for {path}"))?;
             }
-            eprintln!("local-sync: deleted remote file {path}");
+            tracing::info!("local-sync: deleted remote file {path}");
         }
     }
 

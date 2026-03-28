@@ -166,12 +166,12 @@ fn main() {
     let generated_css = out_dir.join("client_ui_app.css");
     let generated_js = out_dir.join("client_ui_app.js");
     let generated_assets = out_dir.join("client_ui_assets.rs");
+    let generated_assets_dir = out_dir.join("client_ui_embedded_assets");
     run_frontend_build(&web_workspace_dir, &generated_dist_dir);
 
     client_ui_dist_candidates.insert(0, generated_dist_dir.clone());
     client_ui_dist_candidates.extend(discover_dist_dirs(&web_workspace_dir));
-    client_ui_dist_candidates.sort();
-    client_ui_dist_candidates.dedup();
+    client_ui_dist_candidates = dedupe_paths_preserving_order(client_ui_dist_candidates);
     let client_ui_dist_dir = locate_dist_dir(&client_ui_dist_candidates).unwrap_or_else(|| {
         panic!(
             "failed locating built client-ui dist after frontend build; checked: {}",
@@ -214,15 +214,32 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_css.display()));
     fs::write(&generated_js, script)
         .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_js.display()));
-    generate_embedded_assets_module(&client_ui_dist_dir, &generated_assets);
+    generate_embedded_assets_module(
+        &client_ui_dist_dir,
+        &generated_assets_dir,
+        &generated_assets,
+    );
 }
 
-fn generate_embedded_assets_module(dist_dir: &Path, generated_file: &Path) {
+fn generate_embedded_assets_module(
+    dist_dir: &Path,
+    generated_assets_dir: &Path,
+    generated_file: &Path,
+) {
     let assets_dir = dist_dir.join("assets");
     let mut assets = Vec::new();
 
+    if generated_assets_dir.exists() {
+        fs::remove_dir_all(generated_assets_dir).unwrap_or_else(|error| {
+            panic!(
+                "failed cleaning generated embedded asset dir {}: {error}",
+                generated_assets_dir.display()
+            )
+        });
+    }
+
     if assets_dir.is_dir() {
-        collect_embedded_assets(&assets_dir, &assets_dir, &mut assets);
+        collect_embedded_assets(&assets_dir, &assets_dir, generated_assets_dir, &mut assets);
     }
 
     assets.sort_by(|left, right| left.0.cmp(&right.0));
@@ -244,14 +261,19 @@ fn generate_embedded_assets_module(dist_dir: &Path, generated_file: &Path) {
         .unwrap_or_else(|error| panic!("failed writing {}: {error}", generated_file.display()));
 }
 
-fn collect_embedded_assets(dir: &Path, root: &Path, assets: &mut Vec<(String, PathBuf)>) {
+fn collect_embedded_assets(
+    dir: &Path,
+    root: &Path,
+    generated_root: &Path,
+    assets: &mut Vec<(String, PathBuf)>,
+) {
     let entries = fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("failed reading asset dir {}: {error}", dir.display()));
 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_embedded_assets(&path, root, assets);
+            collect_embedded_assets(&path, root, generated_root, assets);
             continue;
         }
 
@@ -260,7 +282,27 @@ fn collect_embedded_assets(dir: &Path, root: &Path, assets: &mut Vec<(String, Pa
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        assets.push((relative_path, path));
+        let generated_asset_path = relative_path
+            .split('/')
+            .fold(generated_root.to_path_buf(), |path, segment| {
+                path.join(segment)
+            });
+        if let Some(parent) = generated_asset_path.parent() {
+            fs::create_dir_all(parent).unwrap_or_else(|error| {
+                panic!(
+                    "failed creating embedded asset dir {}: {error}",
+                    parent.display()
+                )
+            });
+        }
+        fs::copy(&path, &generated_asset_path).unwrap_or_else(|error| {
+            panic!(
+                "failed copying embedded asset {} to {}: {error}",
+                path.display(),
+                generated_asset_path.display()
+            )
+        });
+        assets.push((relative_path, generated_asset_path));
     }
 }
 
@@ -361,6 +403,16 @@ fn locate_dist_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
         .iter()
         .find(|candidate| candidate.join("index.html").is_file())
         .cloned()
+}
+
+fn dedupe_paths_preserving_order(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if !deduped.contains(&path) {
+            deduped.push(path);
+        }
+    }
+    deduped
 }
 
 fn discover_dist_dirs(root: &Path) -> Vec<PathBuf> {

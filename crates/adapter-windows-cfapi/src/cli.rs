@@ -70,7 +70,7 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
         }
     }
 
-    eprintln!(
+    tracing::info!(
         "plan-summary: {} total={} directories={} placeholders={} hydrate_on_demand={} queue_uploads={} conflicts={}",
         label,
         plan.actions.len(),
@@ -81,9 +81,12 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
         conflicts
     );
     if !hydrate_sample.is_empty() || !dirty_sample.is_empty() || !conflict_sample.is_empty() {
-        eprintln!(
+        tracing::info!(
             "plan-summary: {} hydrate_sample={:?} dirty_sample={:?} conflict_sample={:?}",
-            label, hydrate_sample, dirty_sample, conflict_sample
+            label,
+            hydrate_sample,
+            dirty_sample,
+            conflict_sample
         );
     }
 }
@@ -169,6 +172,7 @@ struct PinArgs {
 }
 
 pub fn cli_main() -> anyhow::Result<()> {
+    common::logging::init_compact_tracing_default("info");
     let cli = Cli::parse();
 
     match cli.command {
@@ -194,7 +198,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                 args.device_id.as_deref(),
                 args.device_label.as_deref(),
             )?;
-            eprintln!("using connection target {}", connection.connection_target);
+            tracing::info!("using connection target {}", connection.connection_target);
             let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
             let refresh_poller = RemoteSnapshotPoller::server_notifications(
                 Duration::from_secs(25),
@@ -214,7 +218,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                 },
             )?;
             if let Some(identity) = client_identity.as_ref() {
-                eprintln!("using enrolled client identity for {}", identity.device_id);
+                tracing::info!("using enrolled client identity for {}", identity.device_id);
             }
             let client = connection.build_client(client_identity.as_ref())?;
             let persisted_device_id = client_identity
@@ -257,16 +261,16 @@ pub fn cli_main() -> anyhow::Result<()> {
             apply_action_plan(&registration.root_path, &action_plan)?;
             let _ = runtime.sync_from_action_plan(&action_plan);
             let sync_state_stats = reconcile_sync_states(&registration.root_path, &action_plan);
-            eprintln!(
+            tracing::info!(
                 "sync-state: startup reconcile stats: {:?}",
                 sync_state_stats
             );
-            eprintln!(
+            tracing::info!(
                 "materialized {} planned entries under sync root",
                 action_plan.actions.len()
             );
 
-            eprintln!(
+            tracing::info!(
                 "startup-scan: scanning {} for pre-existing files",
                 registration.root_path.display()
             );
@@ -277,12 +281,12 @@ pub fn cli_main() -> anyhow::Result<()> {
                 monitor.run();
             });
 
-            eprintln!("connected to CFAPI callbacks; serving hydration requests");
+            tracing::info!("connected to CFAPI callbacks; serving hydration requests");
             let running = std::sync::Arc::new(AtomicBool::new(true));
             {
                 let r = running.clone();
                 ctrlc::set_handler(move || {
-                    eprintln!("received Ctrl+C, shutting down");
+                    tracing::info!("received Ctrl+C, shutting down");
                     r.store(false, Ordering::SeqCst);
                 })?;
             }
@@ -302,19 +306,19 @@ pub fn cli_main() -> anyhow::Result<()> {
                         format!("remote-refresh changed_paths={}", update.changed_paths.len());
                     log_action_plan_summary(&summary_label, &plan);
                     if let Err(err) = apply_action_plan(&refresh_registration.root_path, &plan) {
-                        eprintln!("remote-refresh: apply_action_plan error: {err}");
+                        tracing::info!("remote-refresh: apply_action_plan error: {err}");
                         return;
                     }
                     let reconciled_paths = refresh_runtime.sync_from_action_plan(&plan);
                     let sync_state_stats =
                         reconcile_sync_states(&refresh_registration.root_path, &plan);
                     if reconciled_paths > 0 {
-                        eprintln!(
+                        tracing::info!(
                             "remote-refresh: reconciled {} changed paths; sync-state={:?}",
                             reconciled_paths, sync_state_stats
                         );
                     } else {
-                        eprintln!(
+                        tracing::info!(
                             "remote-refresh: detected {} changed remote paths; no local plan delta; sync-state={:?}",
                             update.changed_paths.len(),
                             sync_state_stats
@@ -327,7 +331,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                 thread::sleep(Duration::from_secs(1));
             }
 
-            eprintln!("shutting down; dropping connection and exiting");
+            tracing::info!("shutting down; dropping connection and exiting");
             drop(_connection);
             Ok(())
         }
@@ -349,7 +353,7 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
         .write(true)
         .open(&target_path)?;
     cf_set_pin_state(&file, CF_PIN_STATE_PINNED, CF_SET_PIN_FLAG_NONE)?;
-    eprintln!("requested pin for {}", target_path.display());
+    tracing::info!("requested pin for {}", target_path.display());
 
     if !args.wait {
         return Ok(());
@@ -362,7 +366,7 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
 
     loop {
         let info = cf_get_placeholder_standard_info(&file)?;
-        eprintln!(
+        tracing::info!(
             "pin progress: on_disk={} validated={} modified={} total={} pin_state={}",
             info.OnDiskDataSize,
             info.ValidatedDataSize,

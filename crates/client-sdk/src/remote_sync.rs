@@ -231,7 +231,7 @@ impl RemoteSnapshotPoller {
                                     last_sequence = response.sequence;
                                 }
                                 Err(error) => {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "remote-refresh: server change wait unavailable, falling back to polling: {error}"
                                     );
                                     notifications_available = false;
@@ -251,7 +251,7 @@ impl RemoteSnapshotPoller {
                         let next_snapshot = match fetcher.fetch_snapshot_blocking() {
                             Ok(snapshot) => snapshot,
                             Err(error) => {
-                                eprintln!("remote-refresh: snapshot refresh error: {error}");
+                                tracing::warn!("remote-refresh: snapshot refresh error: {error}");
                                 continue;
                             }
                         };
@@ -297,7 +297,7 @@ impl RemoteSnapshotPoller {
                 let next_snapshot = match fetch_snapshot() {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        eprintln!("remote-refresh: snapshot polling error: {error}");
+                        tracing::warn!("remote-refresh: snapshot polling error: {error}");
                         continue;
                     }
                 };

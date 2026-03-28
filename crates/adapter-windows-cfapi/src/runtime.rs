@@ -167,12 +167,12 @@ impl Uploader for DemoUploader {
             read_bytes += n;
         }
 
-        eprintln!("demo upload: path={} bytes={}", path, read_bytes);
+        tracing::info!("demo upload: path={} bytes={}", path, read_bytes);
         Ok(Some("demo-upload".to_string()))
     }
 
     fn delete_path(&self, path: &str) -> Result<()> {
-        eprintln!("demo delete: path={path}");
+        tracing::info!("demo delete: path={path}");
         Ok(())
     }
 }
@@ -240,7 +240,7 @@ impl CfapiRuntime {
         relative_path: &str,
         hydrator: &dyn Hydrator,
     ) -> Result<Vec<u8>> {
-        eprintln!("handle_fetch_data: requested path={relative_path}");
+        tracing::info!("handle_fetch_data: requested path={relative_path}");
         let normalized = normalize_path(relative_path);
         let remote_version = self.resolve_remote_version(&normalized)?;
 
@@ -369,7 +369,7 @@ impl Drop for SyncRootConnection {
         unsafe {
             let _ = CfDisconnectSyncRoot(self.connection_key);
         }
-        eprintln!(
+        tracing::info!(
             "dropped CFAPI connection with key {}, disconnected from sync root",
             self.connection_key
         )
@@ -398,7 +398,7 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
     let display_name = U16String::from_str(&registration.display_name);
     let provider_version = U16String::from_str(env!("CARGO_PKG_VERSION"));
     let icon_resource = current_executable_icon_resource()?;
-    eprintln!(
+    tracing::info!(
         "sync-root registration: path={} hydration_type=Progressive hydration_policy=allow_platform_dehydration population_type=AlwaysFull allow_pinning=true",
         registration.root_path.display()
     );
@@ -574,11 +574,11 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
 
         let result = hresult_to_result(hr, "CfCreatePlaceholders (apply_action_plan)");
         if let Err(err) = &result {
-            eprintln!("apply_action_plan: error creating placeholders: {err}");
-            eprintln!("base_dir={}", base_dir.display());
+            tracing::info!("apply_action_plan: error creating placeholders: {err}");
+            tracing::info!("base_dir={}", base_dir.display());
             for idx in indices {
                 let input = &inputs[idx];
-                eprintln!(
+                tracing::info!(
                     "placeholder: relative_name={} identity={:?} metadata={{attributes={:x} filesize={}}}",
                     input.child_name,
                     input.identity,
@@ -682,7 +682,7 @@ fn reconcile_directory_sync_states_for_candidates(
         let full_path = root_path.join(relative_path.replace('/', "\\"));
         if !full_path.exists() {
             stats.skipped_missing += 1;
-            eprintln!(
+            tracing::info!(
                 "sync-state: skipped missing directory path={} state={}",
                 relative_path,
                 describe_path_state(&full_path)
@@ -695,7 +695,7 @@ fn reconcile_directory_sync_states_for_candidates(
             Ok(metadata) => metadata,
             Err(err) => {
                 stats.failed += 1;
-                eprintln!(
+                tracing::info!(
                     "sync-state: failed to read directory metadata for {}: {} state_before={}",
                     full_path.display(),
                     err,
@@ -718,7 +718,7 @@ fn reconcile_directory_sync_states_for_candidates(
             Ok(file) => file,
             Err(err) => {
                 stats.failed += 1;
-                eprintln!(
+                tracing::info!(
                     "sync-state: failed to open directory {} for sync-state update desired={:?}: {} state_before={}",
                     full_path.display(),
                     desired_state,
@@ -737,7 +737,7 @@ fn reconcile_directory_sync_states_for_candidates(
         ) && let Err(err) = cf_convert_to_placeholder(&file)
         {
             stats.failed += 1;
-            eprintln!(
+            tracing::info!(
                 "sync-state: failed to convert directory {} to placeholder before sync-state update desired={:?}: {} state_before={}",
                 full_path.display(),
                 desired_state,
@@ -758,7 +758,7 @@ fn reconcile_directory_sync_states_for_candidates(
 
         if let Err(err) = result {
             stats.failed += 1;
-            eprintln!(
+            tracing::info!(
                 "sync-state: failed to set directory {:?} for {}: {:#} state_before={}",
                 desired_state,
                 full_path.display(),
@@ -766,7 +766,7 @@ fn reconcile_directory_sync_states_for_candidates(
                 state_before
             );
         } else {
-            eprintln!(
+            tracing::info!(
                 "sync-state: applied directory desired={:?} path={} state_before={} state_after={}",
                 desired_state,
                 relative_path,
@@ -786,9 +786,10 @@ pub(crate) fn reconcile_ancestor_directory_sync_states(root_path: &Path, relativ
 
     let mut stats = SyncStateReconcileStats::default();
     reconcile_directory_sync_states_for_candidates(root_path, &directory_paths, &mut stats);
-    eprintln!(
+    tracing::info!(
         "sync-state: ancestor directory reconcile for {} => {:?}",
-        relative_path, stats
+        relative_path,
+        stats
     );
 }
 
@@ -809,7 +810,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
     }
     let directory_candidates = collect_directory_candidates(plan);
 
-    eprintln!(
+    tracing::info!(
         "sync-state: reconciling {} file paths and {} directories under {}",
         desired_states.len(),
         directory_candidates.len(),
@@ -820,7 +821,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
         let full_path = root_path.join(relative_path.replace('/', "\\"));
         if !full_path.exists() {
             stats.skipped_missing += 1;
-            eprintln!(
+            tracing::info!(
                 "sync-state: skipped missing path={} desired={:?} state={}",
                 relative_path,
                 desired_state,
@@ -834,7 +835,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
             Ok(metadata) => metadata,
             Err(err) => {
                 stats.failed += 1;
-                eprintln!(
+                tracing::info!(
                     "sync-state: failed to read metadata for {} desired={:?}: {} state_before={}",
                     full_path.display(),
                     desired_state,
@@ -847,9 +848,11 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
 
         if metadata.is_dir() {
             stats.skipped_non_placeholder += 1;
-            eprintln!(
+            tracing::info!(
                 "sync-state: skipped non-placeholder path={} desired={:?} state_before={}",
-                relative_path, desired_state, state_before
+                relative_path,
+                desired_state,
+                state_before
             );
             continue;
         }
@@ -858,15 +861,17 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
             path_placeholder_state(&full_path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
         match placeholder_state {
             CF_PLACEHOLDER_STATE_INVALID | CF_PLACEHOLDER_STATE_NO_STATES => {
-                eprintln!(
+                tracing::info!(
                     "sync-state: path is not a placeholder, attempting convert path={} desired={:?} state_before={}",
-                    relative_path, desired_state, state_before
+                    relative_path,
+                    desired_state,
+                    state_before
                 );
                 match open_sync_path(&full_path, true) {
                     Ok(file) => {
                         if let Err(err) = cf_convert_to_placeholder(&file) {
                             stats.failed += 1;
-                            eprintln!(
+                            tracing::info!(
                                 "sync-state: failed to convert to placeholder {} desired={:?}: {} state_before={}",
                                 full_path.display(),
                                 desired_state,
@@ -877,7 +882,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
                     }
                     Err(err) => {
                         stats.failed += 1;
-                        eprintln!(
+                        tracing::info!(
                             "sync-state: failed to open {} for placeholder conversion desired={:?}: {} state_before={}",
                             full_path.display(),
                             desired_state,
@@ -895,7 +900,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
             Ok(file) => file,
             Err(err) => {
                 stats.failed += 1;
-                eprintln!(
+                tracing::info!(
                     "sync-state: failed to open {} for sync-state update desired={:?}: {} state_before={}",
                     full_path.display(),
                     desired_state,
@@ -917,7 +922,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
 
         if let Err(err) = result {
             stats.failed += 1;
-            eprintln!(
+            tracing::info!(
                 "sync-state: failed to set {:?} for {}: {:#} state_before={}",
                 desired_state,
                 full_path.display(),
@@ -925,7 +930,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
                 state_before
             );
         } else {
-            eprintln!(
+            tracing::info!(
                 "sync-state: applied desired={:?} path={} state_before={} state_after={}",
                 desired_state,
                 relative_path,
@@ -1007,7 +1012,7 @@ pub fn connect_sync_root(
     };
     hresult_to_result(hr, "CfConnectSyncRoot")?;
 
-    eprintln!(
+    tracing::info!(
         "connected to CFAPI callbacks with connection key {}",
         connection_key
     );
@@ -1207,9 +1212,10 @@ unsafe extern "system" fn callback_fetch_data(
         Some(path) => path,
         None => {
             let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
-            eprintln!(
+            tracing::info!(
                 "cfapi fetch-data could not resolve relative path: normalized_path='{}' file_id={}",
-                normalized_path, callback_info_ref.FileId
+                normalized_path,
+                callback_info_ref.FileId
             );
             return;
         }
@@ -1218,7 +1224,7 @@ unsafe extern "system" fn callback_fetch_data(
     let remote_version = match context.runtime.resolve_remote_version(&relative_path) {
         Ok(version) => version,
         Err(err) => {
-            eprintln!("cfapi fetch-data missing remote version: {err}");
+            tracing::info!("cfapi fetch-data missing remote version: {err}");
             return;
         }
     };
@@ -1236,7 +1242,7 @@ unsafe extern "system" fn callback_fetch_data(
     let upload_snapshot = context
         .upload_debounce
         .debug_snapshot_for_path(&relative_path, 8);
-    eprintln!(
+    tracing::info!(
         "cfapi fetch-data begin: request={} transfer={} file_id={} session={} path={} remote_version={} offset={} length={} already_hydrated_once={} upload_debounce={} state={}",
         request_identity,
         callback_info_ref.TransferKey,
@@ -1258,7 +1264,7 @@ unsafe extern "system" fn callback_fetch_data(
     let mut writer = CfapiTransferWriter::new(callback_info_ref, range_start);
     let mut progress_callback = |progress: HydrationProgress| {
         if let Err(err) = report_fetch_progress(callback_info_ref, progress) {
-            eprintln!("cfapi progress-report error: {err}");
+            tracing::info!("cfapi progress-report error: {err}");
         }
     };
     let should_cancel = || cancel_flag.load(Ordering::SeqCst);
@@ -1284,7 +1290,7 @@ unsafe extern "system" fn callback_fetch_data(
             if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
                 hydrated_paths.insert(relative_path.clone());
             }
-            eprintln!(
+            tracing::info!(
                 "cfapi fetch-data complete: request={} path={} object_size={} range_start={} range_length={} bytes_transferred={} state_after={} upload_debounce={}",
                 request_identity,
                 relative_path,
@@ -1300,7 +1306,7 @@ unsafe extern "system" fn callback_fetch_data(
             );
         }
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "cfapi fetch-data hydration error: request={} path={} error={:#} state_after={} upload_debounce={}",
                 request_identity,
                 relative_path,
@@ -1341,9 +1347,11 @@ unsafe extern "system" fn callback_cancel_fetch_data(
     let fetch = unsafe { cancel.Anonymous.FetchData };
     let relative_path = resolve_relative_path_from_callback(callback_info_ref, context)
         .unwrap_or_else(|| String::from("<unknown>"));
-    eprintln!(
+    tracing::info!(
         "cfapi cancel-fetch-data: path={} offset={} length={}",
-        relative_path, fetch.FileOffset, fetch.Length
+        relative_path,
+        fetch.FileOffset,
+        fetch.Length
     );
 }
 
@@ -1369,7 +1377,7 @@ unsafe extern "system" fn callback_notify_dehydrate(
         Some(path) => path,
         None => {
             let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
-            eprintln!(
+            tracing::info!(
                 "cfapi notify-dehydrate: request={} could not resolve relative path normalized_path='{}' file_id={} flags=0x{:x} reason={}",
                 request_identity,
                 normalized_path,
@@ -1380,7 +1388,7 @@ unsafe extern "system" fn callback_notify_dehydrate(
             if let Err(err) =
                 execute_ack_dehydrate(callback_info_ref, STATUS_CLOUD_FILE_NOT_IN_SYNC)
             {
-                eprintln!("cfapi notify-dehydrate ack error: {err}");
+                tracing::info!("cfapi notify-dehydrate ack error: {err}");
             }
             return;
         }
@@ -1399,7 +1407,7 @@ unsafe extern "system" fn callback_notify_dehydrate(
                     .has_in_flight_upload_for_path(&relative_path),
             ),
             Err(err) => {
-                eprintln!(
+                tracing::info!(
                     "cfapi notify-dehydrate: request={} path={} failed to read placeholder info: {} state={} upload_debounce={}",
                     request_identity,
                     relative_path,
@@ -1411,7 +1419,7 @@ unsafe extern "system" fn callback_notify_dehydrate(
             }
         },
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "cfapi notify-dehydrate: request={} path={} failed to open target: {} state={} upload_debounce={}",
                 request_identity,
                 relative_path,
@@ -1423,7 +1431,7 @@ unsafe extern "system" fn callback_notify_dehydrate(
         }
     };
 
-    eprintln!(
+    tracing::info!(
         "cfapi notify-dehydrate: request={} transfer={} file_id={} path={} flags=0x{:x} reason={} decision_status=0x{:08x} state={} upload_debounce={}",
         request_identity,
         callback_info_ref.TransferKey,
@@ -1437,9 +1445,12 @@ unsafe extern "system" fn callback_notify_dehydrate(
     );
 
     if let Err(err) = execute_ack_dehydrate(callback_info_ref, completion_status) {
-        eprintln!(
+        tracing::info!(
             "cfapi notify-dehydrate ack error: request={} path={} status=0x{:08x} error={:#}",
-            request_identity, relative_path, completion_status as u32, err
+            request_identity,
+            relative_path,
+            completion_status as u32,
+            err
         );
     }
 }
@@ -1475,7 +1486,7 @@ unsafe extern "system" fn callback_notify_dehydrate_completion(
         context.sync_root.join(relative_path.replace('/', "\\"))
     };
 
-    eprintln!(
+    tracing::info!(
         "cfapi dehydrate-completion: file_id={} path={} flags=0x{:x} reason={} state={} upload_debounce={}",
         callback_info_ref.FileId,
         relative_path,
@@ -1519,31 +1530,32 @@ unsafe extern "system" fn callback_file_close_completion(
     callback_parameters: *const CF_CALLBACK_PARAMETERS,
 ) {
     if callback_info.is_null() || callback_parameters.is_null() {
-        eprintln!("close-completion: null callback_info or callback_parameters");
+        tracing::info!("close-completion: null callback_info or callback_parameters");
         return;
     }
 
     let callback_info_ref = unsafe { &*callback_info };
     let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
     if context_ptr.is_null() {
-        eprintln!("close-completion: null context ptr");
+        tracing::info!("close-completion: null context ptr");
         return;
     }
     let context = unsafe { &*context_ptr };
     let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
 
     let close_completion = unsafe { (*callback_parameters).Anonymous.CloseCompletion };
-    eprintln!(
+    tracing::info!(
         "close-completion: flags={:x} path={}",
-        close_completion.Flags, normalized_path
+        close_completion.Flags,
+        normalized_path
     );
     if (close_completion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
-        eprintln!("close-completion: file deleted, skipping upload");
+        tracing::info!("close-completion: file deleted, skipping upload");
         return;
     }
 
     if normalized_path.is_empty() {
-        eprintln!("close-completion: empty normalized path");
+        tracing::info!("close-completion: empty normalized path");
         return;
     }
 
@@ -1551,7 +1563,7 @@ unsafe extern "system" fn callback_file_close_completion(
     if is_internal_client_identity_relative_path(&relative_path)
         || is_internal_connection_bootstrap_relative_path(&relative_path)
     {
-        eprintln!(
+        tracing::info!(
             "close-completion: skipping internal config file {}",
             relative_path
         );
@@ -1562,9 +1574,11 @@ unsafe extern "system" fn callback_file_close_completion(
     {
         paths_by_file_id.insert(callback_info_ref.FileId, relative_path.clone());
     }
-    eprintln!(
+    tracing::info!(
         "close-completion: relative_path={}, normalized_path={}, sync_root={:?}",
-        relative_path, normalized_path, context.sync_root
+        relative_path,
+        normalized_path,
+        context.sync_root
     );
     schedule_debounced_close_upload(
         context.upload_worker.clone(),

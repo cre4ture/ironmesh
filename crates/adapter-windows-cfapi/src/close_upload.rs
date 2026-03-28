@@ -134,7 +134,7 @@ pub(crate) fn schedule_debounced_close_upload(
     };
     let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
 
-    eprintln!(
+    tracing::info!(
         "close-completion: scheduled upload for {} after {:?} quiet period (generation {}, {})",
         relative_path,
         CLOSE_UPLOAD_QUIET_PERIOD,
@@ -170,7 +170,7 @@ fn spawn_debounced_close_upload(
         };
         if !is_latest {
             let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
-            eprintln!(
+            tracing::info!(
                 "close-completion: skipping stale upload worker for {} generation {} ({})",
                 relative_path,
                 generation,
@@ -187,7 +187,7 @@ fn spawn_debounced_close_upload(
             if !uploads_in_flight.insert(relative_path.clone()) {
                 drop(uploads_in_flight);
                 let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
-                eprintln!(
+                tracing::info!(
                     "close-completion: upload already in flight for {} generation {} ({})",
                     relative_path,
                     generation,
@@ -217,7 +217,7 @@ fn spawn_debounced_close_upload(
             (_, Some(latest)) if latest != generation => {}
             (UploadAttemptOutcome::Retry, Some(latest)) => {
                 let snapshot = debounce.debug_snapshot_for_path(&relative_path, 8);
-                eprintln!(
+                tracing::info!(
                     "close-completion: retrying upload for {} generation {} after {:?} ({})",
                     relative_path,
                     latest,
@@ -250,7 +250,7 @@ fn process_debounced_close_upload(
 ) -> UploadAttemptOutcome {
     let full_path = worker.sync_root.join(relative_path);
 
-    eprintln!(
+    tracing::info!(
         "close-completion: checking upload for {} state_before={}",
         relative_path,
         describe_path_state(&full_path)
@@ -259,14 +259,14 @@ fn process_debounced_close_upload(
     let metadata = match std::fs::metadata(&full_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: path disappeared before upload check, skipping {}",
                 relative_path
             );
             return UploadAttemptOutcome::Settled;
         }
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: metadata error for {}: {}",
                 full_path.display(),
                 err
@@ -276,7 +276,7 @@ fn process_debounced_close_upload(
     };
 
     if metadata.is_dir() {
-        eprintln!(
+        tracing::info!(
             "close-completion: {} is a directory, uploading directory metadata",
             relative_path
         );
@@ -287,13 +287,14 @@ fn process_debounced_close_upload(
             b"<DIR>".len() as u64,
         ) {
             Ok(_) => {
-                eprintln!("cfapi uploaded directory: path={}", relative_path);
+                tracing::info!("cfapi uploaded directory: path={}", relative_path);
                 UploadAttemptOutcome::Settled
             }
             Err(err) => {
-                eprintln!(
+                tracing::info!(
                     "cfapi upload error (dir): path={} error={:#}",
-                    relative_path, err
+                    relative_path,
+                    err
                 );
                 UploadAttemptOutcome::Retry
             }
@@ -307,14 +308,14 @@ fn process_debounced_close_upload(
     {
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: file disappeared before open, skipping {}",
                 relative_path
             );
             return UploadAttemptOutcome::Settled;
         }
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "cfapi close-completion open error: path={} error={}",
                 full_path.display(),
                 err
@@ -325,7 +326,7 @@ fn process_debounced_close_upload(
 
     match cf_get_placeholder_standard_info(&file) {
         Ok(placeholder_info) if placeholder_info.ModifiedDataSize == 0 => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: skipping upload for {} because ModifiedDataSize is zero state={}",
                 relative_path,
                 describe_path_state(&full_path)
@@ -334,9 +335,10 @@ fn process_debounced_close_upload(
         }
         Ok(_) => {}
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: placeholder info unavailable for {}, treating as modified: {}",
-                relative_path, err
+                relative_path,
+                err
             );
         }
     }
@@ -344,9 +346,10 @@ fn process_debounced_close_upload(
     let snapshot_before = match capture_file_snapshot(&file) {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: failed to snapshot {} before upload: {}",
-                relative_path, err
+                relative_path,
+                err
             );
             return UploadAttemptOutcome::Retry;
         }
@@ -355,14 +358,15 @@ fn process_debounced_close_upload(
     let mut upload_usn = match prepare_file_for_upload(&file) {
         Ok(usn) => usn,
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: failed to prepare {} for upload: {:#}",
-                relative_path, err
+                relative_path,
+                err
             );
             return UploadAttemptOutcome::Retry;
         }
     };
-    eprintln!(
+    tracing::info!(
         "close-completion: prepared {} for upload snapshot_before={:?} upload_usn={} state={}",
         relative_path,
         snapshot_before,
@@ -372,9 +376,11 @@ fn process_debounced_close_upload(
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
 
     if let Err(err) = upload_file_on_close(worker, relative_path, snapshot_before.len, file) {
-        eprintln!(
+        tracing::info!(
             "cfapi upload error: path={} bytes={} error={:#}",
-            relative_path, snapshot_before.len, err
+            relative_path,
+            snapshot_before.len,
+            err
         );
         return UploadAttemptOutcome::Retry;
     }
@@ -382,23 +388,24 @@ fn process_debounced_close_upload(
     let snapshot_after = match capture_path_snapshot(&full_path) {
         Ok(snapshot) => snapshot,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: {} was removed after upload; waiting for follow-up event",
                 relative_path
             );
             return UploadAttemptOutcome::Settled;
         }
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: failed to snapshot {} after upload: {}",
-                relative_path, err
+                relative_path,
+                err
             );
             return UploadAttemptOutcome::Retry;
         }
     };
 
     if snapshot_after != snapshot_before {
-        eprintln!(
+        tracing::info!(
             "close-completion: {} changed during upload, scheduling retry snapshot_before={:?} snapshot_after={:?} state={}",
             relative_path,
             snapshot_before,
@@ -407,7 +414,7 @@ fn process_debounced_close_upload(
         );
         return UploadAttemptOutcome::Retry;
     }
-    eprintln!(
+    tracing::info!(
         "close-completion: upload finished for {} snapshot_after={:?} upload_usn={} state_before_in_sync={}",
         relative_path,
         snapshot_after,
@@ -422,24 +429,26 @@ fn process_debounced_close_upload(
     {
         Ok(file_for_sync) => {
             if let Err(err) = ensure_placeholder_then_set_in_sync(&file_for_sync, &mut upload_usn) {
-                eprintln!(
+                tracing::info!(
                     "close-completion: failed to mark {} in sync after upload: {:#}",
-                    relative_path, err
+                    relative_path,
+                    err
                 );
                 return UploadAttemptOutcome::Retry;
             }
         }
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "close-completion: failed to reopen {} for in-sync update: {}",
-                relative_path, err
+                relative_path,
+                err
             );
             return UploadAttemptOutcome::Retry;
         }
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
-    eprintln!(
+    tracing::info!(
         "cfapi uploaded local file: path={} bytes={} final_state={}",
         relative_path,
         snapshot_before.len,
@@ -484,9 +493,10 @@ fn upload_file_on_close(
     metadata_len: u64,
     file: std::fs::File,
 ) -> Result<()> {
-    eprintln!(
+    tracing::info!(
         "close-completion: uploading {} ({} bytes)",
-        relative_path, metadata_len
+        relative_path,
+        metadata_len
     );
 
     let mut reader = file;

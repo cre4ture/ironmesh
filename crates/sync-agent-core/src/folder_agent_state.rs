@@ -653,7 +653,7 @@ pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usi
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "cleanup: failed to read directory {}: {error}",
                     dir.display()
                 );
@@ -665,7 +665,7 @@ pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usi
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    eprintln!("cleanup: failed to read directory entry: {error}");
+                    tracing::warn!("cleanup: failed to read directory entry: {error}");
                     continue;
                 }
             };
@@ -673,7 +673,7 @@ pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usi
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
-                    eprintln!("cleanup: failed to inspect {}: {error}", path.display());
+                    tracing::warn!("cleanup: failed to inspect {}: {error}", path.display());
                     continue;
                 }
             };
@@ -706,7 +706,7 @@ pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usi
             match fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(error) => {
-                    eprintln!("cleanup: failed to remove {}: {error}", path.display());
+                    tracing::warn!("cleanup: failed to remove {}: {error}", path.display());
                 }
             }
         }

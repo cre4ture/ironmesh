@@ -10,6 +10,7 @@ build = "build.rs"
 anyhow.workspace = true
 clap.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
+common = { path = "../../crates/common" }
 git-version.workspace = true
 reqwest.workspace = true
 sync-agent-core = { path = "../../crates/sync-agent-core" }

@@ -11,6 +11,7 @@ axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
 client-sdk = { path = "../client-sdk" }
+common = { path = "../common" }
 ctrlc = "3"
 notify.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -18,3 +19,4 @@ serde.workspace = true
 serde_json.workspace = true
 sync-core = { path = "../sync-core" }
 tokio.workspace = true
+tracing.workspace = true

@@ -55,7 +55,7 @@ impl PlaceholderSnapshot {
         let file = match open_sync_path(path, false) {
             Ok(file) => file,
             Err(err) => {
-                eprintln!(
+                tracing::info!(
                     "monitor: dehydrate probe open failed path={} error={} state={}",
                     path.display(),
                     err,
@@ -67,7 +67,7 @@ impl PlaceholderSnapshot {
         let info = match cf_get_placeholder_standard_info(&file) {
             Ok(info) => info,
             Err(err) => {
-                eprintln!(
+                tracing::info!(
                     "monitor: dehydrate probe placeholder-info failed path={} error={} state={}",
                     path.display(),
                     err,
@@ -202,7 +202,7 @@ impl SyncRootMonitor {
             return;
         }
 
-        eprintln!(
+        tracing::info!(
             "{}: dehydrate-scan total_entries={} unpinned_attr={} probed_placeholders={} eligible={} in_flight={}",
             self.name,
             summary.total_entries,
@@ -287,7 +287,7 @@ impl SyncRootMonitor {
                     .and_then(|value| value.placeholder_state)
                     .is_some())
         {
-            eprintln!(
+            tracing::info!(
                 "{}: path-state changed path={} previous={} current={} raw_state={}",
                 self.name,
                 rel_path,
@@ -306,7 +306,7 @@ impl SyncRootMonitor {
         }
 
         if entry.is_dir {
-            eprintln!("{}: detected new directory {}", self.name, rel_path);
+            tracing::info!("{}: detected new directory {}", self.name, rel_path);
             let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
             let remote_path = directory_marker_path(&rel_path);
             let _ = self
@@ -320,9 +320,10 @@ impl SyncRootMonitor {
             // Check if file is already a CFAPI placeholder using Windows file attributes
             let is_placeholder = path_is_placeholder(path);
             if is_placeholder {
-                eprintln!(
+                tracing::info!(
                     "{}: skipping placeholder creation for CFAPI placeholder file {}",
-                    self.name, rel_path
+                    self.name,
+                    rel_path
                 );
             } else if path.exists() {
                 // File is materialized, convert to placeholder using a file HANDLE
@@ -333,20 +334,22 @@ impl SyncRootMonitor {
                     &mut std::fs::File::open(path).unwrap(),
                     metadata.len(),
                 ) {
-                    eprintln!("{}: failed to upload file {}: {}", self.name, rel_path, e);
+                    tracing::info!("{}: failed to upload file {}: {}", self.name, rel_path, e);
                 } else {
-                    eprintln!("{}: uploaded file {}", self.name, rel_path);
+                    tracing::info!("{}: uploaded file {}", self.name, rel_path);
                 }
             } else {
                 // File does not exist, create placeholder
                 use crate::runtime::create_placeholder;
                 if let Err(e) = create_placeholder(&self.sync_root, &rel_path) {
-                    eprintln!(
+                    tracing::info!(
                         "{}: failed to create placeholder for {}: {}",
-                        self.name, rel_path, e
+                        self.name,
+                        rel_path,
+                        e
                     );
                 } else {
-                    eprintln!("{}: created placeholder for {}", self.name, rel_path);
+                    tracing::info!("{}: created placeholder for {}", self.name, rel_path);
                 }
             }
         }
@@ -365,7 +368,7 @@ impl SyncRootMonitor {
 
         let Some(placeholder_state) = entry.placeholder_state else {
             if previous_entry != Some(entry) {
-                eprintln!(
+                tracing::info!(
                     "{}: dehydrate candidate missing placeholder probe path={} entry={} raw_state={}",
                     self.name,
                     rel_path,
@@ -377,7 +380,7 @@ impl SyncRootMonitor {
         };
         if !placeholder_state.should_dehydrate() {
             if previous_entry != Some(entry) {
-                eprintln!(
+                tracing::info!(
                     "{}: dehydrate candidate rejected path={} snapshot={} reason={} raw_state={}",
                     self.name,
                     rel_path,
@@ -389,7 +392,7 @@ impl SyncRootMonitor {
             return;
         }
 
-        eprintln!(
+        tracing::info!(
             "{}: dehydrate candidate accepted path={} snapshot={} raw_state={}",
             self.name,
             rel_path,
@@ -403,7 +406,7 @@ impl SyncRootMonitor {
                 .lock()
                 .expect("dehydrations_in_flight lock poisoned");
             if !in_flight.insert(rel_path.to_string()) {
-                eprintln!(
+                tracing::info!(
                     "{}: dehydrate already in flight for {} snapshot={} raw_state={}",
                     self.name,
                     rel_path,
@@ -419,7 +422,7 @@ impl SyncRootMonitor {
         let monitor_name = self.name.clone();
         let in_flight = self.dehydrations_in_flight.clone();
         std::thread::spawn(move || {
-            eprintln!(
+            tracing::info!(
                 "{}: dehydrating unpinned placeholder {} state_before={} snapshot={}",
                 monitor_name,
                 rel_path,
@@ -433,7 +436,7 @@ impl SyncRootMonitor {
 
             match result {
                 Ok(()) => {
-                    eprintln!(
+                    tracing::info!(
                         "{}: dehydrated placeholder {} state_after={}",
                         monitor_name,
                         rel_path,
@@ -441,7 +444,7 @@ impl SyncRootMonitor {
                     );
                 }
                 Err(err) => {
-                    eprintln!(
+                    tracing::info!(
                         "{}: failed to dehydrate placeholder {}: {:#} state_after={}",
                         monitor_name,
                         rel_path,
@@ -455,7 +458,7 @@ impl SyncRootMonitor {
                 .lock()
                 .expect("dehydrations_in_flight lock poisoned")
                 .remove(&rel_path);
-            eprintln!(
+            tracing::info!(
                 "{}: dehydrate worker finished for {} current_state={}",
                 monitor_name,
                 rel_path,
@@ -486,27 +489,33 @@ impl SyncRootMonitor {
             }
             if entry.is_dir {
                 let canonical_path = directory_marker_path(path);
-                eprintln!("{}: detected deleted directory {}", self.name, path);
+                tracing::info!("{}: detected deleted directory {}", self.name, path);
                 if let Err(err) = self.uploader.delete_path(&canonical_path) {
-                    eprintln!(
+                    tracing::info!(
                         "{}: failed to delete remote directory marker {}: {}",
-                        self.name, canonical_path, err
+                        self.name,
+                        canonical_path,
+                        err
                     );
                 }
 
                 // Clean up legacy plain-key folder entries created by earlier buggy builds.
                 if let Err(err) = self.uploader.delete_path(path) {
-                    eprintln!(
+                    tracing::info!(
                         "{}: failed to delete legacy remote directory key {}: {}",
-                        self.name, path, err
+                        self.name,
+                        path,
+                        err
                     );
                 }
             } else {
-                eprintln!("{}: detected deleted file {}", self.name, path);
+                tracing::info!("{}: detected deleted file {}", self.name, path);
                 if let Err(err) = self.uploader.delete_path(path) {
-                    eprintln!(
+                    tracing::info!(
                         "{}: failed to delete remote file {}: {}",
-                        self.name, path, err
+                        self.name,
+                        path,
+                        err
                     );
                 }
             }

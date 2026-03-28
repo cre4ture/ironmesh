@@ -12,6 +12,7 @@ axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
 client-sdk = { path = "../../crates/client-sdk" }
+common = { path = "../../crates/common" }
 git-version.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true

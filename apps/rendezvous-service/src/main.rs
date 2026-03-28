@@ -15,7 +15,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::relay::{
     RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
@@ -45,11 +44,7 @@ struct HealthResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    common::logging::init_compact_tracing(common::logging::env_filter_from_default_env("info"));
 
     let config = RendezvousServiceConfig::from_env()?;
     let state = AppState::new(config);

@@ -106,6 +106,7 @@ struct ResolvedStartupTarget {
 }
 
 fn main() -> Result<()> {
+    common::logging::init_compact_tracing_default("info");
     let args = Args::parse();
 
     if let Some(command) = args.command.as_ref() {

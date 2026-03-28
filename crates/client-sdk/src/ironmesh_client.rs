@@ -1698,10 +1698,10 @@ impl IronMeshClient {
     ) -> Result<UploadResult> {
         let key = key.into();
 
-        eprintln!("starting upload for key={key} with length={length} bytes");
+        tracing::info!("starting upload for key={key} with length={length} bytes");
 
         if length <= LARGE_UPLOAD_THRESHOLD_BYTES as u64 {
-            eprintln!("using direct upload for key={key} with length={length} bytes");
+            tracing::info!("using direct upload for key={key} with length={length} bytes");
 
             let mut buf = Vec::with_capacity(std::cmp::min(length as usize, 8192));
             let mut limited = reader.take(length);
@@ -1723,7 +1723,7 @@ impl IronMeshClient {
             });
         }
 
-        eprintln!("using chunked upload for key={key} with length={length} bytes");
+        tracing::info!("using chunked upload for key={key} with length={length} bytes");
 
         self.put_sized_reader_via_upload_session(key, reader, length)
     }

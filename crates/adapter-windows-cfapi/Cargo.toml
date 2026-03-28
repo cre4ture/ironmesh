@@ -10,6 +10,7 @@ authors.workspace = true
 [target.'cfg(windows)'.dependencies]
 sync-core = { path = "../sync-core" }
 client-sdk = { path = "../client-sdk" }
+common = { path = "../common" }
 anyhow = { workspace = true }
 blake3.workspace = true
 clap = { workspace = true }
@@ -30,6 +31,7 @@ windows-sys = { version = "0.61", features = [
 ctrlc = "3"
 normpath = "1.2"
 pathdiff = "0.2"
+tracing.workspace = true
 walkdir = "2.3"
 
 # Prevent compilation on non-Windows targets

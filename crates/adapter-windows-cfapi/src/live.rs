@@ -46,7 +46,7 @@ impl ServerNodeHydrator {
 
 impl Hydrator for ServerNodeHydrator {
     fn hydrate(&self, path: &str, _remote_version: &str) -> Result<Vec<u8>> {
-        eprintln!("hydrating path {path} from server");
+        tracing::info!("hydrating path {path} from server");
         let mut bytes = Vec::new();
         self.sdk
             .download_to_writer_resumable_staged(
@@ -67,7 +67,7 @@ impl Hydrator for ServerNodeHydrator {
         on_progress: &mut dyn FnMut(HydrationProgress),
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<HydrationResult> {
-        eprintln!(
+        tracing::info!(
             "hydrating range path {path} from server offset={} length={}",
             request.offset,
             request.length,

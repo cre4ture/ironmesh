@@ -95,7 +95,7 @@ pub fn cf_dehydrate_placeholder(file: &std::fs::File) -> Result<()> {
         CF_DEHYDRATE_FLAG_NONE, CfDehydratePlaceholder,
     };
 
-    eprintln!("cfapi dehydrate-placeholder: issuing CfDehydratePlaceholder");
+    tracing::info!("cfapi dehydrate-placeholder: issuing CfDehydratePlaceholder");
     let hr = unsafe {
         CfDehydratePlaceholder(
             file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
@@ -105,7 +105,7 @@ pub fn cf_dehydrate_placeholder(file: &std::fs::File) -> Result<()> {
             std::ptr::null_mut(),
         )
     };
-    eprintln!(
+    tracing::info!(
         "cfapi dehydrate-placeholder: CfDehydratePlaceholder returned HRESULT 0x{:08x}",
         hr as u32
     );
@@ -181,7 +181,7 @@ pub fn get_and_log_placeholder_info(
 ) -> Result<CF_PLACEHOLDER_STANDARD_INFO> {
     match cf_get_placeholder_standard_info(file) {
         Ok(returned) => {
-            eprintln!(
+            tracing::info!(
                 "{}: CfGetPlaceholderInfo for {}: returned FileId: {}, OnDiskDataSize: {}, ModifiedDataSize: {}, InSyncState: {:?}",
                 label,
                 rel_path,
@@ -193,9 +193,11 @@ pub fn get_and_log_placeholder_info(
             Ok(returned)
         }
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "{}: CfGetPlaceholderInfo error for {}: {}",
-                label, rel_path, err
+                label,
+                rel_path,
+                err
             );
             Err(err)
         }
@@ -314,7 +316,7 @@ pub fn try_convert_materialized_file(
     metadata: &std::fs::Metadata,
 ) {
     if path_is_placeholder(file_path) {
-        eprintln!(
+        tracing::info!(
             "x: skipping convert for {} because placeholder state already present",
             rel_path
         );
@@ -323,7 +325,7 @@ pub fn try_convert_materialized_file(
 
     {
         let attrs = metadata.file_attributes();
-        eprintln!(
+        tracing::info!(
             "monitor: attempting convert path={} attrs=0x{:08x} size={}",
             file_path.display(),
             attrs,
@@ -338,26 +340,27 @@ pub fn try_convert_materialized_file(
         Ok(fh_file) => {
             let result = cf_convert_to_placeholder(&fh_file);
             if result.is_ok() {
-                eprintln!(
+                tracing::info!(
                     "x: converted materialized file to placeholder: {}",
                     rel_path
                 );
             } else {
-                eprintln!(
+                tracing::info!(
                     "x: failed to convert materialized file to placeholder {}: {:?}",
                     rel_path,
                     result.err()
                 );
                 if let Ok(m) = std::fs::metadata(file_path) {
                     let attrs = m.file_attributes();
-                    eprintln!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
+                    tracing::info!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
                 }
             }
         }
         Err(err) => {
-            eprintln!(
+            tracing::info!(
                 "x: failed to open materialized file {} for conversion: {}",
-                rel_path, err
+                rel_path,
+                err
             );
         }
     }

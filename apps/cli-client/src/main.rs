@@ -9,11 +9,7 @@ use client_sdk::{
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Directive;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use web_ui_backend::{WebUiBootstrapPersistence, WebUiConfig};
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,8 +21,6 @@ const LONG_VERSION: &str = git_version::git_version!(
     prefix = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: "),
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
-static CLI_TRACING_INIT: Once = Once::new();
-
 #[derive(Debug, Clone, Parser)]
 #[command(name = "ironmesh")]
 #[command(about = "CLI client for ironmesh distributed storage")]
@@ -178,27 +172,16 @@ async fn main() -> Result<()> {
 }
 
 fn init_cli_tracing() {
-    CLI_TRACING_INIT.call_once(|| {
-        let perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
-        let mut env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-        if perf_logging_enabled {
-            env_filter = env_filter.add_directive(
-                "info"
-                    .parse::<Directive>()
-                    .expect("valid info tracing directive"),
-            );
-        }
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_timer(tracing_subscriber::fmt::time::SystemTime)
-                    .with_target(false)
-                    .compact(),
-            )
-            .init();
-    });
+    let perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
+    let mut env_filter = common::logging::env_filter_from_default_env("warn");
+    if perf_logging_enabled {
+        env_filter = env_filter.add_directive(
+            "info"
+                .parse::<Directive>()
+                .expect("valid info tracing directive"),
+        );
+    }
+    common::logging::init_compact_tracing(env_filter);
 }
 
 fn env_flag_is_truthy(name: &str) -> bool {

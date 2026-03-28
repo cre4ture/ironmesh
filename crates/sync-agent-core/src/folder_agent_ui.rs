@@ -78,7 +78,7 @@ pub fn spawn_ui_server(
         {
             Ok(value) => value,
             Err(err) => {
-                eprintln!("ui: failed to build runtime: {err}");
+                tracing::warn!("ui: failed to build runtime: {err}");
                 return;
             }
         };
@@ -87,14 +87,14 @@ pub fn spawn_ui_server(
             let listener = match tokio::net::TcpListener::from_std(listener) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("ui: failed to adopt listener: {err}");
+                    tracing::warn!("ui: failed to adopt listener: {err}");
                     return;
                 }
             };
 
             let app = router(state);
             if let Err(err) = axum::serve(listener, app).await {
-                eprintln!("ui: server stopped: {err}");
+                tracing::warn!("ui: server stopped: {err}");
             }
         })
     })

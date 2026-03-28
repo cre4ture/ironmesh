@@ -643,7 +643,7 @@ fn local_paths_to_preserve_on_startup_saf(
                     Ok(local_hash) if local_hash == *remote_hash => continue,
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "startup-state: failed to hash SAF file {path}: {error}; preserving local bytes"
                         );
                     }
@@ -659,7 +659,7 @@ fn local_paths_to_preserve_on_startup_saf(
                     Ok(local_hash) if local_hash == *remote_hash => continue,
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
+                        tracing::warn!(
                             "startup-state: failed to hash SAF file {path}: {error}; preserving local bytes"
                         );
                     }
@@ -708,7 +708,7 @@ fn startup_remote_delete_wins_paths_saf(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "startup-state: failed to hash SAF file {path} for remote-delete check: {error}; preserving local bytes"
                     );
                 }
@@ -744,7 +744,7 @@ fn startup_dual_modify_conflicts_saf(
         let local_hash = match saf_file_content_hash(tree_uri, path) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "startup-state: failed to hash SAF file {path} for dual-modify check: {error}; treating as conflict"
                 );
                 let stored_baseline = baseline.and_then(|state| state.get(path));
@@ -1069,7 +1069,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
         match load_local_baseline_with_retries(&state_store, 6, Duration::from_millis(100)) {
             Ok(state) => Some(state),
             Err(error) => {
-                eprintln!("startup-state: failed to load sqlite baseline: {error}");
+                tracing::warn!("startup-state: failed to load sqlite baseline: {error}");
                 state_store.quarantine_corrupt().ok();
                 None
             }
@@ -1078,7 +1078,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
         match load_local_baseline_hashes_with_retries(&state_store, 6, Duration::from_millis(100)) {
             Ok(hashes) => hashes,
             Err(error) => {
-                eprintln!("startup-state: failed to load sqlite baseline hashes: {error}");
+                tracing::warn!("startup-state: failed to load sqlite baseline hashes: {error}");
                 BTreeMap::new()
             }
         }
