@@ -5,6 +5,11 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
   test.setTimeout(45_000);
   const uploadMetrics = await installClientUiMocks(page);
+  const pageErrors: string[] = [];
+
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+  });
 
   await page.goto("/");
 
@@ -152,6 +157,27 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("dialog").getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
   await expect(page.locator("video")).toBeVisible();
   await page.keyboard.press("Escape");
+  const prefixInput = page.getByLabel("Prefix");
+  await page.getByRole("button", { name: "docs/", exact: true }).click();
+  await expect(prefixInput).toHaveValue("docs/");
+  await expect(page.getByRole("button", { name: "nested/", exact: true })).toBeVisible();
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await page.getByRole("button", { name: "nested/", exact: true }).click();
+  await expect(prefixInput).toHaveValue("docs/nested/");
+  await page.getByRole("button", { name: "Up one level" }).click();
+  await expect(prefixInput).toHaveValue("docs/");
+  await page.getByRole("button", { name: "Up one level" }).click();
+  await expect(prefixInput).toHaveValue("");
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("2 markers")).toBeVisible();
+  await page.getByRole("button", { name: "media/", exact: true }).click();
+  await expect(prefixInput).toHaveValue("media/");
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(page.getByText("2 markers")).toBeVisible();
+  await page.getByRole("button", { name: "Up one level" }).click();
+  await expect(prefixInput).toHaveValue("");
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
+  await expect(pageErrors).toEqual([]);
   await page.getByRole("button", { name: "Grid" }).click();
   await page.getByLabel("Prefix").fill("docs/");
   await page.getByRole("button", { name: "Load" }).click();
@@ -173,9 +199,7 @@ async function installClientUiMocks(page: Page) {
   const movieBody = Buffer.from("mock-movie-payload");
   const logicalMapBody = readFileSync("tests/fixtures/smoke.mbtiles");
   const emptyVectorTileBody = gzipSync(Buffer.alloc(0));
-  const glyphRangeBody = readFileSync(
-    "../map/maptiler-server-map-styles-and-samples-3.15/fonts/Noto Sans Regular/0-255.pbf"
-  );
+  const glyphRangeBody = Buffer.alloc(0);
   let uploadSessionStartCount = 0;
   const uploadSizes = new Map<string, number>();
   const uploadKeys = new Map<string, string>();

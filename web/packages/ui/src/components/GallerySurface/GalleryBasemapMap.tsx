@@ -194,13 +194,19 @@ export function GalleryBasemapMap({
 
         const bumpViewport = () => {
           if (map) {
-            cameraStateRef.current = snapshotMapCamera(map);
+            const nextCamera = trySnapshotMapCamera(map);
+            if (nextCamera) {
+              cameraStateRef.current = nextCamera;
+            }
           }
           setViewportVersion((current) => current + 1);
         };
         let ready = false;
         const markReady = () => {
-          if (cancelled || ready) {
+          if (cancelled || ready || !map) {
+            return;
+          }
+          if (!currentMapProjectionType(map)) {
             return;
           }
           ready = true;
@@ -219,7 +225,9 @@ export function GalleryBasemapMap({
         map.on("resize", bumpViewport);
         map.on("projectiontransition", bumpViewport);
         mapRef.current = map;
-        markReady();
+        if (map.isStyleLoaded()) {
+          markReady();
+        }
       } catch (error) {
         if (!cancelled) {
           setMapError(error instanceof Error ? error.message : "Failed to load self-hosted basemap");
@@ -235,7 +243,10 @@ export function GalleryBasemapMap({
         mbtilesConfigRegistry.delete(localRasterSourceId);
       }
       if (map) {
-        cameraStateRef.current = snapshotMapCamera(map);
+        const nextCamera = trySnapshotMapCamera(map);
+        if (nextCamera) {
+          cameraStateRef.current = nextCamera;
+        }
         map.remove();
       }
       mapRef.current = null;
@@ -268,11 +279,15 @@ export function GalleryBasemapMap({
       return;
     }
 
-    if (map.getProjection().type === projection) {
+    const currentProjection = currentMapProjectionType(map);
+    if (!currentProjection || currentProjection === projection) {
       return;
     }
 
-    const currentCamera = snapshotMapCamera(map);
+    const currentCamera = trySnapshotMapCamera(map);
+    if (!currentCamera) {
+      return;
+    }
     cameraStateRef.current = currentCamera;
     map.setProjection({ type: projection });
     map.jumpTo(currentCamera);
@@ -1069,6 +1084,26 @@ function buildHybridStyle(
 
 function nameExpression(): unknown[] {
   return ["coalesce", ["get", "name:latin"], ["get", "name_en"], ["get", "name"]];
+}
+
+function currentMapProjectionType(map: maplibregl.Map): GalleryMapProjection | null {
+  try {
+    const projection = map.getProjection();
+    if (!projection || typeof projection.type !== "string") {
+      return null;
+    }
+    return projection.type === "mercator" || projection.type === "globe" ? projection.type : null;
+  } catch {
+    return null;
+  }
+}
+
+function trySnapshotMapCamera(map: maplibregl.Map): MapCameraState | null {
+  try {
+    return snapshotMapCamera(map);
+  } catch {
+    return null;
+  }
 }
 
 function snapshotMapCamera(map: maplibregl.Map): MapCameraState {
