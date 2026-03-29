@@ -1,4 +1,5 @@
 import {
+  clearAdminMediaCache,
   getClusterNodes,
   getRendezvousConfig,
   getClusterSummary,
@@ -8,6 +9,7 @@ import {
   getRecentLogs,
   getReplicationPlan,
   triggerReplicationRepair,
+  type AdminMediaCacheClearResponse,
   type ClusterSummary,
   type LogsResponse,
   type NodeDescriptor,
@@ -28,18 +30,20 @@ import {
   Grid,
   Group,
   Loader,
+  Modal,
   ScrollArea,
   Stack,
   Table,
   Text
 } from "@mantine/core";
 import { JsonBlock, StatCard } from "@ironmesh/ui";
+import { useDisclosure } from "@mantine/hooks";
 import { useCallback, useEffect, useState } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
 export function DashboardPage() {
-  const { adminTokenOverride, sessionStatus } = useAdminAccess();
+  const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
   const [clusterSummary, setClusterSummary] = useState<ClusterSummary | null>(null);
   const [nodes, setNodes] = useState<NodeDescriptor[]>([]);
   const [replicationPlan, setReplicationPlan] = useState<ReplicationPlan | null>(null);
@@ -52,8 +56,15 @@ export function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [repairResult, setRepairResult] = useState<Record<string, unknown> | null>(null);
   const [repairPending, setRepairPending] = useState(false);
-  const canInspectRendezvous =
+  const [mediaCacheClearResult, setMediaCacheClearResult] =
+    useState<AdminMediaCacheClearResponse | null>(null);
+  const [mediaCacheClearPending, setMediaCacheClearPending] = useState(false);
+  const [clearMediaCacheOpened, clearMediaCacheDisclosure] = useDisclosure(false);
+  const hasExplicitAdminAccess =
     Boolean(adminTokenOverride.trim()) || Boolean(sessionStatus?.authenticated);
+  const canRunAdminMaintenance =
+    !sessionLoading && (!sessionStatus?.login_required || hasExplicitAdminAccess);
+  const canInspectRendezvous = canRunAdminMaintenance;
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -106,6 +117,21 @@ export function DashboardPage() {
       setError(repairError instanceof Error ? repairError.message : String(repairError));
     } finally {
       setRepairPending(false);
+    }
+  }
+
+  async function confirmMediaCacheClear() {
+    setMediaCacheClearPending(true);
+    setError(null);
+    try {
+      const payload = await clearAdminMediaCache(adminTokenOverride);
+      setMediaCacheClearResult(payload);
+      clearMediaCacheDisclosure.close();
+      await refresh();
+    } catch (clearError) {
+      setError(clearError instanceof Error ? clearError.message : String(clearError));
+    } finally {
+      setMediaCacheClearPending(false);
     }
   }
 
@@ -517,6 +543,47 @@ export function DashboardPage() {
           <Stack gap="lg">
             <Card withBorder radius="md" padding="lg">
               <Stack gap="sm">
+                <Group justify="space-between" align="flex-start">
+                  <Stack gap={4}>
+                    <Text fw={700}>Media cache maintenance</Text>
+                    <Text size="sm" c="dimmed">
+                      Clears generated thumbnails and cached media metadata so they rebuild from source objects on the
+                      next access.
+                    </Text>
+                  </Stack>
+                  <Button
+                    size="sm"
+                    color="red"
+                    variant="light"
+                    disabled={!canRunAdminMaintenance}
+                    loading={mediaCacheClearPending}
+                    onClick={clearMediaCacheDisclosure.open}
+                  >
+                    Clear media cache
+                  </Button>
+                </Group>
+                {mediaCacheClearResult ? (
+                  <Alert color="teal" variant="light" title="Media cache cleared">
+                    Cleared {mediaCacheClearResult.deleted_metadata_records} metadata records and{" "}
+                    {mediaCacheClearResult.deleted_thumbnail_files} generated thumbnails (
+                    {formatBytes(mediaCacheClearResult.deleted_thumbnail_bytes)}) at{" "}
+                    {formatUnixTs(mediaCacheClearResult.cleared_at_unix)}.
+                  </Alert>
+                ) : null}
+                {!canRunAdminMaintenance ? (
+                  <Text size="sm" c="dimmed">
+                    Sign in or provide an admin token override to run destructive maintenance actions from this page.
+                  </Text>
+                ) : (
+                  <Text size="sm" c="dimmed">
+                    Existing object data is untouched. The next gallery or index read will repopulate media metadata as
+                    needed.
+                  </Text>
+                )}
+              </Stack>
+            </Card>
+            <Card withBorder radius="md" padding="lg">
+              <Stack gap="sm">
                 <Group justify="space-between">
                   <Text fw={700}>Replication plan</Text>
                   <Badge variant="light">
@@ -543,6 +610,31 @@ export function DashboardPage() {
           </Stack>
         </Grid.Col>
       </Grid>
+      <Modal
+        opened={clearMediaCacheOpened}
+        onClose={clearMediaCacheDisclosure.close}
+        title="Clear media cache"
+        centered
+      >
+        <Stack gap="md">
+          <Text c="dimmed">
+            This removes generated thumbnails and cached multimedia metadata from this node only. The source files stay
+            intact, and thumbnails regenerate lazily the next time they are requested.
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={clearMediaCacheDisclosure.close}>
+              Cancel
+            </Button>
+            <Button
+              color="red"
+              onClick={() => void confirmMediaCacheClear()}
+              loading={mediaCacheClearPending}
+            >
+              Clear cache
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </Stack>
   );
 }

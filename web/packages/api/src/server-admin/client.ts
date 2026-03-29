@@ -1,5 +1,6 @@
 import { fetchJson } from "../shared/http";
 import type {
+  AdminMediaCacheClearResponse,
   AdminSnapshotSummary,
   AdminStoreListResponse,
   AdminSessionStatus,
@@ -132,6 +133,15 @@ export async function triggerReplicationRepair(): Promise<Record<string, unknown
     method: "POST",
     credentials: "same-origin",
     cache: "no-store"
+  });
+}
+
+export async function clearAdminMediaCache(
+  adminTokenOverride?: string
+): Promise<AdminMediaCacheClearResponse> {
+  return fetchAdminJson<AdminMediaCacheClearResponse>("/auth/media/cache/clear?approve=true", {
+    method: "POST",
+    adminTokenOverride
   });
 }
 

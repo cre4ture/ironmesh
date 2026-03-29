@@ -102,6 +102,13 @@ export type StorageStatsCurrentResponse = {
   last_error?: string | null;
 };
 
+export type AdminMediaCacheClearResponse = {
+  deleted_metadata_records: number;
+  deleted_thumbnail_files: number;
+  deleted_thumbnail_bytes: number;
+  cleared_at_unix: number;
+};
+
 export type SetupStatus = {
   state: "uninitialized" | "pending_join" | "online";
   data_dir: string;
