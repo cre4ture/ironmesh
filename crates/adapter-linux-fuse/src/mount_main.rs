@@ -12,6 +12,7 @@ use client_sdk::{
     RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
+use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use server_node_sdk::LocalNodeHandle;
 use std::fs;
 use std::path::PathBuf;
@@ -449,6 +450,33 @@ impl Hydrator for ServerNodeIo {
                 &self.download_stage_root,
             )
             .with_context(|| format!("failed to fetch object for path {path}"))?;
+        Ok(payload)
+    }
+
+    fn hydrate_range(
+        &self,
+        path: &str,
+        _remote_version: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        let mut payload = Vec::new();
+        let mut on_progress = |_progress: DownloadProgress| {};
+        let should_cancel = || false;
+        self.sdk
+            .download_range_to_writer_with_progress_blocking(
+                DownloadRangeRequest {
+                    key: path,
+                    snapshot: None,
+                    version: None,
+                    start: offset,
+                    length,
+                },
+                &mut payload,
+                &mut on_progress,
+                &should_cancel,
+            )
+            .with_context(|| format!("failed to fetch ranged object for path {path}"))?;
         Ok(payload)
     }
 }

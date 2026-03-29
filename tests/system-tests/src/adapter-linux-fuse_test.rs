@@ -1292,6 +1292,63 @@ mod tests {
         result
     }
 
+    async fn run_zero_byte_create_persistence_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let mountpoint = fresh_data_dir("linux-fuse-zero-byte-persistence");
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
+
+        let result = async {
+            sdk.put_large_aware("seed-zero-byte.txt", Bytes::from_static(b"seed"))
+                .await?;
+
+            let mut adapter = start_linux_fuse_adapter(&fixture.connection, &mountpoint).await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-zero-byte.txt");
+                wait_for_file(&seed_path, 120).await?;
+
+                let created_empty = mountpoint.join("created-empty.txt");
+                fs::File::create(&created_empty).with_context(|| {
+                    format!("failed to create mounted file {}", created_empty.display())
+                })?;
+                wait_for_object_bytes(&sdk, "created-empty.txt", b"", 180).await?;
+
+                let truncated_empty = mountpoint.join("truncated-empty.txt");
+                fs::write(&truncated_empty, b"truncate-me").with_context(|| {
+                    format!("failed to seed mounted file {}", truncated_empty.display())
+                })?;
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&truncated_empty)
+                    .with_context(|| {
+                        format!(
+                            "failed to truncate mounted file {}",
+                            truncated_empty.display()
+                        )
+                    })?;
+                drop(file);
+                wait_for_object_bytes(&sdk, "truncated-empty.txt", b"", 180).await?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
     async fn run_local_rename_move_case(bind: &str) -> Result<()> {
         let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
@@ -1803,6 +1860,11 @@ mod tests {
     #[tokio::test]
     async fn linux_fuse_reports_remote_file_sizes_to_ls() -> Result<()> {
         run_remote_file_size_reporting_case("127.0.0.1:19370").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_zero_byte_creates_and_truncate_persist_remotely() -> Result<()> {
+        run_zero_byte_create_persistence_case("127.0.0.1:19375").await
     }
 
     #[tokio::test]

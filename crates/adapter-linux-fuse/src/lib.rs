@@ -122,7 +122,7 @@ pub mod runtime {
         FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
         ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
     };
-    use libc::{EACCES, EBADF, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
+    use libc::{EACCES, EBADF, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM};
     use std::collections::{BTreeMap, HashMap};
     use std::ffi::OsStr;
     use std::io::Cursor;
@@ -166,6 +166,25 @@ pub mod runtime {
 
     pub trait Hydrator: Send + Sync + 'static {
         fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>>;
+
+        fn hydrate_range(
+            &self,
+            path: &str,
+            remote_version: &str,
+            offset: u64,
+            length: u64,
+        ) -> Result<Vec<u8>> {
+            if length == 0 {
+                return Ok(Vec::new());
+            }
+
+            let payload = self.hydrate(path, remote_version)?;
+            let start = offset.min(payload.len() as u64) as usize;
+            let end = offset
+                .saturating_add(length)
+                .min(payload.len() as u64) as usize;
+            Ok(payload[start..end].to_vec())
+        }
     }
 
     pub trait Uploader: Send + Sync + 'static {
@@ -798,6 +817,47 @@ pub mod runtime {
             Ok(())
         }
 
+        fn read_file_data(&mut self, inode: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
+            let (path, version) = {
+                let node = self
+                    .nodes
+                    .get(&inode)
+                    .ok_or_else(|| anyhow!("inode not found"))?;
+                if node.kind != FileType::RegularFile {
+                    return Err(anyhow!("inode {inode} is not a regular file"));
+                }
+
+                (
+                    self.resolve_full_path(inode),
+                    node.placeholder_version.clone(),
+                )
+            };
+
+            if size == 0 {
+                return Ok(Vec::new());
+            }
+
+            if let Some(version) = version {
+                return self.hydrator.hydrate_range(
+                    &path,
+                    &version,
+                    offset.max(0) as u64,
+                    size as u64,
+                );
+            }
+
+            let node = self
+                .nodes
+                .get(&inode)
+                .ok_or_else(|| anyhow!("inode disappeared during read"))?;
+            let start = offset.max(0) as usize;
+            if start >= node.data.len() {
+                return Ok(Vec::new());
+            }
+            let end = (start + size as usize).min(node.data.len());
+            Ok(node.data[start..end].to_vec())
+        }
+
         fn truncate_if_needed(&mut self, inode: u64, size: u64) -> Result<bool> {
             let node = self
                 .nodes
@@ -897,6 +957,123 @@ pub mod runtime {
             Ok(())
         }
 
+        fn delete_remote_path_for_inode(&self, inode: u64) -> Result<()> {
+            let node = self
+                .nodes
+                .get(&inode)
+                .ok_or_else(|| anyhow!("inode not found"))?;
+            let path = self.resolve_full_path(inode);
+            match node.kind {
+                FileType::RegularFile => self
+                    .uploader
+                    .delete_path(&path)
+                    .with_context(|| format!("failed to delete remote file {path}")),
+                FileType::Directory => {
+                    let marker_path = format!("{}/", path.trim_end_matches('/'));
+                    self.uploader
+                        .delete_path(&marker_path)
+                        .with_context(|| {
+                            format!("failed to delete remote directory marker {marker_path}")
+                        })
+                }
+                _ => Err(anyhow!("unsupported inode type for remote delete")),
+            }
+        }
+
+        fn rename_entry(
+            &mut self,
+            parent: u64,
+            name: &str,
+            newparent: u64,
+            newname: &str,
+            flags: u32,
+        ) -> Result<()> {
+            if flags != 0 {
+                return Err(anyhow!("rename flags not supported"));
+            }
+
+            let Some(old_parent_node) = self.nodes.get(&parent) else {
+                return Err(anyhow!("source parent inode missing"));
+            };
+            if old_parent_node.kind != FileType::Directory {
+                return Err(anyhow!("source parent inode is not a directory"));
+            }
+
+            let Some(new_parent_node) = self.nodes.get(&newparent) else {
+                return Err(anyhow!("destination parent inode missing"));
+            };
+            if new_parent_node.kind != FileType::Directory {
+                return Err(anyhow!("destination parent inode is not a directory"));
+            }
+
+            let Some(inode) = old_parent_node.children.get(name).copied() else {
+                return Err(anyhow!("rename source not found"));
+            };
+
+            if parent == newparent && name == newname {
+                return Ok(());
+            }
+
+            let Some(source_node) = self.nodes.get(&inode).cloned() else {
+                return Err(anyhow!("source inode missing"));
+            };
+
+            let dest_inode = new_parent_node.children.get(newname).copied();
+            if let Some(dest_inode) = dest_inode {
+                if dest_inode == inode {
+                    return Ok(());
+                }
+
+                let Some(dest_node) = self.nodes.get(&dest_inode).cloned() else {
+                    return Err(anyhow!("destination inode missing"));
+                };
+
+                match (source_node.kind, dest_node.kind) {
+                    (FileType::RegularFile, FileType::RegularFile) => {}
+                    (FileType::Directory, FileType::Directory) => {
+                        if !dest_node.children.is_empty() {
+                            return Err(anyhow!("destination directory is not empty"));
+                        }
+                    }
+                    (FileType::RegularFile, FileType::Directory) => {
+                        return Err(anyhow!("cannot replace a directory with a file"));
+                    }
+                    (FileType::Directory, FileType::RegularFile) => {
+                        return Err(anyhow!("cannot replace a file with a directory"));
+                    }
+                    _ => return Err(anyhow!("unsupported inode type for rename")),
+                }
+            }
+
+            let old_parent_path = self.resolve_full_path(parent);
+            let new_parent_path = self.resolve_full_path(newparent);
+            let old_full_path = Self::child_path(&old_parent_path, name);
+            let new_full_path = Self::child_path(&new_parent_path, newname);
+
+            if let Some(dest_inode) = dest_inode {
+                self.delete_remote_path_for_inode(dest_inode)?;
+            }
+
+            let remote_result = match source_node.kind {
+                FileType::RegularFile => self.remote_rename_file(&old_full_path, &new_full_path),
+                FileType::Directory => {
+                    self.remote_rename_directory_subtree(inode, &old_full_path, &new_full_path)
+                }
+                _ => Err(anyhow!("unsupported inode type for rename")),
+            };
+            remote_result?;
+
+            if let Some(dest_inode) = dest_inode {
+                if let Some(parent_node) = self.nodes.get_mut(&newparent) {
+                    parent_node.children.remove(newname);
+                }
+                self.remove_inode_recursive(dest_inode);
+            }
+
+            self.apply_local_rename(parent, name, newparent, newname, inode)?;
+            Ok(())
+        }
+
         fn resolve_full_path(&self, inode: u64) -> String {
             if inode == ROOT_INODE {
                 return String::new();
@@ -990,6 +1167,69 @@ pub mod runtime {
             }
 
             reply.ok();
+        }
+
+        fn mknod(
+            &mut self,
+            _req: &Request<'_>,
+            parent: u64,
+            name: &OsStr,
+            mode: u32,
+            _umask: u32,
+            _rdev: u32,
+            reply: ReplyEntry,
+        ) {
+            self.drain_remote_updates();
+
+            let Some(parent_node) = self.nodes.get(&parent) else {
+                reply.error(ENOENT);
+                return;
+            };
+            if parent_node.kind != FileType::Directory {
+                reply.error(ENOTDIR);
+                return;
+            }
+
+            let Some(name) = name.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+            if name.is_empty() || name.contains('/') {
+                reply.error(EINVAL);
+                return;
+            }
+            if parent_node.children.contains_key(name) {
+                reply.error(EEXIST);
+                return;
+            }
+
+            if (mode & libc::S_IFMT) != libc::S_IFREG {
+                reply.error(EPERM);
+                return;
+            }
+
+            let inode = self.next_inode();
+            self.nodes
+                .insert(inode, FsNode::regular_file(inode, name.to_string(), parent));
+
+            if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                parent_node.children.insert(name.to_string(), inode);
+            }
+
+            if let Err(_error) = self.upload_inode(inode) {
+                if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                    parent_node.children.remove(name);
+                }
+                self.remove_inode_recursive(inode);
+                reply.error(EIO);
+                return;
+            }
+
+            let Some(created) = self.nodes.get(&inode) else {
+                reply.error(EIO);
+                return;
+            };
+            reply.entry(&TTL, &created.attr(self.uid, self.gid), 0);
         }
 
         fn mkdir(
@@ -1168,11 +1408,6 @@ pub mod runtime {
         ) {
             self.drain_remote_updates();
 
-            if flags != 0 {
-                reply.error(EINVAL);
-                return;
-            }
-
             let Some(old_name) = name.to_str() else {
                 reply.error(EINVAL);
                 return;
@@ -1218,19 +1453,44 @@ pub mod runtime {
                 return;
             }
 
+            let Some(node) = self.nodes.get(&inode) else {
+                reply.error(ENOENT);
+                return;
+            };
+
             if let Some(existing_inode) = new_parent_node.children.get(new_name).copied() {
                 if existing_inode == inode {
                     reply.ok();
                     return;
                 }
-                reply.error(EEXIST);
-                return;
-            }
 
-            let Some(node) = self.nodes.get(&inode) else {
-                reply.error(ENOENT);
-                return;
-            };
+                let Some(existing_node) = self.nodes.get(&existing_inode) else {
+                    reply.error(ENOENT);
+                    return;
+                };
+
+                match (node.kind, existing_node.kind) {
+                    (FileType::RegularFile, FileType::RegularFile) => {}
+                    (FileType::Directory, FileType::Directory) => {
+                        if !existing_node.children.is_empty() {
+                            reply.error(ENOTEMPTY);
+                            return;
+                        }
+                    }
+                    (FileType::RegularFile, FileType::Directory) => {
+                        reply.error(EISDIR);
+                        return;
+                    }
+                    (FileType::Directory, FileType::RegularFile) => {
+                        reply.error(ENOTDIR);
+                        return;
+                    }
+                    _ => {
+                        reply.error(EIO);
+                        return;
+                    }
+                }
+            }
 
             if node.kind == FileType::Directory {
                 let mut current = newparent;
@@ -1247,28 +1507,7 @@ pub mod runtime {
                 }
             }
 
-            let old_parent_path = self.resolve_full_path(parent);
-            let new_parent_path = self.resolve_full_path(newparent);
-            let old_full_path = Self::child_path(&old_parent_path, old_name);
-            let new_full_path = Self::child_path(&new_parent_path, new_name);
-
-            let remote_result = match node.kind {
-                FileType::RegularFile => self.remote_rename_file(&old_full_path, &new_full_path),
-                FileType::Directory => {
-                    self.remote_rename_directory_subtree(inode, &old_full_path, &new_full_path)
-                }
-                _ => Err(anyhow!("unsupported inode type for rename")),
-            };
-
-            if remote_result.is_err() {
-                reply.error(EIO);
-                return;
-            }
-
-            if self
-                .apply_local_rename(parent, old_name, newparent, new_name, inode)
-                .is_err()
-            {
+            if let Err(_error) = self.rename_entry(parent, old_name, newparent, new_name, flags) {
                 reply.error(EIO);
                 return;
             }
@@ -1292,6 +1531,10 @@ pub mod runtime {
             let write_access = Self::write_requested(flags);
             if write_access && (flags & libc::O_TRUNC) != 0 {
                 if let Err(_error) = self.truncate_if_needed(ino, 0) {
+                    reply.error(EIO);
+                    return;
+                }
+                if let Err(_error) = self.upload_inode(ino) {
                     reply.error(EIO);
                     return;
                 }
@@ -1348,7 +1591,16 @@ pub mod runtime {
                 parent_node.children.insert(name.to_string(), inode);
             }
 
-            let fh = self.alloc_open_handle(inode, Self::write_requested(flags));
+            let write_access = Self::write_requested(flags);
+            let fh = self.alloc_open_handle(inode, write_access);
+            if let Err(_error) = self.upload_inode(inode) {
+                if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                    parent_node.children.remove(name);
+                }
+                self.remove_inode_recursive(inode);
+                reply.error(EIO);
+                return;
+            }
             let Some(created) = self.nodes.get(&inode) else {
                 reply.error(EIO);
                 return;
@@ -1375,29 +1627,10 @@ pub mod runtime {
         ) {
             self.drain_remote_updates();
 
-            if let Err(_error) = self.hydrate_if_needed(ino) {
-                reply.error(EIO);
-                return;
+            match self.read_file_data(ino, offset, size) {
+                Ok(data) => reply.data(&data),
+                Err(_error) => reply.error(EIO),
             }
-
-            let Some(node) = self.nodes.get(&ino) else {
-                reply.error(ENOENT);
-                return;
-            };
-
-            if node.kind != FileType::RegularFile {
-                reply.error(ENOENT);
-                return;
-            }
-
-            let data = &node.data;
-            let start = offset.max(0) as usize;
-            if start >= data.len() {
-                reply.data(&[]);
-                return;
-            }
-            let end = (start + size as usize).min(data.len());
-            reply.data(&data[start..end]);
         }
 
         fn write(
@@ -1507,6 +1740,14 @@ pub mod runtime {
                         return;
                     }
                 };
+
+                if changed
+                    && size == 0
+                    && let Err(_error) = self.upload_inode(ino)
+                {
+                    reply.error(EIO);
+                    return;
+                }
 
                 if changed
                     && let Some(fh) = fh
@@ -1625,6 +1866,103 @@ pub mod runtime {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::io::Read;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Clone, Default)]
+        struct RecordingHydrator {
+            full_calls: Arc<Mutex<Vec<String>>>,
+            range_calls: Arc<Mutex<Vec<(String, u64, u64)>>>,
+        }
+
+        impl Hydrator for RecordingHydrator {
+            fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>> {
+                self.full_calls
+                    .lock()
+                    .expect("full hydrate call log lock poisoned")
+                    .push(format!("{path}:{remote_version}"));
+                Ok(format!("full:{path}:{remote_version}").into_bytes())
+            }
+
+            fn hydrate_range(
+                &self,
+                path: &str,
+                remote_version: &str,
+                offset: u64,
+                length: u64,
+            ) -> Result<Vec<u8>> {
+                self.range_calls
+                    .lock()
+                    .expect("range hydrate call log lock poisoned")
+                    .push((format!("{path}:{remote_version}"), offset, length));
+                Ok(format!("range:{path}:{remote_version}:{offset}:{length}").into_bytes())
+            }
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum RecordingUploadOp {
+            Upload {
+                path: String,
+                length: u64,
+                bytes: Vec<u8>,
+            },
+            Rename {
+                from: String,
+                to: String,
+                overwrite: bool,
+            },
+            Delete {
+                path: String,
+            },
+        }
+
+        #[derive(Debug, Clone, Default)]
+        struct RecordingUploader {
+            ops: Arc<Mutex<Vec<RecordingUploadOp>>>,
+        }
+
+        impl Uploader for RecordingUploader {
+            fn upload_reader(
+                &self,
+                path: &str,
+                reader: &mut dyn Read,
+                length: u64,
+            ) -> Result<Option<String>> {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes)?;
+                self.ops
+                    .lock()
+                    .expect("upload op log lock poisoned")
+                    .push(RecordingUploadOp::Upload {
+                        path: path.to_string(),
+                        length,
+                        bytes,
+                    });
+                Ok(Some("recorded".to_string()))
+            }
+
+            fn rename_path(&self, from_path: &str, to_path: &str, overwrite: bool) -> Result<()> {
+                self.ops
+                    .lock()
+                    .expect("upload op log lock poisoned")
+                    .push(RecordingUploadOp::Rename {
+                        from: from_path.to_string(),
+                        to: to_path.to_string(),
+                        overwrite,
+                    });
+                Ok(())
+            }
+
+            fn delete_path(&self, path: &str) -> Result<()> {
+                self.ops
+                    .lock()
+                    .expect("upload op log lock poisoned")
+                    .push(RecordingUploadOp::Delete {
+                        path: path.to_string(),
+                    });
+                Ok(())
+            }
+        }
 
         #[test]
         fn placeholder_files_keep_remote_size_metadata() {
@@ -1650,6 +1988,261 @@ pub mod runtime {
                 .expect("placeholder file missing");
             assert_eq!(report.size, 4096);
             assert_eq!(report.placeholder_version.as_deref(), Some("v1"));
+        }
+
+        #[test]
+        fn placeholder_reads_use_ranged_hydration_and_preserve_placeholder_state() {
+            let plan = FuseActionPlan {
+                actions: vec![FuseAction::EnsurePlaceholder {
+                    path: "docs/photo.jpg".to_string(),
+                    remote_version: "v1".to_string(),
+                    remote_size: Some(4096),
+                }],
+            };
+            let hydrator = RecordingHydrator::default();
+            let uploader = RecordingUploader::default();
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &plan,
+                Box::new(hydrator.clone()),
+                Box::new(uploader),
+                None,
+            );
+            let photo_inode = fs
+                .nodes
+                .values()
+                .find(|node| node.name == "photo.jpg")
+                .expect("placeholder file missing")
+                .inode;
+
+            let bytes = fs.read_file_data(photo_inode, 9, 12).expect("range read should work");
+            assert_eq!(bytes, b"range:docs/photo.jpg:v1:9:12");
+
+            assert_eq!(
+                hydrator
+                    .range_calls
+                    .lock()
+                    .expect("range hydrate call log lock poisoned")
+                    .as_slice(),
+                &[(String::from("docs/photo.jpg:v1"), 9, 12)]
+            );
+            assert!(
+                hydrator
+                    .full_calls
+                    .lock()
+                    .expect("full hydrate call log lock poisoned")
+                    .is_empty()
+            );
+            assert_eq!(
+                fs.nodes
+                    .get(&photo_inode)
+                    .and_then(|node| node.placeholder_version.as_deref()),
+                Some("v1")
+            );
+            assert_eq!(fs.nodes.get(&photo_inode).map(|node| node.size), Some(4096));
+        }
+
+        #[test]
+        fn dirty_zero_byte_handles_flush_empty_uploads() {
+            let hydrator = RecordingHydrator::default();
+            let uploader = RecordingUploader::default();
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(hydrator),
+                Box::new(uploader.clone()),
+                None,
+            );
+
+            let inode = fs.next_inode();
+            fs.nodes.insert(
+                inode,
+                FsNode::regular_file(inode, "empty.txt".to_string(), ROOT_INODE),
+            );
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("empty.txt".to_string(), inode);
+
+            let fh = fs.alloc_open_handle(inode, true);
+            fs.open_handles
+                .get_mut(&fh)
+                .expect("handle should exist")
+                .dirty = true;
+            fs.flush_handle(inode, fh).expect("flush should succeed");
+
+            assert_eq!(
+                uploader
+                    .ops
+                    .lock()
+                    .expect("upload op log lock poisoned")
+                    .as_slice(),
+                &[RecordingUploadOp::Upload {
+                    path: "empty.txt".to_string(),
+                    length: 0,
+                    bytes: Vec::new(),
+                }]
+            );
+        }
+
+        #[test]
+        fn rename_overwrites_replaceable_file_targets() {
+            let hydrator = RecordingHydrator::default();
+            let uploader = RecordingUploader::default();
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(hydrator),
+                Box::new(uploader.clone()),
+                None,
+            );
+
+            let source_inode = fs.next_inode();
+            let mut source = FsNode::regular_file(source_inode, "from.txt".to_string(), ROOT_INODE);
+            source.data = b"source".to_vec();
+            source.size = source.data.len() as u64;
+            fs.nodes.insert(source_inode, source);
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("from.txt".to_string(), source_inode);
+
+            let target_inode = fs.next_inode();
+            let mut target = FsNode::regular_file(target_inode, "to.txt".to_string(), ROOT_INODE);
+            target.data = b"target".to_vec();
+            target.size = target.data.len() as u64;
+            fs.nodes.insert(target_inode, target);
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("to.txt".to_string(), target_inode);
+
+            fs.rename_entry(ROOT_INODE, "from.txt", ROOT_INODE, "to.txt", 0)
+                .expect("rename should overwrite replaceable target");
+
+            assert_eq!(
+                fs.nodes
+                    .get(&ROOT_INODE)
+                    .expect("root inode missing")
+                    .children
+                    .get("to.txt")
+                    .copied(),
+                Some(source_inode)
+            );
+            assert!(!fs.nodes.contains_key(&target_inode));
+            assert_eq!(
+                fs.nodes.get(&source_inode).map(|node| node.name.as_str()),
+                Some("to.txt")
+            );
+            assert_eq!(
+                uploader
+                    .ops
+                    .lock()
+                    .expect("upload op log lock poisoned")
+                    .as_slice(),
+                &[
+                    RecordingUploadOp::Delete {
+                        path: "to.txt".to_string(),
+                    },
+                    RecordingUploadOp::Rename {
+                        from: "from.txt".to_string(),
+                        to: "to.txt".to_string(),
+                        overwrite: false,
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn rename_overwrites_replaceable_empty_directory_targets() {
+            let hydrator = RecordingHydrator::default();
+            let uploader = RecordingUploader::default();
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(hydrator),
+                Box::new(uploader.clone()),
+                None,
+            );
+
+            let source_dir_inode = fs.next_inode();
+            fs.nodes.insert(
+                source_dir_inode,
+                FsNode::directory(source_dir_inode, "from".to_string(), ROOT_INODE),
+            );
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("from".to_string(), source_dir_inode);
+
+            let child_inode = fs.next_inode();
+            let mut child = FsNode::regular_file(child_inode, "child.txt".to_string(), source_dir_inode);
+            child.data = b"payload".to_vec();
+            child.size = child.data.len() as u64;
+            fs.nodes.insert(child_inode, child);
+            fs.nodes
+                .get_mut(&source_dir_inode)
+                .expect("source directory missing")
+                .children
+                .insert("child.txt".to_string(), child_inode);
+
+            let target_dir_inode = fs.next_inode();
+            fs.nodes.insert(
+                target_dir_inode,
+                FsNode::directory(target_dir_inode, "to".to_string(), ROOT_INODE),
+            );
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("to".to_string(), target_dir_inode);
+
+            fs.rename_entry(ROOT_INODE, "from", ROOT_INODE, "to", 0)
+                .expect("rename should overwrite replaceable directory target");
+
+            assert_eq!(
+                fs.nodes
+                    .get(&ROOT_INODE)
+                    .expect("root inode missing")
+                    .children
+                    .get("to")
+                    .copied(),
+                Some(source_dir_inode)
+            );
+            assert!(!fs.nodes.contains_key(&target_dir_inode));
+            assert_eq!(
+                fs.nodes.get(&source_dir_inode).map(|node| node.name.as_str()),
+                Some("to")
+            );
+            assert_eq!(
+                fs.nodes.get(&child_inode).map(|node| node.parent_inode),
+                Some(source_dir_inode)
+            );
+            assert_eq!(
+                uploader
+                    .ops
+                    .lock()
+                    .expect("upload op log lock poisoned")
+                    .as_slice(),
+                &[
+                    RecordingUploadOp::Delete {
+                        path: "to/".to_string(),
+                    },
+                    RecordingUploadOp::Rename {
+                        from: "from/child.txt".to_string(),
+                        to: "to/child.txt".to_string(),
+                        overwrite: false,
+                    },
+                    RecordingUploadOp::Upload {
+                        path: "to/".to_string(),
+                        length: 0,
+                        bytes: Vec::new(),
+                    },
+                    RecordingUploadOp::Delete {
+                        path: "from/".to_string(),
+                    },
+                ]
+            );
         }
 
         #[test]
