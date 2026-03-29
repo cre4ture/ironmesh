@@ -380,7 +380,8 @@ class MainViewModel(
         uiState.value = uiState.value.copy(
             loading = true,
             selectedSection = MainSection.WEB_UI,
-            status = "Starting embedded Web UI...",
+            webUiUrl = "",
+            status = "Starting Web UI...",
         )
         viewModelScope.launch {
             runCatching {

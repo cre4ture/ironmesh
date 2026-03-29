@@ -14,10 +14,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 
 class WebUiActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        hideStatusBar()
 
         val url = intent.getStringExtra(EXTRA_WEB_UI_URL).orEmpty()
         if (url.isBlank()) {
@@ -41,6 +44,13 @@ class WebUiActivity : ComponentActivity() {
         }
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            hideStatusBar()
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun WebView.configure(url: String) {
         settings.javaScriptEnabled = true
@@ -50,6 +60,14 @@ class WebUiActivity : ComponentActivity() {
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         webViewClient = WebViewClient()
         loadUrl(url)
+    }
+
+    private fun hideStatusBar() {
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.statusBars())
+        }
     }
 
     companion object {

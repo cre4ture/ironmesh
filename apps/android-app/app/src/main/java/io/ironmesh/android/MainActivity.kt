@@ -13,9 +13,6 @@ import android.os.Bundle
 import android.provider.DocumentsContract
 import android.util.Log
 import android.util.Size
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.ManagedActivityResultLauncher
@@ -88,7 +85,6 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -121,6 +117,18 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val vm: MainViewModel = viewModel()
                     val state by vm.uiState
+                    var openWebUiWhenReady by rememberSaveable { mutableStateOf(false) }
+
+                    LaunchedEffect(openWebUiWhenReady, state.loading, state.webUiUrl) {
+                        if (!openWebUiWhenReady || state.loading) {
+                            return@LaunchedEffect
+                        }
+
+                        if (state.webUiUrl.isNotBlank()) {
+                            startActivity(WebUiActivity.intent(this@MainActivity, state.webUiUrl))
+                        }
+                        openWebUiWhenReady = false
+                    }
 
                     Column(
                         modifier = Modifier
@@ -162,7 +170,17 @@ class MainActivity : ComponentActivity() {
                                 )
                                 MainSection.WEB_UI -> WebUiSection(
                                     state = state,
-                                    vm = vm,
+                                    onStartWebUi = {
+                                        openWebUiWhenReady = true
+                                        vm.startWebUi()
+                                    },
+                                    onRestartWebUi = {
+                                        openWebUiWhenReady = true
+                                        vm.startWebUi()
+                                    },
+                                    onOpenWebUi = { url ->
+                                        startActivity(WebUiActivity.intent(this@MainActivity, url))
+                                    },
                                 )
                                 MainSection.GALLERY -> GalleryView(
                                     state = state,
@@ -332,43 +350,76 @@ private fun SettingsView(
 @Composable
 private fun WebUiSection(
     state: MainUiState,
-    vm: MainViewModel,
+    onStartWebUi: () -> Unit,
+    onRestartWebUi: () -> Unit,
+    onOpenWebUi: (String) -> Unit,
 ) {
     Column(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("Web UI", style = MaterialTheme.typography.titleMedium)
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = vm::startWebUi) {
-                Text(if (state.webUiUrl.isBlank()) "Start Web UI" else "Restart Web UI")
-            }
-        }
+        Text(
+            text = "The client Web UI opens in a dedicated fullscreen screen. Use Android back to return here.",
+        )
 
         if (state.webUiUrl.isBlank()) {
+            Button(onClick = onStartWebUi) {
+                Text("Open Fullscreen Web UI")
+            }
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 tonalElevation = 2.dp,
                 shape = RoundedCornerShape(18.dp),
             ) {
                 Text(
-                    text = "Start the embedded Web UI to load it in this view.",
+                    text = "This starts the local Web UI and opens it fullscreen as soon as it is ready.",
                     modifier = Modifier.padding(16.dp),
                 )
             }
         } else {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { onOpenWebUi(state.webUiUrl) }) {
+                    Text("Open Fullscreen Web UI")
+                }
+                OutlinedButton(onClick = onRestartWebUi) {
+                    Text("Restart Web UI")
+                }
+            }
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                tonalElevation = 2.dp,
+                shape = RoundedCornerShape(18.dp),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text("Web UI ready", style = MaterialTheme.typography.titleSmall)
+                    Text(state.webUiUrl, style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        text = "Open it fullscreen to use the full screen area. Android back closes the Web UI and returns to this shell.",
+                    )
+                }
+            }
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),
-                tonalElevation = 2.dp,
-                shape = RoundedCornerShape(18.dp),
+                tonalElevation = 0.dp,
+                color = Color.Transparent,
             ) {
-                EmbeddedWebUi(
-                    url = state.webUiUrl,
+                Box(
                     modifier = Modifier.fillMaxSize(),
-                )
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "Web UI is no longer embedded inside the native tab.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -1080,26 +1131,6 @@ private fun ProviderThumbnail(
     }
 }
 
-@Composable
-private fun EmbeddedWebUi(
-    url: String,
-    modifier: Modifier = Modifier,
-) {
-    AndroidView(
-        modifier = modifier,
-        factory = { context ->
-            WebView(context).apply {
-                configureForIronmesh(url)
-            }
-        },
-        update = { webView ->
-            if (webView.url != url) {
-                webView.loadUrl(url)
-            }
-        },
-    )
-}
-
 private fun galleryMetaText(item: GalleryImageItem): String? {
     val parts = mutableListOf<String>()
     if (item.width != null && item.height != null) {
@@ -1389,15 +1420,4 @@ private fun fittedImageSize(
         width = imageWidth * scale,
         height = imageHeight * scale,
     )
-}
-
-@SuppressLint("SetJavaScriptEnabled")
-private fun WebView.configureForIronmesh(url: String) {
-    settings.javaScriptEnabled = true
-    settings.domStorageEnabled = true
-    settings.allowFileAccess = false
-    settings.allowContentAccess = false
-    settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-    webViewClient = WebViewClient()
-    loadUrl(url)
 }

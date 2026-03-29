@@ -9,7 +9,7 @@ This is a standalone Kotlin Android app scaffold for local testing of `server-no
 - Replication plan summary (`GET /cluster/replication/plan`)
 - Upload/download via Rust `client-sdk` bridge when native library is available
 - Fallback HTTP/Retrofit path remains enabled if native bridge is not loaded
-- Open embedded Web UI in an in-app `WebView` from the native screen
+- Open the client Web UI in a dedicated fullscreen in-app `WebView`
 - Configure multiple folder-sync profiles (remote prefix <-> local folder)
 - Automatic periodic background folder sync (WorkManager) + manual "Sync Now"
 
