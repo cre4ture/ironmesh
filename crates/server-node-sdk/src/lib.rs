@@ -3510,6 +3510,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/media/thumbnail", get(get_media_thumbnail_admin))
+        .route("/auth/media/cache/clear", post(clear_media_cache_admin))
         .route("/auth/store/{key}", get(get_object_admin))
         .route(
             "/auth/rendezvous-config",
@@ -7542,6 +7543,74 @@ async fn get_media_thumbnail_admin(
     get_media_thumbnail_response(&state, query).await
 }
 
+async fn clear_media_cache_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ApprovalQuery>,
+) -> impl IntoResponse {
+    let approve = query.approve.unwrap_or(false);
+    let action = "auth/media/cache/clear";
+    let request_details = json!({ "approve": approve });
+    let request = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        false,
+        approve,
+        request_details.clone(),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    let result = {
+        let store = lock_store(&state, "maintenance.media_cache_clear").await;
+        store.clear_media_cache().await
+    };
+
+    match result {
+        Ok(report) => {
+            refresh_storage_stats_once(&state).await;
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                false,
+                approve,
+                "success",
+                json!({
+                    "deleted_metadata_records": report.deleted_metadata_records,
+                    "deleted_thumbnail_files": report.deleted_thumbnail_files,
+                    "deleted_thumbnail_bytes": report.deleted_thumbnail_bytes,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(report)).into_response()
+        }
+        Err(err) => {
+            append_admin_audit(
+                &state,
+                action,
+                &request,
+                true,
+                false,
+                approve,
+                "error",
+                json!({
+                    "approve": approve,
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
+            tracing::error!(error = %err, "media cache clear failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnailQuery) -> Response {
     let request_id = Uuid::new_v4();
     let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
@@ -7801,6 +7870,11 @@ struct OutboundNodeHeartbeatRequest {
 struct CleanupQuery {
     retention_secs: Option<u64>,
     dry_run: Option<bool>,
+    approve: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalQuery {
     approve: Option<bool>,
 }
 

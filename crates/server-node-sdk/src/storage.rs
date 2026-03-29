@@ -217,6 +217,14 @@ pub struct CleanupReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct MediaCacheClearReport {
+    pub deleted_metadata_records: usize,
+    pub deleted_thumbnail_files: usize,
+    pub deleted_thumbnail_bytes: u64,
+    pub cleared_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TombstoneCompactionReport {
     pub retention_secs: u64,
     pub dry_run: bool,
@@ -4245,6 +4253,32 @@ impl PersistentStore {
         })
     }
 
+    pub async fn clear_media_cache(&self) -> Result<MediaCacheClearReport> {
+        let mut fingerprints = self.list_media_cache_fingerprints().await?;
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
+
+        for content_fingerprint in &fingerprints {
+            self.metadata_store
+                .delete_media_cache_record(content_fingerprint)
+                .await?;
+        }
+
+        let (deleted_thumbnail_files, deleted_thumbnail_bytes) =
+            directory_file_stats(&self.media_thumbnails_dir).await?;
+        if fs::try_exists(&self.media_thumbnails_dir).await? {
+            fs::remove_dir_all(&self.media_thumbnails_dir).await?;
+        }
+        fs::create_dir_all(&self.media_thumbnails_dir).await?;
+
+        Ok(MediaCacheClearReport {
+            deleted_metadata_records: fingerprints.len(),
+            deleted_thumbnail_files,
+            deleted_thumbnail_bytes,
+            cleared_at_unix: unix_ts(),
+        })
+    }
+
     pub async fn compact_tombstone_indexes(
         &self,
         retention_secs: u64,
@@ -4867,15 +4901,20 @@ async fn file_size_bytes(path: &Path) -> Result<u64> {
 }
 
 async fn directory_size_bytes(root: &Path) -> Result<u64> {
+    Ok(directory_file_stats(root).await?.1)
+}
+
+async fn directory_file_stats(root: &Path) -> Result<(usize, u64)> {
     match fs::metadata(root).await {
-        Ok(metadata) if metadata.is_file() => return Ok(metadata.len()),
+        Ok(metadata) if metadata.is_file() => return Ok((1, metadata.len())),
         Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
         Err(err) => {
             return Err(err).with_context(|| format!("failed to stat {}", root.display()));
         }
     }
 
+    let mut files = 0usize;
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -4896,12 +4935,13 @@ async fn directory_size_bytes(root: &Path) -> Result<u64> {
             if metadata.is_dir() {
                 stack.push(path);
             } else if metadata.is_file() {
+                files += 1;
                 total = total.saturating_add(metadata.len());
             }
         }
     }
 
-    Ok(total)
+    Ok((files, total))
 }
 
 async fn persist_media_cache_record_with_payload(

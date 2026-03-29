@@ -1751,6 +1751,64 @@ run_on_all_metadata_backends!(
     ensure_media_cache_generates_thumbnail_for_mp4_turso
 );
 
+async fn clear_media_cache_removes_metadata_and_thumbnails_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-clear").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/portrait.jpg",
+            Bytes::from(sample_oriented_jpeg_bytes(6)),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let thumb = metadata.thumbnail.as_ref().expect("expected thumbnail");
+    let thumb_path = store.media_thumbnail_path(&metadata.content_fingerprint, &thumb.profile);
+    assert!(fs::try_exists(&thumb_path).await.unwrap());
+
+    let orphan_dir = root
+        .join("state")
+        .join("media_cache")
+        .join("thumbnails")
+        .join("orphan");
+    fs::create_dir_all(&orphan_dir).await.unwrap();
+    let orphan_path = orphan_dir.join("stale.jpg");
+    fs::write(&orphan_path, sample_video_thumbnail_bytes())
+        .await
+        .unwrap();
+
+    let report = store.clear_media_cache().await.unwrap();
+    assert_eq!(report.deleted_metadata_records, 1);
+    assert_eq!(report.deleted_thumbnail_files, 2);
+    assert!(report.deleted_thumbnail_bytes > 0);
+
+    let lookup = store
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lookup.metadata.is_none());
+    assert!(!fs::try_exists(&thumb_path).await.unwrap());
+    assert!(!fs::try_exists(&orphan_path).await.unwrap());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    clear_media_cache_removes_metadata_and_thumbnails_impl,
+    clear_media_cache_removes_metadata_and_thumbnails,
+    clear_media_cache_removes_metadata_and_thumbnails_turso
+);
+
 async fn ensure_media_cache_rebuilds_stale_schema_records_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("media-cache-schema-refresh").await;
 

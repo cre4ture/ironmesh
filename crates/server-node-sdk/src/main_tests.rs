@@ -4702,6 +4702,110 @@ run_on_main_metadata_backends!(
     get_media_thumbnail_admin_requires_auth_and_serves_image_turso
 );
 
+async fn clear_media_cache_admin_requires_auth_and_clears_cached_media_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let (manifest_hash, thumb_path) = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let put = locked
+            .put_object_versioned(
+                "gallery/cat.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let metadata = locked
+            .ensure_media_cache(&put.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let thumb = metadata.thumbnail.as_ref().expect("expected thumbnail");
+        let thumb_path = locked.media_thumbnail_path(&metadata.content_fingerprint, &thumb.profile);
+        (put.manifest_hash, thumb_path)
+    };
+
+    let orphan_dir = state
+        .data_dir
+        .join("state")
+        .join("media_cache")
+        .join("thumbnails")
+        .join("orphan");
+    std::fs::create_dir_all(&orphan_dir).unwrap();
+    let orphan_path = orphan_dir.join("stale.jpg");
+    std::fs::write(&orphan_path, sample_png_bytes()).unwrap();
+
+    let unauthorized = axum::response::IntoResponse::into_response(
+        super::clear_media_cache_admin(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Query(super::ApprovalQuery {
+                approve: Some(true),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let missing_approval = axum::response::IntoResponse::into_response(
+        super::clear_media_cache_admin(
+            axum::extract::State(state.clone()),
+            headers.clone(),
+            axum::extract::Query(super::ApprovalQuery {
+                approve: Some(false),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        missing_approval.status(),
+        axum::http::StatusCode::PRECONDITION_FAILED
+    );
+
+    let response = axum::response::IntoResponse::into_response(
+        super::clear_media_cache_admin(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::extract::Query(super::ApprovalQuery {
+                approve: Some(true),
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["deleted_metadata_records"], 1);
+    assert_eq!(payload["deleted_thumbnail_files"], 2);
+    assert!(payload["deleted_thumbnail_bytes"].as_u64().unwrap() > 0);
+
+    let lookup = {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert!(lookup.metadata.is_none());
+    assert!(!thumb_path.exists());
+    assert!(!orphan_path.exists());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    clear_media_cache_admin_requires_auth_and_clears_cached_media_impl,
+    clear_media_cache_admin_requires_auth_and_clears_cached_media,
+    clear_media_cache_admin_requires_auth_and_clears_cached_media_turso
+);
+
 async fn get_object_admin_returns_bytes_with_admin_token_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
