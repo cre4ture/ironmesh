@@ -188,6 +188,7 @@ fn install_fake_video_tools(dir: &std::path::Path) -> (PathBuf, PathBuf) {
 set -eu
 input=""
 for arg in "$@"; do
+  [ "$arg" != "-nostdin" ]
   input="$arg"
 done
 list="${input#concatf:}"

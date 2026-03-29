@@ -871,6 +871,7 @@ impl MediaCacheWorker {
             persist_ms,
             status = ?metadata.status,
             has_thumbnail = metadata.thumbnail.is_some(),
+            error = metadata.error.as_deref().unwrap_or(""),
             "media cache generation finished"
         );
         if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
@@ -882,6 +883,7 @@ impl MediaCacheWorker {
                 persist_ms,
                 status = ?metadata.status,
                 has_thumbnail = metadata.thumbnail.is_some(),
+                error = metadata.error.as_deref().unwrap_or(""),
                 "slow media cache generation"
             );
         }
@@ -5019,7 +5021,6 @@ async fn derive_video_media_cache(
         ffprobe
             .arg("-v")
             .arg("error")
-            .arg("-nostdin")
             .arg("-select_streams")
             .arg("v:0")
             .arg("-show_entries")
