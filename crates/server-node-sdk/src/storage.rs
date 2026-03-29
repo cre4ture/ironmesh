@@ -1058,10 +1058,7 @@ impl MediaCacheWorker {
                 );
             }
         };
-        let format = match image::guess_format(&sniff_bytes) {
-            Ok(format) => Some(format),
-            Err(_) => None,
-        };
+        let format = image::guess_format(&sniff_bytes).ok();
 
         if let Some(format) = format {
             if image_format_mime_type(format).is_none() {
@@ -1725,7 +1722,7 @@ impl PersistentStore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn set_media_tool_paths_for_test(
         &mut self,
         ffprobe: impl Into<PathBuf>,
@@ -5494,7 +5491,7 @@ fn parse_exif_offset(value: &str) -> Option<UtcOffset> {
     UtcOffset::from_hms(sign * hours, sign * minutes, 0).ok()
 }
 
-fn exif_ascii_string<'a>(field: Option<&'a exif::Field>) -> Option<&'a str> {
+fn exif_ascii_string(field: Option<&exif::Field>) -> Option<&str> {
     match &field?.value {
         Value::Ascii(values) => {
             let value = values.first()?;

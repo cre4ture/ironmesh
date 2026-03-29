@@ -87,6 +87,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -125,7 +126,7 @@ class MainActivity : ComponentActivity() {
                         }
 
                         if (state.webUiUrl.isNotBlank()) {
-                            startActivity(WebUiActivity.intent(this@MainActivity, state.webUiUrl))
+                            openWebUi(state.webUiUrl, vm::setStatus)
                         }
                         openWebUiWhenReady = false
                     }
@@ -179,7 +180,7 @@ class MainActivity : ComponentActivity() {
                                         vm.startWebUi()
                                     },
                                     onOpenWebUi = { url ->
-                                        startActivity(WebUiActivity.intent(this@MainActivity, url))
+                                        openWebUi(url, vm::setStatus)
                                     },
                                 )
                                 MainSection.GALLERY -> GalleryView(
@@ -191,6 +192,30 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    private fun openWebUi(
+        webUiUrl: String,
+        onStatus: (String) -> Unit,
+    ) {
+        if (webUiUrl.isBlank()) {
+            onStatus("Web UI is not ready yet")
+            return
+        }
+
+        val customTabsIntent = CustomTabsIntent.Builder()
+            .setShowTitle(false)
+            .setUrlBarHidingEnabled(true)
+            .setShareState(CustomTabsIntent.SHARE_STATE_OFF)
+            .build()
+
+        try {
+            customTabsIntent.launchUrl(this, Uri.parse(webUiUrl))
+            onStatus("Opened Web UI in a browser-powered tab")
+        } catch (_: ActivityNotFoundException) {
+            startActivity(WebUiActivity.intent(this, webUiUrl))
+            onStatus("No compatible browser tab found, using the embedded Web UI")
         }
     }
 
@@ -360,12 +385,15 @@ private fun WebUiSection(
     ) {
         Text("Web UI", style = MaterialTheme.typography.titleMedium)
         Text(
-            text = "The client Web UI opens in a dedicated fullscreen screen. Use Android back to return here.",
+            text =
+                "The client Web UI opens in a browser-powered Custom Tab when available. " +
+                    "Android back returns here. If no compatible browser is available, " +
+                    "Ironmesh falls back to the embedded Web UI.",
         )
 
         if (state.webUiUrl.isBlank()) {
             Button(onClick = onStartWebUi) {
-                Text("Open Fullscreen Web UI")
+                Text("Open Web UI")
             }
             Surface(
                 modifier = Modifier.fillMaxWidth(),
@@ -373,14 +401,16 @@ private fun WebUiSection(
                 shape = RoundedCornerShape(18.dp),
             ) {
                 Text(
-                    text = "This starts the local Web UI and opens it fullscreen as soon as it is ready.",
+                    text =
+                        "This starts the local Web UI and opens it in a browser-powered tab " +
+                            "as soon as it is ready.",
                     modifier = Modifier.padding(16.dp),
                 )
             }
         } else {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { onOpenWebUi(state.webUiUrl) }) {
-                    Text("Open Fullscreen Web UI")
+                    Text("Open Web UI")
                 }
                 OutlinedButton(onClick = onRestartWebUi) {
                     Text("Restart Web UI")
@@ -400,7 +430,9 @@ private fun WebUiSection(
                     Text("Web UI ready", style = MaterialTheme.typography.titleSmall)
                     Text(state.webUiUrl, style = MaterialTheme.typography.bodySmall)
                     Text(
-                        text = "Open it fullscreen to use the full screen area. Android back closes the Web UI and returns to this shell.",
+                        text =
+                            "Open it in a browser-powered tab for more reliable browser behavior. " +
+                                "If that is unavailable, Ironmesh falls back to the embedded Web UI.",
                     )
                 }
             }
@@ -416,7 +448,7 @@ private fun WebUiSection(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "Web UI is no longer embedded inside the native tab.",
+                        text = "Web UI now launches in a browser-powered tab when available.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }

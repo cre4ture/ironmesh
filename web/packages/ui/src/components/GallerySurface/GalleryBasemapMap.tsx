@@ -1,4 +1,4 @@
-import { Alert, Badge, Card, Center, Loader, Stack, Text } from "@mantine/core";
+import { Alert, Badge, Button, Card, Center, Group, Loader, Stack, Text } from "@mantine/core";
 import { IconMapPin } from "@tabler/icons-react";
 import maplibregl, { type LngLatLike, type StyleSpecification } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
@@ -72,9 +72,11 @@ type GalleryBasemapMapProps = {
   projection: GalleryMapProjection;
   entries: GalleryBasemapMapEntry[];
   hiddenOnMapCount: number;
+  isFullscreen: boolean;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryBasemapMapEntry) => GalleryBasemapPreviewRequest | null;
   onSelectPath: (path: string) => void;
+  onToggleFullscreen: () => void;
   fallback: ReactNode;
 };
 
@@ -127,9 +129,11 @@ export function GalleryBasemapMap({
   projection,
   entries,
   hiddenOnMapCount,
+  isFullscreen,
   selectedPath,
   getMarkerRequest,
   onSelectPath,
+  onToggleFullscreen,
   fallback
 }: GalleryBasemapMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -358,7 +362,24 @@ export function GalleryBasemapMap({
     return () => markerOverlay.removeEventListener("wheel", handleMarkerWheel);
   }, [mapReady]);
 
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || typeof window === "undefined") {
+      return;
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      map.resize();
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [isFullscreen]);
+
   if (mapError) {
+    if (isFullscreen) {
+      return <>{fallback}</>;
+    }
+
     return (
       <Stack gap="md">
         <Alert color="yellow">
@@ -372,114 +393,143 @@ export function GalleryBasemapMap({
   const map = mapRef.current;
   const mapWidth = map?.getContainer().clientWidth ?? 0;
   const mapHeight = map?.getContainer().clientHeight ?? 0;
+  const mapViewport = (
+    <div
+      aria-label="Geotagged gallery map"
+      style={{
+        position: isFullscreen ? "fixed" : "relative",
+        inset: isFullscreen ? 0 : undefined,
+        zIndex: isFullscreen ? 150 : undefined,
+        width: isFullscreen ? "100vw" : undefined,
+        height: isFullscreen ? "100dvh" : undefined,
+        aspectRatio: isFullscreen ? undefined : "16 / 9",
+        overflow: "hidden",
+        borderRadius: isFullscreen ? 0 : "calc(var(--mantine-radius-md) - 2px)",
+        background: "#0b2433"
+      }}
+    >
+      <div
+        ref={containerRef}
+        style={{
+          position: "absolute",
+          inset: 0
+        }}
+      />
 
-  return (
-    <Card withBorder radius="md" padding="lg">
-      <Stack gap="md">
-        <div>
-          <Text fw={700}>Geo-tagged world map</Text>
-          <Text size="sm" c="dimmed">
-            {basemap.label
-              ? `Using ${basemap.label} from your self-hosted basemap dataset.`
-              : "Using your self-hosted basemap dataset."}
-          </Text>
-        </div>
-
-        <div
-          aria-label="Geotagged gallery map"
+      {!mapReady ? (
+        <Center
           style={{
-            position: "relative",
-            aspectRatio: "16 / 9",
-            overflow: "hidden",
-            borderRadius: "calc(var(--mantine-radius-md) - 2px)",
-            background: "#0b2433"
+            position: "absolute",
+            inset: 0,
+            background: "rgba(8, 24, 35, 0.48)",
+            backdropFilter: "blur(2px)"
           }}
         >
-          <div
-            ref={containerRef}
-            style={{
-              position: "absolute",
-              inset: 0
-            }}
-          />
+          <Stack gap="xs" align="center">
+            <Loader color="white" />
+            <Text c="white" size="sm">
+              Loading self-hosted basemap
+            </Text>
+          </Stack>
+        </Center>
+      ) : null}
 
-          {!mapReady ? (
-            <Center
-              style={{
-                position: "absolute",
-                inset: 0,
-                background: "rgba(8, 24, 35, 0.48)",
-                backdropFilter: "blur(2px)"
-              }}
-            >
-              <Stack gap="xs" align="center">
-                <Loader color="white" />
-                <Text c="white" size="sm">
-                  Loading self-hosted basemap
-                </Text>
-              </Stack>
-            </Center>
-          ) : null}
+      {mapReady && map ? (
+        <div
+          ref={markerOverlayRef}
+          style={{
+            position: "absolute",
+            inset: 0,
+            pointerEvents: "none"
+          }}
+        >
+          {entries.map((entry) => {
+            const gps = entry.media?.gps;
+            if (!gps) {
+              return null;
+            }
 
-          {mapReady && map ? (
-            <div
-              ref={markerOverlayRef}
-              style={{
-                position: "absolute",
-                inset: 0,
-                pointerEvents: "none"
-              }}
-            >
-              {entries.map((entry) => {
-                const gps = entry.media?.gps;
-                if (!gps) {
-                  return null;
-                }
+            const projected = map.project([gps.longitude, gps.latitude]);
+            if (
+              projected.x < -64 ||
+              projected.y < -64 ||
+              projected.x > mapWidth + 64 ||
+              projected.y > mapHeight + 64
+            ) {
+              return null;
+            }
 
-                const projected = map.project([gps.longitude, gps.latitude]);
-                if (
-                  projected.x < -64 ||
-                  projected.y < -64 ||
-                  projected.x > mapWidth + 64 ||
-                  projected.y > mapHeight + 64
-                ) {
-                  return null;
-                }
-
-                return (
-                  <GalleryBasemapMarker
-                    key={entry.path}
-                    entry={entry}
-                    request={getMarkerRequest(entry)}
-                    left={projected.x}
-                    top={projected.y}
-                    selected={selectedPath === entry.path}
-                    onClick={() => onSelectPath(entry.path)}
-                  />
-                );
-              })}
-            </div>
-          ) : null}
-
-          <div
-            style={{
-              position: "absolute",
-              left: 12,
-              top: 12,
-              display: "flex",
-              gap: 8
-            }}
-          >
-            <Badge color="grape" variant="filled">
-              {entries.length} markers
-            </Badge>
-            {hiddenOnMapCount > 0 ? (
-              <Badge color="dark" variant="filled">
-                {hiddenOnMapCount} without GPS
-              </Badge>
-            ) : null}
-          </div>
+            return (
+              <GalleryBasemapMarker
+                key={entry.path}
+                entry={entry}
+                request={getMarkerRequest(entry)}
+                left={projected.x}
+                top={projected.y}
+                selected={selectedPath === entry.path}
+                onClick={() => onSelectPath(entry.path)}
+              />
+            );
+          })}
         </div>
+      ) : null}
+
+      {!isFullscreen ? (
+        <div
+          style={{
+            position: "absolute",
+            left: 12,
+            top: 12,
+            display: "flex",
+            gap: 8
+          }}
+        >
+          <Badge color="grape" variant="filled">
+            {entries.length} markers
+          </Badge>
+          {hiddenOnMapCount > 0 ? (
+            <Badge color="dark" variant="filled">
+              {hiddenOnMapCount} without GPS
+            </Badge>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+
+  return (
+    <Card
+      withBorder={!isFullscreen}
+      radius={isFullscreen ? 0 : "md"}
+      padding={isFullscreen ? 0 : "lg"}
+      style={
+        isFullscreen
+          ? {
+              background: "transparent",
+              border: 0,
+              boxShadow: "none"
+            }
+          : undefined
+      }
+    >
+      <Stack gap="md">
+        <div style={{ display: isFullscreen ? "none" : undefined }}>
+          <Group justify="space-between" align="flex-start" gap="sm">
+            <div>
+              <Text fw={700}>Geo-tagged world map</Text>
+              <Text size="sm" c="dimmed">
+                {basemap.label
+                  ? `Using ${basemap.label} from your self-hosted basemap dataset.`
+                  : "Using your self-hosted basemap dataset."}
+              </Text>
+            </div>
+            <Button variant="default" onClick={onToggleFullscreen}>
+              Fullscreen map
+            </Button>
+          </Group>
+        </div>
+
+        {mapViewport}
       </Stack>
     </Card>
   );

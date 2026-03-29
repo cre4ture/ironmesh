@@ -8,6 +8,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.addCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
@@ -18,9 +19,20 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 
 class WebUiActivity : ComponentActivity() {
+    private var hostedWebView: WebView? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         hideStatusBar()
+
+        onBackPressedDispatcher.addCallback(this) {
+            val webView = hostedWebView
+            if (webView != null && webView.canGoBack()) {
+                webView.goBack()
+            } else {
+                finish()
+            }
+        }
 
         val url = intent.getStringExtra(EXTRA_WEB_UI_URL).orEmpty()
         if (url.isBlank()) {
@@ -36,6 +48,7 @@ class WebUiActivity : ComponentActivity() {
                         factory = { context ->
                             WebView(context).apply {
                                 configure(url)
+                                hostedWebView = this
                             }
                         },
                     )

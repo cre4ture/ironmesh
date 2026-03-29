@@ -149,6 +149,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("2 markers")).toBeVisible();
+  await page.getByRole("button", { name: "Fullscreen map" }).click();
+  await expect(page.getByRole("button", { name: "Exit fullscreen map" })).toHaveCount(0);
+  await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
@@ -157,6 +160,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("dialog").getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
   await expect(page.locator("video")).toBeVisible();
   await page.keyboard.press("Escape");
+  await page.goBack();
+  await expect(page.getByRole("button", { name: "Fullscreen map" })).toBeVisible();
   const prefixInput = page.getByLabel("Prefix");
   await page.getByRole("button", { name: "docs/", exact: true }).click();
   await expect(prefixInput).toHaveValue("docs/");

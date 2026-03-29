@@ -29,7 +29,7 @@ import {
   IconPlayerPlay,
   IconRefresh
 } from "@tabler/icons-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   GalleryBasemapMap,
   type GalleryBasemapConfig,
@@ -50,6 +50,7 @@ const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "ironmesh.gallery.thumbnails_per_
 const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
+const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
 
 export type GallerySnapshot = {
   id: string;
@@ -713,65 +714,123 @@ function GalleryMapPanel({
   getMarkerRequest,
   onSelectPath
 }: GalleryMapPanelProps) {
-  const fallback = (
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const pushedFullscreenHistoryRef = useRef(false);
+  const toggleFullscreen = () => setIsFullscreen((current) => !current);
+
+  useEffect(() => {
+    if (!isFullscreen || typeof document === "undefined" || typeof window === "undefined") {
+      return;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !document.querySelector('[role="dialog"]')) {
+        if (pushedFullscreenHistoryRef.current) {
+          window.history.back();
+          return;
+        }
+        setIsFullscreen(false);
+      }
+    };
+    const handlePopState = () => {
+      pushedFullscreenHistoryRef.current = false;
+      setIsFullscreen(false);
+    };
+
+    const historyState =
+      window.history.state && typeof window.history.state === "object"
+        ? {
+            ...window.history.state,
+            [GALLERY_MAP_FULLSCREEN_HISTORY_KEY]: true
+          }
+        : {
+            [GALLERY_MAP_FULLSCREEN_HISTORY_KEY]: true
+          };
+
+    window.history.pushState(historyState, "", window.location.href);
+    pushedFullscreenHistoryRef.current = true;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("popstate", handlePopState);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [isFullscreen]);
+
+  const fallbackMap = (
     <GalleryWorldMap
       entries={entries}
       hiddenOnMapCount={hiddenOnMapCount}
+      isFullscreen={isFullscreen}
       selectedPath={selectedPath}
       getMarkerRequest={getMarkerRequest}
       onSelectPath={onSelectPath}
+      onToggleFullscreen={toggleFullscreen}
     />
   );
 
   if (!activeBasemap) {
-    return fallback;
+    return fallbackMap;
   }
+
+  const basemapMap = (
+    <GalleryBasemapMap
+      basemap={activeBasemap}
+      projection={activeProjection}
+      entries={entries}
+      hiddenOnMapCount={hiddenOnMapCount}
+      isFullscreen={isFullscreen}
+      selectedPath={selectedPath}
+      getMarkerRequest={getMarkerRequest}
+      onSelectPath={onSelectPath}
+      onToggleFullscreen={toggleFullscreen}
+      fallback={fallbackMap}
+    />
+  );
 
   return (
     <Stack gap="sm">
-      {basemaps.length > 1 || activeBasemap ? (
-        <Group gap="sm">
-          {basemaps.length > 1
-            ? basemaps.map((basemap) => (
+      <div style={{ display: isFullscreen ? "none" : undefined }}>
+        {basemaps.length > 1 || activeBasemap ? (
+          <Group gap="sm">
+            {basemaps.length > 1
+              ? basemaps.map((basemap) => (
+                  <Button
+                    key={basemap.id}
+                    variant={basemap.id === activeBasemap.id ? "filled" : "default"}
+                    onClick={() => onSelectBasemap(basemap.id)}
+                  >
+                    {basemap.modeLabel ?? basemap.label ?? basemap.id}
+                  </Button>
+                ))
+              : null}
+            {activeBasemap ? (
+              <Group gap="xs">
                 <Button
-                  key={basemap.id}
-                  variant={basemap.id === activeBasemap.id ? "filled" : "default"}
-                  onClick={() => onSelectBasemap(basemap.id)}
+                  variant={activeProjection === "mercator" ? "filled" : "default"}
+                  aria-pressed={activeProjection === "mercator"}
+                  onClick={() => onSelectProjection("mercator")}
                 >
-                  {basemap.modeLabel ?? basemap.label ?? basemap.id}
+                  Flat
                 </Button>
-              ))
-            : null}
-          {activeBasemap ? (
-            <Group gap="xs">
-              <Button
-                variant={activeProjection === "mercator" ? "filled" : "default"}
-                aria-pressed={activeProjection === "mercator"}
-                onClick={() => onSelectProjection("mercator")}
-              >
-                Flat
-              </Button>
-              <Button
-                variant={activeProjection === "globe" ? "filled" : "default"}
-                aria-pressed={activeProjection === "globe"}
-                onClick={() => onSelectProjection("globe")}
-              >
-                Globe
-              </Button>
-            </Group>
-          ) : null}
-        </Group>
-      ) : null}
-      <GalleryBasemapMap
-        basemap={activeBasemap}
-        projection={activeProjection}
-        entries={entries}
-        hiddenOnMapCount={hiddenOnMapCount}
-        selectedPath={selectedPath}
-        getMarkerRequest={getMarkerRequest}
-        onSelectPath={onSelectPath}
-        fallback={fallback}
-      />
+                <Button
+                  variant={activeProjection === "globe" ? "filled" : "default"}
+                  aria-pressed={activeProjection === "globe"}
+                  onClick={() => onSelectProjection("globe")}
+                >
+                  Globe
+                </Button>
+              </Group>
+            ) : null}
+          </Group>
+        ) : null}
+      </div>
+
+      <div>{basemapMap}</div>
     </Stack>
   );
 }
@@ -779,172 +838,204 @@ function GalleryMapPanel({
 type GalleryWorldMapProps = {
   entries: GalleryEntry[];
   hiddenOnMapCount: number;
+  isFullscreen: boolean;
   selectedPath: string | null;
   getMarkerRequest: (entry: GalleryEntry) => GalleryPreviewRequest | null;
   onSelectPath: (path: string) => void;
+  onToggleFullscreen: () => void;
 };
 
 function GalleryWorldMap({
   entries,
   hiddenOnMapCount,
+  isFullscreen,
   selectedPath,
   getMarkerRequest,
-  onSelectPath
+  onSelectPath,
+  onToggleFullscreen
 }: GalleryWorldMapProps) {
-  return (
-    <Card withBorder radius="md" padding="lg">
-      <Stack gap="md">
-        <Group justify="space-between" align="flex-start">
-          <div>
-            <Text fw={700}>Geo-tagged world map</Text>
-            <Text size="sm" c="dimmed">
-              Click a marker to open the fullscreen media viewer.
-            </Text>
-          </div>
-          <Group gap="xs">
-            <Badge color="grape" variant="light">
-              {entries.length} markers
-            </Badge>
-            {hiddenOnMapCount > 0 ? (
-              <Badge color="gray" variant="light">
-                {hiddenOnMapCount} without GPS
-              </Badge>
-            ) : null}
-          </Group>
-        </Group>
+  const mapViewport = (
+    <div
+      aria-label="Geotagged gallery map"
+      style={{
+        position: isFullscreen ? "fixed" : "relative",
+        inset: isFullscreen ? 0 : undefined,
+        zIndex: isFullscreen ? 150 : undefined,
+        width: isFullscreen ? "100vw" : undefined,
+        height: isFullscreen ? "100dvh" : undefined,
+        aspectRatio: isFullscreen ? undefined : "16 / 9",
+        overflow: "hidden",
+        borderRadius: isFullscreen ? 0 : "calc(var(--mantine-radius-md) - 2px)",
+        background:
+          "radial-gradient(circle at 18% 16%, rgba(255, 255, 255, 0.32), transparent 28%), linear-gradient(180deg, #0c3348 0%, #144e6c 48%, #0d2f44 100%)",
+        boxShadow: isFullscreen ? "none" : "inset 0 0 0 1px rgba(255, 255, 255, 0.08)"
+      }}
+    >
+      <svg
+        viewBox="0 0 1000 560"
+        preserveAspectRatio="none"
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%"
+        }}
+      >
+        <defs>
+          <linearGradient id="ironmesh-gallery-map-land" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor="#335c49" />
+            <stop offset="100%" stopColor="#244739" />
+          </linearGradient>
+        </defs>
+        {[1, 2, 3, 4, 5].map((index) => (
+          <line
+            key={`parallel:${index}`}
+            x1="0"
+            x2="1000"
+            y1={index * (560 / 6)}
+            y2={index * (560 / 6)}
+            stroke="rgba(255, 255, 255, 0.14)"
+            strokeWidth="1"
+          />
+        ))}
+        {[1, 2, 3, 4, 5, 6, 7].map((index) => (
+          <line
+            key={`meridian:${index}`}
+            y1="0"
+            y2="560"
+            x1={index * (1000 / 8)}
+            x2={index * (1000 / 8)}
+            stroke="rgba(255, 255, 255, 0.12)"
+            strokeWidth="1"
+          />
+        ))}
+        <line
+          x1="0"
+          x2="1000"
+          y1="280"
+          y2="280"
+          stroke="rgba(255, 255, 255, 0.22)"
+          strokeWidth="1.5"
+        />
+        <line
+          y1="0"
+          y2="560"
+          x1="500"
+          x2="500"
+          stroke="rgba(255, 255, 255, 0.18)"
+          strokeWidth="1.5"
+        />
+        <path
+          d="M101 125c28-31 79-50 120-42 43 8 66 33 96 46 25 11 60 8 74 35 14 27-13 63-27 92-16 33-15 68-37 92-26 28-72 20-111 7-42-14-80-37-104-71-22-32-28-78-19-114 8-35-10-82 8-105z"
+          fill="url(#ironmesh-gallery-map-land)"
+          opacity="0.78"
+        />
+        <path
+          d="M247 330c32-8 51 19 63 43 13 28 15 64-3 88-17 23-48 38-77 31-27-7-47-34-50-62-3-23 12-43 23-63 11-20 18-32 44-37z"
+          fill="url(#ironmesh-gallery-map-land)"
+          opacity="0.72"
+        />
+        <path
+          d="M474 108c33-22 84-25 118-12 28 11 39 33 61 49 26 20 67 16 87 43 25 33 26 87 8 126-21 46-70 77-120 82-43 5-91-9-126-35-34-26-60-67-57-111 2-34 26-64 27-98 0-20-14-30 2-44z"
+          fill="url(#ironmesh-gallery-map-land)"
+          opacity="0.82"
+        />
+        <path
+          d="M542 352c23-20 63-24 92-16 27 8 41 31 52 54 12 24 21 53 8 77-15 29-52 46-85 43-31-3-59-24-71-53-13-32-20-78 4-105z"
+          fill="url(#ironmesh-gallery-map-land)"
+          opacity="0.74"
+        />
+        <path
+          d="M770 352c23-13 51-12 76-4 24 8 49 25 56 50 7 22-7 48-26 60-23 15-53 15-79 11-21-3-44-10-56-28-11-17-10-42 2-58 7-10 15-22 27-31z"
+          fill="url(#ironmesh-gallery-map-land)"
+          opacity="0.8"
+        />
+      </svg>
 
+      {entries.map((entry) => {
+        const gps = entry.media?.gps;
+        if (!gps) {
+          return null;
+        }
+
+        const projection = projectGpsToWorldMap(gps.latitude, gps.longitude);
+        return (
+          <GalleryMapMarker
+            key={entry.path}
+            entry={entry}
+            request={getMarkerRequest(entry)}
+            projectedX={projection.x}
+            projectedY={projection.y}
+            selected={selectedPath === entry.path}
+            onClick={() => onSelectPath(entry.path)}
+          />
+        );
+      })}
+
+      {!isFullscreen ? (
         <div
-          aria-label="Geotagged gallery map"
           style={{
-            position: "relative",
-            aspectRatio: "16 / 9",
-            overflow: "hidden",
-            borderRadius: "calc(var(--mantine-radius-md) - 2px)",
-            background:
-              "radial-gradient(circle at 18% 16%, rgba(255, 255, 255, 0.32), transparent 28%), linear-gradient(180deg, #0c3348 0%, #144e6c 48%, #0d2f44 100%)",
-            boxShadow: "inset 0 0 0 1px rgba(255, 255, 255, 0.08)"
+            position: "absolute",
+            left: 16,
+            bottom: 12,
+            display: "flex",
+            gap: 12,
+            color: "rgba(255, 255, 255, 0.72)",
+            fontSize: "0.78rem",
+            letterSpacing: "0.04em",
+            textTransform: "uppercase"
           }}
         >
-          <svg
-            viewBox="0 0 1000 560"
-            preserveAspectRatio="none"
-            aria-hidden="true"
-            style={{
-              position: "absolute",
-              inset: 0,
-              width: "100%",
-              height: "100%"
-            }}
-          >
-            <defs>
-              <linearGradient id="ironmesh-gallery-map-land" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" stopColor="#335c49" />
-                <stop offset="100%" stopColor="#244739" />
-              </linearGradient>
-            </defs>
-            {[1, 2, 3, 4, 5].map((index) => (
-              <line
-                key={`parallel:${index}`}
-                x1="0"
-                x2="1000"
-                y1={index * (560 / 6)}
-                y2={index * (560 / 6)}
-                stroke="rgba(255, 255, 255, 0.14)"
-                strokeWidth="1"
-              />
-            ))}
-            {[1, 2, 3, 4, 5, 6, 7].map((index) => (
-              <line
-                key={`meridian:${index}`}
-                y1="0"
-                y2="560"
-                x1={index * (1000 / 8)}
-                x2={index * (1000 / 8)}
-                stroke="rgba(255, 255, 255, 0.12)"
-                strokeWidth="1"
-              />
-            ))}
-            <line
-              x1="0"
-              x2="1000"
-              y1="280"
-              y2="280"
-              stroke="rgba(255, 255, 255, 0.22)"
-              strokeWidth="1.5"
-            />
-            <line
-              y1="0"
-              y2="560"
-              x1="500"
-              x2="500"
-              stroke="rgba(255, 255, 255, 0.18)"
-              strokeWidth="1.5"
-            />
-            <path
-              d="M101 125c28-31 79-50 120-42 43 8 66 33 96 46 25 11 60 8 74 35 14 27-13 63-27 92-16 33-15 68-37 92-26 28-72 20-111 7-42-14-80-37-104-71-22-32-28-78-19-114 8-35-10-82 8-105z"
-              fill="url(#ironmesh-gallery-map-land)"
-              opacity="0.78"
-            />
-            <path
-              d="M247 330c32-8 51 19 63 43 13 28 15 64-3 88-17 23-48 38-77 31-27-7-47-34-50-62-3-23 12-43 23-63 11-20 18-32 44-37z"
-              fill="url(#ironmesh-gallery-map-land)"
-              opacity="0.72"
-            />
-            <path
-              d="M474 108c33-22 84-25 118-12 28 11 39 33 61 49 26 20 67 16 87 43 25 33 26 87 8 126-21 46-70 77-120 82-43 5-91-9-126-35-34-26-60-67-57-111 2-34 26-64 27-98 0-20-14-30 2-44z"
-              fill="url(#ironmesh-gallery-map-land)"
-              opacity="0.82"
-            />
-            <path
-              d="M542 352c23-20 63-24 92-16 27 8 41 31 52 54 12 24 21 53 8 77-15 29-52 46-85 43-31-3-59-24-71-53-13-32-20-78 4-105z"
-              fill="url(#ironmesh-gallery-map-land)"
-              opacity="0.74"
-            />
-            <path
-              d="M770 352c23-13 51-12 76-4 24 8 49 25 56 50 7 22-7 48-26 60-23 15-53 15-79 11-21-3-44-10-56-28-11-17-10-42 2-58 7-10 15-22 27-31z"
-              fill="url(#ironmesh-gallery-map-land)"
-              opacity="0.8"
-            />
-          </svg>
-
-          {entries.map((entry) => {
-            const gps = entry.media?.gps;
-            if (!gps) {
-              return null;
-            }
-
-            const projection = projectGpsToWorldMap(gps.latitude, gps.longitude);
-            return (
-              <GalleryMapMarker
-                key={entry.path}
-                entry={entry}
-                request={getMarkerRequest(entry)}
-                projectedX={projection.x}
-                projectedY={projection.y}
-                selected={selectedPath === entry.path}
-                onClick={() => onSelectPath(entry.path)}
-              />
-            );
-          })}
-
-          <div
-            style={{
-              position: "absolute",
-              left: 16,
-              bottom: 12,
-              display: "flex",
-              gap: 12,
-              color: "rgba(255, 255, 255, 0.72)",
-              fontSize: "0.78rem",
-              letterSpacing: "0.04em",
-              textTransform: "uppercase"
-            }}
-          >
-            <span>180W</span>
-            <span>Prime meridian</span>
-            <span>180E</span>
-          </div>
+          <span>180W</span>
+          <span>Prime meridian</span>
+          <span>180E</span>
         </div>
+      ) : null}
+    </div>
+  );
+
+  return (
+    <Card
+      withBorder={!isFullscreen}
+      radius={isFullscreen ? 0 : "md"}
+      padding={isFullscreen ? 0 : "lg"}
+      style={
+        isFullscreen
+          ? {
+              background: "transparent",
+              border: 0,
+              boxShadow: "none"
+            }
+          : undefined
+      }
+    >
+      <Stack gap="md">
+        <div style={{ display: isFullscreen ? "none" : undefined }}>
+          <Group justify="space-between" align="flex-start">
+            <div>
+              <Text fw={700}>Geo-tagged world map</Text>
+              <Text size="sm" c="dimmed">
+                Click a marker to open the fullscreen media viewer.
+              </Text>
+            </div>
+            <Group gap="xs">
+              <Badge color="grape" variant="light">
+                {entries.length} markers
+              </Badge>
+              {hiddenOnMapCount > 0 ? (
+                <Badge color="gray" variant="light">
+                  {hiddenOnMapCount} without GPS
+                </Badge>
+              ) : null}
+              <Button variant="default" onClick={onToggleFullscreen}>
+                Fullscreen map
+              </Button>
+            </Group>
+          </Group>
+        </div>
+
+        {mapViewport}
       </Stack>
     </Card>
   );
