@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 fn test_store_dir(name: &str) -> PathBuf {
@@ -59,6 +61,27 @@ fn sample_oriented_jpeg_bytes(orientation: u16) -> Vec<u8> {
     jpeg_with_exif_orientation(jpeg, orientation)
 }
 
+fn sample_video_thumbnail_bytes() -> Vec<u8> {
+    let mut image = image::RgbImage::new(256, 144);
+    for y in 0..144 {
+        for x in 0..256 {
+            let pixel = if x < 128 {
+                image::Rgb([28, 99, 193])
+            } else {
+                image::Rgb([244, 180, 0])
+            };
+            image.put_pixel(x, y, pixel);
+        }
+    }
+
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90);
+    encoder
+        .encode_image(&image::DynamicImage::ImageRgb8(image))
+        .unwrap();
+    jpeg
+}
+
 fn jpeg_with_exif_orientation(jpeg: Vec<u8>, orientation: u16) -> Vec<u8> {
     assert!(jpeg.starts_with(&[0xff, 0xd8]));
     let mut encoded = Vec::with_capacity(jpeg.len() + 36);
@@ -111,6 +134,62 @@ fn assert_dominant_color(pixel: &image::Rgb<u8>, expected: [u8; 3]) {
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
+}
+
+#[cfg(unix)]
+fn install_fake_video_tools(dir: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+    std::fs::create_dir_all(dir).unwrap();
+    let poster_path = dir.join("poster.jpg");
+    let poster_bytes = sample_video_thumbnail_bytes();
+    std::fs::write(&poster_path, &poster_bytes).unwrap();
+
+    let ffprobe_path = dir.join("ffprobe");
+    let ffprobe_script = r#"#!/bin/sh
+set -eu
+input=""
+for arg in "$@"; do
+  input="$arg"
+done
+list="${input#concatf:}"
+[ -f "$list" ]
+line_count=$(wc -l < "$list" | tr -d ' ')
+[ "$line_count" -ge 3 ]
+grep -q '^file:' "$list"
+printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.0"}}'
+"#;
+    std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
+
+    let ffmpeg_path = dir.join("ffmpeg");
+    let ffmpeg_script = format!(
+        r#"#!/bin/sh
+set -eu
+input=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-i" ]; then
+    input="$arg"
+    break
+  fi
+  prev="$arg"
+done
+list="${{input#concatf:}}"
+[ -f "$list" ]
+line_count=$(wc -l < "$list" | tr -d ' ')
+[ "$line_count" -ge 3 ]
+grep -q '^file:' "$list"
+cat '{}'
+"#,
+        poster_path.display()
+    );
+    std::fs::write(&ffmpeg_path, ffmpeg_script).unwrap();
+
+    for path in [&ffprobe_path, &ffmpeg_path] {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    (ffprobe_path, ffmpeg_path, poster_bytes)
 }
 
 #[derive(Clone, Copy)]
@@ -1622,6 +1701,53 @@ run_on_all_metadata_backends!(
     ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail_impl,
     ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail,
     ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail_turso
+);
+
+#[cfg(unix)]
+async fn ensure_media_cache_generates_thumbnail_for_mp4_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-mp4").await;
+    let tools_dir = root.join("test-video-tools");
+    let (ffprobe_path, ffmpeg_path, poster_bytes) = install_fake_video_tools(&tools_dir);
+    store.set_media_tool_paths_for_test(ffprobe_path, ffmpeg_path);
+
+    let put = store
+        .put_object_versioned(
+            "movies/clip.mp4",
+            Bytes::from(sample_large_chunked_payload()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert_eq!(metadata.media_type.as_deref(), Some("video"));
+    assert_eq!(metadata.mime_type.as_deref(), Some("video/mp4"));
+    assert_eq!(metadata.width, Some(1920));
+    assert_eq!(metadata.height, Some(1080));
+
+    let thumb = metadata.thumbnail.as_ref().expect("expected thumbnail");
+    assert_eq!((thumb.width, thumb.height), (256, 144));
+    let thumb_path = store.media_thumbnail_path(&metadata.content_fingerprint, &thumb.profile);
+    let written = fs::read(&thumb_path).await.unwrap();
+    assert_eq!(written, poster_bytes);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[cfg(unix)]
+run_on_all_metadata_backends!(
+    ensure_media_cache_generates_thumbnail_for_mp4_impl,
+    ensure_media_cache_generates_thumbnail_for_mp4,
+    ensure_media_cache_generates_thumbnail_for_mp4_turso
 );
 
 async fn ensure_media_cache_rebuilds_stale_schema_records_impl(backend: StorageTestBackend) {

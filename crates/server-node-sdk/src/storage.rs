@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -12,10 +12,13 @@ use exif::{In, Reader as ExifReader, Tag, Value};
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, GenericImageView, ImageFormat};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{Duration, Instant, timeout};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -29,13 +32,19 @@ use self::turso_impl::TursoMetadataStore;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
-const MEDIA_CACHE_SCHEMA_VERSION: u32 = 2;
+const MEDIA_CACHE_SCHEMA_VERSION: u32 = 3;
 const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
+const MEDIA_FORMAT_SNIFF_BYTES: usize = 64 * 1024;
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
 const SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS: u128 = 20000;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
+const FFPROBE_TIMEOUT_SECS: u64 = 15;
+const FFMPEG_TIMEOUT_SECS: u64 = 60;
+const VIDEO_THUMBNAIL_SEEK_FRACTION: f64 = 0.10;
+const VIDEO_THUMBNAIL_SEEK_MIN_SECS: f64 = 1.0;
+const VIDEO_THUMBNAIL_SEEK_MAX_SECS: f64 = 60.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChunkRef {
@@ -524,6 +533,41 @@ impl From<CachedMediaMetadata> for DerivedMediaCacheArtifact {
     }
 }
 
+#[derive(Clone)]
+struct MediaToolPaths {
+    ffprobe: PathBuf,
+    ffmpeg: PathBuf,
+}
+
+impl Default for MediaToolPaths {
+    fn default() -> Self {
+        Self {
+            ffprobe: PathBuf::from("ffprobe"),
+            ffmpeg: PathBuf::from("ffmpeg"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeOutput {
+    #[serde(default)]
+    streams: Vec<FfprobeStream>,
+    #[serde(default)]
+    format: Option<FfprobeFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeStream {
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeFormat {
+    format_name: Option<String>,
+    duration: Option<String>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataBackendKind {
@@ -542,6 +586,7 @@ pub struct PersistentStore {
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
     chunk_ingestor: ChunkIngestor,
+    media_tools: MediaToolPaths,
 }
 
 #[derive(Clone)]
@@ -557,6 +602,7 @@ pub(crate) struct MediaCacheWorker {
     chunks_dir: PathBuf,
     media_thumbnails_dir: PathBuf,
     metadata_store: Arc<dyn MetadataStore>,
+    media_tools: MediaToolPaths,
 }
 
 #[derive(Clone)]
@@ -753,12 +799,14 @@ impl MediaCacheWorker {
         chunks_dir: PathBuf,
         media_thumbnails_dir: PathBuf,
         metadata_store: Arc<dyn MetadataStore>,
+        media_tools: MediaToolPaths,
     ) -> Self {
         Self {
             manifests_dir,
             chunks_dir,
             media_thumbnails_dir,
             metadata_store,
+            media_tools,
         }
     }
 
@@ -932,8 +980,30 @@ impl MediaCacheWorker {
         source_size_bytes: usize,
     ) -> DerivedMediaCacheArtifact {
         let generated_at_unix = unix_ts();
-        let payload = match self.read_object_by_manifest_hash(manifest_hash).await {
-            Ok(payload) => payload,
+        let manifest = match self.load_manifest_by_hash(manifest_hash).await {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => {
+                return DerivedMediaCacheArtifact {
+                    metadata: CachedMediaMetadata {
+                        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                        content_fingerprint: content_fingerprint.to_string(),
+                        source_manifest_hash: manifest_hash.to_string(),
+                        status: MediaCacheStatus::Failed,
+                        media_type: None,
+                        mime_type: None,
+                        width: None,
+                        height: None,
+                        orientation: None,
+                        taken_at_unix: None,
+                        gps: None,
+                        thumbnail: None,
+                        source_size_bytes,
+                        generated_at_unix,
+                        error: Some(format!("manifest missing for hash={manifest_hash}")),
+                    },
+                    thumbnail_payload: None,
+                };
+            }
             Err(err) => {
                 return DerivedMediaCacheArtifact {
                     metadata: CachedMediaMetadata {
@@ -957,12 +1027,133 @@ impl MediaCacheWorker {
                 };
             }
         };
-        match derive_image_media_cache(
+
+        let sniff_bytes = match read_object_prefix_from_manifest(
+            &manifest,
+            &self.chunks_dir,
+            MEDIA_FORMAT_SNIFF_BYTES,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return DerivedMediaCacheArtifact {
+                    metadata: CachedMediaMetadata {
+                        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                        content_fingerprint: content_fingerprint.to_string(),
+                        source_manifest_hash: manifest_hash.to_string(),
+                        status: MediaCacheStatus::Failed,
+                        media_type: None,
+                        mime_type: None,
+                        width: None,
+                        height: None,
+                        orientation: None,
+                        taken_at_unix: None,
+                        gps: None,
+                        thumbnail: None,
+                        source_size_bytes,
+                        generated_at_unix,
+                        error: Some(err.to_string()),
+                    },
+                    thumbnail_payload: None,
+                };
+            }
+        };
+        let format = match image::guess_format(&sniff_bytes) {
+            Ok(format) => Some(format),
+            Err(_) => None,
+        };
+
+        if let Some(format) = format {
+            if image_format_mime_type(format).is_none() {
+                return CachedMediaMetadata {
+                    schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                    content_fingerprint: content_fingerprint.to_string(),
+                    source_manifest_hash: manifest_hash.to_string(),
+                    status: MediaCacheStatus::Unsupported,
+                    media_type: None,
+                    mime_type: None,
+                    width: None,
+                    height: None,
+                    orientation: None,
+                    taken_at_unix: None,
+                    gps: None,
+                    thumbnail: None,
+                    source_size_bytes,
+                    generated_at_unix,
+                    error: Some(
+                        "media format is not supported for thumbnail extraction".to_string(),
+                    ),
+                }
+                .into();
+            }
+
+            let payload = match self.read_object_by_manifest_hash(manifest_hash).await {
+                Ok(payload) => payload,
+                Err(err) => {
+                    return DerivedMediaCacheArtifact {
+                        metadata: CachedMediaMetadata {
+                            schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                            content_fingerprint: content_fingerprint.to_string(),
+                            source_manifest_hash: manifest_hash.to_string(),
+                            status: MediaCacheStatus::Failed,
+                            media_type: None,
+                            mime_type: None,
+                            width: None,
+                            height: None,
+                            orientation: None,
+                            taken_at_unix: None,
+                            gps: None,
+                            thumbnail: None,
+                            source_size_bytes,
+                            generated_at_unix,
+                            error: Some(err.to_string()),
+                        },
+                        thumbnail_payload: None,
+                    };
+                }
+            };
+
+            return match derive_image_media_cache(
+                manifest_hash,
+                content_fingerprint,
+                source_size_bytes,
+                &payload,
+            ) {
+                Ok(derived) => derived,
+                Err(err) => DerivedMediaCacheArtifact {
+                    metadata: CachedMediaMetadata {
+                        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                        content_fingerprint: content_fingerprint.to_string(),
+                        source_manifest_hash: manifest_hash.to_string(),
+                        status: MediaCacheStatus::Failed,
+                        media_type: None,
+                        mime_type: None,
+                        width: None,
+                        height: None,
+                        orientation: None,
+                        taken_at_unix: None,
+                        gps: None,
+                        thumbnail: None,
+                        source_size_bytes,
+                        generated_at_unix,
+                        error: Some(err.to_string()),
+                    },
+                    thumbnail_payload: None,
+                },
+            };
+        }
+
+        match derive_video_media_cache(
             manifest_hash,
             content_fingerprint,
             source_size_bytes,
-            &payload,
-        ) {
+            &manifest,
+            &self.chunks_dir,
+            &self.media_tools,
+        )
+        .await
+        {
             Ok(derived) => derived,
             Err(err) => DerivedMediaCacheArtifact {
                 metadata: CachedMediaMetadata {
@@ -996,7 +1187,6 @@ impl MediaCacheWorker {
         )
         .await
     }
-
 }
 
 impl StorageStatsCollector {
@@ -1568,6 +1758,7 @@ impl PersistentStore {
             metadata_store,
             storage_stats_lock,
             chunk_ingestor,
+            media_tools: MediaToolPaths::default(),
         })
     }
 
@@ -1581,7 +1772,20 @@ impl PersistentStore {
             self.chunks_dir.clone(),
             self.media_thumbnails_dir.clone(),
             self.metadata_store.clone(),
+            self.media_tools.clone(),
         )
+    }
+
+    #[cfg(test)]
+    pub fn set_media_tool_paths_for_test(
+        &mut self,
+        ffprobe: impl Into<PathBuf>,
+        ffmpeg: impl Into<PathBuf>,
+    ) {
+        self.media_tools = MediaToolPaths {
+            ffprobe: ffprobe.into(),
+            ffmpeg: ffmpeg.into(),
+        };
     }
 
     pub(crate) fn store_index_inspector(&self) -> StoreIndexInspector {
@@ -1755,7 +1959,9 @@ impl PersistentStore {
         &self,
         manifest_hash: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
-        self.media_cache_worker().ensure_media_cache(manifest_hash).await
+        self.media_cache_worker()
+            .ensure_media_cache(manifest_hash)
+            .await
     }
 
     pub async fn list_metadata_subjects(&self) -> Result<Vec<String>> {
@@ -4709,6 +4915,289 @@ async fn persist_media_cache_record_with_payload(
         write_atomic(&thumbnail_path, payload).await?;
     }
     metadata_store.persist_media_cache_record(metadata).await
+}
+
+async fn read_object_prefix_from_manifest(
+    manifest: &ObjectManifest,
+    chunks_dir: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let target_len = std::cmp::min(manifest.total_size_bytes, max_bytes);
+    let mut prefix = Vec::with_capacity(target_len);
+
+    for chunk in &manifest.chunks {
+        if prefix.len() >= target_len {
+            break;
+        }
+
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let payload = fs::read(&chunk_path)
+            .await
+            .with_context(|| format!("failed reading chunk {}", chunk.hash))?;
+        if payload.len() != chunk.size_bytes {
+            bail!(
+                "size mismatch for chunk hash={} expected={} actual={}",
+                chunk.hash,
+                chunk.size_bytes,
+                payload.len()
+            );
+        }
+        let actual_hash = hash_hex(&payload);
+        if actual_hash != chunk.hash {
+            bail!(
+                "hash mismatch for chunk expected={} actual={}",
+                chunk.hash,
+                actual_hash
+            );
+        }
+
+        let remaining = target_len.saturating_sub(prefix.len());
+        prefix.extend_from_slice(&payload[..remaining.min(payload.len())]);
+    }
+
+    Ok(prefix)
+}
+
+async fn collect_local_chunk_paths(
+    manifest: &ObjectManifest,
+    chunks_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(manifest.chunks.len());
+    for chunk in &manifest.chunks {
+        let chunk_path = chunk_path_for_hash(chunks_dir, &chunk.hash);
+        let metadata = fs::metadata(&chunk_path)
+            .await
+            .with_context(|| format!("missing chunk {}", chunk.hash))?;
+        if metadata.len() != chunk.size_bytes as u64 {
+            bail!(
+                "size mismatch for chunk hash={} expected={} actual={}",
+                chunk.hash,
+                chunk.size_bytes,
+                metadata.len()
+            );
+        }
+        paths.push(chunk_path);
+    }
+    Ok(paths)
+}
+
+async fn derive_video_media_cache(
+    manifest_hash: &str,
+    content_fingerprint: &str,
+    source_size_bytes: usize,
+    manifest: &ObjectManifest,
+    chunks_dir: &Path,
+    media_tools: &MediaToolPaths,
+) -> Result<DerivedMediaCacheArtifact> {
+    let generated_at_unix = unix_ts();
+    let chunk_paths = collect_local_chunk_paths(manifest, chunks_dir).await?;
+    let concat_temp_dir =
+        std::env::temp_dir().join(format!("ironmesh-media-cache-{}", Uuid::new_v4()));
+    fs::create_dir_all(&concat_temp_dir)
+        .await
+        .with_context(|| format!("failed to create temp dir {}", concat_temp_dir.display()))?;
+    let concat_file_path = concat_temp_dir.join("chunks.concatf");
+
+    let concat_payload = chunk_paths
+        .iter()
+        .map(|path| file_url_for_concatf(path.as_path()))
+        .collect::<Result<Vec<_>>>()?
+        .join("\n");
+    fs::write(&concat_file_path, format!("{concat_payload}\n"))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to write concatf list {}",
+                concat_file_path.display()
+            )
+        })?;
+
+    let concat_input = format!("concatf:{}", concat_file_path.display());
+
+    let derived = async {
+        let mut ffprobe = Command::new(&media_tools.ffprobe);
+        ffprobe
+            .arg("-v")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-select_streams")
+            .arg("v:0")
+            .arg("-show_entries")
+            .arg("stream=width,height,codec_name:format=format_name,duration")
+            .arg("-of")
+            .arg("json")
+            .arg(&concat_input);
+        let probe_output = run_media_tool(&mut ffprobe, FFPROBE_TIMEOUT_SECS, "ffprobe").await?;
+        let probe: FfprobeOutput = serde_json::from_slice(&probe_output.stdout)
+            .context("failed to parse ffprobe JSON output")?;
+        let Some(stream) = probe.streams.first() else {
+            return Ok::<DerivedMediaCacheArtifact, anyhow::Error>(
+                CachedMediaMetadata {
+                    schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                    content_fingerprint: content_fingerprint.to_string(),
+                    source_manifest_hash: manifest_hash.to_string(),
+                    status: MediaCacheStatus::Unsupported,
+                    media_type: None,
+                    mime_type: None,
+                    width: None,
+                    height: None,
+                    orientation: None,
+                    taken_at_unix: None,
+                    gps: None,
+                    thumbnail: None,
+                    source_size_bytes,
+                    generated_at_unix,
+                    error: Some("unsupported media format".to_string()),
+                }
+                .into(),
+            );
+        };
+
+        let duration_secs = probe
+            .format
+            .as_ref()
+            .and_then(|format| format.duration.as_deref())
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0);
+
+        let mut ffmpeg = Command::new(&media_tools.ffmpeg);
+        ffmpeg.arg("-v").arg("error").arg("-nostdin");
+        if let Some(seek_time) = preferred_video_seek_time(duration_secs) {
+            ffmpeg.arg("-ss").arg(seek_time);
+        }
+        ffmpeg
+            .arg("-i")
+            .arg(&concat_input)
+            .arg("-an")
+            .arg("-sn")
+            .arg("-dn")
+            .arg("-vf")
+            .arg(format!(
+                "thumbnail=100,scale={0}:{0}:force_original_aspect_ratio=decrease",
+                GRID_THUMBNAIL_MAX_DIMENSION
+            ))
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-f")
+            .arg("image2pipe")
+            .arg("-vcodec")
+            .arg("mjpeg")
+            .arg("pipe:1");
+        let ffmpeg_output = run_media_tool(&mut ffmpeg, FFMPEG_TIMEOUT_SECS, "ffmpeg").await?;
+        let rendered = image::load_from_memory(&ffmpeg_output.stdout)
+            .context("failed to decode ffmpeg thumbnail output")?;
+        let mime_type = video_mime_type_for_format_name(
+            probe
+                .format
+                .as_ref()
+                .and_then(|format| format.format_name.as_deref()),
+        );
+
+        Ok(DerivedMediaCacheArtifact {
+            metadata: CachedMediaMetadata {
+                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                content_fingerprint: content_fingerprint.to_string(),
+                source_manifest_hash: manifest_hash.to_string(),
+                status: MediaCacheStatus::Ready,
+                media_type: Some("video".to_string()),
+                mime_type,
+                width: stream.width,
+                height: stream.height,
+                orientation: None,
+                taken_at_unix: None,
+                gps: None,
+                thumbnail: Some(CachedThumbnailInfo {
+                    profile: GRID_THUMBNAIL_PROFILE.to_string(),
+                    format: "jpeg".to_string(),
+                    width: rendered.width(),
+                    height: rendered.height(),
+                    size_bytes: ffmpeg_output.stdout.len() as u64,
+                }),
+                source_size_bytes,
+                generated_at_unix,
+                error: None,
+            },
+            thumbnail_payload: Some(ffmpeg_output.stdout),
+        })
+    }
+    .await;
+
+    let _ = fs::remove_dir_all(&concat_temp_dir).await;
+    derived
+}
+
+fn file_url_for_concatf(path: &Path) -> Result<String> {
+    Url::from_file_path(path)
+        .map(|url| url.into())
+        .map_err(|_| anyhow::anyhow!("failed to convert path to file URL: {}", path.display()))
+}
+
+async fn run_media_tool(
+    command: &mut Command,
+    timeout_secs: u64,
+    tool_name: &str,
+) -> Result<std::process::Output> {
+    command.kill_on_drop(true);
+    match timeout(Duration::from_secs(timeout_secs), command.output()).await {
+        Ok(Ok(output)) if output.status.success() => Ok(output),
+        Ok(Ok(output)) => {
+            bail!(
+                "{tool_name} exited with status {}: {}",
+                output.status,
+                trimmed_command_output(&output.stderr)
+            )
+        }
+        Ok(Err(err)) => Err(err).with_context(|| format!("failed to spawn {tool_name}")),
+        Err(_) => bail!("{tool_name} timed out after {timeout_secs}s"),
+    }
+}
+
+fn trimmed_command_output(stderr: &[u8]) -> String {
+    let value = String::from_utf8_lossy(stderr).trim().to_string();
+    if value.len() > 400 {
+        format!("{}...", &value[..400])
+    } else if value.is_empty() {
+        "<no stderr output>".to_string()
+    } else {
+        value
+    }
+}
+
+fn preferred_video_seek_time(duration_secs: Option<f64>) -> Option<String> {
+    let duration_secs = duration_secs?;
+    let seek = (duration_secs * VIDEO_THUMBNAIL_SEEK_FRACTION)
+        .clamp(VIDEO_THUMBNAIL_SEEK_MIN_SECS, VIDEO_THUMBNAIL_SEEK_MAX_SECS)
+        .min(duration_secs);
+    Some(format!("{seek:.3}"))
+}
+
+fn video_mime_type_for_format_name(format_name: Option<&str>) -> Option<String> {
+    let format_name = format_name?;
+    if format_name.contains("webm") {
+        return Some("video/webm".to_string());
+    }
+    if format_name.contains("matroska") {
+        return Some("video/x-matroska".to_string());
+    }
+    if format_name.contains("mov") || format_name.contains("mp4") || format_name.contains("3gp") {
+        return Some("video/mp4".to_string());
+    }
+    if format_name.contains("avi") {
+        return Some("video/x-msvideo".to_string());
+    }
+    if format_name.contains("flv") {
+        return Some("video/x-flv".to_string());
+    }
+    if format_name.contains("mpegts") || format_name == "ts" {
+        return Some("video/mp2t".to_string());
+    }
+    if format_name.contains("ogg") {
+        return Some("video/ogg".to_string());
+    }
+    if format_name.contains("mpeg") {
+        return Some("video/mpeg".to_string());
+    }
+    None
 }
 
 fn derive_image_media_cache(
