@@ -157,3 +157,116 @@ For gallery-style UIs:
 - `taken_at_unix` is reserved in the response but not yet populated
 - EXIF extraction is best-effort and format-dependent
 - video/audio derivatives are not implemented yet
+
+## Proposed Video Thumbnail Pipeline
+
+Status:
+
+- review draft only
+- not implemented yet
+
+### Goals
+
+- add video thumbnails with broad format support
+- avoid duplicating large objects into temporary files
+- keep the existing media-cache API contract stable for clients
+- keep the first implementation operationally simple
+
+### Decision Summary
+
+- use external `ffprobe` and `ffmpeg` processes for video inspection and thumbnail extraction
+- keep image handling on the existing pure-Rust path
+- for the first implementation, use `concatf:` as the only video input path
+- assume all chunk files referenced by the manifest are already present locally
+- keep storing video thumbnails in the existing cache layout under `state/media_cache/thumbnails/<content_fingerprint>/grid.jpg`
+- keep exposing the result through the existing `media.thumbnail` block in `GET /store/index`
+
+### Why External Tools
+
+The main driver is codec and container coverage.
+
+- `ffmpeg`/`ffprobe` support far more real-world formats than the currently available pure-Rust video options
+- this keeps the thumbnailing path efficient and widely compatible without embedding a large decoding stack into `server-node`
+
+### Input Strategy
+
+The first implementation should use one input path only.
+
+#### Fully Local Objects
+
+When every chunk referenced by the manifest is already present on the current node:
+
+- generate a tiny temporary `concatf` file containing the ordered local chunk paths
+- pass that `concatf:` URL to `ffprobe` / `ffmpeg`
+
+This avoids creating a second full copy of the original object, even for very large videos.
+
+This also keeps the first implementation simpler because it avoids introducing an internal HTTP serving path just for thumbnail generation.
+
+#### Objects That Are Not Fully Local
+
+Support for partially local objects is explicitly out of scope for the first iteration.
+
+- the first implementation assumes the required chunk files are already local
+- if that assumption is not true, the video-thumbnail path should not attempt a remote-aware fallback
+- handling partially local objects can be added in a later iteration if needed
+
+### Deferred Follow-Up
+
+If partially local video objects need thumbnail generation later, a follow-up design can revisit:
+
+- an internal loopback HTTP helper with `Range` support
+- token-based request authorization for that helper
+- on-demand remote chunk fetches during FFmpeg seeks
+
+### Thumbnail Generation Flow
+
+For videos, the proposed flow is:
+
+1. resolve the selected manifest and compute `content_fingerprint`
+2. detect whether the payload is image or video
+3. for video, inspect the first video stream with `ffprobe`
+4. capture dimensions, codec/container details, and duration when available
+5. choose a capture position based on duration, for example a clamped percentage into the file rather than frame zero
+6. run `ffmpeg` to extract one representative frame
+7. scale that frame to the existing `grid` thumbnail profile and encode as JPEG
+8. persist the thumbnail and metadata through the existing media-cache record
+
+### Expected Metadata
+
+Initial video support is expected to populate:
+
+- `media_type = "video"`
+- `mime_type` when detectable
+- `width`
+- `height`
+- `thumbnail`
+
+The first implementation does not require new client-facing response fields beyond the existing media block.
+
+### Failure Behavior
+
+The media cache should remain best-effort.
+
+- unsupported or undecodable videos should continue to produce `unsupported` or `failed` records without a thumbnail
+- a missing `ffmpeg` / `ffprobe` binary should be recorded as a clear failure reason
+- failures should be cached so the server does not repeatedly spawn expensive decode jobs for the same object
+
+### Efficiency Notes
+
+- avoid writing the full video to a temporary file
+- use `concatf:` so FFmpeg reads the existing chunk files directly
+- impose timeouts and concurrency limits around external-process execution
+- keep the thumbnail profile unchanged for the first implementation to minimize cache growth
+
+### Scope for the First Iteration
+
+- video thumbnails only
+- one thumbnail profile only: `grid`
+- no audio waveforms or audio poster derivatives
+- no scene-analysis service beyond what `ffmpeg` already provides
+- no client API changes required
+- auto-detect `ffmpeg` / `ffprobe` from `PATH`
+- attempt all formats supported by the installed FFmpeg build
+- no dedicated configuration flag to disable video thumbnail generation
+- assume the manifest is fully local on the node performing thumbnail generation

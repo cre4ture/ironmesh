@@ -510,6 +510,20 @@ struct RenderedThumbnail {
     height: u32,
 }
 
+struct DerivedMediaCacheArtifact {
+    metadata: CachedMediaMetadata,
+    thumbnail_payload: Option<Vec<u8>>,
+}
+
+impl From<CachedMediaMetadata> for DerivedMediaCacheArtifact {
+    fn from(metadata: CachedMediaMetadata) -> Self {
+        Self {
+            metadata,
+            thumbnail_payload: None,
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataBackendKind {
@@ -787,26 +801,24 @@ impl MediaCacheWorker {
             "media cache miss; generating thumbnail"
         );
 
-        let read_started_at = Instant::now();
-        let payload = self.read_object_by_manifest_hash(manifest_hash).await?;
-        let read_object_ms = read_started_at.elapsed().as_millis();
         let build_started_at = Instant::now();
-        let metadata = self.build_media_cache_record(
-            manifest_hash,
-            &content_fingerprint,
-            manifest.total_size_bytes,
-            &payload,
-        );
+        let derived = self
+            .build_media_cache_artifact(
+                manifest_hash,
+                &content_fingerprint,
+                manifest.total_size_bytes,
+            )
+            .await;
         let build_record_ms = build_started_at.elapsed().as_millis();
         let persist_started_at = Instant::now();
-        self.persist_media_cache_record(&metadata).await?;
+        self.persist_media_cache_record(&derived).await?;
         let persist_ms = persist_started_at.elapsed().as_millis();
         let total_ms = ensure_started_at.elapsed().as_millis();
+        let metadata = &derived.metadata;
         info!(
             manifest_hash,
             content_fingerprint = %content_fingerprint,
             total_ms,
-            read_object_ms,
             build_record_ms,
             persist_ms,
             status = ?metadata.status,
@@ -818,7 +830,6 @@ impl MediaCacheWorker {
                 manifest_hash,
                 content_fingerprint = %content_fingerprint,
                 total_ms,
-                read_object_ms,
                 build_record_ms,
                 persist_ms,
                 status = ?metadata.status,
@@ -826,7 +837,7 @@ impl MediaCacheWorker {
                 "slow media cache generation"
             );
         }
-        Ok(Some(metadata))
+        Ok(Some(metadata.clone()))
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
@@ -914,76 +925,78 @@ impl MediaCacheWorker {
             .await
     }
 
-    fn build_media_cache_record(
+    async fn build_media_cache_artifact(
         &self,
         manifest_hash: &str,
         content_fingerprint: &str,
         source_size_bytes: usize,
-        payload: &[u8],
-    ) -> CachedMediaMetadata {
+    ) -> DerivedMediaCacheArtifact {
         let generated_at_unix = unix_ts();
+        let payload = match self.read_object_by_manifest_hash(manifest_hash).await {
+            Ok(payload) => payload,
+            Err(err) => {
+                return DerivedMediaCacheArtifact {
+                    metadata: CachedMediaMetadata {
+                        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                        content_fingerprint: content_fingerprint.to_string(),
+                        source_manifest_hash: manifest_hash.to_string(),
+                        status: MediaCacheStatus::Failed,
+                        media_type: None,
+                        mime_type: None,
+                        width: None,
+                        height: None,
+                        orientation: None,
+                        taken_at_unix: None,
+                        gps: None,
+                        thumbnail: None,
+                        source_size_bytes,
+                        generated_at_unix,
+                        error: Some(err.to_string()),
+                    },
+                    thumbnail_payload: None,
+                };
+            }
+        };
         match derive_image_media_cache(
             manifest_hash,
             content_fingerprint,
             source_size_bytes,
-            payload,
+            &payload,
         ) {
             Ok(derived) => derived,
-            Err(err) => CachedMediaMetadata {
-                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                content_fingerprint: content_fingerprint.to_string(),
-                source_manifest_hash: manifest_hash.to_string(),
-                status: MediaCacheStatus::Failed,
-                media_type: None,
-                mime_type: None,
-                width: None,
-                height: None,
-                orientation: None,
-                taken_at_unix: None,
-                gps: None,
-                thumbnail: None,
-                source_size_bytes,
-                generated_at_unix,
-                error: Some(err.to_string()),
+            Err(err) => DerivedMediaCacheArtifact {
+                metadata: CachedMediaMetadata {
+                    schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+                    content_fingerprint: content_fingerprint.to_string(),
+                    source_manifest_hash: manifest_hash.to_string(),
+                    status: MediaCacheStatus::Failed,
+                    media_type: None,
+                    mime_type: None,
+                    width: None,
+                    height: None,
+                    orientation: None,
+                    taken_at_unix: None,
+                    gps: None,
+                    thumbnail: None,
+                    source_size_bytes,
+                    generated_at_unix,
+                    error: Some(err.to_string()),
+                },
+                thumbnail_payload: None,
             },
         }
     }
 
-    async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
-        if let Some(thumbnail) = &metadata.thumbnail {
-            let thumbnail_path =
-                self.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
-            let payload = self
-                .render_thumbnail_payload(
-                    &metadata.source_manifest_hash,
-                    GRID_THUMBNAIL_MAX_DIMENSION,
-                )
-                .await?;
-            write_atomic(&thumbnail_path, &payload).await?;
-        }
-        self.metadata_store
-            .persist_media_cache_record(metadata)
-            .await
+    async fn persist_media_cache_record(&self, derived: &DerivedMediaCacheArtifact) -> Result<()> {
+        persist_media_cache_record_with_payload(
+            &self.media_thumbnails_dir,
+            self.metadata_store.as_ref(),
+            &derived.metadata,
+            derived.thumbnail_payload.as_deref(),
+        )
+        .await
     }
 
-    async fn render_thumbnail_payload(
-        &self,
-        manifest_hash: &str,
-        max_dimension: u32,
-    ) -> Result<Vec<u8>> {
-        let payload = self
-            .read_object_by_manifest_hash(manifest_hash)
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to read object for thumbnail render: {err}"))?;
-        render_thumbnail_from_payload(&payload, extract_exif_orientation(&payload), max_dimension)
-            .map(|rendered| rendered.payload)
-    }
-
-    fn media_thumbnail_path(&self, content_fingerprint: &str, profile: &str) -> PathBuf {
-        self.media_thumbnails_dir
-            .join(content_fingerprint)
-            .join(format!("{profile}.jpg"))
-    }
 }
 
 impl StorageStatsCollector {
@@ -1742,30 +1755,7 @@ impl PersistentStore {
         &self,
         manifest_hash: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(None);
-        }
-
-        let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
-            return Ok(None);
-        };
-        let content_fingerprint = content_fingerprint_from_manifest(&manifest);
-        if let Some(existing) = current_media_cache_metadata(
-            self.load_cached_media_metadata(&content_fingerprint)
-                .await?,
-        ) {
-            return Ok(Some(existing));
-        }
-
-        let payload = self.read_object_by_manifest_hash(manifest_hash).await?;
-        let metadata = self.build_media_cache_record(
-            manifest_hash,
-            &content_fingerprint,
-            manifest.total_size_bytes,
-            &payload,
-        );
-        self.persist_media_cache_record(&metadata).await?;
-        Ok(Some(metadata))
+        self.media_cache_worker().ensure_media_cache(manifest_hash).await
     }
 
     pub async fn list_metadata_subjects(&self) -> Result<Vec<String>> {
@@ -3098,81 +3088,14 @@ impl PersistentStore {
     }
 
     #[cfg(test)]
-    async fn load_cached_media_metadata(
-        &self,
-        content_fingerprint: &str,
-    ) -> Result<Option<CachedMediaMetadata>> {
-        self.metadata_store
-            .load_cached_media_metadata(content_fingerprint)
-            .await
-    }
-
-    #[cfg(test)]
-    fn build_media_cache_record(
-        &self,
-        manifest_hash: &str,
-        content_fingerprint: &str,
-        source_size_bytes: usize,
-        payload: &[u8],
-    ) -> CachedMediaMetadata {
-        let generated_at_unix = unix_ts();
-        match derive_image_media_cache(
-            manifest_hash,
-            content_fingerprint,
-            source_size_bytes,
-            payload,
-        ) {
-            Ok(derived) => derived,
-            Err(err) => CachedMediaMetadata {
-                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                content_fingerprint: content_fingerprint.to_string(),
-                source_manifest_hash: manifest_hash.to_string(),
-                status: MediaCacheStatus::Failed,
-                media_type: None,
-                mime_type: None,
-                width: None,
-                height: None,
-                orientation: None,
-                taken_at_unix: None,
-                gps: None,
-                thumbnail: None,
-                source_size_bytes,
-                generated_at_unix,
-                error: Some(err.to_string()),
-            },
-        }
-    }
-
-    #[cfg(test)]
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
-        if let Some(thumbnail) = &metadata.thumbnail {
-            let thumbnail_path =
-                self.media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
-            let payload = self
-                .render_thumbnail_payload(
-                    &metadata.source_manifest_hash,
-                    GRID_THUMBNAIL_MAX_DIMENSION,
-                )
-                .await?;
-            write_atomic(&thumbnail_path, &payload).await?;
-        }
-        self.metadata_store
-            .persist_media_cache_record(metadata)
-            .await
-    }
-
-    #[cfg(test)]
-    async fn render_thumbnail_payload(
-        &self,
-        manifest_hash: &str,
-        max_dimension: u32,
-    ) -> Result<Vec<u8>> {
-        let payload = self
-            .read_object_by_manifest_hash(manifest_hash)
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to read object for thumbnail render: {err}"))?;
-        render_thumbnail_from_payload(&payload, extract_exif_orientation(&payload), max_dimension)
-            .map(|rendered| rendered.payload)
+        persist_media_cache_record_with_payload(
+            &self.media_thumbnails_dir,
+            self.metadata_store.as_ref(),
+            metadata,
+            None,
+        )
+        .await
     }
 
     pub fn media_thumbnail_path(&self, content_fingerprint: &str, profile: &str) -> PathBuf {
@@ -4773,12 +4696,27 @@ async fn directory_size_bytes(root: &Path) -> Result<u64> {
     Ok(total)
 }
 
+async fn persist_media_cache_record_with_payload(
+    media_thumbnails_dir: &Path,
+    metadata_store: &dyn MetadataStore,
+    metadata: &CachedMediaMetadata,
+    thumbnail_payload: Option<&[u8]>,
+) -> Result<()> {
+    if let (Some(thumbnail), Some(payload)) = (&metadata.thumbnail, thumbnail_payload) {
+        let thumbnail_path = media_thumbnails_dir
+            .join(&metadata.content_fingerprint)
+            .join(format!("{}.jpg", thumbnail.profile));
+        write_atomic(&thumbnail_path, payload).await?;
+    }
+    metadata_store.persist_media_cache_record(metadata).await
+}
+
 fn derive_image_media_cache(
     manifest_hash: &str,
     content_fingerprint: &str,
     source_size_bytes: usize,
     payload: &[u8],
-) -> Result<CachedMediaMetadata> {
+) -> Result<DerivedMediaCacheArtifact> {
     let generated_at_unix = unix_ts();
     let format = match image::guess_format(payload) {
         Ok(format) => format,
@@ -4799,7 +4737,8 @@ fn derive_image_media_cache(
                 source_size_bytes,
                 generated_at_unix,
                 error: Some("unsupported media format".to_string()),
-            });
+            }
+            .into());
         }
     };
 
@@ -4822,7 +4761,8 @@ fn derive_image_media_cache(
                 source_size_bytes,
                 generated_at_unix,
                 error: Some("media format is not supported for thumbnail extraction".to_string()),
-            });
+            }
+            .into());
         }
     };
 
@@ -4832,28 +4772,31 @@ fn derive_image_media_cache(
     let (orientation, gps) = extract_exif_fields(payload);
     let rendered_thumbnail = render_thumbnail(image, orientation, GRID_THUMBNAIL_MAX_DIMENSION)?;
 
-    Ok(CachedMediaMetadata {
-        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-        content_fingerprint: content_fingerprint.to_string(),
-        source_manifest_hash: manifest_hash.to_string(),
-        status: MediaCacheStatus::Ready,
-        media_type: Some("image".to_string()),
-        mime_type: Some(mime_type),
-        width: Some(width),
-        height: Some(height),
-        orientation,
-        taken_at_unix: None,
-        gps,
-        thumbnail: Some(CachedThumbnailInfo {
-            profile: GRID_THUMBNAIL_PROFILE.to_string(),
-            format: "jpeg".to_string(),
-            width: rendered_thumbnail.width,
-            height: rendered_thumbnail.height,
-            size_bytes: rendered_thumbnail.payload.len() as u64,
-        }),
-        source_size_bytes,
-        generated_at_unix,
-        error: None,
+    Ok(DerivedMediaCacheArtifact {
+        metadata: CachedMediaMetadata {
+            schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+            content_fingerprint: content_fingerprint.to_string(),
+            source_manifest_hash: manifest_hash.to_string(),
+            status: MediaCacheStatus::Ready,
+            media_type: Some("image".to_string()),
+            mime_type: Some(mime_type),
+            width: Some(width),
+            height: Some(height),
+            orientation,
+            taken_at_unix: None,
+            gps,
+            thumbnail: Some(CachedThumbnailInfo {
+                profile: GRID_THUMBNAIL_PROFILE.to_string(),
+                format: "jpeg".to_string(),
+                width: rendered_thumbnail.width,
+                height: rendered_thumbnail.height,
+                size_bytes: rendered_thumbnail.payload.len() as u64,
+            }),
+            source_size_bytes,
+            generated_at_unix,
+            error: None,
+        },
+        thumbnail_payload: Some(rendered_thumbnail.payload),
     })
 }
 
@@ -4872,20 +4815,6 @@ fn current_media_cache_metadata(
     metadata: Option<CachedMediaMetadata>,
 ) -> Option<CachedMediaMetadata> {
     metadata.filter(|metadata| metadata.schema_version == MEDIA_CACHE_SCHEMA_VERSION)
-}
-
-fn extract_exif_orientation(payload: &[u8]) -> Option<u16> {
-    extract_exif_fields(payload).0
-}
-
-fn render_thumbnail_from_payload(
-    payload: &[u8],
-    orientation: Option<u16>,
-    max_dimension: u32,
-) -> Result<RenderedThumbnail> {
-    let image = image::load_from_memory(payload)
-        .context("failed to decode image while rendering thumbnail")?;
-    render_thumbnail(image, orientation, max_dimension)
 }
 
 fn render_thumbnail(
