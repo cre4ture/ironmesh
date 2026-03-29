@@ -6524,7 +6524,11 @@ async fn list_store_index_response(
             .await
         {
             Ok(Some(snapshot_state)) => {
-                let object_hashes = snapshot_state.objects;
+                let (object_hashes, object_ids) = filter_store_index_object_maps_for_prefix(
+                    snapshot_state.objects,
+                    snapshot_state.object_ids,
+                    &prefix,
+                );
                 let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
                 keys.sort();
                 let sizes = match store_index_inspector
@@ -6540,7 +6544,7 @@ async fn list_store_index_response(
                 let modified_times = match store_index_inspector
                     .object_modified_at_by_key(
                         &object_hashes,
-                        &snapshot_state.object_ids,
+                        &object_ids,
                         Some(snapshot_state.created_at_unix),
                     )
                     .await
@@ -6564,8 +6568,11 @@ async fn list_store_index_response(
             }
         }
     } else {
-        let object_hashes = store_index_inspector.current_object_hashes();
-        let object_ids = store_index_inspector.current_object_ids();
+        let (object_hashes, object_ids) = filter_store_index_object_maps_for_prefix(
+            store_index_inspector.current_object_hashes(),
+            store_index_inspector.current_object_ids(),
+            &prefix,
+        );
         let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
         keys.sort();
         let sizes = match store_index_inspector
@@ -6913,6 +6920,27 @@ fn media_type_for_path(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
     build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None)
+}
+
+fn filter_store_index_object_maps_for_prefix(
+    object_hashes: HashMap<String, String>,
+    object_ids: HashMap<String, String>,
+    prefix: &str,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let normalized_prefix = prefix.trim().trim_matches('/');
+    if normalized_prefix.is_empty() {
+        return (object_hashes, object_ids);
+    }
+
+    let object_hashes = object_hashes
+        .into_iter()
+        .filter(|(key, _)| store_index_remainder_for_prefix(key, normalized_prefix).is_some())
+        .collect();
+    let object_ids = object_ids
+        .into_iter()
+        .filter(|(key, _)| store_index_remainder_for_prefix(key, normalized_prefix).is_some())
+        .collect();
+    (object_hashes, object_ids)
 }
 
 fn build_store_index_entries_with_hashes(

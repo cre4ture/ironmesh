@@ -3688,6 +3688,33 @@ fn store_index_prefix_respects_path_boundaries() {
 }
 
 #[test]
+fn store_index_object_map_filter_respects_prefix_boundaries() {
+    let (hashes, object_ids) = super::filter_store_index_object_maps_for_prefix(
+        HashMap::from([
+            ("images/cat.png".to_string(), "hash-cat".to_string()),
+            ("images-raw/cat.png".to_string(), "hash-raw".to_string()),
+            ("images/dogs/beagle.png".to_string(), "hash-dog".to_string()),
+            ("docs/readme.md".to_string(), "hash-doc".to_string()),
+        ]),
+        HashMap::from([
+            ("images/cat.png".to_string(), "obj-cat".to_string()),
+            ("images-raw/cat.png".to_string(), "obj-raw".to_string()),
+            ("images/dogs/beagle.png".to_string(), "obj-dog".to_string()),
+            ("docs/readme.md".to_string(), "obj-doc".to_string()),
+        ]),
+        "images",
+    );
+
+    assert_eq!(hashes.len(), 2);
+    assert!(hashes.contains_key("images/cat.png"));
+    assert!(hashes.contains_key("images/dogs/beagle.png"));
+    assert!(!hashes.contains_key("images-raw/cat.png"));
+    assert_eq!(object_ids.len(), 2);
+    assert!(object_ids.contains_key("images/cat.png"));
+    assert!(object_ids.contains_key("images/dogs/beagle.png"));
+}
+
+#[test]
 fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
     let entries = vec![
         super::StoreIndexEntry {
