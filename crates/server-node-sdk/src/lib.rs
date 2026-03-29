@@ -128,7 +128,7 @@ use storage::{
     MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
     PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
     ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo, StorageStatsSample,
-    StoreReadError, UploadChunkRef, VersionConsistencyState,
+    StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
 };
 #[derive(Clone)]
 struct ServerState {
@@ -3368,6 +3368,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     );
     spawn_local_availability_refresher(state.clone(), startup_phase_anchor);
     spawn_storage_stats_refresher(state.clone());
+    spawn_media_metadata_backfill(state.clone(), "startup");
 
     let load_repair_attempts_phase_started_at =
         log_server_startup_phase_begin("load_repair_attempts", startup_phase_anchor);
@@ -5670,20 +5671,69 @@ fn should_trigger_autonomous_post_write_replication(
     autonomous_replication_on_put_enabled && !internal_replication
 }
 
-fn spawn_media_cache_warmup(state: ServerState, key: String, manifest_hash: String) {
+fn spawn_media_metadata_warmup(state: ServerState, key: String, manifest_hash: String) {
     tokio::spawn(async move {
         let media_cache_worker = {
             let store = read_store(&state, "media_cache_warmup.clone_worker").await;
             store.media_cache_worker()
         };
-        if let Err(err) = media_cache_worker.ensure_media_cache(&manifest_hash).await {
+        if let Err(err) = media_cache_worker
+            .ensure_media_metadata(&manifest_hash)
+            .await
+        {
             warn!(
                 key = %key,
                 manifest_hash = %manifest_hash,
                 error = %err,
-                "failed to warm media cache after write"
+                "failed to warm media metadata after write"
             );
         }
+    });
+}
+
+fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
+    tokio::spawn(async move {
+        let (media_cache_worker, targets) = {
+            let store = read_store(&state, "media_metadata_backfill.snapshot").await;
+            let inspector = store.store_index_inspector();
+            let mut targets = BTreeMap::new();
+            for (key, manifest_hash) in inspector.current_object_hashes() {
+                if looks_like_media_path(&key) && manifest_hash != TOMBSTONE_MANIFEST_HASH {
+                    targets.entry(manifest_hash).or_insert(key);
+                }
+            }
+            (store.media_cache_worker(), targets)
+        };
+
+        let target_count = targets.len();
+        if target_count == 0 {
+            return;
+        }
+
+        info!(
+            reason,
+            media_entries = target_count,
+            "starting media metadata backfill"
+        );
+        for (manifest_hash, key) in targets {
+            if let Err(err) = media_cache_worker
+                .ensure_media_metadata(&manifest_hash)
+                .await
+            {
+                warn!(
+                    reason,
+                    key = %key,
+                    manifest_hash = %manifest_hash,
+                    error = %err,
+                    "failed to backfill media metadata"
+                );
+            }
+        }
+        info!(
+            reason,
+            media_entries = target_count,
+            "finished media metadata backfill"
+        );
     });
 }
 
@@ -5810,7 +5860,7 @@ async fn put_object(
         Ok(outcome) => {
             drop(store);
             publish_namespace_change(&state);
-            spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
+            spawn_media_metadata_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
             let mut cluster = state.cluster.lock().await;
             cluster.note_replica(&key, state.node_id);
@@ -6209,7 +6259,7 @@ async fn complete_upload_session_route(
     drop(store);
 
     publish_namespace_change(&state);
-    spawn_media_cache_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
+    spawn_media_metadata_warmup(state.clone(), key.clone(), outcome.manifest_hash.clone());
 
     let mut cluster = state.cluster.lock().await;
     cluster.note_replica(&key, state.node_id);
@@ -7573,6 +7623,7 @@ async fn clear_media_cache_admin(
     match result {
         Ok(report) => {
             refresh_storage_stats_once(&state).await;
+            spawn_media_metadata_backfill(state.clone(), "clear_media_cache");
             append_admin_audit(
                 &state,
                 action,

@@ -1,6 +1,6 @@
 # Server-Node Media Cache
 
-`server-node` now maintains a server-side cache for image and video metadata plus thumbnails so mobile and web clients can list media-heavy directories without downloading original objects first.
+`server-node` now maintains a server-side cache for image and video metadata plus optional thumbnails so mobile and web clients can list media-heavy directories without downloading original objects first.
 
 ## Goals
 
@@ -17,10 +17,10 @@ Primary object/version state remains unchanged:
 - object manifests live under `manifests/`
 - current/snapshot/path state still points to manifest hashes
 
-Media derivatives are stored separately under:
+Media cache data is stored separately from manifests:
 
-- `state/media_cache/metadata/<content_fingerprint>.json`
-- `state/media_cache/thumbnails/<content_fingerprint>/grid.jpg`
+- metadata records live in the metadata database keyed by `content_fingerprint`
+- generated thumbnails live under `state/media_cache/thumbnails/<content_fingerprint>/grid.jpg`
 
 The cache is keyed by `content_fingerprint`, not by path.
 
@@ -48,6 +48,7 @@ Current implementation:
 - video inspection and thumbnail extraction handled by external `ffprobe` / `ffmpeg`
 - cached dimensions
 - EXIF orientation when available
+- EXIF capture time when available
 - EXIF GPS coordinates when available
 - one JPEG thumbnail profile: `grid` with a maximum dimension of 256 px
 - local video thumbnails built through a `concatf:` list of chunk files
@@ -105,7 +106,8 @@ When the object looks like an image or video but no cache record exists yet, the
 
 - `media.status = "pending"`
 
-The client can still request the thumbnail URL; the server will generate the cache on demand.
+Once metadata is available, `media.status` becomes `ready` even if `media.thumbnail` is still `null`.
+For images, current gallery clients already fall back to the original object when no thumbnail URL is present.
 
 ### `GET /media/thumbnail`
 
@@ -119,7 +121,7 @@ Query parameters:
 Behavior:
 
 - resolves the selected manifest for the requested object state
-- generates the media cache on demand when missing
+- ensures full media cache data, including the thumbnail, on demand when missing
 - returns the cached `grid` thumbnail as `image/jpeg`
 
 Example:
@@ -130,19 +132,28 @@ Example:
 
 ## Cache Warming
 
-New writes trigger asynchronous cache warming after successful upload/finalization. That covers:
+New writes trigger asynchronous metadata warming after successful upload/finalization. That covers:
 
 - `PUT /store/{key}`
 - chunked upload finalization via `POST /store/{key}?complete`
 
-Existing objects created before this feature are still handled lazily:
+Thumbnail generation remains lazy:
 
-- `GET /store/index` exposes `pending`
-- the first thumbnail request generates the cache
+- `GET /store/index` only reads cached media metadata
+- the first thumbnail request generates the thumbnail when it is still missing
+
+Existing objects are backfilled in the background:
+
+- once on server startup
+- after an admin-triggered media-cache clear
+
+This keeps map and metadata-driven views useful even after clearing thumbnails, without making directory listings block on thumbnail rendering.
 
 ## Cleanup
 
 `cleanup_unreferenced` now also removes unreferenced media-cache metadata and thumbnail directories when the associated content fingerprint is no longer reachable from retained manifests.
+
+The server-admin “clear media cache” action removes both metadata records and thumbnails, then immediately starts a background metadata-only backfill for all current media objects on that node.
 
 ## Client Guidance
 
@@ -156,8 +167,8 @@ For gallery-style UIs:
 ## Current Limits
 
 - one thumbnail profile only: `grid`
-- `taken_at_unix` is reserved in the response but not yet populated
 - EXIF extraction is best-effort and format-dependent
+- `taken_at_unix` is best-effort and may fall back to interpreting EXIF datetimes without an explicit offset as UTC
 - video thumbnails require `ffprobe` and `ffmpeg` to be available on `PATH`
 - video thumbnail generation currently assumes all chunk files for the manifest are already local on the node performing the work
 - objects that are not fully local do not yet use a remote-aware fallback path for video thumbnails

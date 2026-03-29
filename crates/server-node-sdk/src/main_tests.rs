@@ -4785,15 +4785,27 @@ async fn clear_media_cache_admin_requires_auth_and_clears_cached_media_impl(
     assert_eq!(payload["deleted_thumbnail_files"], 2);
     assert!(payload["deleted_thumbnail_bytes"].as_u64().unwrap() > 0);
 
-    let lookup = {
-        let locked = lock_store(&state, "tests.state.store").await;
-        locked
-            .lookup_media_cache(&manifest_hash)
-            .await
-            .unwrap()
-            .unwrap()
-    };
-    assert!(lookup.metadata.is_none());
+    let rebuilt = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let metadata = {
+                let locked = lock_store(&state, "tests.state.store").await;
+                locked
+                    .lookup_media_cache(&manifest_hash)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+            };
+            if let Some(metadata) = metadata {
+                break metadata;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("background media metadata rebuild should finish");
+    assert_eq!(rebuilt.status, super::storage::MediaCacheStatus::Ready);
+    assert!(rebuilt.thumbnail.is_none());
     assert!(!thumb_path.exists());
     assert!(!orphan_path.exists());
 
