@@ -2,6 +2,7 @@ use super::*;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 
 fn test_store_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -134,6 +135,29 @@ fn assert_dominant_color(pixel: &image::Rgb<u8>, expected: [u8; 3]) {
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
+}
+
+#[test]
+fn parse_exif_taken_at_supports_offsets_and_utc_fallback() {
+    let with_offset = parse_exif_taken_at(Some("2024:03:04 05:06:07"), Some("+02:30"));
+    let expected_with_offset = PrimitiveDateTime::new(
+        Date::from_calendar_date(2024, Month::March, 4).unwrap(),
+        Time::from_hms(5, 6, 7).unwrap(),
+    )
+    .assume_offset(UtcOffset::from_hms(2, 30, 0).unwrap())
+    .unix_timestamp() as u64;
+    assert_eq!(with_offset, Some(expected_with_offset));
+
+    let without_offset = parse_exif_taken_at(Some("2024:03:04 05:06:07"), None);
+    let expected_without_offset = PrimitiveDateTime::new(
+        Date::from_calendar_date(2024, Month::March, 4).unwrap(),
+        Time::from_hms(5, 6, 7).unwrap(),
+    )
+    .assume_utc()
+    .unix_timestamp() as u64;
+    assert_eq!(without_offset, Some(expected_without_offset));
+
+    assert_eq!(parse_exif_taken_at(Some("invalid"), Some("+02:00")), None);
 }
 
 #[cfg(unix)]
@@ -1704,6 +1728,56 @@ run_on_all_metadata_backends!(
     ensure_media_cache_rotates_exif_oriented_jpeg_thumbnail_turso
 );
 
+async fn ensure_media_metadata_persists_without_thumbnail_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-metadata-only").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/portrait.jpg",
+            Bytes::from(sample_oriented_jpeg_bytes(6)),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert_eq!(metadata.media_type.as_deref(), Some("image"));
+    assert_eq!(metadata.orientation, Some(6));
+    assert!(metadata.thumbnail.is_none());
+
+    let lookup = store
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let cached = lookup.metadata.expect("expected cached metadata");
+    assert!(cached.thumbnail.is_none());
+
+    let full = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(full.thumbnail.is_some());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_metadata_persists_without_thumbnail_impl,
+    ensure_media_metadata_persists_without_thumbnail,
+    ensure_media_metadata_persists_without_thumbnail_turso
+);
+
 #[cfg(unix)]
 async fn ensure_media_cache_generates_thumbnail_for_mp4_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("media-cache-mp4").await;
@@ -1749,6 +1823,54 @@ run_on_all_metadata_backends!(
     ensure_media_cache_generates_thumbnail_for_mp4_impl,
     ensure_media_cache_generates_thumbnail_for_mp4,
     ensure_media_cache_generates_thumbnail_for_mp4_turso
+);
+
+#[cfg(unix)]
+async fn ensure_video_metadata_survives_thumbnail_failures_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-metadata-video-preserve").await;
+    let tools_dir = root.join("test-video-tools");
+    let (ffprobe_path, _, _) = install_fake_video_tools(&tools_dir);
+    store.set_media_tool_paths_for_test(ffprobe_path, root.join("missing-ffmpeg"));
+
+    let put = store
+        .put_object_versioned(
+            "movies/clip.mp4",
+            Bytes::from(sample_large_chunked_payload()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert!(metadata.thumbnail.is_none());
+
+    let full = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(full.status, MediaCacheStatus::Ready);
+    assert_eq!(full.media_type.as_deref(), Some("video"));
+    assert_eq!(full.width, Some(1920));
+    assert_eq!(full.height, Some(1080));
+    assert!(full.thumbnail.is_none());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[cfg(unix)]
+run_on_all_metadata_backends!(
+    ensure_video_metadata_survives_thumbnail_failures_impl,
+    ensure_video_metadata_survives_thumbnail_failures,
+    ensure_video_metadata_survives_thumbnail_failures_turso
 );
 
 async fn clear_media_cache_removes_metadata_and_thumbnails_impl(backend: StorageTestBackend) {

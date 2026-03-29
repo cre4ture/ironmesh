@@ -14,6 +14,7 @@ use image::metadata::Orientation;
 use image::{DynamicImage, GenericImageView, ImageFormat};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -32,7 +33,7 @@ use self::turso_impl::TursoMetadataStore;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
-const MEDIA_CACHE_SCHEMA_VERSION: u32 = 3;
+const MEDIA_CACHE_SCHEMA_VERSION: u32 = 4;
 const GRID_THUMBNAIL_MAX_DIMENSION: u32 = 256;
 const GRID_THUMBNAIL_PROFILE: &str = "grid";
 const MEDIA_FORMAT_SNIFF_BYTES: usize = 64 * 1024;
@@ -818,9 +819,24 @@ impl MediaCacheWorker {
         }
     }
 
+    pub(crate) async fn ensure_media_metadata(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Option<CachedMediaMetadata>> {
+        self.ensure_media_artifact(manifest_hash, false).await
+    }
+
     pub(crate) async fn ensure_media_cache(
         &self,
         manifest_hash: &str,
+    ) -> Result<Option<CachedMediaMetadata>> {
+        self.ensure_media_artifact(manifest_hash, true).await
+    }
+
+    async fn ensure_media_artifact(
+        &self,
+        manifest_hash: &str,
+        include_thumbnail: bool,
     ) -> Result<Option<CachedMediaMetadata>> {
         let ensure_started_at = Instant::now();
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
@@ -831,41 +847,71 @@ impl MediaCacheWorker {
             return Ok(None);
         };
         let content_fingerprint = content_fingerprint_from_manifest(&manifest);
-        if let Some(existing) = current_media_cache_metadata(
+        let existing = current_media_cache_metadata(
             self.load_cached_media_metadata(&content_fingerprint)
                 .await?,
-        ) {
-            let total_ms = ensure_started_at.elapsed().as_millis();
-            if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
-                warn!(
-                    manifest_hash,
-                    content_fingerprint = %content_fingerprint,
-                    total_ms,
-                    cache_hit = true,
-                    status = ?existing.status,
-                    has_thumbnail = existing.thumbnail.is_some(),
-                    "slow media cache ensure"
-                );
+        );
+        if let Some(existing) = existing.as_ref() {
+            let cache_satisfies_request = !include_thumbnail
+                || existing.thumbnail.is_some()
+                || existing.status != MediaCacheStatus::Ready;
+            if !cache_satisfies_request {
+                // Fall through and rebuild the artifact with a thumbnail.
+            } else {
+                let total_ms = ensure_started_at.elapsed().as_millis();
+                if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
+                    warn!(
+                        manifest_hash,
+                        content_fingerprint = %content_fingerprint,
+                        total_ms,
+                        cache_hit = true,
+                        include_thumbnail,
+                        status = ?existing.status,
+                        has_thumbnail = existing.thumbnail.is_some(),
+                        "slow media cache ensure"
+                    );
+                }
+                return Ok(Some(existing.clone()));
             }
-            return Ok(Some(existing));
         }
 
         info!(
             manifest_hash,
             content_fingerprint = %content_fingerprint,
             source_size_bytes = manifest.total_size_bytes,
-            "media cache miss; generating thumbnail"
+            include_thumbnail,
+            metadata_present = existing.is_some(),
+            "media cache build requested"
         );
 
         let build_started_at = Instant::now();
         let derived = self
             .build_media_cache_artifact(
+                &manifest,
                 manifest_hash,
                 &content_fingerprint,
-                manifest.total_size_bytes,
+                include_thumbnail,
             )
             .await;
         let build_record_ms = build_started_at.elapsed().as_millis();
+        if include_thumbnail
+            && let Some(existing) = existing.as_ref()
+            && existing.status == MediaCacheStatus::Ready
+            && existing.thumbnail.is_none()
+            && (derived.metadata.status != MediaCacheStatus::Ready
+                || derived.metadata.thumbnail.is_none())
+        {
+            warn!(
+                manifest_hash,
+                content_fingerprint = %content_fingerprint,
+                include_thumbnail,
+                status = ?derived.metadata.status,
+                error = derived.metadata.error.as_deref().unwrap_or(""),
+                "media thumbnail build did not produce a thumbnail; keeping existing metadata"
+            );
+            return Ok(Some(existing.clone()));
+        }
+
         let persist_started_at = Instant::now();
         self.persist_media_cache_record(&derived).await?;
         let persist_ms = persist_started_at.elapsed().as_millis();
@@ -877,10 +923,11 @@ impl MediaCacheWorker {
             total_ms,
             build_record_ms,
             persist_ms,
+            include_thumbnail,
             status = ?metadata.status,
             has_thumbnail = metadata.thumbnail.is_some(),
             error = metadata.error.as_deref().unwrap_or(""),
-            "media cache generation finished"
+            "media cache build finished"
         );
         if total_ms >= SLOW_MEDIA_CACHE_GENERATION_LOG_THRESHOLD_MS {
             warn!(
@@ -889,10 +936,11 @@ impl MediaCacheWorker {
                 total_ms,
                 build_record_ms,
                 persist_ms,
+                include_thumbnail,
                 status = ?metadata.status,
                 has_thumbnail = metadata.thumbnail.is_some(),
                 error = metadata.error.as_deref().unwrap_or(""),
-                "slow media cache generation"
+                "slow media cache build"
             );
         }
         Ok(Some(metadata.clone()))
@@ -985,61 +1033,15 @@ impl MediaCacheWorker {
 
     async fn build_media_cache_artifact(
         &self,
+        manifest: &ObjectManifest,
         manifest_hash: &str,
         content_fingerprint: &str,
-        source_size_bytes: usize,
+        include_thumbnail: bool,
     ) -> DerivedMediaCacheArtifact {
         let generated_at_unix = unix_ts();
-        let manifest = match self.load_manifest_by_hash(manifest_hash).await {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => {
-                return DerivedMediaCacheArtifact {
-                    metadata: CachedMediaMetadata {
-                        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                        content_fingerprint: content_fingerprint.to_string(),
-                        source_manifest_hash: manifest_hash.to_string(),
-                        status: MediaCacheStatus::Failed,
-                        media_type: None,
-                        mime_type: None,
-                        width: None,
-                        height: None,
-                        orientation: None,
-                        taken_at_unix: None,
-                        gps: None,
-                        thumbnail: None,
-                        source_size_bytes,
-                        generated_at_unix,
-                        error: Some(format!("manifest missing for hash={manifest_hash}")),
-                    },
-                    thumbnail_payload: None,
-                };
-            }
-            Err(err) => {
-                return DerivedMediaCacheArtifact {
-                    metadata: CachedMediaMetadata {
-                        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                        content_fingerprint: content_fingerprint.to_string(),
-                        source_manifest_hash: manifest_hash.to_string(),
-                        status: MediaCacheStatus::Failed,
-                        media_type: None,
-                        mime_type: None,
-                        width: None,
-                        height: None,
-                        orientation: None,
-                        taken_at_unix: None,
-                        gps: None,
-                        thumbnail: None,
-                        source_size_bytes,
-                        generated_at_unix,
-                        error: Some(err.to_string()),
-                    },
-                    thumbnail_payload: None,
-                };
-            }
-        };
 
         let sniff_bytes = match read_object_prefix_from_manifest(
-            &manifest,
+            manifest,
             &self.chunks_dir,
             MEDIA_FORMAT_SNIFF_BYTES,
         )
@@ -1047,26 +1049,13 @@ impl MediaCacheWorker {
         {
             Ok(bytes) => bytes,
             Err(err) => {
-                return DerivedMediaCacheArtifact {
-                    metadata: CachedMediaMetadata {
-                        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                        content_fingerprint: content_fingerprint.to_string(),
-                        source_manifest_hash: manifest_hash.to_string(),
-                        status: MediaCacheStatus::Failed,
-                        media_type: None,
-                        mime_type: None,
-                        width: None,
-                        height: None,
-                        orientation: None,
-                        taken_at_unix: None,
-                        gps: None,
-                        thumbnail: None,
-                        source_size_bytes,
-                        generated_at_unix,
-                        error: Some(err.to_string()),
-                    },
-                    thumbnail_payload: None,
-                };
+                return failed_media_cache_artifact(
+                    manifest_hash,
+                    content_fingerprint,
+                    manifest.total_size_bytes,
+                    generated_at_unix,
+                    err.to_string(),
+                );
             }
         };
         let format = match image::guess_format(&sniff_bytes) {
@@ -1076,115 +1065,65 @@ impl MediaCacheWorker {
 
         if let Some(format) = format {
             if image_format_mime_type(format).is_none() {
-                return CachedMediaMetadata {
-                    schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                    content_fingerprint: content_fingerprint.to_string(),
-                    source_manifest_hash: manifest_hash.to_string(),
-                    status: MediaCacheStatus::Unsupported,
-                    media_type: None,
-                    mime_type: None,
-                    width: None,
-                    height: None,
-                    orientation: None,
-                    taken_at_unix: None,
-                    gps: None,
-                    thumbnail: None,
-                    source_size_bytes,
+                return unsupported_media_cache_artifact(
+                    manifest_hash,
+                    content_fingerprint,
+                    manifest.total_size_bytes,
                     generated_at_unix,
-                    error: Some(
-                        "media format is not supported for thumbnail extraction".to_string(),
-                    ),
-                }
-                .into();
+                    "media format is not supported for thumbnail extraction",
+                );
             }
 
             let payload = match self.read_object_by_manifest_hash(manifest_hash).await {
                 Ok(payload) => payload,
                 Err(err) => {
-                    return DerivedMediaCacheArtifact {
-                        metadata: CachedMediaMetadata {
-                            schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                            content_fingerprint: content_fingerprint.to_string(),
-                            source_manifest_hash: manifest_hash.to_string(),
-                            status: MediaCacheStatus::Failed,
-                            media_type: None,
-                            mime_type: None,
-                            width: None,
-                            height: None,
-                            orientation: None,
-                            taken_at_unix: None,
-                            gps: None,
-                            thumbnail: None,
-                            source_size_bytes,
-                            generated_at_unix,
-                            error: Some(err.to_string()),
-                        },
-                        thumbnail_payload: None,
-                    };
+                    return failed_media_cache_artifact(
+                        manifest_hash,
+                        content_fingerprint,
+                        manifest.total_size_bytes,
+                        generated_at_unix,
+                        err.to_string(),
+                    );
                 }
             };
 
             return match derive_image_media_cache(
                 manifest_hash,
                 content_fingerprint,
-                source_size_bytes,
+                manifest.total_size_bytes,
                 &payload,
+                include_thumbnail,
             ) {
                 Ok(derived) => derived,
-                Err(err) => DerivedMediaCacheArtifact {
-                    metadata: CachedMediaMetadata {
-                        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                        content_fingerprint: content_fingerprint.to_string(),
-                        source_manifest_hash: manifest_hash.to_string(),
-                        status: MediaCacheStatus::Failed,
-                        media_type: None,
-                        mime_type: None,
-                        width: None,
-                        height: None,
-                        orientation: None,
-                        taken_at_unix: None,
-                        gps: None,
-                        thumbnail: None,
-                        source_size_bytes,
-                        generated_at_unix,
-                        error: Some(err.to_string()),
-                    },
-                    thumbnail_payload: None,
-                },
+                Err(err) => failed_media_cache_artifact(
+                    manifest_hash,
+                    content_fingerprint,
+                    manifest.total_size_bytes,
+                    generated_at_unix,
+                    err.to_string(),
+                ),
             };
         }
 
         match derive_video_media_cache(
             manifest_hash,
             content_fingerprint,
-            source_size_bytes,
-            &manifest,
+            manifest.total_size_bytes,
+            manifest,
             &self.chunks_dir,
             &self.media_tools,
+            include_thumbnail,
         )
         .await
         {
             Ok(derived) => derived,
-            Err(err) => DerivedMediaCacheArtifact {
-                metadata: CachedMediaMetadata {
-                    schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                    content_fingerprint: content_fingerprint.to_string(),
-                    source_manifest_hash: manifest_hash.to_string(),
-                    status: MediaCacheStatus::Failed,
-                    media_type: None,
-                    mime_type: None,
-                    width: None,
-                    height: None,
-                    orientation: None,
-                    taken_at_unix: None,
-                    gps: None,
-                    thumbnail: None,
-                    source_size_bytes,
-                    generated_at_unix,
-                    error: Some(err.to_string()),
-                },
-                thumbnail_payload: None,
-            },
+            Err(err) => failed_media_cache_artifact(
+                manifest_hash,
+                content_fingerprint,
+                manifest.total_size_bytes,
+                generated_at_unix,
+                err.to_string(),
+            ),
         }
     }
 
@@ -1971,6 +1910,16 @@ impl PersistentStore {
     ) -> Result<Option<CachedMediaMetadata>> {
         self.media_cache_worker()
             .ensure_media_cache(manifest_hash)
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn ensure_media_metadata(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Option<CachedMediaMetadata>> {
+        self.media_cache_worker()
+            .ensure_media_metadata(manifest_hash)
             .await
     }
 
@@ -4944,6 +4893,75 @@ async fn directory_file_stats(root: &Path) -> Result<(usize, u64)> {
     Ok((files, total))
 }
 
+fn base_media_metadata(
+    manifest_hash: &str,
+    content_fingerprint: &str,
+    source_size_bytes: usize,
+    generated_at_unix: u64,
+) -> CachedMediaMetadata {
+    CachedMediaMetadata {
+        schema_version: MEDIA_CACHE_SCHEMA_VERSION,
+        content_fingerprint: content_fingerprint.to_string(),
+        source_manifest_hash: manifest_hash.to_string(),
+        status: MediaCacheStatus::Failed,
+        media_type: None,
+        mime_type: None,
+        width: None,
+        height: None,
+        orientation: None,
+        taken_at_unix: None,
+        gps: None,
+        thumbnail: None,
+        source_size_bytes,
+        generated_at_unix,
+        error: None,
+    }
+}
+
+fn failed_media_cache_artifact(
+    manifest_hash: &str,
+    content_fingerprint: &str,
+    source_size_bytes: usize,
+    generated_at_unix: u64,
+    error: impl Into<String>,
+) -> DerivedMediaCacheArtifact {
+    DerivedMediaCacheArtifact {
+        metadata: CachedMediaMetadata {
+            status: MediaCacheStatus::Failed,
+            error: Some(error.into()),
+            ..base_media_metadata(
+                manifest_hash,
+                content_fingerprint,
+                source_size_bytes,
+                generated_at_unix,
+            )
+        },
+        thumbnail_payload: None,
+    }
+}
+
+fn unsupported_media_cache_artifact(
+    manifest_hash: &str,
+    content_fingerprint: &str,
+    source_size_bytes: usize,
+    generated_at_unix: u64,
+    error: impl Into<String>,
+) -> DerivedMediaCacheArtifact {
+    DerivedMediaCacheArtifact {
+        metadata: CachedMediaMetadata {
+            status: MediaCacheStatus::Unsupported,
+            error: Some(error.into()),
+            ..base_media_metadata(
+                manifest_hash,
+                content_fingerprint,
+                source_size_bytes,
+                generated_at_unix,
+            )
+        },
+        thumbnail_payload: None,
+    }
+}
+
 async fn persist_media_cache_record_with_payload(
     media_thumbnails_dir: &Path,
     metadata_store: &dyn MetadataStore,
@@ -5030,6 +5048,7 @@ async fn derive_video_media_cache(
     manifest: &ObjectManifest,
     chunks_dir: &Path,
     media_tools: &MediaToolPaths,
+    include_thumbnail: bool,
 ) -> Result<DerivedMediaCacheArtifact> {
     let generated_at_unix = unix_ts();
     let chunk_paths = collect_local_chunk_paths(manifest, chunks_dir).await?;
@@ -5073,26 +5092,42 @@ async fn derive_video_media_cache(
             .context("failed to parse ffprobe JSON output")?;
         let Some(stream) = probe.streams.first() else {
             return Ok::<DerivedMediaCacheArtifact, anyhow::Error>(
-                CachedMediaMetadata {
-                    schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                    content_fingerprint: content_fingerprint.to_string(),
-                    source_manifest_hash: manifest_hash.to_string(),
-                    status: MediaCacheStatus::Unsupported,
-                    media_type: None,
-                    mime_type: None,
-                    width: None,
-                    height: None,
-                    orientation: None,
-                    taken_at_unix: None,
-                    gps: None,
-                    thumbnail: None,
+                unsupported_media_cache_artifact(
+                    manifest_hash,
+                    content_fingerprint,
                     source_size_bytes,
                     generated_at_unix,
-                    error: Some("unsupported media format".to_string()),
-                }
-                .into(),
+                    "unsupported media format",
+                ),
             );
         };
+
+        let mime_type = video_mime_type_for_format_name(
+            probe
+                .format
+                .as_ref()
+                .and_then(|format| format.format_name.as_deref()),
+        );
+        let metadata = CachedMediaMetadata {
+            status: MediaCacheStatus::Ready,
+            media_type: Some("video".to_string()),
+            mime_type,
+            width: stream.width,
+            height: stream.height,
+            ..base_media_metadata(
+                manifest_hash,
+                content_fingerprint,
+                source_size_bytes,
+                generated_at_unix,
+            )
+        };
+
+        if !include_thumbnail {
+            return Ok(DerivedMediaCacheArtifact {
+                metadata,
+                thumbnail_payload: None,
+            });
+        }
 
         let duration_secs = probe
             .format
@@ -5127,26 +5162,9 @@ async fn derive_video_media_cache(
         let ffmpeg_output = run_media_tool(&mut ffmpeg, FFMPEG_TIMEOUT_SECS, "ffmpeg").await?;
         let rendered = image::load_from_memory(&ffmpeg_output.stdout)
             .context("failed to decode ffmpeg thumbnail output")?;
-        let mime_type = video_mime_type_for_format_name(
-            probe
-                .format
-                .as_ref()
-                .and_then(|format| format.format_name.as_deref()),
-        );
 
         Ok(DerivedMediaCacheArtifact {
             metadata: CachedMediaMetadata {
-                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                content_fingerprint: content_fingerprint.to_string(),
-                source_manifest_hash: manifest_hash.to_string(),
-                status: MediaCacheStatus::Ready,
-                media_type: Some("video".to_string()),
-                mime_type,
-                width: stream.width,
-                height: stream.height,
-                orientation: None,
-                taken_at_unix: None,
-                gps: None,
                 thumbnail: Some(CachedThumbnailInfo {
                     profile: GRID_THUMBNAIL_PROFILE.to_string(),
                     format: "jpeg".to_string(),
@@ -5154,9 +5172,7 @@ async fn derive_video_media_cache(
                     height: rendered.height(),
                     size_bytes: ffmpeg_output.stdout.len() as u64,
                 }),
-                source_size_bytes,
-                generated_at_unix,
-                error: None,
+                ..metadata
             },
             thumbnail_payload: Some(ffmpeg_output.stdout),
         })
@@ -5246,75 +5262,67 @@ fn derive_image_media_cache(
     content_fingerprint: &str,
     source_size_bytes: usize,
     payload: &[u8],
+    include_thumbnail: bool,
 ) -> Result<DerivedMediaCacheArtifact> {
     let generated_at_unix = unix_ts();
     let format = match image::guess_format(payload) {
         Ok(format) => format,
         Err(_) => {
-            return Ok(CachedMediaMetadata {
-                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                content_fingerprint: content_fingerprint.to_string(),
-                source_manifest_hash: manifest_hash.to_string(),
-                status: MediaCacheStatus::Unsupported,
-                media_type: None,
-                mime_type: None,
-                width: None,
-                height: None,
-                orientation: None,
-                taken_at_unix: None,
-                gps: None,
-                thumbnail: None,
+            return Ok(unsupported_media_cache_artifact(
+                manifest_hash,
+                content_fingerprint,
                 source_size_bytes,
                 generated_at_unix,
-                error: Some("unsupported media format".to_string()),
-            }
-            .into());
+                "unsupported media format",
+            ));
         }
     };
 
     let mime_type = match image_format_mime_type(format) {
         Some(value) => value.to_string(),
         None => {
-            return Ok(CachedMediaMetadata {
-                schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-                content_fingerprint: content_fingerprint.to_string(),
-                source_manifest_hash: manifest_hash.to_string(),
-                status: MediaCacheStatus::Unsupported,
-                media_type: None,
-                mime_type: None,
-                width: None,
-                height: None,
-                orientation: None,
-                taken_at_unix: None,
-                gps: None,
-                thumbnail: None,
+            return Ok(unsupported_media_cache_artifact(
+                manifest_hash,
+                content_fingerprint,
                 source_size_bytes,
                 generated_at_unix,
-                error: Some("media format is not supported for thumbnail extraction".to_string()),
-            }
-            .into());
+                "media format is not supported for thumbnail extraction",
+            ));
         }
     };
 
     let image = image::load_from_memory_with_format(payload, format)
         .context("failed to decode image payload")?;
     let (width, height) = image.dimensions();
-    let (orientation, gps) = extract_exif_fields(payload);
+    let (orientation, gps, taken_at_unix) = extract_exif_fields(payload);
+    let metadata = CachedMediaMetadata {
+        status: MediaCacheStatus::Ready,
+        media_type: Some("image".to_string()),
+        mime_type: Some(mime_type),
+        width: Some(width),
+        height: Some(height),
+        orientation,
+        taken_at_unix,
+        gps,
+        ..base_media_metadata(
+            manifest_hash,
+            content_fingerprint,
+            source_size_bytes,
+            generated_at_unix,
+        )
+    };
+
+    if !include_thumbnail {
+        return Ok(DerivedMediaCacheArtifact {
+            metadata,
+            thumbnail_payload: None,
+        });
+    }
+
     let rendered_thumbnail = render_thumbnail(image, orientation, GRID_THUMBNAIL_MAX_DIMENSION)?;
 
     Ok(DerivedMediaCacheArtifact {
         metadata: CachedMediaMetadata {
-            schema_version: MEDIA_CACHE_SCHEMA_VERSION,
-            content_fingerprint: content_fingerprint.to_string(),
-            source_manifest_hash: manifest_hash.to_string(),
-            status: MediaCacheStatus::Ready,
-            media_type: Some("image".to_string()),
-            mime_type: Some(mime_type),
-            width: Some(width),
-            height: Some(height),
-            orientation,
-            taken_at_unix: None,
-            gps,
             thumbnail: Some(CachedThumbnailInfo {
                 profile: GRID_THUMBNAIL_PROFILE.to_string(),
                 format: "jpeg".to_string(),
@@ -5322,9 +5330,7 @@ fn derive_image_media_cache(
                 height: rendered_thumbnail.height,
                 size_bytes: rendered_thumbnail.payload.len() as u64,
             }),
-            source_size_bytes,
-            generated_at_unix,
-            error: None,
+            ..metadata
         },
         thumbnail_payload: Some(rendered_thumbnail.payload),
     })
@@ -5376,11 +5382,11 @@ fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {
     image.apply_orientation(orientation);
 }
 
-fn extract_exif_fields(payload: &[u8]) -> (Option<u16>, Option<MediaGpsCoordinates>) {
+fn extract_exif_fields(payload: &[u8]) -> (Option<u16>, Option<MediaGpsCoordinates>, Option<u64>) {
     let mut cursor = Cursor::new(payload);
     let exif = match ExifReader::new().read_from_container(&mut cursor) {
         Ok(value) => value,
-        Err(_) => return (None, None),
+        Err(_) => return (None, None, None),
     };
 
     let orientation = exif
@@ -5415,17 +5421,93 @@ fn extract_exif_fields(payload: &[u8]) -> (Option<u16>, Option<MediaGpsCoordinat
         _ => None,
     };
 
-    (orientation, gps)
+    let taken_at_unix = exif_taken_at_unix(&exif);
+
+    (orientation, gps, taken_at_unix)
 }
 
-fn exif_ascii_ref(field: Option<&exif::Field>) -> Option<char> {
+fn exif_taken_at_unix(exif: &exif::Exif) -> Option<u64> {
+    parse_exif_taken_at(
+        exif_ascii_string(exif.get_field(Tag::DateTimeOriginal, In::PRIMARY)),
+        exif_ascii_string(exif.get_field(Tag::OffsetTimeOriginal, In::PRIMARY))
+            .or_else(|| exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY))),
+    )
+    .or_else(|| {
+        parse_exif_taken_at(
+            exif_ascii_string(exif.get_field(Tag::DateTimeDigitized, In::PRIMARY)),
+            exif_ascii_string(exif.get_field(Tag::OffsetTimeDigitized, In::PRIMARY))
+                .or_else(|| exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY))),
+        )
+    })
+    .or_else(|| {
+        parse_exif_taken_at(
+            exif_ascii_string(exif.get_field(Tag::DateTime, In::PRIMARY)),
+            exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY)),
+        )
+    })
+}
+
+fn parse_exif_taken_at(datetime: Option<&str>, offset: Option<&str>) -> Option<u64> {
+    let date_time = parse_exif_datetime(datetime?)?;
+    let timestamp = match offset.and_then(parse_exif_offset) {
+        Some(offset) => date_time.assume_offset(offset).unix_timestamp(),
+        None => date_time.assume_utc().unix_timestamp(),
+    };
+    u64::try_from(timestamp).ok()
+}
+
+fn parse_exif_datetime(value: &str) -> Option<PrimitiveDateTime> {
+    let value = value.get(..19)?;
+    if !matches!(value.as_bytes().get(4), Some(b':'))
+        || !matches!(value.as_bytes().get(7), Some(b':'))
+        || !matches!(value.as_bytes().get(10), Some(b' '))
+        || !matches!(value.as_bytes().get(13), Some(b':'))
+        || !matches!(value.as_bytes().get(16), Some(b':'))
+    {
+        return None;
+    }
+
+    let year = value.get(0..4)?.parse::<i32>().ok()?;
+    let month = value.get(5..7)?.parse::<u8>().ok()?;
+    let day = value.get(8..10)?.parse::<u8>().ok()?;
+    let hour = value.get(11..13)?.parse::<u8>().ok()?;
+    let minute = value.get(14..16)?.parse::<u8>().ok()?;
+    let second = value.get(17..19)?.parse::<u8>().ok()?;
+
+    let month = Month::try_from(month).ok()?;
+    let date = Date::from_calendar_date(year, month, day).ok()?;
+    let time = Time::from_hms(hour, minute, second).ok()?;
+    Some(PrimitiveDateTime::new(date, time))
+}
+
+fn parse_exif_offset(value: &str) -> Option<UtcOffset> {
+    let value = value.get(..6)?;
+    if !matches!(value.as_bytes().first(), Some(b'+') | Some(b'-'))
+        || !matches!(value.as_bytes().get(3), Some(b':'))
+    {
+        return None;
+    }
+
+    let sign = if value.starts_with('-') { -1 } else { 1 };
+    let hours = value.get(1..3)?.parse::<i8>().ok()?;
+    let minutes = value.get(4..6)?.parse::<i8>().ok()?;
+    UtcOffset::from_hms(sign * hours, sign * minutes, 0).ok()
+}
+
+fn exif_ascii_string<'a>(field: Option<&'a exif::Field>) -> Option<&'a str> {
     match &field?.value {
         Value::Ascii(values) => {
             let value = values.first()?;
-            std::str::from_utf8(value).ok()?.chars().next()
+            let value = std::str::from_utf8(value).ok()?;
+            let value = value.trim_matches(char::from(0)).trim();
+            if value.is_empty() { None } else { Some(value) }
         }
         _ => None,
     }
+}
+
+fn exif_ascii_ref(field: Option<&exif::Field>) -> Option<char> {
+    exif_ascii_string(field)?.chars().next()
 }
 
 fn exif_gps_coordinate(value: &Value) -> Option<f64> {
