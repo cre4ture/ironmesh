@@ -36,6 +36,8 @@ use axum::routing::{get, post};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tokio::time::{Duration, Instant};
 use tower::{Service, ServiceExt};
 
@@ -151,6 +153,83 @@ fn sample_png_bytes() -> Vec<u8> {
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
+}
+
+#[cfg(unix)]
+fn sample_video_thumbnail_bytes() -> Vec<u8> {
+    let mut image = image::RgbImage::new(256, 144);
+    for y in 0..144 {
+        for x in 0..256 {
+            let pixel = if x < 128 {
+                image::Rgb([28, 99, 193])
+            } else {
+                image::Rgb([244, 180, 0])
+            };
+            image.put_pixel(x, y, pixel);
+        }
+    }
+
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90);
+    encoder
+        .encode_image(&image::DynamicImage::ImageRgb8(image))
+        .unwrap();
+    jpeg
+}
+
+#[cfg(unix)]
+fn install_fake_video_tools(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    std::fs::create_dir_all(dir).unwrap();
+    let poster_path = dir.join("poster.jpg");
+    std::fs::write(&poster_path, sample_video_thumbnail_bytes()).unwrap();
+
+    let ffprobe_path = dir.join("ffprobe");
+    let ffprobe_script = r#"#!/bin/sh
+set -eu
+input=""
+for arg in "$@"; do
+  input="$arg"
+done
+list="${input#concatf:}"
+[ -f "$list" ]
+line_count=$(wc -l < "$list" | tr -d ' ')
+[ "$line_count" -ge 3 ]
+grep -q '^file:' "$list"
+printf '%s\n' '{"streams":[{"width":1920,"height":1080}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.0"}}'
+"#;
+    std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
+
+    let ffmpeg_path = dir.join("ffmpeg");
+    let ffmpeg_script = format!(
+        r#"#!/bin/sh
+set -eu
+input=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-i" ]; then
+    input="$arg"
+    break
+  fi
+  prev="$arg"
+done
+list="${{input#concatf:}}"
+[ -f "$list" ]
+line_count=$(wc -l < "$list" | tr -d ' ')
+[ "$line_count" -ge 3 ]
+grep -q '^file:' "$list"
+cat '{}'
+"#,
+        poster_path.display()
+    );
+    std::fs::write(&ffmpeg_path, ffmpeg_script).unwrap();
+
+    for path in [&ffprobe_path, &ffmpeg_path] {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    (ffprobe_path, ffmpeg_path)
 }
 
 fn free_bind_addr() -> SocketAddr {
@@ -3983,6 +4062,70 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_impl,
     list_store_index_includes_cached_media_metadata_for_images,
     list_store_index_includes_cached_media_metadata_for_images_turso
+);
+
+#[cfg(unix)]
+async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let tools_dir = locked.root_dir().join("test-video-tools");
+        let (ffprobe_path, ffmpeg_path) = install_fake_video_tools(&tools_dir);
+        locked.set_media_tool_paths_for_test(ffprobe_path, ffmpeg_path);
+        locked
+            .put_object_versioned(
+                "gallery/clip.mp4",
+                bytes::Bytes::from(sample_large_chunked_payload()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let locked = lock_store(&state, "tests.state.store").await;
+        locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+    }
+
+    let response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: None,
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = payload["entries"].as_array().unwrap();
+    let media = &entries[0]["media"];
+
+    assert_eq!(entries[0]["path"], "gallery/clip.mp4");
+    assert_eq!(media["status"], "ready");
+    assert_eq!(media["media_type"], "video");
+    assert_eq!(media["mime_type"], "video/mp4");
+    assert_eq!(media["width"], 1920);
+    assert_eq!(media["height"], 1080);
+    assert!(
+        media["thumbnail"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("/media/thumbnail?key=gallery%2Fclip.mp4")
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[cfg(unix)]
+run_on_main_metadata_backends!(
+    list_store_index_includes_cached_media_metadata_for_videos_impl,
+    list_store_index_includes_cached_media_metadata_for_videos,
+    list_store_index_includes_cached_media_metadata_for_videos_turso
 );
 
 async fn metadata_import_makes_store_index_visible_without_marking_local_replica_impl(

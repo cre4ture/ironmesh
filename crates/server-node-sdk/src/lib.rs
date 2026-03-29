@@ -6563,9 +6563,9 @@ async fn list_store_index_response(
         Some(&key_sizes),
         Some(&key_modified_times),
     );
-    let image_entry_count = entries
+    let media_entry_count = entries
         .iter()
-        .filter(|entry| entry.entry_type == "key" && looks_like_image_path(&entry.path))
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
         .count();
     let media_lookup_started_at = Instant::now();
     let mut media_ready_count = 0;
@@ -6576,7 +6576,7 @@ async fn list_store_index_response(
     let mut media_error_count = 0;
     let media_lookup_waited_ms = 0;
     for entry in &mut entries {
-        if entry.entry_type != "key" || !looks_like_image_path(&entry.path) {
+        if entry.entry_type != "key" || !looks_like_media_path(&entry.path) {
             continue;
         }
 
@@ -6618,7 +6618,7 @@ async fn list_store_index_response(
         }
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
-    if image_entry_count > 0
+    if media_entry_count > 0
         && (media_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
             || media_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS)
     {
@@ -6628,7 +6628,7 @@ async fn list_store_index_response(
             snapshot = snapshot_label,
             depth,
             entry_count = entries.len(),
-            image_entry_count,
+            media_entry_count,
             lock_waited_ms = media_lookup_waited_ms,
             phase_ms = media_lookup_ms,
             ready_count = media_ready_count,
@@ -6759,6 +6759,7 @@ fn build_media_index_response(
     thumbnail_route: &str,
 ) -> MediaIndexResponse {
     let thumbnail_url = build_thumbnail_url(key, snapshot, thumbnail_route);
+    let pending_media_type = media_type_for_path(key).unwrap_or("image");
     match lookup.metadata.as_ref() {
         Some(metadata) => MediaIndexResponse {
             status: media_cache_status_label(&metadata.status).to_string(),
@@ -6786,7 +6787,7 @@ fn build_media_index_response(
         None => MediaIndexResponse {
             status: "pending".to_string(),
             content_fingerprint: lookup.content_fingerprint.clone(),
-            media_type: Some("image".to_string()),
+            media_type: Some(pending_media_type.to_string()),
             mime_type: None,
             width: None,
             height: None,
@@ -6833,16 +6834,29 @@ fn media_gps_response(value: &MediaGpsCoordinates) -> MediaGpsResponse {
     }
 }
 
-fn looks_like_image_path(path: &str) -> bool {
+fn looks_like_media_path(path: &str) -> bool {
+    media_type_for_path(path).is_some()
+}
+
+fn media_type_for_path(path: &str) -> Option<&'static str> {
     let extension = path
         .rsplit('.')
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    matches!(
+    if matches!(
         extension.as_str(),
         "bmp" | "gif" | "jpeg" | "jpg" | "png" | "webp"
-    )
+    ) {
+        return Some("image");
+    }
+    if matches!(
+        extension.as_str(),
+        "avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "ogv" | "ts" | "webm"
+    ) {
+        return Some("video");
+    }
+    None
 }
 
 #[cfg(test)]
