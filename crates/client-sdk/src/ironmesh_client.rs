@@ -7,7 +7,8 @@ use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use reqwest::Url;
 use reqwest::header::{
-    ACCEPT_RANGES, CONTENT_LENGTH, ETAG, HeaderMap, HeaderName, HeaderValue, IF_RANGE, RANGE,
+    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, HeaderName, HeaderValue,
+    IF_RANGE, RANGE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -61,6 +62,14 @@ struct BufferedTransportResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+}
+
+fn header_value_for_log(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<none>".to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -962,7 +971,7 @@ impl IronMeshClient {
             })
             .unwrap_or(0);
 
-        Ok(ObjectHeadResponse {
+        let head_response = ObjectHeadResponse {
             total_size_bytes,
             etag: response
                 .headers
@@ -975,7 +984,21 @@ impl IronMeshClient {
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.eq_ignore_ascii_case("bytes"))
                 .unwrap_or(false),
-        })
+        };
+
+        tracing::info!(
+            "client head-object response: key={} snapshot={} version={} status={} content_length={} object_size={} etag={} accept_ranges={}",
+            key,
+            snapshot.unwrap_or("<none>"),
+            version.unwrap_or("<none>"),
+            response.status,
+            header_value_for_log(&response.headers, CONTENT_LENGTH.as_str()),
+            head_response.total_size_bytes,
+            head_response.etag.as_deref().unwrap_or("<none>"),
+            head_response.accept_ranges
+        );
+
+        Ok(head_response)
     }
 
     async fn get_object_range_response(
@@ -996,11 +1019,30 @@ impl IronMeshClient {
             headers.push(simple_header(IF_RANGE, if_range)?);
         }
 
-        self.execute_buffered_request(Method::GET, url, headers, None)
+        let response = self
+            .execute_buffered_request(Method::GET, url, headers, None)
             .await
             .with_context(|| {
                 format!("failed to GET object range key={key} start={start} end={end_inclusive}")
-            })
+            })?;
+
+        tracing::info!(
+            "client range-response: key={} snapshot={} version={} start={} end={} status={} content_length={} content_range={} object_size={} etag={} accept_ranges={} body_len={}",
+            key,
+            snapshot.unwrap_or("<none>"),
+            version.unwrap_or("<none>"),
+            start,
+            end_inclusive,
+            response.status,
+            header_value_for_log(&response.headers, CONTENT_LENGTH.as_str()),
+            header_value_for_log(&response.headers, CONTENT_RANGE.as_str()),
+            header_value_for_log(&response.headers, "x-ironmesh-object-size"),
+            header_value_for_log(&response.headers, ETAG.as_str()),
+            header_value_for_log(&response.headers, ACCEPT_RANGES.as_str()),
+            response.body.len()
+        );
+
+        Ok(response)
     }
 
     async fn download_with_range_requests(
@@ -1050,6 +1092,19 @@ impl IronMeshClient {
                 StatusCode::PARTIAL_CONTENT => {
                     let expected_len = (end_inclusive - offset + 1) as usize;
                     if response.body.len() != expected_len {
+                        tracing::info!(
+                            "client range-response length mismatch: key={} range_start={} range_end={} expected_len={} actual_len={} status={} content_length={} content_range={} object_size={} etag={}",
+                            key,
+                            offset,
+                            end_inclusive,
+                            expected_len,
+                            response.body.len(),
+                            response.status,
+                            header_value_for_log(&response.headers, CONTENT_LENGTH.as_str()),
+                            header_value_for_log(&response.headers, CONTENT_RANGE.as_str()),
+                            header_value_for_log(&response.headers, "x-ironmesh-object-size"),
+                            header_value_for_log(&response.headers, ETAG.as_str())
+                        );
                         bail!(
                             "server returned unexpected range length for key={key}: expected={expected_len} actual={}",
                             response.body.len()

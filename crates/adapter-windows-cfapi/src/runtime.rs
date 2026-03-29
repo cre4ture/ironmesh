@@ -1057,6 +1057,84 @@ fn callback_target_session_id(callback_info: &CF_CALLBACK_INFO) -> u32 {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CallbackProcessLogInfo {
+    process_id: u32,
+    image_path: String,
+    package_name: String,
+    application_id: String,
+    command_line: String,
+}
+
+fn callback_process_log_info(callback_info: &CF_CALLBACK_INFO) -> CallbackProcessLogInfo {
+    if callback_info.ProcessInfo.is_null() {
+        return CallbackProcessLogInfo {
+            process_id: 0,
+            image_path: "<unknown>".to_string(),
+            package_name: "<unknown>".to_string(),
+            application_id: "<unknown>".to_string(),
+            command_line: "<unknown>".to_string(),
+        };
+    }
+
+    let process_info = unsafe { &*callback_info.ProcessInfo };
+    let image_path = string_from_pcwstr(process_info.ImagePath);
+    let package_name = string_from_pcwstr(process_info.PackageName);
+    let application_id = string_from_pcwstr(process_info.ApplicationId);
+    let command_line = string_from_pcwstr(process_info.CommandLine);
+
+    CallbackProcessLogInfo {
+        process_id: process_info.ProcessId,
+        image_path: if image_path.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            image_path
+        },
+        package_name: if package_name.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            package_name
+        },
+        application_id: if application_id.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            application_id
+        },
+        command_line: if command_line.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            command_line
+        },
+    }
+}
+
+fn describe_fetch_data_request_kind(flags: CF_CALLBACK_FETCH_DATA_FLAGS) -> String {
+    let mut labels = Vec::new();
+
+    if flags == CF_CALLBACK_FETCH_DATA_FLAG_NONE {
+        labels.push("implicit-hydration".to_string());
+    }
+    if (flags & CF_CALLBACK_FETCH_DATA_FLAG_RECOVERY) != 0 {
+        labels.push("recovery".to_string());
+    }
+    if (flags & CF_CALLBACK_FETCH_DATA_FLAG_EXPLICIT_HYDRATION) != 0 {
+        labels.push("explicit-hydration".to_string());
+    }
+
+    let known_flags =
+        CF_CALLBACK_FETCH_DATA_FLAG_RECOVERY | CF_CALLBACK_FETCH_DATA_FLAG_EXPLICIT_HYDRATION;
+    let unknown_flags = flags & !known_flags;
+    if unknown_flags != 0 {
+        labels.push(format!("unknown-flags(0x{:x})", unknown_flags as u32));
+    }
+
+    if labels.is_empty() {
+        "unspecified".to_string()
+    } else {
+        labels.join("+")
+    }
+}
+
 fn resolve_relative_path_from_callback(
     callback_info: &CF_CALLBACK_INFO,
     context: &CallbackContext,
@@ -1232,7 +1310,11 @@ unsafe extern "system" fn callback_fetch_data(
     let fetch_data = unsafe { (*callback_parameters).Anonymous.FetchData };
     let range_start = fetch_data.RequiredFileOffset.max(0) as u64;
     let range_length = fetch_data.RequiredLength.max(0) as u64;
+    let optional_range_start = fetch_data.OptionalFileOffset.max(0) as u64;
+    let optional_range_length = fetch_data.OptionalLength.max(0) as u64;
     let request_identity = callback_request_identity(callback_info_ref);
+    let request_kind = describe_fetch_data_request_kind(fetch_data.Flags);
+    let process_info = callback_process_log_info(callback_info_ref);
     let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
     let already_hydrated_once = context
         .hydrated_once_paths
@@ -1242,6 +1324,27 @@ unsafe extern "system" fn callback_fetch_data(
     let upload_snapshot = context
         .upload_debounce
         .debug_snapshot_for_path(&relative_path, 8);
+    tracing::info!(
+        "cfapi hydration-trigger: request={} transfer={} file_id={} session={} process_id={} process_image={} package_name={} application_id={} command_line={} path={} request_kind={} fetch_flags=0x{:x} required_offset={} required_length={} optional_offset={} optional_length={} last_dehydration_reason={} last_dehydration_time={}",
+        request_identity,
+        callback_info_ref.TransferKey,
+        callback_info_ref.FileId,
+        callback_target_session_id(callback_info_ref),
+        process_info.process_id,
+        process_info.image_path,
+        process_info.package_name,
+        process_info.application_id,
+        process_info.command_line,
+        relative_path,
+        request_kind,
+        fetch_data.Flags as u32,
+        range_start,
+        range_length,
+        optional_range_start,
+        optional_range_length,
+        fetch_data.LastDehydrationReason,
+        fetch_data.LastDehydrationTime
+    );
     tracing::info!(
         "cfapi fetch-data begin: request={} transfer={} file_id={} session={} path={} remote_version={} offset={} length={} already_hydrated_once={} upload_debounce={} state={}",
         request_identity,

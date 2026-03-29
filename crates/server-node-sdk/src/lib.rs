@@ -5524,6 +5524,12 @@ struct ObjectByteRange {
     end_inclusive: usize,
 }
 
+fn format_object_byte_range(range: Option<ObjectByteRange>) -> String {
+    range
+        .map(|range| format!("{}-{}", range.start, range.end_inclusive))
+        .unwrap_or_else(|| "<full>".to_string())
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct StoreIndexQuery {
     prefix: Option<String>,
@@ -7436,6 +7442,45 @@ async fn get_object_response(
 
     match read_result {
         Ok((status, range, stream_plan)) => {
+            let planned_content_length = stream_plan.content_length();
+            let planned_chunk_count = stream_plan.chunks.len();
+            let first_chunk = stream_plan
+                .chunks
+                .first()
+                .map(|chunk| {
+                    format!(
+                        "hash={} start={} len={}",
+                        chunk.hash, chunk.start, chunk.len
+                    )
+                })
+                .unwrap_or_else(|| "<none>".to_string());
+
+            if range.is_some() {
+                info!(
+                    key = %key,
+                    snapshot = query.snapshot.as_deref().unwrap_or("<none>"),
+                    version = query.version.as_deref().unwrap_or("<none>"),
+                    manifest_hash = %manifest_hash,
+                    requested_range = %headers
+                        .get(header::RANGE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>"),
+                    if_range = %headers
+                        .get(header::IF_RANGE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<none>"),
+                    selected_range = %format_object_byte_range(range),
+                    total_size_bytes,
+                    planned_content_length,
+                    planned_chunk_count,
+                    missing_chunks = missing_chunks.len(),
+                    refreshed_local_availability,
+                    first_chunk = %first_chunk,
+                    status = %status,
+                    "server object range response planned"
+                );
+            }
+
             build_object_stream_response(status, &etag, total_size_bytes, range, stream_plan)
         }
         Err(StoreReadError::NotFound) => StatusCode::NOT_FOUND.into_response(),

@@ -1018,17 +1018,36 @@ async fn get_or_create_mbtiles_source(
     Ok(source)
 }
 
-async fn download_object_range_bytes(
-    sdk: IronMeshClient,
+struct ObjectRangeSelection {
     key: String,
     snapshot: Option<String>,
     version: Option<String>,
     start: u64,
     length: u64,
+}
+
+struct ObjectRangeDownloadRequest {
+    sdk: IronMeshClient,
+    selection: ObjectRangeSelection,
     perf_logging_enabled: bool,
     cancelled: Arc<AtomicBool>,
-) -> Result<Vec<u8>> {
+}
+
+async fn download_object_range_bytes(request: ObjectRangeDownloadRequest) -> Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || {
+        let ObjectRangeDownloadRequest {
+            sdk,
+            selection,
+            perf_logging_enabled,
+            cancelled,
+        } = request;
+        let ObjectRangeSelection {
+            key,
+            snapshot,
+            version,
+            start,
+            length,
+        } = selection;
         let started = Instant::now();
         let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
         let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
@@ -1387,16 +1406,18 @@ async fn web_map_logical_file(
             continue;
         }
 
-        match download_object_range_bytes(
-            sdk.clone(),
-            part.key.clone(),
-            None,
-            None,
-            local_start,
-            segment_length,
-            state.map_perf_logging_enabled,
-            request_cancellation.flag(),
-        )
+        match download_object_range_bytes(ObjectRangeDownloadRequest {
+            sdk: sdk.clone(),
+            selection: ObjectRangeSelection {
+                key: part.key.clone(),
+                snapshot: None,
+                version: None,
+                start: local_start,
+                length: segment_length,
+            },
+            perf_logging_enabled: state.map_perf_logging_enabled,
+            cancelled: request_cancellation.flag(),
+        })
         .await
         {
             Ok(bytes) => body.extend_from_slice(&bytes),
@@ -2054,16 +2075,18 @@ async fn web_store_stream_binary(
         if head.accept_ranges {
             let request_cancellation = RequestCancellation::new();
             let _request_cancellation_guard = request_cancellation.guard();
-            match download_object_range_bytes(
+            match download_object_range_bytes(ObjectRangeDownloadRequest {
                 sdk,
-                query.key.clone(),
-                query.snapshot.clone(),
-                query.version.clone(),
-                range.start,
-                range_length,
-                false,
-                request_cancellation.flag(),
-            )
+                selection: ObjectRangeSelection {
+                    key: query.key.clone(),
+                    snapshot: query.snapshot.clone(),
+                    version: query.version.clone(),
+                    start: range.start,
+                    length: range_length,
+                },
+                perf_logging_enabled: false,
+                cancelled: request_cancellation.flag(),
+            })
             .await
             {
                 Ok(bytes) => bytes,
