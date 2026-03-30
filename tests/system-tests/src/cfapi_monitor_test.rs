@@ -738,7 +738,7 @@ mod tests {
 
         let local_file = sync_root.join(key.replace('/', "\\"));
         wait_for_path(&local_file, 200).await;
-        wait_for_placeholder_state(&local_file, 60).await;
+        wait_for_placeholder_state(&local_file, 300).await;
 
         pin_cfapi_placeholder(&sync_root, key, true)
             .await

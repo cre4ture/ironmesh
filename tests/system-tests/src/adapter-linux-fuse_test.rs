@@ -1065,12 +1065,13 @@ mod tests {
                 for _ in 0..220 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
 
-                    if folder_path.is_dir() && nested_folder_path.is_dir() && file_path.is_file() {
-                        if let Ok(hydrated) = fs::read(&file_path)
-                            && hydrated == expected_payload
-                        {
-                            return Ok::<(), anyhow::Error>(());
-                        }
+                    if folder_path.is_dir()
+                        && nested_folder_path.is_dir()
+                        && file_path.is_file()
+                        && let Ok(hydrated) = fs::read(&file_path)
+                        && hydrated == expected_payload
+                    {
+                        return Ok::<(), anyhow::Error>(());
                     }
 
                     sleep(Duration::from_millis(100)).await;

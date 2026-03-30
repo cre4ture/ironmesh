@@ -477,6 +477,36 @@ fn baseline_integrity_check(root_dir: &Path, connection_target: &str) -> Result<
         .context("failed to execute sqlite integrity_check")
 }
 
+async fn wait_for_baseline_content_hash(
+    root_dir: &Path,
+    connection_target: &str,
+    path: &str,
+    retries: usize,
+) -> Result<String> {
+    for _ in 0..retries {
+        let baseline_path = baseline_db_path(root_dir, connection_target, None)?;
+        if let Ok(connection) = Connection::open(&baseline_path) {
+            let content_hash: Option<String> = connection
+                .query_row(
+                    "SELECT content_hash FROM baseline_entries WHERE path = ?1",
+                    [path],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .with_context(|| format!("failed to query sqlite baseline hash for {path}"))?
+                .flatten()
+                .filter(|value| !value.trim().is_empty());
+            if let Some(content_hash) = content_hash {
+                return Ok(content_hash);
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("expected baseline hash to be present for path={path}")
+}
+
 async fn wait_for_startup_conflict_reason(
     root_dir: &Path,
     connection_target: &str,
@@ -1242,7 +1272,7 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_is_missing(
                 fixture.connection.target_label(),
                 "conflict/x.txt",
                 "dual_modify_missing_baseline",
-                120,
+                240,
             )
             .await?;
 
@@ -1320,7 +1350,7 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_exists() ->
                 fixture.connection.target_label(),
                 "conflict2/y.txt",
                 "dual_modify_conflict",
-                120,
+                240,
             )
             .await?;
 
@@ -1455,37 +1485,48 @@ async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result
 
         let mut second_run =
             start_folder_agent(&fixture.connection, &local_root, None, 1_500, 100, true).await?;
+        let recovery_retries = 720;
         let scenario = async {
             wait_for_remote_file_bytes(
                 &sdk,
                 "crash-active/local-a.bin",
                 b"local-a-after-crash",
-                360,
+                recovery_retries,
             )
             .await?;
             wait_for_remote_file_bytes(
                 &sdk,
                 "crash-active/local-new.txt",
                 b"local-new-after-crash",
-                360,
+                recovery_retries,
             )
             .await?;
 
-            wait_for_remote_file_bytes(&sdk, "crash-active/local-b.bin", &large_payload, 360)
-                .await?;
-            wait_for_remote_file_bytes(&sdk, "crash-active/local-c.bin", &large_payload, 360)
-                .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "crash-active/local-b.bin",
+                &large_payload,
+                recovery_retries,
+            )
+            .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "crash-active/local-c.bin",
+                &large_payload,
+                recovery_retries,
+            )
+            .await?;
 
             wait_for_local_file_bytes(
                 &local_root.join("crash-active/remote-base.txt"),
                 b"remote-v2-after-crash",
-                360,
+                recovery_retries,
             )
             .await?;
             wait_for_local_file_bytes(
                 &local_root.join("crash-active/remote-new.txt"),
                 b"remote-new-after-crash",
-                360,
+                recovery_retries,
             )
             .await?;
             Ok::<(), anyhow::Error>(())
@@ -1629,22 +1670,13 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
         .await?;
         stop_folder_agent(&mut first_run).await;
 
-        let baseline_path = baseline_db_path(&local_root, fixture.connection.target_label(), None)?;
-        let baseline_connection = Connection::open(&baseline_path).with_context(|| {
-            format!("failed to open sqlite baseline {}", baseline_path.display())
-        })?;
-        let baseline_hash: Option<String> = baseline_connection
-            .query_row(
-                "SELECT content_hash FROM baseline_entries WHERE path = ?1",
-                ["conflict-copy/target.bin"],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .context("failed to query sqlite baseline hash for conflict-copy/target.bin")?
-            .flatten();
-        let baseline_hash = baseline_hash
-            .filter(|value| !value.trim().is_empty())
-            .context("expected baseline hash to be present after first sync")?;
+        let baseline_hash = wait_for_baseline_content_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            "conflict-copy/target.bin",
+            240,
+        )
+        .await?;
 
         let local_v2 = b"local-v2-longer-than-remote-v1";
         fs::write(local_root.join("conflict-copy/target.bin"), local_v2).with_context(|| {

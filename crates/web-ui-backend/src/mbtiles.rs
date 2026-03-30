@@ -947,3 +947,162 @@ fn other_io_error(error: anyhow::Error) -> Error {
         Err(error) => Error::other(error.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlite_vfs::wip::WalIndex;
+
+    #[test]
+    fn active_tile_lookup_perf_guard_records_and_restores_previous_state() {
+        let outer_stats = Rc::new(RefCell::new(MbtilesTileLookupPerfStats::default()));
+        let inner_stats = Rc::new(RefCell::new(MbtilesTileLookupPerfStats::default()));
+
+        {
+            let _outer_guard = ActiveTileLookupPerfGuard::install(Some(Rc::clone(&outer_stats)));
+            record_active_tile_lookup_perf_stats(|stats| stats.vfs_reads += 1);
+            assert_eq!(outer_stats.borrow().vfs_reads, 1);
+
+            {
+                let _inner_guard =
+                    ActiveTileLookupPerfGuard::install(Some(Rc::clone(&inner_stats)));
+                record_active_tile_lookup_perf_stats(|stats| stats.segment_downloads += 2);
+                assert_eq!(inner_stats.borrow().segment_downloads, 2);
+                assert_eq!(outer_stats.borrow().segment_downloads, 0);
+            }
+
+            record_active_tile_lookup_perf_stats(|stats| stats.vfs_reads += 3);
+            assert_eq!(outer_stats.borrow().vfs_reads, 4);
+        }
+    }
+
+    #[test]
+    fn active_tile_lookup_cancellation_guard_tracks_and_restores_state() {
+        let outer = Arc::new(AtomicBool::new(false));
+        let inner = Arc::new(AtomicBool::new(true));
+
+        assert!(!active_tile_lookup_is_cancelled());
+
+        {
+            let _outer_guard = ActiveTileLookupCancellationGuard::install(Some(Arc::clone(&outer)));
+            assert!(!active_tile_lookup_is_cancelled());
+            assert!(ensure_active_tile_lookup_not_cancelled().is_ok());
+
+            {
+                let _inner_guard =
+                    ActiveTileLookupCancellationGuard::install(Some(Arc::clone(&inner)));
+                assert!(active_tile_lookup_is_cancelled());
+                let error = ensure_active_tile_lookup_not_cancelled().unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::Interrupted);
+            }
+
+            assert!(!active_tile_lookup_is_cancelled());
+        }
+
+        assert!(!active_tile_lookup_is_cancelled());
+    }
+
+    #[test]
+    fn logical_file_chunk_cache_evicts_oldest_entry_once_capacity_is_exceeded() {
+        let mut cache = LogicalFileChunkCache::default();
+
+        for chunk_index in 0..=SQLITE_RANGE_CACHE_MAX_CHUNKS as u64 {
+            cache.insert(chunk_index, Arc::new(vec![chunk_index as u8]));
+        }
+
+        assert_eq!(cache.chunks.len(), SQLITE_RANGE_CACHE_MAX_CHUNKS);
+        assert!(!cache.chunks.contains_key(&0));
+        assert!(
+            cache
+                .chunks
+                .contains_key(&(SQLITE_RANGE_CACHE_MAX_CHUNKS as u64))
+        );
+    }
+
+    #[test]
+    fn xyz_row_to_tms_converts_rows_and_rejects_invalid_coordinates() {
+        assert_eq!(xyz_row_to_tms(0, 0).unwrap(), 0);
+        assert_eq!(xyz_row_to_tms(3, 0).unwrap(), 7);
+        assert_eq!(xyz_row_to_tms(3, 7).unwrap(), 0);
+
+        let error = xyz_row_to_tms(2, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("y tile coordinate 4 is out of range for zoom 2")
+        );
+    }
+
+    #[test]
+    fn parse_center_accepts_two_or_three_coordinates() {
+        assert_eq!(parse_center("7.5, 46.8"), Some([7.5, 46.8, 0.0]));
+        assert_eq!(parse_center("7.5,46.8,12"), Some([7.5, 46.8, 12.0]));
+        assert_eq!(parse_center("7.5"), None);
+        assert_eq!(parse_center("7.5,nope,12"), None);
+    }
+
+    #[test]
+    fn infer_tile_mime_type_prefers_declared_format_and_falls_back_to_magic_bytes() {
+        assert_eq!(infer_tile_mime_type(&[], Some("JPEG")), "image/jpeg");
+        assert_eq!(
+            infer_tile_mime_type(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], None),
+            "image/png"
+        );
+        assert_eq!(
+            infer_tile_mime_type(&[0xff, 0xd8, 0xff, 0xdb], None),
+            "image/jpeg"
+        );
+        assert_eq!(
+            infer_tile_mime_type(
+                &[0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50],
+                None,
+            ),
+            "image/webp"
+        );
+        assert_eq!(
+            infer_tile_mime_type(b"plain-bytes", None),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn infer_vector_tile_content_encoding_detects_gzip_payloads() {
+        assert_eq!(
+            infer_vector_tile_content_encoding(&[0x1f, 0x8b, 0x08, 0x00]),
+            Some("gzip")
+        );
+        assert_eq!(infer_vector_tile_content_encoding(b"plain"), None);
+    }
+
+    #[test]
+    fn io_error_helpers_preserve_io_errors_and_wrap_other_failures() {
+        let canceled = canceled_anyhow("stop");
+        let canceled = canceled.downcast::<Error>().unwrap();
+        assert_eq!(canceled.kind(), ErrorKind::Interrupted);
+        assert_eq!(canceled.to_string(), "stop");
+
+        let permission_denied = Error::new(ErrorKind::PermissionDenied, "denied");
+        let preserved = other_io_error(anyhow::Error::new(permission_denied));
+        assert_eq!(preserved.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(preserved.to_string(), "denied");
+
+        let wrapped = other_io_error(anyhow!("boom"));
+        assert_eq!(wrapped.kind(), ErrorKind::Other);
+        assert!(wrapped.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn disabled_wal_index_rejects_mapping_and_locking() {
+        assert!(!<DisabledWalIndex as sqlite_vfs::wip::WalIndex>::enabled());
+
+        let mut wal = DisabledWalIndex;
+        let error = wal.map(0).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.to_string().contains("does not support WAL"));
+        assert!(
+            !wal.lock(0..1, sqlite_vfs::wip::WalIndexLock::Shared)
+                .unwrap()
+        );
+        wal.delete().unwrap();
+    }
+}
