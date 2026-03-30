@@ -278,6 +278,7 @@ struct CleanupCommand {
 }
 
 impl CleanupCommand {
+    #[cfg(windows)]
     fn new(
         program: impl Into<PathBuf>,
         args: Vec<OsString>,
@@ -367,6 +368,7 @@ impl ChildGuard {
         }
     }
 
+    #[cfg(windows)]
     pub fn with_cleanup_command(
         mut self,
         program: impl Into<PathBuf>,

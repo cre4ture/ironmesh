@@ -30,6 +30,67 @@ mod tests {
         cursor.into_inner()
     }
 
+    fn sample_vector_tile_gzip_bytes() -> Vec<u8> {
+        vec![
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x2b, 0xae, 0xcc, 0x2b,
+            0xc9, 0x48, 0x2d, 0xc9, 0x4c, 0xd6, 0x2d, 0x4b, 0x4d, 0x2e, 0xc9, 0x2f, 0xd2, 0x2d,
+            0xc9, 0xcc, 0x49, 0x05, 0x00, 0x40, 0xd7, 0x5a, 0x6c, 0x15, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    fn create_sample_vector_mbtiles_fixture(
+        root: &std::path::Path,
+    ) -> Result<(std::path::PathBuf, u32, u32, u32, Vec<u8>)> {
+        let fixture_path = root.join("sample-vector.mbtiles");
+        let fixture_db = rusqlite::Connection::open(&fixture_path)
+            .context("failed opening synthetic vector MBTiles fixture")?;
+        fixture_db
+            .execute_batch(
+                "create table metadata (name text, value text);
+                 create table tiles (
+                     zoom_level integer,
+                     tile_column integer,
+                     tile_row integer,
+                     tile_data blob
+                 );",
+            )
+            .context("failed creating synthetic vector MBTiles schema")?;
+
+        for (name, value) in [
+            ("name", "OpenMapTiles"),
+            ("format", "pbf"),
+            ("minzoom", "1"),
+            ("maxzoom", "1"),
+        ] {
+            fixture_db
+                .execute(
+                    "insert into metadata (name, value) values (?1, ?2)",
+                    rusqlite::params![name, value],
+                )
+                .with_context(|| format!("failed inserting synthetic MBTiles metadata {name}"))?;
+        }
+
+        let zoom_level = 1_u32;
+        let tile_column = 1_u32;
+        let tile_row_tms = 0_u32;
+        let tile_data = sample_vector_tile_gzip_bytes();
+        fixture_db
+            .execute(
+                "insert into tiles (zoom_level, tile_column, tile_row, tile_data)
+                 values (?1, ?2, ?3, ?4)",
+                rusqlite::params![zoom_level, tile_column, tile_row_tms, tile_data],
+            )
+            .context("failed inserting synthetic vector tile row")?;
+
+        Ok((
+            fixture_path,
+            zoom_level,
+            tile_column,
+            tile_row_tms,
+            tile_data,
+        ))
+    }
+
     fn sample_split_manifest_json(
         manifest_key: &str,
         logical_key: &str,
@@ -1158,29 +1219,12 @@ mod tests {
         let web_base = format!("http://{web_bind}");
         let client = reqwest::Client::new();
 
-        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../map/maptiler-server-map-styles-and-samples-3.15/maptiler-openmaptiles.mbtiles",
-        );
-        let fixture_db = rusqlite::Connection::open(&fixture_path)
-            .context("failed opening sample vector MBTiles fixture")?;
-        let (zoom_level, tile_column, tile_row_tms, expected_tile_bytes): (u32, u32, u32, Vec<u8>) =
-            fixture_db
-                .query_row(
-                    "select zoom_level, tile_column, tile_row, tile_data from tiles limit 1",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)? as u32,
-                            row.get::<_, i64>(1)? as u32,
-                            row.get::<_, i64>(2)? as u32,
-                            row.get::<_, Vec<u8>>(3)?,
-                        ))
-                    },
-                )
-                .context("failed selecting sample vector tile")?;
+        let fixture_dir = fresh_data_dir("web-ui-vector-mbtiles-fixture");
+        let (fixture_path, zoom_level, tile_column, tile_row_tms, expected_tile_bytes) =
+            create_sample_vector_mbtiles_fixture(&fixture_dir)?;
         let expected_xyz_y = (1_u32 << zoom_level) - 1 - tile_row_tms;
         let fixture_bytes =
-            fs::read(&fixture_path).context("failed reading sample vector MBTiles fixture")?;
+            fs::read(&fixture_path).context("failed reading synthetic vector MBTiles fixture")?;
         let split_one = fixture_bytes.len() / 3;
         let split_two = (fixture_bytes.len() * 2) / 3;
         let part_aa = fixture_bytes[..split_one].to_vec();

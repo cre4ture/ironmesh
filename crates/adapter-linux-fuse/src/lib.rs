@@ -180,9 +180,7 @@ pub mod runtime {
 
             let payload = self.hydrate(path, remote_version)?;
             let start = offset.min(payload.len() as u64) as usize;
-            let end = offset
-                .saturating_add(length)
-                .min(payload.len() as u64) as usize;
+            let end = offset.saturating_add(length).min(payload.len() as u64) as usize;
             Ok(payload[start..end].to_vec())
         }
     }
@@ -970,11 +968,9 @@ pub mod runtime {
                     .with_context(|| format!("failed to delete remote file {path}")),
                 FileType::Directory => {
                     let marker_path = format!("{}/", path.trim_end_matches('/'));
-                    self.uploader
-                        .delete_path(&marker_path)
-                        .with_context(|| {
-                            format!("failed to delete remote directory marker {marker_path}")
-                        })
+                    self.uploader.delete_path(&marker_path).with_context(|| {
+                        format!("failed to delete remote directory marker {marker_path}")
+                    })
                 }
                 _ => Err(anyhow!("unsupported inode type for remote delete")),
             }
@@ -1930,36 +1926,33 @@ pub mod runtime {
             ) -> Result<Option<String>> {
                 let mut bytes = Vec::new();
                 reader.read_to_end(&mut bytes)?;
-                self.ops
-                    .lock()
-                    .expect("upload op log lock poisoned")
-                    .push(RecordingUploadOp::Upload {
+                self.ops.lock().expect("upload op log lock poisoned").push(
+                    RecordingUploadOp::Upload {
                         path: path.to_string(),
                         length,
                         bytes,
-                    });
+                    },
+                );
                 Ok(Some("recorded".to_string()))
             }
 
             fn rename_path(&self, from_path: &str, to_path: &str, overwrite: bool) -> Result<()> {
-                self.ops
-                    .lock()
-                    .expect("upload op log lock poisoned")
-                    .push(RecordingUploadOp::Rename {
+                self.ops.lock().expect("upload op log lock poisoned").push(
+                    RecordingUploadOp::Rename {
                         from: from_path.to_string(),
                         to: to_path.to_string(),
                         overwrite,
-                    });
+                    },
+                );
                 Ok(())
             }
 
             fn delete_path(&self, path: &str) -> Result<()> {
-                self.ops
-                    .lock()
-                    .expect("upload op log lock poisoned")
-                    .push(RecordingUploadOp::Delete {
+                self.ops.lock().expect("upload op log lock poisoned").push(
+                    RecordingUploadOp::Delete {
                         path: path.to_string(),
-                    });
+                    },
+                );
                 Ok(())
             }
         }
@@ -2014,7 +2007,9 @@ pub mod runtime {
                 .expect("placeholder file missing")
                 .inode;
 
-            let bytes = fs.read_file_data(photo_inode, 9, 12).expect("range read should work");
+            let bytes = fs
+                .read_file_data(photo_inode, 9, 12)
+                .expect("range read should work");
             assert_eq!(bytes, b"range:docs/photo.jpg:v1:9:12");
 
             assert_eq!(
@@ -2176,7 +2171,8 @@ pub mod runtime {
                 .insert("from".to_string(), source_dir_inode);
 
             let child_inode = fs.next_inode();
-            let mut child = FsNode::regular_file(child_inode, "child.txt".to_string(), source_dir_inode);
+            let mut child =
+                FsNode::regular_file(child_inode, "child.txt".to_string(), source_dir_inode);
             child.data = b"payload".to_vec();
             child.size = child.data.len() as u64;
             fs.nodes.insert(child_inode, child);
@@ -2211,7 +2207,9 @@ pub mod runtime {
             );
             assert!(!fs.nodes.contains_key(&target_dir_inode));
             assert_eq!(
-                fs.nodes.get(&source_dir_inode).map(|node| node.name.as_str()),
+                fs.nodes
+                    .get(&source_dir_inode)
+                    .map(|node| node.name.as_str()),
                 Some("to")
             );
             assert_eq!(

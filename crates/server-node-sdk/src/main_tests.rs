@@ -4373,6 +4373,8 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
         assert_eq!(cluster_subjects.len(), 0);
     }
 
+    super::refresh_local_availability_view_once(&target).await;
+
     let after_subjects = axum::response::IntoResponse::into_response(
         super::local_available_subjects(axum::extract::State(target.clone())).await,
     );
