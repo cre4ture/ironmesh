@@ -1408,6 +1408,28 @@ mod tests {
             .collect())
     }
 
+    async fn wait_for_store_object_bytes(
+        client: &reqwest::Client,
+        base_url: &str,
+        key: &str,
+        expected: &[u8],
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(response) = client.get(format!("{base_url}/store/{key}")).send().await
+                && response.status() == StatusCode::OK
+                && let Ok(body) = response.bytes().await
+                && body.as_ref() == expected
+            {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!("store object {key} did not converge to expected payload at {base_url}");
+    }
+
     async fn wait_for_local_available_subject(
         client: &reqwest::Client,
         base_url: &str,
@@ -1590,14 +1612,7 @@ mod tests {
             );
 
             for (base_url, _, _, _) in &nodes {
-                let body = client
-                    .get(format!("{base_url}/store/{key}"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .bytes()
-                    .await?;
-                assert_eq!(body.as_ref(), payload.as_slice());
+                wait_for_store_object_bytes(&client, base_url, key, &payload, 160).await?;
             }
 
             for base_url in &missing_before_reads {
