@@ -34,6 +34,11 @@
   - Implement directory/file metadata operations.
   - Hydrate file data on read.
   - Route writes/renames/deletes to core engine.
+- Status surfacing recommendation:
+  - Expose lightweight sync state on the primary inode via read-only xattrs.
+  - Mount remote-side conflict artifacts under `.ironmesh-conflicts/remote/...`.
+  - Avoid sibling marker files next to user content because they pollute directory listings and
+    confuse apps/indexers.
 - Future option: GNOME GVfs or KDE KIO backend for tighter shell UX.
 
 ### Android
@@ -123,6 +128,38 @@ Out of scope for MVP:
   - Windows: upload on close/commit callback.
   - Linux: upload on flush/fsync boundary.
   - Android: upload pipe contents on write close.
+
+## Linux FUSE Status Surface
+
+The Linux mount should use a hybrid status model:
+
+- Primary files/directories stay in the normal namespace and expose state through read-only
+  `user.ironmesh.*` xattrs.
+- Conflict artifacts are mounted under `.ironmesh-conflicts/remote/...`.
+- The internal `.ironmesh-conflicts` subtree is reserved and read-only from the mount.
+
+Recommended xattrs:
+
+- `user.ironmesh.state`
+  - Comma-separated state flags such as `clean`, `placeholder`, `dirty`, `conflict`,
+    `conflict-copy`, and `read-only`.
+- `user.ironmesh.local_version`
+- `user.ironmesh.remote_version`
+- `user.ironmesh.conflict_reason`
+- `user.ironmesh.conflict_copy`
+  - Mount-relative path to the remote conflict artifact when present.
+- `user.ironmesh.source_path`
+  - For sidecar conflict copies, the original user-visible path they represent.
+
+Current Linux FUSE interpretation:
+
+- Runtime local modifications set `user.ironmesh.state=dirty` until upload succeeds on
+  flush/release.
+- Planner-provided `MarkConflict` actions surface both:
+  - a user-visible conflicted file with conflict xattrs, and
+  - a read-only remote-side artifact under `.ironmesh-conflicts/remote/...`.
+- The conflict sidecar mirrors the remote object view. This keeps the primary namespace clean
+  while preserving a discoverable place for remote conflict artifacts.
 
 ## Acceptance criteria for MVP
 
