@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::adapter::{CfapiAction, CfapiActionPlan, WindowsCfapiAdapter};
 use crate::auth::{ClientEnrollmentOptions, resolve_or_enroll_client_identity};
-use crate::cfapi::{cf_get_placeholder_standard_info, cf_set_pin_state};
+use crate::cfapi::{cf_get_placeholder_standard_info, cf_hydrate_placeholder, cf_set_pin_state};
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
 use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
@@ -358,6 +358,9 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
     if !args.wait {
         return Ok(());
     }
+
+    cf_hydrate_placeholder(&file)?;
+    tracing::info!("requested local hydration for {}", target_path.display());
 
     let timeout = Duration::from_millis(args.timeout_ms.max(1));
     let poll_interval = Duration::from_millis(args.poll_interval_ms.max(50));

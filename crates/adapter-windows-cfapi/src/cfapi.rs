@@ -90,6 +90,26 @@ pub fn cf_set_pin_state(
     hresult_nonneg(hr, "CfSetPinState")
 }
 
+pub fn cf_hydrate_placeholder(file: &std::fs::File) -> Result<()> {
+    use windows_sys::Win32::Storage::CloudFilters::{CF_HYDRATE_FLAG_NONE, CfHydratePlaceholder};
+
+    tracing::info!("cfapi hydrate-placeholder: issuing CfHydratePlaceholder");
+    let hr = unsafe {
+        CfHydratePlaceholder(
+            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            0,
+            -1,
+            CF_HYDRATE_FLAG_NONE,
+            std::ptr::null_mut(),
+        )
+    };
+    tracing::info!(
+        "cfapi hydrate-placeholder: CfHydratePlaceholder returned HRESULT 0x{:08x}",
+        hr as u32
+    );
+    hresult_nonneg(hr, "CfHydratePlaceholder")
+}
+
 pub fn cf_dehydrate_placeholder(file: &std::fs::File) -> Result<()> {
     use windows_sys::Win32::Storage::CloudFilters::{
         CF_DEHYDRATE_FLAG_NONE, CfDehydratePlaceholder,
