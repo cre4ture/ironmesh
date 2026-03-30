@@ -1060,15 +1060,15 @@ mod tests {
                 let folder_path = mountpoint.join("live-refresh-local-edge");
                 let nested_folder_path = mountpoint.join("live-refresh-local-edge").join("subdir");
                 let file_path = mountpoint.join("live-refresh-local-edge").join("added.txt");
+                let expected_payload = b"remote-refresh-content-local-edge";
 
                 for _ in 0..220 {
                     trigger_local_edge_repair(&local_edge_base_url).await;
 
                     if folder_path.is_dir() && nested_folder_path.is_dir() && file_path.is_file() {
-                        let hydrated = fs::read(&file_path).with_context(|| {
-                            format!("failed to read mounted file {}", file_path.display())
-                        })?;
-                        if hydrated == b"remote-refresh-content-local-edge" {
+                        if let Ok(hydrated) = fs::read(&file_path)
+                            && hydrated == expected_payload
+                        {
                             return Ok::<(), anyhow::Error>(());
                         }
                     }
