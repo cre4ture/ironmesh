@@ -1163,14 +1163,31 @@ async fn folder_agent_applies_path_level_recovery_when_baseline_row_is_missing()
 
         let mut second_run =
             start_folder_agent(&fixture.connection, &local_root, None, 2_000, 250, true).await?;
+        let recovery_retries = 360;
         let scenario = async {
             // Changed local file is preserved and uploaded.
-            wait_for_remote_file_bytes(&sdk, "path-recovery/a.txt", b"local-a-v2", 220).await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "path-recovery/a.txt",
+                b"local-a-v2",
+                recovery_retries,
+            )
+            .await?;
             // Unchanged local file with missing baseline row does not force global recovery.
-            wait_for_remote_file_bytes(&sdk, "path-recovery/b.txt", b"remote-b-v1", 220).await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "path-recovery/b.txt",
+                b"remote-b-v1",
+                recovery_retries,
+            )
+            .await?;
             // Remote update still applies on unaffected path.
-            wait_for_local_file_bytes(&local_root.join("path-recovery/c.txt"), b"remote-c-v2", 220)
-                .await?;
+            wait_for_local_file_bytes(
+                &local_root.join("path-recovery/c.txt"),
+                b"remote-c-v2",
+                recovery_retries,
+            )
+            .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;

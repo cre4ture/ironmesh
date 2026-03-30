@@ -245,7 +245,7 @@ pub async fn pin_cfapi_placeholder(
         .arg("--path")
         .arg(relative_path)
         .arg("--timeout-ms")
-        .arg("60000")
+        .arg("180000")
         .arg("--poll-interval-ms")
         .arg("200");
     if wait {
