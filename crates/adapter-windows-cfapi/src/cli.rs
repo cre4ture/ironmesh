@@ -365,7 +365,9 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
     let total_size = file.metadata()?.len() as i64;
 
     loop {
-        let info = cf_get_placeholder_standard_info(&file)?;
+        // Reopen the file for each poll so CFAPI progress reflects the latest placeholder state.
+        let poll_file = OpenOptions::new().read(true).open(&target_path)?;
+        let info = cf_get_placeholder_standard_info(&poll_file)?;
         tracing::info!(
             "pin progress: on_disk={} validated={} modified={} total={} pin_state={}",
             info.OnDiskDataSize,

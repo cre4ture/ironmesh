@@ -1511,14 +1511,7 @@ async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result
                 recovery_retries,
             )
             .await?;
-            wait_for_remote_file_bytes(
-                &sdk,
-                "crash-active/local-new.txt",
-                b"local-new-after-crash",
-                recovery_retries,
-            )
-            .await?;
-
+            // Large resumed uploads can legitimately finish before the small post-crash add.
             wait_for_remote_file_bytes(
                 &sdk,
                 "crash-active/local-b.bin",
@@ -1530,6 +1523,13 @@ async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result
                 &sdk,
                 "crash-active/local-c.bin",
                 &large_payload,
+                recovery_retries,
+            )
+            .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "crash-active/local-new.txt",
+                b"local-new-after-crash",
                 recovery_retries,
             )
             .await?;
