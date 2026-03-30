@@ -13,7 +13,10 @@ mod tests {
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
     use reqwest::StatusCode;
+    use std::ffi::CString;
     use std::fs;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -130,6 +133,32 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .context("failed to spawn linux fuse adapter via os-integration")?;
+
+        Ok(ChildGuard::with_resources(child, resource_guards))
+    }
+
+    async fn start_linux_fuse_adapter_with_snapshot(
+        snapshot_file: &Path,
+        mountpoint: &Path,
+    ) -> Result<ChildGuard> {
+        let os_integration_bin = binary_path("os-integration")?;
+        let mountpoint_arg = mountpoint.to_string_lossy().to_string();
+        let snapshot_arg = snapshot_file.to_string_lossy().to_string();
+        let resource_guards = lock_test_resources([
+            "linux-fuse-adapter".to_string(),
+            path_resource_key(mountpoint),
+        ])
+        .await;
+
+        let child = Command::new(os_integration_bin)
+            .arg("--snapshot-file")
+            .arg(&snapshot_arg)
+            .arg("--mountpoint")
+            .arg(&mountpoint_arg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn linux fuse adapter in snapshot mode")?;
 
         Ok(ChildGuard::with_resources(child, resource_guards))
     }
@@ -366,6 +395,71 @@ mod tests {
             "metadata for {} did not report size {}",
             path.display(),
             expected_size
+        );
+    }
+
+    fn read_xattr(path: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+        let path_cstr = CString::new(path.as_os_str().as_bytes())
+            .with_context(|| format!("failed to encode xattr path {}", path.display()))?;
+        let name_cstr =
+            CString::new(name).with_context(|| format!("failed to encode xattr name {name}"))?;
+
+        // Safe: pointers are valid for the duration of the libc call and lengths come from libc.
+        let size = unsafe {
+            libc::getxattr(
+                path_cstr.as_ptr(),
+                name_cstr.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if size < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENODATA) => Ok(None),
+                _ => Err(error).with_context(|| {
+                    format!("failed to get xattr size for {} ({name})", path.display())
+                }),
+            };
+        }
+
+        let mut buffer = vec![0_u8; size as usize];
+        // Safe: buffer is allocated to the size reported by the previous libc call.
+        let written = unsafe {
+            libc::getxattr(
+                path_cstr.as_ptr(),
+                name_cstr.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if written < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to read xattr for {} ({name})", path.display()));
+        }
+        buffer.truncate(written as usize);
+        Ok(Some(buffer))
+    }
+
+    async fn wait_for_xattr_value(
+        path: &Path,
+        name: &str,
+        expected: &[u8],
+        retries: usize,
+    ) -> Result<()> {
+        for _ in 0..retries {
+            if let Ok(Some(value)) = read_xattr(path, name)
+                && value.as_slice() == expected
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "xattr {} for {} did not match expected value",
+            name,
+            path.display()
         );
     }
 
@@ -1350,6 +1444,146 @@ mod tests {
         result
     }
 
+    async fn run_snapshot_conflict_status_surface_case() -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let mountpoint = fresh_data_dir("linux-fuse-conflict-status");
+        let snapshot_root = fresh_data_dir("linux-fuse-conflict-status-snapshot");
+        let snapshot_file = snapshot_root.join("snapshot.json");
+        let snapshot = serde_json::json!({
+            "local": [{
+                "namespace": {
+                    "path": "report.csv",
+                    "kind": "File",
+                    "version": "v-local",
+                    "content_hash": "h-local",
+                    "size_bytes": 96
+                },
+                "pin_state": "Pinned",
+                "hydration_state": "Hydrated"
+            }],
+            "remote": [{
+                "path": "report.csv",
+                "kind": "File",
+                "version": "v-remote",
+                "content_hash": "h-remote",
+                "size_bytes": 256
+            }]
+        });
+        fs::write(
+            &snapshot_file,
+            serde_json::to_vec_pretty(&snapshot).context("failed to serialize snapshot fixture")?,
+        )
+        .with_context(|| format!("failed to write {}", snapshot_file.display()))?;
+
+        let mut adapter =
+            start_linux_fuse_adapter_with_snapshot(&snapshot_file, &mountpoint).await?;
+        let scenario = async {
+            let primary = mountpoint.join("report.csv");
+            let conflict_copy = mountpoint
+                .join(".ironmesh-conflicts")
+                .join("remote")
+                .join("report.csv");
+            wait_for_file(&primary, 120).await?;
+            wait_for_file(&conflict_copy, 120).await?;
+            wait_for_metadata_size(&primary, 256, 120).await?;
+            wait_for_xattr_value(
+                &primary,
+                "user.ironmesh.state",
+                b"placeholder,conflict",
+                120,
+            )
+            .await?;
+            wait_for_xattr_value(
+                &primary,
+                "user.ironmesh.conflict_copy",
+                b".ironmesh-conflicts/remote/report.csv",
+                120,
+            )
+            .await?;
+            wait_for_xattr_value(
+                &conflict_copy,
+                "user.ironmesh.state",
+                b"placeholder,conflict,conflict-copy,read-only",
+                120,
+            )
+            .await?;
+            wait_for_xattr_value(
+                &conflict_copy,
+                "user.ironmesh.source_path",
+                b"report.csv",
+                120,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        let _ = fs::remove_dir_all(&snapshot_root);
+        scenario
+    }
+
+    async fn run_dirty_xattr_surface_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let mountpoint = fresh_data_dir("linux-fuse-dirty-xattr");
+        let mut fixture = start_authenticated_linux_fuse_fixture(bind).await?;
+        let sdk = fixture.sdk.clone();
+
+        let result = async {
+            sdk.put_large_aware("seed-dirty-xattr.txt", Bytes::from_static(b"seed"))
+                .await?;
+
+            let mut adapter = start_linux_fuse_adapter(&fixture.connection, &mountpoint).await?;
+            let scenario = async {
+                let seed_path = mountpoint.join("seed-dirty-xattr.txt");
+                wait_for_file(&seed_path, 120).await?;
+
+                let mounted_file = mountpoint.join("dirty-state.txt");
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&mounted_file)
+                    .with_context(|| {
+                        format!("failed to open mounted file {}", mounted_file.display())
+                    })?;
+                file.write_all(b"dirty-payload").with_context(|| {
+                    format!("failed to write mounted file {}", mounted_file.display())
+                })?;
+                file.flush().with_context(|| {
+                    format!("failed to flush mounted file {}", mounted_file.display())
+                })?;
+
+                wait_for_xattr_value(&mounted_file, "user.ironmesh.state", b"dirty", 120).await?;
+                drop(file);
+
+                wait_for_object_bytes(&sdk, "dirty-state.txt", b"dirty-payload", 180).await?;
+                wait_for_xattr_value(&mounted_file, "user.ironmesh.state", b"clean", 120).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            scenario
+        }
+        .await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        result
+    }
+
     async fn run_local_rename_move_case(bind: &str) -> Result<()> {
         let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
@@ -1866,6 +2100,16 @@ mod tests {
     #[tokio::test]
     async fn linux_fuse_zero_byte_creates_and_truncate_persist_remotely() -> Result<()> {
         run_zero_byte_create_persistence_case("127.0.0.1:19375").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_snapshot_mode_surfaces_conflict_xattrs_and_sidecars() -> Result<()> {
+        run_snapshot_conflict_status_surface_case().await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_surfaces_runtime_dirty_state_via_xattr() -> Result<()> {
+        run_dirty_xattr_surface_case("127.0.0.1:19376").await
     }
 
     #[tokio::test]

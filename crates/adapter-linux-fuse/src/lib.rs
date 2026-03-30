@@ -57,6 +57,7 @@ pub enum FuseAction {
         path: String,
         local_version: Option<String>,
         remote_version: Option<String>,
+        remote_size: Option<u64>,
     },
     RemovePath {
         path: String,
@@ -105,6 +106,7 @@ pub fn map_sync_plan_to_fuse_actions(
                 path: path.clone(),
                 local_version: local_version.clone(),
                 remote_version: remote_version.clone(),
+                remote_size: remote_sizes_by_path.get(path).copied(),
             },
         };
         actions.push(mapped);
@@ -120,9 +122,13 @@ pub mod runtime {
     use fuser::consts::FOPEN_DIRECT_IO;
     use fuser::{
         FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-        ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+        ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
+        TimeOrNow,
     };
-    use libc::{EACCES, EBADF, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM};
+    use libc::{
+        EACCES, EBADF, EEXIST, EINVAL, EIO, EISDIR, ENODATA, ENOENT, ENOTDIR, ENOTEMPTY, EPERM,
+        ERANGE,
+    };
     use std::collections::{BTreeMap, HashMap};
     use std::ffi::OsStr;
     use std::io::Cursor;
@@ -132,6 +138,15 @@ pub mod runtime {
 
     const ROOT_INODE: u64 = 1;
     const TTL: Duration = Duration::from_secs(1);
+    const CONFLICT_ROOT_NAME: &str = ".ironmesh-conflicts";
+    const CONFLICT_REMOTE_ROOT: &str = ".ironmesh-conflicts/remote";
+    const CONFLICT_REASON_DIVERGENT_VERSIONS: &str = "divergent_versions";
+    const XATTR_STATE: &str = "user.ironmesh.state";
+    const XATTR_LOCAL_VERSION: &str = "user.ironmesh.local_version";
+    const XATTR_REMOTE_VERSION: &str = "user.ironmesh.remote_version";
+    const XATTR_CONFLICT_REASON: &str = "user.ironmesh.conflict_reason";
+    const XATTR_CONFLICT_COPY: &str = "user.ironmesh.conflict_copy";
+    const XATTR_SOURCE_PATH: &str = "user.ironmesh.source_path";
 
     #[derive(Debug, Clone)]
     pub struct FuseMountConfig {
@@ -232,6 +247,21 @@ pub mod runtime {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum NodeNamespace {
+        User,
+        ConflictInternal,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct NodeSyncMetadata {
+        local_version: Option<String>,
+        remote_version: Option<String>,
+        conflict_reason: Option<String>,
+        conflict_copy_path: Option<String>,
+        source_path: Option<String>,
+    }
+
     #[derive(Debug, Clone)]
     struct FsNode {
         inode: u64,
@@ -243,6 +273,10 @@ pub mod runtime {
         children: BTreeMap<String, u64>,
         data: Vec<u8>,
         placeholder_version: Option<String>,
+        read_only: bool,
+        namespace: NodeNamespace,
+        backing_path: Option<String>,
+        sync_metadata: NodeSyncMetadata,
     }
 
     impl FsNode {
@@ -257,6 +291,10 @@ pub mod runtime {
                 children: BTreeMap::new(),
                 data: Vec::new(),
                 placeholder_version: None,
+                read_only: false,
+                namespace: NodeNamespace::User,
+                backing_path: None,
+                sync_metadata: NodeSyncMetadata::default(),
             }
         }
 
@@ -267,6 +305,10 @@ pub mod runtime {
             remote_version: String,
             size: u64,
         ) -> Self {
+            let sync_metadata = NodeSyncMetadata {
+                remote_version: Some(remote_version.clone()),
+                ..NodeSyncMetadata::default()
+            };
             Self {
                 inode,
                 name,
@@ -277,6 +319,10 @@ pub mod runtime {
                 children: BTreeMap::new(),
                 data: Vec::new(),
                 placeholder_version: Some(remote_version),
+                read_only: false,
+                namespace: NodeNamespace::User,
+                backing_path: None,
+                sync_metadata,
             }
         }
 
@@ -291,13 +337,17 @@ pub mod runtime {
                 children: BTreeMap::new(),
                 data: Vec::new(),
                 placeholder_version: None,
+                read_only: false,
+                namespace: NodeNamespace::User,
+                backing_path: None,
+                sync_metadata: NodeSyncMetadata::default(),
             }
         }
 
         fn attr(&self, uid: u32, gid: u32) -> FileAttr {
             let (perm, nlink) = match self.kind {
-                FileType::Directory => (0o755, 2),
-                _ => (0o644, 1),
+                FileType::Directory => (if self.read_only { 0o555 } else { 0o755 }, 2),
+                _ => (if self.read_only { 0o444 } else { 0o644 }, 1),
             };
 
             let blocks = if self.kind == FileType::Directory {
@@ -323,6 +373,10 @@ pub mod runtime {
                 blksize: 4096,
                 flags: 0,
             }
+        }
+
+        fn content_path(&self, resolved_path: String) -> String {
+            self.backing_path.clone().unwrap_or(resolved_path)
         }
     }
 
@@ -386,18 +440,43 @@ pub mod runtime {
                         remote_version,
                         remote_size,
                     } => {
+                        fs.clear_conflict_state_for_path(path);
                         fs.ensure_placeholder_file(path, remote_version, *remote_size);
                     }
-                    FuseAction::UploadOnFlush { .. }
-                    | FuseAction::MarkConflict { .. }
-                    | FuseAction::RemovePath { .. } => {}
+                    FuseAction::MarkConflict {
+                        path,
+                        local_version,
+                        remote_version,
+                        remote_size,
+                    } => {
+                        fs.mark_conflict_path(
+                            path,
+                            local_version.clone(),
+                            remote_version.clone(),
+                            *remote_size,
+                        );
+                    }
+                    FuseAction::UploadOnFlush { .. } | FuseAction::RemovePath { .. } => {}
                 }
             }
 
             fs
         }
 
-        fn ensure_directory(&mut self, relative_path: &str) -> u64 {
+        fn is_reserved_root_child(name: &str) -> bool {
+            name == CONFLICT_ROOT_NAME
+        }
+
+        fn conflict_copy_path(relative_path: &str) -> String {
+            format!("{CONFLICT_REMOTE_ROOT}/{relative_path}")
+        }
+
+        fn ensure_directory_in_namespace(
+            &mut self,
+            relative_path: &str,
+            namespace: NodeNamespace,
+            read_only: bool,
+        ) -> u64 {
             let mut current_inode = ROOT_INODE;
 
             for segment in relative_path
@@ -410,12 +489,21 @@ pub mod runtime {
                     .and_then(|node| node.children.get(segment).copied());
 
                 if let Some(inode) = existing {
+                    if let Some(node) = self.nodes.get_mut(&inode)
+                        && node.kind == FileType::Directory
+                    {
+                        node.namespace = namespace.clone();
+                        node.read_only |= read_only;
+                    }
                     current_inode = inode;
                     continue;
                 }
 
                 let next_inode = self.next_inode();
-                let directory = FsNode::directory(next_inode, segment.to_string(), current_inode);
+                let mut directory =
+                    FsNode::directory(next_inode, segment.to_string(), current_inode);
+                directory.namespace = namespace.clone();
+                directory.read_only = read_only;
                 self.nodes.insert(next_inode, directory);
                 if let Some(parent) = self.nodes.get_mut(&current_inode) {
                     parent.children.insert(segment.to_string(), next_inode);
@@ -424,6 +512,103 @@ pub mod runtime {
             }
 
             current_inode
+        }
+
+        fn ensure_directory(&mut self, relative_path: &str) -> u64 {
+            self.ensure_directory_in_namespace(relative_path, NodeNamespace::User, false)
+        }
+
+        fn ensure_internal_directory(&mut self, relative_path: &str) -> u64 {
+            self.ensure_directory_in_namespace(relative_path, NodeNamespace::ConflictInternal, true)
+        }
+
+        fn lookup_inode_by_relative_path(&self, relative_path: &str) -> Option<u64> {
+            let mut current_inode = ROOT_INODE;
+            if relative_path.is_empty() {
+                return Some(ROOT_INODE);
+            }
+
+            for segment in relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+            {
+                current_inode = self
+                    .nodes
+                    .get(&current_inode)?
+                    .children
+                    .get(segment)
+                    .copied()?;
+            }
+
+            Some(current_inode)
+        }
+
+        fn clear_conflict_metadata(&mut self, inode: u64) {
+            if let Some(node) = self.nodes.get_mut(&inode) {
+                node.sync_metadata.local_version = None;
+                node.sync_metadata.conflict_reason = None;
+                node.sync_metadata.conflict_copy_path = None;
+            }
+        }
+
+        fn clear_conflict_metadata_subtree(&mut self, inode: u64) {
+            let child_inodes = self
+                .nodes
+                .get(&inode)
+                .map(|node| node.children.values().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            self.clear_conflict_metadata(inode);
+            for child_inode in child_inodes {
+                self.clear_conflict_metadata_subtree(child_inode);
+            }
+        }
+
+        fn prune_empty_conflict_ancestors(&mut self, mut inode: u64) {
+            while inode != ROOT_INODE {
+                let Some(node) = self.nodes.get(&inode).cloned() else {
+                    break;
+                };
+                if node.namespace != NodeNamespace::ConflictInternal
+                    || node.kind != FileType::Directory
+                    || !node.children.is_empty()
+                {
+                    break;
+                }
+
+                let parent_inode = node.parent_inode;
+                if let Some(parent) = self.nodes.get_mut(&parent_inode) {
+                    parent.children.remove(&node.name);
+                }
+                self.nodes.remove(&inode);
+                inode = parent_inode;
+            }
+        }
+
+        fn remove_internal_conflict_copy(&mut self, relative_path: &str) {
+            let sidecar_path = Self::conflict_copy_path(relative_path);
+            let Some(inode) = self.lookup_inode_by_relative_path(&sidecar_path) else {
+                return;
+            };
+            if inode == ROOT_INODE {
+                return;
+            }
+
+            let Some(node) = self.nodes.get(&inode).cloned() else {
+                return;
+            };
+            let parent_inode = node.parent_inode;
+            if let Some(parent) = self.nodes.get_mut(&parent_inode) {
+                parent.children.remove(&node.name);
+            }
+            self.remove_inode_recursive(inode);
+            self.prune_empty_conflict_ancestors(parent_inode);
+        }
+
+        fn clear_conflict_state_for_path(&mut self, relative_path: &str) {
+            if let Some(inode) = self.lookup_inode_by_relative_path(relative_path) {
+                self.clear_conflict_metadata(inode);
+            }
+            self.remove_internal_conflict_copy(relative_path);
         }
 
         fn ensure_placeholder_file(
@@ -454,6 +639,7 @@ pub mod runtime {
                     file.placeholder_version = Some(remote_version.to_string());
                     file.data.clear();
                     file.size = remote_size.unwrap_or(0);
+                    file.sync_metadata.remote_version = Some(remote_version.to_string());
                 }
                 return;
             }
@@ -526,6 +712,7 @@ pub mod runtime {
                 file.data.clear();
                 file.size = remote_size.unwrap_or(0);
                 file.modified_at = SystemTime::now();
+                file.sync_metadata.remote_version = Some(remote_version.to_string());
                 return;
             }
 
@@ -540,6 +727,134 @@ pub mod runtime {
             self.nodes.insert(inode, file);
             if let Some(parent) = self.nodes.get_mut(&parent_inode) {
                 parent.children.insert(file_name.to_string(), inode);
+            }
+        }
+
+        fn mark_conflict_path(
+            &mut self,
+            relative_path: &str,
+            local_version: Option<String>,
+            remote_version: Option<String>,
+            remote_size: Option<u64>,
+        ) {
+            let mut segments: Vec<&str> = relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            if segments.is_empty() {
+                return;
+            }
+
+            let file_name = segments.pop().unwrap_or_default();
+            let parent_path = segments.join("/");
+            let parent_inode = self.ensure_directory(&parent_path);
+            let conflict_copy_path = Self::conflict_copy_path(relative_path);
+
+            let existing = self
+                .nodes
+                .get(&parent_inode)
+                .and_then(|node| node.children.get(file_name).copied());
+
+            if let Some(inode) = existing {
+                if let Some(file) = self.nodes.get_mut(&inode) {
+                    if file.kind != FileType::RegularFile {
+                        return;
+                    }
+                    if let Some(remote_version) = remote_version.as_ref()
+                        && file.placeholder_version.is_none()
+                        && file.data.is_empty()
+                    {
+                        file.placeholder_version = Some(remote_version.clone());
+                        file.size = remote_size.unwrap_or(0);
+                    }
+                    file.sync_metadata.local_version = local_version.clone();
+                    file.sync_metadata.remote_version = remote_version.clone();
+                    file.sync_metadata.conflict_reason =
+                        Some(CONFLICT_REASON_DIVERGENT_VERSIONS.to_string());
+                    file.sync_metadata.conflict_copy_path = Some(conflict_copy_path.clone());
+                    file.modified_at = SystemTime::now();
+                }
+            } else {
+                let inode = self.next_inode();
+                let mut file = match remote_version.as_ref() {
+                    Some(remote_version) => FsNode::placeholder_file(
+                        inode,
+                        file_name.to_string(),
+                        parent_inode,
+                        remote_version.clone(),
+                        remote_size.unwrap_or(0),
+                    ),
+                    None => FsNode::regular_file(inode, file_name.to_string(), parent_inode),
+                };
+                file.sync_metadata.local_version = local_version.clone();
+                file.sync_metadata.remote_version = remote_version.clone();
+                file.sync_metadata.conflict_reason =
+                    Some(CONFLICT_REASON_DIVERGENT_VERSIONS.to_string());
+                file.sync_metadata.conflict_copy_path = Some(conflict_copy_path.clone());
+                self.nodes.insert(inode, file);
+                if let Some(parent) = self.nodes.get_mut(&parent_inode) {
+                    parent.children.insert(file_name.to_string(), inode);
+                }
+            }
+
+            let Some(remote_version) = remote_version else {
+                return;
+            };
+
+            let mut sidecar_segments: Vec<&str> = conflict_copy_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            let sidecar_name = sidecar_segments.pop().unwrap_or_default();
+            let sidecar_parent_path = sidecar_segments.join("/");
+            let sidecar_parent = self.ensure_internal_directory(&sidecar_parent_path);
+            let existing_sidecar = self
+                .nodes
+                .get(&sidecar_parent)
+                .and_then(|node| node.children.get(sidecar_name).copied());
+
+            if let Some(sidecar_inode) = existing_sidecar {
+                if let Some(sidecar) = self.nodes.get_mut(&sidecar_inode) {
+                    if sidecar.kind != FileType::RegularFile {
+                        return;
+                    }
+                    sidecar.placeholder_version = Some(remote_version.clone());
+                    sidecar.size = remote_size.unwrap_or(0);
+                    sidecar.read_only = true;
+                    sidecar.namespace = NodeNamespace::ConflictInternal;
+                    sidecar.backing_path = Some(relative_path.to_string());
+                    sidecar.sync_metadata.local_version = local_version;
+                    sidecar.sync_metadata.remote_version = Some(remote_version);
+                    sidecar.sync_metadata.conflict_reason =
+                        Some(CONFLICT_REASON_DIVERGENT_VERSIONS.to_string());
+                    sidecar.sync_metadata.conflict_copy_path = Some(conflict_copy_path.clone());
+                    sidecar.sync_metadata.source_path = Some(relative_path.to_string());
+                }
+                return;
+            }
+
+            let sidecar_inode = self.next_inode();
+            let mut sidecar = FsNode::placeholder_file(
+                sidecar_inode,
+                sidecar_name.to_string(),
+                sidecar_parent,
+                remote_version.clone(),
+                remote_size.unwrap_or(0),
+            );
+            sidecar.read_only = true;
+            sidecar.namespace = NodeNamespace::ConflictInternal;
+            sidecar.backing_path = Some(relative_path.to_string());
+            sidecar.sync_metadata.local_version = local_version;
+            sidecar.sync_metadata.remote_version = Some(remote_version);
+            sidecar.sync_metadata.conflict_reason =
+                Some(CONFLICT_REASON_DIVERGENT_VERSIONS.to_string());
+            sidecar.sync_metadata.conflict_copy_path = Some(conflict_copy_path.clone());
+            sidecar.sync_metadata.source_path = Some(relative_path.to_string());
+            self.nodes.insert(sidecar_inode, sidecar);
+            if let Some(parent) = self.nodes.get_mut(&sidecar_parent) {
+                parent
+                    .children
+                    .insert(sidecar_name.to_string(), sidecar_inode);
             }
         }
 
@@ -594,6 +909,7 @@ pub mod runtime {
                 parent.children.remove(leaf_name);
             }
             self.remove_inode_recursive(target_inode);
+            self.remove_internal_conflict_copy(relative_path);
         }
 
         fn apply_remote_action_plan_refresh(&mut self, action_plan: &FuseActionPlan) {
@@ -606,6 +922,7 @@ pub mod runtime {
             for action in &action_plan.actions {
                 match action {
                     FuseAction::EnsureDirectory { path } => {
+                        self.clear_conflict_state_for_path(path);
                         self.ensure_directory(path);
                     }
                     FuseAction::EnsurePlaceholder {
@@ -618,15 +935,27 @@ pub mod runtime {
                         remote_version,
                         remote_size,
                     } => {
+                        self.clear_conflict_state_for_path(path);
                         self.ensure_placeholder_file_for_refresh(
                             path,
                             remote_version,
                             *remote_size,
                         );
                     }
-                    FuseAction::UploadOnFlush { .. }
-                    | FuseAction::MarkConflict { .. }
-                    | FuseAction::RemovePath { .. } => {}
+                    FuseAction::MarkConflict {
+                        path,
+                        local_version,
+                        remote_version,
+                        remote_size,
+                    } => {
+                        self.mark_conflict_path(
+                            path,
+                            local_version.clone(),
+                            remote_version.clone(),
+                            *remote_size,
+                        );
+                    }
+                    FuseAction::UploadOnFlush { .. } | FuseAction::RemovePath { .. } => {}
                 }
             }
         }
@@ -650,6 +979,113 @@ pub mod runtime {
             } else {
                 format!("{parent_path}/{name}")
             }
+        }
+
+        fn inode_has_dirty_state(&self, inode: u64) -> bool {
+            self.open_handles
+                .values()
+                .any(|handle| handle.inode == inode && handle.write_access && handle.dirty)
+        }
+
+        fn xattr_entries_for_inode(&self, inode: u64) -> Result<Vec<(String, Vec<u8>)>> {
+            let node = self
+                .nodes
+                .get(&inode)
+                .ok_or_else(|| anyhow!("inode not found: {inode}"))?;
+
+            let mut entries = Vec::new();
+            let mut state = Vec::new();
+            if node.placeholder_version.is_some() {
+                state.push("placeholder");
+            }
+            if self.inode_has_dirty_state(inode) {
+                state.push("dirty");
+            }
+            if node.sync_metadata.conflict_reason.is_some() {
+                state.push("conflict");
+            }
+            if node.namespace == NodeNamespace::ConflictInternal
+                && node.kind == FileType::RegularFile
+            {
+                state.push("conflict-copy");
+            }
+            if node.read_only {
+                state.push("read-only");
+            }
+            if state.is_empty() {
+                state.push("clean");
+            }
+            entries.push((XATTR_STATE.to_string(), state.join(",").into_bytes()));
+
+            if let Some(local_version) = node.sync_metadata.local_version.as_deref() {
+                entries.push((
+                    XATTR_LOCAL_VERSION.to_string(),
+                    local_version.as_bytes().to_vec(),
+                ));
+            }
+            if let Some(remote_version) = node.sync_metadata.remote_version.as_deref() {
+                entries.push((
+                    XATTR_REMOTE_VERSION.to_string(),
+                    remote_version.as_bytes().to_vec(),
+                ));
+            }
+            if let Some(conflict_reason) = node.sync_metadata.conflict_reason.as_deref() {
+                entries.push((
+                    XATTR_CONFLICT_REASON.to_string(),
+                    conflict_reason.as_bytes().to_vec(),
+                ));
+            }
+            if let Some(conflict_copy_path) = node.sync_metadata.conflict_copy_path.as_deref() {
+                entries.push((
+                    XATTR_CONFLICT_COPY.to_string(),
+                    conflict_copy_path.as_bytes().to_vec(),
+                ));
+            }
+            if let Some(source_path) = node.sync_metadata.source_path.as_deref() {
+                entries.push((
+                    XATTR_SOURCE_PATH.to_string(),
+                    source_path.as_bytes().to_vec(),
+                ));
+            }
+
+            Ok(entries)
+        }
+
+        fn xattr_value_for_inode(&self, inode: u64, name: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self
+                .xattr_entries_for_inode(inode)?
+                .into_iter()
+                .find_map(|(entry_name, value)| (entry_name == name).then_some(value)))
+        }
+
+        fn xattr_name_list_for_inode(&self, inode: u64) -> Result<Vec<u8>> {
+            let mut payload = Vec::new();
+            for (name, _) in self.xattr_entries_for_inode(inode)? {
+                payload.extend_from_slice(name.as_bytes());
+                payload.push(0);
+            }
+            Ok(payload)
+        }
+
+        fn reply_xattr_payload(payload: &[u8], size: u32, reply: ReplyXattr) {
+            if size == 0 {
+                reply.size(payload.len() as u32);
+                return;
+            }
+
+            if payload.len() > size as usize {
+                reply.error(ERANGE);
+                return;
+            }
+
+            reply.data(payload);
+        }
+
+        fn parent_allows_mutation(&self, parent: u64, name: &str) -> bool {
+            let Some(parent_node) = self.nodes.get(&parent) else {
+                return false;
+            };
+            !parent_node.read_only && !(parent == ROOT_INODE && Self::is_reserved_root_child(name))
         }
 
         fn collect_subtree_nodes(
@@ -799,7 +1235,7 @@ pub mod runtime {
                 let Some(version) = node.placeholder_version.clone() else {
                     return Ok(());
                 };
-                (self.resolve_full_path(inode), version)
+                (node.content_path(self.resolve_full_path(inode)), version)
             };
 
             let data = self.hydrator.hydrate(&path, &version)?;
@@ -826,7 +1262,7 @@ pub mod runtime {
                 }
 
                 (
-                    self.resolve_full_path(inode),
+                    node.content_path(self.resolve_full_path(inode)),
                     node.placeholder_version.clone(),
                 )
             };
@@ -872,6 +1308,7 @@ pub mod runtime {
                 node.size = size;
                 node.modified_at = SystemTime::now();
                 node.placeholder_version = None;
+                node.sync_metadata.local_version = None;
             }
             Ok(changed)
         }
@@ -913,6 +1350,9 @@ pub mod runtime {
                 .ok_or_else(|| anyhow!("inode not found"))?;
             if node.kind != FileType::RegularFile {
                 return Err(anyhow!("inode {inode} is not a regular file"));
+            }
+            if node.read_only {
+                return Err(anyhow!("inode {inode} is read-only"));
             }
 
             let path = self.resolve_full_path(inode);
@@ -994,12 +1434,22 @@ pub mod runtime {
             if old_parent_node.kind != FileType::Directory {
                 return Err(anyhow!("source parent inode is not a directory"));
             }
+            if old_parent_node.read_only
+                || (parent == ROOT_INODE && Self::is_reserved_root_child(name))
+            {
+                return Err(anyhow!("source parent is read-only"));
+            }
 
             let Some(new_parent_node) = self.nodes.get(&newparent) else {
                 return Err(anyhow!("destination parent inode missing"));
             };
             if new_parent_node.kind != FileType::Directory {
                 return Err(anyhow!("destination parent inode is not a directory"));
+            }
+            if new_parent_node.read_only
+                || (newparent == ROOT_INODE && Self::is_reserved_root_child(newname))
+            {
+                return Err(anyhow!("destination parent is read-only"));
             }
 
             let Some(inode) = old_parent_node.children.get(name).copied() else {
@@ -1013,6 +1463,9 @@ pub mod runtime {
             let Some(source_node) = self.nodes.get(&inode).cloned() else {
                 return Err(anyhow!("source inode missing"));
             };
+            if source_node.read_only {
+                return Err(anyhow!("source inode is read-only"));
+            }
 
             let dest_inode = new_parent_node.children.get(newname).copied();
             if let Some(dest_inode) = dest_inode {
@@ -1023,6 +1476,9 @@ pub mod runtime {
                 let Some(dest_node) = self.nodes.get(&dest_inode).cloned() else {
                     return Err(anyhow!("destination inode missing"));
                 };
+                if dest_node.read_only {
+                    return Err(anyhow!("destination inode is read-only"));
+                }
 
                 match (source_node.kind, dest_node.kind) {
                     (FileType::RegularFile, FileType::RegularFile) => {}
@@ -1047,6 +1503,7 @@ pub mod runtime {
             let new_full_path = Self::child_path(&new_parent_path, newname);
 
             if let Some(dest_inode) = dest_inode {
+                self.remove_internal_conflict_copy(&new_full_path);
                 self.delete_remote_path_for_inode(dest_inode)?;
             }
 
@@ -1067,6 +1524,8 @@ pub mod runtime {
             }
 
             self.apply_local_rename(parent, name, newparent, newname, inode)?;
+            self.clear_conflict_metadata_subtree(inode);
+            self.remove_internal_conflict_copy(&old_full_path);
             Ok(())
         }
 
@@ -1194,6 +1653,10 @@ pub mod runtime {
                 reply.error(EINVAL);
                 return;
             }
+            if !self.parent_allows_mutation(parent, name) {
+                reply.error(EACCES);
+                return;
+            }
             if parent_node.children.contains_key(name) {
                 reply.error(EEXIST);
                 return;
@@ -1254,6 +1717,10 @@ pub mod runtime {
             };
             if name.is_empty() || name.contains('/') {
                 reply.error(EINVAL);
+                return;
+            }
+            if !self.parent_allows_mutation(parent, name) {
+                reply.error(EACCES);
                 return;
             }
             if parent_node.children.contains_key(name) {
@@ -1317,6 +1784,10 @@ pub mod runtime {
                 reply.error(ENOENT);
                 return;
             };
+            if child_node.read_only {
+                reply.error(EPERM);
+                return;
+            }
             if child_node.kind == FileType::Directory {
                 reply.error(EISDIR);
                 return;
@@ -1334,6 +1805,7 @@ pub mod runtime {
             self.nodes.remove(&child_inode);
             self.open_handles
                 .retain(|_, handle| handle.inode != child_inode);
+            self.remove_internal_conflict_copy(&child_path);
             reply.ok();
         }
 
@@ -1367,6 +1839,10 @@ pub mod runtime {
                 reply.error(ENOENT);
                 return;
             };
+            if child_node.read_only {
+                reply.error(EPERM);
+                return;
+            }
             if child_node.kind != FileType::Directory {
                 reply.error(ENOTDIR);
                 return;
@@ -1380,6 +1856,7 @@ pub mod runtime {
                 "{}/",
                 self.resolve_full_path(child_inode).trim_end_matches('/')
             );
+            let child_path = self.resolve_full_path(child_inode);
             if self.uploader.delete_path(&directory_marker_path).is_err() {
                 reply.error(EIO);
                 return;
@@ -1389,6 +1866,7 @@ pub mod runtime {
                 parent_node.children.remove(name);
             }
             self.nodes.remove(&child_inode);
+            self.remove_internal_conflict_copy(&child_path);
             reply.ok();
         }
 
@@ -1438,6 +1916,14 @@ pub mod runtime {
                 reply.error(ENOTDIR);
                 return;
             }
+            if old_parent_node.read_only
+                || new_parent_node.read_only
+                || (parent == ROOT_INODE && Self::is_reserved_root_child(old_name))
+                || (newparent == ROOT_INODE && Self::is_reserved_root_child(new_name))
+            {
+                reply.error(EPERM);
+                return;
+            }
 
             let Some(inode) = old_parent_node.children.get(old_name).copied() else {
                 reply.error(ENOENT);
@@ -1453,6 +1939,10 @@ pub mod runtime {
                 reply.error(ENOENT);
                 return;
             };
+            if node.read_only {
+                reply.error(EPERM);
+                return;
+            }
 
             if let Some(existing_inode) = new_parent_node.children.get(new_name).copied() {
                 if existing_inode == inode {
@@ -1464,6 +1954,10 @@ pub mod runtime {
                     reply.error(ENOENT);
                     return;
                 };
+                if existing_node.read_only {
+                    reply.error(EPERM);
+                    return;
+                }
 
                 match (node.kind, existing_node.kind) {
                     (FileType::RegularFile, FileType::RegularFile) => {}
@@ -1525,6 +2019,10 @@ pub mod runtime {
             }
 
             let write_access = Self::write_requested(flags);
+            if node.read_only && write_access {
+                reply.error(EACCES);
+                return;
+            }
             if write_access && (flags & libc::O_TRUNC) != 0 {
                 if let Err(_error) = self.truncate_if_needed(ino, 0) {
                     reply.error(EIO);
@@ -1572,6 +2070,10 @@ pub mod runtime {
             };
             if name.is_empty() || name.contains('/') {
                 reply.error(EINVAL);
+                return;
+            }
+            if !self.parent_allows_mutation(parent, name) {
+                reply.error(EACCES);
                 return;
             }
             if parent_node.children.contains_key(name) {
@@ -1673,6 +2175,10 @@ pub mod runtime {
                 reply.error(ENOENT);
                 return;
             }
+            if file.read_only {
+                reply.error(EACCES);
+                return;
+            }
 
             if file.data.len() < start {
                 file.data.resize(start, 0);
@@ -1684,6 +2190,7 @@ pub mod runtime {
             file.size = file.data.len() as u64;
             file.modified_at = SystemTime::now();
             file.placeholder_version = None;
+            file.sync_metadata.local_version = None;
 
             if let Some(handle) = self.open_handles.get_mut(&fh) {
                 handle.dirty = true;
@@ -1721,6 +2228,10 @@ pub mod runtime {
                     reply.error(ENOENT);
                     return;
                 };
+                if node.read_only {
+                    reply.error(EACCES);
+                    return;
+                }
 
                 if Self::should_hydrate_for_size_change(node, size)
                     && let Err(_error) = self.hydrate_if_needed(ino)
@@ -1793,6 +2304,54 @@ pub mod runtime {
                 Ok(()) => reply.ok(),
                 Err(_error) => reply.error(EIO),
             }
+        }
+
+        fn setxattr(
+            &mut self,
+            _req: &Request<'_>,
+            _ino: u64,
+            _name: &OsStr,
+            _value: &[u8],
+            _flags: i32,
+            _position: u32,
+            reply: ReplyEmpty,
+        ) {
+            reply.error(EPERM);
+        }
+
+        fn getxattr(
+            &mut self,
+            _req: &Request<'_>,
+            ino: u64,
+            name: &OsStr,
+            size: u32,
+            reply: ReplyXattr,
+        ) {
+            self.drain_remote_updates();
+
+            let Some(name) = name.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+
+            match self.xattr_value_for_inode(ino, name) {
+                Ok(Some(payload)) => Self::reply_xattr_payload(&payload, size, reply),
+                Ok(None) => reply.error(ENODATA),
+                Err(_error) => reply.error(ENOENT),
+            }
+        }
+
+        fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+            self.drain_remote_updates();
+
+            match self.xattr_name_list_for_inode(ino) {
+                Ok(payload) => Self::reply_xattr_payload(&payload, size, reply),
+                Err(_error) => reply.error(ENOENT),
+            }
+        }
+
+        fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
+            reply.error(EPERM);
         }
     }
 
@@ -2080,6 +2639,141 @@ pub mod runtime {
         }
 
         #[test]
+        fn conflict_actions_surface_xattrs_and_conflict_sidecars() {
+            let hydrator = RecordingHydrator::default();
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan {
+                    actions: vec![FuseAction::MarkConflict {
+                        path: "albums/report.csv".to_string(),
+                        local_version: Some("v-local".to_string()),
+                        remote_version: Some("v-remote".to_string()),
+                        remote_size: Some(2048),
+                    }],
+                },
+                Box::new(hydrator.clone()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            let user_inode = fs
+                .lookup_inode_by_relative_path("albums/report.csv")
+                .expect("conflicted user file should exist");
+            let sidecar_inode = fs
+                .lookup_inode_by_relative_path(".ironmesh-conflicts/remote/albums/report.csv")
+                .expect("conflict sidecar should exist");
+
+            assert_eq!(
+                fs.xattr_value_for_inode(user_inode, XATTR_STATE)
+                    .expect("xattr lookup should work"),
+                Some(b"placeholder,conflict".to_vec())
+            );
+            assert_eq!(
+                fs.xattr_value_for_inode(user_inode, XATTR_CONFLICT_COPY)
+                    .expect("xattr lookup should work"),
+                Some(b".ironmesh-conflicts/remote/albums/report.csv".to_vec())
+            );
+            assert_eq!(
+                fs.xattr_value_for_inode(sidecar_inode, XATTR_STATE)
+                    .expect("xattr lookup should work"),
+                Some(b"placeholder,conflict,conflict-copy,read-only".to_vec())
+            );
+            assert_eq!(
+                fs.xattr_value_for_inode(sidecar_inode, XATTR_SOURCE_PATH)
+                    .expect("xattr lookup should work"),
+                Some(b"albums/report.csv".to_vec())
+            );
+
+            let sidecar_bytes = fs
+                .read_file_data(sidecar_inode, 4, 7)
+                .expect("sidecar range read should work");
+            assert_eq!(sidecar_bytes, b"range:albums/report.csv:v-remote:4:7");
+            assert_eq!(
+                hydrator
+                    .range_calls
+                    .lock()
+                    .expect("range hydrate call log lock poisoned")
+                    .as_slice(),
+                &[(String::from("albums/report.csv:v-remote"), 4, 7)]
+            );
+        }
+
+        #[test]
+        fn dirty_state_xattr_tracks_open_write_handles() {
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(RecordingHydrator::default()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            let inode = fs.next_inode();
+            let mut file = FsNode::regular_file(inode, "dirty.txt".to_string(), ROOT_INODE);
+            file.data = b"draft".to_vec();
+            file.size = file.data.len() as u64;
+            fs.nodes.insert(inode, file);
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("dirty.txt".to_string(), inode);
+
+            let fh = fs.alloc_open_handle(inode, true);
+            fs.open_handles
+                .get_mut(&fh)
+                .expect("handle should exist")
+                .dirty = true;
+
+            assert_eq!(
+                fs.xattr_value_for_inode(inode, XATTR_STATE)
+                    .expect("xattr lookup should work"),
+                Some(b"dirty".to_vec())
+            );
+        }
+
+        #[test]
+        fn refresh_replaces_conflict_state_with_plain_placeholder() {
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan {
+                    actions: vec![FuseAction::MarkConflict {
+                        path: "albums/report.csv".to_string(),
+                        local_version: Some("v-local".to_string()),
+                        remote_version: Some("v-remote".to_string()),
+                        remote_size: Some(2048),
+                    }],
+                },
+                Box::new(RecordingHydrator::default()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            fs.apply_remote_action_plan_refresh(&FuseActionPlan {
+                actions: vec![FuseAction::EnsurePlaceholder {
+                    path: "albums/report.csv".to_string(),
+                    remote_version: "v-remote-2".to_string(),
+                    remote_size: Some(1024),
+                }],
+            });
+
+            let user_inode = fs
+                .lookup_inode_by_relative_path("albums/report.csv")
+                .expect("refreshed file should exist");
+            assert_eq!(
+                fs.xattr_value_for_inode(user_inode, XATTR_STATE)
+                    .expect("xattr lookup should work"),
+                Some(b"placeholder".to_vec())
+            );
+            assert_eq!(
+                fs.xattr_value_for_inode(user_inode, XATTR_CONFLICT_COPY)
+                    .expect("xattr lookup should work"),
+                None
+            );
+            assert!(
+                fs.lookup_inode_by_relative_path(".ironmesh-conflicts/remote/albums/report.csv")
+                    .is_none()
+            );
+        }
+
+        #[test]
         fn rename_overwrites_replaceable_file_targets() {
             let hydrator = RecordingHydrator::default();
             let uploader = RecordingUploader::default();
@@ -2352,6 +3046,7 @@ mod tests {
                 path: "report.csv".to_string(),
                 local_version: Some("v-local".to_string()),
                 remote_version: Some("v-remote".to_string()),
+                remote_size: None,
             }],
         );
     }
