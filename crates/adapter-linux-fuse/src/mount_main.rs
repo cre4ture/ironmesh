@@ -186,7 +186,8 @@ pub fn mount_main() -> Result<()> {
                     return;
                 }
             };
-            let full_plan = refresh_adapter.plan_actions(&planning_snapshot, &SyncPolicy::default());
+            let full_plan =
+                refresh_adapter.plan_actions(&planning_snapshot, &SyncPolicy::default());
             let plan = filter_refresh_action_plan(full_plan, &update.changed_paths);
             if plan.actions.is_empty() {
                 tracing::info!(
@@ -427,6 +428,19 @@ impl ClientRightsEdgeIo {
             edge_state,
         }
     }
+
+    fn download_version_selector<'a>(remote_version: &'a str) -> Option<&'a str> {
+        let base_version = remote_version
+            .rsplit_once(":size=")
+            .map(|(base, _)| base)
+            .unwrap_or(remote_version)
+            .trim();
+        if base_version.is_empty() || base_version == "server-head" {
+            None
+        } else {
+            Some(base_version)
+        }
+    }
 }
 
 impl Hydrator for ClientRightsEdgeIo {
@@ -436,11 +450,12 @@ impl Hydrator for ClientRightsEdgeIo {
         }
 
         let mut payload = Vec::new();
+        let version_selector = Self::download_version_selector(remote_version);
         self.sdk
             .download_to_writer_resumable_staged(
                 path,
                 None,
-                None,
+                version_selector,
                 &mut payload,
                 &self.download_stage_root,
             )
@@ -466,12 +481,13 @@ impl Hydrator for ClientRightsEdgeIo {
         let mut payload = Vec::new();
         let mut on_progress = |_progress: DownloadProgress| {};
         let should_cancel = || false;
+        let version_selector = Self::download_version_selector(remote_version);
         self.sdk
             .download_range_to_writer_with_progress_blocking(
                 DownloadRangeRequest {
                     key: path,
                     snapshot: None,
-                    version: None,
+                    version: version_selector,
                     start: offset,
                     length,
                 },
@@ -571,6 +587,12 @@ fn read_optional_client_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_args() -> Args {
         Args {
@@ -588,6 +610,119 @@ mod tests {
             depth: 64,
             remote_refresh_interval_ms: 3000,
         }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ironmesh-adapter-linux-fuse-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut buf).expect("request read should succeed");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        String::from_utf8(request).expect("request should be utf8")
+    }
+
+    fn assert_recorded_range_hydration_requests(
+        remote_version: &str,
+        expected_head_request: &str,
+        expected_get_request: &str,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener bind should succeed");
+        let server_addr = listener
+            .local_addr()
+            .expect("listener local addr should succeed");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_server = requests.clone();
+        let server = thread::spawn(move || {
+            for response in [
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Length: 22\r\n",
+                    "x-ironmesh-object-size: 22\r\n",
+                    "ETag: \"etag-v1\"\r\n",
+                    "Accept-Ranges: bytes\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes()
+                .to_vec(),
+                [
+                    concat!(
+                        "HTTP/1.1 206 Partial Content\r\n",
+                        "Content-Length: 12\r\n",
+                        "Content-Range: bytes 9-20/22\r\n",
+                        "x-ironmesh-object-size: 22\r\n",
+                        "ETag: \"etag-v1\"\r\n",
+                        "Accept-Ranges: bytes\r\n",
+                        "Connection: close\r\n",
+                        "\r\n",
+                    )
+                    .as_bytes(),
+                    b"abcdefghijkl".as_slice(),
+                ]
+                .concat(),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept should succeed");
+                let request = read_http_request(&mut stream);
+                requests_for_server
+                    .lock()
+                    .expect("request log lock should succeed")
+                    .push(request);
+                stream
+                    .write_all(&response)
+                    .expect("response write should succeed");
+                stream.flush().expect("response flush should succeed");
+            }
+        });
+
+        let state_dir = unique_temp_dir("versioned-range-read");
+        let stage_dir = unique_temp_dir("versioned-range-stage");
+        fs::create_dir_all(&stage_dir).expect("stage dir create should succeed");
+        let edge_state = Arc::new(
+            ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::On)
+                .expect("edge state create should succeed"),
+        );
+        let io = ClientRightsEdgeIo::with_client(
+            IronMeshClient::from_direct_base_url(format!("http://{server_addr}")),
+            stage_dir.clone(),
+            edge_state,
+        );
+
+        let payload = io
+            .hydrate_range("docs/photo.jpg", remote_version, 9, 12)
+            .expect("range hydration should succeed");
+        assert_eq!(payload, b"abcdefghijkl");
+
+        server.join().expect("server thread should succeed");
+
+        let recorded_requests = requests.lock().expect("request log lock should succeed");
+        assert_eq!(recorded_requests.len(), 2);
+        assert!(recorded_requests[0].starts_with(expected_head_request));
+        assert!(recorded_requests[1].starts_with(expected_get_request));
+        let request_headers = recorded_requests[1].to_ascii_lowercase();
+        assert!(request_headers.contains("\r\nrange: bytes=9-20\r\n"));
+        assert!(request_headers.contains("\r\nif-range: \"etag-v1\"\r\n"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
     }
 
     #[test]
@@ -706,5 +841,23 @@ mod tests {
 
         let derived = effective_client_edge_state_dir(&args).unwrap();
         assert_eq!(derived, PathBuf::from("/tmp/custom-edge-state"));
+    }
+
+    #[test]
+    fn client_rights_edge_range_hydration_uses_placeholder_version_selector() {
+        assert_recorded_range_hydration_requests(
+            "v1:size=22",
+            "HEAD /store/docs%2Fphoto.jpg?version=v1 HTTP/1.1",
+            "GET /store/docs%2Fphoto.jpg?version=v1 HTTP/1.1",
+        );
+    }
+
+    #[test]
+    fn client_rights_edge_range_hydration_omits_server_head_placeholder_selector() {
+        assert_recorded_range_hydration_requests(
+            "server-head:size=22",
+            "HEAD /store/docs%2Fphoto.jpg HTTP/1.1",
+            "GET /store/docs%2Fphoto.jpg HTTP/1.1",
+        );
     }
 }

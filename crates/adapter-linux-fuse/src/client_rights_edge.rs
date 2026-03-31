@@ -113,7 +113,13 @@ impl ClientRightsEdgeState {
 
         let mut queue = load_json_file::<MutationLog>(&queue_path)?.unwrap_or_default();
         if queue.next_id == 0 {
-            queue.next_id = queue.pending.iter().map(|entry| entry.id).max().unwrap_or(0) + 1;
+            queue.next_id = queue
+                .pending
+                .iter()
+                .map(|entry| entry.id)
+                .max()
+                .unwrap_or(0)
+                + 1;
         }
 
         Ok(Self {
@@ -147,7 +153,10 @@ impl ClientRightsEdgeState {
         }
 
         let path = normalize_logical_path(path);
-        let mut queue = self.queue.lock().map_err(|_| anyhow!("queue lock poisoned"))?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow!("queue lock poisoned"))?;
         let id = next_queue_id(&mut queue);
         let staged_rel_path = format!("{id}.bin");
         let upload_state_rel_path = format!("{id}.json");
@@ -170,7 +179,10 @@ impl ClientRightsEdgeState {
 
     pub fn enqueue_directory(&self, path: &str) -> Result<()> {
         let path = normalize_logical_path(path.trim_end_matches('/'));
-        let mut queue = self.queue.lock().map_err(|_| anyhow!("queue lock poisoned"))?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow!("queue lock poisoned"))?;
         let id = next_queue_id(&mut queue);
         queue.pending.push(PendingMutation {
             id,
@@ -187,7 +199,10 @@ impl ClientRightsEdgeState {
         directory: bool,
     ) -> Result<()> {
         let path = normalize_logical_path(path.trim_end_matches('/'));
-        let mut queue = self.queue.lock().map_err(|_| anyhow!("queue lock poisoned"))?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow!("queue lock poisoned"))?;
         let id = next_queue_id(&mut queue);
         queue.pending.push(PendingMutation {
             id,
@@ -208,7 +223,10 @@ impl ClientRightsEdgeState {
         overwrite: bool,
         base_remote_version: Option<&str>,
     ) -> Result<()> {
-        let mut queue = self.queue.lock().map_err(|_| anyhow!("queue lock poisoned"))?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow!("queue lock poisoned"))?;
         let id = next_queue_id(&mut queue);
         queue.pending.push(PendingMutation {
             id,
@@ -224,7 +242,10 @@ impl ClientRightsEdgeState {
     }
 
     pub fn replay_actions(&self) -> Result<Vec<ReplayAction>> {
-        let queue = self.queue.lock().map_err(|_| anyhow!("queue lock poisoned"))?;
+        let queue = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow!("queue lock poisoned"))?;
         let mut actions = Vec::with_capacity(queue.pending.len());
         for mutation in &queue.pending {
             match &mutation.op {
@@ -324,8 +345,9 @@ impl ClientRightsEdgeState {
         match fs::read(&cache_path) {
             Ok(payload) => Ok(Some(payload)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to read {}", cache_path.display())),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to read {}", cache_path.display()))
+            }
         }
     }
 
@@ -389,13 +411,19 @@ impl ClientRightsEdgeState {
     }
 
     fn peek_next_mutation(&self) -> Result<Option<PendingMutation>> {
-        let queue = self.queue.lock().map_err(|_| anyhow!("queue lock poisoned"))?;
+        let queue = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow!("queue lock poisoned"))?;
         Ok(queue.pending.first().cloned())
     }
 
     fn complete_mutation(&self, id: u64) -> Result<()> {
         let removed = {
-            let mut queue = self.queue.lock().map_err(|_| anyhow!("queue lock poisoned"))?;
+            let mut queue = self
+                .queue
+                .lock()
+                .map_err(|_| anyhow!("queue lock poisoned"))?;
             let Some(index) = queue.pending.iter().position(|entry| entry.id == id) else {
                 return Ok(());
             };
@@ -417,7 +445,11 @@ impl ClientRightsEdgeState {
         Ok(())
     }
 
-    fn apply_mutation(&self, client: &IronMeshClient, mutation: &PendingMutation) -> Result<ApplyMutationResult> {
+    fn apply_mutation(
+        &self,
+        client: &IronMeshClient,
+        mutation: &PendingMutation,
+    ) -> Result<ApplyMutationResult> {
         match &mutation.op {
             PendingMutationOp::UploadFile {
                 path,
@@ -434,7 +466,9 @@ impl ClientRightsEdgeState {
                 let upload_state_path = self.upload_state_dir.join(upload_state_rel_path);
                 client
                     .put_file_resumable(path, &staged_path, &upload_state_path)
-                    .with_context(|| format!("failed to upload staged file {}", staged_path.display()))?;
+                    .with_context(|| {
+                        format!("failed to upload staged file {}", staged_path.display())
+                    })?;
                 Ok(ApplyMutationResult::Applied)
             }
             PendingMutationOp::EnsureDirectory { path } => {
@@ -442,7 +476,9 @@ impl ClientRightsEdgeState {
                 let mut reader = Cursor::new(Vec::new());
                 client
                     .put_large_aware_reader(marker, &mut reader, 0)
-                    .with_context(|| format!("failed to create remote directory marker for {path}"))?;
+                    .with_context(|| {
+                        format!("failed to create remote directory marker for {path}")
+                    })?;
                 Ok(ApplyMutationResult::Applied)
             }
             PendingMutationOp::DeletePath {
@@ -474,7 +510,9 @@ impl ClientRightsEdgeState {
                 }
                 client
                     .rename_path_blocking(from_path.clone(), to_path.clone(), *overwrite)
-                    .with_context(|| format!("failed to rename remote path {from_path} -> {to_path}"))?;
+                    .with_context(|| {
+                        format!("failed to rename remote path {from_path} -> {to_path}")
+                    })?;
                 Ok(ApplyMutationResult::Applied)
             }
         }
@@ -495,7 +533,10 @@ impl ClientRightsEdgeState {
     }
 
     fn overlay_files(&self) -> Result<BTreeMap<String, OverlayFileEntry>> {
-        let queue = self.queue.lock().map_err(|_| anyhow!("queue lock poisoned"))?;
+        let queue = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow!("queue lock poisoned"))?;
         let mut overlay_files = BTreeMap::new();
         for mutation in &queue.pending {
             match &mutation.op {
@@ -569,8 +610,8 @@ fn stage_reader_to_file(reader: &mut dyn Read, length: u64, path: &Path) -> Resu
     }
 
     let temp_path = path.with_extension("tmp");
-    let mut file =
-        File::create(&temp_path).with_context(|| format!("failed to create {}", temp_path.display()))?;
+    let mut file = File::create(&temp_path)
+        .with_context(|| format!("failed to create {}", temp_path.display()))?;
     let mut limited = reader.take(length);
     let mut hasher = blake3::Hasher::new();
     let mut remaining = length;
@@ -702,7 +743,9 @@ fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let temp_path = parent.join(format!(
         ".{}.tmp",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("edge-state")
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("edge-state")
     ));
     fs::write(&temp_path, payload)
         .with_context(|| format!("failed to write {}", temp_path.display()))?;

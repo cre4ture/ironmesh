@@ -1283,7 +1283,9 @@ pub mod runtime {
                 (node.content_path(self.resolve_full_path(inode)), version)
             };
 
-            let data = self.hydrator.hydrate(&path, &version)?;
+            let data = self.hydrator.hydrate(&path, &version).with_context(|| {
+                format!("failed to hydrate placeholder path={path} version={version}")
+            })?;
             let file = self
                 .nodes
                 .get_mut(&inode)
@@ -1317,12 +1319,15 @@ pub mod runtime {
             }
 
             if let Some(version) = version {
-                return self.hydrator.hydrate_range(
-                    &path,
-                    &version,
-                    offset.max(0) as u64,
-                    size as u64,
-                );
+                let start = offset.max(0) as u64;
+                return self
+                    .hydrator
+                    .hydrate_range(&path, &version, start, size as u64)
+                    .with_context(|| {
+                        format!(
+                            "failed to hydrate placeholder range path={path} version={version} offset={start} size={size}"
+                        )
+                    });
             }
 
             let node = self
@@ -1464,9 +1469,11 @@ pub mod runtime {
                     .with_context(|| format!("failed to delete remote file {path}")),
                 FileType::Directory => {
                     let marker_path = format!("{}/", path.trim_end_matches('/'));
-                    self.uploader.delete_path(&marker_path, None).with_context(|| {
-                        format!("failed to delete remote directory marker {marker_path}")
-                    })
+                    self.uploader
+                        .delete_path(&marker_path, None)
+                        .with_context(|| {
+                            format!("failed to delete remote directory marker {marker_path}")
+                        })
                 }
                 _ => Err(anyhow!("unsupported inode type for remote delete")),
             }
@@ -2010,7 +2017,10 @@ pub mod runtime {
             let child_path = self.resolve_full_path(child_inode);
             if self
                 .uploader
-                .delete_path(&child_path, child_node.sync_metadata.remote_version.as_deref())
+                .delete_path(
+                    &child_path,
+                    child_node.sync_metadata.remote_version.as_deref(),
+                )
                 .is_err()
             {
                 reply.error(EIO);
@@ -2075,7 +2085,11 @@ pub mod runtime {
                 self.resolve_full_path(child_inode).trim_end_matches('/')
             );
             let child_path = self.resolve_full_path(child_inode);
-            if self.uploader.delete_path(&directory_marker_path, None).is_err() {
+            if self
+                .uploader
+                .delete_path(&directory_marker_path, None)
+                .is_err()
+            {
                 reply.error(EIO);
                 return;
             }
@@ -2342,10 +2356,21 @@ pub mod runtime {
             reply: ReplyData,
         ) {
             self.drain_remote_updates();
+            let path = self.resolve_full_path(ino);
 
             match self.read_file_data(ino, offset, size) {
                 Ok(data) => reply.data(&data),
-                Err(_error) => reply.error(EIO),
+                Err(error) => {
+                    tracing::warn!(
+                        inode = ino,
+                        path = if path.is_empty() { "/" } else { path.as_str() },
+                        offset,
+                        size,
+                        error = %error,
+                        "ironmesh fuse read failed"
+                    );
+                    reply.error(EIO);
+                }
             }
         }
 
@@ -3232,11 +3257,13 @@ pub mod runtime {
             .expect("replay should succeed");
 
             assert!(
-                fs.lookup_inode_by_relative_path("drafts/local.txt").is_none(),
+                fs.lookup_inode_by_relative_path("drafts/local.txt")
+                    .is_none(),
                 "old path should be gone after replay rename"
             );
             assert!(
-                fs.lookup_inode_by_relative_path("drafts/final.txt").is_none(),
+                fs.lookup_inode_by_relative_path("drafts/final.txt")
+                    .is_none(),
                 "delete replay should remove renamed file"
             );
         }

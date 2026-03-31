@@ -1,6 +1,6 @@
 use crate::bootstrap::ConnectionBootstrap;
 use crate::ironmesh_client::IronMeshClient;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -149,27 +149,11 @@ impl RemoteSnapshotFetcher {
     }
 
     pub fn fetch_snapshot_blocking(&self) -> Result<SyncSnapshot> {
-        let mut snapshot = self.client.load_snapshot_from_server_blocking(
+        self.client.load_snapshot_from_server_blocking(
             self.scope.prefix.as_deref(),
             self.scope.depth,
             self.scope.snapshot.as_deref(),
-        )?;
-
-        for entry in &mut snapshot.remote {
-            if entry.kind != EntryKind::File {
-                continue;
-            }
-
-            let size = self
-                .client
-                .get_object_size_blocking(&entry.path, None, None)
-                .with_context(|| format!("failed to fetch remote size for {}", entry.path))?;
-
-            let base_version = entry.version.as_deref().unwrap_or("server-head");
-            entry.version = Some(format!("{base_version}:size={size}"));
-        }
-
-        Ok(snapshot)
+        )
     }
 }
 
@@ -625,6 +609,76 @@ mod tests {
             .expect("bootstrap-backed fetcher should load snapshot");
 
         assert!(snapshot.remote.is_empty());
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
+    fn remote_snapshot_fetcher_uses_store_index_sizes_without_per_file_heads() {
+        async fn health() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "ok": true }))
+        }
+
+        async fn store_index() -> Json<crate::ironmesh_client::StoreIndexResponse> {
+            Json(crate::ironmesh_client::StoreIndexResponse {
+                prefix: String::new(),
+                depth: 1,
+                entry_count: 1,
+                entries: vec![crate::ironmesh_client::StoreIndexEntry {
+                    path: "docs/readme.txt".to_string(),
+                    entry_type: "key".to_string(),
+                    version: Some("v1".to_string()),
+                    content_hash: Some("hash-1".to_string()),
+                    size_bytes: Some(42),
+                    modified_at_unix: None,
+                    content_fingerprint: None,
+                    media: None,
+                }],
+            })
+        }
+
+        let router = Router::new()
+            .route("/health", get(health))
+            .route("/store/index", get(store_index));
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener should bind");
+                let addr = listener.local_addr().expect("listener addr");
+                addr_tx.send(addr).expect("listener addr should send");
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .expect("test server should run");
+            });
+        });
+        let addr = addr_rx.recv().expect("listener addr should arrive");
+
+        let bootstrap = sample_bootstrap(&format!("http://{addr}"));
+        let fetcher = RemoteSnapshotFetcher::from_bootstrap(&bootstrap, None, None, 1, None)
+            .expect("bootstrap-backed fetcher should build");
+
+        let snapshot = fetcher
+            .fetch_snapshot_blocking()
+            .expect("snapshot fetch should use store index metadata only");
+
+        assert_eq!(
+            snapshot.remote,
+            vec![
+                NamespaceEntry::directory("docs"),
+                NamespaceEntry::file_sized("docs/readme.txt", "v1", "hash-1", Some(42)),
+            ]
+        );
 
         let _ = shutdown_tx.send(());
         let _ = server.join();
