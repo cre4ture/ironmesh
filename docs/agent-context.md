@@ -44,8 +44,10 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
   - snapshot mode (`--snapshot-file`)
   - live client-rights edge mode (`--server-base-url` or `--bootstrap-file`)
   - durable local mutation queue + cached remote snapshot for offline restart
-  - optional hydrated-object cache with `--offline-object-cache off` support for same-device
-    server-node deployments
+  - content-hash-based placeholder identity and hydrated-object cache lookups
+  - optional persisted hydrated-object cache, with `--offline-object-cache off` support for
+    same-device server-node deployments
+  - bounded in-memory range chunk cache even when persisted hydrated-object caching is disabled
   - server-driven `/store/index/changes/wait` refresh wakeups with polling fallback
   - recursive directory deletion through the shared `/store/delete` API when deleting directory-marker paths like `dir/`
 

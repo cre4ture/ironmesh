@@ -4,7 +4,7 @@ use crate::runtime::ReplayAction;
 use anyhow::{Context, Result, anyhow};
 use client_sdk::IronMeshClient;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,9 @@ impl OfflineObjectCacheMode {
     }
 }
 
+pub(crate) const RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
+const RANGE_CHUNK_CACHE_MAX_CHUNKS: usize = 16;
+
 #[derive(Debug)]
 pub struct ClientRightsEdgeState {
     queue_path: PathBuf,
@@ -34,7 +37,55 @@ pub struct ClientRightsEdgeState {
     upload_state_dir: PathBuf,
     object_cache_dir: PathBuf,
     queue: Mutex<MutationLog>,
+    range_chunk_cache: Mutex<RangeChunkCache>,
     object_cache_mode: OfflineObjectCacheMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RangeChunkCacheKey {
+    content_hash: String,
+    chunk_index: u64,
+}
+
+impl RangeChunkCacheKey {
+    fn new(content_hash: &str, chunk_index: u64) -> Self {
+        Self {
+            content_hash: content_hash.to_string(),
+            chunk_index,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RangeChunkCache {
+    chunks: HashMap<RangeChunkCacheKey, Arc<Vec<u8>>>,
+    access_order: VecDeque<RangeChunkCacheKey>,
+}
+
+impl RangeChunkCache {
+    fn get(&mut self, key: &RangeChunkCacheKey) -> Option<Arc<Vec<u8>>> {
+        let bytes = self.chunks.get(key).cloned()?;
+        self.touch(key.clone());
+        Some(bytes)
+    }
+
+    fn insert(&mut self, key: RangeChunkCacheKey, bytes: Arc<Vec<u8>>) {
+        self.chunks.insert(key.clone(), bytes);
+        self.touch(key);
+
+        while self.chunks.len() > RANGE_CHUNK_CACHE_MAX_CHUNKS {
+            let Some(oldest) = self.access_order.pop_front() else {
+                break;
+            };
+            if self.chunks.remove(&oldest).is_some() {
+                break;
+            }
+        }
+    }
+
+    fn touch(&mut self, key: RangeChunkCacheKey) {
+        self.access_order.push_back(key);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -129,6 +180,7 @@ impl ClientRightsEdgeState {
             upload_state_dir,
             object_cache_dir,
             queue: Mutex::new(queue),
+            range_chunk_cache: Mutex::new(RangeChunkCache::default()),
             object_cache_mode,
         })
     }
@@ -336,12 +388,12 @@ impl ClientRightsEdgeState {
         })
     }
 
-    pub fn read_cached_object(&self, path: &str, version: &str) -> Result<Option<Vec<u8>>> {
+    pub fn read_cached_object(&self, content_hash: &str) -> Result<Option<Vec<u8>>> {
         if !self.object_cache_mode.enabled() {
             return Ok(None);
         }
 
-        let cache_path = self.object_cache_path(path, version);
+        let cache_path = self.object_cache_path(content_hash);
         match fs::read(&cache_path) {
             Ok(payload) => Ok(Some(payload)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -351,12 +403,45 @@ impl ClientRightsEdgeState {
         }
     }
 
-    pub fn cache_full_object(&self, path: &str, version: &str, payload: &[u8]) -> Result<()> {
+    pub fn cache_full_object(&self, content_hash: &str, payload: &[u8]) -> Result<()> {
         if !self.object_cache_mode.enabled() {
             return Ok(());
         }
-        let cache_path = self.object_cache_path(path, version);
+        let cache_path = self.object_cache_path(content_hash);
         write_atomic(&cache_path, payload)
+    }
+
+    pub fn read_cached_range_chunk(
+        &self,
+        content_hash: &str,
+        chunk_index: u64,
+    ) -> Result<Option<Arc<Vec<u8>>>> {
+        let key = RangeChunkCacheKey::new(content_hash, chunk_index);
+        let mut cache = self
+            .range_chunk_cache
+            .lock()
+            .map_err(|_| anyhow!("range chunk cache lock poisoned"))?;
+        Ok(cache.get(&key))
+    }
+
+    pub fn cache_range_chunk(
+        &self,
+        content_hash: &str,
+        chunk_index: u64,
+        payload: Vec<u8>,
+    ) -> Result<Arc<Vec<u8>>> {
+        let payload = Arc::new(payload);
+        if payload.is_empty() {
+            return Ok(payload);
+        }
+
+        let key = RangeChunkCacheKey::new(content_hash, chunk_index);
+        let mut cache = self
+            .range_chunk_cache
+            .lock()
+            .map_err(|_| anyhow!("range chunk cache lock poisoned"))?;
+        cache.insert(key, Arc::clone(&payload));
+        Ok(payload)
     }
 
     pub fn spawn_sync_loop(
@@ -587,10 +672,8 @@ impl ClientRightsEdgeState {
         Ok(overlay_files)
     }
 
-    fn object_cache_path(&self, path: &str, version: &str) -> PathBuf {
-        let cache_key = blake3::hash(format!("{path}\u{0}{version}").as_bytes())
-            .to_hex()
-            .to_string();
+    fn object_cache_path(&self, content_hash: &str) -> PathBuf {
+        let cache_key = blake3::hash(content_hash.as_bytes()).to_hex().to_string();
         self.object_cache_dir
             .join(&cache_key[..2])
             .join(format!("{cache_key}.bin"))
@@ -844,14 +927,41 @@ mod tests {
             .expect("state should initialize");
 
         state
-            .cache_full_object("photos/a.jpg", "v1", b"jpeg")
+            .cache_full_object("hash-a", b"jpeg")
             .expect("cache operation should no-op");
         assert_eq!(
             state
-                .read_cached_object("photos/a.jpg", "v1")
+                .read_cached_object("hash-a")
                 .expect("cache read should succeed"),
             None
         );
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn range_chunk_cache_evicts_oldest_entry_once_capacity_is_exceeded() {
+        let state_dir = temp_state_dir("range-chunk-cache");
+        let state = ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::Off)
+            .expect("state should initialize");
+
+        for chunk_index in 0..=(RANGE_CHUNK_CACHE_MAX_CHUNKS as u64) {
+            state
+                .cache_range_chunk("hash-a", chunk_index, vec![chunk_index as u8])
+                .expect("range chunk cache insert should succeed");
+        }
+
+        assert_eq!(
+            state
+                .read_cached_range_chunk("hash-a", 0)
+                .expect("range chunk cache read should succeed"),
+            None
+        );
+        let newest = state
+            .read_cached_range_chunk("hash-a", RANGE_CHUNK_CACHE_MAX_CHUNKS as u64)
+            .expect("range chunk cache read should succeed")
+            .expect("newest chunk should remain cached");
+        assert_eq!(newest.as_slice(), &[RANGE_CHUNK_CACHE_MAX_CHUNKS as u8]);
 
         let _ = fs::remove_dir_all(&state_dir);
     }

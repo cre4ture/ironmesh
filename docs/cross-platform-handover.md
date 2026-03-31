@@ -19,7 +19,8 @@ This document is the handover package for continuing cross-platform filesystem i
   - Mount modes:
     - `--snapshot-file`: static snapshot input.
     - `--server-base-url` or `--bootstrap-file`: live client-rights edge mode with durable local
-      mutation queue, cached remote snapshot, and optional hydrated-object cache.
+      mutation queue, cached remote snapshot, content-hash-based placeholder identity, and
+      optional hydrated-object cache.
 - Android SAF integration:
   - Provider + API/repository wiring.
   - Persisted base URL shared between app UI and provider.
@@ -156,7 +157,10 @@ Implement CFAPI behavior by mapping existing operations:
   in `docs/client-rights-edge-sync-idea.md`.
 - Direct/bootstrap Linux FUSE mounts now own offline restart through a client-rights durable
   mutation queue and cached remote snapshot.
-- Live server mode currently maps remote file versions to placeholder synthetic values for planning consistency.
+- Live server mode now carries remote `content_hash` through sync planning, placeholder state, and
+  cache lookups so hydrated-object reuse is content-addressed rather than path/version-addressed.
+- `--offline-object-cache off` disables persisted hydrated-object copies, but the live mount still
+  keeps a small in-memory range chunk cache for repeated reads during the current mount session.
 
 ## Suggested first task on Windows
 

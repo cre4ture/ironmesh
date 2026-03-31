@@ -96,10 +96,12 @@ pub enum SyncOperation {
     EnsurePlaceholder {
         path: String,
         remote_version: String,
+        remote_content_hash: String,
     },
     Hydrate {
         path: String,
         remote_version: String,
+        remote_content_hash: String,
     },
     Upload {
         path: String,
@@ -109,6 +111,7 @@ pub enum SyncOperation {
         path: String,
         local_version: Option<String>,
         remote_version: Option<String>,
+        remote_content_hash: Option<String>,
     },
     CreateDirectory {
         path: String,
@@ -175,6 +178,7 @@ pub fn plan_sync(snapshot: &SyncSnapshot, policy: &SyncPolicy) -> SyncPlan {
                         operations.push(SyncOperation::Hydrate {
                             path: path.to_string(),
                             remote_version: remote_entry.version.clone().unwrap_or_default(),
+                            remote_content_hash: placeholder_content_hash(path, remote_entry),
                         });
                     }
                     continue;
@@ -189,6 +193,7 @@ pub fn plan_sync(snapshot: &SyncSnapshot, policy: &SyncPolicy) -> SyncPlan {
                         path: path.to_string(),
                         local_version: local_entry.namespace.version.clone(),
                         remote_version: remote_entry.version.clone(),
+                        remote_content_hash: Some(placeholder_content_hash(path, remote_entry)),
                     });
                     continue;
                 }
@@ -196,6 +201,7 @@ pub fn plan_sync(snapshot: &SyncSnapshot, policy: &SyncPolicy) -> SyncPlan {
                 operations.push(SyncOperation::Hydrate {
                     path: path.to_string(),
                     remote_version: remote_entry.version.clone().unwrap_or_default(),
+                    remote_content_hash: placeholder_content_hash(path, remote_entry),
                 });
             }
             (Some(local_entry), None) => {
@@ -221,6 +227,7 @@ pub fn plan_sync(snapshot: &SyncSnapshot, policy: &SyncPolicy) -> SyncPlan {
                     operations.push(SyncOperation::EnsurePlaceholder {
                         path: path.to_string(),
                         remote_version: remote_entry.version.clone().unwrap_or_default(),
+                        remote_content_hash: placeholder_content_hash(path, remote_entry),
                     });
                 }
             }
@@ -234,6 +241,13 @@ pub fn plan_sync(snapshot: &SyncSnapshot, policy: &SyncPolicy) -> SyncPlan {
 fn normalize_path(path: impl Into<String>) -> String {
     let raw = path.into();
     raw.trim().trim_start_matches('/').to_string()
+}
+
+fn placeholder_content_hash(path: &str, remote_entry: &NamespaceEntry) -> String {
+    remote_entry
+        .content_hash
+        .clone()
+        .unwrap_or_else(|| format!("server-head:{path}"))
 }
 
 #[cfg(test)]
@@ -254,6 +268,7 @@ mod tests {
             vec![SyncOperation::EnsurePlaceholder {
                 path: "docs/readme.txt".to_string(),
                 remote_version: "v1".to_string(),
+                remote_content_hash: "h1".to_string(),
             }],
         );
     }
@@ -299,6 +314,7 @@ mod tests {
                 path: "report.csv".to_string(),
                 local_version: Some("v1-local".to_string()),
                 remote_version: Some("v2-remote".to_string()),
+                remote_content_hash: Some("h2".to_string()),
             }],
         );
     }
@@ -321,6 +337,7 @@ mod tests {
             vec![SyncOperation::Hydrate {
                 path: "media/song.mp3".to_string(),
                 remote_version: "v1".to_string(),
+                remote_content_hash: "h1".to_string(),
             }],
         );
     }

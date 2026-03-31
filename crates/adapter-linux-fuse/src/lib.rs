@@ -43,11 +43,13 @@ pub enum FuseAction {
     EnsurePlaceholder {
         path: String,
         remote_version: String,
+        remote_content_hash: String,
         remote_size: Option<u64>,
     },
     HydrateOnRead {
         path: String,
         remote_version: String,
+        remote_content_hash: String,
         remote_size: Option<u64>,
     },
     UploadOnFlush {
@@ -58,6 +60,7 @@ pub enum FuseAction {
         path: String,
         local_version: Option<String>,
         remote_version: Option<String>,
+        remote_content_hash: Option<String>,
         remote_size: Option<u64>,
     },
     RemovePath {
@@ -79,17 +82,21 @@ pub fn map_sync_plan_to_fuse_actions(
             SyncOperation::EnsurePlaceholder {
                 path,
                 remote_version,
+                remote_content_hash,
             } => FuseAction::EnsurePlaceholder {
                 path: path.clone(),
                 remote_version: remote_version.clone(),
+                remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_sizes_by_path.get(path).copied(),
             },
             SyncOperation::Hydrate {
                 path,
                 remote_version,
+                remote_content_hash,
             } => FuseAction::HydrateOnRead {
                 path: path.clone(),
                 remote_version: remote_version.clone(),
+                remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_sizes_by_path.get(path).copied(),
             },
             SyncOperation::Upload {
@@ -103,10 +110,12 @@ pub fn map_sync_plan_to_fuse_actions(
                 path,
                 local_version,
                 remote_version,
+                remote_content_hash,
             } => FuseAction::MarkConflict {
                 path: path.clone(),
                 local_version: local_version.clone(),
                 remote_version: remote_version.clone(),
+                remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_sizes_by_path.get(path).copied(),
             },
         };
@@ -181,12 +190,18 @@ pub mod runtime {
     }
 
     pub trait Hydrator: Send + Sync + 'static {
-        fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>>;
+        fn hydrate(
+            &self,
+            path: &str,
+            remote_version: &str,
+            remote_content_hash: &str,
+        ) -> Result<Vec<u8>>;
 
         fn hydrate_range(
             &self,
             path: &str,
             remote_version: &str,
+            remote_content_hash: &str,
             offset: u64,
             length: u64,
         ) -> Result<Vec<u8>> {
@@ -194,7 +209,7 @@ pub mod runtime {
                 return Ok(Vec::new());
             }
 
-            let payload = self.hydrate(path, remote_version)?;
+            let payload = self.hydrate(path, remote_version, remote_content_hash)?;
             let start = offset.min(payload.len() as u64) as usize;
             let end = offset.saturating_add(length).min(payload.len() as u64) as usize;
             Ok(payload[start..end].to_vec())
@@ -225,7 +240,12 @@ pub mod runtime {
     pub struct DemoHydrator;
 
     impl Hydrator for DemoHydrator {
-        fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>> {
+        fn hydrate(
+            &self,
+            path: &str,
+            remote_version: &str,
+            _remote_content_hash: &str,
+        ) -> Result<Vec<u8>> {
             Ok(
                 format!("ironmesh placeholder hydrated: path={path} version={remote_version}\n")
                     .into_bytes(),
@@ -288,6 +308,7 @@ pub mod runtime {
         children: BTreeMap<String, u64>,
         data: Vec<u8>,
         placeholder_version: Option<String>,
+        placeholder_content_hash: Option<String>,
         read_only: bool,
         namespace: NodeNamespace,
         backing_path: Option<String>,
@@ -306,6 +327,7 @@ pub mod runtime {
                 children: BTreeMap::new(),
                 data: Vec::new(),
                 placeholder_version: None,
+                placeholder_content_hash: None,
                 read_only: false,
                 namespace: NodeNamespace::User,
                 backing_path: None,
@@ -318,6 +340,7 @@ pub mod runtime {
             name: String,
             parent_inode: u64,
             remote_version: String,
+            remote_content_hash: String,
             size: u64,
         ) -> Self {
             let sync_metadata = NodeSyncMetadata {
@@ -334,6 +357,7 @@ pub mod runtime {
                 children: BTreeMap::new(),
                 data: Vec::new(),
                 placeholder_version: Some(remote_version),
+                placeholder_content_hash: Some(remote_content_hash),
                 read_only: false,
                 namespace: NodeNamespace::User,
                 backing_path: None,
@@ -352,6 +376,7 @@ pub mod runtime {
                 children: BTreeMap::new(),
                 data: Vec::new(),
                 placeholder_version: None,
+                placeholder_content_hash: None,
                 read_only: false,
                 namespace: NodeNamespace::User,
                 backing_path: None,
@@ -469,26 +494,35 @@ pub mod runtime {
                     FuseAction::EnsurePlaceholder {
                         path,
                         remote_version,
+                        remote_content_hash,
                         remote_size,
                     }
                     | FuseAction::HydrateOnRead {
                         path,
                         remote_version,
+                        remote_content_hash,
                         remote_size,
                     } => {
                         fs.clear_conflict_state_for_path(path);
-                        fs.ensure_placeholder_file(path, remote_version, *remote_size);
+                        fs.ensure_placeholder_file(
+                            path,
+                            remote_version,
+                            remote_content_hash,
+                            *remote_size,
+                        );
                     }
                     FuseAction::MarkConflict {
                         path,
                         local_version,
                         remote_version,
+                        remote_content_hash,
                         remote_size,
                     } => {
                         fs.mark_conflict_path(
                             path,
                             local_version.clone(),
                             remote_version.clone(),
+                            remote_content_hash.clone(),
                             *remote_size,
                         );
                     }
@@ -651,6 +685,7 @@ pub mod runtime {
             &mut self,
             relative_path: &str,
             remote_version: &str,
+            remote_content_hash: &str,
             remote_size: Option<u64>,
         ) {
             let mut segments: Vec<&str> = relative_path
@@ -673,6 +708,7 @@ pub mod runtime {
             if let Some(inode) = existing {
                 if let Some(file) = self.nodes.get_mut(&inode) {
                     file.placeholder_version = Some(remote_version.to_string());
+                    file.placeholder_content_hash = Some(remote_content_hash.to_string());
                     file.data.clear();
                     file.size = remote_size.unwrap_or(0);
                     file.sync_metadata.remote_version = Some(remote_version.to_string());
@@ -686,6 +722,7 @@ pub mod runtime {
                 file_name.to_string(),
                 parent_inode,
                 remote_version.to_string(),
+                remote_content_hash.to_string(),
                 remote_size.unwrap_or(0),
             );
 
@@ -705,6 +742,7 @@ pub mod runtime {
             &mut self,
             relative_path: &str,
             remote_version: &str,
+            remote_content_hash: &str,
             remote_size: Option<u64>,
         ) {
             let mut segments: Vec<&str> = relative_path
@@ -738,6 +776,7 @@ pub mod runtime {
 
                 let already_placeholder = file.placeholder_version.as_deref()
                     == Some(remote_version)
+                    && file.placeholder_content_hash.as_deref() == Some(remote_content_hash)
                     && file.data.is_empty()
                     && file.size == remote_size.unwrap_or(0);
                 if already_placeholder {
@@ -745,6 +784,7 @@ pub mod runtime {
                 }
 
                 file.placeholder_version = Some(remote_version.to_string());
+                file.placeholder_content_hash = Some(remote_content_hash.to_string());
                 file.data.clear();
                 file.size = remote_size.unwrap_or(0);
                 file.modified_at = SystemTime::now();
@@ -758,6 +798,7 @@ pub mod runtime {
                 file_name.to_string(),
                 parent_inode,
                 remote_version.to_string(),
+                remote_content_hash.to_string(),
                 remote_size.unwrap_or(0),
             );
             self.nodes.insert(inode, file);
@@ -771,6 +812,7 @@ pub mod runtime {
             relative_path: &str,
             local_version: Option<String>,
             remote_version: Option<String>,
+            remote_content_hash: Option<String>,
             remote_size: Option<u64>,
         ) {
             let mut segments: Vec<&str> = relative_path
@@ -796,11 +838,13 @@ pub mod runtime {
                     if file.kind != FileType::RegularFile {
                         return;
                     }
-                    if let Some(remote_version) = remote_version.as_ref()
+                    if let (Some(remote_version), Some(remote_content_hash)) =
+                        (remote_version.as_ref(), remote_content_hash.as_ref())
                         && file.placeholder_version.is_none()
                         && file.data.is_empty()
                     {
                         file.placeholder_version = Some(remote_version.clone());
+                        file.placeholder_content_hash = Some(remote_content_hash.clone());
                         file.size = remote_size.unwrap_or(0);
                     }
                     file.sync_metadata.local_version = local_version.clone();
@@ -812,15 +856,16 @@ pub mod runtime {
                 }
             } else {
                 let inode = self.next_inode();
-                let mut file = match remote_version.as_ref() {
-                    Some(remote_version) => FsNode::placeholder_file(
+                let mut file = match (remote_version.as_ref(), remote_content_hash.as_ref()) {
+                    (Some(remote_version), Some(remote_content_hash)) => FsNode::placeholder_file(
                         inode,
                         file_name.to_string(),
                         parent_inode,
                         remote_version.clone(),
+                        remote_content_hash.clone(),
                         remote_size.unwrap_or(0),
                     ),
-                    None => FsNode::regular_file(inode, file_name.to_string(), parent_inode),
+                    _ => FsNode::regular_file(inode, file_name.to_string(), parent_inode),
                 };
                 file.sync_metadata.local_version = local_version.clone();
                 file.sync_metadata.remote_version = remote_version.clone();
@@ -833,7 +878,9 @@ pub mod runtime {
                 }
             }
 
-            let Some(remote_version) = remote_version else {
+            let (Some(remote_version), Some(remote_content_hash)) =
+                (remote_version, remote_content_hash)
+            else {
                 return;
             };
 
@@ -855,6 +902,7 @@ pub mod runtime {
                         return;
                     }
                     sidecar.placeholder_version = Some(remote_version.clone());
+                    sidecar.placeholder_content_hash = Some(remote_content_hash.clone());
                     sidecar.size = remote_size.unwrap_or(0);
                     sidecar.read_only = true;
                     sidecar.namespace = NodeNamespace::ConflictInternal;
@@ -875,6 +923,7 @@ pub mod runtime {
                 sidecar_name.to_string(),
                 sidecar_parent,
                 remote_version.clone(),
+                remote_content_hash,
                 remote_size.unwrap_or(0),
             );
             sidecar.read_only = true;
@@ -964,17 +1013,20 @@ pub mod runtime {
                     FuseAction::EnsurePlaceholder {
                         path,
                         remote_version,
+                        remote_content_hash,
                         remote_size,
                     }
                     | FuseAction::HydrateOnRead {
                         path,
                         remote_version,
+                        remote_content_hash,
                         remote_size,
                     } => {
                         self.clear_conflict_state_for_path(path);
                         self.ensure_placeholder_file_for_refresh(
                             path,
                             remote_version,
+                            remote_content_hash,
                             *remote_size,
                         );
                     }
@@ -982,12 +1034,14 @@ pub mod runtime {
                         path,
                         local_version,
                         remote_version,
+                        remote_content_hash,
                         remote_size,
                     } => {
                         self.mark_conflict_path(
                             path,
                             local_version.clone(),
                             remote_version.clone(),
+                            remote_content_hash.clone(),
                             *remote_size,
                         );
                     }
@@ -1269,7 +1323,7 @@ pub mod runtime {
         }
 
         fn hydrate_if_needed(&mut self, inode: u64) -> Result<()> {
-            let (path, version) = {
+            let (path, version, content_hash) = {
                 let node = self
                     .nodes
                     .get(&inode)
@@ -1280,12 +1334,25 @@ pub mod runtime {
                 let Some(version) = node.placeholder_version.clone() else {
                     return Ok(());
                 };
-                (node.content_path(self.resolve_full_path(inode)), version)
+                let content_hash = node
+                    .placeholder_content_hash
+                    .clone()
+                    .ok_or_else(|| anyhow!("placeholder content hash missing"))?;
+                (
+                    node.content_path(self.resolve_full_path(inode)),
+                    version,
+                    content_hash,
+                )
             };
 
-            let data = self.hydrator.hydrate(&path, &version).with_context(|| {
-                format!("failed to hydrate placeholder path={path} version={version}")
-            })?;
+            let data = self
+                .hydrator
+                .hydrate(&path, &version, &content_hash)
+                .with_context(|| {
+                    format!(
+                        "failed to hydrate placeholder path={path} version={version} content_hash={content_hash}"
+                    )
+                })?;
             let file = self
                 .nodes
                 .get_mut(&inode)
@@ -1294,12 +1361,13 @@ pub mod runtime {
             file.size = file.data.len() as u64;
             file.modified_at = SystemTime::now();
             file.placeholder_version = None;
+            file.placeholder_content_hash = None;
 
             Ok(())
         }
 
         fn read_file_data(&mut self, inode: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
-            let (path, version) = {
+            let (path, version, content_hash) = {
                 let node = self
                     .nodes
                     .get(&inode)
@@ -1311,6 +1379,7 @@ pub mod runtime {
                 (
                     node.content_path(self.resolve_full_path(inode)),
                     node.placeholder_version.clone(),
+                    node.placeholder_content_hash.clone(),
                 )
             };
 
@@ -1319,13 +1388,15 @@ pub mod runtime {
             }
 
             if let Some(version) = version {
+                let content_hash =
+                    content_hash.ok_or_else(|| anyhow!("placeholder content hash missing"))?;
                 let start = offset.max(0) as u64;
                 return self
                     .hydrator
-                    .hydrate_range(&path, &version, start, size as u64)
+                    .hydrate_range(&path, &version, &content_hash, start, size as u64)
                     .with_context(|| {
                         format!(
-                            "failed to hydrate placeholder range path={path} version={version} offset={start} size={size}"
+                            "failed to hydrate placeholder range path={path} version={version} content_hash={content_hash} offset={start} size={size}"
                         )
                     });
             }
@@ -1358,6 +1429,7 @@ pub mod runtime {
                 node.size = size;
                 node.modified_at = SystemTime::now();
                 node.placeholder_version = None;
+                node.placeholder_content_hash = None;
                 node.sync_metadata.local_version = None;
             }
             Ok(changed)
@@ -1650,6 +1722,7 @@ pub mod runtime {
                     node.data = data.to_vec();
                     node.size = node.data.len() as u64;
                     node.placeholder_version = None;
+                    node.placeholder_content_hash = None;
                     node.modified_at = SystemTime::now();
                     node.sync_metadata.local_version = None;
                     return Ok(());
@@ -2433,6 +2506,7 @@ pub mod runtime {
             file.size = file.data.len() as u64;
             file.modified_at = SystemTime::now();
             file.placeholder_version = None;
+            file.placeholder_content_hash = None;
             file.sync_metadata.local_version = None;
 
             if let Some(handle) = self.open_handles.get_mut(&fh) {
@@ -2687,26 +2761,41 @@ pub mod runtime {
         }
 
         impl Hydrator for RecordingHydrator {
-            fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>> {
+            fn hydrate(
+                &self,
+                path: &str,
+                remote_version: &str,
+                remote_content_hash: &str,
+            ) -> Result<Vec<u8>> {
                 self.full_calls
                     .lock()
                     .expect("full hydrate call log lock poisoned")
-                    .push(format!("{path}:{remote_version}"));
-                Ok(format!("full:{path}:{remote_version}").into_bytes())
+                    .push(format!("{path}:{remote_version}:{remote_content_hash}"));
+                Ok(format!("full:{path}:{remote_version}:{remote_content_hash}").into_bytes())
             }
 
             fn hydrate_range(
                 &self,
                 path: &str,
                 remote_version: &str,
+                remote_content_hash: &str,
                 offset: u64,
                 length: u64,
             ) -> Result<Vec<u8>> {
                 self.range_calls
                     .lock()
                     .expect("range hydrate call log lock poisoned")
-                    .push((format!("{path}:{remote_version}"), offset, length));
-                Ok(format!("range:{path}:{remote_version}:{offset}:{length}").into_bytes())
+                    .push((
+                        format!("{path}:{remote_version}:{remote_content_hash}"),
+                        offset,
+                        length,
+                    ));
+                Ok(
+                    format!(
+                        "range:{path}:{remote_version}:{remote_content_hash}:{offset}:{length}"
+                    )
+                    .into_bytes(),
+                )
             }
         }
 
@@ -2785,6 +2874,7 @@ pub mod runtime {
                 actions: vec![FuseAction::EnsurePlaceholder {
                     path: "docs/report.txt".to_string(),
                     remote_version: "v1".to_string(),
+                    remote_content_hash: "h1".to_string(),
                     remote_size: Some(4096),
                 }],
             };
@@ -2803,6 +2893,7 @@ pub mod runtime {
                 .expect("placeholder file missing");
             assert_eq!(report.size, 4096);
             assert_eq!(report.placeholder_version.as_deref(), Some("v1"));
+            assert_eq!(report.placeholder_content_hash.as_deref(), Some("h1"));
         }
 
         #[test]
@@ -2811,6 +2902,7 @@ pub mod runtime {
                 actions: vec![FuseAction::EnsurePlaceholder {
                     path: "docs/photo.jpg".to_string(),
                     remote_version: "v1".to_string(),
+                    remote_content_hash: "h-photo".to_string(),
                     remote_size: Some(4096),
                 }],
             };
@@ -2832,7 +2924,7 @@ pub mod runtime {
             let bytes = fs
                 .read_file_data(photo_inode, 9, 12)
                 .expect("range read should work");
-            assert_eq!(bytes, b"range:docs/photo.jpg:v1:9:12");
+            assert_eq!(bytes, b"range:docs/photo.jpg:v1:h-photo:9:12");
 
             assert_eq!(
                 hydrator
@@ -2840,7 +2932,7 @@ pub mod runtime {
                     .lock()
                     .expect("range hydrate call log lock poisoned")
                     .as_slice(),
-                &[(String::from("docs/photo.jpg:v1"), 9, 12)]
+                &[(String::from("docs/photo.jpg:v1:h-photo"), 9, 12)]
             );
             assert!(
                 hydrator
@@ -2854,6 +2946,12 @@ pub mod runtime {
                     .get(&photo_inode)
                     .and_then(|node| node.placeholder_version.as_deref()),
                 Some("v1")
+            );
+            assert_eq!(
+                fs.nodes
+                    .get(&photo_inode)
+                    .and_then(|node| node.placeholder_content_hash.as_deref()),
+                Some("h-photo")
             );
             assert_eq!(fs.nodes.get(&photo_inode).map(|node| node.size), Some(4096));
         }
@@ -2910,6 +3008,7 @@ pub mod runtime {
                         path: "albums/report.csv".to_string(),
                         local_version: Some("v-local".to_string()),
                         remote_version: Some("v-remote".to_string()),
+                        remote_content_hash: Some("h-remote".to_string()),
                         remote_size: Some(2048),
                     }],
                 },
@@ -2949,14 +3048,17 @@ pub mod runtime {
             let sidecar_bytes = fs
                 .read_file_data(sidecar_inode, 4, 7)
                 .expect("sidecar range read should work");
-            assert_eq!(sidecar_bytes, b"range:albums/report.csv:v-remote:4:7");
+            assert_eq!(
+                sidecar_bytes,
+                b"range:albums/report.csv:v-remote:h-remote:4:7"
+            );
             assert_eq!(
                 hydrator
                     .range_calls
                     .lock()
                     .expect("range hydrate call log lock poisoned")
                     .as_slice(),
-                &[(String::from("albums/report.csv:v-remote"), 4, 7)]
+                &[(String::from("albums/report.csv:v-remote:h-remote"), 4, 7)]
             );
         }
 
@@ -3001,6 +3103,7 @@ pub mod runtime {
                         path: "albums/report.csv".to_string(),
                         local_version: Some("v-local".to_string()),
                         remote_version: Some("v-remote".to_string()),
+                        remote_content_hash: Some("h-remote".to_string()),
                         remote_size: Some(2048),
                     }],
                 },
@@ -3013,6 +3116,7 @@ pub mod runtime {
                 actions: vec![FuseAction::EnsurePlaceholder {
                     path: "albums/report.csv".to_string(),
                     remote_version: "v-remote-2".to_string(),
+                    remote_content_hash: "h-remote-2".to_string(),
                     remote_size: Some(1024),
                 }],
             });
@@ -3207,6 +3311,7 @@ pub mod runtime {
                     actions: vec![FuseAction::EnsurePlaceholder {
                         path: "docs/report.txt".to_string(),
                         remote_version: "v1".to_string(),
+                        remote_content_hash: "h1".to_string(),
                         remote_size: Some(1024),
                     }],
                 },
@@ -3285,6 +3390,7 @@ pub mod runtime {
                 "report.txt".to_string(),
                 ROOT_INODE,
                 "v1".to_string(),
+                "h1".to_string(),
                 2048,
             );
             let hydrated = FsNode::regular_file(3, "hydrated.txt".to_string(), ROOT_INODE);
@@ -3329,6 +3435,7 @@ mod tests {
             vec![FuseAction::EnsurePlaceholder {
                 path: "docs/readme.md".to_string(),
                 remote_version: "v1".to_string(),
+                remote_content_hash: "h1".to_string(),
                 remote_size: Some(123),
             }],
         );
@@ -3377,6 +3484,7 @@ mod tests {
                 path: "report.csv".to_string(),
                 local_version: Some("v-local".to_string()),
                 remote_version: Some("v-remote".to_string()),
+                remote_content_hash: Some("h2".to_string()),
                 remote_size: None,
             }],
         );

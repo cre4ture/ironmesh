@@ -1,6 +1,8 @@
 #![cfg(not(windows))]
 
-use crate::client_rights_edge::{ClientRightsEdgeState, OfflineObjectCacheMode};
+use crate::client_rights_edge::{
+    ClientRightsEdgeState, OfflineObjectCacheMode, RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES,
+};
 use crate::runtime::{
     DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, IronmeshFuseFs, Uploader,
     mount_action_plan_until_shutdown, mount_fs_until_shutdown,
@@ -444,8 +446,13 @@ impl ClientRightsEdgeIo {
 }
 
 impl Hydrator for ClientRightsEdgeIo {
-    fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>> {
-        if let Some(payload) = self.edge_state.read_cached_object(path, remote_version)? {
+    fn hydrate(
+        &self,
+        path: &str,
+        remote_version: &str,
+        remote_content_hash: &str,
+    ) -> Result<Vec<u8>> {
+        if let Some(payload) = self.edge_state.read_cached_object(remote_content_hash)? {
             return Ok(payload);
         }
 
@@ -461,7 +468,7 @@ impl Hydrator for ClientRightsEdgeIo {
             )
             .with_context(|| format!("failed to fetch object for path {path}"))?;
         self.edge_state
-            .cache_full_object(path, remote_version, &payload)?;
+            .cache_full_object(remote_content_hash, &payload)?;
         Ok(payload)
     }
 
@@ -469,33 +476,73 @@ impl Hydrator for ClientRightsEdgeIo {
         &self,
         path: &str,
         remote_version: &str,
+        remote_content_hash: &str,
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>> {
-        if let Some(payload) = self.edge_state.read_cached_object(path, remote_version)? {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        if let Some(payload) = self.edge_state.read_cached_object(remote_content_hash)? {
             let start = offset.min(payload.len() as u64) as usize;
             let end = offset.saturating_add(length).min(payload.len() as u64) as usize;
             return Ok(payload[start..end].to_vec());
         }
 
-        let mut payload = Vec::new();
-        let mut on_progress = |_progress: DownloadProgress| {};
-        let should_cancel = || false;
         let version_selector = Self::download_version_selector(remote_version);
-        self.sdk
-            .download_range_to_writer_with_progress_blocking(
-                DownloadRangeRequest {
-                    key: path,
-                    snapshot: None,
-                    version: version_selector,
-                    start: offset,
-                    length,
-                },
-                &mut payload,
-                &mut on_progress,
-                &should_cancel,
-            )
-            .with_context(|| format!("failed to fetch ranged object for path {path}"))?;
+        let range_end_exclusive = offset.saturating_add(length);
+        let chunk_size = RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES as u64;
+        let first_chunk_index = offset / chunk_size;
+        let last_chunk_index = range_end_exclusive.saturating_sub(1) / chunk_size;
+        let mut payload = Vec::with_capacity(length.min(usize::MAX as u64) as usize);
+
+        for chunk_index in first_chunk_index..=last_chunk_index {
+            let chunk_start = chunk_index.saturating_mul(chunk_size);
+            let chunk = if let Some(chunk) = self
+                .edge_state
+                .read_cached_range_chunk(remote_content_hash, chunk_index)?
+            {
+                chunk
+            } else {
+                let mut downloaded = Vec::new();
+                let mut on_progress = |_progress: DownloadProgress| {};
+                let should_cancel = || false;
+                self.sdk
+                    .download_range_to_writer_with_progress_blocking(
+                        DownloadRangeRequest {
+                            key: path,
+                            snapshot: None,
+                            version: version_selector,
+                            start: chunk_start,
+                            length: chunk_size,
+                        },
+                        &mut downloaded,
+                        &mut on_progress,
+                        &should_cancel,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to fetch ranged object chunk for path {path} chunk_index={chunk_index}"
+                        )
+                    })?;
+                self.edge_state
+                    .cache_range_chunk(remote_content_hash, chunk_index, downloaded)?
+            };
+
+            let slice_start = offset.saturating_sub(chunk_start) as usize;
+            let slice_end = range_end_exclusive
+                .min(chunk_start.saturating_add(chunk.len() as u64))
+                .saturating_sub(chunk_start) as usize;
+            if slice_start < slice_end {
+                payload.extend_from_slice(&chunk[slice_start..slice_end]);
+            }
+
+            if chunk.len() < RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES {
+                break;
+            }
+        }
+
         Ok(payload)
     }
 }
@@ -644,6 +691,7 @@ mod tests {
         remote_version: &str,
         expected_head_request: &str,
         expected_get_request: &str,
+        expected_get_range_header: &str,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener bind should succeed");
         let server_addr = listener
@@ -667,8 +715,8 @@ mod tests {
                 [
                     concat!(
                         "HTTP/1.1 206 Partial Content\r\n",
-                        "Content-Length: 12\r\n",
-                        "Content-Range: bytes 9-20/22\r\n",
+                        "Content-Length: 22\r\n",
+                        "Content-Range: bytes 0-21/22\r\n",
                         "x-ironmesh-object-size: 22\r\n",
                         "ETag: \"etag-v1\"\r\n",
                         "Accept-Ranges: bytes\r\n",
@@ -676,7 +724,7 @@ mod tests {
                         "\r\n",
                     )
                     .as_bytes(),
-                    b"abcdefghijkl".as_slice(),
+                    b"012345678abcdefghijklm".as_slice(),
                 ]
                 .concat(),
             ] {
@@ -707,7 +755,7 @@ mod tests {
         );
 
         let payload = io
-            .hydrate_range("docs/photo.jpg", remote_version, 9, 12)
+            .hydrate_range("docs/photo.jpg", remote_version, "hash-photo-v1", 9, 12)
             .expect("range hydration should succeed");
         assert_eq!(payload, b"abcdefghijkl");
 
@@ -718,7 +766,7 @@ mod tests {
         assert!(recorded_requests[0].starts_with(expected_head_request));
         assert!(recorded_requests[1].starts_with(expected_get_request));
         let request_headers = recorded_requests[1].to_ascii_lowercase();
-        assert!(request_headers.contains("\r\nrange: bytes=9-20\r\n"));
+        assert!(request_headers.contains(expected_get_range_header));
         assert!(request_headers.contains("\r\nif-range: \"etag-v1\"\r\n"));
 
         let _ = fs::remove_dir_all(&state_dir);
@@ -735,11 +783,13 @@ mod tests {
                 FuseAction::EnsurePlaceholder {
                     path: "docs/new.txt".to_string(),
                     remote_version: "v1".to_string(),
+                    remote_content_hash: "h1".to_string(),
                     remote_size: Some(12),
                 },
                 FuseAction::EnsurePlaceholder {
                     path: "notes/todo.txt".to_string(),
                     remote_version: "v3".to_string(),
+                    remote_content_hash: "h3".to_string(),
                     remote_size: Some(8),
                 },
             ],
@@ -752,6 +802,7 @@ mod tests {
             vec![FuseAction::EnsurePlaceholder {
                 path: "docs/new.txt".to_string(),
                 remote_version: "v1".to_string(),
+                remote_content_hash: "h1".to_string(),
                 remote_size: Some(12),
             }],
         );
@@ -763,6 +814,7 @@ mod tests {
             actions: vec![FuseAction::EnsurePlaceholder {
                 path: "docs/new.txt".to_string(),
                 remote_version: "v2".to_string(),
+                remote_content_hash: "h2".to_string(),
                 remote_size: Some(14),
             }],
         };
@@ -778,6 +830,7 @@ mod tests {
                 FuseAction::EnsurePlaceholder {
                     path: "docs/new.txt".to_string(),
                     remote_version: "v2".to_string(),
+                    remote_content_hash: "h2".to_string(),
                     remote_size: Some(14),
                 },
                 FuseAction::RemovePath {
@@ -801,6 +854,7 @@ mod tests {
                 FuseAction::EnsurePlaceholder {
                     path: "docs/sub/new.txt".to_string(),
                     remote_version: "v2".to_string(),
+                    remote_content_hash: "h2".to_string(),
                     remote_size: Some(14),
                 },
             ],
@@ -817,6 +871,7 @@ mod tests {
                 FuseAction::EnsurePlaceholder {
                     path: "docs/sub/new.txt".to_string(),
                     remote_version: "v2".to_string(),
+                    remote_content_hash: "h2".to_string(),
                     remote_size: Some(14),
                 },
                 FuseAction::RemovePath {
@@ -849,6 +904,7 @@ mod tests {
             "v1:size=22",
             "HEAD /store/docs%2Fphoto.jpg?version=v1 HTTP/1.1",
             "GET /store/docs%2Fphoto.jpg?version=v1 HTTP/1.1",
+            "\r\nrange: bytes=0-21\r\n",
         );
     }
 
@@ -858,6 +914,90 @@ mod tests {
             "server-head:size=22",
             "HEAD /store/docs%2Fphoto.jpg HTTP/1.1",
             "GET /store/docs%2Fphoto.jpg HTTP/1.1",
+            "\r\nrange: bytes=0-21\r\n",
         );
+    }
+
+    #[test]
+    fn client_rights_edge_range_hydration_reuses_in_memory_chunk_cache_when_disk_cache_is_off() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener bind should succeed");
+        let server_addr = listener
+            .local_addr()
+            .expect("listener local addr should succeed");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_server = requests.clone();
+        let server = thread::spawn(move || {
+            for response in [
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Length: 22\r\n",
+                    "x-ironmesh-object-size: 22\r\n",
+                    "ETag: \"etag-v1\"\r\n",
+                    "Accept-Ranges: bytes\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes()
+                .to_vec(),
+                [
+                    concat!(
+                        "HTTP/1.1 206 Partial Content\r\n",
+                        "Content-Length: 22\r\n",
+                        "Content-Range: bytes 0-21/22\r\n",
+                        "x-ironmesh-object-size: 22\r\n",
+                        "ETag: \"etag-v1\"\r\n",
+                        "Accept-Ranges: bytes\r\n",
+                        "Connection: close\r\n",
+                        "\r\n",
+                    )
+                    .as_bytes(),
+                    b"012345678abcdefghijklm".as_slice(),
+                ]
+                .concat(),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept should succeed");
+                let request = read_http_request(&mut stream);
+                requests_for_server
+                    .lock()
+                    .expect("request log lock should succeed")
+                    .push(request);
+                stream
+                    .write_all(&response)
+                    .expect("response write should succeed");
+                stream.flush().expect("response flush should succeed");
+            }
+        });
+
+        let state_dir = unique_temp_dir("range-cache-off");
+        let stage_dir = unique_temp_dir("range-cache-off-stage");
+        fs::create_dir_all(&stage_dir).expect("stage dir create should succeed");
+        let edge_state = Arc::new(
+            ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::Off)
+                .expect("edge state create should succeed"),
+        );
+        let io = ClientRightsEdgeIo::with_client(
+            IronMeshClient::from_direct_base_url(format!("http://{server_addr}")),
+            stage_dir.clone(),
+            edge_state,
+        );
+
+        let first = io
+            .hydrate_range("docs/photo.jpg", "server-head", "hash-photo-v1", 9, 4)
+            .expect("first range hydration should succeed");
+        let second = io
+            .hydrate_range("docs/photo.jpg", "server-head", "hash-photo-v1", 13, 4)
+            .expect("second range hydration should succeed");
+        assert_eq!(first, b"abcd");
+        assert_eq!(second, b"efgh");
+
+        server.join().expect("server thread should succeed");
+
+        let recorded_requests = requests.lock().expect("request log lock should succeed");
+        assert_eq!(recorded_requests.len(), 2);
+        assert!(recorded_requests[0].starts_with("HEAD /store/docs%2Fphoto.jpg HTTP/1.1"));
+        assert!(recorded_requests[1].starts_with("GET /store/docs%2Fphoto.jpg HTTP/1.1"));
+
+        let _ = fs::remove_dir_all(&state_dir);
+        let _ = fs::remove_dir_all(&stage_dir);
     }
 }

@@ -54,10 +54,14 @@ Current Linux FUSE scope:
   - a durable local mutation queue,
   - staged upload state for resumable client-side uploads,
   - optional hydrated-object cache state.
+- placeholder identity and hydrated-object cache lookups now carry remote `content_hash` from
+  `/store/index` when available, so cache reuse is content-addressed rather than path/version-based.
 
 Object cache policy:
 - hydrated remote object caching is configurable and can be disabled completely.
 - disabling the object cache does not disable the durable local mutation queue.
+- disabling the object cache also does not disable the small in-memory range chunk cache that the
+  mount uses to avoid repeated refetches within the current session.
 - this is intended for deployments where the FUSE mount already runs on the same device as a
   regular `server-node` and a second hydrated-object copy would be redundant.
 
@@ -167,7 +171,8 @@ Implemented:
 - offline restart from the last cached remote snapshot plus replayed local mutations
 - resumable client-side uploads for queued large-file writes
 - server-notification-driven remote refresh with polling fallback
-- optional hydrated-object cache for remote reads
+- content-hash-based placeholder identity and optional hydrated-object cache for remote reads
+- bounded in-memory range chunk cache for repeated remote rereads during a mounted session
 
 Current limits:
 - the durable mutation queue is stronger than the hydrated-object cache; local pending writes are

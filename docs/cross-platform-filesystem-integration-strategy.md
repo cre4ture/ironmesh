@@ -292,6 +292,10 @@ cargo run -p os-integration -- \
 - `--client-edge-state-dir` overrides the default persisted state location.
 - `--offline-object-cache` controls whether hydrated remote objects are cached locally for offline
   rereads.
+- Remote placeholders and hydrated-object cache entries are keyed by remote `content_hash` when it
+  is available from `/store/index`, so renamed/copied paths can reuse hydrated bytes safely.
+- Even with `--offline-object-cache off`, the live mount keeps a small in-memory range chunk cache
+  for repeated reads during the current mount session.
 
 Recommended same-device deployment:
 
@@ -307,6 +311,8 @@ cargo run -p os-integration -- \
   regular `server-node` and a second hydrated-object cache would be redundant.
 - This does not disable the durable mutation queue or snapshot cache required for client-rights
   offline sync semantics.
+- This also does not disable the in-memory range chunk cache used to avoid refetching identical
+  chunks within the same mounted session.
 
 Obsolete path kept for design history:
 
