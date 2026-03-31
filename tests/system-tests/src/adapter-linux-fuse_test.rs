@@ -106,13 +106,28 @@ mod tests {
         connection: &LinuxFuseConnection,
         mountpoint: &Path,
     ) -> Result<ChildGuard> {
-        start_linux_fuse_adapter_with_refresh(connection, mountpoint, 500).await
+        start_linux_fuse_adapter_with_args(connection, mountpoint, 500, &[]).await
     }
 
     async fn start_linux_fuse_adapter_with_refresh(
         connection: &LinuxFuseConnection,
         mountpoint: &Path,
         remote_refresh_interval_ms: u64,
+    ) -> Result<ChildGuard> {
+        start_linux_fuse_adapter_with_args(
+            connection,
+            mountpoint,
+            remote_refresh_interval_ms,
+            &[],
+        )
+        .await
+    }
+
+    async fn start_linux_fuse_adapter_with_args(
+        connection: &LinuxFuseConnection,
+        mountpoint: &Path,
+        remote_refresh_interval_ms: u64,
+        extra_args: &[&str],
     ) -> Result<ChildGuard> {
         let os_integration_bin = binary_path("os-integration")?;
         let mountpoint_arg = mountpoint.to_string_lossy().to_string();
@@ -129,6 +144,7 @@ mod tests {
             .arg(&mountpoint_arg)
             .arg("--remote-refresh-interval-ms")
             .arg(remote_refresh_interval_ms.to_string())
+            .args(extra_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1561,11 +1577,10 @@ mod tests {
                 file.write_all(b"dirty-payload").with_context(|| {
                     format!("failed to write mounted file {}", mounted_file.display())
                 })?;
+                wait_for_xattr_value(&mounted_file, "user.ironmesh.state", b"dirty", 120).await?;
                 file.flush().with_context(|| {
                     format!("failed to flush mounted file {}", mounted_file.display())
                 })?;
-
-                wait_for_xattr_value(&mounted_file, "user.ironmesh.state", b"dirty", 120).await?;
                 drop(file);
 
                 wait_for_object_bytes(&sdk, "dirty-state.txt", b"dirty-payload", 180).await?;
@@ -2031,6 +2046,81 @@ mod tests {
         result
     }
 
+    async fn run_client_rights_edge_offline_restart_case(bind: &str) -> Result<()> {
+        let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
+        if !fuse_runtime_available() {
+            eprintln!("skipping linux fuse system test because /dev/fuse is missing");
+            return Ok(());
+        }
+
+        let node_id = Uuid::new_v4().to_string();
+        let server_data_dir = fresh_data_dir("linux-fuse-client-rights-edge-server");
+        let client_edge_state_dir = fresh_data_dir("linux-fuse-client-rights-edge-state");
+        let mountpoint = fresh_data_dir("linux-fuse-client-rights-edge-mount");
+        let base_url = format!("http://{bind}");
+        let connection = LinuxFuseConnection::direct(base_url.clone());
+        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let mut server = start_open_server_with_env(bind, &server_data_dir, &node_id, 1, &[]).await?;
+
+        let result = async {
+            sdk.put("seed/online.txt", Bytes::from_static(b"seed-online"))
+                .await?;
+
+            let extra_args_owned = vec![
+                "--client-edge-state-dir".to_string(),
+                client_edge_state_dir.to_string_lossy().to_string(),
+                "--offline-object-cache".to_string(),
+                "off".to_string(),
+            ];
+            let extra_args = extra_args_owned
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+
+            let mut adapter =
+                start_linux_fuse_adapter_with_args(&connection, &mountpoint, 250, &extra_args)
+                    .await?;
+            wait_for_mount_active(&mountpoint, 150).await?;
+            wait_for_file(&mountpoint.join("seed/online.txt"), 120).await?;
+
+            stop_server(&mut server).await;
+
+            let offline_key = "offline-client-rights-write.txt";
+            let offline_payload = b"written-while-direct-client-edge-was-offline".to_vec();
+            let mounted_offline = mountpoint.join(offline_key);
+            fs::write(&mounted_offline, &offline_payload).with_context(|| {
+                format!(
+                    "failed to write mounted offline file {}",
+                    mounted_offline.display()
+                )
+            })?;
+            wait_for_file_bytes(&mounted_offline, &offline_payload, 40).await?;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+
+            let mut adapter =
+                start_linux_fuse_adapter_with_args(&connection, &mountpoint, 250, &extra_args)
+                    .await?;
+            wait_for_mount_active(&mountpoint, 150).await?;
+            wait_for_file(&mountpoint.join("seed/online.txt"), 120).await?;
+            wait_for_file(&mounted_offline, 120).await?;
+            wait_for_file_bytes(&mounted_offline, &offline_payload, 120).await?;
+
+            server = start_open_server_with_env(bind, &server_data_dir, &node_id, 1, &[]).await?;
+            wait_for_object_bytes(&sdk, offline_key, &offline_payload, 300).await?;
+
+            stop_linux_fuse_adapter(&mut adapter, &mountpoint).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = fs::remove_dir_all(&mountpoint);
+        let _ = fs::remove_dir_all(&server_data_dir);
+        let _ = fs::remove_dir_all(&client_edge_state_dir);
+        result
+    }
+
     #[tokio::test]
     async fn linux_fuse_server_mode_uploads_small_payload() -> Result<()> {
         run_server_mode_upload_case(
@@ -2136,5 +2226,11 @@ mod tests {
     async fn linux_fuse_local_edge_mount_survives_upstream_restart_and_syncs_offline_write()
     -> Result<()> {
         run_local_edge_upstream_restart_case("127.0.0.1:19371").await
+    }
+
+    #[tokio::test]
+    async fn linux_fuse_client_rights_edge_survives_offline_restart_and_syncs_queued_write()
+    -> Result<()> {
+        run_client_rights_edge_offline_restart_case("127.0.0.1:19377").await
     }
 }
