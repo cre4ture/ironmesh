@@ -114,13 +114,8 @@ mod tests {
         mountpoint: &Path,
         remote_refresh_interval_ms: u64,
     ) -> Result<ChildGuard> {
-        start_linux_fuse_adapter_with_args(
-            connection,
-            mountpoint,
-            remote_refresh_interval_ms,
-            &[],
-        )
-        .await
+        start_linux_fuse_adapter_with_args(connection, mountpoint, remote_refresh_interval_ms, &[])
+            .await
     }
 
     async fn start_linux_fuse_adapter_with_args(
@@ -1836,7 +1831,7 @@ mod tests {
         result
     }
 
-    async fn run_remote_file_rename_refresh_local_edge_case(bind: &str) -> Result<()> {
+    async fn run_remote_rename_move_refresh_local_edge_case(bind: &str) -> Result<()> {
         let _case_guard = lock_test_resources(["linux-fuse-case".to_string()]).await;
         if !fuse_runtime_available() {
             eprintln!("skipping linux fuse system test because /dev/fuse is missing");
@@ -1938,6 +1933,99 @@ mod tests {
                 wait_for_file(&mounted_remote_file_to, 120).await?;
                 wait_for_file_bytes(&mounted_remote_file_to, &remote_file_payload, 120).await?;
                 wait_for_absence(&mounted_remote_file_from, 120).await?;
+
+                let remote_folder_payload = b"remote-folder-move-local-edge-payload".to_vec();
+                let old_root = "remote-folder-move-local-edge/from";
+                let old_root_marker = "remote-folder-move-local-edge/from/";
+                let old_nested_marker = "remote-folder-move-local-edge/from/nested/";
+                let old_file = "remote-folder-move-local-edge/from/nested/inside.txt";
+                let new_root = "remote-folder-move-local-edge/to";
+                let new_root_marker = "remote-folder-move-local-edge/to/";
+                let new_nested_marker = "remote-folder-move-local-edge/to/nested/";
+                let new_file = "remote-folder-move-local-edge/to/nested/inside.txt";
+                let old_root_prefix = format!("{old_root}/");
+                let new_root_prefix = format!("{new_root}/");
+
+                sdk.put(old_root_marker, Bytes::new()).await?;
+                sdk.put(old_nested_marker, Bytes::new()).await?;
+                sdk.put_large_aware(old_file, Bytes::from(remote_folder_payload.clone()))
+                    .await?;
+
+                let mounted_old_file = mountpoint.join(old_file);
+                for _ in 0..220 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if mounted_old_file.is_file() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_file(&mounted_old_file, 40).await?;
+
+                sdk.rename_path(old_file, new_file, false).await?;
+                sdk.rename_path(old_nested_marker, new_nested_marker, false)
+                    .await?;
+                sdk.rename_path(old_root_marker, new_root_marker, false)
+                    .await?;
+
+                for _ in 0..360 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    let new_ready = local_edge_sdk
+                        .get(new_file)
+                        .await
+                        .map(|bytes| bytes.as_ref() == remote_folder_payload.as_slice())
+                        .unwrap_or(false);
+                    let old_missing = local_edge_sdk.get(old_file).await.is_err();
+                    let index_moved = local_edge_sdk
+                        .store_index(Some("remote-folder-move-local-edge"), 64, None)
+                        .await
+                        .map(|index| {
+                            let old_present = index.entries.iter().any(|entry| {
+                                entry.path == old_root
+                                    || entry.path == old_root_marker
+                                    || entry.path.starts_with(&old_root_prefix)
+                            });
+                            let new_present = index.entries.iter().any(|entry| {
+                                entry.path == new_root
+                                    || entry.path == new_root_marker
+                                    || entry.path.starts_with(&new_root_prefix)
+                            });
+                            !old_present && new_present
+                        })
+                        .unwrap_or(false);
+                    if new_ready && old_missing && index_moved {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+
+                wait_for_object_bytes(&local_edge_sdk, new_file, &remote_folder_payload, 120)
+                    .await?;
+                wait_for_remote_file_absence(&local_edge_sdk, old_file, 120).await?;
+                wait_for_remote_directory_absence(&local_edge_sdk, old_root, 120).await?;
+                wait_for_store_index_entry(
+                    &local_edge_sdk,
+                    Some("remote-folder-move-local-edge"),
+                    1,
+                    new_root_marker,
+                    "prefix",
+                    true,
+                    120,
+                )
+                .await?;
+
+                let mounted_new_file = mountpoint.join(new_file);
+                for _ in 0..360 {
+                    trigger_local_edge_repair(&local_edge_base_url).await;
+                    if mounted_new_file.is_file() && mounted_path_absent(&mountpoint.join(old_root))
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                wait_for_file(&mounted_new_file, 120).await?;
+                wait_for_file_bytes(&mounted_new_file, &remote_folder_payload, 120).await?;
+                wait_for_absence(&mountpoint.join(old_root), 120).await?;
+                wait_for_dir(&mountpoint.join(new_root), 120).await?;
 
                 Ok::<(), anyhow::Error>(())
             }
@@ -2060,7 +2148,8 @@ mod tests {
         let base_url = format!("http://{bind}");
         let connection = LinuxFuseConnection::direct(base_url.clone());
         let sdk = IronMeshClient::from_direct_base_url(&base_url);
-        let mut server = start_open_server_with_env(bind, &server_data_dir, &node_id, 1, &[]).await?;
+        let mut server =
+            start_open_server_with_env(bind, &server_data_dir, &node_id, 1, &[]).await?;
 
         let result = async {
             sdk.put("seed/online.txt", Bytes::from_static(b"seed-online"))
@@ -2213,8 +2302,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn linux_fuse_remote_file_rename_refreshes_in_place_in_local_edge_mode() -> Result<()> {
-        run_remote_file_rename_refresh_local_edge_case("127.0.0.1:19374").await
+    async fn linux_fuse_remote_file_and_folder_renames_refresh_in_place_in_local_edge_mode()
+    -> Result<()> {
+        run_remote_rename_move_refresh_local_edge_case("127.0.0.1:19374").await
     }
 
     #[tokio::test]

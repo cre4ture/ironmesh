@@ -1668,6 +1668,26 @@ pub mod runtime {
             Ok(())
         }
 
+        fn would_create_directory_cycle(
+            &self,
+            directory_inode: u64,
+            candidate_parent_inode: u64,
+        ) -> Result<bool> {
+            let mut current = candidate_parent_inode;
+            while current != ROOT_INODE {
+                if current == directory_inode {
+                    return Ok(true);
+                }
+                let ancestor = self
+                    .nodes
+                    .get(&current)
+                    .ok_or_else(|| anyhow!("ancestor inode missing during rename"))?;
+                current = ancestor.parent_inode;
+            }
+
+            Ok(false)
+        }
+
         fn resolve_full_path(&self, inode: u64) -> String {
             if inode == ROOT_INODE {
                 return String::new();
@@ -2288,17 +2308,16 @@ pub mod runtime {
             }
 
             if node.kind == FileType::Directory {
-                let mut current = newparent;
-                while current != ROOT_INODE {
-                    if current == inode {
+                match self.would_create_directory_cycle(inode, newparent) {
+                    Ok(true) => {
                         reply.error(EINVAL);
                         return;
                     }
-                    let Some(ancestor) = self.nodes.get(&current) else {
+                    Ok(false) => {}
+                    Err(_) => {
                         reply.error(EIO);
                         return;
-                    };
-                    current = ancestor.parent_inode;
+                    }
                 }
             }
 
@@ -3301,6 +3320,142 @@ pub mod runtime {
                         path: "from/".to_string(),
                     },
                 ]
+            );
+        }
+
+        #[test]
+        fn rename_rejects_non_empty_directory_targets() {
+            let hydrator = RecordingHydrator::default();
+            let uploader = RecordingUploader::default();
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(hydrator),
+                Box::new(uploader.clone()),
+                None,
+            );
+
+            let source_dir_inode = fs.next_inode();
+            fs.nodes.insert(
+                source_dir_inode,
+                FsNode::directory(source_dir_inode, "from".to_string(), ROOT_INODE),
+            );
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("from".to_string(), source_dir_inode);
+
+            let target_dir_inode = fs.next_inode();
+            fs.nodes.insert(
+                target_dir_inode,
+                FsNode::directory(target_dir_inode, "to".to_string(), ROOT_INODE),
+            );
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("to".to_string(), target_dir_inode);
+
+            let target_child_inode = fs.next_inode();
+            let target_child = FsNode::regular_file(
+                target_child_inode,
+                "nested.txt".to_string(),
+                target_dir_inode,
+            );
+            fs.nodes.insert(target_child_inode, target_child);
+            fs.nodes
+                .get_mut(&target_dir_inode)
+                .expect("target directory missing")
+                .children
+                .insert("nested.txt".to_string(), target_child_inode);
+
+            let error = fs
+                .rename_entry(ROOT_INODE, "from", ROOT_INODE, "to", 0)
+                .expect_err("rename should reject non-empty directory targets");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("destination directory is not empty"),
+                "unexpected rename error: {error:#}"
+            );
+            assert_eq!(
+                fs.nodes
+                    .get(&ROOT_INODE)
+                    .expect("root inode missing")
+                    .children
+                    .get("from")
+                    .copied(),
+                Some(source_dir_inode)
+            );
+            assert_eq!(
+                fs.nodes
+                    .get(&ROOT_INODE)
+                    .expect("root inode missing")
+                    .children
+                    .get("to")
+                    .copied(),
+                Some(target_dir_inode)
+            );
+            assert_eq!(
+                uploader
+                    .ops
+                    .lock()
+                    .expect("upload op log lock poisoned")
+                    .len(),
+                0
+            );
+        }
+
+        #[test]
+        fn rename_cycle_detection_blocks_descendant_targets() {
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(RecordingHydrator::default()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            let source_dir_inode = fs.next_inode();
+            fs.nodes.insert(
+                source_dir_inode,
+                FsNode::directory(source_dir_inode, "from".to_string(), ROOT_INODE),
+            );
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("from".to_string(), source_dir_inode);
+
+            let nested_dir_inode = fs.next_inode();
+            fs.nodes.insert(
+                nested_dir_inode,
+                FsNode::directory(nested_dir_inode, "nested".to_string(), source_dir_inode),
+            );
+            fs.nodes
+                .get_mut(&source_dir_inode)
+                .expect("source directory missing")
+                .children
+                .insert("nested".to_string(), nested_dir_inode);
+
+            let sibling_dir_inode = fs.next_inode();
+            fs.nodes.insert(
+                sibling_dir_inode,
+                FsNode::directory(sibling_dir_inode, "other".to_string(), ROOT_INODE),
+            );
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("other".to_string(), sibling_dir_inode);
+
+            assert!(
+                fs.would_create_directory_cycle(source_dir_inode, nested_dir_inode)
+                    .expect("cycle detection should succeed")
+            );
+            assert!(
+                !fs.would_create_directory_cycle(source_dir_inode, sibling_dir_inode)
+                    .expect("cycle detection should succeed")
             );
         }
 
