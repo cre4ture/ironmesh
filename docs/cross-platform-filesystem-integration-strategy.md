@@ -11,7 +11,6 @@
 
 - Perfect parity of all OS-specific shell features in the first release.
 - Bi-directional real-time sync with advanced conflict UI.
-- Offline-first writeback queue with full resume semantics.
 
 ## Platform targets
 
@@ -109,7 +108,7 @@ Out of scope for MVP:
 ## Planned phase sequence
 
 1. MVP (this change): shared planner + tests.
-2. Linux pilot: `adapter-linux-fuse` mount with live hydration, write-through, and local-edge support. ✅
+2. Linux pilot: `adapter-linux-fuse` mount with live hydration and client-rights edge sync. ✅
 3. Windows pilot: sync root registration + read/hydrate callback path. ✅
 4. Android alignment: map `DocumentsProvider` operations to the same planner contracts.
 5. Shared writeback queue + conflict resolution UX.
@@ -176,10 +175,14 @@ Current Linux FUSE interpretation:
 - Completed:
   - `crates/sync-core` with deterministic reconciliation planner + unit tests.
   - `crates/adapter-linux-fuse` runtime with Linux FUSE mount support.
-  - Linux `os-integration` mount CLI with three modes:
+  - Linux `os-integration` mount CLI with:
     - `--snapshot-file` static snapshot mode.
-    - `--server-base-url` live namespace/hydration/write-through mode via `server-node` APIs.
-    - `--local-edge` embedded local-edge mode with persistent local storage and upstream sync.
+    - live client-rights edge mode via `--server-base-url` or `--bootstrap-file`.
+  - Linux direct/bootstrap mounts now persist:
+    - the last successfully fetched remote snapshot,
+    - a durable client-side mutation queue,
+    - resumable upload state for queued large uploads,
+    - an optional hydrated-object cache for remote reads.
   - CI artifact publication for Ubuntu mount binary (`linux-fuse-mount-binary-ubuntu`).
   - `crates/adapter-windows-cfapi` runtime with:
     - sync-root registration + placeholder creation,
@@ -270,7 +273,7 @@ Snapshot mode behavior:
 - File reads trigger demo hydration.
 - Snapshot mode is for inspection/debugging, not persistent sync.
 
-Direct server-node mode:
+Direct/bootstrap client-rights edge mode:
 
 ```bash
 mkdir -p /tmp/ironmesh-mount-live
@@ -280,21 +283,34 @@ cargo run -p os-integration -- \
 ```
 
 - `--server-base-url` loads namespace entries from `/store/index`.
-- File reads hydrate through live `GET /store/{key}` requests.
-- Local writes, deletes, and renames are sent back to the server.
+- `--bootstrap-file` is the equivalent authenticated entrypoint when a client bootstrap bundle is
+  preferred over a raw base URL.
+- Local writes, deletes, and renames are captured into a durable local mutation queue first and
+  then synchronized through client APIs.
+- Offline restart replays the last cached snapshot plus queued local mutations.
 - `--remote-refresh-interval-ms` controls namespace polling while mounted.
+- `--client-edge-state-dir` overrides the default persisted state location.
+- `--offline-object-cache` controls whether hydrated remote objects are cached locally for offline
+  rereads.
 
-Embedded local-edge mode:
+Recommended same-device deployment:
 
 ```bash
-mkdir -p /tmp/ironmesh-mount-edge
+mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
-  --local-edge \
-  --mountpoint /tmp/ironmesh-mount-edge
+  --offline-object-cache off \
+  --mountpoint /tmp/ironmesh-mount-live
 ```
 
-- `--local-edge` mounts against a spawned local edge node instead of the remote server directly.
-- The local edge persists state on disk and can accept writes while the upstream is unavailable.
-- By default, the local edge stores state under `$XDG_STATE_HOME/ironmesh/os-integration/local-edge/` or `~/.local/state/ironmesh/os-integration/local-edge/`.
-- `--local-edge-data-dir` is the advanced override for choosing that storage path explicitly.
+- Use `--offline-object-cache off` when the FUSE mount already runs on the same device as a
+  regular `server-node` and a second hydrated-object cache would be redundant.
+- This does not disable the durable mutation queue or snapshot cache required for client-rights
+  offline sync semantics.
+
+Obsolete path kept for design history:
+
+- The embedded Linux FUSE `--local-edge` helper is obsolete and removed.
+- It is not being revived because it still required local `server-node` authority rather than a
+  plain client identity.
+- The rationale is preserved in `docs/client-rights-edge-sync-idea.md`.

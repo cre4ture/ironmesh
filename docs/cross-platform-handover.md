@@ -16,10 +16,10 @@ This document is the handover package for continuing cross-platform filesystem i
   - Action mapping from `sync-core` operations.
   - FUSE runtime.
   - User-facing Linux mount entrypoint via `apps/os-integration`.
-  - Three mount modes:
+  - Mount modes:
     - `--snapshot-file`: static snapshot input.
-    - `--server-base-url`: live namespace + object hydration/write-through from `server-node`.
-    - `--local-edge`: embedded local edge node with persistent storage and upstream sync.
+    - `--server-base-url` or `--bootstrap-file`: live client-rights edge mode with durable local
+      mutation queue, cached remote snapshot, and optional hydrated-object cache.
 - Android SAF integration:
   - Provider + API/repository wiring.
   - Persisted base URL shared between app UI and provider.
@@ -81,7 +81,7 @@ cargo run -p os-integration -- \
   --mountpoint /tmp/ironmesh-mount
 ```
 
-Live server mode:
+Live client-rights edge mode:
 
 ```bash
 mkdir -p /tmp/ironmesh-mount-live
@@ -90,14 +90,14 @@ cargo run -p os-integration -- \
   --mountpoint /tmp/ironmesh-mount-live
 ```
 
-Local-edge mode:
+Same-device mode with hydrated-object cache disabled:
 
 ```bash
-mkdir -p /tmp/ironmesh-mount-edge
+mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
-  --local-edge \
-  --mountpoint /tmp/ironmesh-mount-edge
+  --offline-object-cache off \
+  --mountpoint /tmp/ironmesh-mount-live
 ```
 
 Unmount:
@@ -152,7 +152,10 @@ Implement CFAPI behavior by mapping existing operations:
 ## Known caveats
 
 - Coverage gate currently excludes `crates/adapter-linux-fuse/` because runtime code is larger than current test surface.
-- Local-edge restart/offline coverage now exists, and live mount refresh prefers server notifications with polling fallback for compatibility.
+- Embedded Linux FUSE `--local-edge` is obsolete and removed; the design-history rationale is kept
+  in `docs/client-rights-edge-sync-idea.md`.
+- Direct/bootstrap Linux FUSE mounts now own offline restart through a client-rights durable
+  mutation queue and cached remote snapshot.
 - Live server mode currently maps remote file versions to placeholder synthetic values for planning consistency.
 
 ## Suggested first task on Windows
