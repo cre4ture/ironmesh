@@ -1,19 +1,19 @@
 #![cfg(not(windows))]
 
+use crate::client_rights_edge::{ClientRightsEdgeState, OfflineObjectCacheMode};
 use crate::runtime::{
-    DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, Uploader,
-    mount_action_plan_until_shutdown, mount_action_plan_until_shutdown_with_updates,
+    DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, IronmeshFuseFs, Uploader,
+    mount_action_plan_until_shutdown, mount_fs_until_shutdown,
 };
 use crate::{FuseAction, FuseActionPlan, LinuxFuseAdapter};
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
     ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, RemoteSnapshotFetcher,
     RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
-use server_node_sdk::LocalNodeHandle;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,16 +48,10 @@ struct Args {
     server_ca_pem_file: Option<PathBuf>,
     #[arg(long)]
     client_identity_file: Option<PathBuf>,
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Spawn a persistent local edge node and mount against it"
-    )]
-    local_edge: bool,
     #[arg(long)]
-    local_edge_data_dir: Option<PathBuf>,
-    #[arg(long, hide = true)]
-    local_edge_base_url_file: Option<PathBuf>,
+    client_edge_state_dir: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = CliOfflineObjectCacheMode::On)]
+    offline_object_cache: CliOfflineObjectCacheMode,
     #[arg(long)]
     mountpoint: PathBuf,
     #[arg(long, default_value = "ironmesh")]
@@ -76,43 +70,40 @@ struct ResolvedUpstreamTarget {
     client: IronMeshClient,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliOfflineObjectCacheMode {
+    On,
+    Off,
+}
+
+impl From<CliOfflineObjectCacheMode> for OfflineObjectCacheMode {
+    fn from(value: CliOfflineObjectCacheMode) -> Self {
+        match value {
+            CliOfflineObjectCacheMode::On => OfflineObjectCacheMode::On,
+            CliOfflineObjectCacheMode::Off => OfflineObjectCacheMode::Off,
+        }
+    }
+}
+
 pub fn mount_main() -> Result<()> {
     common::logging::init_compact_tracing_default("info");
     let args = Args::parse();
     let client_identity = read_optional_client_identity(args.client_identity_file.as_deref())?;
-
-    let effective_local_edge_data_dir = effective_local_edge_data_dir(&args)?;
     let upstream_target = resolve_upstream_target(&args, client_identity.as_ref())?;
 
     if args.snapshot_file.is_some() {
-        if args.server_base_url.is_some()
-            || args.bootstrap_file.is_some()
-            || args.local_edge_data_dir.is_some()
-            || args.local_edge
-        {
+        if args.server_base_url.is_some() || args.bootstrap_file.is_some() {
             anyhow::bail!(
-                "--snapshot-file cannot be combined with --server-base-url, --bootstrap-file, --local-edge, or --local-edge-data-dir"
+                "--snapshot-file cannot be combined with --server-base-url or --bootstrap-file"
             );
         }
-    } else if upstream_target.is_none() && effective_local_edge_data_dir.is_none() {
-        anyhow::bail!(
-            "set either --snapshot-file, --server-base-url, --bootstrap-file, --local-edge, or --local-edge-data-dir"
-        );
-    }
-
-    if effective_local_edge_data_dir.is_some() && upstream_target.is_some() {
-        anyhow::bail!(
-            "--local-edge no longer supports direct upstream wiring; mount the remote target directly or provision a local edge node separately via node bootstrap/enrollment"
-        );
-    }
-
-    if args.local_edge_base_url_file.is_some() && effective_local_edge_data_dir.is_none() {
-        anyhow::bail!("--local-edge-base-url-file requires --local-edge or --local-edge-data-dir");
+    } else if upstream_target.is_none() {
+        anyhow::bail!("set either --snapshot-file, --server-base-url, or --bootstrap-file");
     }
 
     let adapter = LinuxFuseAdapter::new(args.fs_name.clone());
     let download_stage_root = download_stage_root(&args)?;
-    let mut config = FuseMountConfig::new(args.mountpoint, args.fs_name);
+    let mut config = FuseMountConfig::new(args.mountpoint.clone(), args.fs_name.clone());
     config.allow_other = args.allow_other;
 
     if let Some(snapshot_file) = &args.snapshot_file {
@@ -129,145 +120,139 @@ pub fn mount_main() -> Result<()> {
         );
     }
 
-    let local_node = if let Some(data_dir) = effective_local_edge_data_dir.as_ref() {
-        Some(
-            LocalNodeHandle::start_local_edge(data_dir).with_context(|| {
-                format!("failed to start local edge node in {}", data_dir.display())
-            })?,
-        )
-    } else {
-        None
-    };
-
-    let local_edge_base_url = local_node
+    let client = upstream_target
         .as_ref()
-        .map(|local_node| normalize_server_base_url(local_node.base_url()))
-        .transpose()?;
-    if let (Some(local_node), Some(output_path)) =
-        (local_node.as_ref(), args.local_edge_base_url_file.as_ref())
-    {
-        fs::write(output_path, local_node.base_url()).with_context(|| {
-            format!(
-                "failed to write local edge base URL to {}",
-                output_path.display()
-            )
-        })?;
-    }
-    let client = if local_node.is_none() {
-        upstream_target
-            .as_ref()
-            .map(|target| target.client.clone())
-            .ok_or_else(|| anyhow::anyhow!("missing upstream target for live mount"))?
-    } else {
-        build_configured_client(
-            local_edge_base_url
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing local edge base URL"))?
-                .as_str(),
-            None,
-            client_identity.as_ref(),
-        )?
-    };
+        .map(|target| target.client.clone())
+        .ok_or_else(|| anyhow::anyhow!("missing upstream target for live mount"))?;
+    let client_edge_state_dir = effective_client_edge_state_dir(&args)?;
+    let client_edge_state = Arc::new(ClientRightsEdgeState::new(
+        client_edge_state_dir,
+        args.offline_object_cache.into(),
+    )?);
     let initial_fetcher = RemoteSnapshotFetcher::new(
         client.clone(),
         RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
     );
-    let snapshot = initial_fetcher.fetch_snapshot_blocking()?;
-    let action_plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
+    let remote_snapshot = match initial_fetcher.fetch_snapshot_blocking() {
+        Ok(snapshot) => {
+            client_edge_state.persist_snapshot(&snapshot)?;
+            snapshot
+        }
+        Err(error) => {
+            if let Some(snapshot) = client_edge_state.load_cached_snapshot()? {
+                tracing::warn!(
+                    "client-rights-edge: failed to fetch initial snapshot; using cached snapshot: {error}"
+                );
+                snapshot
+            } else {
+                tracing::warn!(
+                    "client-rights-edge: failed to fetch initial snapshot and no cache exists; starting from empty namespace: {error}"
+                );
+                SyncSnapshot::default()
+            }
+        }
+    };
+    let planning_snapshot = client_edge_state.planning_snapshot(&remote_snapshot)?;
+    let action_plan = adapter.plan_actions(&planning_snapshot, &SyncPolicy::default());
+    let replay_actions = client_edge_state.replay_actions()?;
 
-    let refresh_enabled = upstream_target.is_some();
-    let (refresh_rx, refresh_thread, refresh_running) = if refresh_enabled {
-        let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
-        let wait_timeout = Duration::from_secs(2).max(refresh_interval);
-        let refresh_poller =
-            RemoteSnapshotPoller::server_notifications(wait_timeout, refresh_interval);
-        let refresh_fetcher = RemoteSnapshotFetcher::new(
-            client.clone(),
-            RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
-        );
-        let refresh_adapter = adapter.clone();
-        let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
-        let refresh_running = Arc::new(AtomicBool::new(true));
-        let refresh_stop_signal = refresh_running.clone();
-        let refresh_thread = refresh_poller.spawn_fetcher_loop(
-            refresh_running.clone(),
-            Some(snapshot),
-            refresh_fetcher,
-            move |update| {
-                let full_plan =
-                    refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
-                let plan = filter_refresh_action_plan(full_plan, &update.changed_paths);
-                if plan.actions.is_empty() {
-                    tracing::info!(
-                        "remote-refresh: detected {} changed remote paths; no local plan delta",
-                        update.changed_paths.len()
+    let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
+    let wait_timeout = Duration::from_secs(2).max(refresh_interval);
+    let refresh_poller = RemoteSnapshotPoller::server_notifications(wait_timeout, refresh_interval);
+    let refresh_fetcher = RemoteSnapshotFetcher::new(
+        client.clone(),
+        RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
+    );
+    let refresh_adapter = adapter.clone();
+    let refresh_state = Arc::clone(&client_edge_state);
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
+    let refresh_running = Arc::new(AtomicBool::new(true));
+    let refresh_stop_signal = refresh_running.clone();
+    let refresh_thread = refresh_poller.spawn_fetcher_loop(
+        refresh_running.clone(),
+        Some(remote_snapshot.clone()),
+        refresh_fetcher,
+        move |update| {
+            if let Err(error) = refresh_state.persist_snapshot(&update.snapshot) {
+                tracing::warn!("client-rights-edge: failed to persist refreshed snapshot: {error}");
+            }
+
+            let planning_snapshot = match refresh_state.planning_snapshot(&update.snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(
+                        "client-rights-edge: failed to build refresh planning snapshot: {error}"
                     );
                     return;
                 }
-
-                if refresh_tx.send(plan).is_err() {
-                    refresh_stop_signal.store(false, Ordering::SeqCst);
-                    return;
-                }
+            };
+            let full_plan = refresh_adapter.plan_actions(&planning_snapshot, &SyncPolicy::default());
+            let plan = filter_refresh_action_plan(full_plan, &update.changed_paths);
+            if plan.actions.is_empty() {
                 tracing::info!(
-                    "remote-refresh: reconciled {} changed paths",
+                    "remote-refresh: detected {} changed remote paths; no local plan delta",
                     update.changed_paths.len()
                 );
-            },
-        );
-        (
-            Some(refresh_rx),
-            Some(refresh_thread),
-            Some(refresh_running),
-        )
-    } else {
-        (None, None, None)
-    };
+                return;
+            }
 
-    let io = ServerNodeIo::with_client(client, download_stage_root);
-    let result = mount_action_plan_until_shutdown_with_updates(
-        &config,
-        action_plan,
-        Box::new(io.clone()),
-        Box::new(io),
-        refresh_rx,
+            if refresh_tx.send(plan).is_err() {
+                refresh_stop_signal.store(false, Ordering::SeqCst);
+                return;
+            }
+            tracing::info!(
+                "remote-refresh: reconciled {} changed paths",
+                update.changed_paths.len()
+            );
+        },
+    );
+    let sync_thread = client_edge_state.spawn_sync_loop(
+        refresh_running.clone(),
+        client.clone(),
+        refresh_interval,
     );
 
-    if let Some(refresh_running) = refresh_running {
-        refresh_running.store(false, Ordering::SeqCst);
-    }
-    if let Some(refresh_thread) = refresh_thread {
-        let _ = refresh_thread.join();
-    }
-    drop(local_node);
+    let io = ClientRightsEdgeIo::with_client(
+        client,
+        download_stage_root,
+        Arc::clone(&client_edge_state),
+    );
+    let mut fs = IronmeshFuseFs::from_action_plan(
+        &action_plan,
+        Box::new(io.clone()),
+        Box::new(io),
+        Some(refresh_rx),
+    );
+    fs.apply_replay_actions(&replay_actions)?;
+    let result = mount_fs_until_shutdown(&config, fs);
+
+    refresh_running.store(false, Ordering::SeqCst);
+    let _ = refresh_thread.join();
+    let _ = sync_thread.join();
 
     result
 }
 
-fn effective_local_edge_data_dir(args: &Args) -> Result<Option<PathBuf>> {
-    if let Some(path) = args.local_edge_data_dir.clone() {
-        return Ok(Some(path));
+fn effective_client_edge_state_dir(args: &Args) -> Result<PathBuf> {
+    if let Some(path) = args.client_edge_state_dir.clone() {
+        return Ok(path);
     }
 
-    if !args.local_edge {
-        return Ok(None);
-    }
-
-    default_local_edge_data_dir(args)
+    default_client_edge_state_dir(args)
 }
 
-fn default_local_edge_data_dir(args: &Args) -> Result<Option<PathBuf>> {
+fn default_client_edge_state_dir(args: &Args) -> Result<PathBuf> {
     let state_home = xdg_state_home().unwrap_or_else(std::env::temp_dir);
     let mut path = state_home
         .join("ironmesh")
         .join("os-integration")
-        .join("local-edge");
-    let scope = local_edge_scope_label(args);
+        .join("client-rights-edge");
+    let scope = client_edge_scope_label(args);
     if scope.is_empty() {
-        anyhow::bail!("failed to derive local-edge storage scope");
+        anyhow::bail!("failed to derive client-rights edge storage scope");
     }
     path.push(scope);
-    Ok(Some(path))
+    Ok(path)
 }
 
 fn xdg_state_home() -> Option<PathBuf> {
@@ -281,7 +266,7 @@ fn xdg_state_home() -> Option<PathBuf> {
         .map(|home| home.join(".local").join("state"))
 }
 
-fn local_edge_scope_label(args: &Args) -> String {
+fn client_edge_scope_label(args: &Args) -> String {
     let mountpoint = args.mountpoint.to_string_lossy().to_string();
     let mut parts: Vec<String> = Vec::new();
     if let Some(base_url) = args.server_base_url.as_deref() {
@@ -424,22 +409,32 @@ fn filter_refresh_action_plan(plan: FuseActionPlan, changed_paths: &[String]) ->
 }
 
 #[derive(Clone)]
-struct ServerNodeIo {
+struct ClientRightsEdgeIo {
     sdk: IronMeshClient,
     download_stage_root: PathBuf,
+    edge_state: Arc<ClientRightsEdgeState>,
 }
 
-impl ServerNodeIo {
-    fn with_client(sdk: IronMeshClient, download_stage_root: PathBuf) -> Self {
+impl ClientRightsEdgeIo {
+    fn with_client(
+        sdk: IronMeshClient,
+        download_stage_root: PathBuf,
+        edge_state: Arc<ClientRightsEdgeState>,
+    ) -> Self {
         Self {
             sdk,
             download_stage_root,
+            edge_state,
         }
     }
 }
 
-impl Hydrator for ServerNodeIo {
-    fn hydrate(&self, path: &str, _remote_version: &str) -> Result<Vec<u8>> {
+impl Hydrator for ClientRightsEdgeIo {
+    fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>> {
+        if let Some(payload) = self.edge_state.read_cached_object(path, remote_version)? {
+            return Ok(payload);
+        }
+
         let mut payload = Vec::new();
         self.sdk
             .download_to_writer_resumable_staged(
@@ -450,16 +445,24 @@ impl Hydrator for ServerNodeIo {
                 &self.download_stage_root,
             )
             .with_context(|| format!("failed to fetch object for path {path}"))?;
+        self.edge_state
+            .cache_full_object(path, remote_version, &payload)?;
         Ok(payload)
     }
 
     fn hydrate_range(
         &self,
         path: &str,
-        _remote_version: &str,
+        remote_version: &str,
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>> {
+        if let Some(payload) = self.edge_state.read_cached_object(path, remote_version)? {
+            let start = offset.min(payload.len() as u64) as usize;
+            let end = offset.saturating_add(length).min(payload.len() as u64) as usize;
+            return Ok(payload[start..end].to_vec());
+        }
+
         let mut payload = Vec::new();
         let mut on_progress = |_progress: DownloadProgress| {};
         let should_cancel = || false;
@@ -481,29 +484,57 @@ impl Hydrator for ServerNodeIo {
     }
 }
 
-impl Uploader for ServerNodeIo {
+impl Uploader for ClientRightsEdgeIo {
     fn upload_reader(
         &self,
         path: &str,
+        base_remote_version: Option<&str>,
         reader: &mut dyn std::io::Read,
         length: u64,
     ) -> Result<Option<String>> {
-        self.sdk
-            .put_large_aware_reader(path.to_string(), reader, length)
-            .with_context(|| format!("failed to upload object for path {path}"))?;
-        Ok(Some("server-head".to_string()))
+        self.edge_state
+            .enqueue_upload(path, base_remote_version, reader, length)
+            .with_context(|| format!("failed to persist queued upload for path {path}"))?;
+        Ok(None)
     }
 
-    fn rename_path(&self, from_path: &str, to_path: &str, overwrite: bool) -> Result<()> {
-        self.sdk
+    fn rename_path(
+        &self,
+        from_path: &str,
+        to_path: &str,
+        overwrite: bool,
+        base_remote_version: Option<&str>,
+    ) -> Result<()> {
+        match self
+            .sdk
             .rename_path_blocking(from_path.to_string(), to_path.to_string(), overwrite)
-            .with_context(|| format!("failed to rename object {from_path} -> {to_path}"))
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    "client-rights-edge: remote rename {from_path} -> {to_path} failed, queueing for retry: {error}"
+                );
+                self.edge_state
+                    .enqueue_rename(from_path, to_path, overwrite, base_remote_version)
+                    .with_context(|| {
+                        format!("failed to persist queued rename {from_path} -> {to_path}")
+                    })
+            }
+        }
     }
 
-    fn delete_path(&self, path: &str) -> Result<()> {
-        self.sdk
-            .delete_path_blocking(path)
-            .with_context(|| format!("failed to delete object {path}"))
+    fn delete_path(&self, path: &str, base_remote_version: Option<&str>) -> Result<()> {
+        match self.sdk.delete_path_blocking(path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    "client-rights-edge: remote delete {path} failed, queueing for retry: {error}"
+                );
+                self.edge_state
+                    .enqueue_delete(path, base_remote_version, path.ends_with('/'))
+                    .with_context(|| format!("failed to persist queued delete for {path}"))
+            }
+        }
     }
 }
 
@@ -548,9 +579,8 @@ mod tests {
             bootstrap_file: None,
             server_ca_pem_file: None,
             client_identity_file: None,
-            local_edge: false,
-            local_edge_data_dir: None,
-            local_edge_base_url_file: None,
+            client_edge_state_dir: None,
+            offline_object_cache: CliOfflineObjectCacheMode::On,
             mountpoint: PathBuf::from("/tmp/mount"),
             fs_name: "ironmesh".to_string(),
             allow_other: false,
@@ -662,21 +692,19 @@ mod tests {
     }
 
     #[test]
-    fn effective_local_edge_data_dir_is_none_without_edge_flags() {
+    fn effective_client_edge_state_dir_derives_persistent_default() {
         let args = sample_args();
-        assert_eq!(effective_local_edge_data_dir(&args).unwrap(), None);
+        let derived = effective_client_edge_state_dir(&args).unwrap();
+
+        assert!(derived.ends_with("http___127.0.0.1_8080___tmp_mount"));
     }
 
     #[test]
-    fn effective_local_edge_data_dir_derives_persistent_default_for_local_edge_mode() {
+    fn effective_client_edge_state_dir_uses_explicit_override() {
         let mut args = sample_args();
-        args.local_edge = true;
-        args.prefix = Some("photos/2026".to_string());
+        args.client_edge_state_dir = Some(PathBuf::from("/tmp/custom-edge-state"));
 
-        let derived = effective_local_edge_data_dir(&args)
-            .unwrap()
-            .expect("local-edge path should be derived");
-
-        assert!(derived.ends_with("http___127.0.0.1_8080__photos_2026___tmp_mount"));
+        let derived = effective_client_edge_state_dir(&args).unwrap();
+        assert_eq!(derived, PathBuf::from("/tmp/custom-edge-state"));
     }
 }

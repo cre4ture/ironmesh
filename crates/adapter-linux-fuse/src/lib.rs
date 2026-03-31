@@ -1,5 +1,6 @@
 #![cfg(not(windows))]
 
+pub mod client_rights_edge;
 pub mod mount_main;
 
 use std::collections::HashMap;
@@ -204,13 +205,20 @@ pub mod runtime {
         fn upload_reader(
             &self,
             path: &str,
+            base_remote_version: Option<&str>,
             reader: &mut dyn std::io::Read,
             length: u64,
         ) -> Result<Option<String>>;
 
-        fn rename_path(&self, from_path: &str, to_path: &str, overwrite: bool) -> Result<()>;
+        fn rename_path(
+            &self,
+            from_path: &str,
+            to_path: &str,
+            overwrite: bool,
+            base_remote_version: Option<&str>,
+        ) -> Result<()>;
 
-        fn delete_path(&self, path: &str) -> Result<()>;
+        fn delete_path(&self, path: &str, base_remote_version: Option<&str>) -> Result<()>;
     }
 
     #[derive(Debug, Default, Clone)]
@@ -232,17 +240,24 @@ pub mod runtime {
         fn upload_reader(
             &self,
             _path: &str,
+            _base_remote_version: Option<&str>,
             _reader: &mut dyn std::io::Read,
             _length: u64,
         ) -> Result<Option<String>> {
             Ok(Some("demo-upload".to_string()))
         }
 
-        fn rename_path(&self, _from_path: &str, _to_path: &str, _overwrite: bool) -> Result<()> {
+        fn rename_path(
+            &self,
+            _from_path: &str,
+            _to_path: &str,
+            _overwrite: bool,
+            _base_remote_version: Option<&str>,
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn delete_path(&self, _path: &str) -> Result<()> {
+        fn delete_path(&self, _path: &str, _base_remote_version: Option<&str>) -> Result<()> {
             Ok(())
         }
     }
@@ -385,6 +400,27 @@ pub mod runtime {
         inode: u64,
         write_access: bool,
         dirty: bool,
+        upload_enqueued: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ReplayAction {
+        EnsureDirectory {
+            path: String,
+        },
+        UpsertFile {
+            path: String,
+            data: Vec<u8>,
+        },
+        DeletePath {
+            path: String,
+            directory: bool,
+        },
+        RenamePath {
+            from_path: String,
+            to_path: String,
+            overwrite: bool,
+        },
     }
 
     pub struct IronmeshFuseFs {
@@ -1116,7 +1152,7 @@ pub mod runtime {
         fn ensure_remote_directory_marker(&self, path: &str) -> Result<()> {
             let marker = format!("{}/", path.trim_end_matches('/'));
             let mut reader = Cursor::new(Vec::new());
-            self.uploader.upload_reader(&marker, &mut reader, 0)?;
+            self.uploader.upload_reader(&marker, None, &mut reader, 0)?;
             Ok(())
         }
 
@@ -1126,9 +1162,14 @@ pub mod runtime {
                 .count()
         }
 
-        fn remote_rename_file(&self, from_path: &str, to_path: &str) -> Result<()> {
+        fn remote_rename_file(
+            &self,
+            from_path: &str,
+            to_path: &str,
+            base_remote_version: Option<&str>,
+        ) -> Result<()> {
             self.uploader
-                .rename_path(from_path, to_path, false)
+                .rename_path(from_path, to_path, false, base_remote_version)
                 .with_context(|| format!("failed to rename remote file {from_path} -> {to_path}"))
         }
 
@@ -1149,7 +1190,11 @@ pub mod runtime {
                     .and_then(|value| value.strip_prefix('/'))
                     .ok_or_else(|| anyhow!("file path escaped rename root: {old_path}"))?;
                 let new_path = format!("{to_root}/{relative}");
-                self.remote_rename_file(&old_path, &new_path)?;
+                let remote_version = self
+                    .nodes
+                    .get(&inode)
+                    .and_then(|node| node.sync_metadata.remote_version.as_deref());
+                self.remote_rename_file(&old_path, &new_path, remote_version)?;
             }
 
             let mut directory_paths: Vec<String> = directories
@@ -1181,7 +1226,7 @@ pub mod runtime {
             for old_path in &directory_paths {
                 let old_marker = format!("{}/", old_path.trim_end_matches('/'));
                 self.uploader
-                    .delete_path(&old_marker)
+                    .delete_path(&old_marker, None)
                     .with_context(|| format!("failed to delete stale marker {old_marker}"))?;
             }
 
@@ -1322,6 +1367,7 @@ pub mod runtime {
                     inode,
                     write_access,
                     dirty: false,
+                    upload_enqueued: false,
                 },
             );
             fh
@@ -1343,7 +1389,7 @@ pub mod runtime {
                 && node.size != size
         }
 
-        fn upload_inode(&self, inode: u64) -> Result<()> {
+        fn upload_inode(&self, inode: u64) -> Result<bool> {
             let node = self
                 .nodes
                 .get(&inode)
@@ -1357,10 +1403,16 @@ pub mod runtime {
 
             let path = self.resolve_full_path(inode);
             let mut reader = Cursor::new(node.data.clone());
-            self.uploader
-                .upload_reader(&path, &mut reader, node.size)
+            let remote_version = self
+                .uploader
+                .upload_reader(
+                    &path,
+                    node.sync_metadata.remote_version.as_deref(),
+                    &mut reader,
+                    node.size,
+                )
                 .with_context(|| format!("failed to upload path {path}"))?;
-            Ok(())
+            Ok(remote_version.is_some())
         }
 
         fn flush_handle(&mut self, ino: u64, fh: u64) -> Result<()> {
@@ -1371,10 +1423,14 @@ pub mod runtime {
                 return Err(anyhow!("inode/file-handle mismatch"));
             }
 
-            if handle.write_access && handle.dirty {
-                self.upload_inode(ino)?;
+            if handle.write_access && handle.dirty && !handle.upload_enqueued {
+                let synced = self.upload_inode(ino)?;
                 if let Some(handle) = self.open_handles.get_mut(&fh) {
-                    handle.dirty = false;
+                    if synced {
+                        handle.dirty = false;
+                    } else {
+                        handle.upload_enqueued = true;
+                    }
                 }
             }
 
@@ -1389,7 +1445,7 @@ pub mod runtime {
                 return Err(anyhow!("inode/file-handle mismatch"));
             }
 
-            if handle.write_access && handle.dirty {
+            if handle.write_access && handle.dirty && !handle.upload_enqueued {
                 self.upload_inode(ino)?;
             }
             Ok(())
@@ -1404,11 +1460,11 @@ pub mod runtime {
             match node.kind {
                 FileType::RegularFile => self
                     .uploader
-                    .delete_path(&path)
+                    .delete_path(&path, node.sync_metadata.remote_version.as_deref())
                     .with_context(|| format!("failed to delete remote file {path}")),
                 FileType::Directory => {
                     let marker_path = format!("{}/", path.trim_end_matches('/'));
-                    self.uploader.delete_path(&marker_path).with_context(|| {
+                    self.uploader.delete_path(&marker_path, None).with_context(|| {
                         format!("failed to delete remote directory marker {marker_path}")
                     })
                 }
@@ -1508,7 +1564,11 @@ pub mod runtime {
             }
 
             let remote_result = match source_node.kind {
-                FileType::RegularFile => self.remote_rename_file(&old_full_path, &new_full_path),
+                FileType::RegularFile => self.remote_rename_file(
+                    &old_full_path,
+                    &new_full_path,
+                    source_node.sync_metadata.remote_version.as_deref(),
+                ),
                 FileType::Directory => {
                     self.remote_rename_directory_subtree(inode, &old_full_path, &new_full_path)
                 }
@@ -1546,6 +1606,160 @@ pub mod runtime {
             }
             segments.reverse();
             segments.join("/")
+        }
+
+        fn split_relative_path(relative_path: &str) -> Result<(String, String)> {
+            let mut segments: Vec<&str> = relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            if segments.is_empty() {
+                return Err(anyhow!("relative path is empty"));
+            }
+            let name = segments.pop().unwrap_or_default().to_string();
+            Ok((segments.join("/"), name))
+        }
+
+        fn upsert_file_local_only(&mut self, relative_path: &str, data: &[u8]) -> Result<()> {
+            let (parent_path, name) = Self::split_relative_path(relative_path)?;
+            let parent_inode = self.ensure_directory(&parent_path);
+            let existing = self
+                .nodes
+                .get(&parent_inode)
+                .and_then(|node| node.children.get(name.as_str()).copied());
+
+            if let Some(inode) = existing {
+                let existing_kind = self
+                    .nodes
+                    .get(&inode)
+                    .map(|node| node.kind)
+                    .ok_or_else(|| anyhow!("inode missing during replay upsert"))?;
+                if existing_kind == FileType::Directory {
+                    if let Some(parent) = self.nodes.get_mut(&parent_inode) {
+                        parent.children.remove(name.as_str());
+                    }
+                    self.remove_inode_recursive(inode);
+                } else if let Some(node) = self.nodes.get_mut(&inode) {
+                    node.data = data.to_vec();
+                    node.size = node.data.len() as u64;
+                    node.placeholder_version = None;
+                    node.modified_at = SystemTime::now();
+                    node.sync_metadata.local_version = None;
+                    return Ok(());
+                }
+            }
+
+            let inode = self.next_inode();
+            let mut file = FsNode::regular_file(inode, name.clone(), parent_inode);
+            file.data = data.to_vec();
+            file.size = file.data.len() as u64;
+            self.nodes.insert(inode, file);
+            if let Some(parent) = self.nodes.get_mut(&parent_inode) {
+                parent.children.insert(name, inode);
+            }
+            Ok(())
+        }
+
+        fn delete_path_local_only(&mut self, relative_path: &str, _directory: bool) -> Result<()> {
+            let Some(inode) = self.lookup_inode_by_relative_path(relative_path) else {
+                self.remove_internal_conflict_copy(relative_path);
+                return Ok(());
+            };
+            if inode == ROOT_INODE {
+                return Err(anyhow!("cannot delete root inode"));
+            }
+
+            let parent_inode = self
+                .nodes
+                .get(&inode)
+                .map(|node| node.parent_inode)
+                .ok_or_else(|| anyhow!("inode missing during replay delete"))?;
+            let name = self
+                .nodes
+                .get(&inode)
+                .map(|node| node.name.clone())
+                .ok_or_else(|| anyhow!("inode missing during replay delete"))?;
+            if let Some(parent) = self.nodes.get_mut(&parent_inode) {
+                parent.children.remove(name.as_str());
+            }
+            self.remove_inode_recursive(inode);
+            self.remove_internal_conflict_copy(relative_path);
+            Ok(())
+        }
+
+        fn rename_path_local_only(
+            &mut self,
+            from_path: &str,
+            to_path: &str,
+            overwrite: bool,
+        ) -> Result<()> {
+            let Some(inode) = self.lookup_inode_by_relative_path(from_path) else {
+                return Ok(());
+            };
+            let old_parent = self
+                .nodes
+                .get(&inode)
+                .map(|node| node.parent_inode)
+                .ok_or_else(|| anyhow!("source inode missing during replay rename"))?;
+            let old_name = self
+                .nodes
+                .get(&inode)
+                .map(|node| node.name.clone())
+                .ok_or_else(|| anyhow!("source inode missing during replay rename"))?;
+            let (new_parent_path, new_name) = Self::split_relative_path(to_path)?;
+            let new_parent = self.ensure_directory(&new_parent_path);
+
+            if let Some(dest_inode) = self.lookup_inode_by_relative_path(to_path) {
+                if dest_inode == inode {
+                    return Ok(());
+                }
+                if !overwrite {
+                    return Err(anyhow!("replay rename target exists: {to_path}"));
+                }
+                let dest_parent = self
+                    .nodes
+                    .get(&dest_inode)
+                    .map(|node| node.parent_inode)
+                    .ok_or_else(|| anyhow!("target inode missing during replay rename"))?;
+                let dest_name = self
+                    .nodes
+                    .get(&dest_inode)
+                    .map(|node| node.name.clone())
+                    .ok_or_else(|| anyhow!("target inode missing during replay rename"))?;
+                if let Some(parent) = self.nodes.get_mut(&dest_parent) {
+                    parent.children.remove(dest_name.as_str());
+                }
+                self.remove_inode_recursive(dest_inode);
+            }
+
+            self.apply_local_rename(old_parent, &old_name, new_parent, &new_name, inode)?;
+            self.clear_conflict_metadata_subtree(inode);
+            self.remove_internal_conflict_copy(from_path);
+            Ok(())
+        }
+
+        pub fn apply_replay_actions(&mut self, actions: &[ReplayAction]) -> Result<()> {
+            for action in actions {
+                match action {
+                    ReplayAction::EnsureDirectory { path } => {
+                        self.ensure_directory(path);
+                    }
+                    ReplayAction::UpsertFile { path, data } => {
+                        self.upsert_file_local_only(path, data)?;
+                    }
+                    ReplayAction::DeletePath { path, directory } => {
+                        self.delete_path_local_only(path, *directory)?;
+                    }
+                    ReplayAction::RenamePath {
+                        from_path,
+                        to_path,
+                        overwrite,
+                    } => {
+                        self.rename_path_local_only(from_path, to_path, *overwrite)?;
+                    }
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1740,7 +1954,7 @@ pub mod runtime {
             let mut marker_reader = Cursor::new(Vec::new());
             if self
                 .uploader
-                .upload_reader(&directory_marker_path, &mut marker_reader, 0)
+                .upload_reader(&directory_marker_path, None, &mut marker_reader, 0)
                 .is_err()
             {
                 if let Some(parent_node) = self.nodes.get_mut(&parent) {
@@ -1794,7 +2008,11 @@ pub mod runtime {
             }
 
             let child_path = self.resolve_full_path(child_inode);
-            if self.uploader.delete_path(&child_path).is_err() {
+            if self
+                .uploader
+                .delete_path(&child_path, child_node.sync_metadata.remote_version.as_deref())
+                .is_err()
+            {
                 reply.error(EIO);
                 return;
             }
@@ -1857,7 +2075,7 @@ pub mod runtime {
                 self.resolve_full_path(child_inode).trim_end_matches('/')
             );
             let child_path = self.resolve_full_path(child_inode);
-            if self.uploader.delete_path(&directory_marker_path).is_err() {
+            if self.uploader.delete_path(&directory_marker_path, None).is_err() {
                 reply.error(EIO);
                 return;
             }
@@ -2194,6 +2412,7 @@ pub mod runtime {
 
             if let Some(handle) = self.open_handles.get_mut(&fh) {
                 handle.dirty = true;
+                handle.upload_enqueued = false;
             }
 
             let Ok(written) = u32::try_from(data.len()) else {
@@ -2262,6 +2481,7 @@ pub mod runtime {
                     && handle.write_access
                 {
                     handle.dirty = true;
+                    handle.upload_enqueued = false;
                 }
             }
 
@@ -2382,13 +2602,7 @@ pub mod runtime {
         mount_action_plan_until_shutdown_with_updates(config, action_plan, hydrator, uploader, None)
     }
 
-    pub fn mount_action_plan_until_shutdown_with_updates(
-        config: &FuseMountConfig,
-        action_plan: FuseActionPlan,
-        hydrator: Box<dyn Hydrator>,
-        uploader: Box<dyn Uploader>,
-        refresh_rx: Option<Receiver<FuseActionPlan>>,
-    ) -> Result<()> {
+    pub fn mount_fs_until_shutdown(config: &FuseMountConfig, fs: IronmeshFuseFs) -> Result<()> {
         if !Path::new(&config.mountpoint).exists() {
             return Err(anyhow!(
                 "mountpoint does not exist: {}",
@@ -2396,7 +2610,6 @@ pub mod runtime {
             ));
         }
 
-        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader, refresh_rx);
         let session = fuser::spawn_mount2(fs, &config.mountpoint, &config.mount_options())
             .with_context(|| {
                 format!(
@@ -2416,6 +2629,24 @@ pub mod runtime {
 
         drop(session);
         Ok(())
+    }
+
+    pub fn mount_action_plan_until_shutdown_with_updates(
+        config: &FuseMountConfig,
+        action_plan: FuseActionPlan,
+        hydrator: Box<dyn Hydrator>,
+        uploader: Box<dyn Uploader>,
+        refresh_rx: Option<Receiver<FuseActionPlan>>,
+    ) -> Result<()> {
+        if !Path::new(&config.mountpoint).exists() {
+            return Err(anyhow!(
+                "mountpoint does not exist: {}",
+                config.mountpoint.display()
+            ));
+        }
+
+        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader, refresh_rx);
+        mount_fs_until_shutdown(config, fs)
     }
 
     #[cfg(test)]
@@ -2480,6 +2711,7 @@ pub mod runtime {
             fn upload_reader(
                 &self,
                 path: &str,
+                _base_remote_version: Option<&str>,
                 reader: &mut dyn Read,
                 length: u64,
             ) -> Result<Option<String>> {
@@ -2495,7 +2727,13 @@ pub mod runtime {
                 Ok(Some("recorded".to_string()))
             }
 
-            fn rename_path(&self, from_path: &str, to_path: &str, overwrite: bool) -> Result<()> {
+            fn rename_path(
+                &self,
+                from_path: &str,
+                to_path: &str,
+                overwrite: bool,
+                _base_remote_version: Option<&str>,
+            ) -> Result<()> {
                 self.ops.lock().expect("upload op log lock poisoned").push(
                     RecordingUploadOp::Rename {
                         from: from_path.to_string(),
@@ -2506,7 +2744,7 @@ pub mod runtime {
                 Ok(())
             }
 
-            fn delete_path(&self, path: &str) -> Result<()> {
+            fn delete_path(&self, path: &str, _base_remote_version: Option<&str>) -> Result<()> {
                 self.ops.lock().expect("upload op log lock poisoned").push(
                     RecordingUploadOp::Delete {
                         path: path.to_string(),
@@ -2934,6 +3172,72 @@ pub mod runtime {
                         path: "from/".to_string(),
                     },
                 ]
+            );
+        }
+
+        #[test]
+        fn replay_actions_restore_pending_file_over_placeholder() {
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan {
+                    actions: vec![FuseAction::EnsurePlaceholder {
+                        path: "docs/report.txt".to_string(),
+                        remote_version: "v1".to_string(),
+                        remote_size: Some(1024),
+                    }],
+                },
+                Box::new(RecordingHydrator::default()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            fs.apply_replay_actions(&[ReplayAction::UpsertFile {
+                path: "docs/report.txt".to_string(),
+                data: b"offline-local".to_vec(),
+            }])
+            .expect("replay should succeed");
+
+            let inode = fs
+                .lookup_inode_by_relative_path("docs/report.txt")
+                .expect("file should exist after replay");
+            let node = fs.nodes.get(&inode).expect("inode should exist");
+            assert_eq!(node.data, b"offline-local".to_vec());
+            assert_eq!(node.placeholder_version, None);
+            assert_eq!(node.size, b"offline-local".len() as u64);
+        }
+
+        #[test]
+        fn replay_actions_restore_queued_rename_and_delete() {
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(RecordingHydrator::default()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            fs.apply_replay_actions(&[
+                ReplayAction::UpsertFile {
+                    path: "drafts/local.txt".to_string(),
+                    data: b"payload".to_vec(),
+                },
+                ReplayAction::RenamePath {
+                    from_path: "drafts/local.txt".to_string(),
+                    to_path: "drafts/final.txt".to_string(),
+                    overwrite: true,
+                },
+                ReplayAction::DeletePath {
+                    path: "drafts/final.txt".to_string(),
+                    directory: false,
+                },
+            ])
+            .expect("replay should succeed");
+
+            assert!(
+                fs.lookup_inode_by_relative_path("drafts/local.txt").is_none(),
+                "old path should be gone after replay rename"
+            );
+            assert!(
+                fs.lookup_inode_by_relative_path("drafts/final.txt").is_none(),
+                "delete replay should remove renamed file"
             );
         }
 
