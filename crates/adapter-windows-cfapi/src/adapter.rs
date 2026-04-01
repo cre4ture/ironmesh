@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sync_core::{SyncOperation, SyncPlan, SyncPolicy, SyncSnapshot, plan_sync};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +16,12 @@ impl WindowsCfapiAdapter {
 
     pub fn plan_actions(&self, snapshot: &SyncSnapshot, policy: &SyncPolicy) -> CfapiActionPlan {
         let sync_plan = plan_sync(snapshot, policy);
-        map_sync_plan_to_cfapi_actions(&sync_plan)
+        let remote_sizes_by_path = snapshot
+            .remote
+            .iter()
+            .filter_map(|entry| entry.size_bytes.map(|size| (entry.path.clone(), size)))
+            .collect::<HashMap<_, _>>();
+        map_sync_plan_to_cfapi_actions(&sync_plan, &remote_sizes_by_path)
     }
 }
 
@@ -31,10 +38,12 @@ pub enum CfapiAction {
     EnsurePlaceholder {
         path: String,
         remote_version: String,
+        remote_size: Option<u64>,
     },
     HydrateOnDemand {
         path: String,
         remote_version: String,
+        remote_size: Option<u64>,
     },
     QueueUploadOnClose {
         path: String,
@@ -44,10 +53,14 @@ pub enum CfapiAction {
         path: String,
         local_version: Option<String>,
         remote_version: Option<String>,
+        remote_size: Option<u64>,
     },
 }
 
-pub fn map_sync_plan_to_cfapi_actions(sync_plan: &SyncPlan) -> CfapiActionPlan {
+pub fn map_sync_plan_to_cfapi_actions(
+    sync_plan: &SyncPlan,
+    remote_sizes_by_path: &HashMap<String, u64>,
+) -> CfapiActionPlan {
     let mut actions = Vec::with_capacity(sync_plan.operations.len());
 
     for operation in &sync_plan.operations {
@@ -58,16 +71,20 @@ pub fn map_sync_plan_to_cfapi_actions(sync_plan: &SyncPlan) -> CfapiActionPlan {
             SyncOperation::EnsurePlaceholder {
                 path,
                 remote_version,
+                ..
             } => CfapiAction::EnsurePlaceholder {
                 path: path.clone(),
                 remote_version: remote_version.clone(),
+                remote_size: remote_sizes_by_path.get(path).copied(),
             },
             SyncOperation::Hydrate {
                 path,
                 remote_version,
+                ..
             } => CfapiAction::HydrateOnDemand {
                 path: path.clone(),
                 remote_version: remote_version.clone(),
+                remote_size: remote_sizes_by_path.get(path).copied(),
             },
             SyncOperation::Upload {
                 path,
@@ -80,10 +97,12 @@ pub fn map_sync_plan_to_cfapi_actions(sync_plan: &SyncPlan) -> CfapiActionPlan {
                 path,
                 local_version,
                 remote_version,
+                ..
             } => CfapiAction::MarkConflict {
                 path: path.clone(),
                 local_version: local_version.clone(),
                 remote_version: remote_version.clone(),
+                remote_size: remote_sizes_by_path.get(path).copied(),
             },
         };
 
@@ -113,6 +132,7 @@ mod tests {
             vec![CfapiAction::EnsurePlaceholder {
                 path: "docs/readme.md".to_string(),
                 remote_version: "v1".to_string(),
+                remote_size: None,
             }],
         );
     }
@@ -160,6 +180,32 @@ mod tests {
                 path: "report.csv".to_string(),
                 local_version: Some("v-local".to_string()),
                 remote_version: Some("v-remote".to_string()),
+                remote_size: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn adapter_carries_remote_size_for_file_actions() {
+        let adapter = WindowsCfapiAdapter::new("Ironmesh");
+        let snapshot = SyncSnapshot {
+            local: vec![],
+            remote: vec![NamespaceEntry::file_sized(
+                "docs/readme.md",
+                "v1",
+                "h1",
+                Some(42),
+            )],
+        };
+
+        let plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
+
+        assert_eq!(
+            plan.actions,
+            vec![CfapiAction::EnsurePlaceholder {
+                path: "docs/readme.md".to_string(),
+                remote_version: "v1".to_string(),
+                remote_size: Some(42),
             }],
         );
     }

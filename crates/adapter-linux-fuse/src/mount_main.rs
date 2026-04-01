@@ -531,7 +531,7 @@ impl ClientRightsEdgeIo {
         }
     }
 
-    fn download_version_selector<'a>(remote_version: &'a str) -> Option<&'a str> {
+    fn download_version_selector(remote_version: &str) -> Option<&str> {
         let base_version = remote_version
             .rsplit_once(":size=")
             .map(|(base, _)| base)

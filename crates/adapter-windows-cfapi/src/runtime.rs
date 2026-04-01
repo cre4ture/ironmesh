@@ -208,10 +208,12 @@ impl CfapiRuntime {
                 CfapiAction::EnsurePlaceholder {
                     path,
                     remote_version,
+                    ..
                 }
                 | CfapiAction::HydrateOnDemand {
                     path,
                     remote_version,
+                    ..
                 } => {
                     remote_versions_by_path.insert(normalize_path(path), remote_version.clone());
                 }
@@ -275,10 +277,12 @@ impl CfapiRuntime {
                 CfapiAction::EnsurePlaceholder {
                     path,
                     remote_version,
+                    ..
                 }
                 | CfapiAction::HydrateOnDemand {
                     path,
                     remote_version,
+                    ..
                 } => {
                     let normalized = normalize_path(path);
                     let update = match remote_versions.get(&normalized) {
@@ -442,6 +446,14 @@ fn parse_size_from_remote_version(remote_version: &str) -> Option<i64> {
     size_str.parse::<i64>().ok().filter(|size| *size >= 0)
 }
 
+fn placeholder_file_size(remote_version: &str, remote_size: Option<u64>) -> i64 {
+    remote_size
+        .and_then(|size| i64::try_from(size).ok())
+        .filter(|size| *size >= 0)
+        .or_else(|| parse_size_from_remote_version(remote_version))
+        .unwrap_or(0)
+}
+
 fn encode_file_identity(relative_path: &str, remote_version: &str) -> Vec<u8> {
     format!("path={relative_path}\nversion={remote_version}").into_bytes()
 }
@@ -459,7 +471,7 @@ fn decode_path_from_file_identity(file_identity: &[u8]) -> Option<String> {
 pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()> {
     std::fs::create_dir_all(root_path)?;
 
-    let mut placeholders: BTreeMap<String, String> = BTreeMap::new();
+    let mut placeholders: BTreeMap<String, (String, Option<u64>)> = BTreeMap::new();
     for action in &plan.actions {
         match action {
             CfapiAction::EnsureDirectory { path } => {
@@ -468,10 +480,12 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
             CfapiAction::EnsurePlaceholder {
                 path,
                 remote_version,
+                remote_size,
             }
             | CfapiAction::HydrateOnDemand {
                 path,
                 remote_version,
+                remote_size,
             } => {
                 let normalized = normalize_path(path);
                 let full_path = root_path.join(normalized.replace('/', "\\"));
@@ -483,7 +497,7 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
                 {
                     std::fs::create_dir_all(root_path.join(parent))?;
                 }
-                placeholders.insert(normalized, remote_version.clone());
+                placeholders.insert(normalized, (remote_version.clone(), *remote_size));
             }
             CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
         }
@@ -502,7 +516,7 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
     }
 
     let mut inputs = Vec::with_capacity(placeholders.len());
-    for (relative_path, remote_version) in placeholders {
+    for (relative_path, (remote_version, remote_size)) in placeholders {
         let (parent_rel, child_name) = match relative_path.rsplit_once('/') {
             Some((parent, child)) => (parent, child),
             None => ("", relative_path.as_str()),
@@ -522,7 +536,7 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
             FileAttributes: FILE_ATTRIBUTE_NORMAL,
             ..Default::default()
         };
-        let file_size = parse_size_from_remote_version(&remote_version).unwrap_or(0);
+        let file_size = placeholder_file_size(&remote_version, remote_size);
         let metadata = CF_FS_METADATA {
             BasicInfo: basic_info,
             FileSize: file_size,
@@ -1776,6 +1790,7 @@ mod tests {
             actions: vec![CfapiAction::HydrateOnDemand {
                 path: "docs/readme.md".to_string(),
                 remote_version: "v7".to_string(),
+                remote_size: None,
             }],
         };
 
@@ -1805,6 +1820,7 @@ mod tests {
             actions: vec![CfapiAction::HydrateOnDemand {
                 path: "docs\\notes.txt".to_string(),
                 remote_version: "v3".to_string(),
+                remote_size: None,
             }],
         };
 
@@ -1881,10 +1897,12 @@ mod tests {
                 CfapiAction::EnsurePlaceholder {
                     path: "docs/readme.md".to_string(),
                     remote_version: "v1".to_string(),
+                    remote_size: None,
                 },
                 CfapiAction::HydrateOnDemand {
                     path: "docs/photo.jpg".to_string(),
                     remote_version: "v2".to_string(),
+                    remote_size: None,
                 },
                 CfapiAction::QueueUploadOnClose {
                     path: "draft.txt".to_string(),
@@ -1894,6 +1912,7 @@ mod tests {
                     path: "conflict.txt".to_string(),
                     local_version: Some("local".to_string()),
                     remote_version: Some("remote".to_string()),
+                    remote_size: None,
                 },
             ],
         };

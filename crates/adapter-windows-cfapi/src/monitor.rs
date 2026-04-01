@@ -678,6 +678,7 @@ mod tests {
             actions: vec![CfapiAction::EnsurePlaceholder {
                 path: "docs/readme.txt".to_string(),
                 remote_version: "v1".to_string(),
+                remote_size: None,
             }],
         });
         monitor.walk();
