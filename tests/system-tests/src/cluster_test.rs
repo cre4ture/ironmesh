@@ -1104,8 +1104,9 @@ mod tests {
                 .to_string();
 
             sleep(Duration::from_millis(2_300)).await;
-            client
-                .get(format!("{}/cluster/status", fixture.http.base_url))
+            fixture
+                .http
+                .request(Method::GET, "/cluster/status")?
                 .send()
                 .await?
                 .error_for_status()?;
@@ -1229,7 +1230,12 @@ mod tests {
         retries: usize,
     ) -> Result<()> {
         for _ in 0..retries {
-            let nodes_a = match client.get(format!("{base_a}/cluster/nodes")).send().await {
+            let nodes_a = match client
+                .get(format!("{base_a}/cluster/nodes"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .send()
+                .await
+            {
                 Ok(response) => match response.error_for_status() {
                     Ok(ok) => match ok.json::<serde_json::Value>().await {
                         Ok(payload) => payload,
@@ -1249,7 +1255,12 @@ mod tests {
                 }
             };
 
-            let nodes_b = match client.get(format!("{base_b}/cluster/nodes")).send().await {
+            let nodes_b = match client
+                .get(format!("{base_b}/cluster/nodes"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .send()
+                .await
+            {
                 Ok(response) => match response.error_for_status() {
                     Ok(ok) => match ok.json::<serde_json::Value>().await {
                         Ok(payload) => payload,
@@ -1343,7 +1354,11 @@ mod tests {
         retries: usize,
     ) -> Result<()> {
         for _ in 0..retries {
-            if let Ok(response) = client.get(format!("{base_url}/cluster/nodes")).send().await
+            if let Ok(response) = client
+                .get(format!("{base_url}/cluster/nodes"))
+                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .send()
+                .await
                 && let Ok(response) = response.error_for_status()
                 && let Ok(nodes) = response.json::<serde_json::Value>().await
                 && let Some(entries) = nodes.as_array()
@@ -1833,8 +1848,9 @@ mod tests {
                 .await?
                 .error_for_status()?;
 
-            let plan_body = http
-                .get(format!("{base_a}/cluster/replication/plan"))
+            let plan_body = client_a
+                .http
+                .request(Method::GET, "/cluster/replication/plan")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -2018,8 +2034,9 @@ mod tests {
                 .await?
                 .error_for_status()?;
 
-            let before_plan: serde_json::Value = http
-                .get(format!("{base_a}/cluster/replication/plan"))
+            let before_plan: serde_json::Value = client_a
+                .http
+                .request(Method::GET, "/cluster/replication/plan")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -2048,8 +2065,9 @@ mod tests {
                 "expected at least one successful transfer, report={repair_report:?}"
             );
 
-            let after_plan: serde_json::Value = http
-                .get(format!("{base_a}/cluster/replication/plan"))
+            let after_plan: serde_json::Value = client_a
+                .http
+                .request(Method::GET, "/cluster/replication/plan")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -2557,8 +2575,9 @@ mod tests {
                     .error_for_status()?;
             }
 
-            let before_plan: serde_json::Value = http
-                .get(format!("{base_a}/cluster/replication/plan"))
+            let before_plan: serde_json::Value = client_a
+                .http
+                .request(Method::GET, "/cluster/replication/plan")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -2604,8 +2623,9 @@ mod tests {
                 transfers_per_sec
             );
 
-            let after_plan: serde_json::Value = http
-                .get(format!("{base_a}/cluster/replication/plan"))
+            let after_plan: serde_json::Value = client_a
+                .http
+                .request(Method::GET, "/cluster/replication/plan")?
                 .send()
                 .await?
                 .error_for_status()?
@@ -3007,8 +3027,11 @@ mod tests {
                 let http = http.clone();
                 async move {
                     for _ in 0..120 {
-                        if let Ok(response) =
-                            http.get(format!("{base_url}/cluster/nodes")).send().await
+                        if let Ok(response) = http
+                            .get(format!("{base_url}/cluster/nodes"))
+                            .header("x-ironmesh-admin-token", admin_token)
+                            .send()
+                            .await
                             && let Ok(response) = response.error_for_status()
                             && let Ok(nodes) = response.json::<serde_json::Value>().await
                             && let Some(entries) = nodes.as_array()
@@ -3493,7 +3516,10 @@ mod tests {
                 async move {
                     for _ in 0..120 {
                         if let Ok(response) =
-                            http.get(format!("{base_url}/cluster/nodes")).send().await
+                            http.get(format!("{base_url}/cluster/nodes"))
+                                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                                .send()
+                                .await
                             && let Ok(response) = response.error_for_status()
                             && let Ok(nodes) = response.json::<serde_json::Value>().await
                             && let Some(entries) = nodes.as_array()

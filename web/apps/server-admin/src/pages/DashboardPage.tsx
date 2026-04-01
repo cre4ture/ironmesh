@@ -64,28 +64,37 @@ export function DashboardPage() {
     Boolean(adminTokenOverride.trim()) || Boolean(sessionStatus?.authenticated);
   const canRunAdminMaintenance =
     !sessionLoading && (!sessionStatus?.login_required || hasExplicitAdminAccess);
+  const canInspectCluster = canRunAdminMaintenance;
   const canInspectRendezvous = canRunAdminMaintenance;
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [summary, nodeList, plan, recentLogs, health, currentStorageStats, storageStatsHistory] = await Promise.all([
-        getClusterSummary(),
-        getClusterNodes(),
-        getReplicationPlan(),
+      const [recentLogs, health, currentStorageStats, storageStatsHistory] = await Promise.all([
         getRecentLogs(120),
         getServerHealth(),
         getStorageStatsCurrent(),
         getStorageStatsHistory(120)
       ]);
-      setClusterSummary(summary);
-      setNodes(nodeList);
-      setReplicationPlan(plan);
       setLogs(recentLogs);
       setBackendHealth(health);
       setStorageStats(currentStorageStats);
       setStorageHistory(storageStatsHistory);
+      if (canInspectCluster) {
+        const [summary, nodeList, plan] = await Promise.all([
+          getClusterSummary(adminTokenOverride),
+          getClusterNodes(adminTokenOverride),
+          getReplicationPlan(adminTokenOverride)
+        ]);
+        setClusterSummary(summary);
+        setNodes(nodeList);
+        setReplicationPlan(plan);
+      } else {
+        setClusterSummary(null);
+        setNodes([]);
+        setReplicationPlan(null);
+      }
       if (canInspectRendezvous) {
         try {
           setRendezvousConfig(await getRendezvousConfig(adminTokenOverride));
@@ -100,7 +109,7 @@ export function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, [adminTokenOverride, canInspectRendezvous]);
+  }, [adminTokenOverride, canInspectCluster, canInspectRendezvous]);
 
   useEffect(() => {
     void refresh();

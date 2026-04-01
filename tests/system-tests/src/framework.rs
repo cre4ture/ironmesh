@@ -604,6 +604,8 @@ pub async fn start_open_server_with_public_https_env(
     replication_factor: usize,
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
+    let mut merged_env = vec![("IRONMESH_REQUIRE_CLIENT_AUTH", "false")];
+    merged_env.extend_from_slice(extra_env);
     start_server_with_env_options_inner(
         bind,
         data_dir,
@@ -611,7 +613,7 @@ pub async fn start_open_server_with_public_https_env(
         replication_factor,
         None,
         None,
-        extra_env,
+        &merged_env,
         true,
     )
     .await
@@ -626,6 +628,8 @@ pub async fn start_open_server_with_env_options(
     heartbeat_timeout_secs: Option<u64>,
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
+    let mut merged_env = vec![("IRONMESH_REQUIRE_CLIENT_AUTH", "false")];
+    merged_env.extend_from_slice(extra_env);
     start_server_with_env_options_inner(
         bind,
         data_dir,
@@ -633,7 +637,7 @@ pub async fn start_open_server_with_env_options(
         replication_factor,
         metadata_commit_mode,
         heartbeat_timeout_secs,
-        extra_env,
+        &merged_env,
         false,
     )
     .await
@@ -1129,7 +1133,11 @@ pub async fn wait_for_online_nodes(
     retries: usize,
 ) -> Result<()> {
     for _ in 0..retries {
-        if let Ok(resp) = http.get(format!("{base_url}/cluster/status")).send().await
+        if let Ok(resp) = http
+            .get(format!("{base_url}/cluster/status"))
+            .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+            .send()
+            .await
             && let Ok(ok_resp) = resp.error_for_status()
             && let Ok(payload) = ok_resp.json::<serde_json::Value>().await
         {

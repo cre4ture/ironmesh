@@ -732,16 +732,38 @@ async fn require_client_auth(
         return Ok(next.run(request).await);
     }
 
-    let signed_headers = SignedRequestHeaders::from_header_lookup(|name| {
-        request
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string)
-    })
-    .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    if signed_headers.cluster_id != state.cluster_id {
-        return Err(StatusCode::UNAUTHORIZED);
+    let request_headers = request.headers().clone();
+    let request_path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| request.uri().path())
+        .to_string();
+    let request_method = request.method().as_str().to_string();
+
+    validate_client_auth_request(
+        &state,
+        &request_headers,
+        &request_method,
+        &request_path_and_query,
+    )
+    .await?;
+
+    Ok(next.run(request).await)
+}
+
+async fn require_client_or_admin_auth(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> std::result::Result<Response, StatusCode> {
+    let request_headers = request.headers().clone();
+    if request_has_admin_auth(&state, &request_headers).await {
+        return Ok(next.run(request).await);
+    }
+
+    if !state.client_auth_control.require_client_auth {
+        return Ok(next.run(request).await);
     }
 
     let request_path_and_query = request
@@ -751,6 +773,35 @@ async fn require_client_auth(
         .unwrap_or_else(|| request.uri().path())
         .to_string();
     let request_method = request.method().as_str().to_string();
+
+    validate_client_auth_request(
+        &state,
+        &request_headers,
+        &request_method,
+        &request_path_and_query,
+    )
+    .await?;
+
+    Ok(next.run(request).await)
+}
+
+async fn validate_client_auth_request(
+    state: &ServerState,
+    headers: &HeaderMap,
+    request_method: &str,
+    request_path_and_query: &str,
+) -> std::result::Result<(), StatusCode> {
+    let signed_headers = SignedRequestHeaders::from_header_lookup(|name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string)
+    })
+    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if signed_headers.cluster_id != state.cluster_id {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     let now = unix_ts();
     if signed_headers.timestamp_unix < now.saturating_sub(CLIENT_AUTH_MAX_CLOCK_SKEW_SECS)
         || signed_headers.timestamp_unix > now.saturating_add(CLIENT_AUTH_MAX_CLOCK_SKEW_SECS)
@@ -786,8 +837,8 @@ async fn require_client_auth(
     verify_signed_request_headers(
         &signed_headers,
         &public_key_pem,
-        &request_method,
-        &request_path_and_query,
+        request_method,
+        request_path_and_query,
     )
     .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
@@ -797,7 +848,24 @@ async fn require_client_auth(
     }
     drop(replay_cache);
 
-    Ok(next.run(request).await)
+    Ok(())
+}
+
+async fn request_has_admin_auth(state: &ServerState, headers: &HeaderMap) -> bool {
+    state
+        .admin_control
+        .admin_token
+        .as_deref()
+        .map(|expected| {
+            token_matches(
+                expected,
+                headers
+                    .get(ADMIN_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+            )
+        })
+        .unwrap_or(false)
+        || current_admin_session_expiry(state, headers).await.is_some()
 }
 
 fn hash_token(token: &str) -> String {
@@ -2345,7 +2413,7 @@ impl ServerNodeConfig {
             require_client_auth: std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(false),
+                .unwrap_or(true),
         })
     }
 
@@ -2656,7 +2724,7 @@ impl ServerNodeConfig {
             require_client_auth: std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(false),
+                .unwrap_or(true),
         })
     }
 
@@ -3504,6 +3572,15 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             require_client_auth,
         ));
 
+    let public_cluster_info_api = Router::new()
+        .route("/cluster/status", get(cluster_status))
+        .route("/cluster/nodes", get(list_nodes))
+        .route("/cluster/replication/plan", get(replication_plan))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_or_admin_auth,
+        ));
+
     let public_admin_api = Router::new()
         .route("/auth/admin/session", get(get_admin_session_status))
         .route("/auth/admin/login", post(login_admin_session))
@@ -3610,8 +3687,6 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/logs", get(ui::list_logs))
         .route("/health", get(health))
         .route("/auth/device/enroll", post(enroll_client_device))
-        .route("/cluster/status", get(cluster_status))
-        .route("/cluster/nodes", get(list_nodes))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
         .route(
@@ -3619,7 +3694,6 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             put(register_node).delete(remove_node),
         )
         .route("/cluster/placement/{key}", get(placement_for_key))
-        .route("/cluster/replication/plan", get(replication_plan))
         .route(
             "/cluster/replication/audit",
             post(trigger_replication_audit),
@@ -3651,6 +3725,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             post(run_tombstone_archive_purge),
         )
         .merge(public_admin_api)
+        .merge(public_cluster_info_api)
         .merge(public_client_api);
 
     if config.public_peer_api_enabled {

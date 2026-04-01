@@ -3444,6 +3444,54 @@ run_on_main_metadata_backends!(
     client_auth_middleware_rejects_replayed_nonce_turso
 );
 
+async fn cluster_info_middleware_accepts_admin_auth_and_rejects_anonymous_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.client_auth_control.require_client_auth = true;
+    state.admin_control.admin_token = Some("cluster-admin-secret".to_string());
+
+    let app = Router::new()
+        .route("/cluster/status", get(|| async { StatusCode::OK }))
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::require_client_or_admin_auth,
+        ));
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/cluster/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/cluster/status")
+                .header(super::ADMIN_TOKEN_HEADER, "cluster-admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    cluster_info_middleware_accepts_admin_auth_and_rejects_anonymous_impl,
+    cluster_info_middleware_accepts_admin_auth_and_rejects_anonymous,
+    cluster_info_middleware_accepts_admin_auth_and_rejects_anonymous_turso
+);
+
 async fn list_client_credentials_returns_fingerprint_metadata_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());

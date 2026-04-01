@@ -308,8 +308,9 @@ Notes:
 
 ### Client device authentication
 
-- Public client auth can be enabled with:
-	- `IRONMESH_REQUIRE_CLIENT_AUTH=true`
+- Public client auth is enabled by default.
+- Opt out only for explicit open/local-dev scenarios:
+	- `IRONMESH_REQUIRE_CLIENT_AUTH=false`
 - Admin can issue one-time pairing authorizations:
 	- `POST /auth/pairing-tokens/issue`
 	- header: `x-ironmesh-admin-token: <admin token>`

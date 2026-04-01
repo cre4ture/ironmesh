@@ -107,24 +107,27 @@ export async function listAdminStoreEntries(
   });
 }
 
-export async function getClusterSummary(): Promise<ClusterSummary> {
-  return fetchJson<ClusterSummary>("/cluster/status", {
-    credentials: "same-origin",
-    cache: "no-store"
+export async function getClusterSummary(
+  adminTokenOverride?: string
+): Promise<ClusterSummary> {
+  return fetchAdminJson<ClusterSummary>("/cluster/status", {
+    adminTokenOverride
   });
 }
 
-export async function getClusterNodes(): Promise<NodeDescriptor[]> {
-  return fetchJson<NodeDescriptor[]>("/cluster/nodes", {
-    credentials: "same-origin",
-    cache: "no-store"
+export async function getClusterNodes(
+  adminTokenOverride?: string
+): Promise<NodeDescriptor[]> {
+  return fetchAdminJson<NodeDescriptor[]>("/cluster/nodes", {
+    adminTokenOverride
   });
 }
 
-export async function getReplicationPlan(): Promise<ReplicationPlan> {
-  return fetchJson<ReplicationPlan>("/cluster/replication/plan", {
-    credentials: "same-origin",
-    cache: "no-store"
+export async function getReplicationPlan(
+  adminTokenOverride?: string
+): Promise<ReplicationPlan> {
+  return fetchAdminJson<ReplicationPlan>("/cluster/replication/plan", {
+    adminTokenOverride
   });
 }
 
