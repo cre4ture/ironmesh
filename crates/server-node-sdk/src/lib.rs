@@ -4584,6 +4584,8 @@ async fn execute_peer_request(
     body: Vec<u8>,
 ) -> Result<PeerHttpResponse> {
     let plan = plan_peer_transport(state, node)?;
+    let availability_sync = path_and_query == "/cluster/availability/subjects/local";
+    let started = availability_sync.then(Instant::now);
 
     match plan.path_kind {
         TransportPathKind::DirectHttps | TransportPathKind::DirectQuic => {
@@ -4593,7 +4595,7 @@ async fn execute_peer_request(
                 .map(|candidate| candidate.endpoint.trim_end_matches('/').to_string())
                 .context("peer transport plan did not include a selected candidate")?;
             let internal_http = current_internal_http(state).await;
-            execute_direct_peer_request(
+            let response = execute_direct_peer_request(
                 &internal_http,
                 &base_url,
                 method,
@@ -4601,10 +4603,30 @@ async fn execute_peer_request(
                 headers,
                 body,
             )
-            .await
+            .await?;
+            if let Some(started) = started {
+                info!(
+                    peer_node_id = %node.node_id,
+                    transport = ?plan.path_kind,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "availability peer request transport finished"
+                );
+            }
+            Ok(response)
         }
         TransportPathKind::RelayTunnel => {
-            execute_relay_peer_request(state, node, method, path_and_query, headers, body).await
+            let response =
+                execute_relay_peer_request(state, node, method, path_and_query, headers, body)
+                    .await?;
+            if let Some(started) = started {
+                info!(
+                    peer_node_id = %node.node_id,
+                    transport = ?plan.path_kind,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "availability peer request transport finished"
+                );
+            }
+            Ok(response)
         }
     }
 }
@@ -4954,8 +4976,18 @@ struct LocalMetadataSubjectsResponse {
 }
 
 pub(crate) async fn sync_availability_views_once(state: &ServerState) {
+    let started = Instant::now();
+    let local_started = Instant::now();
     refresh_local_availability_view_once(state).await;
+    let local_elapsed_ms = local_started.elapsed().as_millis();
+    let remote_started = Instant::now();
     sync_remote_availability_views_once(state).await;
+    info!(
+        local_elapsed_ms,
+        remote_elapsed_ms = remote_started.elapsed().as_millis(),
+        total_elapsed_ms = started.elapsed().as_millis(),
+        "availability sync finished"
+    );
 }
 
 async fn sync_remote_availability_views_once(state: &ServerState) {
@@ -4971,7 +5003,11 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
             .collect::<Vec<_>>()
     };
 
+    info!(peer_count = peers.len(), "availability remote sync start");
+
     for peer in peers {
+        let peer_started = Instant::now();
+        info!(peer_node_id = %peer.node_id, "availability peer sync start");
         match execute_peer_request(
             state,
             &peer,
@@ -4987,6 +5023,12 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
                     Ok(payload) => {
                         let mut cluster = state.cluster.lock().await;
                         cluster.replace_node_available_view(payload.node_id, &payload.subjects);
+                        info!(
+                            peer_node_id = %peer.node_id,
+                            subject_count = payload.subjects.len(),
+                            elapsed_ms = peer_started.elapsed().as_millis(),
+                            "availability peer sync finished"
+                        );
                     }
                     Err(err) => {
                         tracing::debug!(
@@ -4998,6 +5040,12 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
                 }
             }
             Ok(response) => {
+                info!(
+                    peer_node_id = %peer.node_id,
+                    status = response.status,
+                    elapsed_ms = peer_started.elapsed().as_millis(),
+                    "availability peer sync rejected"
+                );
                 tracing::debug!(
                     node_id = %peer.node_id,
                     status = response.status,
@@ -5005,6 +5053,12 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
                 );
             }
             Err(err) => {
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    elapsed_ms = peer_started.elapsed().as_millis(),
+                    error = %err,
+                    "availability peer sync failed"
+                );
                 tracing::debug!(
                     node_id = %peer.node_id,
                     error = %err,
@@ -5843,23 +5897,69 @@ async fn rename_object_path(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    let started = Instant::now();
+    info!(
+        from_path = %request.from_path,
+        to_path = %request.to_path,
+        overwrite = request.overwrite,
+        "store path rename request start"
+    );
     let mut store = lock_store(&state, "store_path.rename").await;
+    let store_lock_wait_ms = store.waited_ms();
+    let store_started = Instant::now();
     match store
         .rename_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
     {
         Ok(PathMutationResult::Applied) => {
+            info!(
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "store path rename applied; publishing namespace change"
+            );
             drop(store);
             publish_namespace_change(&state);
-            sync_availability_views_once(&state).await;
+            request_local_availability_refresh(&state);
+            info!(
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "store path rename response ready after queueing background availability refresh"
+            );
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),
-        Ok(PathMutationResult::TargetExists) => StatusCode::CONFLICT.into_response(),
+        Ok(PathMutationResult::SourceMissing) => {
+            info!(
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "store path rename source missing"
+            );
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Ok(PathMutationResult::TargetExists) => {
+            info!(
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "store path rename target exists"
+            );
+            StatusCode::CONFLICT.into_response()
+        }
         Err(err) => {
             tracing::error!(
                 from_path = %request.from_path,
                 to_path = %request.to_path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
                 error = %err,
                 "failed to rename object path"
             );
@@ -5884,7 +5984,7 @@ async fn copy_object_path(
         Ok(PathMutationResult::Applied) => {
             drop(store);
             publish_namespace_change(&state);
-            sync_availability_views_once(&state).await;
+            request_local_availability_refresh(&state);
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(PathMutationResult::SourceMissing) => StatusCode::NOT_FOUND.into_response(),

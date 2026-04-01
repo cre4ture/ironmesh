@@ -88,6 +88,7 @@ Live client-rights edge mode:
 mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
+  --client-identity-file /path/to/client-identity.json \
   --mountpoint /tmp/ironmesh-mount-live
 ```
 
@@ -97,6 +98,7 @@ Same-device mode with hydrated-object cache disabled:
 mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
+  --client-identity-file /path/to/client-identity.json \
   --offline-object-cache off \
   --mountpoint /tmp/ironmesh-mount-live
 ```

@@ -144,7 +144,7 @@ pub mod runtime {
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::Receiver;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     const ROOT_INODE: u64 = 1;
     const TTL: Duration = Duration::from_secs(1);
@@ -1259,9 +1259,25 @@ pub mod runtime {
             to_path: &str,
             base_remote_version: Option<&str>,
         ) -> Result<()> {
+            let started = Instant::now();
+            tracing::info!(
+                from_path,
+                to_path,
+                base_remote_version = base_remote_version.unwrap_or("<none>"),
+                "ironmesh fuse remote rename file start"
+            );
             self.uploader
                 .rename_path(from_path, to_path, false, base_remote_version)
-                .with_context(|| format!("failed to rename remote file {from_path} -> {to_path}"))
+                .with_context(|| {
+                    format!("failed to rename remote file {from_path} -> {to_path}")
+                })?;
+            tracing::info!(
+                from_path,
+                to_path,
+                elapsed_ms = started.elapsed().as_millis(),
+                "ironmesh fuse remote rename file finished"
+            );
+            Ok(())
         }
 
         fn remote_rename_directory_subtree(
@@ -1270,10 +1286,20 @@ pub mod runtime {
             from_root: &str,
             to_root: &str,
         ) -> Result<()> {
+            let started = Instant::now();
             let mut directories = Vec::new();
             let mut files = Vec::new();
             self.collect_subtree_nodes(directory_inode, &mut directories, &mut files)?;
+            tracing::info!(
+                from_root,
+                to_root,
+                file_count = files.len(),
+                directory_count = directories.len(),
+                "ironmesh fuse remote rename directory subtree start"
+            );
 
+            let file_phase_started = Instant::now();
+            let file_count = files.len();
             for inode in files {
                 let old_path = self.resolve_full_path(inode);
                 let relative = old_path
@@ -1285,8 +1311,22 @@ pub mod runtime {
                     .nodes
                     .get(&inode)
                     .and_then(|node| node.sync_metadata.remote_version.as_deref());
+                tracing::info!(
+                    from_path = old_path.as_str(),
+                    to_path = new_path.as_str(),
+                    base_remote_version = remote_version.unwrap_or("<none>"),
+                    file_count,
+                    "ironmesh fuse remote rename directory file step"
+                );
                 self.remote_rename_file(&old_path, &new_path, remote_version)?;
             }
+            tracing::info!(
+                from_root,
+                to_root,
+                file_count,
+                elapsed_ms = file_phase_started.elapsed().as_millis(),
+                "ironmesh fuse remote rename directory file phase finished"
+            );
 
             let mut directory_paths: Vec<String> = directories
                 .into_iter()
@@ -1294,6 +1334,8 @@ pub mod runtime {
                 .collect();
 
             directory_paths.sort_by_key(|path| Self::path_depth(path));
+            let marker_create_started = Instant::now();
+            let directory_count = directory_paths.len();
             for old_path in &directory_paths {
                 let relative = old_path
                     .strip_prefix(from_root)
@@ -1310,16 +1352,43 @@ pub mod runtime {
                 } else {
                     format!("{to_root}/{relative}")
                 };
+                tracing::info!(
+                    from_path = old_path.as_str(),
+                    to_path = new_path.as_str(),
+                    directory_count,
+                    "ironmesh fuse remote rename directory marker create step"
+                );
                 self.ensure_remote_directory_marker(&new_path)?;
             }
+            tracing::info!(
+                from_root,
+                to_root,
+                directory_count,
+                elapsed_ms = marker_create_started.elapsed().as_millis(),
+                "ironmesh fuse remote rename directory marker create phase finished"
+            );
 
             directory_paths.sort_by_key(|path| std::cmp::Reverse(Self::path_depth(path)));
+            let marker_delete_started = Instant::now();
             for old_path in &directory_paths {
                 let old_marker = format!("{}/", old_path.trim_end_matches('/'));
+                tracing::info!(
+                    old_marker = old_marker.as_str(),
+                    directory_count,
+                    "ironmesh fuse remote rename directory marker delete step"
+                );
                 self.uploader
                     .delete_path(&old_marker, None)
                     .with_context(|| format!("failed to delete stale marker {old_marker}"))?;
             }
+            tracing::info!(
+                from_root,
+                to_root,
+                directory_count,
+                elapsed_ms = marker_delete_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "ironmesh fuse remote rename directory subtree finished"
+            );
 
             Ok(())
         }
@@ -2322,8 +2391,29 @@ pub mod runtime {
                 return;
             }
 
+            let old_parent_path = self.resolve_full_path(parent);
+            let new_parent_path = self.resolve_full_path(newparent);
+            let old_full_path = Self::child_path(&old_parent_path, old_name);
+            let new_full_path = Self::child_path(&new_parent_path, new_name);
+            let started = Instant::now();
+            tracing::info!(
+                from_path = old_full_path.as_str(),
+                to_path = new_full_path.as_str(),
+                inode,
+                kind = ?node.kind,
+                flags,
+                destination_exists = new_parent_node.children.contains_key(new_name),
+                "ironmesh fuse rename start"
+            );
+
             if let Some(existing_inode) = new_parent_node.children.get(new_name).copied() {
                 if existing_inode == inode {
+                    tracing::info!(
+                        from_path = old_full_path.as_str(),
+                        to_path = new_full_path.as_str(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "ironmesh fuse rename short-circuited because destination already matches source"
+                    );
                     reply.ok();
                     return;
                 }
@@ -2374,11 +2464,24 @@ pub mod runtime {
                 }
             }
 
-            if let Err(_error) = self.rename_entry(parent, old_name, newparent, new_name, flags) {
+            if let Err(error) = self.rename_entry(parent, old_name, newparent, new_name, flags) {
+                tracing::warn!(
+                    from_path = old_full_path.as_str(),
+                    to_path = new_full_path.as_str(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %error,
+                    "ironmesh fuse rename failed"
+                );
                 reply.error(EIO);
                 return;
             }
 
+            tracing::info!(
+                from_path = old_full_path.as_str(),
+                to_path = new_full_path.as_str(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "ironmesh fuse rename finished"
+            );
             reply.ok();
         }
 

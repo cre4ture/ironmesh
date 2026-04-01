@@ -20,7 +20,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sync_core::{SyncPolicy, SyncSnapshot};
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -90,7 +90,7 @@ impl From<CliOfflineObjectCacheMode> for OfflineObjectCacheMode {
 pub fn mount_main() -> Result<()> {
     common::logging::init_compact_tracing_default("info");
     let args = Args::parse();
-    let client_identity = read_optional_client_identity(args.client_identity_file.as_deref())?;
+    let client_identity = resolve_client_identity(&args)?;
     let upstream_target = resolve_upstream_target(&args, client_identity.as_ref())?;
 
     if args.snapshot_file.is_some() {
@@ -141,6 +141,12 @@ pub fn mount_main() -> Result<()> {
             snapshot
         }
         Err(error) => {
+            if is_unauthorized_store_index_error(&error) {
+                let auth_hint = live_mount_auth_hint(&args, client_identity.is_some());
+                return Err(error).context(format!(
+                    "initial remote snapshot fetch was unauthorized; {auth_hint}"
+                ));
+            }
             if let Some(snapshot) = client_edge_state.load_cached_snapshot()? {
                 tracing::warn!(
                     "client-rights-edge: failed to fetch initial snapshot; using cached snapshot: {error}"
@@ -352,6 +358,70 @@ fn resolve_upstream_target(
         client_identity,
     )?;
     Ok(Some(ResolvedUpstreamTarget { client }))
+}
+
+fn default_client_identity_path(bootstrap_path: &std::path::Path) -> PathBuf {
+    if let Some(stem) = bootstrap_path.file_stem() {
+        let mut file_name = stem.to_os_string();
+        file_name.push(".client-identity.json");
+        return bootstrap_path.with_file_name(file_name);
+    }
+    bootstrap_path.with_file_name("ironmesh-client-identity.json")
+}
+
+fn resolve_client_identity(args: &Args) -> Result<Option<ClientIdentityMaterial>> {
+    if let Some(path) = args.client_identity_file.as_deref() {
+        return Ok(Some(ClientIdentityMaterial::from_path(path)?));
+    }
+
+    let Some(bootstrap_path) = args.bootstrap_file.as_deref() else {
+        return Ok(None);
+    };
+
+    let inferred_path = default_client_identity_path(bootstrap_path);
+    if !inferred_path.exists() {
+        return Ok(None);
+    }
+
+    tracing::info!(
+        inferred_path = %inferred_path.display(),
+        bootstrap_path = %bootstrap_path.display(),
+        "client-rights-edge: using client identity inferred from bootstrap path"
+    );
+    Ok(Some(
+        ClientIdentityMaterial::from_path(&inferred_path).with_context(|| {
+            format!(
+                "failed to load client identity inferred from bootstrap path {}",
+                inferred_path.display()
+            )
+        })?,
+    ))
+}
+
+fn is_unauthorized_store_index_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("/store/index returned non-success status: 401 Unauthorized")
+            || message
+                .contains("/store/index/changes/wait returned non-success status: 401 Unauthorized")
+    })
+}
+
+fn live_mount_auth_hint(args: &Args, has_client_identity: bool) -> String {
+    if has_client_identity {
+        return "the loaded client identity was rejected by the server or is no longer valid"
+            .to_string();
+    }
+
+    if let Some(bootstrap_path) = args.bootstrap_file.as_deref() {
+        let inferred_path = default_client_identity_path(bootstrap_path);
+        return format!(
+            "live mounts now require client auth; pass --client-identity-file {} or place a client identity next to the bootstrap file",
+            inferred_path.display()
+        );
+    }
+
+    "live mounts now require client auth; pass --client-identity-file <path-to-client-identity.json>".to_string()
 }
 
 fn sanitize_path_component(raw: &str) -> String {
@@ -598,20 +668,48 @@ impl Uploader for ClientRightsEdgeIo {
         overwrite: bool,
         base_remote_version: Option<&str>,
     ) -> Result<()> {
+        let started = Instant::now();
+        tracing::info!(
+            from_path,
+            to_path,
+            overwrite,
+            base_remote_version = base_remote_version.unwrap_or("<none>"),
+            "client-rights-edge: direct remote rename attempt start"
+        );
         match self
             .sdk
             .rename_path_blocking(from_path.to_string(), to_path.to_string(), overwrite)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                tracing::info!(
+                    from_path,
+                    to_path,
+                    overwrite,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "client-rights-edge: direct remote rename attempt finished"
+                );
+                Ok(())
+            }
             Err(error) => {
                 tracing::warn!(
+                    from_path,
+                    to_path,
+                    overwrite,
+                    elapsed_ms = started.elapsed().as_millis(),
                     "client-rights-edge: remote rename {from_path} -> {to_path} failed, queueing for retry: {error}"
                 );
                 self.edge_state
                     .enqueue_rename(from_path, to_path, overwrite, base_remote_version)
                     .with_context(|| {
                         format!("failed to persist queued rename {from_path} -> {to_path}")
-                    })
+                    })?;
+                tracing::info!(
+                    from_path,
+                    to_path,
+                    overwrite,
+                    "client-rights-edge: queued rename for retry"
+                );
+                Ok(())
             }
         }
     }
@@ -653,12 +751,6 @@ fn read_optional_utf8_file(path: Option<&std::path::Path>) -> Result<Option<Stri
     })
     .transpose()
     .map(|value| value.filter(|value| !value.is_empty()))
-}
-
-fn read_optional_client_identity(
-    path: Option<&std::path::Path>,
-) -> Result<Option<ClientIdentityMaterial>> {
-    path.map(ClientIdentityMaterial::from_path).transpose()
 }
 
 #[cfg(test)]
@@ -958,6 +1050,49 @@ mod tests {
 
         let derived = effective_client_edge_state_dir(&args).unwrap();
         assert_eq!(derived, PathBuf::from("/tmp/custom-edge-state"));
+    }
+
+    #[test]
+    fn default_client_identity_path_uses_bootstrap_stem() {
+        let path = default_client_identity_path(std::path::Path::new(
+            "/tmp/ironmesh-client-bootstrap-cli-client.json",
+        ));
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/ironmesh-client-bootstrap-cli-client.client-identity.json")
+        );
+    }
+
+    #[test]
+    fn resolve_client_identity_uses_bootstrap_sibling_when_present() {
+        let dir = unique_temp_dir("bootstrap-sibling-identity");
+        fs::create_dir_all(&dir).expect("temp dir create should succeed");
+        let bootstrap_path = dir.join("client.bootstrap.json");
+        fs::write(&bootstrap_path, "{}").expect("bootstrap placeholder write should succeed");
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("linux-fuse-test".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let identity_path = default_client_identity_path(&bootstrap_path);
+        identity
+            .write_to_path(&identity_path)
+            .expect("identity should persist");
+
+        let mut args = sample_args();
+        args.server_base_url = None;
+        args.bootstrap_file = Some(bootstrap_path);
+
+        let resolved = resolve_client_identity(&args)
+            .expect("identity resolution should succeed")
+            .expect("bootstrap sibling identity should be inferred");
+        assert_eq!(resolved.device_id, identity.device_id);
+        assert_eq!(resolved.cluster_id, identity.cluster_id);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

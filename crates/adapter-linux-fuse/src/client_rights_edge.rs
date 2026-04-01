@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_core::{EntryKind, HydrationState, LocalEntry, NamespaceEntry, PinState, SyncSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +286,8 @@ impl ClientRightsEdgeState {
         overwrite: bool,
         base_remote_version: Option<&str>,
     ) -> Result<()> {
+        let from_path = normalize_logical_path(from_path);
+        let to_path = normalize_logical_path(to_path);
         let mut queue = self
             .queue
             .lock()
@@ -295,13 +297,24 @@ impl ClientRightsEdgeState {
             id,
             created_at_unix_ms: unix_ms(),
             op: PendingMutationOp::RenamePath {
-                from_path: normalize_logical_path(from_path),
-                to_path: normalize_logical_path(to_path),
+                from_path: from_path.clone(),
+                to_path: to_path.clone(),
                 overwrite,
                 base_remote_version: base_remote_version.map(ToString::to_string),
             },
         });
-        persist_json_file_atomic(&self.queue_path, &*queue)
+        let queue_len = queue.pending.len();
+        persist_json_file_atomic(&self.queue_path, &*queue)?;
+        tracing::info!(
+            mutation_id = id,
+            from_path,
+            to_path,
+            overwrite,
+            base_remote_version = base_remote_version.unwrap_or("<none>"),
+            queue_len,
+            "client-rights-edge: queued rename mutation"
+        );
+        Ok(())
     }
 
     pub fn replay_actions(&self) -> Result<Vec<ReplayAction>> {
@@ -600,19 +613,44 @@ impl ClientRightsEdgeState {
                 overwrite,
                 base_remote_version,
             } => {
+                let started = Instant::now();
                 if base_remote_version.is_some()
                     && self.cached_snapshot_reports_conflict(
                         from_path,
                         base_remote_version.as_deref(),
                     )?
                 {
+                    tracing::warn!(
+                        mutation_id = mutation.id,
+                        from_path,
+                        to_path,
+                        overwrite,
+                        base_remote_version = base_remote_version.as_deref().unwrap_or("<none>"),
+                        "client-rights-edge: queued rename blocked by remote divergence"
+                    );
                     return Ok(ApplyMutationResult::Conflict);
                 }
+                tracing::info!(
+                    mutation_id = mutation.id,
+                    from_path,
+                    to_path,
+                    overwrite,
+                    base_remote_version = base_remote_version.as_deref().unwrap_or("<none>"),
+                    "client-rights-edge: queued rename apply start"
+                );
                 client
                     .rename_path_blocking(from_path.clone(), to_path.clone(), *overwrite)
                     .with_context(|| {
                         format!("failed to rename remote path {from_path} -> {to_path}")
                     })?;
+                tracing::info!(
+                    mutation_id = mutation.id,
+                    from_path,
+                    to_path,
+                    overwrite,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "client-rights-edge: queued rename apply finished"
+                );
                 Ok(ApplyMutationResult::Applied)
             }
         }

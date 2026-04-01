@@ -181,6 +181,7 @@ Direct server mode:
 mkdir -p /tmp/ironmesh-mount
 cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
+  --client-identity-file /path/to/client-identity.json \
   --mountpoint /tmp/ironmesh-mount
 ```
 
@@ -196,6 +197,10 @@ cargo run -p os-integration -- \
 
 Notes:
 
+- Live mounts now require client auth when the server protects `/store/*` APIs. In direct mode,
+  pass `--client-identity-file`.
+- In bootstrap mode, `adapter-linux-fuse-mount` auto-loads a sibling
+  `bootstrap.client-identity.json` when present.
 - `--local-edge` starts a persistent local edge node and mounts against it instead of talking to the remote server directly.
 - By default, local-edge state is stored under `$XDG_STATE_HOME/ironmesh/os-integration/local-edge/` or `~/.local/state/ironmesh/os-integration/local-edge/`.
 - Use `--local-edge-data-dir` to override that storage path explicitly.
