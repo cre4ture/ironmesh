@@ -2174,7 +2174,7 @@ mod tests {
             sdk.put("seed/online.txt", Bytes::from_static(b"seed-online"))
                 .await?;
 
-            let extra_args_owned = vec![
+            let extra_args_owned = [
                 "--client-edge-state-dir".to_string(),
                 client_edge_state_dir.to_string_lossy().to_string(),
                 "--offline-object-cache".to_string(),

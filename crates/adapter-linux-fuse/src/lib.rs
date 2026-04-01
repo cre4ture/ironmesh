@@ -1212,8 +1212,7 @@ pub mod runtime {
             let Some(parent_node) = self.nodes.get(&parent) else {
                 return false;
             };
-            !(parent_node.read_only
-                || (parent == ROOT_INODE && Self::is_reserved_root_child(name)))
+            !(parent_node.read_only || (parent == ROOT_INODE && Self::is_reserved_root_child(name)))
         }
 
         fn collect_subtree_nodes(
