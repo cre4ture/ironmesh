@@ -1348,6 +1348,7 @@ impl IronMeshClient {
                 chunk_size_bytes: session.chunk_size_bytes,
             },
         )?;
+        maybe_abort_after_resumable_upload_state_persist(&key, state_path);
 
         if session.completed {
             remove_file_if_exists(state_path)?;
@@ -2179,6 +2180,17 @@ fn upload_result_from_session_complete(
         upload_mode: UploadMode::Chunked,
         chunk_size_bytes: Some(session.chunk_size_bytes),
         chunk_count: Some(session.chunk_count),
+    }
+}
+
+fn maybe_abort_after_resumable_upload_state_persist(key: &str, state_path: &Path) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+
+    let crash_key = std::env::var("IRONMESH_TEST_CRASH_AFTER_UPLOAD_STATE_KEY").ok();
+    if crash_key.as_deref() == Some(key) && state_path.is_file() {
+        std::process::abort();
     }
 }
 
