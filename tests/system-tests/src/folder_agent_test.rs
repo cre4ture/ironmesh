@@ -1123,6 +1123,27 @@ async fn folder_agent_applies_path_level_recovery_when_baseline_row_is_missing()
             .await?;
         wait_for_local_file_bytes(&local_root.join("path-recovery/c.txt"), b"remote-c-v1", 220)
             .await?;
+        wait_for_baseline_content_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            "path-recovery/a.txt",
+            240,
+        )
+        .await?;
+        wait_for_baseline_content_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            "path-recovery/b.txt",
+            240,
+        )
+        .await?;
+        wait_for_baseline_content_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            "path-recovery/c.txt",
+            240,
+        )
+        .await?;
         stop_folder_agent(&mut first_run).await;
 
         fs::write(local_root.join("path-recovery/a.txt"), b"local-a-v2").with_context(|| {
