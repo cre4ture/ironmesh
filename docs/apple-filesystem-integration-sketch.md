@@ -49,6 +49,10 @@ These decisions are already made for the Apple track:
 - Do not use `UniFFI` in the initial Apple slice.
 - File Provider item identity should be designed around durable remote object identity rather than treating path text as the long-term identifier model.
 - Because current `/store/index` responses do not expose `object_id`, the Apple-facing metadata/list contract must be extended before the File Provider identifier scheme is finalized.
+- For the initial Apple slice:
+  - file item IDs should use durable remote file identity where available
+  - directory item IDs may be path-derived temporarily
+  - do not require directory-marker objects ending in `/` to exist as the source of directory identity
 
 ## Priority order
 
@@ -169,7 +173,8 @@ Treat the Windows adapter as a precedent for a thin native integration layer ove
 2. Add a static-library + C-ABI bridge from `apps/ios-app`, generated with `cbindgen`.
 3. Define one shared Apple-side config and Rust facade contract for both platforms.
 4. Extend the Apple-facing list/stat surface to expose file `object_id` before locking the File Provider item-identifier scheme.
-5. Keep as much extension logic shared as practical, with only platform lifecycle glue split natively.
+5. Use path-derived IDs for directory entries temporarily, without depending on explicit directory-marker objects.
+6. Keep as much extension logic shared as practical, with only platform lifecycle glue split natively.
 
 ### Phase 2: File Provider read path on both platforms
 
@@ -232,7 +237,13 @@ Apple-facing metadata/list responses should carry the fields that the extension 
 - size / modified time
 - revision/version hints
 - durable file `object_id` when available
-- conflict-friendly state metadata as needed for the extension UI
+- temporary path-derived directory identifier
+- conflict-friendly state metadata as needed for the extension UI, for example:
+  - canonical state such as `clean`, `pending_upload`, or `conflicted`
+  - conflict reason codes such as modify/modify or modify/delete
+  - preferred revision/head information
+  - optional alternate/conflicting revision identifiers
+  - optional conflict-copy/reference path if IronMesh materializes one
 
 ## Key design rules
 
@@ -243,15 +254,18 @@ Apple-facing metadata/list responses should carry the fields that the extension 
 - Use a static library + manual C ABI with `cbindgen` for the initial Swift <-> Rust bridge.
 - Keep Apple native project files inside this repo.
 - Expose durable identity through the Apple-facing metadata/list contract instead of treating path text as the final File Provider identifier model.
+- Accept temporary path-derived IDs for directories until the server exposes first-class durable directory identity.
+- Keep conflict detection, authoritative conflict state, and conflict reason codes in Rust.
+- Keep native Apple code responsible for presentation only:
+  - badges
+  - localized strings
+  - File Provider-specific affordances
+  - host-app / extension UI timing and rendering
 - Reuse generic patterns from the Windows CFAPI adapter where they fit, but do not try to reuse Windows shell glue directly.
 - Keep Finder Sync clearly positioned as fallback-only.
 
 ## Open questions for implementation
 
-- Directory item identity:
-  - durable file `object_id` exists in backend/version APIs, but current prefix/directory entries do not yet carry a matching durable identity in the Apple-facing list/index shape
-  - decide whether initial directory item IDs are path-derived or whether durable directory IDs should be added to the server contract early
-- How much of conflict state should be represented natively versus surfaced from Rust.
 - Exact in-repo Apple project layout under `apps/apple-*`:
   - single Xcode project with shared packages/targets
   - or split macOS/iOS project structure with shared source packages
