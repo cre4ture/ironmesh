@@ -205,28 +205,39 @@ impl ClientRightsEdgeState {
         }
 
         let path = normalize_logical_path(path);
-        let mut queue = self
-            .queue
-            .lock()
-            .map_err(|_| anyhow!("queue lock poisoned"))?;
-        let id = next_queue_id(&mut queue);
-        let staged_rel_path = format!("{id}.bin");
-        let upload_state_rel_path = format!("{id}.json");
-        let staged_path = self.staged_dir.join(&staged_rel_path);
-        let content_hash = stage_reader_to_file(reader, length, &staged_path)?;
-        queue.pending.push(PendingMutation {
-            id,
-            created_at_unix_ms: unix_ms(),
-            op: PendingMutationOp::UploadFile {
-                path,
-                staged_rel_path,
-                upload_state_rel_path,
-                size: length,
-                base_remote_version: base_remote_version.map(ToString::to_string),
-                content_hash,
-            },
-        });
-        persist_json_file_atomic(&self.queue_path, &*queue)
+        let (removed_uploads, persisted) = {
+            let mut queue = self
+                .queue
+                .lock()
+                .map_err(|_| anyhow!("queue lock poisoned"))?;
+            let id = next_queue_id(&mut queue);
+            let staged_rel_path = format!("{id}.bin");
+            let upload_state_rel_path = format!("{id}.json");
+            let staged_path = self.staged_dir.join(&staged_rel_path);
+            let content_hash = stage_reader_to_file(reader, length, &staged_path)?;
+            let removed_uploads = supersede_pending_uploads(&mut queue.pending, &path);
+            let base_remote_version = if removed_uploads.is_empty() {
+                base_remote_version.map(ToString::to_string)
+            } else {
+                None
+            };
+            queue.pending.push(PendingMutation {
+                id,
+                created_at_unix_ms: unix_ms(),
+                op: PendingMutationOp::UploadFile {
+                    path,
+                    staged_rel_path,
+                    upload_state_rel_path,
+                    size: length,
+                    base_remote_version,
+                    content_hash,
+                },
+            });
+            let persisted = persist_json_file_atomic(&self.queue_path, &*queue);
+            (removed_uploads, persisted)
+        };
+        persisted?;
+        cleanup_removed_uploads(&self.staged_dir, &self.upload_state_dir, &removed_uploads)
     }
 
     pub fn enqueue_directory(&self, path: &str) -> Result<()> {
@@ -386,6 +397,10 @@ impl ClientRightsEdgeState {
             local,
             remote: remote_snapshot.remote.clone(),
         })
+    }
+
+    pub fn overlay_file_paths(&self) -> Result<std::collections::BTreeSet<String>> {
+        Ok(self.overlay_files()?.into_keys().collect())
     }
 
     pub fn read_cached_object(&self, content_hash: &str) -> Result<Option<Vec<u8>>> {
@@ -740,6 +755,26 @@ fn normalize_logical_path(path: &str) -> String {
         .join("/")
 }
 
+fn cleanup_removed_uploads(
+    staged_dir: &Path,
+    upload_state_dir: &Path,
+    removed_uploads: &[PendingMutation],
+) -> Result<()> {
+    for mutation in removed_uploads {
+        let PendingMutationOp::UploadFile {
+            staged_rel_path,
+            upload_state_rel_path,
+            ..
+        } = &mutation.op
+        else {
+            continue;
+        };
+        remove_file_if_exists(&staged_dir.join(staged_rel_path))?;
+        remove_file_if_exists(&upload_state_dir.join(upload_state_rel_path))?;
+    }
+    Ok(())
+}
+
 fn remote_file_version(snapshot: &SyncSnapshot, path: &str) -> Option<String> {
     snapshot.remote.iter().find_map(|entry| {
         (entry.kind == EntryKind::File && entry.path == path)
@@ -764,6 +799,69 @@ fn is_same_or_child(candidate: &str, root: &str) -> bool {
         || candidate
             .strip_prefix(root)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn paths_overlap(lhs: &str, rhs: &str) -> bool {
+    is_same_or_child(lhs, rhs) || is_same_or_child(rhs, lhs)
+}
+
+fn mutation_blocks_upload_supersession(op: &PendingMutationOp, path: &str) -> bool {
+    match op {
+        PendingMutationOp::UploadFile {
+            path: existing_path,
+            ..
+        } => existing_path != path && paths_overlap(existing_path, path),
+        PendingMutationOp::EnsureDirectory {
+            path: directory_path,
+        } => paths_overlap(directory_path, path),
+        PendingMutationOp::DeletePath {
+            path: deleted_path,
+            directory,
+            ..
+        } => {
+            if *directory {
+                paths_overlap(deleted_path, path)
+            } else {
+                deleted_path == path
+            }
+        }
+        PendingMutationOp::RenamePath {
+            from_path, to_path, ..
+        } => paths_overlap(from_path, path) || paths_overlap(to_path, path),
+    }
+}
+
+fn supersede_pending_uploads(
+    pending: &mut Vec<PendingMutation>,
+    path: &str,
+) -> Vec<PendingMutation> {
+    let mut last_barrier = None;
+    for (index, mutation) in pending.iter().enumerate() {
+        if mutation_blocks_upload_supersession(&mutation.op, path) {
+            last_barrier = Some(index);
+        }
+    }
+
+    let start = last_barrier.map(|index| index + 1).unwrap_or(0);
+    let mut removed = Vec::new();
+    let mut keep = Vec::with_capacity(pending.len());
+    for (index, mutation) in pending.drain(..).enumerate() {
+        let superseded = index >= start
+            && matches!(
+                &mutation.op,
+                PendingMutationOp::UploadFile {
+                    path: existing_path,
+                    ..
+                } if existing_path == path
+            );
+        if superseded {
+            removed.push(mutation);
+        } else {
+            keep.push(mutation);
+        }
+    }
+    *pending = keep;
+    removed
 }
 
 fn rename_path_prefix(path: &str, from_root: &str, to_root: &str) -> Result<String> {
@@ -962,6 +1060,52 @@ mod tests {
             .expect("range chunk cache read should succeed")
             .expect("newest chunk should remain cached");
         assert_eq!(newest.as_slice(), &[RANGE_CHUNK_CACHE_MAX_CHUNKS as u8]);
+
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn enqueue_upload_supersedes_trailing_same_path_uploads() {
+        let state_dir = temp_state_dir("supersede-upload");
+        let state = ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::Off)
+            .expect("state should initialize");
+
+        let mut first_reader = Cursor::new(b"first".to_vec());
+        state
+            .enqueue_upload("docs/report.txt", Some("v1"), &mut first_reader, 5)
+            .expect("first upload should queue");
+
+        let mut second_reader = Cursor::new(Vec::new());
+        state
+            .enqueue_upload("docs/report.txt", Some("v2"), &mut second_reader, 0)
+            .expect("second upload should queue");
+
+        let queue = state.queue.lock().expect("queue lock should succeed");
+        assert_eq!(queue.pending.len(), 1);
+        let PendingMutationOp::UploadFile {
+            path,
+            size,
+            base_remote_version,
+            ..
+        } = &queue.pending[0].op
+        else {
+            panic!("expected queued upload mutation");
+        };
+        assert_eq!(path, "docs/report.txt");
+        assert_eq!(*size, 0);
+        assert_eq!(base_remote_version, &None);
+        drop(queue);
+
+        let replay = state
+            .replay_actions()
+            .expect("replay actions should materialize queued file");
+        assert_eq!(
+            replay,
+            vec![ReplayAction::UpsertFile {
+                path: "docs/report.txt".to_string(),
+                data: Vec::new(),
+            }]
+        );
 
         let _ = fs::remove_dir_all(&state_dir);
     }

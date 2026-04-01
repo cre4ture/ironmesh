@@ -732,10 +732,34 @@ pub mod runtime {
             }
         }
 
-        fn inode_has_active_writer(&self, inode: u64) -> bool {
+        fn inode_has_open_handle(&self, inode: u64) -> bool {
             self.open_handles
                 .values()
-                .any(|handle| handle.inode == inode && handle.write_access)
+                .any(|handle| handle.inode == inode)
+        }
+
+        fn inode_has_unsynced_local_file_state(&self, inode: u64) -> bool {
+            self.nodes.get(&inode).is_some_and(|node| {
+                node.kind == FileType::RegularFile
+                    && !node.read_only
+                    && node.placeholder_version.is_none()
+                    && node.sync_metadata.remote_version.is_none()
+            })
+        }
+
+        fn local_file_matches_remote(
+            file: &FsNode,
+            remote_content_hash: &str,
+            remote_size: Option<u64>,
+        ) -> bool {
+            if file.kind != FileType::RegularFile || file.placeholder_version.is_some() {
+                return false;
+            }
+            if remote_size.is_some_and(|size| size != file.size) {
+                return false;
+            }
+
+            blake3::hash(&file.data).to_hex().as_str() == remote_content_hash
         }
 
         fn ensure_placeholder_file_for_refresh(
@@ -763,7 +787,15 @@ pub mod runtime {
                 .and_then(|node| node.children.get(file_name).copied());
 
             if let Some(inode) = existing {
-                if self.inode_has_active_writer(inode) {
+                if self.inode_has_open_handle(inode) {
+                    return;
+                }
+                if self.inode_has_unsynced_local_file_state(inode) {
+                    if let Some(file) = self.nodes.get_mut(&inode)
+                        && Self::local_file_matches_remote(file, remote_content_hash, remote_size)
+                    {
+                        file.sync_metadata.remote_version = Some(remote_version.to_string());
+                    }
                     return;
                 }
 
@@ -986,7 +1018,10 @@ pub mod runtime {
                 return;
             };
 
-            if self.inode_has_active_writer(target_inode) {
+            if self.inode_has_open_handle(target_inode) {
+                return;
+            }
+            if self.inode_has_unsynced_local_file_state(target_inode) {
                 return;
             }
 
@@ -1072,9 +1107,11 @@ pub mod runtime {
         }
 
         fn inode_has_dirty_state(&self, inode: u64) -> bool {
-            self.open_handles
-                .values()
-                .any(|handle| handle.inode == inode && handle.write_access && handle.dirty)
+            self.open_handles.values().any(|handle| {
+                handle.inode == inode
+                    && handle.write_access
+                    && (handle.dirty || handle.upload_enqueued)
+            })
         }
 
         fn xattr_entries_for_inode(&self, inode: u64) -> Result<Vec<(String, Vec<u8>)>> {
@@ -1435,7 +1472,12 @@ pub mod runtime {
             Ok(changed)
         }
 
-        fn alloc_open_handle(&mut self, inode: u64, write_access: bool) -> u64 {
+        fn alloc_open_handle(
+            &mut self,
+            inode: u64,
+            write_access: bool,
+            upload_enqueued: bool,
+        ) -> u64 {
             let fh = self.next_handle;
             self.next_handle = self.next_handle.saturating_add(1);
             self.open_handles.insert(
@@ -1444,7 +1486,7 @@ pub mod runtime {
                     inode,
                     write_access,
                     dirty: false,
-                    upload_enqueued: false,
+                    upload_enqueued,
                 },
             );
             fh
@@ -1466,30 +1508,41 @@ pub mod runtime {
                 && node.size != size
         }
 
-        fn upload_inode(&self, inode: u64) -> Result<bool> {
-            let node = self
-                .nodes
-                .get(&inode)
-                .ok_or_else(|| anyhow!("inode not found"))?;
-            if node.kind != FileType::RegularFile {
-                return Err(anyhow!("inode {inode} is not a regular file"));
-            }
-            if node.read_only {
-                return Err(anyhow!("inode {inode} is read-only"));
-            }
+        fn upload_inode(&mut self, inode: u64) -> Result<bool> {
+            let (path, base_remote_version, size, payload) = {
+                let node = self
+                    .nodes
+                    .get(&inode)
+                    .ok_or_else(|| anyhow!("inode not found"))?;
+                if node.kind != FileType::RegularFile {
+                    return Err(anyhow!("inode {inode} is not a regular file"));
+                }
+                if node.read_only {
+                    return Err(anyhow!("inode {inode} is read-only"));
+                }
 
-            let path = self.resolve_full_path(inode);
-            let mut reader = Cursor::new(node.data.clone());
+                (
+                    self.resolve_full_path(inode),
+                    node.sync_metadata.remote_version.clone(),
+                    node.size,
+                    node.data.clone(),
+                )
+            };
+
+            let mut reader = Cursor::new(payload);
             let remote_version = self
                 .uploader
-                .upload_reader(
-                    &path,
-                    node.sync_metadata.remote_version.as_deref(),
-                    &mut reader,
-                    node.size,
-                )
+                .upload_reader(&path, base_remote_version.as_deref(), &mut reader, size)
                 .with_context(|| format!("failed to upload path {path}"))?;
-            Ok(remote_version.is_some())
+            let synced = remote_version.is_some();
+
+            if !synced && let Some(node) = self.nodes.get_mut(&inode) {
+                // Once a mutation is only queued, the old remote version is no longer a reliable
+                // parent for subsequent local writes on this inode.
+                node.sync_metadata.remote_version = None;
+            }
+
+            Ok(synced)
         }
 
         fn flush_handle(&mut self, ino: u64, fh: u64) -> Result<()> {
@@ -2343,6 +2396,7 @@ pub mod runtime {
             }
 
             let write_access = Self::write_requested(flags);
+            let mut upload_enqueued = false;
             if node.read_only && write_access {
                 reply.error(EACCES);
                 return;
@@ -2352,9 +2406,12 @@ pub mod runtime {
                     reply.error(EIO);
                     return;
                 }
-                if let Err(_error) = self.upload_inode(ino) {
-                    reply.error(EIO);
-                    return;
+                match self.upload_inode(ino) {
+                    Ok(synced) => upload_enqueued = !synced,
+                    Err(_error) => {
+                        reply.error(EIO);
+                        return;
+                    }
                 }
             } else if Self::should_hydrate_on_open(flags)
                 && let Err(_error) = self.hydrate_if_needed(ino)
@@ -2363,7 +2420,7 @@ pub mod runtime {
                 return;
             }
 
-            let fh = self.alloc_open_handle(ino, write_access);
+            let fh = self.alloc_open_handle(ino, write_access, upload_enqueued);
             reply.opened(fh, FOPEN_DIRECT_IO);
         }
 
@@ -2414,14 +2471,21 @@ pub mod runtime {
             }
 
             let write_access = Self::write_requested(flags);
-            let fh = self.alloc_open_handle(inode, write_access);
-            if let Err(_error) = self.upload_inode(inode) {
-                if let Some(parent_node) = self.nodes.get_mut(&parent) {
-                    parent_node.children.remove(name);
+            let fh = self.alloc_open_handle(inode, write_access, false);
+            match self.upload_inode(inode) {
+                Ok(synced) => {
+                    if !synced && let Some(handle) = self.open_handles.get_mut(&fh) {
+                        handle.upload_enqueued = true;
+                    }
                 }
-                self.remove_inode_recursive(inode);
-                reply.error(EIO);
-                return;
+                Err(_error) => {
+                    if let Some(parent_node) = self.nodes.get_mut(&parent) {
+                        parent_node.children.remove(name);
+                    }
+                    self.remove_inode_recursive(inode);
+                    reply.error(EIO);
+                    return;
+                }
             }
             let Some(created) = self.nodes.get(&inode) else {
                 reply.error(EIO);
@@ -2997,7 +3061,7 @@ pub mod runtime {
                 .children
                 .insert("empty.txt".to_string(), inode);
 
-            let fh = fs.alloc_open_handle(inode, true);
+            let fh = fs.alloc_open_handle(inode, true, false);
             fs.open_handles
                 .get_mut(&fh)
                 .expect("handle should exist")
@@ -3101,7 +3165,7 @@ pub mod runtime {
                 .children
                 .insert("dirty.txt".to_string(), inode);
 
-            let fh = fs.alloc_open_handle(inode, true);
+            let fh = fs.alloc_open_handle(inode, true, false);
             fs.open_handles
                 .get_mut(&fh)
                 .expect("handle should exist")
@@ -3111,6 +3175,41 @@ pub mod runtime {
                 fs.xattr_value_for_inode(inode, XATTR_STATE)
                     .expect("xattr lookup should work"),
                 Some(b"dirty".to_vec())
+            );
+        }
+
+        #[test]
+        fn dirty_state_xattr_treats_enqueued_open_writes_as_dirty() {
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(RecordingHydrator::default()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            let inode = fs.next_inode();
+            fs.nodes.insert(
+                inode,
+                FsNode::regular_file(inode, "queued.txt".to_string(), ROOT_INODE),
+            );
+            fs.nodes
+                .get_mut(&ROOT_INODE)
+                .expect("root inode missing")
+                .children
+                .insert("queued.txt".to_string(), inode);
+
+            let fh = fs.alloc_open_handle(inode, true, true);
+            assert_eq!(
+                fs.xattr_value_for_inode(inode, XATTR_STATE)
+                    .expect("xattr lookup should work"),
+                Some(b"dirty".to_vec())
+            );
+
+            fs.open_handles.remove(&fh);
+            assert_eq!(
+                fs.xattr_value_for_inode(inode, XATTR_STATE)
+                    .expect("xattr lookup should work"),
+                Some(b"clean".to_vec())
             );
         }
 
@@ -3156,6 +3255,85 @@ pub mod runtime {
             assert!(
                 fs.lookup_inode_by_relative_path(".ironmesh-conflicts/remote/albums/report.csv")
                     .is_none()
+            );
+        }
+
+        #[test]
+        fn refresh_does_not_clobber_unsynced_local_file_with_placeholder() {
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(RecordingHydrator::default()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            let docs_inode = fs.ensure_directory("docs");
+            let file_inode = fs.next_inode();
+            let mut file = FsNode::regular_file(file_inode, "report.txt".to_string(), docs_inode);
+            file.data = b"offline-local".to_vec();
+            file.size = file.data.len() as u64;
+            file.sync_metadata.remote_version = None;
+            fs.nodes.insert(file_inode, file);
+            fs.nodes
+                .get_mut(&docs_inode)
+                .expect("docs directory missing")
+                .children
+                .insert("report.txt".to_string(), file_inode);
+
+            fs.apply_remote_action_plan_refresh(&FuseActionPlan {
+                actions: vec![FuseAction::EnsurePlaceholder {
+                    path: "docs/report.txt".to_string(),
+                    remote_version: "v-remote".to_string(),
+                    remote_content_hash: "h-remote".to_string(),
+                    remote_size: Some(2048),
+                }],
+            });
+
+            let file = fs.nodes.get(&file_inode).expect("local file should remain");
+            assert_eq!(file.data, b"offline-local".to_vec());
+            assert_eq!(file.placeholder_version, None);
+            assert_eq!(file.sync_metadata.remote_version, None);
+            assert_eq!(file.size, b"offline-local".len() as u64);
+        }
+
+        #[test]
+        fn refresh_rebinds_remote_version_when_local_bytes_match_remote_content() {
+            let mut fs = IronmeshFuseFs::from_action_plan(
+                &FuseActionPlan::default(),
+                Box::new(RecordingHydrator::default()),
+                Box::new(RecordingUploader::default()),
+                None,
+            );
+
+            let docs_inode = fs.ensure_directory("docs");
+            let file_inode = fs.next_inode();
+            let payload = b"synced".to_vec();
+            let mut file = FsNode::regular_file(file_inode, "report.txt".to_string(), docs_inode);
+            file.data = payload.clone();
+            file.size = payload.len() as u64;
+            file.sync_metadata.remote_version = None;
+            fs.nodes.insert(file_inode, file);
+            fs.nodes
+                .get_mut(&docs_inode)
+                .expect("docs directory missing")
+                .children
+                .insert("report.txt".to_string(), file_inode);
+
+            fs.apply_remote_action_plan_refresh(&FuseActionPlan {
+                actions: vec![FuseAction::EnsurePlaceholder {
+                    path: "docs/report.txt".to_string(),
+                    remote_version: "v-remote".to_string(),
+                    remote_content_hash: blake3::hash(&payload).to_hex().to_string(),
+                    remote_size: Some(payload.len() as u64),
+                }],
+            });
+
+            let file = fs.nodes.get(&file_inode).expect("local file should remain");
+            assert_eq!(file.data, payload);
+            assert_eq!(file.placeholder_version, None);
+            assert_eq!(
+                file.sync_metadata.remote_version.as_deref(),
+                Some("v-remote")
             );
         }
 

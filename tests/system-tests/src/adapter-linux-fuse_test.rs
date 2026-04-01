@@ -458,19 +458,26 @@ mod tests {
         expected: &[u8],
         retries: usize,
     ) -> Result<()> {
+        let mut last_seen = None;
         for _ in 0..retries {
-            if let Ok(Some(value)) = read_xattr(path, name)
-                && value.as_slice() == expected
-            {
-                return Ok(());
+            match read_xattr(path, name) {
+                Ok(Some(value)) => {
+                    if value.as_slice() == expected {
+                        return Ok(());
+                    }
+                    last_seen = Some(format!("value({:?})", String::from_utf8_lossy(&value)));
+                }
+                Ok(None) => last_seen = Some("none".to_string()),
+                Err(error) => last_seen = Some(format!("error({error:#})")),
             }
             sleep(Duration::from_millis(100)).await;
         }
 
         bail!(
-            "xattr {} for {} did not match expected value",
+            "xattr {} for {} did not match expected value; last seen: {}",
             name,
-            path.display()
+            path.display(),
+            last_seen.unwrap_or_else(|| "nothing observed".to_string())
         );
     }
 
@@ -588,17 +595,29 @@ mod tests {
         expected: &[u8],
         retries: usize,
     ) -> Result<()> {
+        let mut last_seen = None;
         for _ in 0..retries {
-            if let Ok(bytes) = sdk.get(key).await
-                && bytes.as_ref() == expected
-            {
-                return Ok(());
+            match sdk.get(key).await {
+                Ok(bytes) => {
+                    if bytes.as_ref() == expected {
+                        return Ok(());
+                    }
+                    last_seen = Some(format!(
+                        "bytes(len={}, preview={:?})",
+                        bytes.len(),
+                        &bytes[..bytes.len().min(32)]
+                    ));
+                }
+                Err(error) => last_seen = Some(format!("error({error})")),
             }
 
             sleep(Duration::from_millis(100)).await;
         }
 
-        bail!("server did not expose expected payload for key {key}");
+        bail!(
+            "server did not expose expected payload for key {key}; last seen: {}",
+            last_seen.unwrap_or_else(|| "nothing observed".to_string())
+        );
     }
 
     async fn wait_for_remote_sync_via_local_edge(

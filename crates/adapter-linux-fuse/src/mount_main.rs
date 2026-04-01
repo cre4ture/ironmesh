@@ -190,7 +190,16 @@ pub fn mount_main() -> Result<()> {
             };
             let full_plan =
                 refresh_adapter.plan_actions(&planning_snapshot, &SyncPolicy::default());
-            let plan = filter_refresh_action_plan(full_plan, &update.changed_paths);
+            let overlay_paths = match refresh_state.overlay_file_paths() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    tracing::warn!(
+                        "client-rights-edge: failed to inspect overlay file paths during refresh: {error}"
+                    );
+                    std::collections::BTreeSet::new()
+                }
+            };
+            let plan = filter_refresh_action_plan(full_plan, &update.changed_paths, &overlay_paths);
             if plan.actions.is_empty() {
                 tracing::info!(
                     "remote-refresh: detected {} changed remote paths; no local plan delta",
@@ -364,7 +373,21 @@ fn sanitize_path_component(raw: &str) -> String {
         .collect::<String>()
 }
 
-fn filter_refresh_action_plan(plan: FuseActionPlan, changed_paths: &[String]) -> FuseActionPlan {
+fn paths_overlap(lhs: &str, rhs: &str) -> bool {
+    lhs == rhs
+        || lhs
+            .strip_prefix(rhs)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || rhs
+            .strip_prefix(lhs)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn filter_refresh_action_plan(
+    plan: FuseActionPlan,
+    changed_paths: &[String],
+    overlay_paths: &std::collections::BTreeSet<String>,
+) -> FuseActionPlan {
     if changed_paths.is_empty() {
         return FuseActionPlan::default();
     }
@@ -396,13 +419,20 @@ fn filter_refresh_action_plan(plan: FuseActionPlan, changed_paths: &[String]) ->
             planned_paths.insert(path.clone());
         }
 
-        if changed.contains(path.as_str()) && keeps_remote_presence {
+        let suppressed_by_overlay = overlay_paths
+            .iter()
+            .any(|overlay_path| paths_overlap(path, overlay_path));
+
+        if changed.contains(path.as_str()) && keeps_remote_presence && !suppressed_by_overlay {
             actions.push(action);
         }
     }
 
     for path in changed_paths {
-        if planned_paths.contains(path) {
+        let suppressed_by_overlay = overlay_paths
+            .iter()
+            .any(|overlay_path| paths_overlap(path, overlay_path));
+        if planned_paths.contains(path) || suppressed_by_overlay {
             continue;
         }
         actions.push(FuseAction::RemovePath { path: path.clone() });
@@ -795,7 +825,11 @@ mod tests {
             ],
         };
 
-        let filtered = filter_refresh_action_plan(plan, &["docs/new.txt".to_string()]);
+        let filtered = filter_refresh_action_plan(
+            plan,
+            &["docs/new.txt".to_string()],
+            &std::collections::BTreeSet::new(),
+        );
 
         assert_eq!(
             filtered.actions,
@@ -822,6 +856,7 @@ mod tests {
         let filtered = filter_refresh_action_plan(
             plan,
             &["docs/new.txt".to_string(), "docs/old.txt".to_string()],
+            &std::collections::BTreeSet::new(),
         );
 
         assert_eq!(
@@ -863,6 +898,7 @@ mod tests {
         let filtered = filter_refresh_action_plan(
             plan,
             &["docs/old.txt".to_string(), "docs/sub/new.txt".to_string()],
+            &std::collections::BTreeSet::new(),
         );
 
         assert_eq!(
@@ -879,6 +915,32 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn filter_refresh_action_plan_suppresses_paths_with_pending_overlay_uploads() {
+        let plan = FuseActionPlan {
+            actions: vec![
+                FuseAction::EnsurePlaceholder {
+                    path: "docs/dirty.txt".to_string(),
+                    remote_version: "v2".to_string(),
+                    remote_content_hash: "h2".to_string(),
+                    remote_size: Some(14),
+                },
+                FuseAction::RemovePath {
+                    path: "docs".to_string(),
+                },
+            ],
+        };
+        let overlay_paths = std::collections::BTreeSet::from(["docs/dirty.txt".to_string()]);
+
+        let filtered = filter_refresh_action_plan(
+            plan,
+            &["docs/dirty.txt".to_string(), "docs".to_string()],
+            &overlay_paths,
+        );
+
+        assert!(filtered.actions.is_empty());
     }
 
     #[test]
