@@ -99,6 +99,7 @@ cargo run -p os-integration -- \
 - Implement Windows CFAPI adapter prototype using `sync-core` contracts.
 - Continue from handover doc checklist in `docs/cross-platform-handover.md`.
 - Apple platform planning now lives in `docs/apple-filesystem-integration-sketch.md`:
-  - Priority 1: File Provider on macOS and iOS/iPadOS
-  - Priority 2: macOS WebDAV mount
-  - Lowest priority: `folder-agent + Finder Sync`
+  - Active track: File Provider on macOS and iOS/iPadOS
+  - Initial bridge decision: static library + C ABI via `cbindgen` (not `UniFFI`)
+  - Native Apple project files should live in-repo under `apps/apple-*`
+  - Fallback only: `folder-agent + Finder Sync`

@@ -151,7 +151,7 @@ Notes:
 `android-app` and `ios-app` are Rust-first shells designed to expose the storage SDK and web GUI string payload to native layers. Typical production integration uses:
 
 - Android: JNI/Kotlin bridge (or UniFFI).
-- iOS: C-ABI/Swift bridge (or UniFFI).
+- iOS: C-ABI/Swift bridge. The current Apple File Provider plan explicitly prefers a manual C ABI plus `cbindgen` over `UniFFI` for the initial slice.
 
 Those bridges can be added incrementally without changing the workspace topology.
 

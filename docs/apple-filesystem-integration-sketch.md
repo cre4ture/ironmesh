@@ -5,10 +5,11 @@
 This document is the implementation sketch for bringing IronMesh to Apple platforms, with:
 
 1. `File Provider` on both macOS and iOS/iPadOS as the shared primary track.
-2. `WebDAV` mount support on macOS as the secondary track.
-3. `folder-agent + Finder Sync` as the lowest-priority fallback/MVP track.
+2. `folder-agent + Finder Sync` as the lowest-priority fallback/MVP track only if File Provider is blocked.
 
-This is intended as a handoff document for a macOS development machine running Codex Agent.
+There is no active `WebDAV` track in the current Apple plan.
+
+This is intended as an in-repo handoff document for a macOS development machine running Codex Agent.
 
 ## Current repo state
 
@@ -23,8 +24,31 @@ This is intended as a handoff document for a macOS development machine running C
   - Android: `DocumentsProvider`
   - Linux: FUSE adapter
   - Windows: CFAPI adapter
+- Existing object-identity direction:
+  - Server-side `object_id` already exists in storage and version APIs.
+  - Current `/store/index` / `StoreIndexEntry` responses are still path-centric and do not yet expose `object_id`.
 
 The current `apps/ios-app` crate is already useful as a thin Rust-side API surface for Apple host apps. It accepts either direct base URLs or bootstrap JSON plus optional client identity material, which is the right starting point for Apple platform shells.
+
+The existing Windows CFAPI adapter is also useful as an architectural precedent. It already covers several concerns that are similar in spirit to Apple File Provider work:
+
+- sync planning and adapter action mapping
+- live hydrator/uploader abstraction boundaries
+- remote refresh via `client-sdk::RemoteSnapshotPoller`
+- persisted bootstrap and client identity artifacts for an OS-facing integration
+
+The CFAPI-specific shell callbacks and placeholder APIs are Windows-only, but the surrounding shape is relevant.
+
+## Decided implementation direction
+
+These decisions are already made for the Apple track:
+
+- `File Provider` is the only active Apple integration track right now.
+- Apple native/Xcode project files should live inside this repo, under `apps/apple-*` style paths rather than in an external-only Xcode workspace.
+- The initial Swift <-> Rust bridge should use a static library with a manual C ABI and `cbindgen`.
+- Do not use `UniFFI` in the initial Apple slice.
+- File Provider item identity should be designed around durable remote object identity rather than treating path text as the long-term identifier model.
+- Because current `/store/index` responses do not expose `object_id`, the Apple-facing metadata/list contract must be extended before the File Provider identifier scheme is finalized.
 
 ## Priority order
 
@@ -81,72 +105,22 @@ Practical architecture:
 Suggested repo direction:
 
 - Keep `apps/ios-app` as the Rust facade crate for Apple clients/extensions.
+- Keep Apple native app/extension project files inside this repo under `apps/apple-*`.
 - Add Apple-facing methods for:
   - enumerate directory/prefix contents
   - stat one item
   - fetch object bytes or stream ranges
   - create/update/delete/move objects
-  - report conflict-friendly metadata
-- Keep native extension glue outside the Rust workspace if needed, in an Xcode project on the macOS machine.
+  - report conflict-friendly metadata, including durable identity where available
+- Prefer a narrow manual C ABI boundary with a thin Objective-C/Swift wrapper rather than exposing low-level Rust internals directly to Swift.
 
-### Priority 2: WebDAV mount on macOS
-
-This is the secondary track, mainly for macOS.
-
-Why this is second:
-
-- Finder can mount WebDAV servers directly, which gives a familiar mount-style UX.
-- It may be faster to get something usable on macOS than a full File Provider implementation.
-- It is a good backup path if File Provider extension work is blocked by entitlement, lifecycle, or API complexity.
-
-Why it is not first:
-
-- It does not give a shared Apple-platform story with iOS the way File Provider does.
-- It is a different UX class from Apple's modern cloud-file model.
-- It is less aligned with IronMesh's existing placeholder/hydration-oriented adapter work.
-
-What this should become:
-
-- A small authenticated WebDAV frontend backed by IronMesh object/index APIs.
-- A macOS Finder-connectable endpoint for browsing, opening, editing, renaming, and deleting files.
-
-Suggested implementation shape:
-
-1. Add a WebDAV server mode
-   - Prefer a new Rust crate or a server module, for example:
-     - `crates/webdav-server` or
-     - `apps/os-integration` WebDAV mode
-   - Map WebDAV methods onto existing IronMesh operations:
-     - `PROPFIND` -> directory listing / metadata
-     - `GET` -> object fetch
-     - `PUT` -> upload/overwrite
-     - `MKCOL` -> directory marker creation
-     - `MOVE` -> rename/move
-     - `DELETE` -> delete subtree/object
-
-2. Authentication model
-   - Reuse bootstrap/client identity material where practical.
-   - Support a simple local authenticated endpoint first.
-   - Decide whether the endpoint is:
-     - local-only helper started by the app, or
-     - remote-capable service exposure
-
-3. macOS UX
-   - Document Finder connection flow.
-   - Validate behavior with larger files, save-in-place, package files, rename/move, and conflict cases.
-
-Important scope note:
-
-- Treat WebDAV as a macOS path unless iOS support is explicitly validated later.
-- Do not let WebDAV dictate the core Apple architecture.
-
-### Priority 3: Quick macOS MVP via `folder-agent + Finder Sync`
+### Priority 2: Quick macOS MVP via `folder-agent + Finder Sync`
 
 This is the lowest-priority track right now.
 
 Why it stays on the list:
 
-- It is likely the fastest way to ship a basic native-feeling macOS integration if both File Provider and WebDAV are blocked.
+- It is likely the fastest way to ship a basic native-feeling macOS integration if File Provider is blocked.
 - It can reuse the existing `apps/ironmesh-folder-agent` work with relatively little backend change.
 
 Why it is lowest priority:
@@ -164,17 +138,38 @@ What it would look like:
   - status affordances
 - Accept that local disk usage, hydration, and placeholder behavior are much less elegant than File Provider.
 
+## Reuse from Windows CFAPI
+
+The existing Windows adapter is similar enough to be useful, but only at the shared-service and adapter-shape level.
+
+Reusable ideas and code patterns:
+
+- sync planning and action mapping from `sync-core`
+- thin OS adapter over shared Rust transport/object logic
+- hydrator/uploader split with live `client-sdk` wiring
+- remote refresh integration via `RemoteSnapshotPoller`
+- persisted bootstrap and client identity handling for an OS-facing integration
+
+Not reusable as-is:
+
+- CFAPI registration/callback APIs
+- Windows shell-specific placeholder/dehydrate/pin behavior
+- the current Windows placeholder identity format (`path + version`) as the long-term Apple identity model
+
+Treat the Windows adapter as a precedent for a thin native integration layer over shared Rust services, not as a source of Apple-specific shell code.
+
 ## Recommended sequence
 
 ### Phase 1: Shared Apple File Provider foundation
 
-1. Stand up Apple native project structure for both platforms:
+1. Stand up in-repo Apple native project structure for both platforms:
    - macOS host app + File Provider extension
    - iOS host app + File Provider extension
    - shared app-group storage model where appropriate
-2. Bridge both host apps/extensions to `apps/ios-app` Rust functionality.
+2. Add a static-library + C-ABI bridge from `apps/ios-app`, generated with `cbindgen`.
 3. Define one shared Apple-side config and Rust facade contract for both platforms.
-4. Keep as much extension logic shared as practical, with only platform lifecycle glue split natively.
+4. Extend the Apple-facing list/stat surface to expose file `object_id` before locking the File Provider item-identifier scheme.
+5. Keep as much extension logic shared as practical, with only platform lifecycle glue split natively.
 
 ### Phase 2: File Provider read path on both platforms
 
@@ -183,40 +178,36 @@ What it would look like:
 3. Validate:
    - Finder visibility and file open on macOS
    - Files app visibility and file open on iOS/iPadOS
-4. Confirm the same Rust facade is serving both extension targets cleanly.
+4. Confirm the same Rust facade and identity model are serving both extension targets cleanly.
 
 ### Phase 3: File Provider write path on both platforms
 
 1. Implement create/modify/delete.
 2. Implement rename/move.
-3. Add remote refresh integration.
+3. Add remote refresh integration using the same `client-sdk` notification/polling patterns already proven in Linux and Windows where practical.
 4. Add conflict handling and progress/cancellation reporting.
 5. Validate security-scoped URL workflows from other apps on iOS/iPadOS and normal Finder workflows on macOS.
 
-### Phase 4: WebDAV backup path on macOS
-
-1. Build a small local WebDAV frontend.
-2. Validate Finder mount flow and file operations.
-3. Keep it available as a fallback/debugging/degraded-access path.
-
-### Phase 5: Finder Sync fallback only if needed
+### Phase 4: Finder Sync fallback only if needed
 
 1. Pair folder-agent with a synced local root.
 2. Add Finder badges and menu actions.
-3. Use only if the higher-priority paths are blocked or delayed.
+3. Use only if the File Provider track is blocked or delayed.
 
 ## Suggested first tasks on the macOS machine
 
-1. Create the Apple host app + File Provider extension targets in Xcode for both macOS and iOS/iPadOS.
-2. Confirm app-group persistence and Rust bridge loading for the shared Apple facade.
-3. Extend `apps/ios-app` with a narrow facade for:
+1. Create the in-repo Apple host app + File Provider extension targets for both macOS and iOS/iPadOS.
+2. Confirm app-group persistence and Rust static-library loading for the shared Apple facade.
+3. Add `cbindgen`-based header generation and a thin Objective-C/Swift wrapper layer.
+4. Extend `apps/ios-app` with a narrow facade for:
    - list children
    - stat item
    - fetch bytes
    - put bytes
    - delete item
    - move item
-4. Get read-only File Provider enumeration and file open working on both macOS and iOS/iPadOS before tackling writes.
+   - return durable identity metadata needed for File Provider
+5. Get read-only File Provider enumeration and file open working on both macOS and iOS/iPadOS before tackling writes.
 
 ## Suggested Rust facade surface
 
@@ -234,28 +225,36 @@ Example responsibilities:
 - `move(from, to, expected_revision)`
 - `poll_or_refresh(cursor)`
 
+Apple-facing metadata/list responses should carry the fields that the extension needs directly, rather than forcing Swift to reconstruct them from raw server payloads. In particular:
+
+- path
+- entry kind
+- size / modified time
+- revision/version hints
+- durable file `object_id` when available
+- conflict-friendly state metadata as needed for the extension UI
+
 ## Key design rules
 
 - Keep Apple extension code thin and mostly native lifecycle glue.
 - Keep transport, object operations, and conflict policy in Rust where possible.
 - Prefer one shared Apple architecture across macOS and iOS.
 - Treat File Provider support for macOS and iOS/iPadOS as one shared top-priority initiative.
-- Do not optimize for a pure mount UX on macOS at the expense of the File Provider plan.
-- Keep WebDAV clearly positioned as secondary.
+- Use a static library + manual C ABI with `cbindgen` for the initial Swift <-> Rust bridge.
+- Keep Apple native project files inside this repo.
+- Expose durable identity through the Apple-facing metadata/list contract instead of treating path text as the final File Provider identifier model.
+- Reuse generic patterns from the Windows CFAPI adapter where they fit, but do not try to reuse Windows shell glue directly.
 - Keep Finder Sync clearly positioned as fallback-only.
 
 ## Open questions for implementation
 
-- Exact Swift <-> Rust bridge mechanism:
-  - static library via `cbindgen` / C ABI
-  - uniffi
-  - another FFI layer
-- Whether to keep Apple native project files outside this repo initially or add them under `apps/apple-*`.
-- Whether File Provider item identifiers should be path-derived or based on durable remote object IDs.
+- Directory item identity:
+  - durable file `object_id` exists in backend/version APIs, but current prefix/directory entries do not yet carry a matching durable identity in the Apple-facing list/index shape
+  - decide whether initial directory item IDs are path-derived or whether durable directory IDs should be added to the server contract early
 - How much of conflict state should be represented natively versus surfaced from Rust.
-- Whether WebDAV should run as:
-  - app-launched localhost service, or
-  - reusable server-node mode
+- Exact in-repo Apple project layout under `apps/apple-*`:
+  - single Xcode project with shared packages/targets
+  - or split macOS/iOS project structure with shared source packages
 
 ## Source notes
 
@@ -263,11 +262,10 @@ This priority order is based on current Apple platform guidance:
 
 - `File Provider` is the modern Apple-supported model across macOS and iOS/iPadOS.
 - Apple's iOS File Provider guidance explicitly builds on the macOS model and notes that the iOS sample extension is mostly unchanged from the macOS version.
-- WebDAV remains useful on macOS as a mount-style fallback, but it is not the primary shared-platform strategy.
+- The existing Windows CFAPI adapter is a useful precedent for shared hydrator/uploader/refresh/config patterns, but not for Apple shell APIs directly.
 
 Relevant external references:
 
 - Apple: `Sync files to the cloud with FileProvider on macOS`
 - Apple: `Bring desktop class sync to iOS with FileProvider`
 - Apple: `NSFileProviderReplicatedExtension`
-- Apple: Finder WebDAV support documentation
