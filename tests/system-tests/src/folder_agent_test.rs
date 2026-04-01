@@ -528,31 +528,61 @@ async fn wait_for_startup_conflict_reason(
     bail!("startup conflict not found for path={path} reason={reason}")
 }
 
-async fn wait_for_remote_prefix_entry_count(
+async fn wait_for_remote_prefix_entry_count_before_baseline_hash(
+    root_dir: &Path,
+    connection_target: &str,
     sdk: &IronMeshClient,
     prefix: &str,
     expected_min: usize,
+    baseline_hash_path: &str,
     retries: usize,
 ) -> Result<()> {
     let normalized_prefix = prefix.trim_matches('/');
+
     for _ in 0..retries {
-        if let Ok(index) = sdk.store_index(None, 64, None).await {
-            let observed = index
-                .entries
-                .iter()
-                .filter(|entry| {
-                    let path = entry.path.trim_matches('/');
-                    path.starts_with(normalized_prefix)
-                })
-                .count();
-            if observed >= expected_min {
-                return Ok(());
+        let remote_ready = match sdk.store_index(None, 64, None).await {
+            Ok(index) => {
+                index
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        let path = entry.path.trim_matches('/');
+                        path.starts_with(normalized_prefix)
+                    })
+                    .count()
+                    >= expected_min
             }
+            Err(_) => false,
+        };
+        let baseline_hash_present = {
+            let baseline_path = baseline_db_path(root_dir, connection_target, None)?;
+            if let Ok(connection) = Connection::open(&baseline_path) {
+                connection
+                    .query_row(
+                        "SELECT content_hash FROM baseline_entries WHERE path = ?1",
+                        [baseline_hash_path],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .flatten()
+                    .is_some_and(|value| !value.trim().is_empty())
+            } else {
+                false
+            }
+        };
+
+        if remote_ready && !baseline_hash_present {
+            return Ok(());
         }
+
         sleep(Duration::from_millis(100)).await;
     }
 
-    bail!("remote prefix {normalized_prefix} did not reach at least {expected_min} entries")
+    bail!(
+        "remote prefix {normalized_prefix} did not reach at least {expected_min} entries before baseline hash appeared for path={baseline_hash_path}"
+    )
 }
 
 #[tokio::test]
@@ -1459,8 +1489,20 @@ async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result
         let mut first_run =
             start_folder_agent(&fixture.connection, &local_root, None, 1_500, 100, true).await?;
 
-        // Wait until active sync starts and at least one local upload hits remote.
-        wait_for_remote_prefix_entry_count(&sdk, "crash-active/local-", 1, 320).await?;
+        // Crash only after active sync has landed at least one file remotely but before the final
+        // large pre-crash upload has a persisted baseline hash, so restart recovery still has
+        // real upload work left to finish and does not race a just-finished upload against the
+        // next startup snapshot.
+        wait_for_remote_prefix_entry_count_before_baseline_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            &sdk,
+            "crash-active/local-",
+            1,
+            "crash-active/local-c.bin",
+            320,
+        )
+        .await?;
 
         // Abrupt process termination during active syncing.
         stop_folder_agent(&mut first_run).await;
