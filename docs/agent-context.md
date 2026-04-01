@@ -64,6 +64,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - `.github/workflows/coverage.yml`
 - `docs/cross-platform-filesystem-integration-strategy.md`
 - `docs/cross-platform-handover.md`
+- `docs/apple-filesystem-integration-sketch.md`
 
 ## Quick validation commands
 
@@ -97,3 +98,7 @@ cargo run -p os-integration -- \
 
 - Implement Windows CFAPI adapter prototype using `sync-core` contracts.
 - Continue from handover doc checklist in `docs/cross-platform-handover.md`.
+- Apple platform planning now lives in `docs/apple-filesystem-integration-sketch.md`:
+  - Priority 1: File Provider on macOS and iOS/iPadOS
+  - Priority 2: macOS WebDAV mount
+  - Lowest priority: `folder-agent + Finder Sync`
