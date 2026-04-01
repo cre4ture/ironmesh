@@ -756,6 +756,13 @@ async fn folder_agent_detects_remote_add_and_modify_done_while_stopped_after_res
             220,
         )
         .await?;
+        wait_for_baseline_content_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            "restart-detect/existing.txt",
+            240,
+        )
+        .await?;
         stop_folder_agent(&mut first_run).await;
 
         sdk.put_large_aware(
@@ -1222,6 +1229,13 @@ async fn folder_agent_respects_remote_delete_intent_for_unchanged_local_after_re
             &local_root.join("delete-intent/target.txt"),
             b"remote-v1",
             220,
+        )
+        .await?;
+        wait_for_baseline_content_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            "delete-intent/target.txt",
+            240,
         )
         .await?;
         stop_folder_agent(&mut first_run).await;
