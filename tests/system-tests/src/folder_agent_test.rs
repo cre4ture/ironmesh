@@ -706,6 +706,13 @@ async fn folder_agent_propagates_local_file_deletions_to_remote() -> Result<()> 
         let scenario = async {
             let local_file = local_root.join("delete-me/target.txt");
             wait_for_local_file_bytes(&local_file, b"to-delete", 220).await?;
+            wait_for_baseline_content_hash(
+                &local_root,
+                fixture.connection.target_label(),
+                "delete-me/target.txt",
+                240,
+            )
+            .await?;
 
             fs::remove_file(&local_file)
                 .with_context(|| format!("failed to remove local file {}", local_file.display()))?;
@@ -1235,6 +1242,13 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_is_missing(
         let mut first_run =
             start_folder_agent(&fixture.connection, &local_root, None, 2_000, 250, true).await?;
         wait_for_local_file_bytes(&local_root.join("conflict/x.txt"), b"remote-v1", 220).await?;
+        wait_for_baseline_content_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            "conflict/x.txt",
+            240,
+        )
+        .await?;
         stop_folder_agent(&mut first_run).await;
 
         fs::write(local_root.join("conflict/x.txt"), b"local-v2").with_context(|| {
@@ -1319,6 +1333,13 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_exists() ->
         let mut first_run =
             start_folder_agent(&fixture.connection, &local_root, None, 2_000, 250, true).await?;
         wait_for_local_file_bytes(&local_root.join("conflict2/y.txt"), b"remote-v1", 220).await?;
+        wait_for_baseline_content_hash(
+            &local_root,
+            fixture.connection.target_label(),
+            "conflict2/y.txt",
+            240,
+        )
+        .await?;
         stop_folder_agent(&mut first_run).await;
 
         fs::write(local_root.join("conflict2/y.txt"), b"local-v2").with_context(|| {
