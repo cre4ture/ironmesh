@@ -1679,8 +1679,6 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
             220,
         )
         .await?;
-        stop_folder_agent(&mut first_run).await;
-
         let baseline_hash = wait_for_baseline_content_hash(
             &local_root,
             fixture.connection.target_label(),
@@ -1688,6 +1686,7 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
             240,
         )
         .await?;
+        stop_folder_agent(&mut first_run).await;
 
         let local_v2 = b"local-v2-longer-than-remote-v1";
         fs::write(local_root.join("conflict-copy/target.bin"), local_v2).with_context(|| {
