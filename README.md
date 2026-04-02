@@ -17,6 +17,16 @@ Current direction highlights:
 
 Ironmesh draws inspiration from [PicApport](https://www.picapport.de/de/index.php) on the self-hosted media/gallery side and [Syncthing](https://syncthing.net/) on the private, direct-first synchronization side.
 
+## At A Glance
+
+<object data="docs/ironmesh-at-a-glance.html" type="text/html" width="100%" height="1280">
+  <p>
+    This Markdown renderer does not support embedded HTML objects.
+    Open the responsive overview directly here:
+    <a href="docs/ironmesh-at-a-glance.html">docs/ironmesh-at-a-glance.html</a>
+  </p>
+</object>
+
 ## Workspace layout
 
 - `crates/common` — shared models used by all nodes/apps.

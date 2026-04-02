@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IronMesh At A Glance</title>
+    <style>
+      :root {
+        --bg-top: #f8fdfb;
+        --bg-bottom: #deefe9;
+        --surface: rgba(255, 255, 255, 0.9);
+        --surface-strong: rgba(255, 255, 255, 0.96);
+        --surface-line: rgba(108, 156, 143, 0.26);
+        --ink: #112826;
+        --muted: #365c56;
+        --soft: #4b6f68;
+        --mint: #14b8a6;
+        --mint-soft: #74e4c8;
+        --mint-deep: #0d6b5c;
+        --cluster-top: #112826;
+        --cluster-mid: #143934;
+        --cluster-bottom: #0d6558;
+        --gold: #f6d078;
+        --gold-deep: #d08e22;
+        --shadow-lg: 0 26px 56px rgba(10, 23, 21, 0.14);
+        --shadow-md: 0 16px 34px rgba(10, 23, 21, 0.11);
+        --radius-xl: 32px;
+        --radius-lg: 24px;
+        --radius-md: 18px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+      }
+
+      body {
+        font-family: "Space Grotesk", "Aptos", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 10% 10%, rgba(116, 228, 200, 0.22), transparent 28%),
+          radial-gradient(circle at 88% 14%, rgba(116, 228, 200, 0.16), transparent 24%),
+          linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(rgba(183, 216, 206, 0.42) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(183, 216, 206, 0.42) 1px, transparent 1px);
+        background-size: 44px 44px;
+        opacity: 0.34;
+      }
+
+      .page {
+        position: relative;
+        max-width: 1560px;
+        margin: 0 auto;
+        padding: clamp(1.4rem, 2.6vw, 2.8rem);
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 1rem 1.4rem;
+        align-items: center;
+        margin-bottom: clamp(1.2rem, 2vw, 2rem);
+      }
+
+      .hero-logo {
+        width: clamp(72px, 8vw, 112px);
+        filter: drop-shadow(0 18px 26px rgba(9, 32, 28, 0.18));
+      }
+
+      .eyebrow {
+        margin: 0 0 0.45rem;
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.8rem;
+        font-weight: 700;
+        letter-spacing: 0.28em;
+        color: var(--mint-deep);
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      .hero h1 {
+        font-size: clamp(2rem, 4.2vw, 3.7rem);
+        line-height: 0.98;
+        letter-spacing: 0.02em;
+      }
+
+      .hero p {
+        margin-top: 0.65rem;
+        max-width: 58rem;
+        font-size: clamp(1rem, 1.8vw, 1.22rem);
+        line-height: 1.35;
+        color: var(--muted);
+      }
+
+      .diagram {
+        position: relative;
+        display: grid;
+        grid-template-columns: minmax(18rem, 1fr) minmax(26rem, 1.35fr) minmax(18rem, 1fr);
+        grid-template-areas:
+          "setup cluster connectivity"
+          "access cluster storage";
+        gap: clamp(1rem, 1.7vw, 1.5rem);
+        align-items: stretch;
+      }
+
+      .card {
+        position: relative;
+        overflow: hidden;
+        background: var(--surface);
+        border: 1px solid var(--surface-line);
+        border-radius: var(--radius-xl);
+        padding: 1.35rem;
+        box-shadow: var(--shadow-md);
+        backdrop-filter: blur(10px);
+        animation: rise 480ms ease both;
+      }
+
+      .card::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.32), transparent 36%);
+        pointer-events: none;
+      }
+
+      .card > * {
+        position: relative;
+        z-index: 1;
+      }
+
+      .card h2 {
+        margin-top: 0.32rem;
+        font-size: 1.52rem;
+        line-height: 1.08;
+      }
+
+      .card .intro {
+        margin-top: 0.72rem;
+        font-size: 0.98rem;
+        line-height: 1.38;
+        color: var(--muted);
+      }
+
+      .setup { grid-area: setup; }
+      .connectivity { grid-area: connectivity; }
+      .access { grid-area: access; }
+      .storage { grid-area: storage; }
+
+      .cluster {
+        grid-area: cluster;
+        padding: 1.45rem;
+        background:
+          radial-gradient(circle at 18% 10%, rgba(116, 228, 200, 0.22), transparent 30%),
+          linear-gradient(150deg, var(--cluster-top) 0%, var(--cluster-mid) 52%, var(--cluster-bottom) 100%);
+        border-color: rgba(116, 228, 200, 0.3);
+        color: #f7fffc;
+        box-shadow: var(--shadow-lg);
+      }
+
+      .cluster .eyebrow {
+        color: #8debd0;
+      }
+
+      .cluster .intro {
+        color: #d4f3ea;
+      }
+
+      .cluster-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem;
+        margin-top: 1rem;
+      }
+
+      .badge {
+        padding: 0.48rem 0.8rem;
+        border-radius: 999px;
+        background: rgba(234, 251, 246, 0.12);
+        border: 1px solid rgba(141, 235, 208, 0.16);
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.75rem;
+        font-weight: 700;
+        color: #b4f6e2;
+      }
+
+      .cluster-inner {
+        margin-top: 1rem;
+        display: grid;
+        gap: 1rem;
+      }
+
+      .node-primary {
+        max-width: 18rem;
+        margin: 0 auto;
+        padding: 1rem 1.05rem;
+        border-radius: 26px;
+        background: rgba(23, 68, 61, 0.96);
+        border: 2px solid rgba(208, 142, 34, 0.9);
+        box-shadow: 0 14px 26px rgba(4, 10, 10, 0.2);
+      }
+
+      .node-tag {
+        display: inline-block;
+        padding: 0.32rem 0.66rem;
+        border-radius: 999px;
+        background: linear-gradient(135deg, #ffe6af, #f4c866);
+        color: #0f2b28;
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .node-primary h3,
+      .node-secondary h3,
+      .object-card h3 {
+        margin-top: 0.7rem;
+        font-size: 1.18rem;
+      }
+
+      .node-primary p,
+      .node-secondary p,
+      .object-card p {
+        margin-top: 0.28rem;
+        font-size: 0.95rem;
+        line-height: 1.34;
+      }
+
+      .object-card {
+        position: relative;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 1rem 1.2rem;
+        align-items: center;
+        padding: 1.1rem 1.15rem;
+        border-radius: 28px;
+        background: var(--surface-strong);
+        color: var(--ink);
+        min-height: 11rem;
+      }
+
+      .object-copy {
+        min-width: 0;
+      }
+
+      .object-copy h3 {
+        margin-top: 0;
+      }
+
+      .object-card p {
+        color: var(--soft);
+        max-width: 28rem;
+      }
+
+      .object-mesh {
+        position: static;
+        justify-self: end;
+        align-self: center;
+        width: 86px;
+        height: 86px;
+        padding: 0.42rem;
+        border-radius: 999px;
+        background: linear-gradient(180deg, #214740, #102927);
+        border: 1px solid rgba(141, 235, 208, 0.18);
+        opacity: 0.9;
+      }
+
+      .object-mesh svg {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      .node-row {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+      }
+
+      .node-secondary {
+        padding: 1rem 1.05rem;
+        border-radius: 24px;
+        background: rgba(23, 68, 61, 0.94);
+        border: 1px solid rgba(58, 169, 142, 0.7);
+      }
+
+      .step-list,
+      .bullet-list {
+        margin: 1rem 0 0;
+        padding: 0;
+        list-style: none;
+        display: grid;
+        gap: 0.72rem;
+      }
+
+      .step {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 0.72rem;
+        align-items: center;
+        padding: 0.72rem 0.84rem;
+        border-radius: 18px;
+        background: rgba(237, 248, 245, 0.96);
+      }
+
+      .step .index {
+        width: 1.7rem;
+        height: 1.7rem;
+        display: grid;
+        place-items: center;
+        border-radius: 999px;
+        background: linear-gradient(135deg, var(--mint), var(--mint-soft));
+        color: #f5fffc;
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.8rem;
+        font-weight: 700;
+      }
+
+      .step span,
+      .bullet-list li,
+      .surface-grid .pill {
+        font-size: 0.95rem;
+        line-height: 1.34;
+        color: #244843;
+      }
+
+      .meta-pill,
+      .footer-banner {
+        margin-top: 1rem;
+        padding: 0.68rem 0.9rem;
+        border-radius: 999px;
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.8rem;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+      }
+
+      .meta-pill {
+        display: inline-flex;
+        align-items: center;
+        background: #11312d;
+        color: #86ecd1;
+      }
+
+      .transport-diagram {
+        margin-top: 1rem;
+        padding: 1rem;
+        border-radius: 24px;
+        background: rgba(231, 247, 241, 0.9);
+      }
+
+      .transport-row {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 0.75rem;
+      }
+
+      .transport-end,
+      .transport-hub {
+        border-radius: 999px;
+        padding: 0.82rem 0.9rem;
+        text-align: center;
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.82rem;
+        font-weight: 700;
+      }
+
+      .transport-end {
+        background: rgba(255, 255, 255, 0.96);
+        color: #163833;
+      }
+
+      .transport-hub {
+        background: #11312d;
+        color: #8debd0;
+      }
+
+      .transport-caption {
+        margin-top: 0.82rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.48rem;
+      }
+
+      .transport-caption span {
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.78rem;
+        color: #1e5049;
+      }
+
+      .bullet-list li {
+        position: relative;
+        padding-left: 1rem;
+      }
+
+      .bullet-list li::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 0.52rem;
+        width: 0.42rem;
+        height: 0.42rem;
+        border-radius: 999px;
+        background: var(--mint);
+      }
+
+      .surface-grid {
+        margin-top: 1rem;
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0.65rem;
+      }
+
+      .surface-grid .pill {
+        padding: 0.72rem 0.78rem;
+        border-radius: 18px;
+        background: rgba(238, 249, 245, 0.96);
+        text-align: center;
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.82rem;
+        font-weight: 700;
+      }
+
+      .footer-banner {
+        display: block;
+        margin-top: 1.15rem;
+        background: #11312d;
+        color: #d6f7ee;
+        border-radius: 22px;
+        font-family: "Space Grotesk", "Aptos", "Segoe UI", sans-serif;
+        font-size: 1rem;
+        font-weight: 500;
+        line-height: 1.35;
+        letter-spacing: 0;
+      }
+
+      .flow-chip {
+        position: absolute;
+        z-index: 3;
+        padding: 0.46rem 0.78rem;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.9);
+        border: 1px solid rgba(173, 203, 194, 0.8);
+        box-shadow: 0 10px 18px rgba(12, 25, 23, 0.08);
+        font-family: "IBM Plex Mono", Consolas, monospace;
+        font-size: 0.72rem;
+        font-weight: 700;
+        color: #214742;
+        backdrop-filter: blur(8px);
+      }
+
+      .flow-chip.setup { left: 74%; top: 14%; }
+      .flow-chip.relay { right: 26%; top: 19%; }
+      .flow-chip.clients { left: 25.5%; bottom: 10%; }
+      .flow-chip.replication { right: 27.4%; bottom: 8%; }
+
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(10px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 1260px) {
+        .diagram {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          grid-template-areas:
+            "cluster cluster"
+            "setup connectivity"
+            "access storage";
+        }
+
+        .flow-chip {
+          display: none;
+        }
+      }
+
+      @media (max-width: 860px) {
+        .hero {
+          grid-template-columns: 1fr;
+        }
+
+        .diagram {
+          grid-template-columns: 1fr;
+          grid-template-areas:
+            "cluster"
+            "setup"
+            "connectivity"
+            "access"
+            "storage";
+        }
+
+        .node-row,
+        .surface-grid,
+        .transport-row {
+          grid-template-columns: 1fr;
+        }
+
+        .object-card {
+          grid-template-columns: 1fr;
+        }
+
+        .object-mesh {
+          justify-self: start;
+          width: 72px;
+          height: 72px;
+          margin-top: 0.3rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <img class="hero-logo" src="assets/ironmesh-mark.svg" alt="IronMesh mark" />
+        <div>
+          <p class="eyebrow">One-Picture Overview</p>
+          <h1>IronMesh At A Glance</h1>
+          <p>
+            Private, self-hosted storage that wraps clustered data, zero-touch onboarding,
+            and relay-capable access into something closer to a consumer cloud drive.
+          </p>
+        </div>
+      </header>
+
+      <section class="diagram" aria-label="IronMesh overview diagram">
+        <div class="flow-chip setup">setup + trust</div>
+        <div class="flow-chip relay">direct / relay</div>
+        <div class="flow-chip clients">client operations</div>
+        <div class="flow-chip replication">replicate + reconcile</div>
+
+        <article class="card setup">
+          <p class="eyebrow">Zero-Touch Setup</p>
+          <h2>From fresh node to trusted cluster</h2>
+          <p class="intro">
+            IronMesh hides the heavy PKI and enrollment mechanics behind guided UI flows.
+          </p>
+
+          <ol class="step-list">
+            <li class="step">
+              <span class="index">1</span>
+              <span>Fresh node boots into a local HTTPS setup UI.</span>
+            </li>
+            <li class="step">
+              <span class="index">2</span>
+              <span>Start a cluster or import an approved join package.</span>
+            </li>
+            <li class="step">
+              <span class="index">3</span>
+              <span>Issue node and client bootstrap bundles for real access.</span>
+            </li>
+          </ol>
+
+          <div class="meta-pill">regular path: first node also hosts managed rendezvous</div>
+        </article>
+
+        <article class="card connectivity">
+          <p class="eyebrow">Rendezvous + Relay</p>
+          <h2>Connectivity that survives awkward networks</h2>
+          <p class="intro">
+            Every endpoint keeps an outbound control path alive so NAT and firewalls stop being
+            a deal-breaker.
+          </p>
+
+          <div class="transport-diagram">
+            <div class="transport-row">
+              <div class="transport-end">node / client</div>
+              <div class="transport-hub">rendezvous</div>
+              <div class="transport-end">peer / node</div>
+            </div>
+            <div class="transport-caption">
+              <span>prefer direct HTTPS / QUIC when it works</span>
+              <span>relay fallback when direct establishment fails</span>
+            </div>
+          </div>
+
+          <ul class="bullet-list">
+            <li>Rendezvous tracks reachability and issues relay tickets.</li>
+            <li>Direct paths stay preferred; relay is a permanent safety net.</li>
+            <li>Inner peer security stays end-to-end above the relay.</li>
+          </ul>
+
+          <div class="meta-pill" style="background: rgba(238, 249, 245, 0.96); color: #15403a;">
+            advanced path: standalone rendezvous-service
+          </div>
+        </article>
+
+        <article class="card cluster">
+          <p class="eyebrow">Core Cluster</p>
+          <h2>Private, approved, multi-node storage</h2>
+          <p class="intro">
+            Server nodes share one logical namespace, exchange data and metadata, and keep trust
+            rooted in cluster-issued identities.
+          </p>
+          <p class="intro" style="margin-top: 0.45rem;">
+            The goal is consumer-cloud feel without giving up deployment control or data ownership.
+          </p>
+
+          <div class="cluster-badges">
+            <span class="badge">rendezvous hashing</span>
+            <span class="badge">async repair</span>
+            <span class="badge">no-loss versions</span>
+          </div>
+
+          <div class="cluster-inner">
+            <section class="node-primary">
+              <span class="node-tag">First Node</span>
+              <h3>Node A</h3>
+              <p>setup UI + admin</p>
+              <p>managed rendezvous in the regular path</p>
+            </section>
+
+            <section class="object-card">
+              <div class="object-copy">
+                <h3>Object namespace</h3>
+                <p>paths + metadata + version graph + media cache</p>
+                <p>Clients hit one logical store even while data lives on several nodes.</p>
+              </div>
+              <div class="object-mesh" aria-hidden="true">
+                <svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+                  <defs>
+                    <linearGradient id="mesh-lines-html" x1="18" y1="18" x2="102" y2="102">
+                      <stop offset="0" stop-color="#e3f8f1" />
+                      <stop offset="0.45" stop-color="#98d5c7" />
+                      <stop offset="1" stop-color="#5fc0ae" />
+                    </linearGradient>
+                  </defs>
+                  <g fill="none" stroke="url(#mesh-lines-html)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M60 18L96 38L96 82L60 102L24 82L24 38Z" />
+                    <path d="M60 18V102" />
+                    <path d="M24 38L96 82" />
+                    <path d="M96 38L24 82" />
+                    <path d="M24 38H96" />
+                    <path d="M24 82H96" />
+                  </g>
+                  <g fill="#eef9f5">
+                    <circle cx="60" cy="18" r="6" />
+                    <circle cx="96" cy="38" r="6" />
+                    <circle cx="96" cy="82" r="6" />
+                    <circle cx="60" cy="102" r="6" />
+                    <circle cx="24" cy="82" r="6" />
+                    <circle cx="24" cy="38" r="6" />
+                    <circle cx="60" cy="60" r="7" fill="#78d9c5" />
+                  </g>
+                </svg>
+              </div>
+            </section>
+
+            <div class="node-row">
+              <section class="node-secondary">
+                <h3>Node B</h3>
+                <p>approved join</p>
+                <p>more capacity + more replicas</p>
+              </section>
+              <section class="node-secondary">
+                <h3>Node C</h3>
+                <p>serve reads, writes, and repair work</p>
+                <p>same trust root, same cluster identity</p>
+              </section>
+            </div>
+          </div>
+        </article>
+
+        <article class="card access">
+          <p class="eyebrow">Access Surfaces</p>
+          <h2>Same data, many entry points</h2>
+          <p class="intro">
+            Browsers, phones, and file managers all ride the same bootstrap-aware client path.
+          </p>
+
+          <div class="surface-grid">
+            <div class="pill">Web UI</div>
+            <div class="pill">CLI</div>
+            <div class="pill">Android</div>
+            <div class="pill">iOS</div>
+            <div class="pill">Linux FUSE</div>
+            <div class="pill">Windows CFAPI</div>
+            <div class="pill">Folder agent</div>
+          </div>
+
+          <div class="meta-pill">browse + upload + sync + hydrate on open + media previews</div>
+        </article>
+
+        <article class="card storage">
+          <p class="eyebrow">Storage + Sync</p>
+          <h2>Behavior designed for real-world drift</h2>
+          <p class="intro">
+            IronMesh favors stable placement, asynchronous repair, and conflict preservation
+            instead of silent data loss.
+          </p>
+
+          <ul class="bullet-list">
+            <li>Deterministic placement keeps object homes stable.</li>
+            <li>Background auditors repair missing replicas over time.</li>
+            <li>Offline and concurrent edits stay as preserved branches.</li>
+            <li>Media metadata and thumbnails avoid full original downloads.</li>
+          </ul>
+        </article>
+      </section>
+
+      <div class="footer-banner">
+        Main idea: make clustered private storage approachable without surrendering trust,
+        topology control, or ownership of the data.
+      </div>
+    </main>
+  </body>
+</html>
