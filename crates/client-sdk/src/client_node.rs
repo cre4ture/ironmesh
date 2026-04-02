@@ -6,7 +6,10 @@ use bytes::Bytes;
 use common::{CacheEntry, StorageObjectMeta};
 use tokio::sync::RwLock;
 
-use crate::ironmesh_client::{IronMeshClient, UploadResult};
+use crate::ironmesh_client::{
+    IronMeshClient, ObjectHeadInfo, StoreIndexResponse, StoreIndexView, UploadResult,
+    VersionGraphSummary,
+};
 
 #[derive(Clone)]
 pub struct ClientNode {
@@ -144,6 +147,33 @@ impl ClientNode {
         self.client.delete_path(&key).await?;
         self.cache.write().await.remove(&key);
         Ok(())
+    }
+
+    pub async fn store_index(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+    ) -> Result<StoreIndexResponse> {
+        self.client
+            .store_index_with_view(prefix, depth, snapshot, Some(StoreIndexView::Tree))
+            .await
+    }
+
+    pub async fn list_versions(
+        &self,
+        key: impl AsRef<str>,
+    ) -> Result<Option<VersionGraphSummary>> {
+        self.client.list_versions(key).await
+    }
+
+    pub async fn head_object(
+        &self,
+        key: impl AsRef<str>,
+        snapshot: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<ObjectHeadInfo> {
+        self.client.head_object(key, snapshot, version).await
     }
 
     pub fn put_large_aware_reader(

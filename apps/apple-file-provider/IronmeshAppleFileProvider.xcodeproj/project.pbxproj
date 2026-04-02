@@ -1,0 +1,1137 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		082E983DBE4DD0A288B7E0B2 /* IronmeshMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9E696F4C80404E103A51256 /* IronmeshMacApp.swift */; };
+		09176176A1A35D7D95E20B12 /* IronmeshIosProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A36A32CA7808E8CC71993FEC /* IronmeshIosProjectTests.swift */; };
+		0BC42E8828E7FB463CEA0761 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
+		0DBC3C31113B92CB3CFE0EFD /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
+		1F30F9EE22B86F396DAEA0DF /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
+		3ECD32BAAD7E1074A209E6A9 /* IronmeshAppleProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7920A3DC35240252C623BC7 /* IronmeshAppleProjectTests.swift */; };
+		5325406375A4DA8E66293157 /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
+		5392619423EF7380FFA0BA73 /* IronmeshBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */; };
+		5AA87421C5EE2962F1348EEC /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
+		5B1FCE6BC32843D4F5EFBBFF /* IronmeshBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */; };
+		6221144F7C8633273DCB8805 /* IronmeshIosApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */; };
+		63380B5E6141E9E28F67CD07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
+		6F3E03595FD2D97919630E3B /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */; };
+		71AE453247F18B2C6C8A3FD4 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 4CADBC90D590EDBD274936BB /* AppleFileProviderShared */; };
+		7338228AFCA582F92DE83DE8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 3B0EAA0A0E8449F387555CF7 /* AppleCore */; };
+		81832537D853D978072D3C62 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 27724ACE6FAA8F9BBB92D194 /* AppleFileProviderShared */; };
+		8BB7E92B717F247AC803FF2F /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 036A193B5DAC68469095CE5A /* AppleCore */; };
+		98957DAEF45FB9170691016A /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
+		9937DD5D5A6AEBD58A6F5689 /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
+		B1CEF3BBBCCA99EB5A2C2F17 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 648AE487A41AA72E53A73C09 /* AppleFileProviderShared */; };
+		B34CFEFE0F3CACD159AFC871 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = D4758290C2F46CB307E07F32 /* AppleCore */; };
+		B36DE238EE6B5D64A18A7FB8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 610C745899D565B8093E9493 /* AppleCore */; };
+		BD69388C688129F3E278CF1C /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = F0BA5FE65065A174670816F1 /* AppleFileProviderShared */; };
+		C6AA101E4103A45EE21D1EE1 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
+		C6EC8D0848B7E4A66A05D61B /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = D3D93B20FE0A9294021D714C /* AppleFileProviderShared */; };
+		CBE7EAED3C09B6F2403AFD28 /* IronmeshIosFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7E9C7CA35FBD3948776E0AF /* IronmeshIosFileProviderExtension.swift */; };
+		D802864A3D2DE7B7303E6279 /* IronmeshMacFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AF23604A81569FFBE88C99C /* IronmeshMacFileProviderExtension.swift */; };
+		D94B5BAD893A2D88F7DF51C8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 4FCEFD47F4EBD2FDE8D48497 /* AppleCore */; };
+		DD9F571E15ABD0C5B4D38F1D /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
+		E139DE3EBC4A80CC22CED1D6 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
+		E5578688033BE7CDB458989B /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
+		E574A10C6D8F9A186FC35D3B /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
+		E6752CA7D26660DD296011E0 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 5EB1E57AE3FC7EA54C1477E3 /* AppleCore */; };
+		F02D4D63B27E99F45F6B05C9 /* IronmeshFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */; };
+		F13F3F0DA872B57AFD30EE67 /* IronmeshRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */; };
+		FAF90D30003E3533BA646C07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		12FA89B442EAB3D62123DB56 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = EF0C3BABBB66E445EE36D4B9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4ED9573DAC30D96830CFD46E;
+			remoteInfo = IronmeshMacApp;
+		};
+		37F7EE86454EF0AA1E2830BA /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = EF0C3BABBB66E445EE36D4B9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FC2702FC78F437CFD22D714F;
+			remoteInfo = IronmeshIosApp;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		244B38CABFC537484ED1F06D /* apple-file-provider */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "apple-file-provider"; path = .; sourceTree = SOURCE_ROOT; };
+		3AF23604A81569FFBE88C99C /* IronmeshMacFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshMacFileProviderExtension.swift; sourceTree = "<group>"; };
+		69448FBEB222C861B5CA9C1C /* IronmeshAppleProjectTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = IronmeshAppleProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIosApp.swift; sourceTree = "<group>"; };
+		7DA129FD959C0FD0D040070D /* IronmeshIosProjectTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = IronmeshIosProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		7DD73EE64ADF4D79132C4282 /* IronmeshAppleFFI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "IronmeshAppleFFI-Bridging-Header.h"; sourceTree = "<group>"; };
+		8F5701975DDED656D7A9B6A6 /* IronmeshMacFileProviderExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = IronmeshMacFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		987EDC104DA47B5CF20BED0D /* IronmeshMacApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IronmeshMacApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshBrowserModel.swift; sourceTree = "<group>"; };
+		A36A32CA7808E8CC71993FEC /* IronmeshIosProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIosProjectTests.swift; sourceTree = "<group>"; };
+		A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
+		A7E9C7CA35FBD3948776E0AF /* IronmeshIosFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshIosFileProviderExtension.swift; sourceTree = "<group>"; };
+		B88EA20710228EA5788F3224 /* IronmeshIosApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = IronmeshIosApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B9E696F4C80404E103A51256 /* IronmeshMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshMacApp.swift; sourceTree = "<group>"; };
+		C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshRustFFIAdapter.swift; sourceTree = "<group>"; };
+		D65743C5EC88BC86B9CCD14F /* IronmeshIosFileProviderExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = IronmeshIosFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		EC4454FA337C8FA97EBDD917 /* FileProvider.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FileProvider.framework; path = System/Library/Frameworks/FileProvider.framework; sourceTree = SDKROOT; };
+		F7920A3DC35240252C623BC7 /* IronmeshAppleProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshAppleProjectTests.swift; sourceTree = "<group>"; };
+		F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IronmeshFileProviderRuntime.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		2E91FA967882205DEA6909D7 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E6752CA7D26660DD296011E0 /* AppleCore in Frameworks */,
+				B1CEF3BBBCCA99EB5A2C2F17 /* AppleFileProviderShared in Frameworks */,
+				63380B5E6141E9E28F67CD07 /* FileProvider.framework in Frameworks */,
+				E139DE3EBC4A80CC22CED1D6 /* UniformTypeIdentifiers.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		38A2DEC89126509F9AB22490 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7338228AFCA582F92DE83DE8 /* AppleCore in Frameworks */,
+				71AE453247F18B2C6C8A3FD4 /* AppleFileProviderShared in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7295ADD219FD27199FF6A11B /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B34CFEFE0F3CACD159AFC871 /* AppleCore in Frameworks */,
+				6F3E03595FD2D97919630E3B /* AppleFileProviderShared in Frameworks */,
+				C6AA101E4103A45EE21D1EE1 /* FileProvider.framework in Frameworks */,
+				0DBC3C31113B92CB3CFE0EFD /* UniformTypeIdentifiers.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BADE7AED9873561B8E167D86 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D94B5BAD893A2D88F7DF51C8 /* AppleCore in Frameworks */,
+				BD69388C688129F3E278CF1C /* AppleFileProviderShared in Frameworks */,
+				FAF90D30003E3533BA646C07 /* FileProvider.framework in Frameworks */,
+				E574A10C6D8F9A186FC35D3B /* UniformTypeIdentifiers.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D21BAECC9077B6D63A420174 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8BB7E92B717F247AC803FF2F /* AppleCore in Frameworks */,
+				C6EC8D0848B7E4A66A05D61B /* AppleFileProviderShared in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F718AB135756C1436B5312C0 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B36DE238EE6B5D64A18A7FB8 /* AppleCore in Frameworks */,
+				81832537D853D978072D3C62 /* AppleFileProviderShared in Frameworks */,
+				0BC42E8828E7FB463CEA0761 /* FileProvider.framework in Frameworks */,
+				DD9F571E15ABD0C5B4D38F1D /* UniformTypeIdentifiers.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		24C0877E8576BBFC778FFC94 /* IronmeshMacFileProviderExtension */ = {
+			isa = PBXGroup;
+			children = (
+				3AF23604A81569FFBE88C99C /* IronmeshMacFileProviderExtension.swift */,
+			);
+			name = IronmeshMacFileProviderExtension;
+			path = Sources/IronmeshMacFileProviderExtension;
+			sourceTree = "<group>";
+		};
+		376D29036F21AEDB681A67DC /* IronmeshIosFileProviderExtension */ = {
+			isa = PBXGroup;
+			children = (
+				A7E9C7CA35FBD3948776E0AF /* IronmeshIosFileProviderExtension.swift */,
+			);
+			name = IronmeshIosFileProviderExtension;
+			path = Sources/IronmeshIosFileProviderExtension;
+			sourceTree = "<group>";
+		};
+		3B8720FF51AAA0345F62D3FB /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				69448FBEB222C861B5CA9C1C /* IronmeshAppleProjectTests.xctest */,
+				B88EA20710228EA5788F3224 /* IronmeshIosApp.app */,
+				D65743C5EC88BC86B9CCD14F /* IronmeshIosFileProviderExtension.appex */,
+				7DA129FD959C0FD0D040070D /* IronmeshIosProjectTests.xctest */,
+				987EDC104DA47B5CF20BED0D /* IronmeshMacApp.app */,
+				8F5701975DDED656D7A9B6A6 /* IronmeshMacFileProviderExtension.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		5534E1C4D921104D7C7A59BD /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				EC4454FA337C8FA97EBDD917 /* FileProvider.framework */,
+				A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		69075CFCAA25D9B0A969540F /* AppleNativeBridge */ = {
+			isa = PBXGroup;
+			children = (
+				7DD73EE64ADF4D79132C4282 /* IronmeshAppleFFI-Bridging-Header.h */,
+				C0FA8B4BC4DABA6189BBC74A /* IronmeshRustFFIAdapter.swift */,
+			);
+			name = AppleNativeBridge;
+			path = Sources/AppleNativeBridge;
+			sourceTree = "<group>";
+		};
+		6A4777D0C0506B8D27B6198F /* AppleAppSupport */ = {
+			isa = PBXGroup;
+			children = (
+				A13094E341F56B086D44DEDB /* IronmeshBrowserModel.swift */,
+			);
+			name = AppleAppSupport;
+			path = Sources/AppleAppSupport;
+			sourceTree = "<group>";
+		};
+		76A60EFD796E5C3B758B0F98 /* IronmeshMacApp */ = {
+			isa = PBXGroup;
+			children = (
+				B9E696F4C80404E103A51256 /* IronmeshMacApp.swift */,
+			);
+			name = IronmeshMacApp;
+			path = Sources/IronmeshMacApp;
+			sourceTree = "<group>";
+		};
+		96F7B3C14F1A91CD6DCE0635 /* AppleFileProviderRuntime */ = {
+			isa = PBXGroup;
+			children = (
+				F89BB0FEE78E57EA6B128404 /* IronmeshFileProviderRuntime.swift */,
+			);
+			name = AppleFileProviderRuntime;
+			path = Sources/AppleFileProviderRuntime;
+			sourceTree = "<group>";
+		};
+		9B49D4C4CCD3297433E6597D /* IronmeshAppleProjectTests */ = {
+			isa = PBXGroup;
+			children = (
+				F7920A3DC35240252C623BC7 /* IronmeshAppleProjectTests.swift */,
+			);
+			name = IronmeshAppleProjectTests;
+			path = Tests/IronmeshAppleProjectTests;
+			sourceTree = "<group>";
+		};
+		A0AFBB5EB4B353003D20B835 = {
+			isa = PBXGroup;
+			children = (
+				6A4777D0C0506B8D27B6198F /* AppleAppSupport */,
+				96F7B3C14F1A91CD6DCE0635 /* AppleFileProviderRuntime */,
+				69075CFCAA25D9B0A969540F /* AppleNativeBridge */,
+				9B49D4C4CCD3297433E6597D /* IronmeshAppleProjectTests */,
+				E5BF17148530CB1790E898F6 /* IronmeshIosApp */,
+				376D29036F21AEDB681A67DC /* IronmeshIosFileProviderExtension */,
+				A5D0FB02CF3B6AEB2B72D86A /* IronmeshIosProjectTests */,
+				76A60EFD796E5C3B758B0F98 /* IronmeshMacApp */,
+				24C0877E8576BBFC778FFC94 /* IronmeshMacFileProviderExtension */,
+				F8D391B477B8A6461C30F665 /* Packages */,
+				5534E1C4D921104D7C7A59BD /* Frameworks */,
+				3B8720FF51AAA0345F62D3FB /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A5D0FB02CF3B6AEB2B72D86A /* IronmeshIosProjectTests */ = {
+			isa = PBXGroup;
+			children = (
+				A36A32CA7808E8CC71993FEC /* IronmeshIosProjectTests.swift */,
+			);
+			name = IronmeshIosProjectTests;
+			path = Tests/IronmeshIosProjectTests;
+			sourceTree = "<group>";
+		};
+		E5BF17148530CB1790E898F6 /* IronmeshIosApp */ = {
+			isa = PBXGroup;
+			children = (
+				6ED16406A1BE1EDF63710436 /* IronmeshIosApp.swift */,
+			);
+			name = IronmeshIosApp;
+			path = Sources/IronmeshIosApp;
+			sourceTree = "<group>";
+		};
+		F8D391B477B8A6461C30F665 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				244B38CABFC537484ED1F06D /* apple-file-provider */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		0DA04F6B3DEE0D8908F46746 /* IronmeshIosProjectTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 104BE8BA6F2038EAC9F3037F /* Build configuration list for PBXNativeTarget "IronmeshIosProjectTests" */;
+			buildPhases = (
+				88E4E98C627F204DF5016D8E /* Sources */,
+				D21BAECC9077B6D63A420174 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				99BB79389F861FB7445B1144 /* PBXTargetDependency */,
+			);
+			name = IronmeshIosProjectTests;
+			packageProductDependencies = (
+				036A193B5DAC68469095CE5A /* AppleCore */,
+				D3D93B20FE0A9294021D714C /* AppleFileProviderShared */,
+			);
+			productName = IronmeshIosProjectTests;
+			productReference = 7DA129FD959C0FD0D040070D /* IronmeshIosProjectTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		219D58F25590BF1A3D18330F /* IronmeshMacFileProviderExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2F5A3721F5889FCF397CF835 /* Build configuration list for PBXNativeTarget "IronmeshMacFileProviderExtension" */;
+			buildPhases = (
+				EC79C2E7483EF8856A36F1EB /* Build Rust Apple FFI */,
+				AA61513144DD263788D143B8 /* Sources */,
+				2E91FA967882205DEA6909D7 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = IronmeshMacFileProviderExtension;
+			packageProductDependencies = (
+				5EB1E57AE3FC7EA54C1477E3 /* AppleCore */,
+				648AE487A41AA72E53A73C09 /* AppleFileProviderShared */,
+			);
+			productName = IronmeshMacFileProviderExtension;
+			productReference = 8F5701975DDED656D7A9B6A6 /* IronmeshMacFileProviderExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		4ED9573DAC30D96830CFD46E /* IronmeshMacApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8C92952F62EC44217705EF5E /* Build configuration list for PBXNativeTarget "IronmeshMacApp" */;
+			buildPhases = (
+				B5E350D7E026B35BE5272036 /* Build Rust Apple FFI */,
+				7EE56167233D3A90E1359388 /* Sources */,
+				F718AB135756C1436B5312C0 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = IronmeshMacApp;
+			packageProductDependencies = (
+				610C745899D565B8093E9493 /* AppleCore */,
+				27724ACE6FAA8F9BBB92D194 /* AppleFileProviderShared */,
+			);
+			productName = IronmeshMacApp;
+			productReference = 987EDC104DA47B5CF20BED0D /* IronmeshMacApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A2F481122FD00FA65540A1A5 /* IronmeshAppleProjectTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0D6926F0D9DE65A8CCA52573 /* Build configuration list for PBXNativeTarget "IronmeshAppleProjectTests" */;
+			buildPhases = (
+				3E9CABBEFCAC86288E39F139 /* Sources */,
+				38A2DEC89126509F9AB22490 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0405CBEACC0E9D8AE47967BB /* PBXTargetDependency */,
+			);
+			name = IronmeshAppleProjectTests;
+			packageProductDependencies = (
+				3B0EAA0A0E8449F387555CF7 /* AppleCore */,
+				4CADBC90D590EDBD274936BB /* AppleFileProviderShared */,
+			);
+			productName = IronmeshAppleProjectTests;
+			productReference = 69448FBEB222C861B5CA9C1C /* IronmeshAppleProjectTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		AFBE96E8276416130D63E761 /* IronmeshIosFileProviderExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6613AEA48C03748C70AA88AD /* Build configuration list for PBXNativeTarget "IronmeshIosFileProviderExtension" */;
+			buildPhases = (
+				5A8944670DD4793912F77413 /* Build Rust Apple FFI */,
+				06547582563CE0CD0F005C21 /* Sources */,
+				7295ADD219FD27199FF6A11B /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = IronmeshIosFileProviderExtension;
+			packageProductDependencies = (
+				D4758290C2F46CB307E07F32 /* AppleCore */,
+				87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */,
+			);
+			productName = IronmeshIosFileProviderExtension;
+			productReference = D65743C5EC88BC86B9CCD14F /* IronmeshIosFileProviderExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		FC2702FC78F437CFD22D714F /* IronmeshIosApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 64FCC4EEC5FE5632A56E5538 /* Build configuration list for PBXNativeTarget "IronmeshIosApp" */;
+			buildPhases = (
+				07FC14D06BCBF8B7FAA879FB /* Build Rust Apple FFI */,
+				898EAFC7D0721A0B953C3839 /* Sources */,
+				BADE7AED9873561B8E167D86 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = IronmeshIosApp;
+			packageProductDependencies = (
+				4FCEFD47F4EBD2FDE8D48497 /* AppleCore */,
+				F0BA5FE65065A174670816F1 /* AppleFileProviderShared */,
+			);
+			productName = IronmeshIosApp;
+			productReference = B88EA20710228EA5788F3224 /* IronmeshIosApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		EF0C3BABBB66E445EE36D4B9 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					0DA04F6B3DEE0D8908F46746 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+					219D58F25590BF1A3D18330F = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+					4ED9573DAC30D96830CFD46E = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+					A2F481122FD00FA65540A1A5 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Manual;
+					};
+					AFBE96E8276416130D63E761 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+					FC2702FC78F437CFD22D714F = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 76727E7C888A54996E335170 /* Build configuration list for PBXProject "IronmeshAppleFileProvider" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = A0AFBB5EB4B353003D20B835;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				37157AA1007E5B83DF70C1B5 /* XCLocalSwiftPackageReference "." */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 3B8720FF51AAA0345F62D3FB /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A2F481122FD00FA65540A1A5 /* IronmeshAppleProjectTests */,
+				FC2702FC78F437CFD22D714F /* IronmeshIosApp */,
+				AFBE96E8276416130D63E761 /* IronmeshIosFileProviderExtension */,
+				0DA04F6B3DEE0D8908F46746 /* IronmeshIosProjectTests */,
+				4ED9573DAC30D96830CFD46E /* IronmeshMacApp */,
+				219D58F25590BF1A3D18330F /* IronmeshMacFileProviderExtension */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		07FC14D06BCBF8B7FAA879FB /* Build Rust Apple FFI */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Apple FFI";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$PROJECT_DIR/scripts/build-rust-apple-ffi.sh\" \"$PLATFORM_NAME\" \"$CONFIGURATION\"\n";
+		};
+		5A8944670DD4793912F77413 /* Build Rust Apple FFI */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Apple FFI";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$PROJECT_DIR/scripts/build-rust-apple-ffi.sh\" \"$PLATFORM_NAME\" \"$CONFIGURATION\"\n";
+		};
+		B5E350D7E026B35BE5272036 /* Build Rust Apple FFI */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Apple FFI";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$PROJECT_DIR/scripts/build-rust-apple-ffi.sh\" \"$PLATFORM_NAME\" \"$CONFIGURATION\"\n";
+		};
+		EC79C2E7483EF8856A36F1EB /* Build Rust Apple FFI */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Apple FFI";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$PROJECT_DIR/scripts/build-rust-apple-ffi.sh\" \"$PLATFORM_NAME\" \"$CONFIGURATION\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		06547582563CE0CD0F005C21 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				98957DAEF45FB9170691016A /* IronmeshFileProviderRuntime.swift in Sources */,
+				CBE7EAED3C09B6F2403AFD28 /* IronmeshIosFileProviderExtension.swift in Sources */,
+				5325406375A4DA8E66293157 /* IronmeshRustFFIAdapter.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		3E9CABBEFCAC86288E39F139 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3ECD32BAAD7E1074A209E6A9 /* IronmeshAppleProjectTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7EE56167233D3A90E1359388 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5392619423EF7380FFA0BA73 /* IronmeshBrowserModel.swift in Sources */,
+				F02D4D63B27E99F45F6B05C9 /* IronmeshFileProviderRuntime.swift in Sources */,
+				082E983DBE4DD0A288B7E0B2 /* IronmeshMacApp.swift in Sources */,
+				F13F3F0DA872B57AFD30EE67 /* IronmeshRustFFIAdapter.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		88E4E98C627F204DF5016D8E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				09176176A1A35D7D95E20B12 /* IronmeshIosProjectTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		898EAFC7D0721A0B953C3839 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5B1FCE6BC32843D4F5EFBBFF /* IronmeshBrowserModel.swift in Sources */,
+				1F30F9EE22B86F396DAEA0DF /* IronmeshFileProviderRuntime.swift in Sources */,
+				6221144F7C8633273DCB8805 /* IronmeshIosApp.swift in Sources */,
+				E5578688033BE7CDB458989B /* IronmeshRustFFIAdapter.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AA61513144DD263788D143B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9937DD5D5A6AEBD58A6F5689 /* IronmeshFileProviderRuntime.swift in Sources */,
+				D802864A3D2DE7B7303E6279 /* IronmeshMacFileProviderExtension.swift in Sources */,
+				5AA87421C5EE2962F1348EEC /* IronmeshRustFFIAdapter.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0405CBEACC0E9D8AE47967BB /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4ED9573DAC30D96830CFD46E /* IronmeshMacApp */;
+			targetProxy = 12FA89B442EAB3D62123DB56 /* PBXContainerItemProxy */;
+		};
+		99BB79389F861FB7445B1144 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FC2702FC78F437CFD22D714F /* IronmeshIosApp */;
+			targetProxy = 37F7EE86454EF0AA1E2830BA /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0EB76EC6F65AD6952BA57CE7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/IronmeshMacApp-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macapp;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		1E854127D07AFEA80F9A3940 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/IronmeshIosApp-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		27B5FC704E87C709C5CA9E2D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGNING_REQUIRED = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = "Resources/Info/IronmeshAppleProjectTests-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/IronmeshMacApp.app/Contents/MacOS/IronmeshMacApp";
+			};
+			name = Release;
+		};
+		3D008F29D5D93CCA2528E436 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/IronmeshIosApp-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		3D5F59DE85E1A0FA2586207B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGNING_REQUIRED = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = "Resources/Info/IronmeshAppleProjectTests-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/IronmeshMacApp.app/Contents/MacOS/IronmeshMacApp";
+			};
+			name = Debug;
+		};
+		3F89A94689BD39F40D176FAD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.1;
+			};
+			name = Release;
+		};
+		42E7C2F9C9F584AB7AF5D179 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				INFOPLIST_FILE = "Resources/Info/IronmeshIosProjectTests-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.ios.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/IronmeshIosApp.app/IronmeshIosApp";
+			};
+			name = Debug;
+		};
+		438673375255170381B484EA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/IronmeshMacFileProviderExtension-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macfileprovider;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		56B86372DF7B4513C95FC4F4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				INFOPLIST_FILE = "Resources/Info/IronmeshIosProjectTests-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.ios.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/IronmeshIosApp.app/IronmeshIosApp";
+			};
+			name = Release;
+		};
+		6033E1896FB578470A8455DE /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.1;
+			};
+			name = Debug;
+		};
+		737FE5F6A626C093F8737FED /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/IronmeshIosFileProviderExtension-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosfileprovider;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A8F036FECE2D5E82FED161A1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/IronmeshMacApp-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macapp;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		C8D904EEB4580E12BF4D2C45 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/IronmeshMacFileProviderExtension-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macfileprovider;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		E1F1AC4E121D72EC14CCAE94 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/IronmeshIosFileProviderExtension-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosfileprovider;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0D6926F0D9DE65A8CCA52573 /* Build configuration list for PBXNativeTarget "IronmeshAppleProjectTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				3D5F59DE85E1A0FA2586207B /* Debug */,
+				27B5FC704E87C709C5CA9E2D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		104BE8BA6F2038EAC9F3037F /* Build configuration list for PBXNativeTarget "IronmeshIosProjectTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				42E7C2F9C9F584AB7AF5D179 /* Debug */,
+				56B86372DF7B4513C95FC4F4 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		2F5A3721F5889FCF397CF835 /* Build configuration list for PBXNativeTarget "IronmeshMacFileProviderExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				438673375255170381B484EA /* Debug */,
+				C8D904EEB4580E12BF4D2C45 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		64FCC4EEC5FE5632A56E5538 /* Build configuration list for PBXNativeTarget "IronmeshIosApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				3D008F29D5D93CCA2528E436 /* Debug */,
+				1E854127D07AFEA80F9A3940 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		6613AEA48C03748C70AA88AD /* Build configuration list for PBXNativeTarget "IronmeshIosFileProviderExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E1F1AC4E121D72EC14CCAE94 /* Debug */,
+				737FE5F6A626C093F8737FED /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		76727E7C888A54996E335170 /* Build configuration list for PBXProject "IronmeshAppleFileProvider" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6033E1896FB578470A8455DE /* Debug */,
+				3F89A94689BD39F40D176FAD /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		8C92952F62EC44217705EF5E /* Build configuration list for PBXNativeTarget "IronmeshMacApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A8F036FECE2D5E82FED161A1 /* Debug */,
+				0EB76EC6F65AD6952BA57CE7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		37157AA1007E5B83DF70C1B5 /* XCLocalSwiftPackageReference "." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = .;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		036A193B5DAC68469095CE5A /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		27724ACE6FAA8F9BBB92D194 /* AppleFileProviderShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleFileProviderShared;
+		};
+		3B0EAA0A0E8449F387555CF7 /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		4CADBC90D590EDBD274936BB /* AppleFileProviderShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleFileProviderShared;
+		};
+		4FCEFD47F4EBD2FDE8D48497 /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		5EB1E57AE3FC7EA54C1477E3 /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		610C745899D565B8093E9493 /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		648AE487A41AA72E53A73C09 /* AppleFileProviderShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleFileProviderShared;
+		};
+		87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleFileProviderShared;
+		};
+		D3D93B20FE0A9294021D714C /* AppleFileProviderShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleFileProviderShared;
+		};
+		D4758290C2F46CB307E07F32 /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		F0BA5FE65065A174670816F1 /* AppleFileProviderShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleFileProviderShared;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = EF0C3BABBB66E445EE36D4B9 /* Project object */;
+}

@@ -1,0 +1,24 @@
+language = "C"
+pragma_once = true
+include_guard = "IRONMESH_IOS_APP_H"
+line_length = 100
+documentation = true
+
+[parse]
+clean = true
+parse_deps = false
+
+[export]
+include = [
+    "IronmeshIosBytes",
+    "ironmesh_ios_facade_create",
+    "ironmesh_ios_facade_free",
+    "ironmesh_ios_string_free",
+    "ironmesh_ios_bytes_free",
+    "ironmesh_ios_facade_list_json",
+    "ironmesh_ios_facade_metadata_json",
+    "ironmesh_ios_facade_fetch_bytes",
+    "ironmesh_ios_facade_put_bytes",
+    "ironmesh_ios_facade_delete_path",
+    "ironmesh_ios_facade_move_path",
+]

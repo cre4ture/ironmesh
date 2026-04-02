@@ -1,0 +1,213 @@
+name: IronmeshAppleFileProvider
+
+options:
+  bundleIdPrefix: dev.ironmesh
+
+settings:
+  base:
+    CLANG_ENABLE_MODULES: YES
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+    ONLY_ACTIVE_ARCH: YES
+    SWIFT_VERSION: 6.1
+
+packages:
+  AppleFileProviderPackage:
+    path: .
+
+targets:
+  IronmeshMacApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/IronmeshMacApp
+      - path: Sources/AppleAppSupport
+      - path: Sources/AppleNativeBridge
+      - path: Sources/AppleFileProviderRuntime
+    dependencies:
+      - package: AppleFileProviderPackage
+        product: AppleCore
+      - package: AppleFileProviderPackage
+        product: AppleFileProviderShared
+      - sdk: FileProvider.framework
+      - sdk: UniformTypeIdentifiers.framework
+    preBuildScripts:
+      - name: Build Rust Apple FFI
+        basedOnDependencyAnalysis: false
+        script: |
+          "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
+    settings:
+      base:
+        INFOPLIST_FILE: Resources/Info/IronmeshMacApp-Info.plist
+        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        OTHER_LDFLAGS: $(inherited) -lios_app
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.macapp
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
+
+  IronmeshMacFileProviderExtension:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Sources/IronmeshMacFileProviderExtension
+      - path: Sources/AppleNativeBridge
+      - path: Sources/AppleFileProviderRuntime
+    dependencies:
+      - package: AppleFileProviderPackage
+        product: AppleCore
+      - package: AppleFileProviderPackage
+        product: AppleFileProviderShared
+      - sdk: FileProvider.framework
+      - sdk: UniformTypeIdentifiers.framework
+    preBuildScripts:
+      - name: Build Rust Apple FFI
+        basedOnDependencyAnalysis: false
+        script: |
+          "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
+    settings:
+      base:
+        INFOPLIST_FILE: Resources/Info/IronmeshMacFileProviderExtension-Info.plist
+        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        OTHER_LDFLAGS: $(inherited) -lios_app
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.macfileprovider
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
+
+  IronmeshIosApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/IronmeshIosApp
+      - path: Sources/AppleAppSupport
+      - path: Sources/AppleNativeBridge
+      - path: Sources/AppleFileProviderRuntime
+    dependencies:
+      - package: AppleFileProviderPackage
+        product: AppleCore
+      - package: AppleFileProviderPackage
+        product: AppleFileProviderShared
+      - sdk: FileProvider.framework
+      - sdk: UniformTypeIdentifiers.framework
+    preBuildScripts:
+      - name: Build Rust Apple FFI
+        basedOnDependencyAnalysis: false
+        script: |
+          "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
+    settings:
+      base:
+        INFOPLIST_FILE: Resources/Info/IronmeshIosApp-Info.plist
+        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
+        IPHONEOS_DEPLOYMENT_TARGET: 16.0
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
+        OTHER_LDFLAGS: $(inherited) -lios_app
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosapp
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
+        TARGETED_DEVICE_FAMILY: 1,2
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+
+  IronmeshIosFileProviderExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/IronmeshIosFileProviderExtension
+      - path: Sources/AppleNativeBridge
+      - path: Sources/AppleFileProviderRuntime
+    dependencies:
+      - package: AppleFileProviderPackage
+        product: AppleCore
+      - package: AppleFileProviderPackage
+        product: AppleFileProviderShared
+      - sdk: FileProvider.framework
+      - sdk: UniformTypeIdentifiers.framework
+    preBuildScripts:
+      - name: Build Rust Apple FFI
+        basedOnDependencyAnalysis: false
+        script: |
+          "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
+    settings:
+      base:
+        INFOPLIST_FILE: Resources/Info/IronmeshIosFileProviderExtension-Info.plist
+        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
+        IPHONEOS_DEPLOYMENT_TARGET: 16.0
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
+        OTHER_LDFLAGS: $(inherited) -lios_app
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosfileprovider
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
+        TARGETED_DEVICE_FAMILY: 1,2
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+
+  IronmeshAppleProjectTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/IronmeshAppleProjectTests
+    dependencies:
+      - target: IronmeshMacApp
+      - package: AppleFileProviderPackage
+        product: AppleCore
+      - package: AppleFileProviderPackage
+        product: AppleFileProviderShared
+    settings:
+      base:
+        INFOPLIST_FILE: Resources/Info/IronmeshAppleProjectTests-Info.plist
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.tests
+        CODE_SIGNING_ALLOWED: YES
+        CODE_SIGNING_REQUIRED: YES
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+
+  IronmeshIosProjectTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/IronmeshIosProjectTests
+    dependencies:
+      - target: IronmeshIosApp
+      - package: AppleFileProviderPackage
+        product: AppleCore
+      - package: AppleFileProviderPackage
+        product: AppleFileProviderShared
+    settings:
+      base:
+        INFOPLIST_FILE: Resources/Info/IronmeshIosProjectTests-Info.plist
+        IPHONEOS_DEPLOYMENT_TARGET: 16.0
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.ios.tests
+        TARGETED_DEVICE_FAMILY: 1,2
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+
+schemes:
+  IronmeshAppleProject:
+    build:
+      targets:
+        IronmeshMacApp: all
+        IronmeshMacFileProviderExtension: all
+        IronmeshIosApp: all
+        IronmeshIosFileProviderExtension: all
+  IronmeshMacProject:
+    build:
+      targets:
+        IronmeshMacApp: all
+        IronmeshMacFileProviderExtension: all
+    test:
+      gatherCoverageData: false
+      targets:
+        - IronmeshAppleProjectTests
+  IronmeshIosProject:
+    build:
+      targets:
+        IronmeshIosApp: all
+        IronmeshIosFileProviderExtension: all
+    test:
+      gatherCoverageData: false
+      targets:
+        - IronmeshIosProjectTests

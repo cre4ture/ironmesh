@@ -1,0 +1,17 @@
+import AppleCore
+
+public typealias AppleBridgeItem = AppleCore.AppleBridgeItem
+public typealias AppleBridgeItemReference = AppleCore.AppleBridgeItemReference
+public typealias AppleBridgeOperation = AppleCore.AppleBridgeOperation
+public typealias AppleBridgeSession = AppleCore.AppleBridgeSession
+public typealias AppleConflictReasonCode = AppleCore.AppleConflictReasonCode
+public typealias AppleConflictState = AppleCore.AppleConflictState
+public typealias AppleConflictStatus = AppleCore.AppleConflictStatus
+public typealias AppleConnectionConfiguration = AppleCore.AppleConnectionConfiguration
+public typealias AppleFileProviderItemIdentifier = AppleCore.AppleFileProviderItemIdentifier
+public typealias AppleFileProviderItemIdentifierKind = AppleCore.AppleFileProviderItemIdentifierKind
+public typealias AppleFileProviderItemKind = AppleCore.AppleFileProviderItemKind
+public typealias AppleManualCBridge = AppleCore.AppleManualCBridge
+public typealias AppleMutationResult = AppleCore.AppleMutationResult
+public typealias AppleRefreshResult = AppleCore.AppleRefreshResult
+public typealias AppleRustBridge = AppleCore.AppleRustBridge

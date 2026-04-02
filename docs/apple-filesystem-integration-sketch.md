@@ -264,11 +264,51 @@ Apple-facing metadata/list responses should carry the fields that the extension 
 - Reuse generic patterns from the Windows CFAPI adapter where they fit, but do not try to reuse Windows shell glue directly.
 - Keep Finder Sync clearly positioned as fallback-only.
 
-## Open questions for implementation
+## Chosen in-repo Apple project layout
 
-- Exact in-repo Apple project layout under `apps/apple-*`:
-  - single Xcode project with shared packages/targets
-  - or split macOS/iOS project structure with shared source packages
+Prefer one in-repo Apple project root with shared code and four concrete native targets.
+
+Suggested shape:
+
+- `apps/apple-file-provider/`
+  - one repo-local Xcode project or workspace
+  - shared Swift package or shared source group for common native code
+  - Rust build glue that links the `apps/ios-app` static library and generated C header
+
+Suggested native targets:
+
+- `IronmeshMacApp`
+- `IronmeshMacFileProviderExtension`
+- `IronmeshIosApp`
+- `IronmeshIosFileProviderExtension`
+
+Suggested shared native modules:
+
+- `AppleCore`
+  - Swift models mirroring the Apple-facing Rust facade
+  - Objective-C/Swift wrapper around the C ABI
+  - app-group config loading/saving
+  - logging and error mapping
+- `AppleFileProviderShared`
+  - shared File Provider item/model mapping
+  - shared identifier parsing/formatting
+  - shared domain registration helpers where platform APIs overlap
+
+Why this layout:
+
+- keeps macOS and iOS in one place so the shared File Provider architecture stays visibly unified
+- avoids duplicating bridge and model code across platforms
+- still allows platform-specific lifecycle/entitlement glue to live in separate targets
+- is a better fit for automated testing than two unrelated native project trees
+
+Recommended testing shape:
+
+- Rust unit tests for the Apple facade in `apps/ios-app`
+- native unit tests for `AppleCore` and `AppleFileProviderShared`
+- macOS extension smoke/integration tests where the environment allows them
+- iOS simulator tests for host-app and shared mapping logic
+
+This layout is the default assumption for follow-up implementation work unless a concrete Xcode or entitlement constraint forces an adjustment.
 
 ## Source notes
 

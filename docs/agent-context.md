@@ -102,4 +102,5 @@ cargo run -p os-integration -- \
   - Active track: File Provider on macOS and iOS/iPadOS
   - Initial bridge decision: static library + C ABI via `cbindgen` (not `UniFFI`)
   - Native Apple project files should live in-repo under `apps/apple-*`
+  - Default native layout: one in-repo Apple project root with shared code plus macOS/iOS app and File Provider extension targets
   - Fallback only: `folder-agent + Finder Sync`

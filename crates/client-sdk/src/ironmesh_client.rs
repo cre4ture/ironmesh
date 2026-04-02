@@ -256,6 +256,47 @@ pub struct StoreIndexResponse {
     pub entries: Vec<StoreIndexEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionConsistencyState {
+    Provisional,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreferredHeadReason {
+    ConfirmedPreferredOverProvisional,
+    ProvisionalFallbackNoConfirmed,
+    DeterministicTiebreakVersionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionRecordSummary {
+    pub version_id: String,
+    pub logical_path: Option<String>,
+    pub parent_version_ids: Vec<String>,
+    pub state: VersionConsistencyState,
+    pub created_at_unix: u64,
+    pub copied_from_object_id: Option<String>,
+    pub copied_from_version_id: Option<String>,
+    pub copied_from_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionGraphSummary {
+    pub key: String,
+    pub object_id: String,
+    #[serde(default)]
+    pub preferred_head_version_id: Option<String>,
+    #[serde(default)]
+    pub preferred_head_reason: Option<PreferredHeadReason>,
+    #[serde(default)]
+    pub head_version_ids: Vec<String>,
+    #[serde(default)]
+    pub versions: Vec<VersionRecordSummary>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreIndexView {
     Raw,
@@ -661,6 +702,39 @@ impl IronMeshClient {
             StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(()),
             status => Err(anyhow!("delete failed for {key}: {status}")),
         }
+    }
+
+    pub async fn list_versions(
+        &self,
+        key: impl AsRef<str>,
+    ) -> Result<Option<VersionGraphSummary>> {
+        let key = key.as_ref();
+        let url = self.store_versions_url(key)?;
+
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to request /versions/{key}"))?;
+
+        match response.status {
+            StatusCode::OK => serde_json::from_slice::<VersionGraphSummary>(&response.body)
+                .map(Some)
+                .context("failed to parse /versions response"),
+            StatusCode::NOT_FOUND => Ok(None),
+            status => Err(anyhow!("versions lookup failed for {key}: {status}")),
+        }
+    }
+
+    pub fn list_versions_blocking(
+        &self,
+        key: impl AsRef<str>,
+    ) -> Result<Option<VersionGraphSummary>> {
+        let key = key.as_ref().to_string();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create runtime for versions request")?;
+        runtime.block_on(self.list_versions(key))
     }
 
     pub async fn store_index(
@@ -1933,6 +2007,21 @@ impl IronMeshClient {
         Ok(url)
     }
 
+    fn store_versions_url(&self, key: &str) -> Result<Url> {
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("versions");
+            segments.push(key);
+        }
+
+        Ok(url)
+    }
+
     fn store_index_change_wait_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(self.server_base_url())
             .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
@@ -2606,6 +2695,65 @@ mod tests {
         let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
         let url = client.store_delete_url().expect("delete url should build");
         assert_eq!(url.as_str(), "http://127.0.0.1:18080/store/delete");
+    }
+
+    #[test]
+    fn versions_url_builder_builds_expected_path() {
+        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+        let url = client.store_versions_url("docs/readme.txt").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:18080/versions/docs%2Freadme.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_versions_parses_version_graph_summary() {
+        async fn versions(
+            axum::extract::Path(key): axum::extract::Path<String>,
+        ) -> axum::Json<VersionGraphSummary> {
+            axum::Json(VersionGraphSummary {
+                key,
+                object_id: "obj-123".to_string(),
+                preferred_head_version_id: Some("v2".to_string()),
+                preferred_head_reason: Some(PreferredHeadReason::DeterministicTiebreakVersionId),
+                head_version_ids: vec!["v2".to_string()],
+                versions: vec![VersionRecordSummary {
+                    version_id: "v2".to_string(),
+                    logical_path: Some("docs/readme.txt".to_string()),
+                    parent_version_ids: vec!["v1".to_string()],
+                    state: VersionConsistencyState::Confirmed,
+                    created_at_unix: 123,
+                    copied_from_object_id: None,
+                    copied_from_version_id: None,
+                    copied_from_path: None,
+                }],
+            })
+        }
+
+        let app = axum::Router::new().route("/versions/{key}", axum::routing::get(versions));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let server = axum::serve(listener, app.into_make_service());
+        let handle = tokio::spawn(async move {
+            let _ = server.await;
+        });
+
+        let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
+        let versions = client
+            .list_versions("docs/readme.txt")
+            .await
+            .expect("versions should parse")
+            .expect("versions should exist");
+
+        assert_eq!(versions.object_id, "obj-123");
+        assert_eq!(versions.preferred_head_version_id.as_deref(), Some("v2"));
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.versions[0].version_id, "v2");
+
+        handle.abort();
     }
 
     #[derive(Clone)]
