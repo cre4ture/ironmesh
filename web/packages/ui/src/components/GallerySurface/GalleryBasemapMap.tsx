@@ -3,7 +3,7 @@ import { IconMapPin } from "@tabler/icons-react";
 import maplibregl, { type LngLatLike, type StyleSpecification } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { createDbWorker, type WorkerHttpvfs } from "sql.js-httpvfs";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 const MBTILES_PROTOCOL = "ironmesh-mbtiles";
 const SQLJS_WORKER_URL = new URL(
@@ -11,6 +11,9 @@ const SQLJS_WORKER_URL = new URL(
   import.meta.url
 ).toString();
 const SQLJS_WASM_URL = new URL("sql.js-httpvfs/dist/sql-wasm.wasm", import.meta.url).toString();
+const MAP_MARKER_VIEWPORT_PADDING = 64;
+const MAX_VISIBLE_THUMBNAIL_MARKERS = 120;
+const MAX_CACHED_MARKER_IMAGES = 256;
 const TRANSPARENT_PNG_BYTES = base64ToUint8Array(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII="
 );
@@ -120,8 +123,14 @@ type LoadedBasemapStyle = {
   viewMetadata: MbtilesMetadata;
 };
 
+type CachedMarkerImage = {
+  lastAccessedAt: number;
+  resolvedSrc: string;
+};
+
 const mbtilesSourceCache = new Map<string, Promise<MbtilesSource>>();
 const mbtilesConfigRegistry = new Map<string, GalleryRasterBasemapConfig>();
+const cachedMarkerImages = new Map<string, CachedMarkerImage>();
 let mbtilesProtocolRegistered = false;
 
 export function GalleryBasemapMap({
@@ -140,8 +149,10 @@ export function GalleryBasemapMap({
   const markerOverlayRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const cameraStateRef = useRef<MapCameraState | null>(null);
+  const viewportFrameRef = useRef<number | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
+  const [isInteracting, setIsInteracting] = useState(false);
   const [viewportVersion, setViewportVersion] = useState(0);
   const [fitSignature, setFitSignature] = useState("");
   const serverRasterBasemap = isServerRasterBasemap(basemap) ? basemap : null;
@@ -151,12 +162,16 @@ export function GalleryBasemapMap({
   const localRasterSourceId = localRasterBasemap
     ? sourceIdForLogicalFile(localRasterBasemap.logicalFileUrl)
     : null;
-  const entrySignature = entries
-    .map((entry) => {
-      const gps = entry.media?.gps;
-      return `${entry.path}:${gps?.latitude ?? ""}:${gps?.longitude ?? ""}`;
-    })
-    .join("|");
+  const entrySignature = useMemo(
+    () =>
+      entries
+        .map((entry) => {
+          const gps = entry.media?.gps;
+          return `${entry.path}:${gps?.latitude ?? ""}:${gps?.longitude ?? ""}`;
+        })
+        .join("|"),
+    [entries]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -164,6 +179,7 @@ export function GalleryBasemapMap({
 
     setMapReady(false);
     setMapError(null);
+    setIsInteracting(false);
 
     async function start() {
       try {
@@ -197,15 +213,32 @@ export function GalleryBasemapMap({
         });
 
         const bumpViewport = () => {
-          if (map) {
+          if (typeof window === "undefined" || viewportFrameRef.current !== null) {
+            return;
+          }
+
+          viewportFrameRef.current = window.requestAnimationFrame(() => {
+            viewportFrameRef.current = null;
+            if (!map) {
+              return;
+            }
+
             const nextCamera = trySnapshotMapCamera(map);
             if (nextCamera) {
               cameraStateRef.current = nextCamera;
             }
-          }
-          setViewportVersion((current) => current + 1);
+            setViewportVersion((current) => current + 1);
+          });
         };
         let ready = false;
+        const markInteractionStart = () => {
+          setIsInteracting(true);
+          bumpViewport();
+        };
+        const markInteractionEnd = () => {
+          setIsInteracting(false);
+          bumpViewport();
+        };
         const markReady = () => {
           if (cancelled || ready || !map) {
             return;
@@ -215,7 +248,7 @@ export function GalleryBasemapMap({
           }
           ready = true;
           setMapReady(true);
-          bumpViewport();
+          markInteractionEnd();
         };
         map.on("styledata", () => {
           if (cancelled) {
@@ -224,8 +257,9 @@ export function GalleryBasemapMap({
           markReady();
         });
         map.on("load", markReady);
+        map.on("movestart", markInteractionStart);
         map.on("move", bumpViewport);
-        map.on("zoom", bumpViewport);
+        map.on("moveend", markInteractionEnd);
         map.on("resize", bumpViewport);
         map.on("projectiontransition", bumpViewport);
         mapRef.current = map;
@@ -243,6 +277,10 @@ export function GalleryBasemapMap({
 
     return () => {
       cancelled = true;
+      if (viewportFrameRef.current !== null && typeof window !== "undefined") {
+        window.cancelAnimationFrame(viewportFrameRef.current);
+        viewportFrameRef.current = null;
+      }
       if (localRasterBasemap && localRasterSourceId) {
         mbtilesConfigRegistry.delete(localRasterSourceId);
       }
@@ -393,6 +431,38 @@ export function GalleryBasemapMap({
   const map = mapRef.current;
   const mapWidth = map?.getContainer().clientWidth ?? 0;
   const mapHeight = map?.getContainer().clientHeight ?? 0;
+  const visibleMarkers = useMemo(
+    () =>
+      mapReady && map
+        ? entries.flatMap((entry) => {
+            const gps = entry.media?.gps;
+            if (!gps) {
+              return [];
+            }
+
+            const projected = map.project([gps.longitude, gps.latitude]);
+            if (
+              projected.x < -MAP_MARKER_VIEWPORT_PADDING ||
+              projected.y < -MAP_MARKER_VIEWPORT_PADDING ||
+              projected.x > mapWidth + MAP_MARKER_VIEWPORT_PADDING ||
+              projected.y > mapHeight + MAP_MARKER_VIEWPORT_PADDING
+            ) {
+              return [];
+            }
+
+            return [
+              {
+                entry,
+                left: projected.x,
+                top: projected.y
+              }
+            ];
+          })
+        : [],
+    [entries, map, mapHeight, mapReady, mapWidth, viewportVersion]
+  );
+  const suppressMarkerThumbnails =
+    isInteracting || visibleMarkers.length > MAX_VISIBLE_THUMBNAIL_MARKERS;
   const mapViewport = (
     <div
       aria-label="Geotagged gallery map"
@@ -443,30 +513,17 @@ export function GalleryBasemapMap({
             pointerEvents: "none"
           }}
         >
-          {entries.map((entry) => {
-            const gps = entry.media?.gps;
-            if (!gps) {
-              return null;
-            }
-
-            const projected = map.project([gps.longitude, gps.latitude]);
-            if (
-              projected.x < -64 ||
-              projected.y < -64 ||
-              projected.x > mapWidth + 64 ||
-              projected.y > mapHeight + 64
-            ) {
-              return null;
-            }
+          {visibleMarkers.map(({ entry, left, top }) => {
+            const selected = selectedPath === entry.path;
 
             return (
               <GalleryBasemapMarker
                 key={entry.path}
                 entry={entry}
-                request={getMarkerRequest(entry)}
-                left={projected.x}
-                top={projected.y}
-                selected={selectedPath === entry.path}
+                request={!suppressMarkerThumbnails || selected ? getMarkerRequest(entry) : null}
+                left={left}
+                top={top}
+                selected={selected}
                 onClick={() => onSelectPath(entry.path)}
               />
             );
@@ -492,6 +549,21 @@ export function GalleryBasemapMap({
               {hiddenOnMapCount} without GPS
             </Badge>
           ) : null}
+        </div>
+      ) : null}
+      {suppressMarkerThumbnails ? (
+        <div
+          style={{
+            position: "absolute",
+            right: 12,
+            top: 12
+          }}
+        >
+          <Badge color="dark" variant="filled">
+            {isInteracting
+              ? "Marker thumbnails paused while moving"
+              : `Showing pins for ${visibleMarkers.length} visible markers`}
+          </Badge>
         </div>
       ) : null}
     </div>
@@ -1667,8 +1739,14 @@ function useResolvedImageRequest(
       return;
     }
 
+    const cached = cachedMarkerImages.get(signature);
+    if (cached) {
+      cached.lastAccessedAt = Date.now();
+      setResolvedSrc(cached.resolvedSrc);
+      return;
+    }
+
     const controller = new AbortController();
-    let objectUrl: string | null = null;
     let active = true;
 
     setResolvedSrc(null);
@@ -1688,8 +1766,13 @@ function useResolvedImageRequest(
           return;
         }
 
-        objectUrl = URL.createObjectURL(blob);
-        setResolvedSrc(objectUrl);
+        const nextResolvedSrc = URL.createObjectURL(blob);
+        cachedMarkerImages.set(signature, {
+          lastAccessedAt: Date.now(),
+          resolvedSrc: nextResolvedSrc
+        });
+        trimCachedMarkerImages();
+        setResolvedSrc(nextResolvedSrc);
       })
       .catch(() => {
         if (!active || controller.signal.aborted) {
@@ -1701,13 +1784,28 @@ function useResolvedImageRequest(
     return () => {
       active = false;
       controller.abort();
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
     };
   }, [hasHeaders, request?.url, signature]);
 
   return { resolvedSrc, failed };
+}
+
+function trimCachedMarkerImages() {
+  if (cachedMarkerImages.size <= MAX_CACHED_MARKER_IMAGES) {
+    return;
+  }
+
+  const overflow = cachedMarkerImages.size - MAX_CACHED_MARKER_IMAGES;
+  const oldestEntries = [...cachedMarkerImages.entries()]
+    .sort((left, right) => left[1].lastAccessedAt - right[1].lastAccessedAt)
+    .slice(0, overflow);
+
+  for (const [signature, cached] of oldestEntries) {
+    cachedMarkerImages.delete(signature);
+    if (cached.resolvedSrc) {
+      URL.revokeObjectURL(cached.resolvedSrc);
+    }
+  }
 }
 
 function requestSignature(request: GalleryBasemapPreviewRequest | null | undefined): string {

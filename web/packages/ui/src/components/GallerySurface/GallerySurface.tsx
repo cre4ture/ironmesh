@@ -51,6 +51,7 @@ const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
 const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
 const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
 const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
+const MAX_WORLD_MAP_THUMBNAIL_MARKERS = 120;
 
 export type GallerySnapshot = {
   id: string;
@@ -854,6 +855,7 @@ function GalleryWorldMap({
   onSelectPath,
   onToggleFullscreen
 }: GalleryWorldMapProps) {
+  const suppressMarkerThumbnails = entries.length > MAX_WORLD_MAP_THUMBNAIL_MARKERS;
   const mapViewport = (
     <div
       aria-label="Geotagged gallery map"
@@ -964,7 +966,11 @@ function GalleryWorldMap({
           <GalleryMapMarker
             key={entry.path}
             entry={entry}
-            request={getMarkerRequest(entry)}
+            request={
+              !suppressMarkerThumbnails || selectedPath === entry.path
+                ? getMarkerRequest(entry)
+                : null
+            }
             projectedX={projection.x}
             projectedY={projection.y}
             selected={selectedPath === entry.path}
@@ -990,6 +996,19 @@ function GalleryWorldMap({
           <span>180W</span>
           <span>Prime meridian</span>
           <span>180E</span>
+        </div>
+      ) : null}
+      {suppressMarkerThumbnails ? (
+        <div
+          style={{
+            position: "absolute",
+            right: 16,
+            top: 16
+          }}
+        >
+          <Badge color="dark" variant="filled">
+            Showing pins for {entries.length} markers
+          </Badge>
         </div>
       ) : null}
     </div>
