@@ -19,13 +19,15 @@ Ironmesh draws inspiration from [PicApport](https://www.picapport.de/de/index.ph
 
 ## At A Glance
 
-<object data="docs/ironmesh-at-a-glance.html" type="text/html" width="100%" height="1280">
-  <p>
-    This Markdown renderer does not support embedded HTML objects.
-    Open the responsive overview directly here:
-    <a href="docs/ironmesh-at-a-glance.html">docs/ironmesh-at-a-glance.html</a>
-  </p>
-</object>
+<p align="center">
+  <a href="docs/assets/ironmesh-at-a-glance.png">
+    <img
+      src="docs/assets/ironmesh-at-a-glance.png"
+      alt="IronMesh at a glance overview diagram"
+      width="1200"
+    />
+  </a>
+</p>
 
 ## Workspace layout
 
