@@ -306,7 +306,7 @@ pub fn free_handle(handle: *mut c_void) {
     }
 }
 
-pub fn list_json(
+fn list_json(
     handle: *mut c_void,
     prefix: Option<&str>,
     depth: usize,
@@ -317,33 +317,28 @@ pub fn list_json(
         .context("failed to serialize Apple list response")
 }
 
-pub fn metadata_json(handle: *mut c_void, key: impl AsRef<str>) -> Result<String> {
+fn metadata_json(handle: *mut c_void, key: impl AsRef<str>) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
     serde_json::to_string(&app.metadata(key)?)
         .context("failed to serialize Apple metadata response")
 }
 
-pub fn fetch_bytes(handle: *mut c_void, key: impl AsRef<str>) -> Result<Vec<u8>> {
+fn fetch_bytes(handle: *mut c_void, key: impl AsRef<str>) -> Result<Vec<u8>> {
     let app = unsafe { handle_to_app(handle)? };
     app.fetch(key)
 }
 
-pub fn put_json(
-    handle: *mut c_void,
-    key: impl Into<String>,
-    data: Vec<u8>,
-) -> Result<String> {
+fn put_json(handle: *mut c_void, key: impl Into<String>, data: Vec<u8>) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
-    serde_json::to_string(&app.put(key, data)?)
-        .context("failed to serialize Apple put response")
+    serde_json::to_string(&app.put(key, data)?).context("failed to serialize Apple put response")
 }
 
-pub fn delete_path(handle: *mut c_void, key: impl AsRef<str>) -> Result<()> {
+fn delete_path(handle: *mut c_void, key: impl AsRef<str>) -> Result<()> {
     let app = unsafe { handle_to_app(handle)? };
     app.delete_path(key)
 }
 
-pub fn move_path(
+fn move_path(
     handle: *mut c_void,
     from_path: impl Into<String>,
     to_path: impl Into<String>,
@@ -386,8 +381,12 @@ pub extern "C" fn ironmesh_ios_facade_free(handle: *mut c_void) {
     free_handle(handle);
 }
 
+/// # Safety
+///
+/// `value` must be a pointer previously returned by this library via
+/// `CString::into_raw`, and it must not be freed more than once.
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_string_free(value: *mut c_char) {
+pub unsafe extern "C" fn ironmesh_ios_string_free(value: *mut c_char) {
     if value.is_null() {
         return;
     }
@@ -422,12 +421,7 @@ pub extern "C" fn ironmesh_ios_facade_list_json(
     run_ffi_string_result(out_json, out_error, || {
         let prefix = optional_c_string(prefix)?;
         let snapshot = optional_c_string(snapshot)?;
-        list_json(
-            handle,
-            prefix.as_deref(),
-            depth,
-            snapshot.as_deref(),
-        )
+        list_json(handle, prefix.as_deref(), depth, snapshot.as_deref())
     })
 }
 
@@ -485,7 +479,9 @@ pub extern "C" fn ironmesh_ios_facade_delete_path(
     out_error: *mut *mut c_char,
 ) -> c_int {
     clear_error(out_error);
-    run_ffi_unit_result(out_error, || delete_path(handle, required_c_string(key, "key")?))
+    run_ffi_unit_result(out_error, || {
+        delete_path(handle, required_c_string(key, "key")?)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -798,7 +794,13 @@ mod tests {
             .route("/store/index", get(list_store_index))
             .route("/store/delete", post(delete_by_query))
             .route("/store/rename", post(rename_path))
-            .route("/store/{*key}", put(put_object).get(get_object).head(head_object).delete(delete_object))
+            .route(
+                "/store/{*key}",
+                put(put_object)
+                    .get(get_object)
+                    .head(head_object)
+                    .delete(delete_object),
+            )
             .route("/versions/{*key}", get(list_versions))
             .with_state(state)
     }
@@ -823,7 +825,10 @@ mod tests {
         StatusCode::CREATED
     }
 
-    async fn get_object(State(state): State<TestServerState>, Path(key): Path<String>) -> impl IntoResponse {
+    async fn get_object(
+        State(state): State<TestServerState>,
+        Path(key): Path<String>,
+    ) -> impl IntoResponse {
         let objects = state.objects.lock().expect("lock poisoned");
         match objects.get(&key) {
             Some(object) => (StatusCode::OK, object.bytes.clone()).into_response(),
@@ -831,7 +836,10 @@ mod tests {
         }
     }
 
-    async fn head_object(State(state): State<TestServerState>, Path(key): Path<String>) -> impl IntoResponse {
+    async fn head_object(
+        State(state): State<TestServerState>,
+        Path(key): Path<String>,
+    ) -> impl IntoResponse {
         let objects = state.objects.lock().expect("lock poisoned");
         match objects.get(&key) {
             Some(object) => {
@@ -840,16 +848,20 @@ mod tests {
                     "x-ironmesh-object-size",
                     HeaderValue::from_str(&object.bytes.len().to_string()).expect("valid header"),
                 );
-                response
-                    .headers_mut()
-                    .insert("content-length", HeaderValue::from_str(&object.bytes.len().to_string()).expect("valid header"));
+                response.headers_mut().insert(
+                    "content-length",
+                    HeaderValue::from_str(&object.bytes.len().to_string()).expect("valid header"),
+                );
                 response
             }
             None => StatusCode::NOT_FOUND.into_response(),
         }
     }
 
-    async fn delete_object(State(state): State<TestServerState>, Path(key): Path<String>) -> impl IntoResponse {
+    async fn delete_object(
+        State(state): State<TestServerState>,
+        Path(key): Path<String>,
+    ) -> impl IntoResponse {
         let mut objects = state.objects.lock().expect("lock poisoned");
         if objects.remove(&key).is_some() {
             StatusCode::NO_CONTENT
@@ -860,18 +872,25 @@ mod tests {
 
     async fn delete_by_query(
         State(state): State<TestServerState>,
-        axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+        axum::extract::Query(query): axum::extract::Query<
+            std::collections::HashMap<String, String>,
+        >,
     ) -> impl IntoResponse {
         let Some(key) = query.get("key") else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        let recursive = query.get("recursive").map(|value| value == "true").unwrap_or(false);
+        let recursive = query
+            .get("recursive")
+            .map(|value| value == "true")
+            .unwrap_or(false);
         let mut objects = state.objects.lock().expect("lock poisoned");
         let removed = if recursive && key.ends_with('/') {
             let prefix = key.trim_end_matches('/');
             let keys = objects
                 .keys()
-                .filter(|candidate| candidate == &key || candidate.starts_with(&format!("{prefix}/")))
+                .filter(|candidate| {
+                    candidate == &key || candidate.starts_with(&format!("{prefix}/"))
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let count = keys.len();
@@ -982,12 +1001,14 @@ mod tests {
     fn spawn_test_server() -> SocketAddr {
         let state = TestServerState::default();
         let app = test_router(state);
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("test server should bind");
+        let std_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
         std_listener
             .set_nonblocking(true)
             .expect("listener should become nonblocking");
-        let addr = std_listener.local_addr().expect("listener should have address");
+        let addr = std_listener
+            .local_addr()
+            .expect("listener should have address");
 
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("server runtime should build");
@@ -1005,15 +1026,10 @@ mod tests {
         let url = format!("http://{addr}");
         let url = CString::new(url).expect("url should be valid");
         let mut error = ptr::null_mut();
-        let handle = ironmesh_ios_facade_create(
-            url.as_ptr(),
-            ptr::null(),
-            ptr::null(),
-            &mut error,
-        );
+        let handle = ironmesh_ios_facade_create(url.as_ptr(), ptr::null(), ptr::null(), &mut error);
         if !error.is_null() {
             let message = unsafe { CStr::from_ptr(error).to_string_lossy().into_owned() };
-            ironmesh_ios_string_free(error);
+            unsafe { ironmesh_ios_string_free(error) };
             panic!("failed to create facade: {message}");
         }
         handle
@@ -1078,13 +1094,15 @@ mod tests {
             serde_json::from_str(&read_string(list_json)).expect("list response should parse");
         assert_eq!(list_response.entries.len(), 2);
         assert!(
+            list_response.entries.iter().any(
+                |entry| entry.path == "docs/" && matches!(entry.kind, AppleItemKind::Directory)
+            )
+        );
+        assert!(
             list_response
                 .entries
                 .iter()
-                .any(|entry| entry.path == "docs/" && matches!(entry.kind, AppleItemKind::Directory))
-        );
-        assert!(
-            list_response.entries.iter().any(|entry| entry.path == "docs/readme.txt")
+                .any(|entry| entry.path == "docs/readme.txt")
         );
 
         let mut metadata_json = ptr::null_mut();
@@ -1142,8 +1160,7 @@ mod tests {
         assert_eq!(read_bytes(moved_bytes), payload);
 
         let mut delete_error = ptr::null_mut();
-        let status =
-            ironmesh_ios_facade_delete_path(handle, new_key.as_ptr(), &mut delete_error);
+        let status = ironmesh_ios_facade_delete_path(handle, new_key.as_ptr(), &mut delete_error);
         assert_eq!(status, FFI_OK);
         assert!(delete_error.is_null());
 
@@ -1161,7 +1178,7 @@ mod tests {
         );
         assert_eq!(status, FFI_ERR);
         assert!(!post_delete_error.is_null());
-        ironmesh_ios_string_free(post_delete_error);
+        unsafe { ironmesh_ios_string_free(post_delete_error) };
 
         ironmesh_ios_facade_free(handle);
     }

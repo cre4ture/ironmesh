@@ -704,10 +704,7 @@ impl IronMeshClient {
         }
     }
 
-    pub async fn list_versions(
-        &self,
-        key: impl AsRef<str>,
-    ) -> Result<Option<VersionGraphSummary>> {
+    pub async fn list_versions(&self, key: impl AsRef<str>) -> Result<Option<VersionGraphSummary>> {
         let key = key.as_ref();
         let url = self.store_versions_url(key)?;
 

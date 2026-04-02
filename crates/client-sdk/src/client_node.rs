@@ -160,10 +160,7 @@ impl ClientNode {
             .await
     }
 
-    pub async fn list_versions(
-        &self,
-        key: impl AsRef<str>,
-    ) -> Result<Option<VersionGraphSummary>> {
+    pub async fn list_versions(&self, key: impl AsRef<str>) -> Result<Option<VersionGraphSummary>> {
         self.client.list_versions(key).await
     }
 

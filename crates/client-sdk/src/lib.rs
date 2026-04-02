@@ -25,10 +25,9 @@ pub use device_auth::{
 };
 pub use ironmesh_client::{
     IronMeshClient, ObjectHeadInfo, PreferredHeadReason, StoreIndexEntry, StoreIndexResponse,
-    StoreIndexView, UploadMode, UploadResult, UploadSessionChunkStatus,
-    UploadSessionCompleteInfo, UploadSessionStatus, VersionConsistencyState,
-    VersionGraphSummary, VersionRecordSummary, normalize_server_base_url,
-    snapshot_from_store_index_entries,
+    StoreIndexView, UploadMode, UploadResult, UploadSessionChunkStatus, UploadSessionCompleteInfo,
+    UploadSessionStatus, VersionConsistencyState, VersionGraphSummary, VersionRecordSummary,
+    normalize_server_base_url, snapshot_from_store_index_entries,
 };
 pub use remote_sync::{
     RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
