@@ -10,6 +10,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - Cross-platform filesystem work:
   - Shared planner: `crates/sync-core`
   - Linux adapter: `crates/adapter-linux-fuse`
+  - Windows adapter: `crates/adapter-windows-cfapi`
 
 ## Toolchain + CI policy
 
@@ -18,6 +19,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
   - Rust checks/lints/tests
   - Android debug build + artifact (`android-debug-apk`)
   - Linux FUSE mount binary build + artifact (`linux-fuse-mount-binary-ubuntu`)
+  - Windows CFAPI compile check lane
 - Coverage gate excludes `crates/adapter-linux-fuse/` for current MVP stage.
 
 ## Current state (latest implemented)
@@ -51,11 +53,23 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
   - server-driven `/store/index/changes/wait` refresh wakeups with polling fallback
   - recursive directory deletion through the shared `/store/delete` API when deleting directory-marker paths like `dir/`
 
+### Windows CFAPI
+
+- `adapter-windows-cfapi` now has:
+  - operation mapping tests aligned with the Linux adapter contract
+  - sync-root registration and placeholder creation runtime
+  - fetch-data hydration callbacks backed by `server-node`
+  - remote namespace refresh driven by server notifications with polling fallback
+  - registration utility binary: `adapter-windows-cfapi-register`
+
 ## Key files now authoritative
 
 - `crates/sync-core/src/lib.rs`
 - `crates/adapter-linux-fuse/src/lib.rs`
 - `crates/adapter-linux-fuse/src/mount_main.rs`
+- `crates/adapter-windows-cfapi/src/lib.rs`
+- `crates/adapter-windows-cfapi/src/runtime.rs`
+- `crates/adapter-windows-cfapi/src/register.rs`
 - `apps/os-integration/src/main.rs`
 - `apps/android-app/app/src/main/java/io/ironmesh/android/ui/MainViewModel.kt`
 - `apps/android-app/app/src/main/java/io/ironmesh/android/data/IronmeshPreferences.kt`
@@ -63,13 +77,13 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - `.github/workflows/check.yml`
 - `.github/workflows/coverage.yml`
 - `docs/cross-platform-filesystem-integration-strategy.md`
-- `docs/cross-platform-handover.md`
 - `docs/apple-filesystem-integration-sketch.md`
 
 ## Quick validation commands
 
 ```bash
 cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p sync-core
 cargo test -p adapter-linux-fuse
 cargo check -p adapter-linux-fuse
@@ -96,8 +110,7 @@ cargo run -p os-integration -- \
 
 ## Immediate next objective
 
-- Implement Windows CFAPI adapter prototype using `sync-core` contracts.
-- Continue from handover doc checklist in `docs/cross-platform-handover.md`.
+- Continue expanding Windows CFAPI and Android alignment from the status and implementation notes in `docs/cross-platform-filesystem-integration-strategy.md`.
 - Apple platform planning now lives in `docs/apple-filesystem-integration-sketch.md`:
   - Active track: File Provider on macOS and iOS/iPadOS
   - Initial bridge decision: static library + C ABI via `cbindgen` (not `UniFFI`)

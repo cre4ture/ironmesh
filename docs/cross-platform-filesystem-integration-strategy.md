@@ -61,7 +61,7 @@ Use a layered architecture:
 2. `transport-client` (existing `client-sdk` + wrappers)
    - Remote object listing/metadata/content operations.
 3. Platform adapters
-  - `adapter-windows-cfapi` (next)
+  - `adapter-windows-cfapi`
   - `adapter-linux-fuse` (implemented MVP runtime)
   - `adapter-android-docs` (existing Kotlin provider now, Rust bridge future)
 
@@ -187,7 +187,8 @@ Current Linux FUSE interpretation:
   - `crates/adapter-windows-cfapi` runtime with:
     - sync-root registration + placeholder creation,
     - fetch-data hydration callbacks backed by `server-node`,
-    - periodic remote namespace refresh via `/store/index` polling.
+    - registration utility binary: `adapter-windows-cfapi-register`,
+    - remote namespace refresh via server notifications first, with polling fallback.
   - Shared polling abstraction in `crates/client-sdk/src/remote_sync.rs`:
     - SDK-owned polling thread (`RemoteSnapshotPoller`),
     - callback contract on `changed_paths` + latest snapshot,
@@ -196,6 +197,7 @@ Current Linux FUSE interpretation:
     - `server-node` exposes `/store/index/changes/wait` long-poll wakeups,
     - Linux FUSE and Windows CFAPI now wait on server change notifications and then refresh snapshots,
     - periodic polling remains as a compatibility fallback for older servers.
+  - CI now includes a Windows compile check lane for the CFAPI adapter.
   - `crates/adapter-linux-fuse` live mount now consumes the same polling abstraction to materialize remote additions without remounting.
   - `crates/sync-agent-core` with reusable local tree scanning, diffing, and remote index utilities.
   - `apps/ironmesh-folder-agent`:

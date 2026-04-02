@@ -197,31 +197,19 @@ cargo run -p os-integration -- \
   --mountpoint /tmp/ironmesh-mount
 ```
 
-Embedded local-edge mode:
-
-```bash
-mkdir -p /tmp/ironmesh-mount
-cargo run -p os-integration -- \
-  --server-base-url http://127.0.0.1:18080 \
-  --local-edge \
-  --mountpoint /tmp/ironmesh-mount
-```
-
 Notes:
 
 - Live mounts now require client auth when the server protects `/store/*` APIs. In direct mode,
   pass `--client-identity-file`.
 - In bootstrap mode, `adapter-linux-fuse-mount` auto-loads a sibling
   `bootstrap.client-identity.json` when present.
-- `--local-edge` starts a persistent local edge node and mounts against it instead of talking to the remote server directly.
-- By default, local-edge state is stored under `$XDG_STATE_HOME/ironmesh/os-integration/local-edge/` or `~/.local/state/ironmesh/os-integration/local-edge/`.
-- Use `--local-edge-data-dir` to override that storage path explicitly.
 - `--remote-refresh-interval-ms` controls fallback polling/retry cadence for namespace updates in live modes.
 - Snapshot mode is still available for debugging with `--snapshot-file`.
 
-## Cross-environment handover
+## Cross-platform status
 
-- Current implementation status, environment bootstrap steps, and Windows-next development handover are documented in [docs/cross-platform-handover.md](docs/cross-platform-handover.md).
+- Cross-platform filesystem implementation status and platform notes live in [docs/cross-platform-filesystem-integration-strategy.md](docs/cross-platform-filesystem-integration-strategy.md).
+- Short coding-session bootstrap context lives in [docs/agent-context.md](docs/agent-context.md).
 
 ## CI operations
 
