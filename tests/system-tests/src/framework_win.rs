@@ -137,25 +137,6 @@ async fn start_cfapi_adapter_with_resolved_inputs(
         format!("{sync_root_id}.{:016x}", hasher.finish())
     };
 
-    let register_output = Command::new(&os_integration_bin)
-        .arg("register")
-        .arg("--sync-root-id")
-        .arg(&unique_sync_root_id)
-        .arg("--display-name")
-        .arg(display_name)
-        .arg("--root-path")
-        .arg(&root_path_arg)
-        .output()
-        .await
-        .context("failed to execute os-integration register")?;
-
-    if !register_output.status.success() {
-        bail!(
-            "os-integration register failed: {}",
-            String::from_utf8_lossy(&register_output.stderr)
-        );
-    }
-
     let unregister_args = cfapi_unregister_args(root_path);
 
     let mut command = Command::new(&os_integration_bin);

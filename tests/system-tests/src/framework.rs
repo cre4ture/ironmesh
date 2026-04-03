@@ -411,6 +411,24 @@ impl ChildGuard {
         }
         Ok(())
     }
+
+    pub async fn stop_without_cleanup(&mut self) -> Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            child
+                .kill()
+                .await
+                .context("failed to kill child process")?;
+            child
+                .wait()
+                .await
+                .context("failed to wait for child process to exit")?;
+            self.child = None;
+        }
+
+        self.cleanup_commands.clear();
+        self._resource_guards.clear();
+        Ok(())
+    }
 }
 
 impl Drop for ChildGuard {
@@ -1249,6 +1267,10 @@ pub async fn wait_for_store_index_entry(
 
 pub async fn stop_server(child: &mut ChildGuard) {
     child.stop().await.ok();
+}
+
+pub async fn stop_server_without_cleanup(child: &mut ChildGuard) {
+    child.stop_without_cleanup().await.ok();
 }
 
 pub fn binary_path(name: &str) -> Result<PathBuf> {

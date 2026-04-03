@@ -6,7 +6,7 @@ mod tests {
     use crate::framework::{
         TEST_ADMIN_TOKEN, default_client_identity_path, fresh_data_dir,
         https_client_with_root_from_data_dir, issue_bootstrap_bundle, start_authenticated_server,
-        start_open_server_with_public_https_env, stop_server,
+        start_open_server_with_public_https_env, stop_server, stop_server_without_cleanup,
     };
     use crate::framework_win::{pin_cfapi_placeholder, start_cfapi_adapter_with_bootstrap};
     use bytes::Bytes;
@@ -115,14 +115,6 @@ mod tests {
             .await
             .expect("Failed to start authenticated CFAPI fixture");
 
-        let test_file = sync_root.join("monitor_test.txt");
-
-        // Step 1: Create new file
-        let mut file = File::create(&test_file).expect("Failed to create file");
-        file.write_all(initial_content.as_bytes())
-            .expect("Failed to write initial content");
-        file.sync_all().expect("Failed to sync file");
-
         // start CFAPI adapter to monitor the sync root and upload changes to server
         let _adapter = start_cfapi_adapter_with_bootstrap(
             "ironmesh.systemtest.syncroot",
@@ -133,6 +125,14 @@ mod tests {
         )
         .await
         .expect("Failed to register and serve CFAPI adapter");
+
+        let test_file = sync_root.join("monitor_test.txt");
+
+        // Step 1: Create new file after the sync root has been registered.
+        let mut file = File::create(&test_file).expect("Failed to create file");
+        file.write_all(initial_content.as_bytes())
+            .expect("Failed to write initial content");
+        file.sync_all().expect("Failed to sync file");
 
         // Wait for monitor to detect and upload
         wait_for_remote_payload(
@@ -954,7 +954,7 @@ mod tests {
             .context("failed to pin placeholder before restart")?;
         wait_for_hydrated_payload(&local_file, payload, 200).await;
 
-        stop_server(&mut adapter).await;
+        stop_server_without_cleanup(&mut adapter).await;
 
         fixture
             .sdk

@@ -57,12 +57,10 @@ struct Args {
 pub fn serve_main() -> anyhow::Result<()> {
     common::logging::init_compact_tracing_default("info");
     let args = Args::parse();
-    let registration =
-        SyncRootRegistration::new(args.sync_root_id, args.display_name, args.root_path);
-    register_sync_root(&registration)?;
+    let root_path = PathBuf::from(&args.root_path);
 
     let connection = resolve_connection_config(
-        &registration.root_path,
+        &root_path,
         args.server_base_url.as_deref(),
         args.server_ca_cert.as_deref(),
         args.bootstrap_file.as_deref(),
@@ -70,6 +68,14 @@ pub fn serve_main() -> anyhow::Result<()> {
         args.device_id.as_deref(),
         args.device_label.as_deref(),
     )?;
+    let registration = SyncRootRegistration::new(
+        args.sync_root_id,
+        args.display_name,
+        root_path,
+        connection.cluster_id,
+        args.prefix.as_deref(),
+    );
+    let _sync_root_identity = register_sync_root(&registration)?;
     tracing::info!("using connection target {}", connection.connection_target);
     let client_identity = resolve_or_enroll_client_identity(
         connection.enrollment_base_url.as_ref(),

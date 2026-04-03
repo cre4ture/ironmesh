@@ -26,6 +26,9 @@ use crate::helpers::{
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use crate::snapshot_cache::record_local_file_hash;
+use crate::sync_root_identity::{
+    SyncRootIdentity, load_registered_sync_root_context, normalize_prefix,
+};
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
@@ -53,6 +56,8 @@ pub struct SyncRootRegistration {
     pub sync_root_id: String,
     pub display_name: String,
     pub root_path: PathBuf,
+    pub cluster_id: uuid::Uuid,
+    pub prefix: String,
 }
 
 impl SyncRootRegistration {
@@ -60,11 +65,15 @@ impl SyncRootRegistration {
         sync_root_id: impl Into<String>,
         display_name: impl Into<String>,
         root_path: impl Into<PathBuf>,
+        cluster_id: uuid::Uuid,
+        prefix: Option<&str>,
     ) -> Self {
         Self {
             sync_root_id: sync_root_id.into(),
             display_name: display_name.into(),
             root_path: root_path.into(),
+            cluster_id,
+            prefix: normalize_prefix(prefix),
         }
     }
 }
@@ -427,20 +436,74 @@ pub(crate) struct CallbackContext {
     upload_debounce: Arc<UploadDebounceState>,
 }
 
-pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
+pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRootIdentity> {
     validate_registration(registration)?;
     std::fs::create_dir_all(&registration.root_path)?;
-    if let Ok(existing_sync_root_id) = SyncRootId::from_path(&registration.root_path) {
-        let _ = existing_sync_root_id.unregister();
+
+    let expected_shell_sync_root_id = build_shell_sync_root_id(registration)?
+        .as_hstring()
+        .to_string_lossy();
+    let expected_identity = |provider_instance_id| {
+        SyncRootIdentity::new(
+            provider_instance_id,
+            registration.cluster_id,
+            registration.sync_root_id.clone(),
+            registration.prefix.clone(),
+        )
+    };
+
+    if let Some(existing) = load_registered_sync_root_context(&registration.root_path)? {
+        if existing.windows_sync_root_id != expected_shell_sync_root_id {
+            return Err(anyhow!(
+                "sync root {} at {} is already registered to {} instead of {}",
+                registration.display_name,
+                registration.root_path.display(),
+                existing.windows_sync_root_id,
+                expected_shell_sync_root_id
+            ));
+        }
+        if existing.identity.sync_root_id != registration.sync_root_id
+            || existing.identity.cluster_id != registration.cluster_id
+            || existing.identity.prefix != registration.prefix
+        {
+            return Err(anyhow!(
+                "sync root {} at {} is registered to a different IronMesh root (registered: sync_root_id={} cluster_id={} prefix='{}'; requested: sync_root_id={} cluster_id={} prefix='{}')",
+                registration.display_name,
+                registration.root_path.display(),
+                existing.identity.sync_root_id,
+                existing.identity.cluster_id,
+                existing.identity.prefix,
+                registration.sync_root_id,
+                registration.cluster_id,
+                registration.prefix
+            ));
+        }
+        return Ok(existing.identity);
+    }
+
+    if std::fs::read_dir(&registration.root_path)?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(anyhow!(
+            "refusing to register non-empty folder {} as a new sync root",
+            registration.root_path.display()
+        ));
     }
 
     let sync_root_id = build_shell_sync_root_id(registration)?;
     let display_name = U16String::from_str(&registration.display_name);
     let provider_version = U16String::from_str(env!("CARGO_PKG_VERSION"));
     let icon_resource = current_executable_icon_resource()?;
+    let sync_root_identity = expected_identity(uuid::Uuid::now_v7());
+    let sync_root_identity_blob = sync_root_identity.encoded();
     tracing::info!(
-        "sync-root registration: path={} hydration_type=Progressive hydration_policy=allow_platform_dehydration population_type=AlwaysFull allow_pinning=true",
-        registration.root_path.display()
+        "sync-root registration: path={} hydration_type=Progressive hydration_policy=allow_platform_dehydration population_type=AlwaysFull allow_pinning=true cluster_id={} prefix='{}' provider_instance_id={}",
+        registration.root_path.display(),
+        registration.cluster_id,
+        registration.prefix,
+        sync_root_identity.provider_instance_id
     );
 
     Registration::from_sync_root_id(&sync_root_id)
@@ -455,8 +518,11 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<()> {
         .population_type(PopulationType::AlwaysFull)
         .allow_pinning()
         .show_siblings_as_group()
+        .blob(&sync_root_identity_blob)
         .register(&registration.root_path)
-        .map_err(|error| anyhow!("failed to register sync root with Explorer shell: {error}"))
+        .map_err(|error| anyhow!("failed to register sync root with Explorer shell: {error}"))?;
+
+    Ok(sync_root_identity)
 }
 
 pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
@@ -1710,6 +1776,9 @@ fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
     if registration.root_path.as_os_str().is_empty() {
         return Err(anyhow!("root path cannot be empty"));
     }
+    if registration.prefix.contains('\\') {
+        return Err(anyhow!("prefix must use normalized forward-slash separators"));
+    }
     Ok(())
 }
 
@@ -1735,10 +1804,12 @@ mod tests {
 
     #[test]
     fn registration_validation_rejects_empty_inputs() {
-        let registration = SyncRootRegistration::new("", "Ironmesh", "C:/ironmesh");
+        let cluster_id = uuid::Uuid::nil();
+        let registration = SyncRootRegistration::new("", "Ironmesh", "C:/ironmesh", cluster_id, None);
         assert!(register_sync_root(&registration).is_err());
 
-        let registration = SyncRootRegistration::new("id", "", "C:/ironmesh");
+        let registration =
+            SyncRootRegistration::new("id", "", "C:/ironmesh", cluster_id, None);
         assert!(register_sync_root(&registration).is_err());
     }
 
