@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod tests {
     use crate::framework::{
-        TEST_ADMIN_TOKEN, fresh_data_dir, https_client_with_root_from_data_dir,
-        issue_bootstrap_bundle, start_authenticated_server,
+        TEST_ADMIN_TOKEN, default_client_identity_path, fresh_data_dir,
+        https_client_with_root_from_data_dir, issue_bootstrap_bundle, start_authenticated_server,
         start_open_server_with_public_https_env, stop_server,
     };
     use crate::framework_win::{pin_cfapi_placeholder, start_cfapi_adapter_with_bootstrap};
@@ -37,8 +37,7 @@ mod tests {
         OPEN_EXISTING, WIN32_FIND_STREAM_DATA,
     };
 
-    const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".ironmesh-connection.json";
-    const DEFAULT_CLIENT_IDENTITY_FILE_NAME: &str = ".ironmesh-client-identity.json";
+    const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "ironmesh-client-bootstrap.json";
 
     struct AuthenticatedCfapiFixture {
         server: crate::framework::ChildGuard,
@@ -49,7 +48,7 @@ mod tests {
 
     async fn start_authenticated_cfapi_fixture(
         bind: &str,
-        sync_root: &Path,
+        _sync_root: &Path,
         label: &str,
     ) -> anyhow::Result<AuthenticatedCfapiFixture> {
         let nonce = bind.replace(['.', ':'], "-");
@@ -62,7 +61,9 @@ mod tests {
             issue_bootstrap_bundle(&http, &base_url, TEST_ADMIN_TOKEN, Some(label), Some(600))
                 .await?;
 
-        let bootstrap_file = sync_root.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+        let client_config_dir = server_data_dir.join("client-config");
+        std::fs::create_dir_all(&client_config_dir)?;
+        let bootstrap_file = client_config_dir.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
         bootstrap.write_to_path(&bootstrap_file)?;
 
         let bootstrap_json = bootstrap.to_json_pretty()?;
@@ -86,7 +87,7 @@ mod tests {
         let identity = enrolled
             .client_identity_material()
             .expect("failed to build client identity material from enrollment response");
-        let client_identity_file = sync_root.join(DEFAULT_CLIENT_IDENTITY_FILE_NAME);
+        let client_identity_file = default_client_identity_path(&bootstrap_file);
         identity
             .write_to_path(&client_identity_file)
             .expect("failed to persist client identity");
@@ -1012,7 +1013,10 @@ mod tests {
                 "ironmesh.systemtest.authenticated.{}",
                 bind.replace(['.', ':'], "_")
             );
-            let bootstrap_file = sync_root.join(".ironmesh-connection.json");
+            let client_config_dir = server_data_dir.join("client-config");
+            std::fs::create_dir_all(&client_config_dir)
+                .expect("failed to create client config dir");
+            let bootstrap_file = client_config_dir.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
             bootstrap
                 .write_to_path(&bootstrap_file)
                 .expect("failed to write bootstrap bundle");
@@ -1025,7 +1029,7 @@ mod tests {
             )
             .await?;
 
-            let client_identity_file = sync_root.join(".ironmesh-client-identity.json");
+            let client_identity_file = default_client_identity_path(&bootstrap_file);
             wait_for_path(&client_identity_file, 120).await;
 
             let client_identity = ClientIdentityMaterial::from_path(&client_identity_file)
@@ -1044,18 +1048,6 @@ mod tests {
                 .expect("failed to write local file for authenticated upload");
             wait_for_remote_payload(&sdk, "authenticated-upload.txt", b"cfapi auth upload", 220)
                 .await;
-            let index = sdk
-                .store_index(None, 64, None)
-                .await
-                .expect("failed to inspect remote index after authenticated upload");
-            assert!(
-                index.entries.iter().all(|entry| {
-                    entry.path != ".ironmesh-client-identity.json"
-                        && entry.path != ".ironmesh-connection.json"
-                }),
-                "internal auth/bootstrap file leaked into remote namespace"
-            );
-
             sdk.put_large_aware(
                 "remote-auth/seeded.txt",
                 Bytes::from_static(b"remote auth payload"),
@@ -1076,6 +1068,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
 
         result.expect("authenticated CFAPI adapter flow failed");
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_adapter_uses_existing_sibling_identity_without_reenrolling() {
+        let bind = "127.0.0.1:19112";
+        let base_url = format!("https://{bind}");
+        let admin_token = "system-tests-admin-secret";
+        let server_data_dir = fresh_data_dir("cfapi-auth-existing-identity-server");
+        let sync_root = fresh_data_dir("cfapi-auth-existing-identity-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let rendezvous_urls = base_url.clone();
+
+        let mut server = start_open_server_with_public_https_env(
+            bind,
+            &server_data_dir,
+            "",
+            1,
+            &[
+                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+                ("IRONMESH_ADMIN_TOKEN", admin_token),
+                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+            ],
+        )
+        .await
+        .expect("failed to start auth-enabled server-node");
+
+        let result = async {
+            let http = https_client_with_root_from_data_dir(&server_data_dir)?;
+            let issued_bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                admin_token,
+                Some("cfapi-existing-identity"),
+                Some(600),
+            )
+            .await?;
+
+            let client_config_dir = server_data_dir.join("client-config-existing-identity");
+            std::fs::create_dir_all(&client_config_dir)
+                .expect("failed to create client config dir");
+            let bootstrap_file = client_config_dir.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+            issued_bootstrap
+                .write_to_path(&bootstrap_file)
+                .expect("failed to write bootstrap bundle");
+
+            let bootstrap_json = issued_bootstrap.to_json_pretty()?;
+            let enrolled = tokio::task::spawn_blocking(move || {
+                enroll_connection_input_blocking(
+                    &bootstrap_json,
+                    None,
+                    Some("cfapi-existing-identity"),
+                )
+            })
+            .await
+            .expect("bootstrap enrollment task should join")?;
+
+            let persisted_bootstrap_json = enrolled
+                .connection_bootstrap_json
+                .clone()
+                .expect("enrollment response should include persisted bootstrap json");
+            let persisted_bootstrap = ConnectionBootstrap::from_json_str(&persisted_bootstrap_json)
+                .expect("failed to parse persisted bootstrap json");
+            let identity = enrolled
+                .client_identity_material()
+                .expect("failed to build client identity material from enrollment response");
+            let client_identity_file = default_client_identity_path(&bootstrap_file);
+            identity
+                .write_to_path(&client_identity_file)
+                .expect("failed to persist sibling client identity");
+
+            let mut bootstrap_with_invalid_pairing = issued_bootstrap.clone();
+            bootstrap_with_invalid_pairing.pairing_token =
+                Some("definitely-invalid-pairing-token".to_string());
+            bootstrap_with_invalid_pairing
+                .write_to_path(&bootstrap_file)
+                .expect("failed to overwrite bootstrap with invalid pairing token");
+
+            let sync_root_id = format!(
+                "ironmesh.systemtest.authenticated.existing.{}",
+                bind.replace(['.', ':'], "_")
+            );
+            let _adapter = start_cfapi_adapter_with_bootstrap(
+                &sync_root_id,
+                "ironmesh System Test Existing Identity Root",
+                &sync_root,
+                500,
+                &bootstrap_file,
+            )
+            .await?;
+
+            let persisted_identity = ClientIdentityMaterial::from_path(&client_identity_file)
+                .expect("failed to reload sibling client identity");
+            let sdk = tokio::task::spawn_blocking(move || {
+                persisted_bootstrap.build_client_with_identity(&persisted_identity)
+            })
+            .await
+            .expect("bootstrap client builder task should join")
+            .expect("failed to build authenticated SDK client from persisted bootstrap");
+
+            let local_file = sync_root.join("existing-identity-upload.txt");
+            std::fs::write(&local_file, b"cfapi existing identity upload")
+                .expect("failed to write local file for authenticated upload");
+            wait_for_remote_payload(
+                &sdk,
+                "existing-identity-upload.txt",
+                b"cfapi existing identity upload",
+                220,
+            )
+            .await;
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = std::fs::remove_dir_all(&server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+
+        result.expect("authenticated CFAPI adapter should reuse existing sibling identity");
     }
 
     #[tokio::test]

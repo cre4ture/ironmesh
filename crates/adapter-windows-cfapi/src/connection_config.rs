@@ -57,7 +57,6 @@ pub fn resolve_connection_config(
 
     if bootstrap_path.exists() {
         let mut bundle = ConnectionBootstrap::from_path(&bootstrap_path)?;
-        let bootstrap_pairing_token = normalize_optional(bundle.pairing_token.as_deref());
         if let Some(server_ca_pem) = direct_ca_pem.as_ref() {
             bundle.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
@@ -70,7 +69,7 @@ pub fn resolve_connection_config(
                 .clone()
                 .or(bundle.trust_roots.public_api_ca_pem.clone()),
             pairing_token: normalize_optional(pairing_token).or(bundle.pairing_token.clone()),
-            force_reenroll: bootstrap_pairing_token.is_some(),
+            force_reenroll: false,
             device_id: normalize_optional(device_id).or(bundle.device_id.clone()),
             device_label: normalize_optional(device_label).or(bundle.device_label.clone()),
             bootstrap_path,
@@ -288,6 +287,59 @@ mod tests {
             Some("https://public.invalid/")
         );
         assert!(resolved.connection_target.starts_with("relay://"));
+
+        let _ = std::fs::remove_file(bootstrap_path);
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn resolve_connection_config_does_not_force_reenroll_for_bootstrap_pairing_token() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-sync-root-no-force-reenroll-{}",
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&sync_root).expect("sync root should exist");
+        let bootstrap_path = default_connection_bootstrap_path(&sync_root);
+        let bootstrap = ConnectionBootstrap {
+            version: 1,
+            cluster_id: Uuid::now_v7(),
+            rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "https://public.example".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(Uuid::new_v4()),
+            }],
+            relay_mode: RelayMode::Fallback,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: Some("pairing-token".to_string()),
+            device_label: Some("existing-device".to_string()),
+            device_id: Some(Uuid::now_v7().to_string()),
+        };
+        bootstrap
+            .write_to_path(&bootstrap_path)
+            .expect("bootstrap should persist");
+
+        let resolved = resolve_connection_config(
+            &sync_root,
+            None,
+            None,
+            Some(&bootstrap_path),
+            None,
+            None,
+            None,
+        )
+        .expect("resolve should succeed");
+
+        assert_eq!(resolved.pairing_token.as_deref(), Some("pairing-token"));
+        assert!(
+            !resolved.force_reenroll,
+            "bootstrap startup should keep existing sibling identities instead of forcing reenrollment"
+        );
 
         let _ = std::fs::remove_file(bootstrap_path);
         let _ = std::fs::remove_dir_all(sync_root);

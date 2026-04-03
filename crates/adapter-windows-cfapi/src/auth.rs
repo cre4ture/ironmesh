@@ -25,12 +25,13 @@ pub struct ClientEnrollmentOptions {
 pub fn resolve_or_enroll_client_identity(
     base_url: Option<&Url>,
     sync_root_path: &Path,
+    bootstrap_file: Option<&Path>,
     options: &ClientEnrollmentOptions,
 ) -> Result<Option<ClientIdentityMaterial>> {
     let identity_file = options
         .client_identity_file
         .clone()
-        .unwrap_or_else(|| default_client_identity_path(sync_root_path));
+        .unwrap_or_else(|| default_client_identity_path(sync_root_path, bootstrap_file));
 
     if identity_file.exists() && !options.force_reenroll {
         return load_client_identity(&identity_file).map(Some);
@@ -55,8 +56,25 @@ pub fn resolve_or_enroll_client_identity(
     Ok(Some(identity))
 }
 
-pub fn default_client_identity_path(sync_root_path: &Path) -> PathBuf {
+pub fn default_client_identity_path(
+    sync_root_path: &Path,
+    bootstrap_file: Option<&Path>,
+) -> PathBuf {
+    if let Some(bootstrap_path) = bootstrap_file {
+        return sibling_client_identity_path(bootstrap_path);
+    }
+
     sync_root_path.join(DEFAULT_CLIENT_IDENTITY_FILE_NAME)
+}
+
+fn sibling_client_identity_path(bootstrap_path: &Path) -> PathBuf {
+    if let Some(stem) = bootstrap_path.file_stem() {
+        let mut file_name = stem.to_os_string();
+        file_name.push(".client-identity.json");
+        return bootstrap_path.with_file_name(file_name);
+    }
+
+    bootstrap_path.with_file_name("ironmesh-client-identity.json")
 }
 
 pub fn is_internal_client_identity_relative_path(path: &str) -> bool {
@@ -153,11 +171,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_client_identity_path_uses_sync_root() {
-        let path = default_client_identity_path(Path::new("C:\\sync-root"));
+    fn default_client_identity_path_uses_sync_root_without_bootstrap_file() {
+        let path = default_client_identity_path(Path::new("C:\\sync-root"), None);
         assert_eq!(
             path,
             Path::new("C:\\sync-root").join(".ironmesh-client-identity.json")
+        );
+    }
+
+    #[test]
+    fn default_client_identity_path_uses_bootstrap_sibling_when_bootstrap_file_is_provided() {
+        let bootstrap_path = Path::new("C:\\config\\ironmesh-client-bootstrap.json");
+        let path = default_client_identity_path(Path::new("C:\\sync-root"), Some(bootstrap_path));
+        assert_eq!(
+            path,
+            Path::new("C:\\config\\ironmesh-client-bootstrap.client-identity.json")
         );
     }
 

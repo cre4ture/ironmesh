@@ -207,6 +207,7 @@ pub fn cli_main() -> anyhow::Result<()> {
             let client_identity = resolve_or_enroll_client_identity(
                 connection.enrollment_base_url.as_ref(),
                 &registration.root_path,
+                args.bootstrap_file.as_deref(),
                 &ClientEnrollmentOptions {
                     cluster_id: connection.cluster_id,
                     pairing_token: connection.pairing_token.clone(),
