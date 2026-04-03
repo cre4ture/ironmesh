@@ -219,6 +219,39 @@ mod tests {
         );
     }
 
+    async fn wait_for_remote_file_absence(sdk: &IronMeshClient, key: &str, retries: usize) {
+        for _ in 0..retries {
+            if sdk.get(key).await.is_err() {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let lingering = sdk
+            .get(key)
+            .await
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        panic!("remote file did not disappear for {key} (last observed size {lingering} bytes)");
+    }
+
+    async fn wait_for_remote_version_graph(
+        sdk: &IronMeshClient,
+        key: &str,
+        retries: usize,
+    ) -> client_sdk::ironmesh_client::VersionGraphSummary {
+        for _ in 0..retries {
+            if let Ok(Some(summary)) = sdk.list_versions(key).await {
+                return summary;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        panic!("remote version graph did not appear for {key}");
+    }
+
     fn placeholder_standard_info_for_file(
         file: &File,
     ) -> anyhow::Result<CF_PLACEHOLDER_STANDARD_INFO> {
@@ -765,6 +798,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
     }
 
+    async fn run_cfapi_remote_file_rename_case(
+        bind: &str,
+        old_key: &str,
+        new_key: &str,
+        payload: &[u8],
+        hydrate_before_rename: bool,
+    ) {
+        let sync_root = fresh_data_dir("cfapi-remote-file-rename-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture = start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-file-rename")
+            .await
+            .expect("failed to start authenticated CFAPI fixture");
+
+        fixture
+            .sdk
+            .put_large_aware(old_key, Bytes::from(payload.to_vec()))
+            .await
+            .expect("failed to seed remote file for rename");
+        let old_versions = fixture
+            .sdk
+            .list_versions(old_key)
+            .await
+            .expect("failed to fetch source version graph before rename")
+            .expect("source version graph should exist before rename");
+        let old_object_id = old_versions.object_id.clone();
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.remote.file.rename.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Remote File Rename Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let old_path = sync_root.join(old_key.replace('/', "\\"));
+        let new_path = sync_root.join(new_key.replace('/', "\\"));
+        wait_for_path(&old_path, 220).await;
+        wait_for_placeholder_in_sync(&old_path, 220).await;
+
+        if hydrate_before_rename {
+            wait_for_hydrated_payload(&old_path, payload, 200).await;
+        } else {
+            request_online_only_via_attrib(&old_path)
+                .expect("failed to request online-only state before rename");
+            wait_for_file_attribute_unpinned(&old_path, 220).await;
+            wait_for_placeholder_dehydrated(&old_path, 220).await;
+        }
+
+        std::fs::rename(&old_path, &new_path).expect("failed to rename cloud-backed file locally");
+        wait_for_path(&new_path, 80).await;
+        wait_for_remote_payload(&fixture.sdk, new_key, payload, 260).await;
+        wait_for_remote_file_absence(&fixture.sdk, old_key, 260).await;
+
+        let new_versions = wait_for_remote_version_graph(&fixture.sdk, new_key, 260).await;
+        assert_eq!(
+            new_versions.object_id, old_object_id,
+            "local rename should preserve remote object identity instead of reuploading"
+        );
+
+        wait_for_hydrated_payload(&new_path, payload, 220).await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
     #[tokio::test]
     async fn test_cfapi_monitor_detects_new_and_modified_file_small() {
         run_cfapi_monitor_case("127.0.0.1:19090", "initial content", "modified content").await;
@@ -972,6 +1077,30 @@ mod tests {
         stop_server(&mut fixture.server).await;
         let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
         let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_dehydrated_in_sync_file_rename_preserves_remote_object_identity() {
+        run_cfapi_remote_file_rename_case(
+            "127.0.0.1:19113",
+            "rename-remote/dehydrated-source.jpg",
+            "rename-remote/dehydrated-target.jpg",
+            b"dehydrated rename payload",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_hydrated_in_sync_file_rename_preserves_remote_object_identity() {
+        run_cfapi_remote_file_rename_case(
+            "127.0.0.1:19114",
+            "rename-remote/hydrated-source.jpg",
+            "rename-remote/hydrated-target.jpg",
+            b"hydrated rename payload",
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]

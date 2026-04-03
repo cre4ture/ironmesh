@@ -7,6 +7,7 @@ use crate::runtime::{
 use anyhow::{Context, Result, anyhow};
 use core::ffi::c_void;
 use std::mem::size_of;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::ptr::{null, null_mut};
@@ -553,6 +554,20 @@ pub(crate) fn open_read_attributes_file(path: &Path) -> std::io::Result<std::fs:
     }
 
     Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
+}
+
+pub(crate) fn local_file_identity_for_path(path: &Path) -> Result<(u32, u64)> {
+    let file = open_read_attributes_file(path)
+        .with_context(|| format!("failed to open {} for local file identity", path.display()))?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("GetFileInformationByHandle failed for {}", path.display()));
+    }
+
+    let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    Ok((info.dwVolumeSerialNumber, file_index))
 }
 
 fn callback_context(callback_info: &CF_CALLBACK_INFO) -> Option<&CallbackContext> {

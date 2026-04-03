@@ -125,6 +125,13 @@ impl Uploader for ServerNodeHydrator {
             .with_context(|| format!("failed to delete remote object for path {path}"))?;
         Ok(())
     }
+
+    fn rename_path(&self, from_path: &str, to_path: &str) -> Result<bool> {
+        self.sdk
+            .rename_path_blocking(from_path, to_path, false)
+            .with_context(|| format!("failed to rename remote object {from_path} -> {to_path}"))?;
+        Ok(true)
+    }
 }
 
 pub fn normalize_base_url(input: &str) -> Result<Url> {

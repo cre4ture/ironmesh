@@ -151,6 +151,10 @@ pub trait Uploader: Send + Sync + 'static {
         length: u64,
     ) -> Result<Option<String>>;
 
+    fn rename_path(&self, _from_path: &str, _to_path: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     fn delete_path(&self, _path: &str) -> Result<()> {
         Ok(())
     }
@@ -197,6 +201,11 @@ impl Uploader for DemoUploader {
     fn delete_path(&self, path: &str) -> Result<()> {
         tracing::info!("demo delete: path={path}");
         Ok(())
+    }
+
+    fn rename_path(&self, from_path: &str, to_path: &str) -> Result<bool> {
+        tracing::info!("demo rename: from_path={from_path} to_path={to_path}");
+        Ok(true)
     }
 }
 

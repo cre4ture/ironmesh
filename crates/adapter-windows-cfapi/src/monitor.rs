@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::windows::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -6,49 +7,90 @@ use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_dehydrate_placeholder_with_oplock, cf_get_placeholder_standard_info,
-    cf_hydrate_placeholder_with_oplock, describe_path_state, open_sync_path, path_is_placeholder,
+    cf_get_placeholder_standard_info_with_identity, cf_hydrate_placeholder_with_oplock,
+    cf_set_in_sync, describe_path_state, open_sync_path, path_is_placeholder,
     path_placeholder_state, try_convert_materialized_file,
 };
+use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
-use crate::helpers::path_to_relative;
+use crate::helpers::{decode_path_from_file_identity, path_to_relative};
 use crate::runtime::Uploader;
-use std::os::windows::fs::MetadataExt;
 use windows_sys::Win32::Storage::CloudFilters::{
     CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
     CF_PLACEHOLDER_STATE_NO_STATES, CF_PLACEHOLDER_STATE_PARTIAL,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_UNPINNED};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LocalFileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
+impl LocalFileIdentity {
+    fn from_path(path: &std::path::Path) -> Option<Self> {
+        let (volume_serial_number, file_index) = local_file_identity_for_path(path).ok()?;
+        Some(Self {
+            volume_serial_number,
+            file_index,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SeenEntry {
     is_dir: bool,
     file_attributes: u32,
+    local_file_identity: Option<LocalFileIdentity>,
+    placeholder_identity_path: Option<String>,
     placeholder_state: Option<PlaceholderSnapshot>,
 }
 
 impl SeenEntry {
-    fn has_pinned_attribute(self) -> bool {
+    fn has_pinned_attribute(&self) -> bool {
         (self.file_attributes & FILE_ATTRIBUTE_PINNED) != 0
     }
 
-    fn has_unpinned_attribute(self) -> bool {
+    fn has_unpinned_attribute(&self) -> bool {
         (self.file_attributes & FILE_ATTRIBUTE_UNPINNED) != 0
     }
 
-    fn to_log_string(self) -> String {
+    fn to_log_string(&self) -> String {
         let placeholder_state = self
             .placeholder_state
             .map(|state| state.to_log_string())
             .unwrap_or_else(|| String::from("none"));
+        let local_file_identity = self
+            .local_file_identity
+            .map(|identity| {
+                format!(
+                    "{:08x}:{:016x}",
+                    identity.volume_serial_number, identity.file_index
+                )
+            })
+            .unwrap_or_else(|| String::from("none"));
+        let placeholder_identity_path = self
+            .placeholder_identity_path
+            .clone()
+            .unwrap_or_else(|| String::from("none"));
         format!(
-            "dir={} attrs=0x{:08x} pinned_attr={} unpinned_attr={} placeholder_probe={}",
+            "dir={} attrs=0x{:08x} pinned_attr={} unpinned_attr={} file_id={} placeholder_identity={} placeholder_probe={}",
             self.is_dir,
             self.file_attributes,
             self.has_pinned_attribute(),
             self.has_unpinned_attribute(),
+            local_file_identity,
+            placeholder_identity_path,
             placeholder_state
         )
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalRenamePair {
+    from_path: String,
+    to_path: String,
+    detection: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,9 +242,13 @@ impl SyncRootMonitor {
 
     pub fn walk(&mut self) {
         let mut current = self.snapshot_entries();
+        let handled_renames = self.handle_local_file_renames(&current);
         let dehydrate_summary = summarize_dehydrate_scan(&current);
         let paths = current.keys().cloned().collect::<Vec<_>>();
         for rel_path in paths {
+            if handled_renames.contains(&rel_path) {
+                continue;
+            }
             let path = self
                 .sync_root
                 .join(rel_path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()));
@@ -210,8 +256,90 @@ impl SyncRootMonitor {
         }
 
         self.log_dehydrate_scan_summary(dehydrate_summary);
-        self.handle_deleted_entries(&current);
+        self.handle_deleted_entries(&current, &handled_renames);
         self.seen = current;
+    }
+
+    fn handle_local_file_renames(
+        &self,
+        current: &HashMap<String, SeenEntry>,
+    ) -> std::collections::HashSet<String> {
+        let rename_pairs = detect_local_file_renames(&self.seen, current);
+        let mut handled_paths = std::collections::HashSet::new();
+
+        for rename in rename_pairs {
+            let full_path = self.sync_root.join(
+                rename
+                    .to_path
+                    .replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()),
+            );
+            tracing::info!(
+                "{}: detected local file rename {} -> {} detection={} state_before={} state_after={}",
+                self.name,
+                rename.from_path,
+                rename.to_path,
+                rename.detection,
+                self.seen
+                    .get(&rename.from_path)
+                    .map(|entry| entry.to_log_string())
+                    .unwrap_or_else(|| String::from("<missing>")),
+                current
+                    .get(&rename.to_path)
+                    .map(|entry| entry.to_log_string())
+                    .unwrap_or_else(|| String::from("<missing>")),
+            );
+
+            match self
+                .uploader
+                .rename_path(&rename.from_path, &rename.to_path)
+            {
+                Ok(true) => {
+                    handled_paths.insert(rename.from_path.clone());
+                    handled_paths.insert(rename.to_path.clone());
+                    tracing::info!(
+                        "{}: remote rename applied {} -> {} raw_state={}",
+                        self.name,
+                        rename.from_path,
+                        rename.to_path,
+                        describe_path_state(&full_path)
+                    );
+                    if let Some(entry) = current.get(&rename.to_path)
+                        && let Err(err) = repair_locally_renamed_materialized_file(
+                            &full_path,
+                            &rename.to_path,
+                            entry,
+                        )
+                    {
+                        tracing::info!(
+                            "{}: failed to repair local renamed file {} after remote rename: {:#} state={}",
+                            self.name,
+                            rename.to_path,
+                            err,
+                            describe_path_state(&full_path)
+                        );
+                    }
+                }
+                Ok(false) => {
+                    tracing::info!(
+                        "{}: uploader declined rename optimization {} -> {}; falling back to upload/delete",
+                        self.name,
+                        rename.from_path,
+                        rename.to_path
+                    );
+                }
+                Err(err) => {
+                    tracing::info!(
+                        "{}: remote rename failed {} -> {}: {:#}; falling back to upload/delete",
+                        self.name,
+                        rename.from_path,
+                        rename.to_path,
+                        err
+                    );
+                }
+            }
+        }
+
+        handled_paths
     }
 
     fn log_dehydrate_scan_summary(&self, summary: DehydrateScanSummary) {
@@ -310,13 +438,14 @@ impl SyncRootMonitor {
         {
             return;
         }
-        let entry = match current.get(&rel_path).copied() {
+        let entry = match current.get(&rel_path) {
             Some(entry) => entry,
             None => return,
         };
-        let previous_entry = self.seen.get(&rel_path).copied();
+        let previous_entry = self.seen.get(&rel_path);
+        let entry_unchanged = previous_entry == Some(entry);
 
-        if previous_entry != Some(entry)
+        if !entry_unchanged
             && (entry.has_unpinned_attribute()
                 || previous_entry.is_some_and(SeenEntry::has_unpinned_attribute)
                 || entry.placeholder_state.is_some()
@@ -339,7 +468,7 @@ impl SyncRootMonitor {
         self.maybe_schedule_placeholder_hydrate(path, &rel_path, previous_entry, entry);
         self.maybe_schedule_placeholder_dehydrate(path, &rel_path, previous_entry, entry);
 
-        if previous_entry == Some(entry) {
+        if entry_unchanged {
             return;
         }
 
@@ -397,8 +526,8 @@ impl SyncRootMonitor {
         &self,
         path: &std::path::Path,
         rel_path: &str,
-        previous_entry: Option<SeenEntry>,
-        entry: SeenEntry,
+        previous_entry: Option<&SeenEntry>,
+        entry: &SeenEntry,
     ) {
         if !entry.has_unpinned_attribute() {
             return;
@@ -511,8 +640,8 @@ impl SyncRootMonitor {
         &self,
         path: &std::path::Path,
         rel_path: &str,
-        previous_entry: Option<SeenEntry>,
-        entry: SeenEntry,
+        previous_entry: Option<&SeenEntry>,
+        entry: &SeenEntry,
     ) {
         if !entry.has_pinned_attribute() {
             return;
@@ -632,7 +761,11 @@ impl SyncRootMonitor {
         });
     }
 
-    fn handle_deleted_entries(&self, current: &HashMap<String, SeenEntry>) {
+    fn handle_deleted_entries(
+        &self,
+        current: &HashMap<String, SeenEntry>,
+        handled_renames: &std::collections::HashSet<String>,
+    ) {
         let mut deleted_paths = self
             .seen
             .iter()
@@ -640,7 +773,7 @@ impl SyncRootMonitor {
                 if current.contains_key(path) {
                     None
                 } else {
-                    Some((path.as_str(), *entry))
+                    Some((path.as_str(), entry.clone()))
                 }
             })
             .collect::<Vec<_>>();
@@ -650,6 +783,14 @@ impl SyncRootMonitor {
             if is_internal_client_identity_relative_path(path)
                 || is_internal_connection_bootstrap_relative_path(path)
             {
+                continue;
+            }
+            if handled_renames.contains(path) {
+                tracing::info!(
+                    "{}: skipping delete handling for renamed path {}",
+                    self.name,
+                    path
+                );
                 continue;
             }
             if entry.is_dir {
@@ -697,16 +838,143 @@ fn directory_marker_path(path: &str) -> String {
     }
 }
 
+fn placeholder_identity_path_for_entry(
+    path: &std::path::Path,
+    is_placeholder: bool,
+) -> Option<String> {
+    if !is_placeholder {
+        return None;
+    }
+
+    let file = open_sync_path(path, false).ok()?;
+    let info = cf_get_placeholder_standard_info_with_identity(&file).ok()?;
+    let file_identity = info.file_identity();
+    if file_identity.is_empty() {
+        return None;
+    }
+
+    decode_path_from_file_identity(file_identity)
+}
+
+fn repair_locally_renamed_materialized_file(
+    path: &std::path::Path,
+    rel_path: &str,
+    entry: &SeenEntry,
+) -> anyhow::Result<()> {
+    if entry.is_dir || path_is_placeholder(path) {
+        return Ok(());
+    }
+
+    let metadata = std::fs::metadata(path)?;
+    try_convert_materialized_file(path, rel_path, &metadata);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    cf_set_in_sync(&file)?;
+    Ok(())
+}
+
+fn detect_local_file_renames(
+    previous: &HashMap<String, SeenEntry>,
+    current: &HashMap<String, SeenEntry>,
+) -> Vec<LocalRenamePair> {
+    let mut pairs = Vec::new();
+    let mut matched_sources = std::collections::HashSet::new();
+    let mut matched_destinations = std::collections::HashSet::new();
+
+    for (to_path, entry) in current {
+        if previous.contains_key(to_path) || entry.is_dir {
+            continue;
+        }
+        let Some(from_path) = entry.placeholder_identity_path.as_deref() else {
+            continue;
+        };
+        if from_path == to_path
+            || matched_sources.contains(from_path)
+            || matched_destinations.contains(to_path)
+            || current.contains_key(from_path)
+        {
+            continue;
+        }
+        if previous
+            .get(from_path)
+            .is_some_and(|candidate| !candidate.is_dir)
+        {
+            matched_sources.insert(from_path.to_string());
+            matched_destinations.insert(to_path.clone());
+            pairs.push(LocalRenamePair {
+                from_path: from_path.to_string(),
+                to_path: to_path.clone(),
+                detection: "placeholder-identity",
+            });
+        }
+    }
+
+    let mut deleted_by_identity: HashMap<LocalFileIdentity, Vec<String>> = HashMap::new();
+    for (from_path, entry) in previous {
+        if current.contains_key(from_path) || entry.is_dir || matched_sources.contains(from_path) {
+            continue;
+        }
+        let Some(identity) = entry.local_file_identity else {
+            continue;
+        };
+        deleted_by_identity
+            .entry(identity)
+            .or_default()
+            .push(from_path.clone());
+    }
+
+    for (to_path, entry) in current {
+        if previous.contains_key(to_path) || entry.is_dir || matched_destinations.contains(to_path)
+        {
+            continue;
+        }
+        let Some(identity) = entry.local_file_identity else {
+            continue;
+        };
+        let Some(from_paths) = deleted_by_identity.get(&identity) else {
+            continue;
+        };
+        if from_paths.len() != 1 {
+            continue;
+        }
+        let from_path = &from_paths[0];
+        if matched_sources.contains(from_path) || current.contains_key(from_path) {
+            continue;
+        }
+
+        matched_sources.insert(from_path.clone());
+        matched_destinations.insert(to_path.clone());
+        pairs.push(LocalRenamePair {
+            from_path: from_path.clone(),
+            to_path: to_path.clone(),
+            detection: "file-index",
+        });
+    }
+
+    pairs.sort_by(|left, right| left.from_path.cmp(&right.from_path));
+    pairs
+}
+
 fn snapshot_entry(path: &std::path::Path, is_dir: bool) -> SeenEntry {
-    let file_attributes = std::fs::metadata(path)
+    let metadata = std::fs::metadata(path).ok();
+    let file_attributes = metadata
+        .as_ref()
         .map(|metadata| metadata.file_attributes())
         .unwrap_or_default();
+    let is_placeholder = !is_dir && path_is_placeholder(path);
     let should_probe = !is_dir
         && ((file_attributes & FILE_ATTRIBUTE_UNPINNED) != 0
             || (file_attributes & FILE_ATTRIBUTE_PINNED) != 0);
     SeenEntry {
         is_dir,
         file_attributes,
+        local_file_identity: (!is_dir)
+            .then(|| LocalFileIdentity::from_path(path))
+            .flatten(),
+        placeholder_identity_path: placeholder_identity_path_for_entry(path, is_placeholder),
         placeholder_state: if !should_probe {
             None
         } else {
@@ -722,7 +990,7 @@ fn summarize_dehydrate_scan(entries: &HashMap<String, SeenEntry>) -> DehydrateSc
         total_entries: entries.len(),
         ..Default::default()
     };
-    for entry in entries.values().copied() {
+    for entry in entries.values() {
         if entry.has_pinned_attribute() {
             summary.pinned_attribute_count += 1;
         }
