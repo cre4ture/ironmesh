@@ -5,6 +5,17 @@ use crate::cfapi::{
     cf_get_placeholder_standard_info_with_identity, cf_report_provider_progress2, cf_set_in_sync,
     cf_set_not_in_sync, describe_path_state, open_sync_path, path_placeholder_state,
 };
+use crate::cfapi_safe_wrap::{
+    CancelFetchDataCallbackParams, CloseCompletionCallbackParams, FetchDataCallbackParams,
+    NotifyDehydrateCallbackParams, NotifyDehydrateCompletionCallbackParams, callback_file_identity,
+    callback_process_log_info, callback_target_session_id,
+    connect_sync_root as cf_connect_sync_root, create_placeholders as cf_create_placeholders,
+    disconnect_sync_root as cf_disconnect_sync_root, empty_fs_metadata,
+    execute_ack_dehydrate as cf_execute_ack_dehydrate,
+    execute_transfer_data_chunk as cf_execute_transfer_data_chunk,
+    execute_transfer_data_failure as cf_execute_transfer_data_failure, string_from_pcwstr,
+    unregister_sync_root as cf_unregister_sync_root,
+};
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
 };
@@ -15,17 +26,25 @@ use crate::helpers::{
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::c_void;
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
+use widestring::U16String;
+use wincs::{
+    HydrationPolicy, HydrationType, PopulationType, Registration, SecurityId, SyncRootId,
+    SyncRootIdBuilder,
+};
 use windows_sys::Win32::Foundation::{
     NTSTATUS, STATUS_CLOUD_FILE_NOT_IN_SYNC, STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
     STATUS_CLOUD_FILE_PINNED, STATUS_CLOUD_FILE_REQUEST_CANCELED, STATUS_CLOUD_FILE_UNSUCCESSFUL,
     STATUS_SUCCESS,
 };
+use windows_sys::Win32::Storage::CloudFilters::*;
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRootRegistration {
@@ -353,51 +372,23 @@ pub fn create_placeholder(sync_root: &std::path::Path, rel_path: &str) -> anyhow
         Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
         FileIdentity: identity.as_ptr().cast::<c_void>(),
         FileIdentityLength: identity.len() as u32,
-        FsMetadata: unsafe { std::mem::zeroed() },
+        FsMetadata: empty_fs_metadata(),
         Result: 0,
         CreateUsn: 0,
     };
-    let hr = unsafe {
-        CfCreatePlaceholders(
-            sync_root
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect::<Vec<u16>>()
-                .as_ptr(),
-            &mut create_info,
-            1,
-            CF_CREATE_FLAG_STOP_ON_ERROR,
-            std::ptr::null_mut(),
-        )
-    };
-    hresult_to_result(hr, "CfCreatePlaceholders (monitor)")
+    let sync_root_utf16 = sync_root
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<u16>>();
+    cf_create_placeholders(
+        &sync_root_utf16,
+        std::slice::from_mut(&mut create_info),
+        CF_CREATE_FLAG_STOP_ON_ERROR,
+        None,
+        "CfCreatePlaceholders (monitor)",
+    )
 }
-pub fn hresult_to_result(hr: i32, operation: &str) -> anyhow::Result<()> {
-    if hr == 0 {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "{} failed with HRESULT 0x{:08x}",
-            operation,
-            hr
-        ))
-    }
-}
-use std::ffi::c_void;
-
-use std::mem::size_of;
-
-use std::path::Path;
-use std::ptr::null;
-
-use widestring::U16String;
-use wincs::{
-    HydrationPolicy, HydrationType, PopulationType, Registration, SecurityId, SyncRootId,
-    SyncRootIdBuilder,
-};
-use windows_sys::Win32::Storage::CloudFilters::*;
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
 
 pub struct SyncRootConnection {
     connection_key: CF_CONNECTION_KEY,
@@ -407,9 +398,7 @@ pub struct SyncRootConnection {
 
 impl Drop for SyncRootConnection {
     fn drop(&mut self) {
-        unsafe {
-            let _ = CfDisconnectSyncRoot(self.connection_key);
-        }
+        cf_disconnect_sync_root(self.connection_key);
         tracing::info!(
             "dropped CFAPI connection with key {}, disconnected from sync root",
             self.connection_key
@@ -417,7 +406,7 @@ impl Drop for SyncRootConnection {
     }
 }
 
-struct CallbackContext {
+pub(crate) struct CallbackContext {
     sync_root: PathBuf,
     runtime: Arc<CfapiRuntime>,
     hydrator: Box<dyn Hydrator>,
@@ -466,7 +455,7 @@ pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
     }
 
     let root_path_utf16 = utf16_path(root_path);
-    let hr = unsafe { CfUnregisterSyncRoot(root_path_utf16.as_ptr()) };
+    let hr = cf_unregister_sync_root(&root_path_utf16);
     if hr == 0 || hr == STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT {
         return Ok(());
     }
@@ -599,17 +588,13 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
 
         let base_path = utf16_path(&base_dir);
         let mut entries_processed = 0u32;
-        let hr = unsafe {
-            CfCreatePlaceholders(
-                base_path.as_ptr(),
-                create_infos.as_mut_ptr(),
-                create_infos.len() as u32,
-                CF_CREATE_FLAG_STOP_ON_ERROR,
-                &mut entries_processed,
-            )
-        };
-
-        let result = hresult_to_result(hr, "CfCreatePlaceholders (apply_action_plan)");
+        let result = cf_create_placeholders(
+            &base_path,
+            &mut create_infos,
+            CF_CREATE_FLAG_STOP_ON_ERROR,
+            Some(&mut entries_processed),
+            "CfCreatePlaceholders (apply_action_plan)",
+        );
         if let Err(err) = &result {
             tracing::info!("apply_action_plan: error creating placeholders: {err}");
             tracing::info!("base_dir={}", base_dir.display());
@@ -1070,50 +1055,7 @@ pub fn connect_sync_root(
         upload_worker,
         upload_debounce,
     });
-
-    let callback_table = vec![
-        CF_CALLBACK_REGISTRATION {
-            Type: CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION,
-            Callback: Some(callback_file_open),
-        },
-        CF_CALLBACK_REGISTRATION {
-            Type: CF_CALLBACK_TYPE_FETCH_DATA,
-            Callback: Some(callback_fetch_data),
-        },
-        CF_CALLBACK_REGISTRATION {
-            Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
-            Callback: Some(callback_cancel_fetch_data),
-        },
-        CF_CALLBACK_REGISTRATION {
-            Type: CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE,
-            Callback: Some(callback_notify_dehydrate),
-        },
-        CF_CALLBACK_REGISTRATION {
-            Type: CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE_COMPLETION,
-            Callback: Some(callback_notify_dehydrate_completion),
-        },
-        CF_CALLBACK_REGISTRATION {
-            Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
-            Callback: Some(callback_file_close_completion),
-        },
-        CF_CALLBACK_REGISTRATION {
-            Type: CF_CALLBACK_TYPE_NONE,
-            Callback: None,
-        },
-    ]
-    .into_boxed_slice();
-
-    let mut connection_key: CF_CONNECTION_KEY = 0;
-    let hr = unsafe {
-        CfConnectSyncRoot(
-            root_path.as_ptr(),
-            callback_table.as_ptr(),
-            (&mut *callback_context as *mut CallbackContext).cast::<c_void>(),
-            CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
-            &mut connection_key,
-        )
-    };
-    hresult_to_result(hr, "CfConnectSyncRoot")?;
+    let (connection_key, callback_table) = cf_connect_sync_root(&root_path, &mut callback_context)?;
 
     tracing::info!(
         "connected to CFAPI callbacks with connection key {}",
@@ -1127,21 +1069,6 @@ pub fn connect_sync_root(
     })
 }
 
-fn string_from_pcwstr(value: windows_sys::core::PCWSTR) -> String {
-    if value.is_null() {
-        return String::new();
-    }
-
-    let mut len = 0usize;
-    unsafe {
-        while *value.add(len) != 0 {
-            len += 1;
-        }
-        let raw = std::slice::from_raw_parts(value, len);
-        String::from_utf16_lossy(raw)
-    }
-}
-
 fn callback_request_identity(callback_info: &CF_CALLBACK_INFO) -> i64 {
     if callback_info.RequestKey != 0 {
         callback_info.RequestKey
@@ -1149,65 +1076,6 @@ fn callback_request_identity(callback_info: &CF_CALLBACK_INFO) -> i64 {
         callback_info.TransferKey
     } else {
         callback_info.FileId
-    }
-}
-
-fn callback_target_session_id(callback_info: &CF_CALLBACK_INFO) -> u32 {
-    if callback_info.ProcessInfo.is_null() {
-        0
-    } else {
-        unsafe { (*callback_info.ProcessInfo).SessionId }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CallbackProcessLogInfo {
-    process_id: u32,
-    image_path: String,
-    package_name: String,
-    application_id: String,
-    command_line: String,
-}
-
-fn callback_process_log_info(callback_info: &CF_CALLBACK_INFO) -> CallbackProcessLogInfo {
-    if callback_info.ProcessInfo.is_null() {
-        return CallbackProcessLogInfo {
-            process_id: 0,
-            image_path: "<unknown>".to_string(),
-            package_name: "<unknown>".to_string(),
-            application_id: "<unknown>".to_string(),
-            command_line: "<unknown>".to_string(),
-        };
-    }
-
-    let process_info = unsafe { &*callback_info.ProcessInfo };
-    let image_path = string_from_pcwstr(process_info.ImagePath);
-    let package_name = string_from_pcwstr(process_info.PackageName);
-    let application_id = string_from_pcwstr(process_info.ApplicationId);
-    let command_line = string_from_pcwstr(process_info.CommandLine);
-
-    CallbackProcessLogInfo {
-        process_id: process_info.ProcessId,
-        image_path: if image_path.is_empty() {
-            "<unknown>".to_string()
-        } else {
-            image_path
-        },
-        package_name: if package_name.is_empty() {
-            "<unknown>".to_string()
-        } else {
-            package_name
-        },
-        application_id: if application_id.is_empty() {
-            "<unknown>".to_string()
-        } else {
-            application_id
-        },
-        command_line: if command_line.is_empty() {
-            "<unknown>".to_string()
-        } else {
-            command_line
-        },
     }
 }
 
@@ -1254,17 +1122,10 @@ fn resolve_relative_path_from_callback(
     {
         relative_path = mapped.clone();
     }
-    if relative_path.is_empty()
-        && !callback_info.FileIdentity.is_null()
-        && callback_info.FileIdentityLength > 0
-    {
-        let file_identity = unsafe {
-            std::slice::from_raw_parts(
-                callback_info.FileIdentity.cast::<u8>(),
-                callback_info.FileIdentityLength as usize,
-            )
-        };
-        if let Some(decoded_path) = decode_path_from_file_identity(file_identity) {
+    if relative_path.is_empty() && !callback_file_identity(callback_info).is_empty() {
+        if let Some(decoded_path) =
+            decode_path_from_file_identity(callback_file_identity(callback_info))
+        {
             relative_path = decoded_path;
         }
     }
@@ -1317,30 +1178,7 @@ fn execute_ack_dehydrate(
     callback_info: &CF_CALLBACK_INFO,
     completion_status: NTSTATUS,
 ) -> Result<()> {
-    let mut op_params = CF_OPERATION_PARAMETERS {
-        ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
-        Anonymous: CF_OPERATION_PARAMETERS_0 {
-            AckDehydrate: CF_OPERATION_PARAMETERS_0_5 {
-                Flags: CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE,
-                CompletionStatus: completion_status,
-                FileIdentity: callback_info.FileIdentity,
-                FileIdentityLength: callback_info.FileIdentityLength,
-            },
-        },
-    };
-
-    let op_info = CF_OPERATION_INFO {
-        StructSize: size_of::<CF_OPERATION_INFO>() as u32,
-        Type: CF_OPERATION_TYPE_ACK_DEHYDRATE,
-        ConnectionKey: callback_info.ConnectionKey,
-        TransferKey: callback_info.TransferKey,
-        CorrelationVector: callback_info.CorrelationVector,
-        SyncStatus: null(),
-        RequestKey: callback_info.RequestKey,
-    };
-
-    let hr = unsafe { CfExecute(&op_info, &mut op_params) };
-    hresult_to_result(hr, "CfExecute(AckDehydrate)")
+    cf_execute_ack_dehydrate(callback_info, completion_status)
 }
 
 struct CfapiTransferWriter<'a> {
@@ -1374,21 +1212,11 @@ impl Write for CfapiTransferWriter<'_> {
     }
 }
 
-unsafe extern "system" fn callback_fetch_data(
-    callback_info: *const CF_CALLBACK_INFO,
-    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+pub(crate) fn handle_callback_fetch_data(
+    callback_info_ref: &CF_CALLBACK_INFO,
+    context: &CallbackContext,
+    fetch_data: FetchDataCallbackParams,
 ) {
-    if callback_info.is_null() || callback_parameters.is_null() {
-        return;
-    }
-
-    let callback_info_ref = unsafe { &*callback_info };
-    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
-    if context_ptr.is_null() {
-        return;
-    }
-    let context = unsafe { &*context_ptr };
-
     let relative_path = match resolve_relative_path_from_callback(callback_info_ref, context) {
         Some(path) => path,
         None => {
@@ -1410,13 +1238,12 @@ unsafe extern "system" fn callback_fetch_data(
         }
     };
 
-    let fetch_data = unsafe { (*callback_parameters).Anonymous.FetchData };
-    let range_start = fetch_data.RequiredFileOffset.max(0) as u64;
-    let range_length = fetch_data.RequiredLength.max(0) as u64;
-    let optional_range_start = fetch_data.OptionalFileOffset.max(0) as u64;
-    let optional_range_length = fetch_data.OptionalLength.max(0) as u64;
+    let range_start = fetch_data.required_file_offset.max(0) as u64;
+    let range_length = fetch_data.required_length.max(0) as u64;
+    let optional_range_start = fetch_data.optional_file_offset.max(0) as u64;
+    let optional_range_length = fetch_data.optional_length.max(0) as u64;
     let request_identity = callback_request_identity(callback_info_ref);
-    let request_kind = describe_fetch_data_request_kind(fetch_data.Flags);
+    let request_kind = describe_fetch_data_request_kind(fetch_data.flags);
     let process_info = callback_process_log_info(callback_info_ref);
     let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
     let already_hydrated_once = context
@@ -1440,13 +1267,13 @@ unsafe extern "system" fn callback_fetch_data(
         process_info.command_line,
         relative_path,
         request_kind,
-        fetch_data.Flags as u32,
+        fetch_data.flags as u32,
         range_start,
         range_length,
         optional_range_start,
         optional_range_length,
-        fetch_data.LastDehydrationReason,
-        fetch_data.LastDehydrationTime
+        fetch_data.last_dehydration_reason,
+        fetch_data.last_dehydration_time
     );
     tracing::info!(
         "cfapi fetch-data begin: request={} transfer={} file_id={} session={} path={} remote_version={} offset={} length={} already_hydrated_once={} upload_debounce={} state={}",
@@ -1556,21 +1383,11 @@ unsafe extern "system" fn callback_fetch_data(
     }
 }
 
-unsafe extern "system" fn callback_cancel_fetch_data(
-    callback_info: *const CF_CALLBACK_INFO,
-    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+pub(crate) fn handle_callback_cancel_fetch_data(
+    callback_info_ref: &CF_CALLBACK_INFO,
+    context: &CallbackContext,
+    cancel: CancelFetchDataCallbackParams,
 ) {
-    if callback_info.is_null() || callback_parameters.is_null() {
-        return;
-    }
-
-    let callback_info_ref = unsafe { &*callback_info };
-    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
-    if context_ptr.is_null() {
-        return;
-    }
-    let context = unsafe { &*context_ptr };
-
     let request_identity = callback_request_identity(callback_info_ref);
     if let Ok(fetch_cancellations) = context.fetch_cancellations.lock()
         && let Some(cancel_flag) = fetch_cancellations.get(&request_identity)
@@ -1578,35 +1395,26 @@ unsafe extern "system" fn callback_cancel_fetch_data(
         cancel_flag.store(true, Ordering::SeqCst);
     }
 
-    let cancel = unsafe { (*callback_parameters).Anonymous.Cancel };
-    let fetch = unsafe { cancel.Anonymous.FetchData };
     let relative_path = resolve_relative_path_from_callback(callback_info_ref, context)
         .unwrap_or_else(|| String::from("<unknown>"));
     tracing::info!(
         "cfapi cancel-fetch-data: path={} offset={} length={}",
         relative_path,
-        fetch.FileOffset,
-        fetch.Length
+        cancel.file_offset,
+        cancel.length
     );
 }
 
-unsafe extern "system" fn callback_notify_dehydrate(
-    callback_info: *const CF_CALLBACK_INFO,
-    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+pub(crate) fn handle_callback_notify_dehydrate(
+    callback_info_ref: &CF_CALLBACK_INFO,
+    context: Option<&CallbackContext>,
+    dehydrate: NotifyDehydrateCallbackParams,
 ) {
-    if callback_info.is_null() || callback_parameters.is_null() {
-        return;
-    }
-
-    let callback_info_ref = unsafe { &*callback_info };
     let request_identity = callback_request_identity(callback_info_ref);
-    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
-    if context_ptr.is_null() {
+    let Some(context) = context else {
         let _ = execute_ack_dehydrate(callback_info_ref, STATUS_CLOUD_FILE_NOT_IN_SYNC);
         return;
-    }
-    let context = unsafe { &*context_ptr };
-    let dehydrate = unsafe { (*callback_parameters).Anonymous.Dehydrate };
+    };
 
     let relative_path = match resolve_relative_path_from_callback(callback_info_ref, context) {
         Some(path) => path,
@@ -1617,8 +1425,8 @@ unsafe extern "system" fn callback_notify_dehydrate(
                 request_identity,
                 normalized_path,
                 callback_info_ref.FileId,
-                dehydrate.Flags,
-                dehydrate.Reason
+                dehydrate.flags,
+                dehydrate.reason
             );
             if let Err(err) =
                 execute_ack_dehydrate(callback_info_ref, STATUS_CLOUD_FILE_NOT_IN_SYNC)
@@ -1672,8 +1480,8 @@ unsafe extern "system" fn callback_notify_dehydrate(
         callback_info_ref.TransferKey,
         callback_info_ref.FileId,
         relative_path,
-        dehydrate.Flags,
-        dehydrate.Reason,
+        dehydrate.flags,
+        dehydrate.reason,
         completion_status as u32,
         describe_path_state(&full_path),
         upload_snapshot.to_log_string()
@@ -1690,26 +1498,16 @@ unsafe extern "system" fn callback_notify_dehydrate(
     }
 }
 
-unsafe extern "system" fn callback_notify_dehydrate_completion(
-    callback_info: *const CF_CALLBACK_INFO,
-    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+pub(crate) fn handle_callback_notify_dehydrate_completion(
+    callback_info_ref: &CF_CALLBACK_INFO,
+    context: &CallbackContext,
+    dehydrate: NotifyDehydrateCompletionCallbackParams,
 ) {
-    if callback_info.is_null() || callback_parameters.is_null() {
-        return;
-    }
-
-    let callback_info_ref = unsafe { &*callback_info };
-    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
-    if context_ptr.is_null() {
-        return;
-    }
-    let context = unsafe { &*context_ptr };
-    let dehydrate = unsafe { (*callback_parameters).Anonymous.DehydrateCompletion };
     let relative_path = resolve_relative_path_from_callback(callback_info_ref, context)
         .unwrap_or_else(|| String::from("<unknown>"));
 
     if relative_path != "<unknown>"
-        && (dehydrate.Flags & CF_CALLBACK_DEHYDRATE_COMPLETION_FLAG_DEHYDRATED) != 0
+        && (dehydrate.flags & CF_CALLBACK_DEHYDRATE_COMPLETION_FLAG_DEHYDRATED) != 0
         && let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock()
     {
         hydrated_paths.remove(&relative_path);
@@ -1725,8 +1523,8 @@ unsafe extern "system" fn callback_notify_dehydrate_completion(
         "cfapi dehydrate-completion: file_id={} path={} flags=0x{:x} reason={} state={} upload_debounce={}",
         callback_info_ref.FileId,
         relative_path,
-        dehydrate.Flags,
-        dehydrate.Reason,
+        dehydrate.flags,
+        dehydrate.reason,
         describe_path_state(&full_path),
         context
             .upload_debounce
@@ -1735,21 +1533,10 @@ unsafe extern "system" fn callback_notify_dehydrate_completion(
     );
 }
 
-unsafe extern "system" fn callback_file_open(
-    callback_info: *const CF_CALLBACK_INFO,
-    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+pub(crate) fn handle_callback_file_open(
+    callback_info_ref: &CF_CALLBACK_INFO,
+    context: &CallbackContext,
 ) {
-    if callback_info.is_null() || callback_parameters.is_null() {
-        return;
-    }
-
-    let callback_info_ref = unsafe { &*callback_info };
-    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
-    if context_ptr.is_null() {
-        return;
-    }
-    let context = unsafe { &*context_ptr };
-
     // Map FileId -> relative path for follow-up callbacks that may not include NormalizedPath.
     let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
     let relative = path_to_relative(&context.sync_root, &normalized_path);
@@ -1760,31 +1547,19 @@ unsafe extern "system" fn callback_file_open(
     }
 }
 
-unsafe extern "system" fn callback_file_close_completion(
-    callback_info: *const CF_CALLBACK_INFO,
-    callback_parameters: *const CF_CALLBACK_PARAMETERS,
+pub(crate) fn handle_callback_file_close_completion(
+    callback_info_ref: &CF_CALLBACK_INFO,
+    context: &CallbackContext,
+    close_completion: CloseCompletionCallbackParams,
 ) {
-    if callback_info.is_null() || callback_parameters.is_null() {
-        tracing::info!("close-completion: null callback_info or callback_parameters");
-        return;
-    }
-
-    let callback_info_ref = unsafe { &*callback_info };
-    let context_ptr = callback_info_ref.CallbackContext as *const CallbackContext;
-    if context_ptr.is_null() {
-        tracing::info!("close-completion: null context ptr");
-        return;
-    }
-    let context = unsafe { &*context_ptr };
     let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
 
-    let close_completion = unsafe { (*callback_parameters).Anonymous.CloseCompletion };
     tracing::info!(
         "close-completion: flags={:x} path={}",
-        close_completion.Flags,
+        close_completion.flags,
         normalized_path
     );
-    if (close_completion.Flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
+    if (close_completion.flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
         tracing::info!("close-completion: file deleted, skipping upload");
         return;
     }
@@ -1865,37 +1640,7 @@ fn execute_transfer_data_chunk(
     offset: u64,
     payload: &[u8],
 ) -> Result<()> {
-    if payload.is_empty() {
-        return Ok(());
-    }
-
-    let transfer_data = CF_OPERATION_PARAMETERS_0_0 {
-        Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-        CompletionStatus: 0,
-        Buffer: payload.as_ptr().cast::<c_void>(),
-        Offset: offset as i64,
-        Length: payload.len() as i64,
-    };
-
-    let mut op_params = CF_OPERATION_PARAMETERS {
-        ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
-        Anonymous: CF_OPERATION_PARAMETERS_0 {
-            TransferData: transfer_data,
-        },
-    };
-
-    let op_info = CF_OPERATION_INFO {
-        StructSize: size_of::<CF_OPERATION_INFO>() as u32,
-        Type: CF_OPERATION_TYPE_TRANSFER_DATA,
-        ConnectionKey: callback_info.ConnectionKey,
-        TransferKey: callback_info.TransferKey,
-        CorrelationVector: callback_info.CorrelationVector,
-        SyncStatus: null(),
-        RequestKey: callback_info.RequestKey,
-    };
-
-    let hr = unsafe { CfExecute(&op_info, &mut op_params) };
-    hresult_to_result(hr, "CfExecute")
+    cf_execute_transfer_data_chunk(callback_info, offset, payload)
 }
 
 fn execute_transfer_data_failure(
@@ -1904,33 +1649,7 @@ fn execute_transfer_data_failure(
     length: u64,
     completion_status: NTSTATUS,
 ) -> Result<()> {
-    let transfer_data = CF_OPERATION_PARAMETERS_0_0 {
-        Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-        CompletionStatus: completion_status,
-        Buffer: null(),
-        Offset: offset as i64,
-        Length: length as i64,
-    };
-
-    let mut op_params = CF_OPERATION_PARAMETERS {
-        ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
-        Anonymous: CF_OPERATION_PARAMETERS_0 {
-            TransferData: transfer_data,
-        },
-    };
-
-    let op_info = CF_OPERATION_INFO {
-        StructSize: size_of::<CF_OPERATION_INFO>() as u32,
-        Type: CF_OPERATION_TYPE_TRANSFER_DATA,
-        ConnectionKey: callback_info.ConnectionKey,
-        TransferKey: callback_info.TransferKey,
-        CorrelationVector: callback_info.CorrelationVector,
-        SyncStatus: null(),
-        RequestKey: callback_info.RequestKey,
-    };
-
-    let hr = unsafe { CfExecute(&op_info, &mut op_params) };
-    hresult_to_result(hr, "CfExecute(TransferDataFailure)")
+    cf_execute_transfer_data_failure(callback_info, offset, length, completion_status)
 }
 
 fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {

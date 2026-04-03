@@ -1,32 +1,21 @@
-use crate::helpers::{encode_placeholder_file_identity, hresult_nonneg, utf16_path};
+use crate::cfapi_safe_wrap::{
+    convert_to_placeholder, hydrate_placeholder_hresult, open_read_attributes_file,
+    path_placeholder_state_from_find, read_placeholder_standard_info, report_provider_progress2,
+    set_in_sync_state, set_pin_state, update_placeholder, update_placeholder_hresult,
+    with_cf_oplock_handle,
+};
+use crate::helpers::{encode_placeholder_file_identity, hresult_nonneg};
 use anyhow::{Context, Result};
-use core::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
-use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Storage::CloudFilters::{
-    CF_CONNECTION_KEY, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO, CF_PLACEHOLDER_STATE,
-    CF_PLACEHOLDER_STATE_PLACEHOLDER, CF_SET_PIN_FLAGS,
+    CF_CONNECTION_KEY, CF_FILE_RANGE, CF_PIN_STATE, CF_PLACEHOLDER_STANDARD_INFO,
+    CF_PLACEHOLDER_STATE, CF_PLACEHOLDER_STATE_PLACEHOLDER, CF_SET_PIN_FLAGS,
+    CF_UPDATE_FLAG_DEHYDRATE, CF_UPDATE_FLAG_MARK_IN_SYNC,
 };
-
-struct ProtectedCfHandle(windows_sys::Win32::Foundation::HANDLE);
-
-impl ProtectedCfHandle {
-    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
-        self.0
-    }
-}
-
-impl Drop for ProtectedCfHandle {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Storage::CloudFilters::CfCloseHandle(self.0);
-        }
-    }
-}
 
 pub struct PlaceholderStandardInfo {
     info: CF_PLACEHOLDER_STANDARD_INFO,
@@ -34,10 +23,7 @@ pub struct PlaceholderStandardInfo {
 }
 
 impl PlaceholderStandardInfo {
-    fn from_raw(raw: Vec<u8>) -> Self {
-        let info = unsafe {
-            std::ptr::read_unaligned(raw.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>())
-        };
+    fn from_parts(info: CF_PLACEHOLDER_STANDARD_INFO, raw: Vec<u8>) -> Self {
         Self { info, raw }
     }
 
@@ -67,50 +53,22 @@ pub fn cf_convert_to_placeholder_with_identity(
     file: &std::fs::File,
     file_identity: Option<&[u8]>,
 ) -> Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::CfConvertToPlaceholder;
-
-    let file_identity = file_identity.unwrap_or(&[]);
-    let hr = unsafe {
-        CfConvertToPlaceholder(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            if file_identity.is_empty() {
-                std::ptr::null()
-            } else {
-                file_identity.as_ptr().cast::<c_void>()
-            },
-            file_identity.len() as u32,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    hresult_nonneg(hr, "CfConvertToPlaceholder")
+    convert_to_placeholder(
+        file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+        file_identity,
+    )
 }
 
 pub fn cf_update_placeholder_file_identity(
     file: &std::fs::File,
     file_identity: &[u8],
 ) -> Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::CfUpdatePlaceholder;
-
-    let hr = unsafe {
-        CfUpdatePlaceholder(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            std::ptr::null(),
-            if file_identity.is_empty() {
-                std::ptr::null()
-            } else {
-                file_identity.as_ptr().cast::<c_void>()
-            },
-            file_identity.len() as u32,
-            std::ptr::null(),
-            0,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    hresult_nonneg(hr, "CfUpdatePlaceholder")
+    update_placeholder(
+        file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+        file_identity,
+        None,
+        0,
+    )
 }
 
 pub fn cf_ensure_placeholder_identity(file: &std::fs::File, relative_path: &str) -> Result<()> {
@@ -168,19 +126,11 @@ pub fn cf_set_in_sync_state(
     in_sync_state: windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE,
     in_sync_usn: Option<&mut i64>,
 ) -> Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::{CF_SET_IN_SYNC_FLAG_NONE, CfSetInSyncState};
-
-    let hr = unsafe {
-        CfSetInSyncState(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            in_sync_state,
-            CF_SET_IN_SYNC_FLAG_NONE,
-            in_sync_usn
-                .map(|value| value as *mut i64)
-                .unwrap_or(std::ptr::null_mut()),
-        )
-    };
-    hresult_nonneg(hr, "CfSetInSyncState")
+    set_in_sync_state(
+        file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+        in_sync_state,
+        in_sync_usn,
+    )
 }
 
 pub fn cf_set_pin_state(
@@ -188,32 +138,17 @@ pub fn cf_set_pin_state(
     pin_state: CF_PIN_STATE,
     pin_flags: CF_SET_PIN_FLAGS,
 ) -> Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::CfSetPinState;
-
-    let hr = unsafe {
-        CfSetPinState(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            pin_state,
-            pin_flags,
-            std::ptr::null_mut(),
-        )
-    };
-    hresult_nonneg(hr, "CfSetPinState")
+    set_pin_state(
+        file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+        pin_state,
+        pin_flags,
+    )
 }
 
 pub fn cf_hydrate_placeholder(file: &std::fs::File) -> Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::{CF_HYDRATE_FLAG_NONE, CfHydratePlaceholder};
-
     tracing::info!("cfapi hydrate-placeholder: issuing CfHydratePlaceholder");
-    let hr = unsafe {
-        CfHydratePlaceholder(
-            file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-            0,
-            -1,
-            CF_HYDRATE_FLAG_NONE,
-            std::ptr::null_mut(),
-        )
-    };
+    let hr =
+        hydrate_placeholder_hresult(file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE);
     tracing::info!(
         "cfapi hydrate-placeholder: CfHydratePlaceholder returned HRESULT 0x{:08x}",
         hr as u32
@@ -223,110 +158,81 @@ pub fn cf_hydrate_placeholder(file: &std::fs::File) -> Result<()> {
 
 pub fn cf_hydrate_placeholder_with_oplock(path: &Path) -> Result<()> {
     use windows_sys::Win32::Storage::CloudFilters::{
-        CF_HYDRATE_FLAG_NONE, CF_OPEN_FILE_FLAG_EXCLUSIVE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-        CfHydratePlaceholder,
+        CF_OPEN_FILE_FLAG_EXCLUSIVE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
     };
 
     tracing::info!(
         "cfapi hydrate-placeholder: opening protected oplock handle path={}",
         path.display()
     );
-    let protected_handle = cf_open_file_with_oplock(
+    let result = with_cf_oplock_handle(
         path,
         CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-    )?;
-
-    tracing::info!("cfapi hydrate-placeholder: issuing CfHydratePlaceholder via oplock handle");
-    let hr = unsafe {
-        CfHydratePlaceholder(
-            protected_handle.raw(),
-            0,
-            -1,
-            CF_HYDRATE_FLAG_NONE,
-            std::ptr::null_mut(),
-        )
-    };
-    tracing::info!(
-        "cfapi hydrate-placeholder: CfHydratePlaceholder via oplock handle returned HRESULT 0x{:08x}",
-        hr as u32
+        |handle| {
+            tracing::info!(
+                "cfapi hydrate-placeholder: issuing CfHydratePlaceholder via oplock handle"
+            );
+            let hr = hydrate_placeholder_hresult(handle);
+            tracing::info!(
+                "cfapi hydrate-placeholder: CfHydratePlaceholder via oplock handle returned HRESULT 0x{:08x}",
+                hr as u32
+            );
+            hresult_nonneg(hr, "CfHydratePlaceholder")
+        },
     );
-    hresult_nonneg(hr, "CfHydratePlaceholder")
-}
-
-fn cf_open_file_with_oplock(
-    path: &Path,
-    flags: windows_sys::Win32::Storage::CloudFilters::CF_OPEN_FILE_FLAGS,
-) -> Result<ProtectedCfHandle> {
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::CloudFilters::CfOpenFileWithOplock;
-
-    let wide_path = utf16_path(path);
-    let mut protected_handle = INVALID_HANDLE_VALUE;
-    let hr = unsafe { CfOpenFileWithOplock(wide_path.as_ptr(), flags, &mut protected_handle) };
-    hresult_nonneg(hr, "CfOpenFileWithOplock")?;
-    Ok(ProtectedCfHandle(protected_handle))
+    result
 }
 
 pub fn cf_dehydrate_placeholder_with_oplock(path: &Path, relative_path: &str) -> Result<()> {
     use windows_sys::Win32::Storage::CloudFilters::{
-        CF_FILE_RANGE, CF_OPEN_FILE_FLAG_EXCLUSIVE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-        CF_UPDATE_FLAG_DEHYDRATE, CF_UPDATE_FLAG_MARK_IN_SYNC, CfUpdatePlaceholder,
+        CF_OPEN_FILE_FLAG_EXCLUSIVE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
     };
 
     tracing::info!(
         "cfapi dehydrate-placeholder: opening protected oplock handle for CfUpdatePlaceholder path={}",
         path.display()
     );
-    let protected_handle = cf_open_file_with_oplock(
+    with_cf_oplock_handle(
         path,
         CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-    )?;
-    let placeholder_info = cf_get_placeholder_standard_info_for_handle(protected_handle.raw())
-        .with_context(|| {
-            format!(
-                "reading placeholder info before CfUpdatePlaceholder for {}",
-                path.display()
-            )
-        })?;
-    let synthesized_identity;
-    let file_identity = if placeholder_info.file_identity().is_empty() {
-        synthesized_identity = encode_placeholder_file_identity(relative_path, None);
-        synthesized_identity.as_slice()
-    } else {
-        placeholder_info.file_identity()
-    };
-    let dehydrate_range = CF_FILE_RANGE {
-        StartingOffset: 0,
-        Length: placeholder_info.info().OnDiskDataSize,
-    };
-
-    tracing::info!(
-        "cfapi dehydrate-placeholder: issuing CfUpdatePlaceholder with CF_UPDATE_FLAG_DEHYDRATE via oplock handle identity_len={} dehydrate_length={}",
-        file_identity.len(),
-        dehydrate_range.Length
-    );
-    let hr = unsafe {
-        CfUpdatePlaceholder(
-            protected_handle.raw(),
-            std::ptr::null(),
-            if file_identity.is_empty() {
-                std::ptr::null()
+        |handle| {
+            let placeholder_info = cf_get_placeholder_standard_info_for_handle(handle)
+                .with_context(|| {
+                    format!(
+                        "reading placeholder info before CfUpdatePlaceholder for {}",
+                        path.display()
+                    )
+                })?;
+            let synthesized_identity;
+            let file_identity = if placeholder_info.file_identity().is_empty() {
+                synthesized_identity = encode_placeholder_file_identity(relative_path, None);
+                synthesized_identity.as_slice()
             } else {
-                file_identity.as_ptr().cast::<c_void>()
-            },
-            file_identity.len() as u32,
-            &dehydrate_range,
-            1,
-            CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_DEHYDRATE,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    tracing::info!(
-        "cfapi dehydrate-placeholder: CfUpdatePlaceholder via oplock handle returned HRESULT 0x{:08x}",
-        hr as u32
-    );
-    hresult_nonneg(hr, "CfUpdatePlaceholder")
+                placeholder_info.file_identity()
+            };
+            let dehydrate_range = CF_FILE_RANGE {
+                StartingOffset: 0,
+                Length: placeholder_info.info().OnDiskDataSize,
+            };
+
+            tracing::info!(
+                "cfapi dehydrate-placeholder: issuing CfUpdatePlaceholder with CF_UPDATE_FLAG_DEHYDRATE via oplock handle identity_len={} dehydrate_length={}",
+                file_identity.len(),
+                dehydrate_range.Length
+            );
+            let hr = update_placeholder_hresult(
+                handle,
+                file_identity,
+                Some(std::slice::from_ref(&dehydrate_range)),
+                CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_DEHYDRATE,
+            );
+            tracing::info!(
+                "cfapi dehydrate-placeholder: CfUpdatePlaceholder via oplock handle returned HRESULT 0x{:08x}",
+                hr as u32
+            );
+            hresult_nonneg(hr, "CfUpdatePlaceholder")
+        },
+    )
 }
 
 pub fn cf_report_provider_progress2(
@@ -337,53 +243,21 @@ pub fn cf_report_provider_progress2(
     provider_progress_completed: i64,
     target_session_id: u32,
 ) -> Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::CfReportProviderProgress2;
-
-    let hr = unsafe {
-        CfReportProviderProgress2(
-            connection_key,
-            transfer_key,
-            request_key,
-            provider_progress_total,
-            provider_progress_completed,
-            target_session_id,
-        )
-    };
-    hresult_nonneg(hr, "CfReportProviderProgress2")
+    report_provider_progress2(
+        connection_key,
+        transfer_key,
+        request_key,
+        provider_progress_total,
+        provider_progress_completed,
+        target_session_id,
+    )
 }
 
 fn cf_get_placeholder_standard_info_for_handle(
     handle: windows_sys::Win32::Foundation::HANDLE,
 ) -> Result<PlaceholderStandardInfo> {
-    use windows_sys::Win32::Storage::CloudFilters::{
-        CF_PLACEHOLDER_INFO_STANDARD, CF_PLACEHOLDER_STANDARD_INFO, CfGetPlaceholderInfo,
-    };
-
-    const HRESULT_MORE_DATA: i32 = 0x800700EAu32 as i32;
-
-    let mut buffer_len = 4096usize.max(size_of::<CF_PLACEHOLDER_STANDARD_INFO>());
-    loop {
-        let mut info_buf = vec![0u8; buffer_len];
-        let mut returned = 0u32;
-        let hr_info = unsafe {
-            CfGetPlaceholderInfo(
-                handle,
-                CF_PLACEHOLDER_INFO_STANDARD,
-                info_buf.as_mut_ptr().cast::<c_void>(),
-                info_buf.len() as u32,
-                &mut returned,
-            )
-        };
-
-        if hr_info == HRESULT_MORE_DATA && returned as usize > info_buf.len() {
-            buffer_len = returned as usize;
-            continue;
-        }
-
-        hresult_nonneg(hr_info, "CfGetPlaceholderInfo")?;
-        info_buf.truncate((returned as usize).max(size_of::<CF_PLACEHOLDER_STANDARD_INFO>()));
-        return Ok(PlaceholderStandardInfo::from_raw(info_buf));
-    }
+    let (info, raw) = read_placeholder_standard_info(handle)?;
+    Ok(PlaceholderStandardInfo::from_parts(info, raw))
 }
 
 pub fn cf_get_placeholder_standard_info(
@@ -435,25 +309,7 @@ pub fn is_placeholder(file: &std::fs::File) -> bool {
 }
 
 pub fn path_placeholder_state(path: &Path) -> Result<CF_PLACEHOLDER_STATE> {
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::CloudFilters::CfGetPlaceholderStateFromAttributeTag;
-    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
-
-    let wide_path = utf16_path(path);
-    let mut find_data = WIN32_FIND_DATAW::default();
-    let handle = unsafe { FindFirstFileW(wide_path.as_ptr(), &mut find_data) };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("FindFirstFileW failed for {}", path.display()));
-    }
-
-    let state = unsafe {
-        CfGetPlaceholderStateFromAttributeTag(find_data.dwFileAttributes, find_data.dwReserved0)
-    };
-    unsafe {
-        FindClose(handle);
-    }
-    Ok(state)
+    path_placeholder_state_from_find(path)
 }
 
 pub fn path_is_placeholder(path: &Path) -> bool {
@@ -463,11 +319,7 @@ pub fn path_is_placeholder(path: &Path) -> bool {
 }
 
 pub fn open_sync_path(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
     if write {
         let mut options = std::fs::OpenOptions::new();
@@ -478,24 +330,7 @@ pub fn open_sync_path(path: &Path, write: bool) -> std::io::Result<std::fs::File
         return options.open(path);
     }
 
-    let wide_path = utf16_path(path);
-    let handle = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
-    Ok(file)
+    open_read_attributes_file(path)
 }
 
 pub fn describe_path_state(path: &Path) -> String {
