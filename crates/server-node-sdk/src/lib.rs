@@ -127,8 +127,9 @@ use storage::{
     MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
     MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
     PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
-    ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo, StorageStatsSample,
-    StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
+    ReconcileVersionEntry, RepairAttemptRecord, ReplicationChunkInfo,
+    SnapshotRestoreMutationResult, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH,
+    UploadChunkRef, VersionConsistencyState,
 };
 #[derive(Clone)]
 struct ServerState {
@@ -3554,6 +3555,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
             put(put_object)
@@ -3771,6 +3773,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
         .route("/store/copy", post(copy_object_path))
+        .route("/store/restore", post(restore_snapshot_path))
         .route(
             "/store/{key}",
             put(put_object)
@@ -5793,6 +5796,17 @@ struct PathMutationRequest {
     overwrite: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct SnapshotRestoreRequest {
+    snapshot: String,
+    from_path: String,
+    to_path: String,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    overwrite: bool,
+}
+
 fn should_trigger_autonomous_post_write_replication(
     autonomous_replication_on_put_enabled: bool,
     internal_replication: bool,
@@ -5995,6 +6009,100 @@ async fn copy_object_path(
                 to_path = %request.to_path,
                 error = %err,
                 "failed to copy object path"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn restore_snapshot_path(
+    State(state): State<ServerState>,
+    Json(request): Json<SnapshotRestoreRequest>,
+) -> Response {
+    if request.snapshot.trim().is_empty()
+        || request.from_path.trim().is_empty()
+        || request.to_path.trim().is_empty()
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let started = Instant::now();
+    info!(
+        snapshot = %request.snapshot,
+        from_path = %request.from_path,
+        to_path = %request.to_path,
+        recursive = request.recursive,
+        overwrite = request.overwrite,
+        "snapshot restore request start"
+    );
+    let mut store = lock_store(&state, "store_path.restore").await;
+    let store_lock_wait_ms = store.waited_ms();
+    let store_started = Instant::now();
+    match store
+        .restore_snapshot_path(
+            &request.snapshot,
+            &request.from_path,
+            &request.to_path,
+            request.recursive,
+            request.overwrite,
+        )
+        .await
+    {
+        Ok(SnapshotRestoreMutationResult::Applied(report)) => {
+            info!(
+                snapshot = %request.snapshot,
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                recursive = request.recursive,
+                restored_count = report.restored_count,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "snapshot restore applied; publishing namespace change"
+            );
+            drop(store);
+            publish_namespace_change(&state);
+            request_local_availability_refresh(&state);
+            (StatusCode::OK, Json(report)).into_response()
+        }
+        Ok(SnapshotRestoreMutationResult::SourceMissing) => {
+            info!(
+                snapshot = %request.snapshot,
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                recursive = request.recursive,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "snapshot restore source missing"
+            );
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Ok(SnapshotRestoreMutationResult::TargetExists { path }) => {
+            info!(
+                snapshot = %request.snapshot,
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                recursive = request.recursive,
+                conflict_path = %path,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "snapshot restore target exists"
+            );
+            StatusCode::CONFLICT.into_response()
+        }
+        Err(err) => {
+            tracing::error!(
+                snapshot = %request.snapshot,
+                from_path = %request.from_path,
+                to_path = %request.to_path,
+                recursive = request.recursive,
+                store_lock_wait_ms,
+                store_elapsed_ms = store_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                error = %err,
+                "failed to restore snapshot path"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }

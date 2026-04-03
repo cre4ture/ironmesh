@@ -365,6 +365,24 @@ struct PathMutationRequest {
     overwrite: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct SnapshotRestoreRequest {
+    snapshot: String,
+    from_path: String,
+    to_path: String,
+    recursive: bool,
+    overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRestoreResponse {
+    pub snapshot_id: String,
+    pub source_path: String,
+    pub target_path: String,
+    pub recursive: bool,
+    pub restored_count: usize,
+}
+
 impl IronMeshClient {
     pub fn from_direct_base_url(server_base_url: impl Into<String>) -> Self {
         Self::from_direct_http_client(server_base_url, HttpClient::new())
@@ -681,6 +699,57 @@ impl IronMeshClient {
             StatusCode::CONFLICT => bail!("copy target path already exists: {to_path}"),
             status => Err(anyhow!(
                 "copy failed for {from_path} -> {to_path}: {status}"
+            )),
+        }
+    }
+
+    pub async fn restore_path_from_snapshot(
+        &self,
+        snapshot: impl Into<String>,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        recursive: bool,
+        overwrite: bool,
+    ) -> Result<SnapshotRestoreResponse> {
+        let snapshot = snapshot.into();
+        let from_path = from_path.into();
+        let to_path = to_path.into();
+        let url = self.store_restore_url()?;
+        let payload = serde_json::to_vec(&SnapshotRestoreRequest {
+            snapshot: snapshot.clone(),
+            from_path: from_path.clone(),
+            to_path: to_path.clone(),
+            recursive,
+            overwrite,
+        })
+        .context("failed to encode snapshot restore request")?;
+
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                url,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to restore snapshot={} path {} -> {}",
+                    snapshot, from_path, to_path
+                )
+            })?;
+
+        match response.status {
+            StatusCode::OK => serde_json::from_slice::<SnapshotRestoreResponse>(&response.body)
+                .context("failed to parse snapshot restore response"),
+            StatusCode::NOT_FOUND => {
+                bail!("snapshot restore source path not found in snapshot={snapshot}: {from_path}")
+            }
+            StatusCode::CONFLICT => {
+                bail!("snapshot restore target path already exists: {to_path}")
+            }
+            status => Err(anyhow!(
+                "snapshot restore failed for {from_path} -> {to_path}: {status}"
             )),
         }
     }
@@ -2076,6 +2145,21 @@ impl IronMeshClient {
                 .map_err(|_| anyhow!("server URL cannot be a base"))?;
             segments.push("store");
             segments.push("delete");
+        }
+
+        Ok(url)
+    }
+
+    fn store_restore_url(&self) -> Result<Url> {
+        let mut url = reqwest::Url::parse(self.server_base_url())
+            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("restore");
         }
 
         Ok(url)

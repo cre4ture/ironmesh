@@ -4,10 +4,10 @@
 mod tests {
     use crate::framework::{
         ChildGuard, EnrolledTestClient, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
-        issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client, lock_test_resources,
-        run_cli, start_authenticated_server, start_open_server_with_env, start_rendezvous_service,
-        stop_server, tcp_resource_key, wait_for_rendezvous_registered_endpoints,
-        wait_for_url_status,
+        issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client,
+        latest_snapshot_id_for_client, lock_test_resources, run_cli, start_authenticated_server,
+        start_open_server_with_env, start_rendezvous_service, stop_server, tcp_resource_key,
+        wait_for_rendezvous_registered_endpoints, wait_for_url_status,
     };
     use anyhow::{Context, Result};
     use client_sdk::BootstrapEndpointUse;
@@ -182,6 +182,61 @@ mod tests {
             .error_for_status()?;
 
         Ok(())
+    }
+
+    async fn get_text_via_web(
+        client: &reqwest::Client,
+        web_base: &str,
+        key: &str,
+    ) -> Result<String> {
+        let response: serde_json::Value = client
+            .get(format!("{web_base}/api/store/get"))
+            .query(&[("key", key)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        response
+            .get("value")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+            .context("store get response missing string value")
+    }
+
+    async fn list_store_paths_via_web(
+        client: &reqwest::Client,
+        web_base: &str,
+        prefix: &str,
+        depth: usize,
+    ) -> Result<Vec<String>> {
+        let response: serde_json::Value = client
+            .get(format!("{web_base}/api/store/list"))
+            .query(&[
+                ("prefix", prefix),
+                ("depth", &depth.to_string()),
+                ("view", "raw"),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let mut paths = response
+            .get("entries")
+            .and_then(|value| value.as_array())
+            .context("store list response missing entries")?
+            .iter()
+            .filter(|entry| {
+                entry.get("entry_type").and_then(|value| value.as_str()) != Some("prefix")
+            })
+            .filter_map(|entry| entry.get("path").and_then(|value| value.as_str()))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        paths.sort();
+        Ok(paths)
     }
 
     async fn start_web_backend_with_args(bind: &str, cli_args: &[&str]) -> Result<ChildGuard> {
@@ -862,6 +917,239 @@ mod tests {
             assert_eq!(get_deleted.status(), StatusCode::BAD_GATEWAY);
 
             assert!(upstream_client.get(delete_key).await.is_err());
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn web_ui_backend_restore_supports_file_directory_subdir_and_nested_file() -> Result<()> {
+        let server_bind = "127.0.0.1:19422";
+        let web_bind = "127.0.0.1:19423";
+        let web_base = format!("http://{web_bind}");
+        let client = reqwest::Client::new();
+
+        let (mut server, mut web, enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-restore-server",
+            "web-ui-restore-client",
+        )
+        .await?;
+        let upstream_client = enrolled.build_client_async().await?;
+
+        let result = async {
+            for (key, value) in [
+                ("tree/root.txt", "root-v1"),
+                ("tree/sub/inner.txt", "inner-v1"),
+                ("tree/sub/deeper/leaf.txt", "leaf-v1"),
+            ] {
+                client
+                    .post(format!("{web_base}/api/store/put"))
+                    .json(&serde_json::json!({
+                        "key": key,
+                        "value": value,
+                    }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            let snapshot_id = latest_snapshot_id_for_client(&upstream_client).await?;
+
+            for (key, value) in [
+                ("tree/root.txt", "root-v2"),
+                ("tree/sub/inner.txt", "inner-v2"),
+                ("tree/sub/deeper/leaf.txt", "leaf-v2"),
+            ] {
+                client
+                    .post(format!("{web_base}/api/store/put"))
+                    .json(&serde_json::json!({
+                        "key": key,
+                        "value": value,
+                    }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            let file_restore: serde_json::Value = client
+                .post(format!("{web_base}/api/store/restore"))
+                .json(&serde_json::json!({
+                    "snapshot": snapshot_id,
+                    "source_path": "tree/root.txt",
+                    "target_path": "tree/root.txt",
+                    "recursive": false,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                file_restore
+                    .get("snapshot")
+                    .and_then(|value| value.as_str()),
+                Some(snapshot_id.as_str())
+            );
+            assert_eq!(
+                file_restore
+                    .get("source_path")
+                    .and_then(|value| value.as_str()),
+                Some("tree/root.txt")
+            );
+            assert_eq!(
+                file_restore
+                    .get("target_path")
+                    .and_then(|value| value.as_str()),
+                Some("tree/root.txt")
+            );
+            assert_eq!(
+                file_restore
+                    .get("recursive")
+                    .and_then(|value| value.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                file_restore
+                    .get("restored_count")
+                    .and_then(|value| value.as_u64()),
+                Some(1)
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "tree/root.txt").await?,
+                "root-v1"
+            );
+            assert_eq!(
+                std::str::from_utf8(&upstream_client.get("tree/root.txt").await?)?,
+                "root-v1"
+            );
+
+            let directory_restore: serde_json::Value = client
+                .post(format!("{web_base}/api/store/restore"))
+                .json(&serde_json::json!({
+                    "snapshot": snapshot_id,
+                    "source_path": "tree/",
+                    "target_path": "restored/tree/",
+                    "recursive": true,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                directory_restore
+                    .get("target_path")
+                    .and_then(|value| value.as_str()),
+                Some("restored/tree/")
+            );
+            assert_eq!(
+                directory_restore
+                    .get("restored_count")
+                    .and_then(|value| value.as_u64()),
+                Some(3)
+            );
+            assert_eq!(
+                list_store_paths_via_web(&client, &web_base, "restored/tree", 8).await?,
+                vec![
+                    "restored/tree/root.txt".to_string(),
+                    "restored/tree/sub/deeper/leaf.txt".to_string(),
+                    "restored/tree/sub/inner.txt".to_string(),
+                ]
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "restored/tree/root.txt").await?,
+                "root-v1"
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "restored/tree/sub/inner.txt").await?,
+                "inner-v1"
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "restored/tree/sub/deeper/leaf.txt").await?,
+                "leaf-v1"
+            );
+
+            let subdir_restore: serde_json::Value = client
+                .post(format!("{web_base}/api/store/restore"))
+                .json(&serde_json::json!({
+                    "snapshot": snapshot_id,
+                    "source_path": "tree/sub/",
+                    "target_path": "restored/sub/",
+                    "recursive": true,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                subdir_restore
+                    .get("target_path")
+                    .and_then(|value| value.as_str()),
+                Some("restored/sub/")
+            );
+            assert_eq!(
+                subdir_restore
+                    .get("restored_count")
+                    .and_then(|value| value.as_u64()),
+                Some(2)
+            );
+            assert_eq!(
+                list_store_paths_via_web(&client, &web_base, "restored/sub", 8).await?,
+                vec![
+                    "restored/sub/deeper/leaf.txt".to_string(),
+                    "restored/sub/inner.txt".to_string(),
+                ]
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "restored/sub/inner.txt").await?,
+                "inner-v1"
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "restored/sub/deeper/leaf.txt").await?,
+                "leaf-v1"
+            );
+
+            let nested_file_restore: serde_json::Value = client
+                .post(format!("{web_base}/api/store/restore"))
+                .json(&serde_json::json!({
+                    "snapshot": snapshot_id,
+                    "source_path": "tree/sub/deeper/leaf.txt",
+                    "target_path": "restored/leaf-copy.txt",
+                    "recursive": false,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                nested_file_restore
+                    .get("target_path")
+                    .and_then(|value| value.as_str()),
+                Some("restored/leaf-copy.txt")
+            );
+            assert_eq!(
+                nested_file_restore
+                    .get("restored_count")
+                    .and_then(|value| value.as_u64()),
+                Some(1)
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "restored/leaf-copy.txt").await?,
+                "leaf-v1"
+            );
+            assert_eq!(
+                std::str::from_utf8(&upstream_client.get("restored/leaf-copy.txt").await?)?,
+                "leaf-v1"
+            );
 
             Ok::<(), anyhow::Error>(())
         }

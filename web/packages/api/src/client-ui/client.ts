@@ -152,6 +152,26 @@ export async function deleteStoreValue(key: string): Promise<JsonObject> {
   });
 }
 
+export async function restoreStorePathFromSnapshot(
+  snapshot: string,
+  sourcePath: string,
+  targetPath: string,
+  recursive = false
+): Promise<JsonObject> {
+  return fetchJson<JsonObject>("/api/store/restore", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      snapshot,
+      source_path: sourcePath,
+      target_path: targetPath,
+      recursive
+    })
+  });
+}
+
 export async function putBinaryObject(
   key: string,
   file: File,

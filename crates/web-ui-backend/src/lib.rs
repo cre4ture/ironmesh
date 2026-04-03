@@ -303,6 +303,7 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/store/put", post(web_store_put))
         .route("/api/store/rename", post(web_store_rename))
         .route("/api/store/delete", delete(web_store_delete))
+        .route("/api/store/restore", post(web_store_restore))
         .route("/api/store/uploads/start", post(web_store_upload_start))
         .route(
             "/api/store/uploads/{upload_id}/chunk/{index}",
@@ -390,6 +391,15 @@ struct WebStoreRenameRequest {
 #[derive(Debug, Deserialize)]
 struct WebStoreDeleteQuery {
     key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreRestoreRequest {
+    snapshot: String,
+    source_path: String,
+    target_path: String,
+    #[serde(default)]
+    recursive: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,6 +529,19 @@ async fn current_sdk(state: &WebState) -> IronMeshClient {
 
 async fn current_client(state: &WebState) -> ClientNode {
     state.runtime.read().await.client.clone()
+}
+
+fn normalize_store_restore_path(path: &str, is_prefix: bool) -> String {
+    let trimmed = path.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if is_prefix || trimmed.ends_with('/') {
+        return format!("{}/", trimmed.trim_end_matches('/'));
+    }
+
+    trimmed.to_string()
 }
 
 fn normalize_rendezvous_urls(urls: &[String]) -> Vec<String> {
@@ -1809,6 +1832,51 @@ async fn web_store_delete(
     }
 }
 
+async fn web_store_restore(
+    State(state): State<WebState>,
+    Json(request): Json<WebStoreRestoreRequest>,
+) -> impl IntoResponse {
+    let snapshot = request.snapshot.trim();
+    if snapshot.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "snapshot must not be empty");
+    }
+
+    let source_path = normalize_store_restore_path(&request.source_path, request.recursive);
+    if source_path.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "source_path must not be empty");
+    }
+
+    let target_path = normalize_store_restore_path(&request.target_path, request.recursive);
+    if target_path.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "target_path must not be empty");
+    }
+
+    match current_client(&state)
+        .await
+        .restore_path_from_snapshot(
+            snapshot.to_string(),
+            source_path.clone(),
+            target_path.clone(),
+            request.recursive,
+            false,
+        )
+        .await
+    {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "snapshot": report.snapshot_id,
+                "source_path": report.source_path,
+                "target_path": report.target_path,
+                "recursive": report.recursive,
+                "restored_count": report.restored_count,
+            })),
+        )
+            .into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
 async fn web_store_upload_start(
     State(state): State<WebState>,
     Json(request): Json<WebStoreUploadSessionStartRequest>,
@@ -2205,4 +2273,26 @@ async fn web_update_rendezvous(
         Json(probe_rendezvous_and_build_view(&state).await),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_store_restore_path;
+
+    #[test]
+    fn normalize_store_restore_path_distinguishes_files_and_prefixes() {
+        assert_eq!(
+            normalize_store_restore_path("  /docs/readme.txt ", false),
+            "docs/readme.txt"
+        );
+        assert_eq!(
+            normalize_store_restore_path("docs/archive", true),
+            "docs/archive/"
+        );
+        assert_eq!(
+            normalize_store_restore_path("/docs/archive/", true),
+            "docs/archive/"
+        );
+        assert_eq!(normalize_store_restore_path("   ", false), "");
+    }
 }

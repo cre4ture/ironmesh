@@ -48,6 +48,7 @@ import {
   getClientReplicationPlan,
   getClientPing,
   getStoreValue,
+  restoreStorePathFromSnapshot,
   getVersionGraph,
   listSnapshots,
   listStoreEntries,
@@ -1578,6 +1579,66 @@ function ExplorerPage({
     triggerBrowserDownloadFromUrl(getBinaryObjectDownloadUrl(entry.path, snapshotId));
   }
 
+  async function restoreEntry(entry: StoreEntry) {
+    const currentSnapshotId = snapshotId;
+    if (!currentSnapshotId) {
+      setError("Choose a snapshot before restoring entries.");
+      return;
+    }
+
+    const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const sourcePath = normalizeExplorerPath(entry.path, isPrefix);
+    if (!sourcePath) {
+      setError("Path must not be empty.");
+      return;
+    }
+
+    const requestedTargetPath =
+      typeof window === "undefined"
+        ? sourcePath
+        : window.prompt(
+            isPrefix
+              ? `Restore snapshot folder "${sourcePath}" into current data at path:`
+              : `Restore snapshot object "${sourcePath}" into current data at path:`,
+            sourcePath
+          );
+    if (requestedTargetPath == null) {
+      return;
+    }
+
+    const targetPath = normalizeExplorerPath(requestedTargetPath, isPrefix);
+    if (!targetPath) {
+      setError("Target path must not be empty.");
+      return;
+    }
+    if (!isPrefix && targetPath.endsWith("/")) {
+      setError("Restore target for an object must not end with '/'.");
+      return;
+    }
+
+    setLoading(`restore-entry:${sourcePath}`);
+    setError(null);
+    try {
+      const response = await restoreStorePathFromSnapshot(
+        currentSnapshotId,
+        sourcePath,
+        targetPath,
+        isPrefix
+      );
+      setSelectedPayload({
+        action: isPrefix ? "restored_snapshot_prefix" : "restored_snapshot_path",
+        snapshot: currentSnapshotId,
+        source_path: sourcePath,
+        target_path: targetPath,
+        response
+      });
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed restoring snapshot entry");
+    } finally {
+      setLoading(null);
+    }
+  }
+
   async function createFolder() {
     if (!canMutateCurrentStore) {
       setError("Switch Snapshot to Current data before creating folders.");
@@ -1946,7 +2007,7 @@ function ExplorerPage({
               <Text c="dimmed" size="sm">
                 {canMutateCurrentStore
                   ? "Delete on a prefix removes that whole subtree from current data. Rename on a prefix rewrites each stored path under it."
-                  : "Create, rename, and delete are disabled while browsing a historical snapshot."}
+                  : "Restore copies the selected snapshot item into current data. Create, rename, and delete stay disabled while browsing a historical snapshot."}
               </Text>
               <Table.ScrollContainer minWidth={720}>
                 <Table striped highlightOnHover withTableBorder>
@@ -1977,25 +2038,37 @@ function ExplorerPage({
                                 <Button size="xs" variant="light" onClick={() => void readEntry(entry)}>
                                   Open
                                 </Button>
-                                <Button
-                                  size="xs"
-                                  variant="default"
-                                  disabled={!canMutateCurrentStore}
-                                  loading={loading === `rename-entry:${normalizeExplorerPath(entry.path, true)}`}
-                                  onClick={() => void renameEntry(entry)}
-                                >
-                                  Rename
-                                </Button>
-                                <Button
-                                  size="xs"
-                                  color="red"
-                                  variant="default"
-                                  disabled={!canMutateCurrentStore}
-                                  loading={loading === `delete-entry:${normalizeExplorerPath(entry.path, true)}`}
-                                  onClick={() => void deleteEntry(entry)}
-                                >
-                                  Delete
-                                </Button>
+                                {snapshotId ? (
+                                  <Button
+                                    size="xs"
+                                    variant="default"
+                                    loading={loading === `restore-entry:${normalizeExplorerPath(entry.path, true)}`}
+                                    onClick={() => void restoreEntry(entry)}
+                                  >
+                                    Restore...
+                                  </Button>
+                                ) : null}
+                                {canMutateCurrentStore ? (
+                                  <Button
+                                    size="xs"
+                                    variant="default"
+                                    loading={loading === `rename-entry:${normalizeExplorerPath(entry.path, true)}`}
+                                    onClick={() => void renameEntry(entry)}
+                                  >
+                                    Rename
+                                  </Button>
+                                ) : null}
+                                {canMutateCurrentStore ? (
+                                  <Button
+                                    size="xs"
+                                    color="red"
+                                    variant="default"
+                                    loading={loading === `delete-entry:${normalizeExplorerPath(entry.path, true)}`}
+                                    onClick={() => void deleteEntry(entry)}
+                                  >
+                                    Delete
+                                  </Button>
+                                ) : null}
                               </Group>
                             ) : (
                               <Group gap="xs" wrap="nowrap">
@@ -2010,25 +2083,37 @@ function ExplorerPage({
                                 <Button size="xs" variant="default" onClick={() => downloadEntry(entry)}>
                                   Download
                                 </Button>
-                                <Button
-                                  size="xs"
-                                  variant="default"
-                                  disabled={!canMutateCurrentStore}
-                                  loading={loading === `rename-entry:${normalizeExplorerPath(entry.path, false)}`}
-                                  onClick={() => void renameEntry(entry)}
-                                >
-                                  Rename
-                                </Button>
-                                <Button
-                                  size="xs"
-                                  color="red"
-                                  variant="default"
-                                  disabled={!canMutateCurrentStore}
-                                  loading={loading === `delete-entry:${normalizeExplorerPath(entry.path, false)}`}
-                                  onClick={() => void deleteEntry(entry)}
-                                >
-                                  Delete
-                                </Button>
+                                {snapshotId ? (
+                                  <Button
+                                    size="xs"
+                                    variant="default"
+                                    loading={loading === `restore-entry:${normalizeExplorerPath(entry.path, false)}`}
+                                    onClick={() => void restoreEntry(entry)}
+                                  >
+                                    Restore...
+                                  </Button>
+                                ) : null}
+                                {canMutateCurrentStore ? (
+                                  <Button
+                                    size="xs"
+                                    variant="default"
+                                    loading={loading === `rename-entry:${normalizeExplorerPath(entry.path, false)}`}
+                                    onClick={() => void renameEntry(entry)}
+                                  >
+                                    Rename
+                                  </Button>
+                                ) : null}
+                                {canMutateCurrentStore ? (
+                                  <Button
+                                    size="xs"
+                                    color="red"
+                                    variant="default"
+                                    loading={loading === `delete-entry:${normalizeExplorerPath(entry.path, false)}`}
+                                    onClick={() => void deleteEntry(entry)}
+                                  >
+                                    Delete
+                                  </Button>
+                                ) : null}
                               </Group>
                             )}
                           </Table.Td>

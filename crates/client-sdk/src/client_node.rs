@@ -7,8 +7,8 @@ use common::{CacheEntry, StorageObjectMeta};
 use tokio::sync::RwLock;
 
 use crate::ironmesh_client::{
-    IronMeshClient, ObjectHeadInfo, StoreIndexResponse, StoreIndexView, UploadResult,
-    VersionGraphSummary,
+    IronMeshClient, ObjectHeadInfo, SnapshotRestoreResponse, StoreIndexResponse, StoreIndexView,
+    UploadResult, VersionGraphSummary,
 };
 
 #[derive(Clone)]
@@ -140,6 +140,38 @@ impl ClientNode {
             self.cache.write().await.insert(to_path, payload);
         }
         Ok(())
+    }
+
+    pub async fn restore_path_from_snapshot(
+        &self,
+        snapshot: impl Into<String>,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        recursive: bool,
+        overwrite: bool,
+    ) -> Result<SnapshotRestoreResponse> {
+        let snapshot = snapshot.into();
+        let from_path = from_path.into();
+        let to_path = to_path.into();
+        let response = self
+            .client
+            .restore_path_from_snapshot(
+                snapshot,
+                from_path.clone(),
+                to_path.clone(),
+                recursive,
+                overwrite,
+            )
+            .await?;
+
+        let mut cache = self.cache.write().await;
+        if recursive {
+            cache.retain(|key, _| key != &to_path && !key.starts_with(&to_path));
+        } else {
+            cache.remove(&to_path);
+        }
+
+        Ok(response)
     }
 
     pub async fn delete_path(&self, key: impl Into<String>) -> Result<()> {

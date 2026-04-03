@@ -11,7 +11,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::bootstrap::ConnectionBootstrap;
-use crate::ironmesh_client::{IronMeshClient, UploadResult};
+use crate::ironmesh_client::{IronMeshClient, SnapshotRestoreResponse, UploadResult};
 use transport_sdk::ClientIdentityMaterial;
 
 const CACHE_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
@@ -189,6 +189,48 @@ impl ContentAddressedClientCache {
             .await?;
         self.storage.apply_gc_plan(gc_plan).await?;
         Ok(())
+    }
+
+    pub async fn restore_path_from_snapshot(
+        &self,
+        snapshot: impl Into<String>,
+        from_path: impl Into<String>,
+        to_path: impl Into<String>,
+        recursive: bool,
+        overwrite: bool,
+    ) -> Result<SnapshotRestoreResponse> {
+        let snapshot = snapshot.into();
+        let from_path = from_path.into();
+        let to_path = to_path.into();
+        let response = self
+            .client
+            .restore_path_from_snapshot(snapshot, from_path, to_path.clone(), recursive, overwrite)
+            .await?;
+
+        if recursive {
+            let cached_keys: Vec<String> = self
+                .storage
+                .list_entries()
+                .await?
+                .into_iter()
+                .filter_map(|entry| {
+                    if entry.key == to_path || entry.key.starts_with(&to_path) {
+                        Some(entry.key)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for key in cached_keys {
+                let gc_plan = self.storage.remove_key(&key).await?;
+                self.storage.apply_gc_plan(gc_plan).await?;
+            }
+        } else {
+            let gc_plan = self.storage.remove_key(&to_path).await?;
+            self.storage.apply_gc_plan(gc_plan).await?;
+        }
+
+        Ok(response)
     }
 
     pub async fn delete_path(&self, key: impl Into<String>) -> Result<()> {

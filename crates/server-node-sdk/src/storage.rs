@@ -135,6 +135,22 @@ pub enum PathMutationResult {
     TargetExists,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRestoreReport {
+    pub snapshot_id: String,
+    pub source_path: String,
+    pub target_path: String,
+    pub recursive: bool,
+    pub restored_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRestoreMutationResult {
+    Applied(SnapshotRestoreReport),
+    SourceMissing,
+    TargetExists { path: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TombstonePathResult {
     pub path: String,
@@ -169,6 +185,14 @@ pub struct SnapshotObjectState {
     pub created_at_unix: u64,
     pub objects: HashMap<String, String>,
     pub object_ids: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotRestoreSource {
+    manifest_hash: String,
+    object_id: Option<String>,
+    version_id: Option<String>,
+    state: VersionConsistencyState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3944,6 +3968,122 @@ impl PersistentStore {
         Ok(PathMutationResult::Applied)
     }
 
+    pub async fn restore_snapshot_path(
+        &mut self,
+        snapshot_id: &str,
+        from_path: &str,
+        to_path: &str,
+        recursive: bool,
+        overwrite: bool,
+    ) -> Result<SnapshotRestoreMutationResult> {
+        let Some(snapshot_manifest) = self
+            .metadata_store
+            .load_snapshot_manifest(snapshot_id)
+            .await?
+        else {
+            return Ok(SnapshotRestoreMutationResult::SourceMissing);
+        };
+        let snapshot_state = SnapshotObjectState {
+            created_at_unix: snapshot_manifest.created_at_unix,
+            objects: snapshot_manifest.objects,
+            object_ids: snapshot_manifest.object_ids,
+        };
+
+        if recursive {
+            let mut source_paths: Vec<String> = snapshot_state
+                .objects
+                .keys()
+                .filter(|candidate| *candidate == from_path || candidate.starts_with(from_path))
+                .cloned()
+                .collect();
+            source_paths.sort();
+            if source_paths.is_empty() {
+                return Ok(SnapshotRestoreMutationResult::SourceMissing);
+            }
+
+            if from_path != to_path
+                && let Some(conflict_path) = self
+                    .current_state
+                    .object_ids
+                    .keys()
+                    .find(|candidate| *candidate == to_path || candidate.starts_with(to_path))
+                    .cloned()
+            {
+                if !overwrite {
+                    return Ok(SnapshotRestoreMutationResult::TargetExists {
+                        path: conflict_path,
+                    });
+                }
+                return Ok(SnapshotRestoreMutationResult::TargetExists {
+                    path: conflict_path,
+                });
+            }
+
+            for source_candidate in &source_paths {
+                let Some(suffix) = source_candidate.as_str().strip_prefix(from_path) else {
+                    continue;
+                };
+                let target_candidate = format!("{to_path}{suffix}");
+                match self
+                    .restore_snapshot_object_path_inner(
+                        &snapshot_state,
+                        source_candidate,
+                        &target_candidate,
+                        false,
+                        overwrite,
+                    )
+                    .await?
+                {
+                    PathMutationResult::Applied => {}
+                    PathMutationResult::SourceMissing => {
+                        return Ok(SnapshotRestoreMutationResult::SourceMissing);
+                    }
+                    PathMutationResult::TargetExists => {
+                        return Ok(SnapshotRestoreMutationResult::TargetExists {
+                            path: target_candidate,
+                        });
+                    }
+                }
+            }
+
+            self.create_snapshot().await?;
+            return Ok(SnapshotRestoreMutationResult::Applied(
+                SnapshotRestoreReport {
+                    snapshot_id: snapshot_id.to_string(),
+                    source_path: from_path.to_string(),
+                    target_path: to_path.to_string(),
+                    recursive: true,
+                    restored_count: source_paths.len(),
+                },
+            ));
+        }
+
+        match self
+            .restore_snapshot_object_path_inner(
+                &snapshot_state,
+                from_path,
+                to_path,
+                true,
+                overwrite,
+            )
+            .await?
+        {
+            PathMutationResult::Applied => Ok(SnapshotRestoreMutationResult::Applied(
+                SnapshotRestoreReport {
+                    snapshot_id: snapshot_id.to_string(),
+                    source_path: from_path.to_string(),
+                    target_path: to_path.to_string(),
+                    recursive: false,
+                    restored_count: 1,
+                },
+            )),
+            PathMutationResult::SourceMissing => Ok(SnapshotRestoreMutationResult::SourceMissing),
+            PathMutationResult::TargetExists => Ok(SnapshotRestoreMutationResult::TargetExists {
+                path: to_path.to_string(),
+            }),
+        }
+    }
+
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
         self.metadata_store.list_snapshot_infos().await
     }
@@ -4601,6 +4741,168 @@ impl PersistentStore {
         self.metadata_store
             .persist_current_state(&self.current_state)
             .await
+    }
+
+    async fn restore_snapshot_object_path_inner(
+        &mut self,
+        snapshot_state: &SnapshotObjectState,
+        source_path: &str,
+        target_path: &str,
+        create_snapshot: bool,
+        overwrite: bool,
+    ) -> Result<PathMutationResult> {
+        let Some(source) = self
+            .snapshot_restore_source(snapshot_state, source_path)
+            .await?
+        else {
+            return Ok(PathMutationResult::SourceMissing);
+        };
+
+        if source_path != target_path && self.current_state.object_ids.contains_key(target_path) {
+            if !overwrite {
+                return Ok(PathMutationResult::TargetExists);
+            }
+            return Ok(PathMutationResult::TargetExists);
+        }
+
+        let restored_manifest_hash = self
+            .clone_manifest_for_key(&source.manifest_hash, target_path)
+            .await?;
+
+        if source_path == target_path {
+            let object_id = self
+                .object_id_for_key(target_path)
+                .unwrap_or_else(generate_object_id);
+            let mut index = self
+                .load_version_index_by_object_id(&object_id)
+                .await?
+                .unwrap_or_else(|| empty_version_index(&object_id));
+            let restore_version_id = format!(
+                "restore-{}-{}",
+                unix_ts_nanos(),
+                &restored_manifest_hash[..12]
+            );
+            let parent_version_ids = index.preferred_head_version_id.iter().cloned().collect();
+
+            index.versions.insert(
+                restore_version_id.clone(),
+                FileVersionRecord {
+                    version_id: restore_version_id,
+                    object_id: object_id.clone(),
+                    manifest_hash: restored_manifest_hash,
+                    logical_path: Some(target_path.to_string()),
+                    parent_version_ids,
+                    state: source.state,
+                    created_at_unix: unix_ts(),
+                    copied_from_object_id: source.object_id,
+                    copied_from_version_id: source.version_id,
+                    copied_from_path: Some(source_path.to_string()),
+                },
+            );
+            index.head_version_ids = recompute_head_version_ids(&index);
+            index.preferred_head_version_id = choose_preferred_head(&index);
+
+            self.persist_version_index_by_object_id(&object_id, &index)
+                .await?;
+            self.sync_current_state_for_key_from_index(target_path, &index)?;
+            self.persist_current_state().await?;
+            if create_snapshot {
+                self.create_snapshot().await?;
+            }
+            return Ok(PathMutationResult::Applied);
+        }
+
+        let copied_object_id = generate_object_id();
+        let copied_version_id = format!(
+            "restore-{}-{}",
+            unix_ts_nanos(),
+            &restored_manifest_hash[..12]
+        );
+        let copied_record = FileVersionRecord {
+            version_id: copied_version_id.clone(),
+            object_id: copied_object_id.clone(),
+            manifest_hash: restored_manifest_hash,
+            logical_path: Some(target_path.to_string()),
+            parent_version_ids: Vec::new(),
+            state: source.state,
+            created_at_unix: unix_ts(),
+            copied_from_object_id: source.object_id,
+            copied_from_version_id: source.version_id,
+            copied_from_path: Some(source_path.to_string()),
+        };
+
+        let mut copied_index = empty_version_index(&copied_object_id);
+        copied_index
+            .versions
+            .insert(copied_version_id.clone(), copied_record);
+        copied_index.head_version_ids = vec![copied_version_id];
+        copied_index.preferred_head_version_id = choose_preferred_head(&copied_index);
+        self.persist_version_index_by_object_id(&copied_object_id, &copied_index)
+            .await?;
+        self.sync_current_state_for_key_from_index(target_path, &copied_index)?;
+        self.persist_current_state().await?;
+        if create_snapshot {
+            self.create_snapshot().await?;
+        }
+
+        Ok(PathMutationResult::Applied)
+    }
+
+    async fn snapshot_restore_source(
+        &self,
+        snapshot_state: &SnapshotObjectState,
+        source_path: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        let Some(manifest_hash) = snapshot_state.objects.get(source_path).cloned() else {
+            return Ok(None);
+        };
+
+        let Some(source_object_id) = snapshot_state.object_ids.get(source_path).cloned() else {
+            return Ok(Some(SnapshotRestoreSource {
+                manifest_hash,
+                object_id: None,
+                version_id: None,
+                state: VersionConsistencyState::Confirmed,
+            }));
+        };
+
+        let Some(index) = self
+            .load_version_index_by_object_id(&source_object_id)
+            .await?
+        else {
+            return Ok(Some(SnapshotRestoreSource {
+                manifest_hash,
+                object_id: Some(source_object_id),
+                version_id: None,
+                state: VersionConsistencyState::Confirmed,
+            }));
+        };
+
+        let matching_record = snapshot_version_record_for_manifest(
+            &index,
+            &manifest_hash,
+            snapshot_state.created_at_unix,
+        )
+        .or_else(|| {
+            index
+                .versions
+                .values()
+                .filter(|record| record.manifest_hash == manifest_hash)
+                .max_by(|left, right| {
+                    left.created_at_unix
+                        .cmp(&right.created_at_unix)
+                        .then_with(|| left.version_id.cmp(&right.version_id))
+                })
+        });
+
+        Ok(Some(SnapshotRestoreSource {
+            manifest_hash,
+            object_id: Some(source_object_id),
+            version_id: matching_record.map(|record| record.version_id.clone()),
+            state: matching_record
+                .map(|record| record.state.clone())
+                .unwrap_or(VersionConsistencyState::Confirmed),
+        }))
     }
 
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {
@@ -5625,6 +5927,23 @@ fn version_record_for_read_mode(
             heads.first().copied()
         }
     }
+}
+
+fn snapshot_version_record_for_manifest<'a>(
+    index: &'a FileVersionIndex,
+    manifest_hash: &str,
+    max_created_at_unix: u64,
+) -> Option<&'a FileVersionRecord> {
+    index
+        .versions
+        .values()
+        .filter(|record| record.manifest_hash == manifest_hash)
+        .filter(|record| record.created_at_unix <= max_created_at_unix)
+        .max_by(|left, right| {
+            left.created_at_unix
+                .cmp(&right.created_at_unix)
+                .then_with(|| left.version_id.cmp(&right.version_id))
+        })
 }
 
 fn rank_state(state: &VersionConsistencyState) -> u8 {

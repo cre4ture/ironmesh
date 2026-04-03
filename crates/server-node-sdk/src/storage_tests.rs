@@ -1441,6 +1441,156 @@ run_on_all_metadata_backends!(
     copy_creates_new_object_id_with_provenance_turso
 );
 
+async fn restore_snapshot_same_path_creates_new_head_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("restore-snapshot-same-path").await;
+
+    let first = store
+        .put_object_versioned(
+            "docs/readme.txt",
+            Bytes::from_static(b"v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let _second = store
+        .put_object_versioned(
+            "docs/readme.txt",
+            Bytes::from_static(b"v2"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let restored = store
+        .restore_snapshot_path(
+            &first.snapshot_id,
+            "docs/readme.txt",
+            "docs/readme.txt",
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    match restored {
+        SnapshotRestoreMutationResult::Applied(report) => {
+            assert_eq!(report.restored_count, 1);
+            assert!(!report.recursive);
+        }
+        other => panic!("expected applied restore, got {other:?}"),
+    }
+
+    let payload = store
+        .get_object("docs/readme.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(payload.as_ref(), b"v1");
+
+    let versions = store
+        .list_versions("docs/readme.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(versions.versions.len(), 3);
+    let preferred_head_id = versions
+        .preferred_head_version_id
+        .clone()
+        .expect("restored path should have a preferred head");
+    let restored_head = versions
+        .versions
+        .iter()
+        .find(|record| record.version_id == preferred_head_id)
+        .expect("preferred head should exist in versions");
+    assert_eq!(restored_head.parent_version_ids.len(), 1);
+    assert_eq!(
+        restored_head.copied_from_version_id.as_deref(),
+        Some(first.version_id.as_str())
+    );
+    assert_eq!(
+        restored_head.copied_from_path.as_deref(),
+        Some("docs/readme.txt")
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_snapshot_same_path_creates_new_head_impl,
+    restore_snapshot_same_path_creates_new_head,
+    restore_snapshot_same_path_creates_new_head_turso
+);
+
+async fn restore_snapshot_to_custom_target_uses_metadata_copy_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("restore-snapshot-custom-target").await;
+
+    let first = store
+        .put_object_versioned(
+            "docs/source.txt",
+            Bytes::from_static(b"source-v1"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let source_versions = store
+        .list_versions("docs/source.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let source_object_id = source_versions.object_id.clone();
+
+    let restored = store
+        .restore_snapshot_path(
+            &first.snapshot_id,
+            "docs/source.txt",
+            "restored/copy.txt",
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    match restored {
+        SnapshotRestoreMutationResult::Applied(report) => {
+            assert_eq!(report.restored_count, 1);
+            assert_eq!(report.target_path, "restored/copy.txt");
+        }
+        other => panic!("expected applied restore, got {other:?}"),
+    }
+
+    let copied_payload = store
+        .get_object("restored/copy.txt", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    assert_eq!(copied_payload.as_ref(), b"source-v1");
+
+    let copy_versions = store
+        .list_versions("restored/copy.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(copy_versions.object_id, source_object_id);
+    assert_eq!(copy_versions.versions.len(), 1);
+    let copy_root = &copy_versions.versions[0];
+    assert_eq!(
+        copy_root.copied_from_object_id.as_deref(),
+        Some(source_object_id.as_str())
+    );
+    assert_eq!(
+        copy_root.copied_from_version_id.as_deref(),
+        Some(first.version_id.as_str())
+    );
+    assert_eq!(
+        copy_root.copied_from_path.as_deref(),
+        Some("docs/source.txt")
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_snapshot_to_custom_target_uses_metadata_copy_impl,
+    restore_snapshot_to_custom_target_uses_metadata_copy,
+    restore_snapshot_to_custom_target_uses_metadata_copy_turso
+);
+
 async fn load_cluster_replicas_returns_empty_when_file_missing_impl(backend: StorageTestBackend) {
     let (root, store) = backend.init_store("cluster-replicas-empty").await;
 
