@@ -188,6 +188,29 @@ enum DesiredSyncState {
     NotInSync,
 }
 
+fn placeholder_info_matches_desired_sync_state(
+    info: &CF_PLACEHOLDER_STANDARD_INFO,
+    desired_state: DesiredSyncState,
+) -> bool {
+    match desired_state {
+        DesiredSyncState::InSync => info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC,
+        DesiredSyncState::NotInSync => info.InSyncState == CF_IN_SYNC_STATE_NOT_IN_SYNC,
+    }
+}
+
+fn path_matches_desired_sync_state(path: &Path, desired_state: DesiredSyncState) -> bool {
+    let file = match open_sync_path(path, false) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let info = match cf_get_placeholder_standard_info(&file) {
+        Ok(info) => info,
+        Err(_) => return false,
+    };
+
+    placeholder_info_matches_desired_sync_state(&info, desired_state)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SyncStateReconcileStats {
     pub marked_in_sync: usize,
@@ -728,6 +751,47 @@ fn reconcile_directory_sync_states_for_candidates(
             DesiredSyncState::NotInSync
         };
 
+        let placeholder_state =
+            path_placeholder_state(&full_path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
+        if matches!(
+            placeholder_state,
+            CF_PLACEHOLDER_STATE_INVALID | CF_PLACEHOLDER_STATE_NO_STATES
+        ) {
+            let file = match open_sync_path(&full_path, true) {
+                Ok(file) => file,
+                Err(err) => {
+                    stats.failed += 1;
+                    tracing::info!(
+                        "sync-state: failed to open directory {} for sync-state update desired={:?}: {} state_before={}",
+                        full_path.display(),
+                        desired_state,
+                        err,
+                        state_before
+                    );
+                    continue;
+                }
+            };
+            if let Err(err) = cf_convert_to_placeholder(&file) {
+                stats.failed += 1;
+                tracing::info!(
+                    "sync-state: failed to convert directory {} to placeholder before sync-state update desired={:?}: {} state_before={}",
+                    full_path.display(),
+                    desired_state,
+                    err,
+                    state_before
+                );
+                continue;
+            }
+        } else if path_matches_desired_sync_state(&full_path, desired_state) {
+            tracing::info!(
+                "sync-state: skipped directory already {:?} path={} state_before={}",
+                desired_state,
+                relative_path,
+                state_before
+            );
+            continue;
+        }
+
         let file = match open_sync_path(&full_path, true) {
             Ok(file) => file,
             Err(err) => {
@@ -742,24 +806,6 @@ fn reconcile_directory_sync_states_for_candidates(
                 continue;
             }
         };
-
-        let placeholder_state =
-            path_placeholder_state(&full_path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
-        if matches!(
-            placeholder_state,
-            CF_PLACEHOLDER_STATE_INVALID | CF_PLACEHOLDER_STATE_NO_STATES
-        ) && let Err(err) = cf_convert_to_placeholder(&file)
-        {
-            stats.failed += 1;
-            tracing::info!(
-                "sync-state: failed to convert directory {} to placeholder before sync-state update desired={:?}: {} state_before={}",
-                full_path.display(),
-                desired_state,
-                err,
-                state_before
-            );
-            continue;
-        }
 
         let result = match desired_state {
             DesiredSyncState::InSync => cf_set_in_sync(&file).map(|_| {
@@ -906,6 +952,15 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
                         continue;
                     }
                 }
+            }
+            _ if path_matches_desired_sync_state(&full_path, desired_state) => {
+                tracing::info!(
+                    "sync-state: skipped path already {:?} path={} state_before={}",
+                    desired_state,
+                    relative_path,
+                    state_before
+                );
+                continue;
             }
             _ => {}
         }
@@ -1885,6 +1940,32 @@ mod tests {
             dehydrate_completion_status(&info, true),
             STATUS_CLOUD_FILE_NOT_IN_SYNC
         );
+    }
+
+    #[test]
+    fn placeholder_sync_state_match_helper_uses_in_sync_state_only() {
+        let mut info = CF_PLACEHOLDER_STANDARD_INFO {
+            InSyncState: CF_IN_SYNC_STATE_IN_SYNC,
+            ..Default::default()
+        };
+        assert!(placeholder_info_matches_desired_sync_state(
+            &info,
+            DesiredSyncState::InSync
+        ));
+        assert!(!placeholder_info_matches_desired_sync_state(
+            &info,
+            DesiredSyncState::NotInSync
+        ));
+
+        info.InSyncState = CF_IN_SYNC_STATE_NOT_IN_SYNC;
+        assert!(placeholder_info_matches_desired_sync_state(
+            &info,
+            DesiredSyncState::NotInSync
+        ));
+        assert!(!placeholder_info_matches_desired_sync_state(
+            &info,
+            DesiredSyncState::InSync
+        ));
     }
 
     #[test]
