@@ -47,8 +47,20 @@ The manifest currently points the `Application` executable at `os-integration.ex
    - `cargo build -p os-integration`
 3. Copy the outputs into a package staging folder next to `AppxManifest.xml`.
 4. Register/install the package using your normal Windows packaging workflow.
-5. Restart Explorer.
-6. Open an Ironmesh sync root in large-icon view and confirm that dehydrated placeholders use the fixed thumbnail.
+5. Unregister any existing unpackaged Ironmesh sync root registration for the test root.
+6. Re-register and serve the sync root using the packaged `os-integration.exe` from the installed package location, not the repo-local `target\debug\os-integration.exe`.
+   - Example PowerShell:
+     - `$pkg = Get-AppxPackage Ironmesh.ThumbnailProvider.Prototype`
+     - `$exe = Join-Path $pkg.InstallLocation 'os-integration.exe'`
+     - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
+7. Restart Explorer.
+8. Open an Ironmesh sync root in large-icon view and confirm that dehydrated placeholders use the fixed thumbnail.
+
+Why this matters:
+
+- the thumbnail handler is registered as a packaged Cloud Files extension
+- installing the package does not retroactively convert an already-running unpackaged sync-root registration into a packaged one
+- if the sync root is still being served by `target\debug\os-integration.exe`, Explorer may continue using the old unpackaged registration path and never call the prototype thumbnail provider
 
 ## Important note
 
@@ -88,6 +100,17 @@ Notes:
 - `-StageOnly` is the safest way to verify the prototype package contents today
 - full `.msix` packing and signing now work on a machine with the Windows SDK tools available
 - `-Install` is optional and may require both the usual Windows developer/sideloading settings and an elevated PowerShell so the self-signed cert can be imported into `Cert:\LocalMachine\TrustedPeople`
+
+## Diagnostics
+
+The prototype DLL now writes a simple log file to:
+
+- `%LocalAppData%\Ironmesh\thumbnail-provider.log`
+
+Useful signals:
+
+- if `GetThumbnail` appears there, Explorer is loading the packaged thumbnail handler
+- if the log stays empty while browsing a dehydrated placeholder folder in large-icon view, the packaged handler is still not being invoked
 
 ## What you need installed for MSIX
 

@@ -1,8 +1,12 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
+use std::fs::{OpenOptions, create_dir_all};
+use std::io::Write;
+use std::path::PathBuf;
 use std::ptr::{copy_nonoverlapping, null_mut};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_POINTER, S_FALSE,
@@ -45,12 +49,37 @@ impl IronmeshThumbnailProvider {
     }
 }
 
+fn append_diagnostic_log(message: &str) {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Ironmesh");
+    if create_dir_all(&root).is_err() {
+        return;
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let line = format!("[{timestamp}] {message}\r\n");
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("thumbnail-provider.log"))
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+}
+
 #[allow(non_snake_case)]
 impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
     fn Initialize(&self, psi: Ref<'_, IShellItem>, _grfmode: u32) -> Result<()> {
         let resolved = psi
             .as_ref()
             .and_then(|item| unsafe { shell_item_path(item) });
+        append_diagnostic_log(&format!(
+            "Initialize path={}",
+            resolved.as_deref().unwrap_or("<unresolved>")
+        ));
         *self
             .source_path
             .lock()
@@ -71,8 +100,19 @@ impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
             return Err(E_POINTER.into());
         }
 
-        let bitmap =
-            unsafe { create_prototype_bitmap(cx.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE))? };
+        let clamped_size = cx.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE);
+        let source_path = self
+            .source_path
+            .lock()
+            .expect("thumbnail path lock poisoned")
+            .clone()
+            .unwrap_or_else(|| String::from("<uninitialized>"));
+        append_diagnostic_log(&format!(
+            "GetThumbnail size={} source_path={}",
+            clamped_size, source_path
+        ));
+
+        let bitmap = unsafe { create_prototype_bitmap(clamped_size)? };
         unsafe {
             *phbmp = bitmap;
             *pdwalpha = WTSAT_ARGB;
