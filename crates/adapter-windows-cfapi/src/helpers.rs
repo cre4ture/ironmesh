@@ -20,6 +20,29 @@ pub fn normalize_path(path: &str) -> String {
         .replace('\\', "/")
 }
 
+pub fn encode_placeholder_file_identity(
+    relative_path: &str,
+    remote_version: Option<&str>,
+) -> Vec<u8> {
+    let relative_path = normalize_path(relative_path);
+    match remote_version {
+        Some(remote_version) => {
+            format!("path={relative_path}\nversion={remote_version}").into_bytes()
+        }
+        None => format!("path={relative_path}").into_bytes(),
+    }
+}
+
+pub fn decode_path_from_file_identity(file_identity: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(file_identity).ok()?;
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("path=") {
+            return Some(normalize_path(path));
+        }
+    }
+    None
+}
+
 pub fn utf16_string(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -133,7 +156,9 @@ fn strip_to_after_root_name_case_insensitive<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::path_to_relative;
+    use super::{
+        decode_path_from_file_identity, encode_placeholder_file_identity, path_to_relative,
+    };
     use std::path::Path;
 
     #[test]
@@ -174,5 +199,23 @@ mod tests {
 
         let relative = path_to_relative(sync_root, normalized_path);
         assert_eq!(relative, "monitor_test.txt");
+    }
+
+    #[test]
+    fn placeholder_identity_round_trips_path_with_version() {
+        let encoded = encode_placeholder_file_identity(r"docs\readme.txt", Some("version:size=42"));
+        assert_eq!(
+            decode_path_from_file_identity(&encoded).as_deref(),
+            Some("docs/readme.txt")
+        );
+    }
+
+    #[test]
+    fn placeholder_identity_round_trips_path_without_version() {
+        let encoded = encode_placeholder_file_identity("movies/example.mkv", None);
+        assert_eq!(
+            decode_path_from_file_identity(&encoded).as_deref(),
+            Some("movies/example.mkv")
+        );
     }
 }

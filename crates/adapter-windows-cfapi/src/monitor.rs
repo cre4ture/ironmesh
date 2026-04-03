@@ -5,15 +5,19 @@ use std::sync::{Arc, Mutex};
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
-    cf_dehydrate_placeholder, cf_get_placeholder_standard_info, describe_path_state,
-    open_sync_path, path_is_placeholder, try_convert_materialized_file,
+    cf_dehydrate_placeholder_with_oplock, cf_get_placeholder_standard_info,
+    cf_hydrate_placeholder_with_oplock, describe_path_state, open_sync_path, path_is_placeholder,
+    path_placeholder_state, try_convert_materialized_file,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::path_to_relative;
 use crate::runtime::Uploader;
 use std::os::windows::fs::MetadataExt;
-use windows_sys::Win32::Storage::CloudFilters::{CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_UNPINNED};
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_UNPINNED;
+use windows_sys::Win32::Storage::CloudFilters::{
+    CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
+    CF_PLACEHOLDER_STATE_NO_STATES, CF_PLACEHOLDER_STATE_PARTIAL,
+};
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_UNPINNED};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SeenEntry {
@@ -23,6 +27,10 @@ struct SeenEntry {
 }
 
 impl SeenEntry {
+    fn has_pinned_attribute(self) -> bool {
+        (self.file_attributes & FILE_ATTRIBUTE_PINNED) != 0
+    }
+
     fn has_unpinned_attribute(self) -> bool {
         (self.file_attributes & FILE_ATTRIBUTE_UNPINNED) != 0
     }
@@ -33,9 +41,10 @@ impl SeenEntry {
             .map(|state| state.to_log_string())
             .unwrap_or_else(|| String::from("none"));
         format!(
-            "dir={} attrs=0x{:08x} unpinned_attr={} placeholder_probe={}",
+            "dir={} attrs=0x{:08x} pinned_attr={} unpinned_attr={} placeholder_probe={}",
             self.is_dir,
             self.file_attributes,
+            self.has_pinned_attribute(),
             self.has_unpinned_attribute(),
             placeholder_state
         )
@@ -48,10 +57,11 @@ struct PlaceholderSnapshot {
     modified_data_size: i64,
     in_sync_state: i32,
     pin_state: i32,
+    is_partial: bool,
 }
 
 impl PlaceholderSnapshot {
-    fn from_path(path: &std::path::Path) -> Option<Self> {
+    fn from_path(path: &std::path::Path, placeholder_state_bits: u32) -> Option<Self> {
         let file = match open_sync_path(path, false) {
             Ok(file) => file,
             Err(err) => {
@@ -81,6 +91,7 @@ impl PlaceholderSnapshot {
             modified_data_size: info.ModifiedDataSize,
             in_sync_state: info.InSyncState,
             pin_state: info.PinState,
+            is_partial: (placeholder_state_bits & CF_PLACEHOLDER_STATE_PARTIAL) != 0,
         })
     }
 
@@ -89,6 +100,13 @@ impl PlaceholderSnapshot {
             && self.in_sync_state == CF_IN_SYNC_STATE_IN_SYNC
             && self.modified_data_size == 0
             && self.on_disk_data_size > 0
+    }
+
+    fn should_hydrate(self) -> bool {
+        self.pin_state == CF_PIN_STATE_PINNED
+            && self.in_sync_state == CF_IN_SYNC_STATE_IN_SYNC
+            && self.modified_data_size == 0
+            && self.is_partial
     }
 
     fn block_reason(self) -> &'static str {
@@ -107,8 +125,12 @@ impl PlaceholderSnapshot {
 
     fn to_log_string(self) -> String {
         format!(
-            "on_disk={} modified={} in_sync={} pin={}",
-            self.on_disk_data_size, self.modified_data_size, self.in_sync_state, self.pin_state
+            "on_disk={} modified={} in_sync={} pin={} partial={}",
+            self.on_disk_data_size,
+            self.modified_data_size,
+            self.in_sync_state,
+            self.pin_state,
+            self.is_partial
         )
     }
 }
@@ -119,13 +141,16 @@ pub struct SyncRootMonitor {
     uploader: Arc<dyn Uploader>,
     seen: HashMap<String, SeenEntry>,
     dehydrations_in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
+    hydrations_in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DehydrateScanSummary {
     total_entries: usize,
+    pinned_attribute_count: usize,
     unpinned_attribute_count: usize,
     probed_placeholder_count: usize,
+    hydrate_eligible_count: usize,
     eligible_count: usize,
 }
 
@@ -137,6 +162,7 @@ impl SyncRootMonitor {
             uploader,
             seen: HashMap::new(),
             dehydrations_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            hydrations_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -189,26 +215,37 @@ impl SyncRootMonitor {
     }
 
     fn log_dehydrate_scan_summary(&self, summary: DehydrateScanSummary) {
+        let hydrate_in_flight_count = self
+            .hydrations_in_flight
+            .lock()
+            .expect("hydrations_in_flight lock poisoned")
+            .len();
         let in_flight_count = self
             .dehydrations_in_flight
             .lock()
             .expect("dehydrations_in_flight lock poisoned")
             .len();
-        if summary.unpinned_attribute_count == 0
+        if summary.pinned_attribute_count == 0
+            && summary.unpinned_attribute_count == 0
             && summary.probed_placeholder_count == 0
+            && summary.hydrate_eligible_count == 0
             && summary.eligible_count == 0
+            && hydrate_in_flight_count == 0
             && in_flight_count == 0
         {
             return;
         }
 
         tracing::info!(
-            "{}: dehydrate-scan total_entries={} unpinned_attr={} probed_placeholders={} eligible={} in_flight={}",
+            "{}: dehydrate-scan total_entries={} pinned_attr={} unpinned_attr={} probed_placeholders={} hydrate_eligible={} eligible={} hydrate_in_flight={} in_flight={}",
             self.name,
             summary.total_entries,
+            summary.pinned_attribute_count,
             summary.unpinned_attribute_count,
             summary.probed_placeholder_count,
+            summary.hydrate_eligible_count,
             summary.eligible_count,
+            hydrate_in_flight_count,
             in_flight_count
         );
     }
@@ -299,6 +336,7 @@ impl SyncRootMonitor {
             );
         }
 
+        self.maybe_schedule_placeholder_hydrate(path, &rel_path, previous_entry, entry);
         self.maybe_schedule_placeholder_dehydrate(path, &rel_path, previous_entry, entry);
 
         if previous_entry == Some(entry) {
@@ -392,13 +430,15 @@ impl SyncRootMonitor {
             return;
         }
 
-        tracing::info!(
-            "{}: dehydrate candidate accepted path={} snapshot={} raw_state={}",
-            self.name,
-            rel_path,
-            placeholder_state.to_log_string(),
-            describe_path_state(path)
-        );
+        if previous_entry != Some(entry) {
+            tracing::info!(
+                "{}: dehydrate candidate accepted path={} snapshot={} raw_state={} action=request-provider-dehydrate",
+                self.name,
+                rel_path,
+                placeholder_state.to_log_string(),
+                describe_path_state(path),
+            );
+        }
 
         {
             let mut in_flight = self
@@ -406,13 +446,15 @@ impl SyncRootMonitor {
                 .lock()
                 .expect("dehydrations_in_flight lock poisoned");
             if !in_flight.insert(rel_path.to_string()) {
-                tracing::info!(
-                    "{}: dehydrate already in flight for {} snapshot={} raw_state={}",
-                    self.name,
-                    rel_path,
-                    placeholder_state.to_log_string(),
-                    describe_path_state(path)
-                );
+                if previous_entry != Some(entry) {
+                    tracing::info!(
+                        "{}: dehydrate already in flight for {} snapshot={} raw_state={}",
+                        self.name,
+                        rel_path,
+                        placeholder_state.to_log_string(),
+                        describe_path_state(path)
+                    );
+                }
                 return;
             }
         }
@@ -430,9 +472,7 @@ impl SyncRootMonitor {
                 placeholder_state.to_log_string()
             );
 
-            let result = open_sync_path(&full_path, true)
-                .map_err(anyhow::Error::from)
-                .and_then(|file| cf_dehydrate_placeholder(&file));
+            let result = cf_dehydrate_placeholder_with_oplock(&full_path, &rel_path);
 
             match result {
                 Ok(()) => {
@@ -460,6 +500,131 @@ impl SyncRootMonitor {
                 .remove(&rel_path);
             tracing::info!(
                 "{}: dehydrate worker finished for {} current_state={}",
+                monitor_name,
+                rel_path,
+                describe_path_state(&full_path)
+            );
+        });
+    }
+
+    fn maybe_schedule_placeholder_hydrate(
+        &self,
+        path: &std::path::Path,
+        rel_path: &str,
+        previous_entry: Option<SeenEntry>,
+        entry: SeenEntry,
+    ) {
+        if !entry.has_pinned_attribute() {
+            return;
+        }
+
+        let Some(placeholder_state) = entry.placeholder_state else {
+            if previous_entry != Some(entry) {
+                tracing::info!(
+                    "{}: hydrate candidate missing placeholder probe path={} entry={} raw_state={}",
+                    self.name,
+                    rel_path,
+                    entry.to_log_string(),
+                    describe_path_state(path)
+                );
+            }
+            return;
+        };
+        if !placeholder_state.should_hydrate() {
+            if previous_entry != Some(entry) {
+                let reason = if placeholder_state.pin_state != CF_PIN_STATE_PINNED {
+                    "pin-state-not-pinned"
+                } else if placeholder_state.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC {
+                    "not-in-sync"
+                } else if placeholder_state.modified_data_size != 0 {
+                    "modified-data-present"
+                } else if !placeholder_state.is_partial {
+                    "already-fully-hydrated"
+                } else {
+                    "not-eligible"
+                };
+                tracing::info!(
+                    "{}: hydrate candidate rejected path={} snapshot={} reason={} raw_state={}",
+                    self.name,
+                    rel_path,
+                    placeholder_state.to_log_string(),
+                    reason,
+                    describe_path_state(path)
+                );
+            }
+            return;
+        }
+
+        if previous_entry != Some(entry) {
+            tracing::info!(
+                "{}: hydrate candidate accepted path={} snapshot={} raw_state={} action=request-provider-hydrate",
+                self.name,
+                rel_path,
+                placeholder_state.to_log_string(),
+                describe_path_state(path),
+            );
+        }
+
+        {
+            let mut in_flight = self
+                .hydrations_in_flight
+                .lock()
+                .expect("hydrations_in_flight lock poisoned");
+            if !in_flight.insert(rel_path.to_string()) {
+                if previous_entry != Some(entry) {
+                    tracing::info!(
+                        "{}: hydrate already in flight for {} snapshot={} raw_state={}",
+                        self.name,
+                        rel_path,
+                        placeholder_state.to_log_string(),
+                        describe_path_state(path)
+                    );
+                }
+                return;
+            }
+        }
+
+        let rel_path = rel_path.to_string();
+        let full_path = path.to_path_buf();
+        let monitor_name = self.name.clone();
+        let in_flight = self.hydrations_in_flight.clone();
+        std::thread::spawn(move || {
+            tracing::info!(
+                "{}: hydrating pinned placeholder {} state_before={} snapshot={}",
+                monitor_name,
+                rel_path,
+                describe_path_state(&full_path),
+                placeholder_state.to_log_string()
+            );
+
+            let result = cf_hydrate_placeholder_with_oplock(&full_path);
+
+            match result {
+                Ok(()) => {
+                    tracing::info!(
+                        "{}: hydrated pinned placeholder {} state_after={}",
+                        monitor_name,
+                        rel_path,
+                        describe_path_state(&full_path)
+                    );
+                }
+                Err(err) => {
+                    tracing::info!(
+                        "{}: failed to hydrate pinned placeholder {}: {:#} state_after={}",
+                        monitor_name,
+                        rel_path,
+                        err,
+                        describe_path_state(&full_path)
+                    );
+                }
+            }
+
+            in_flight
+                .lock()
+                .expect("hydrations_in_flight lock poisoned")
+                .remove(&rel_path);
+            tracing::info!(
+                "{}: hydrate worker finished for {} current_state={}",
                 monitor_name,
                 rel_path,
                 describe_path_state(&full_path)
@@ -536,13 +701,18 @@ fn snapshot_entry(path: &std::path::Path, is_dir: bool) -> SeenEntry {
     let file_attributes = std::fs::metadata(path)
         .map(|metadata| metadata.file_attributes())
         .unwrap_or_default();
+    let should_probe = !is_dir
+        && ((file_attributes & FILE_ATTRIBUTE_UNPINNED) != 0
+            || (file_attributes & FILE_ATTRIBUTE_PINNED) != 0);
     SeenEntry {
         is_dir,
         file_attributes,
-        placeholder_state: if is_dir || (file_attributes & FILE_ATTRIBUTE_UNPINNED) == 0 {
+        placeholder_state: if !should_probe {
             None
         } else {
-            PlaceholderSnapshot::from_path(path)
+            let placeholder_state_bits =
+                path_placeholder_state(path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
+            PlaceholderSnapshot::from_path(path, placeholder_state_bits)
         },
     }
 }
@@ -553,11 +723,20 @@ fn summarize_dehydrate_scan(entries: &HashMap<String, SeenEntry>) -> DehydrateSc
         ..Default::default()
     };
     for entry in entries.values().copied() {
+        if entry.has_pinned_attribute() {
+            summary.pinned_attribute_count += 1;
+        }
         if entry.has_unpinned_attribute() {
             summary.unpinned_attribute_count += 1;
         }
         if entry.placeholder_state.is_some() {
             summary.probed_placeholder_count += 1;
+        }
+        if entry
+            .placeholder_state
+            .is_some_and(PlaceholderSnapshot::should_hydrate)
+        {
+            summary.hydrate_eligible_count += 1;
         }
         if entry
             .placeholder_state
@@ -709,6 +888,7 @@ mod tests {
             modified_data_size: 0,
             in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
             pin_state: CF_PIN_STATE_UNPINNED,
+            is_partial: false,
         };
         assert!(eligible.should_dehydrate());
 
@@ -741,5 +921,20 @@ mod tests {
             ..eligible
         };
         assert!(!already_dehydrated.should_dehydrate());
+
+        let partial_pinned = PlaceholderSnapshot {
+            on_disk_data_size: 1024,
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: CF_PIN_STATE_PINNED,
+            is_partial: true,
+        };
+        assert!(partial_pinned.should_hydrate());
+
+        let fully_hydrated_pinned = PlaceholderSnapshot {
+            is_partial: false,
+            ..partial_pinned
+        };
+        assert!(!fully_hydrated_pinned.should_hydrate());
     }
 }

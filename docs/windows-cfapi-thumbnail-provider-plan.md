@@ -2,6 +2,10 @@
 
 Status: Design note plus initial fixed-bitmap prototype scaffold for Explorer thumbnails on dehydrated Ironmesh placeholders
 
+Related notes:
+
+- [Nextcloud CFAPI Behavior Reference](others/nextcloud-cfapi-behavior.md)
+
 ## Goal
 
 - Show thumbnails in Windows Explorer for dehydrated Ironmesh placeholders without hydrating the full file.

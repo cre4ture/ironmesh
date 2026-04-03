@@ -1,15 +1,18 @@
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
-    cf_convert_to_placeholder, cf_get_placeholder_standard_info, cf_report_provider_progress2,
-    cf_set_in_sync, cf_set_not_in_sync, describe_path_state, open_sync_path,
-    path_placeholder_state,
+    cf_ensure_placeholder_identity, cf_get_placeholder_standard_info,
+    cf_get_placeholder_standard_info_with_identity, cf_report_provider_progress2, cf_set_in_sync,
+    cf_set_not_in_sync, describe_path_state, open_sync_path, path_placeholder_state,
 };
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
-use crate::helpers::{normalize_path, path_to_relative, utf16_path, utf16_string};
+use crate::helpers::{
+    decode_path_from_file_identity, encode_placeholder_file_identity, normalize_path,
+    path_to_relative, utf16_path, utf16_string,
+};
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
@@ -20,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
 use windows_sys::Win32::Foundation::{
     NTSTATUS, STATUS_CLOUD_FILE_NOT_IN_SYNC, STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
-    STATUS_CLOUD_FILE_PINNED, STATUS_SUCCESS,
+    STATUS_CLOUD_FILE_PINNED, STATUS_CLOUD_FILE_REQUEST_CANCELED, STATUS_CLOUD_FILE_UNSUCCESSFUL,
+    STATUS_SUCCESS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +215,17 @@ fn path_matches_desired_sync_state(path: &Path, desired_state: DesiredSyncState)
     placeholder_info_matches_desired_sync_state(&info, desired_state)
 }
 
+fn path_placeholder_identity_missing(path: &Path) -> bool {
+    let file = match open_sync_path(path, false) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    match cf_get_placeholder_standard_info_with_identity(&file) {
+        Ok(info) => info.file_identity().is_empty(),
+        Err(_) => false,
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SyncStateReconcileStats {
     pub marked_in_sync: usize,
@@ -329,16 +344,15 @@ impl CfapiRuntime {
 // `normalize_path` now lives in `helpers.rs`.
 
 pub fn create_placeholder(sync_root: &std::path::Path, rel_path: &str) -> anyhow::Result<()> {
-    use std::ptr::null_mut;
     use windows_sys::Win32::Storage::CloudFilters::*;
-    let full_path =
-        sync_root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR.to_string().as_str()));
-    let wide: Vec<u16> = full_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let relative_name = rel_path.replace('/', "\\");
+    let wide: Vec<u16> = relative_name.encode_utf16().chain(Some(0)).collect();
+    let identity = encode_placeholder_file_identity(rel_path, None);
     let mut create_info = CF_PLACEHOLDER_CREATE_INFO {
         RelativeFileName: wide.as_ptr(),
         Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
-        FileIdentity: null_mut(),
-        FileIdentityLength: 0,
+        FileIdentity: identity.as_ptr().cast::<c_void>(),
+        FileIdentityLength: identity.len() as u32,
         FsMetadata: unsafe { std::mem::zeroed() },
         Result: 0,
         CreateUsn: 0,
@@ -477,20 +491,6 @@ fn placeholder_file_size(remote_version: &str, remote_size: Option<u64>) -> i64 
         .unwrap_or(0)
 }
 
-fn encode_file_identity(relative_path: &str, remote_version: &str) -> Vec<u8> {
-    format!("path={relative_path}\nversion={remote_version}").into_bytes()
-}
-
-fn decode_path_from_file_identity(file_identity: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(file_identity).ok()?;
-    for line in text.lines() {
-        if let Some(path) = line.strip_prefix("path=") {
-            return Some(normalize_path(path));
-        }
-    }
-    None
-}
-
 pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()> {
     std::fs::create_dir_all(root_path)?;
 
@@ -569,7 +569,7 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
             base_dir,
             child_name: child_name.to_string(),
             relative_name_utf16: utf16_string(child_name),
-            identity: encode_file_identity(&relative_path, &remote_version),
+            identity: encode_placeholder_file_identity(&relative_path, Some(&remote_version)),
             metadata,
         });
     }
@@ -771,10 +771,10 @@ fn reconcile_directory_sync_states_for_candidates(
                     continue;
                 }
             };
-            if let Err(err) = cf_convert_to_placeholder(&file) {
+            if let Err(err) = cf_ensure_placeholder_identity(&file, relative_path) {
                 stats.failed += 1;
                 tracing::info!(
-                    "sync-state: failed to convert directory {} to placeholder before sync-state update desired={:?}: {} state_before={}",
+                    "sync-state: failed to ensure directory placeholder identity for {} before sync-state update desired={:?}: {} state_before={}",
                     full_path.display(),
                     desired_state,
                     err,
@@ -922,17 +922,17 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
         match placeholder_state {
             CF_PLACEHOLDER_STATE_INVALID | CF_PLACEHOLDER_STATE_NO_STATES => {
                 tracing::info!(
-                    "sync-state: path is not a placeholder, attempting convert path={} desired={:?} state_before={}",
+                    "sync-state: path is not a placeholder, attempting convert with identity path={} desired={:?} state_before={}",
                     relative_path,
                     desired_state,
                     state_before
                 );
                 match open_sync_path(&full_path, true) {
                     Ok(file) => {
-                        if let Err(err) = cf_convert_to_placeholder(&file) {
+                        if let Err(err) = cf_ensure_placeholder_identity(&file, &relative_path) {
                             stats.failed += 1;
                             tracing::info!(
-                                "sync-state: failed to convert to placeholder {} desired={:?}: {} state_before={}",
+                                "sync-state: failed to ensure placeholder identity for {} desired={:?}: {} state_before={}",
                                 full_path.display(),
                                 desired_state,
                                 err,
@@ -944,6 +944,40 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
                         stats.failed += 1;
                         tracing::info!(
                             "sync-state: failed to open {} for placeholder conversion desired={:?}: {} state_before={}",
+                            full_path.display(),
+                            desired_state,
+                            err,
+                            state_before
+                        );
+                        continue;
+                    }
+                }
+            }
+            _ if path_placeholder_identity_missing(&full_path) => {
+                tracing::info!(
+                    "sync-state: repairing missing placeholder identity path={} desired={:?} state_before={}",
+                    relative_path,
+                    desired_state,
+                    state_before
+                );
+                match open_sync_path(&full_path, true) {
+                    Ok(file) => {
+                        if let Err(err) = cf_ensure_placeholder_identity(&file, &relative_path) {
+                            stats.failed += 1;
+                            tracing::info!(
+                                "sync-state: failed to repair placeholder identity for {} desired={:?}: {} state_before={}",
+                                full_path.display(),
+                                desired_state,
+                                err,
+                                state_before
+                            );
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        stats.failed += 1;
+                        tracing::info!(
+                            "sync-state: failed to open {} for placeholder identity repair desired={:?}: {} state_before={}",
                             full_path.display(),
                             desired_state,
                             err,
@@ -1478,11 +1512,40 @@ unsafe extern "system" fn callback_fetch_data(
             );
         }
         Err(err) => {
+            let request_end = range_start.saturating_add(range_length);
+            let failure_offset = writer.next_offset.min(request_end);
+            let failure_length = request_end.saturating_sub(failure_offset);
+            let completion_status = if cancel_flag.load(Ordering::SeqCst) {
+                STATUS_CLOUD_FILE_REQUEST_CANCELED
+            } else {
+                STATUS_CLOUD_FILE_UNSUCCESSFUL
+            };
+            if failure_length > 0 {
+                if let Err(exec_err) = execute_transfer_data_failure(
+                    callback_info_ref,
+                    failure_offset,
+                    failure_length,
+                    completion_status,
+                ) {
+                    tracing::info!(
+                        "cfapi fetch-data failure completion error: request={} path={} status=0x{:08x} offset={} length={} error={:#}",
+                        request_identity,
+                        relative_path,
+                        completion_status as u32,
+                        failure_offset,
+                        failure_length,
+                        exec_err
+                    );
+                }
+            }
             tracing::info!(
-                "cfapi fetch-data hydration error: request={} path={} error={:#} state_after={} upload_debounce={}",
+                "cfapi fetch-data hydration error: request={} path={} error={:#} completion_status=0x{:08x} failure_offset={} failure_length={} state_after={} upload_debounce={}",
                 request_identity,
                 relative_path,
                 err,
+                completion_status as u32,
+                failure_offset,
+                failure_length,
                 describe_path_state(&full_path),
                 context
                     .upload_debounce
@@ -1752,6 +1815,44 @@ unsafe extern "system" fn callback_file_close_completion(
         normalized_path,
         context.sync_root
     );
+    let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
+    match open_sync_path(&full_path, false) {
+        Ok(file) => match cf_get_placeholder_standard_info(&file) {
+            Ok(info) if info.ModifiedDataSize == 0 => {
+                tracing::info!(
+                    "close-completion: skipping upload scheduling for clean placeholder {} state={}",
+                    relative_path,
+                    describe_path_state(&full_path)
+                );
+                return;
+            }
+            Ok(info) => {
+                tracing::info!(
+                    "close-completion: scheduling upload for dirty placeholder {} modified={} in_sync={} pin={} state={}",
+                    relative_path,
+                    info.ModifiedDataSize,
+                    info.InSyncState,
+                    info.PinState,
+                    describe_path_state(&full_path)
+                );
+            }
+            Err(err) => {
+                tracing::info!(
+                    "close-completion: placeholder info unavailable for {}; scheduling upload conservatively: {} state={}",
+                    relative_path,
+                    err,
+                    describe_path_state(&full_path)
+                );
+            }
+        },
+        Err(err) => {
+            tracing::info!(
+                "close-completion: could not open {} to inspect placeholder state before scheduling upload: {}",
+                full_path.display(),
+                err
+            );
+        }
+    }
     schedule_debounced_close_upload(
         context.upload_worker.clone(),
         context.upload_debounce.clone(),
@@ -1795,6 +1896,41 @@ fn execute_transfer_data_chunk(
 
     let hr = unsafe { CfExecute(&op_info, &mut op_params) };
     hresult_to_result(hr, "CfExecute")
+}
+
+fn execute_transfer_data_failure(
+    callback_info: &CF_CALLBACK_INFO,
+    offset: u64,
+    length: u64,
+    completion_status: NTSTATUS,
+) -> Result<()> {
+    let transfer_data = CF_OPERATION_PARAMETERS_0_0 {
+        Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+        CompletionStatus: completion_status,
+        Buffer: null(),
+        Offset: offset as i64,
+        Length: length as i64,
+    };
+
+    let mut op_params = CF_OPERATION_PARAMETERS {
+        ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            TransferData: transfer_data,
+        },
+    };
+
+    let op_info = CF_OPERATION_INFO {
+        StructSize: size_of::<CF_OPERATION_INFO>() as u32,
+        Type: CF_OPERATION_TYPE_TRANSFER_DATA,
+        ConnectionKey: callback_info.ConnectionKey,
+        TransferKey: callback_info.TransferKey,
+        CorrelationVector: callback_info.CorrelationVector,
+        SyncStatus: null(),
+        RequestKey: callback_info.RequestKey,
+    };
+
+    let hr = unsafe { CfExecute(&op_info, &mut op_params) };
+    hresult_to_result(hr, "CfExecute(TransferDataFailure)")
 }
 
 fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {

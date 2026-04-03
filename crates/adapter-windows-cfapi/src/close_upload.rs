@@ -1,5 +1,5 @@
 use crate::cfapi::{
-    cf_convert_to_placeholder, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
+    cf_ensure_placeholder_identity, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
     cf_set_not_in_sync, describe_path_state,
 };
 use crate::runtime::{CfapiRuntime, Uploader, reconcile_ancestor_directory_sync_states};
@@ -355,7 +355,7 @@ fn process_debounced_close_upload(
         }
     };
 
-    let mut upload_usn = match prepare_file_for_upload(&file) {
+    let mut upload_usn = match prepare_file_for_upload(&file, relative_path) {
         Ok(usn) => usn,
         Err(err) => {
             tracing::info!(
@@ -428,7 +428,9 @@ fn process_debounced_close_upload(
         .open(&full_path)
     {
         Ok(file_for_sync) => {
-            if let Err(err) = ensure_placeholder_then_set_in_sync(&file_for_sync, &mut upload_usn) {
+            if let Err(err) =
+                ensure_placeholder_then_set_in_sync(&file_for_sync, relative_path, &mut upload_usn)
+            {
                 tracing::info!(
                     "close-completion: failed to mark {} in sync after upload: {:#}",
                     relative_path,
@@ -457,17 +459,17 @@ fn process_debounced_close_upload(
     UploadAttemptOutcome::Settled
 }
 
-fn prepare_file_for_upload(file: &std::fs::File) -> Result<i64> {
-    if cf_get_placeholder_standard_info(file).is_err() {
-        cf_convert_to_placeholder(file)?;
-    }
+fn prepare_file_for_upload(file: &std::fs::File, relative_path: &str) -> Result<i64> {
+    cf_ensure_placeholder_identity(file, relative_path)?;
     cf_set_not_in_sync(file)
 }
 
-fn ensure_placeholder_then_set_in_sync(file: &std::fs::File, upload_usn: &mut i64) -> Result<()> {
-    if cf_get_placeholder_standard_info(file).is_err() {
-        cf_convert_to_placeholder(file)?;
-    }
+fn ensure_placeholder_then_set_in_sync(
+    file: &std::fs::File,
+    relative_path: &str,
+    upload_usn: &mut i64,
+) -> Result<()> {
+    cf_ensure_placeholder_identity(file, relative_path)?;
     cf_set_in_sync_with_usn(file, upload_usn)
 }
 
