@@ -24,6 +24,9 @@ import java.util.concurrent.ConcurrentHashMap
 
 class IronmeshDocumentsProvider : DocumentsProvider() {
     private val repository = IronmeshRepository()
+    private val thumbnailStreamer = IronmeshThumbnailStreamer(
+        IronmeshRepositoryThumbnailDataSource(repository),
+    )
     private val documentEntries = ConcurrentHashMap<String, StoreIndexEntry>()
 
     override fun onCreate(): Boolean {
@@ -231,8 +234,6 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         }
 
         val entry = resolveFileEntry(target.path)
-        val thumbnailUrl = entry.media?.thumbnail?.url
-            ?: throw FileNotFoundException("thumbnail not available")
 
         try {
             val pipe = ParcelFileDescriptor.createPipe()
@@ -243,9 +244,9 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { output ->
                     try {
                         runBlocking {
-                            repository.streamRelativeUrlTo(
+                            thumbnailStreamer.streamTo(
                                 resolveConnectionInput(),
-                                thumbnailUrl,
+                                entry,
                                 output,
                                 resolveServerCaPem(),
                                 resolveClientIdentityJson(),

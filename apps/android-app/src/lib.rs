@@ -4,15 +4,12 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    IronMeshClient, build_reqwest_client_from_pem_for_url, build_signed_request_headers,
-    enroll_connection_input_blocking,
+    IronMeshClient, enroll_connection_input_blocking,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyte, jbyteArray, jint, jlong, jstring};
-use reqwest::Method;
-use reqwest::Url;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -667,26 +664,6 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn url_path_and_query(url: &Url) -> String {
-    match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedDirectConnectionTarget {
-    server_base_url: String,
-    server_ca_pem: Option<String>,
-}
-
 fn normalized_connection_input_string(connection_input: impl Into<String>) -> Result<String> {
     let connection_input = connection_input.into();
     let trimmed = connection_input.trim();
@@ -710,35 +687,6 @@ fn split_connection_input(
     } else {
         Ok((Some(normalized), None))
     }
-}
-
-fn resolve_direct_connection_target(
-    connection_input: impl Into<String>,
-    server_ca_pem: Option<String>,
-) -> Result<ResolvedDirectConnectionTarget> {
-    let server_ca_pem = normalize_optional_string(server_ca_pem);
-    let (server_base_url, client_bootstrap_json) = split_connection_input(connection_input)?;
-    if let Some(server_base_url) = server_base_url {
-        return Ok(ResolvedDirectConnectionTarget {
-            server_base_url,
-            server_ca_pem,
-        });
-    }
-
-    let bootstrap_json =
-        client_bootstrap_json.ok_or_else(|| anyhow::anyhow!("missing connection input"))?;
-    let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
-        .context("failed to parse android connection bootstrap JSON")?;
-    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-        bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-    }
-    let resolved = bootstrap
-        .resolve_direct_http_target_blocking()
-        .context("failed to resolve direct public API target from android bootstrap")?;
-    Ok(ResolvedDirectConnectionTarget {
-        server_base_url: resolved.server_base_url,
-        server_ca_pem: resolved.server_ca_pem.or(server_ca_pem),
-    })
 }
 
 fn configured_sdk(
@@ -1125,49 +1073,17 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
         let server_ca_pem = optional_jstring(&mut env, server_ca_pem)?;
         let client_identity_json = optional_jstring(&mut env, client_identity_json)?;
         let mut writer = JavaOutputStreamWriter::new(&mut env, output_stream)?;
-        let resolved_target =
-            resolve_direct_connection_target(connection_input, server_ca_pem.clone())
-                .context("relative streaming requires a direct public API endpoint")?;
-        let base = Url::parse(&resolved_target.server_base_url)
-            .context("invalid direct base URL for relative stream")?;
-        let target = base
-            .join(&relative_url)
-            .with_context(|| format!("failed to resolve relative URL {relative_url}"))?;
-        let client = build_reqwest_client_from_pem_for_url(
-            resolved_target.server_ca_pem.as_deref(),
-            &target,
-        )?;
-        let client_identity = parse_client_identity_json(client_identity_json)?;
-        let mut request = client.get(target.clone());
-        if let Some(identity) = client_identity.as_ref() {
-            let signed_headers = build_signed_request_headers(
-                identity,
-                Method::GET.as_str(),
-                &url_path_and_query(&target),
-                now_unix_secs(),
-                None,
-            )?;
-            request = signed_headers.apply_to_reqwest(request);
-        }
-
         let rt = runtime()?;
-        let response = rt.block_on(async {
-            request
-                .send()
-                .await
-                .context("failed to request relative URL")?
-                .error_for_status()
-                .context("relative URL request returned non-success status")
-        })?;
-
-        let body = rt.block_on(async {
-            response
-                .bytes()
-                .await
-                .context("failed reading relative URL response body")
-        })?;
+        let client = configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
+        let response = rt.block_on(client.get_relative_path(&relative_url))?;
+        if !response.status.is_success() {
+            anyhow::bail!(
+                "relative URL request returned non-success status: {}",
+                response.status
+            );
+        }
         writer
-            .write_all(&body)
+            .write_all(&response.body)
             .context("failed streaming relative URL response body")?;
         writer
             .flush()
