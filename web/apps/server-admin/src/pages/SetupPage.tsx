@@ -2,6 +2,7 @@ import {
   generateSetupJoinRequest,
   getSetupStatus,
   importSetupEnrollmentPackage,
+  isHttpErrorStatus,
   startSetupCluster,
   type SetupStatus,
   type SetupTransitionResponse
@@ -42,12 +43,12 @@ export function SetupPage() {
       setStatus(payload);
       setAvailability("available");
     } catch (refreshError) {
-      const message = refreshError instanceof Error ? refreshError.message : String(refreshError);
-      if (message.startsWith("HTTP 404")) {
+      if (isHttpErrorStatus(refreshError, 401, 403, 404)) {
         setAvailability("unavailable");
         setStatus(null);
         return;
       }
+      const message = refreshError instanceof Error ? refreshError.message : String(refreshError);
       setError(message);
       setAvailability("unavailable");
     }

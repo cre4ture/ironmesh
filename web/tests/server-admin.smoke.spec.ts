@@ -177,9 +177,33 @@ test("server-admin provisioning does not fall back when a specific rendezvous se
   await expect(page.getByText("Compact claim issuance is temporarily unavailable on this node, so the page fell back to a full bootstrap QR.")).toHaveCount(0);
 });
 
+test("server-admin runtime ignores auth-protected setup probes", async ({ page }) => {
+  await installServerAdminMocks(page, { setupProbeStatus: 401 });
+
+  await page.goto("/");
+
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByText("Setup probe warning", { exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await expect(page.getByText("Setup probe warning", { exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Setup", { exact: true }).click();
+  await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
+  await expect(page.getByText("Setup endpoint error", { exact: true })).toHaveCount(0);
+});
+
 async function installServerAdminMocks(
   page: Page,
-  options?: { setupMode?: boolean; bootstrapClaimMode?: "success" | "bad_gateway" }
+  options?: {
+    setupMode?: boolean;
+    bootstrapClaimMode?: "success" | "bad_gateway";
+    setupProbeStatus?: 401 | 403 | 404;
+  }
 ) {
   const imageBody = tinyPngBuffer();
   let authenticated = false;
@@ -549,11 +573,17 @@ async function installServerAdminMocks(
     }
 
     if (pathname === "/setup/status" && method === "GET") {
-      await route.fulfill({
-        status: 404,
-        contentType: "application/json; charset=utf-8",
-        body: JSON.stringify({ error: "setup mode not active" })
-      });
+      const status = options?.setupProbeStatus ?? 404;
+      if (status === 404) {
+        await route.fulfill({
+          status,
+          contentType: "application/json; charset=utf-8",
+          body: JSON.stringify({ error: "setup mode not active" })
+        });
+        return;
+      }
+
+      await route.fulfill({ status });
       return;
     }
 

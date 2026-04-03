@@ -1,4 +1,4 @@
-import { getSetupStatus } from "@ironmesh/api";
+import { getSetupStatus, isHttpErrorStatus } from "@ironmesh/api";
 import { ColorSchemeControl, IronmeshBrand, PageHeader } from "@ironmesh/ui";
 import { Alert, AppShell, Badge, Burger, Button, Center, Group, Loader, NavLink, ScrollArea, Stack, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
@@ -40,12 +40,12 @@ export function ServerAdminShell() {
         if (cancelled) {
           return;
         }
-        const message = error instanceof Error ? error.message : String(error);
         setSurfaceMode("runtime");
-        if (!message.startsWith("HTTP 404")) {
-          setSurfaceError(`Failed to probe setup mode: ${message}`);
-        } else {
+        if (isHttpErrorStatus(error, 401, 403, 404)) {
           setSurfaceError(null);
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          setSurfaceError(`Failed to probe setup mode: ${message}`);
         }
       }
     }
