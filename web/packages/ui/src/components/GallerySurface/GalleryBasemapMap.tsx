@@ -658,9 +658,7 @@ function GalleryBasemapMarker({
         overflow: "hidden",
         transform: "translate(-50%, -50%)",
         background: failed || imageFailed ? "rgba(18, 48, 64, 0.92)" : "rgba(255, 255, 255, 0.16)",
-        boxShadow: selected
-          ? "0 0 0 6px rgba(164, 80, 255, 0.24), 0 18px 34px rgba(0, 0, 0, 0.42)"
-          : "0 12px 28px rgba(0, 0, 0, 0.34)",
+        boxShadow: selected ? "0 0 0 6px rgba(164, 80, 255, 0.24)" : "none",
         cursor: "pointer",
         pointerEvents: "auto"
       }}
