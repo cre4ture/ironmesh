@@ -15,6 +15,8 @@ use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{decode_path_from_file_identity, path_to_relative};
 use crate::runtime::Uploader;
+use crate::snapshot_cache::record_local_file_hash;
+use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use windows_sys::Win32::Storage::CloudFilters::{
     CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
     CF_PLACEHOLDER_STATE_NO_STATES, CF_PLACEHOLDER_STATE_PARTIAL,
@@ -221,6 +223,14 @@ impl SyncRootMonitor {
     }
 
     pub fn seed_remote_entries(&mut self, plan: &CfapiActionPlan) {
+        self.seed_remote_entries_with_suppressed_paths(plan, &std::collections::BTreeSet::new());
+    }
+
+    pub fn seed_remote_entries_with_suppressed_paths(
+        &mut self,
+        plan: &CfapiActionPlan,
+        suppressed_paths: &std::collections::BTreeSet<String>,
+    ) {
         let mut seeded = HashMap::new();
         for action in &plan.actions {
             match action {
@@ -235,6 +245,12 @@ impl SyncRootMonitor {
                     }
                 }
                 CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
+            }
+        }
+        for path in suppressed_paths {
+            self.seed_existing_entry(&mut seeded, path, false);
+            for parent in parent_directories_for_path(path) {
+                self.seed_existing_entry(&mut seeded, &parent, true);
             }
         }
         self.seen = seeded;
@@ -387,6 +403,7 @@ impl SyncRootMonitor {
             if rel_path.is_empty()
                 || is_internal_client_identity_relative_path(&rel_path)
                 || is_internal_connection_bootstrap_relative_path(&rel_path)
+                || is_internal_remote_snapshot_relative_path(&rel_path)
             {
                 continue;
             }
@@ -407,6 +424,7 @@ impl SyncRootMonitor {
         if normalized.is_empty()
             || is_internal_client_identity_relative_path(&normalized)
             || is_internal_connection_bootstrap_relative_path(&normalized)
+            || is_internal_remote_snapshot_relative_path(&normalized)
         {
             return;
         }
@@ -435,6 +453,7 @@ impl SyncRootMonitor {
         }
         if is_internal_client_identity_relative_path(&rel_path)
             || is_internal_connection_bootstrap_relative_path(&rel_path)
+            || is_internal_remote_snapshot_relative_path(&rel_path)
         {
             return;
         }
@@ -503,6 +522,14 @@ impl SyncRootMonitor {
                 ) {
                     tracing::info!("{}: failed to upload file {}: {}", self.name, rel_path, e);
                 } else {
+                    if let Err(err) = record_local_file_hash(&self.sync_root, &rel_path) {
+                        tracing::info!(
+                            "{}: failed to record in-sync local file hash for {}: {:#}",
+                            self.name,
+                            rel_path,
+                            err
+                        );
+                    }
                     tracing::info!("{}: uploaded file {}", self.name, rel_path);
                 }
             } else {
@@ -782,6 +809,7 @@ impl SyncRootMonitor {
         for (path, entry) in deleted_paths {
             if is_internal_client_identity_relative_path(path)
                 || is_internal_connection_bootstrap_relative_path(path)
+                || is_internal_remote_snapshot_relative_path(path)
             {
                 continue;
             }

@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use crate::framework::{
         TEST_ADMIN_TOKEN, default_client_identity_path, fresh_data_dir,
         https_client_with_root_from_data_dir, issue_bootstrap_bundle, start_authenticated_server,
@@ -175,6 +176,18 @@ mod tests {
         panic!("timed out waiting for path {}", path.display());
     }
 
+    async fn wait_for_path_absence(path: &Path, retries: usize) {
+        for _ in 0..retries {
+            if !path.exists() {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        panic!("timed out waiting for path absence {}", path.display());
+    }
+
     async fn wait_for_hydrated_payload(path: &Path, expected: &[u8], retries: usize) {
         for _ in 0..retries {
             if let Ok(bytes) = std::fs::read(path)
@@ -234,6 +247,36 @@ mod tests {
             .map(|bytes| bytes.len())
             .unwrap_or_default();
         panic!("remote file did not disappear for {key} (last observed size {lingering} bytes)");
+    }
+
+    async fn wait_for_remote_store_index_file_absence(
+        sdk: &IronMeshClient,
+        key: &str,
+        retries: usize,
+    ) {
+        for _ in 0..retries {
+            if let Ok(index) = sdk.store_index(None, 64, None).await
+                && !index.entries.iter().any(|entry| entry.path == key)
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let snapshot = sdk
+            .store_index(None, 64, None)
+            .await
+            .map(|index| {
+                index
+                    .entries
+                    .into_iter()
+                    .map(|entry| format!("{} [{}]", entry.path, entry.entry_type))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|err| format!("store-index-error: {err}"));
+        panic!("remote store index did not drop file {key}; index={snapshot}");
     }
 
     async fn wait_for_remote_version_graph(
@@ -870,6 +913,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
     }
 
+    async fn run_cfapi_remote_delete_restart_case(
+        bind: &str,
+        key: &str,
+        payload: &'static [u8],
+        offline_local_payload: Option<&'static [u8]>,
+    ) -> anyhow::Result<()> {
+        let sync_root = fresh_data_dir("cfapi-remote-delete-restart-sync-root");
+        std::fs::create_dir_all(&sync_root).context("failed to create sync root")?;
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-remote-delete-restart")
+                .await
+                .context("failed to start authenticated CFAPI fixture")?;
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.remote.delete.restart.{}",
+            bind.replace(['.', ':'], "_")
+        );
+
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from_static(payload))
+            .await
+            .context("failed to seed remote file for restart delete case")?;
+
+        let mut adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Remote Delete Restart Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .context("failed to register and serve CFAPI adapter")?;
+
+        let local_file = sync_root.join(key.replace('/', "\\"));
+        wait_for_path(&local_file, 220).await;
+        pin_cfapi_placeholder(&sync_root, key, true)
+            .await
+            .context("failed to pin placeholder before restart")?;
+        wait_for_hydrated_payload(&local_file, payload, 200).await;
+
+        stop_server(&mut adapter).await;
+
+        fixture
+            .sdk
+            .delete_path(key)
+            .await
+            .with_context(|| format!("failed to delete remote file {key} while adapter offline"))?;
+        wait_for_remote_file_absence(&fixture.sdk, key, 220).await;
+        wait_for_remote_store_index_file_absence(&fixture.sdk, key, 220).await;
+        if let Some(offline_local_payload) = offline_local_payload {
+            let mut file =
+                File::create(&local_file).context("failed to reopen local file while offline")?;
+            file.write_all(offline_local_payload)
+                .context("failed to write offline local bytes after remote delete")?;
+            file.sync_all()
+                .context("failed to sync offline local bytes after remote delete")?;
+            drop(file);
+        }
+
+        let mut restarted_adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Remote Delete Restart Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .context("failed to restart CFAPI adapter after remote delete")?;
+
+        let result = async {
+            if let Some(offline_local_payload) = offline_local_payload {
+                wait_for_path(&local_file, 220).await;
+                wait_for_hydrated_payload(&local_file, offline_local_payload, 220).await;
+                wait_for_remote_payload(&fixture.sdk, key, offline_local_payload, 220).await;
+            } else {
+                wait_for_path_absence(&local_file, 220).await;
+                wait_for_remote_file_absence(&fixture.sdk, key, 220).await;
+                wait_for_remote_store_index_file_absence(&fixture.sdk, key, 220).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut restarted_adapter).await;
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        result
+    }
+
     #[tokio::test]
     async fn test_cfapi_monitor_detects_new_and_modified_file_small() {
         run_cfapi_monitor_case("127.0.0.1:19090", "initial content", "modified content").await;
@@ -1101,6 +1235,30 @@ mod tests {
             true,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_remote_delete_while_offline_does_not_resurrect_clean_file_on_restart() {
+        run_cfapi_remote_delete_restart_case(
+            "127.0.0.1:19115",
+            "offline-delete/check.txt",
+            b"remote delete restart payload",
+            None,
+        )
+        .await
+        .expect("remote delete while offline should not resurrect clean file on restart");
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_remote_delete_while_offline_preserves_local_only_changes_on_restart() {
+        run_cfapi_remote_delete_restart_case(
+            "127.0.0.1:19116",
+            "offline-delete/local-change.txt",
+            b"remote delete restart payload",
+            Some(b"offline local-only payload"),
+        )
+        .await
+        .expect("remote delete while offline should preserve local-only file changes on restart");
     }
 
     #[tokio::test]

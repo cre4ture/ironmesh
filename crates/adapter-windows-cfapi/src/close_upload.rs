@@ -3,6 +3,7 @@ use crate::cfapi::{
     cf_set_not_in_sync, describe_path_state,
 };
 use crate::runtime::{CfapiRuntime, Uploader, reconcile_ancestor_directory_sync_states};
+use crate::snapshot_cache::record_local_file_hash;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -450,6 +451,13 @@ fn process_debounced_close_upload(
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
+    if let Err(err) = record_local_file_hash(&worker.sync_root, relative_path) {
+        tracing::info!(
+            "close-completion: failed to record in-sync local file hash for {}: {:#}",
+            relative_path,
+            err
+        );
+    }
     tracing::info!(
         "cfapi uploaded local file: path={} bytes={} final_state={}",
         relative_path,

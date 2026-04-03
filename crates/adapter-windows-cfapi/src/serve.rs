@@ -8,6 +8,11 @@ use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
     reconcile_sync_states, register_sync_root,
 };
+use crate::snapshot_cache::{
+    RemoteDeleteReconcileReport, RemoteSnapshotCache, load_remote_snapshot_cache,
+    persist_remote_snapshot_cache,
+    reconcile_remote_delete_state,
+};
 use clap::Parser;
 use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
 use std::path::PathBuf;
@@ -103,7 +108,36 @@ pub fn serve_main() -> anyhow::Result<()> {
         client.clone(),
         RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
     );
+    let cached_remote_snapshot = match load_remote_snapshot_cache(&registration.root_path) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::warn!("failed to load remote snapshot cache: {err:#}");
+            None
+        }
+    };
     let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
+    let startup_delete_report = match reconcile_remote_delete_state(
+        &registration.root_path,
+        cached_remote_snapshot.as_ref(),
+        &initial_snapshot,
+    ) {
+        Ok(report) => report,
+        Err(err) => {
+            tracing::warn!("startup remote-delete reconciliation failed: {err:#}");
+            RemoteDeleteReconcileReport::default()
+        }
+    };
+    if !startup_delete_report.deleted_paths.is_empty()
+        || !startup_delete_report.preserved_paths.is_empty()
+        || !startup_delete_report.suppressed_startup_paths.is_empty()
+    {
+        tracing::info!(
+            "remote-delete-reconcile: startup deleted={} preserved={} suppressed={}",
+            startup_delete_report.deleted_paths.len(),
+            startup_delete_report.preserved_paths.len(),
+            startup_delete_report.suppressed_startup_paths.len()
+        );
+    }
     let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
     let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
     let refresh_poller =
@@ -133,6 +167,16 @@ pub fn serve_main() -> anyhow::Result<()> {
         "materialized {} planned entries under sync root",
         action_plan.actions.len()
     );
+    let mut previous_remote_snapshot = match persist_remote_snapshot_cache(
+        &registration.root_path,
+        &initial_snapshot,
+    ) {
+        Ok(cache) => cache,
+        Err(err) => {
+            tracing::warn!("failed to persist remote snapshot cache: {err:#}");
+            RemoteSnapshotCache::from_snapshot(initial_snapshot.clone())
+        }
+    };
 
     tracing::info!("connected to CFAPI callbacks; serving hydration requests");
     let running = std::sync::Arc::new(AtomicBool::new(true));
@@ -153,6 +197,13 @@ pub fn serve_main() -> anyhow::Result<()> {
         Some(initial_snapshot),
         fetcher,
         move |update| {
+            if let Err(err) = reconcile_remote_delete_state(
+                &refresh_registration.root_path,
+                Some(&previous_remote_snapshot),
+                &update.snapshot,
+            ) {
+                tracing::warn!("remote-refresh: remote-delete reconciliation failed: {err:#}");
+            }
             let plan = refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
             if let Err(err) = apply_action_plan(&refresh_registration.root_path, &plan) {
                 tracing::info!("remote-refresh: apply_action_plan error: {err}");
@@ -172,6 +223,16 @@ pub fn serve_main() -> anyhow::Result<()> {
                     sync_state_stats
                 );
             }
+            previous_remote_snapshot = match persist_remote_snapshot_cache(
+                &refresh_registration.root_path,
+                &update.snapshot,
+            ) {
+                Ok(cache) => cache,
+                Err(err) => {
+                    tracing::warn!("remote-refresh: failed to persist remote snapshot cache: {err:#}");
+                    previous_remote_snapshot.with_snapshot(update.snapshot.clone())
+                }
+            };
         },
     );
 

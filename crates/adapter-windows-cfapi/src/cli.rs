@@ -19,6 +19,11 @@ use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
     reconcile_sync_states, register_sync_root, unregister_sync_root,
 };
+use crate::snapshot_cache::{
+    RemoteDeleteReconcileReport, RemoteSnapshotCache, load_remote_snapshot_cache,
+    persist_remote_snapshot_cache, record_local_file_hash,
+    reconcile_remote_delete_state,
+};
 use sync_core::SyncPolicy;
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -89,6 +94,45 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
             conflict_sample
         );
     }
+}
+
+fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconcileReport) {
+    if report.deleted_paths.is_empty()
+        && report.preserved_paths.is_empty()
+        && report.suppressed_startup_paths.is_empty()
+    {
+        return;
+    }
+
+    tracing::info!(
+        "remote-delete-reconcile: {} deleted={} preserved={} suppressed={}",
+        label,
+        report.deleted_paths.len(),
+        report.preserved_paths.len(),
+        report.suppressed_startup_paths.len()
+    );
+    tracing::info!(
+        "remote-delete-reconcile: {} deleted_sample={:?} preserved_sample={:?} suppressed_sample={:?}",
+        label,
+        report
+            .deleted_paths
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+        report
+            .preserved_paths
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+        report
+            .suppressed_startup_paths
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
 }
 
 #[derive(Debug, Parser)]
@@ -241,7 +285,28 @@ pub fn cli_main() -> anyhow::Result<()> {
                 client.clone(),
                 RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
             );
+            let cached_remote_snapshot = match load_remote_snapshot_cache(&registration.root_path) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    tracing::warn!("failed to load remote snapshot cache: {err:#}");
+                    None
+                }
+            };
             let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
+            let startup_delete_report = match reconcile_remote_delete_state(
+                &registration.root_path,
+                cached_remote_snapshot.as_ref(),
+                &initial_snapshot,
+            ) {
+                Ok(report) => {
+                    log_remote_delete_reconcile_summary("startup", &report);
+                    report
+                }
+                Err(err) => {
+                    tracing::warn!("startup remote-delete reconciliation failed: {err:#}");
+                    RemoteDeleteReconcileReport::default()
+                }
+            };
             let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
             log_action_plan_summary("startup", &action_plan);
 
@@ -277,10 +342,23 @@ pub fn cli_main() -> anyhow::Result<()> {
             );
             let mut monitor =
                 SyncRootMonitor::new("monitor", registration.root_path.clone(), uploader.clone());
-            monitor.seed_remote_entries(&action_plan);
+            monitor.seed_remote_entries_with_suppressed_paths(
+                &action_plan,
+                &startup_delete_report.suppressed_startup_paths,
+            );
             std::thread::spawn(move || {
                 monitor.run();
             });
+            let mut previous_remote_snapshot = match persist_remote_snapshot_cache(
+                &registration.root_path,
+                &initial_snapshot,
+            ) {
+                Ok(cache) => cache,
+                Err(err) => {
+                    tracing::warn!("failed to persist remote snapshot cache: {err:#}");
+                    RemoteSnapshotCache::from_snapshot(initial_snapshot.clone())
+                }
+            };
 
             tracing::info!("connected to CFAPI callbacks; serving hydration requests");
             let running = std::sync::Arc::new(AtomicBool::new(true));
@@ -301,6 +379,25 @@ pub fn cli_main() -> anyhow::Result<()> {
                 Some(initial_snapshot),
                 fetcher,
                 move |update| {
+                    let remote_delete_report = match reconcile_remote_delete_state(
+                        &refresh_registration.root_path,
+                        Some(&previous_remote_snapshot),
+                        &update.snapshot,
+                    ) {
+                        Ok(report) => {
+                            log_remote_delete_reconcile_summary(
+                                &format!("refresh changed_paths={}", update.changed_paths.len()),
+                                &report,
+                            );
+                            report
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "remote-refresh: remote-delete reconciliation failed: {err:#}"
+                            );
+                            RemoteDeleteReconcileReport::default()
+                        }
+                    };
                     let plan =
                         refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
                     let summary_label =
@@ -325,6 +422,24 @@ pub fn cli_main() -> anyhow::Result<()> {
                             sync_state_stats
                         );
                     }
+                    if !remote_delete_report.suppressed_startup_paths.is_empty() {
+                        tracing::info!(
+                            "remote-refresh: preserved {} stale local path(s) after delete because local bytes could not be removed",
+                            remote_delete_report.suppressed_startup_paths.len()
+                        );
+                    }
+                    previous_remote_snapshot = match persist_remote_snapshot_cache(
+                        &refresh_registration.root_path,
+                        &update.snapshot,
+                    ) {
+                        Ok(cache) => cache,
+                        Err(err) => {
+                            tracing::warn!(
+                                "remote-refresh: failed to persist remote snapshot cache: {err:#}"
+                            );
+                            previous_remote_snapshot.with_snapshot(update.snapshot.clone())
+                        }
+                    };
                 },
             );
 
@@ -382,6 +497,12 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
         );
 
         if info.OnDiskDataSize >= total_size && info.ModifiedDataSize == 0 {
+            if let Err(err) = record_local_file_hash(&root_path, &args.path) {
+                tracing::warn!(
+                    "failed to record in-sync local file hash for pinned placeholder {}: {err:#}",
+                    target_path.display()
+                );
+            }
             return Ok(());
         }
 

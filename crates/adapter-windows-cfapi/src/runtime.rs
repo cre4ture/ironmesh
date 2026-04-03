@@ -24,6 +24,8 @@ use crate::helpers::{
     decode_path_from_file_identity, encode_placeholder_file_identity, normalize_path,
     path_to_relative, utf16_path, utf16_string,
 };
+use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
+use crate::snapshot_cache::record_local_file_hash;
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
@@ -333,11 +335,7 @@ impl CfapiRuntime {
     }
 
     pub fn sync_from_action_plan(&self, plan: &CfapiActionPlan) -> usize {
-        let mut changed = 0usize;
-        let mut remote_versions = self
-            .remote_versions_by_path
-            .lock()
-            .expect("remote version map lock poisoned");
+        let mut next_remote_versions = BTreeMap::new();
         for action in &plan.actions {
             match action {
                 CfapiAction::EnsurePlaceholder {
@@ -350,22 +348,25 @@ impl CfapiRuntime {
                     remote_version,
                     ..
                 } => {
-                    let normalized = normalize_path(path);
-                    let update = match remote_versions.get(&normalized) {
-                        Some(existing) => existing != remote_version,
-                        None => true,
-                    };
-                    if update {
-                        remote_versions.insert(normalized, remote_version.clone());
-                        changed += 1;
-                    }
+                    next_remote_versions.insert(normalize_path(path), remote_version.clone());
                 }
                 CfapiAction::EnsureDirectory { .. }
                 | CfapiAction::QueueUploadOnClose { .. }
                 | CfapiAction::MarkConflict { .. } => {}
             }
         }
-        changed
+        let mut remote_versions = self
+            .remote_versions_by_path
+            .lock()
+            .expect("remote version map lock poisoned");
+        let changed = remote_versions
+            .iter()
+            .any(|(path, version)| next_remote_versions.get(path) != Some(version))
+            || next_remote_versions
+                .iter()
+                .any(|(path, version)| remote_versions.get(path) != Some(version));
+        *remote_versions = next_remote_versions;
+        usize::from(changed)
     }
 }
 
@@ -669,6 +670,7 @@ fn path_has_pending_sync_activity(root_path: &Path, path: &Path) -> bool {
     if relative_path.is_empty()
         || is_internal_client_identity_relative_path(&relative_path)
         || is_internal_connection_bootstrap_relative_path(&relative_path)
+        || is_internal_remote_snapshot_relative_path(&relative_path)
     {
         return false;
     }
@@ -1332,6 +1334,33 @@ pub(crate) fn handle_callback_fetch_data(
             if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
                 hydrated_paths.insert(relative_path.clone());
             }
+            if result.object_size_bytes > 0 {
+                match open_sync_path(&full_path, false)
+                    .and_then(|file| cf_get_placeholder_standard_info(&file).map_err(std::io::Error::other))
+                {
+                    Ok(info)
+                        if info.ModifiedDataSize == 0
+                            && info.OnDiskDataSize >= result.object_size_bytes as i64 =>
+                    {
+                        if let Err(err) = record_local_file_hash(&context.sync_root, &relative_path)
+                        {
+                            tracing::info!(
+                                "cfapi fetch-data complete: failed to record in-sync local file hash for {}: {:#}",
+                                relative_path,
+                                err
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::info!(
+                            "cfapi fetch-data complete: failed to inspect hydrated file {} for local hash capture: {}",
+                            relative_path,
+                            err
+                        );
+                    }
+                }
+            }
             tracing::info!(
                 "cfapi fetch-data complete: request={} path={} object_size={} range_start={} range_length={} bytes_transferred={} state_after={} upload_debounce={}",
                 request_identity,
@@ -1581,6 +1610,7 @@ pub(crate) fn handle_callback_file_close_completion(
     let relative_path = path_to_relative(&context.sync_root, &normalized_path);
     if is_internal_client_identity_relative_path(&relative_path)
         || is_internal_connection_bootstrap_relative_path(&relative_path)
+        || is_internal_remote_snapshot_relative_path(&relative_path)
     {
         tracing::info!(
             "close-completion: skipping internal config file {}",
@@ -1603,6 +1633,15 @@ pub(crate) fn handle_callback_file_close_completion(
     match open_sync_path(&full_path, false) {
         Ok(file) => match cf_get_placeholder_standard_info(&file) {
             Ok(info) if info.ModifiedDataSize == 0 => {
+                if info.OnDiskDataSize > 0
+                    && let Err(err) = record_local_file_hash(&context.sync_root, &relative_path)
+                {
+                    tracing::info!(
+                        "close-completion: failed to record in-sync local file hash for clean placeholder {}: {:#}",
+                        relative_path,
+                        err
+                    );
+                }
                 tracing::info!(
                     "close-completion: skipping upload scheduling for clean placeholder {} state={}",
                     relative_path,
