@@ -60,6 +60,7 @@ internal object IronmeshCursorRows {
         val mime = entry.media?.mime_type ?: fallbackMimeType
         val createdAtMillis = entry.media?.taken_at_unix?.times(1000)
         val thumbnail = entry.media?.thumbnail
+        val supportsThumbnail = thumbnail != null || supportsGeneratedThumbnail(entry, mime)
 
         addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_DOCUMENT_ID, documentId)
         addColumnIfPresent(cursor, row, DocumentsContract.Document.COLUMN_DISPLAY_NAME, fileName)
@@ -69,7 +70,7 @@ internal object IronmeshCursorRows {
             row,
             DocumentsContract.Document.COLUMN_FLAGS,
             DocumentsContract.Document.FLAG_SUPPORTS_WRITE or
-                if (thumbnail != null) DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL else 0,
+                if (supportsThumbnail) DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL else 0,
         )
         addColumnIfPresent(
             cursor,
@@ -122,4 +123,43 @@ internal object IronmeshCursorRows {
             row.add(columnName, value)
         }
     }
+
+    private fun supportsGeneratedThumbnail(
+        entry: StoreIndexEntry,
+        mime: String,
+    ): Boolean {
+        val normalizedMime = mime.lowercase()
+        if (normalizedMime.startsWith("image/") || normalizedMime.startsWith("video/")) {
+            return true
+        }
+
+        val mediaType = entry.media?.media_type?.lowercase()
+        if (mediaType == "image" || mediaType == "video") {
+            return true
+        }
+
+        val extension = entry.path.substringAfterLast('.', "").lowercase()
+        return extension in THUMBNAIL_IMAGE_EXTENSIONS || extension in THUMBNAIL_VIDEO_EXTENSIONS
+    }
+
+    private val THUMBNAIL_IMAGE_EXTENSIONS = setOf(
+        "avif",
+        "bmp",
+        "gif",
+        "heic",
+        "heif",
+        "jpeg",
+        "jpg",
+        "png",
+        "webp",
+    )
+
+    private val THUMBNAIL_VIDEO_EXTENSIONS = setOf(
+        "m4v",
+        "mkv",
+        "mov",
+        "mp4",
+        "ogv",
+        "webm",
+    )
 }

@@ -44,7 +44,34 @@ class IronmeshCursorRowsTest {
         )
     }
 
-    private fun sampleImageEntry(): StoreIndexEntry {
+    @Test
+    fun populateFileRow_marksImagesAsThumbnailCapableWithoutPrefetchedThumbnailMetadata() {
+        val cursor = MatrixCursor(
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_FLAGS,
+            ),
+        )
+
+        val row = cursor.newRow()
+        IronmeshCursorRows.populateFileRow(
+            cursor = cursor,
+            row = row,
+            documentId = "file:gallery/cat.png",
+            entry = sampleImageEntry(thumbnail = null),
+            fallbackMimeType = "image/png",
+            summary = "4 x 3 - ready",
+        )
+
+        assertTrue(cursor.moveToFirst())
+        assertTrue(
+            cursor.getInt(3) and DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL != 0,
+        )
+    }
+
+    private fun sampleImageEntry(thumbnail: StoreIndexThumbnail? = sampleThumbnail()): StoreIndexEntry {
         return StoreIndexEntry(
             path = "gallery/cat.png",
             entry_type = "key",
@@ -55,15 +82,19 @@ class IronmeshCursorRowsTest {
                 mime_type = "image/png",
                 width = 4,
                 height = 3,
-                thumbnail = StoreIndexThumbnail(
-                    url = "/media/thumbnail?key=gallery%2Fcat.png",
-                    profile = "grid",
-                    width = 256,
-                    height = 192,
-                    format = "jpeg",
-                    size_bytes = 1024,
-                ),
+                thumbnail = thumbnail,
             ),
+        )
+    }
+
+    private fun sampleThumbnail(): StoreIndexThumbnail {
+        return StoreIndexThumbnail(
+            url = "/media/thumbnail?key=gallery%2Fcat.png",
+            profile = "grid",
+            width = 256,
+            height = 192,
+            format = "jpeg",
+            size_bytes = 1024,
         )
     }
 }

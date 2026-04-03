@@ -21,6 +21,7 @@ import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 class IronmeshDocumentsProvider : DocumentsProvider() {
     private val repository = IronmeshRepository()
@@ -28,6 +29,7 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         IronmeshRepositoryThumbnailDataSource(repository),
     )
     private val documentEntries = ConcurrentHashMap<String, StoreIndexEntry>()
+    private val thumbnailExecutor = Executors.newFixedThreadPool(MAX_CONCURRENT_THUMBNAIL_STREAMS)
 
     override fun onCreate(): Boolean {
         context?.applicationContext?.let { RustPreferencesBridge.initialize(it) }
@@ -240,7 +242,12 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
             val readSide = pipe[0]
             val writeSide = pipe[1]
 
-            Thread {
+            signal?.setOnCancelListener {
+                runCatching { readSide.close() }
+                runCatching { writeSide.close() }
+            }
+
+            thumbnailExecutor.execute {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { output ->
                     try {
                         runBlocking {
@@ -253,13 +260,15 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
                             )
                         }
                         output.flush()
+                    } catch (e: FileNotFoundException) {
+                        Log.w(TAG, "Thumbnail unavailable for ${entry.path}: ${e.message}")
                     } catch (e: IOException) {
                         Log.w(TAG, "Client closed thumbnail pipe: ${e.message}")
                     } catch (e: Exception) {
-                        Log.e(TAG, "Error streaming thumbnail", e)
+                        Log.w(TAG, "Failed to stream thumbnail for ${entry.path}: ${e.message}")
                     }
                 }
-            }.start()
+            }
 
             return AssetFileDescriptor(readSide, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
         } catch (e: IOException) {
@@ -474,5 +483,6 @@ class IronmeshDocumentsProvider : DocumentsProvider() {
         private const val TAG = "IronmeshDocumentsProvider"
         private const val ROOT_ID = "ironmesh-root"
         private const val ROOT_TITLE = "Ironmesh"
+        private const val MAX_CONCURRENT_THUMBNAIL_STREAMS = 4
     }
 }

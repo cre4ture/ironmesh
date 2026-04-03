@@ -5,7 +5,6 @@ import android.content.ActivityNotFoundException
 import android.content.ContentResolver
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Point
 import android.net.Uri
 import android.os.Build
@@ -1046,6 +1045,14 @@ private fun GalleryFullscreenViewer(
     }
 }
 
+private sealed interface GalleryFullscreenImageState {
+    data object Loading : GalleryFullscreenImageState
+
+    data class Loaded(val bitmap: Bitmap) : GalleryFullscreenImageState
+
+    data object Failed : GalleryFullscreenImageState
+}
+
 @Composable
 private fun GalleryFullscreenPage(
     item: GalleryImageItem,
@@ -1056,13 +1063,19 @@ private fun GalleryFullscreenPage(
     var scale by remember(item.documentUri) { mutableFloatStateOf(1f) }
     var offsetX by remember(item.documentUri) { mutableFloatStateOf(0f) }
     var offsetY by remember(item.documentUri) { mutableFloatStateOf(0f) }
-    val bitmap by produceState<Bitmap?>(initialValue = null, item.documentUri) {
+    val imageState by produceState<GalleryFullscreenImageState>(
+        initialValue = GalleryFullscreenImageState.Loading,
+        key1 = item.documentUri,
+    ) {
         value = withContext(Dispatchers.IO) {
-            loadDocumentBitmap(
+            DocumentBitmapLoader.load(
+                context = context,
                 contentResolver = context.contentResolver,
                 documentUri = item.documentUri,
                 maxDimensionPx = 2048,
-            )
+            )?.let { bitmap ->
+                GalleryFullscreenImageState.Loaded(bitmap)
+            } ?: GalleryFullscreenImageState.Failed
         }
     }
 
@@ -1078,51 +1091,76 @@ private fun GalleryFullscreenPage(
     ) {
         val widthPx = with(density) { maxWidth.toPx() }
         val heightPx = with(density) { maxHeight.toPx() }
-        val loadedBitmap = bitmap
-        if (loadedBitmap != null) {
-            val fittedSize = fittedImageSize(
-                imageWidth = loadedBitmap.width.toFloat(),
-                imageHeight = loadedBitmap.height.toFloat(),
-                containerWidth = widthPx,
-                containerHeight = heightPx,
-            )
-            Image(
-                bitmap = loadedBitmap.asImageBitmap(),
-                contentDescription = item.displayName,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zoomableImageGesture(
-                        gestureKey = item.documentUri,
-                        fittedSize = fittedSize,
-                        containerWidth = widthPx,
-                        containerHeight = heightPx,
-                        scale = { scale },
-                        offset = { Offset(offsetX, offsetY) },
-                        onTransform = { newScale, newOffset ->
-                            scale = newScale
-                            offsetX = newOffset.x
-                            offsetY = newOffset.y
-                        },
-                    )
-                    .graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
-                        translationX = offsetX
-                        translationY = offsetY
-                    },
-            )
-        } else {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                CircularProgressIndicator(color = Color.White)
-                Text(
-                    text = "Loading image...",
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodyMedium,
+        when (val state = imageState) {
+            is GalleryFullscreenImageState.Loaded -> {
+                val loadedBitmap = state.bitmap
+                val fittedSize = fittedImageSize(
+                    imageWidth = loadedBitmap.width.toFloat(),
+                    imageHeight = loadedBitmap.height.toFloat(),
+                    containerWidth = widthPx,
+                    containerHeight = heightPx,
                 )
+                Image(
+                    bitmap = loadedBitmap.asImageBitmap(),
+                    contentDescription = item.displayName,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zoomableImageGesture(
+                            gestureKey = item.documentUri,
+                            fittedSize = fittedSize,
+                            containerWidth = widthPx,
+                            containerHeight = heightPx,
+                            scale = { scale },
+                            offset = { Offset(offsetX, offsetY) },
+                            onTransform = { newScale, newOffset ->
+                                scale = newScale
+                                offsetX = newOffset.x
+                                offsetY = newOffset.y
+                            },
+                        )
+                        .graphicsLayer {
+                            scaleX = scale
+                            scaleY = scale
+                            translationX = offsetX
+                            translationY = offsetY
+                        },
+                )
+            }
+
+            GalleryFullscreenImageState.Loading -> {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(color = Color.White)
+                    Text(
+                        text = "Loading image...",
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+
+            GalleryFullscreenImageState.Failed -> {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.padding(24.dp),
+                ) {
+                    Text(
+                        text = "Image unavailable",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Text(
+                        text = item.remotePath,
+                        color = Color.White.copy(alpha = 0.75f),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
     }
@@ -1276,51 +1314,6 @@ private fun loadDocumentThumbnail(
     }.onFailure { error ->
         Log.w("MainActivity", "Thumbnail load failed for $documentUri: ${error.message}")
     }.getOrNull()
-}
-
-private fun loadDocumentBitmap(
-    contentResolver: ContentResolver,
-    documentUri: Uri,
-    maxDimensionPx: Int,
-): Bitmap? {
-    return runCatching {
-        val bounds = BitmapFactory.Options().apply {
-            inJustDecodeBounds = true
-        }
-        contentResolver.openInputStream(documentUri)?.use { input ->
-            BitmapFactory.decodeStream(input, null, bounds)
-        }
-
-        val sampleSize = computeInSampleSize(
-            width = bounds.outWidth,
-            height = bounds.outHeight,
-            maxDimensionPx = maxDimensionPx,
-        )
-        val decodeOptions = BitmapFactory.Options().apply {
-            inSampleSize = sampleSize
-        }
-        contentResolver.openInputStream(documentUri)?.use { input ->
-            BitmapFactory.decodeStream(input, null, decodeOptions)
-        }
-    }.onFailure { error ->
-        Log.w("MainActivity", "Full image load failed for $documentUri: ${error.message}")
-    }.getOrNull()
-}
-
-private fun computeInSampleSize(
-    width: Int,
-    height: Int,
-    maxDimensionPx: Int,
-): Int {
-    if (width <= 0 || height <= 0 || maxDimensionPx <= 0) {
-        return 1
-    }
-
-    var sampleSize = 1
-    while (width / sampleSize > maxDimensionPx || height / sampleSize > maxDimensionPx) {
-        sampleSize *= 2
-    }
-    return sampleSize.coerceAtLeast(1)
 }
 
 private fun Modifier.galleryGridPinchGesture(

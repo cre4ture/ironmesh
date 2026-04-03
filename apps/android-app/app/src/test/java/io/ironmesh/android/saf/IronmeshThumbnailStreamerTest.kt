@@ -28,11 +28,37 @@ class IronmeshThumbnailStreamerTest {
         )
 
         assertEquals(1, dataSource.relativeUrlCallCount)
+        assertEquals("/media/thumbnail?key=gallery%2Fcat.png", dataSource.lastRelativeUrl)
         assertArrayEquals("thumb".toByteArray(), output.toByteArray())
     }
 
     @Test
-    fun streamTo_throwsWhenThumbnailMetadataIsMissing() = runBlocking {
+    fun streamTo_fallsBackToGeneratedThumbnailWhenMetadataIsMissing() = runBlocking {
+        val dataSource = FakeThumbnailDataSource(
+            thumbnailBytes = "thumb".toByteArray(),
+        )
+        val streamer = IronmeshThumbnailStreamer(dataSource)
+        val output = ByteArrayOutputStream()
+
+        streamer.streamTo(
+            connectionInput = "{\"bootstrap\":true}",
+            entry = sampleImageEntry(
+                path = "gallery/cat one.png",
+                thumbnail = null,
+            ),
+            output = output,
+        )
+
+        assertEquals(1, dataSource.relativeUrlCallCount)
+        assertEquals(
+            "/media/thumbnail?key=gallery%2Fcat%20one.png",
+            dataSource.lastRelativeUrl,
+        )
+        assertArrayEquals("thumb".toByteArray(), output.toByteArray())
+    }
+
+    @Test
+    fun streamTo_throwsWhenEntryDoesNotLookLikeMedia() = runBlocking {
         val dataSource = FakeThumbnailDataSource(
             thumbnailBytes = "thumb".toByteArray(),
         )
@@ -43,7 +69,11 @@ class IronmeshThumbnailStreamerTest {
             runBlocking {
                 streamer.streamTo(
                     connectionInput = "{\"bootstrap\":true}",
-                    entry = sampleImageEntry(thumbnail = null),
+                    entry = StoreIndexEntry(
+                        path = "docs/readme.txt",
+                        entry_type = "key",
+                        media = null,
+                    ),
                     output = output,
                 )
             }
@@ -72,9 +102,12 @@ class IronmeshThumbnailStreamerTest {
         assertEquals(1, dataSource.relativeUrlCallCount)
     }
 
-    private fun sampleImageEntry(thumbnail: StoreIndexThumbnail? = sampleThumbnail()): StoreIndexEntry {
+    private fun sampleImageEntry(
+        path: String = "gallery/cat.png",
+        thumbnail: StoreIndexThumbnail? = sampleThumbnail(),
+    ): StoreIndexEntry {
         return StoreIndexEntry(
-            path = "gallery/cat.png",
+            path = path,
             entry_type = "key",
             media = StoreIndexMedia(
                 status = "ready",
@@ -93,6 +126,7 @@ class IronmeshThumbnailStreamerTest {
         private val relativeUrlFailure: Exception? = null,
     ) : IronmeshThumbnailStreamDataSource {
         var relativeUrlCallCount: Int = 0
+        var lastRelativeUrl: String? = null
 
         override suspend fun streamRelativeUrlTo(
             connectionInput: String,
@@ -102,6 +136,7 @@ class IronmeshThumbnailStreamerTest {
             clientIdentityJson: String?,
         ) {
             relativeUrlCallCount += 1
+            lastRelativeUrl = relativeUrl
             relativeUrlFailure?.let { throw it }
             output.write(thumbnailBytes)
         }

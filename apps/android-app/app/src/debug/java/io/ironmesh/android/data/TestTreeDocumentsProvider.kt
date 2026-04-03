@@ -9,6 +9,8 @@ import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
 import java.io.File
 import java.io.FileNotFoundException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 class TestTreeDocumentsProvider : DocumentsProvider() {
     override fun onCreate(): Boolean = true
@@ -107,6 +109,9 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
         if (!file.exists()) {
             file.createNewFile()
         }
+        if (!mode.contains('w')) {
+            recordReadOpen(file)
+        }
         val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.parseMode(mode))
         if (mode.contains('w')) {
             notifyParentChanged(parentDocumentIdForFile(file))
@@ -192,12 +197,21 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
                 deleteRecursively(root)
             }
             root.mkdirs()
+            openCounts.clear()
         }
 
         fun seedFile(context: Context, relativePath: String, bytes: ByteArray) {
             val target = File(rootDir(context), relativePath.replace('/', File.separatorChar))
             target.parentFile?.mkdirs()
             target.writeBytes(bytes)
+        }
+
+        fun resetOpenCounts() {
+            openCounts.clear()
+        }
+
+        fun openCountFor(relativePath: String): Int {
+            return openCounts[relativePath.replace('\\', '/')]?.get() ?: 0
         }
 
         private fun rootDir(context: Context): File =
@@ -210,6 +224,15 @@ class TestTreeDocumentsProvider : DocumentsProvider() {
 
         @Volatile
         private var instanceContext: Context? = null
+
+        private val openCounts = ConcurrentHashMap<String, AtomicInteger>()
+
+        private fun recordReadOpen(file: File) {
+            val relativePath = file.canonicalFile
+                .relativeTo(rootDir().canonicalFile)
+                .invariantSeparatorsPath
+            openCounts.computeIfAbsent(relativePath) { AtomicInteger() }.incrementAndGet()
+        }
 
         private fun deleteRecursively(file: File): Boolean {
             if (!file.exists()) {
