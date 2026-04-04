@@ -2,8 +2,8 @@ use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
     cf_set_not_in_sync, describe_path_state,
 };
+use crate::placeholder_metadata::record_in_sync_local_file_state;
 use crate::runtime::{CfapiRuntime, Uploader, reconcile_ancestor_directory_sync_states};
-use crate::snapshot_cache::record_local_file_hash;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ const CLOSE_UPLOAD_RETRY_DELAY: Duration = Duration::from_millis(1000);
 
 pub(crate) struct UploadWorkerContext {
     pub(crate) sync_root: PathBuf,
+    pub(crate) provider_instance_id: uuid::Uuid,
     pub(crate) runtime: Arc<CfapiRuntime>,
     pub(crate) uploader: Arc<dyn Uploader>,
 }
@@ -451,7 +452,11 @@ fn process_debounced_close_upload(
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
-    if let Err(err) = record_local_file_hash(&worker.sync_root, relative_path) {
+    if let Err(err) = record_in_sync_local_file_state(
+        &worker.sync_root,
+        relative_path,
+        worker.provider_instance_id,
+    ) {
         tracing::info!(
             "close-completion: failed to record in-sync local file hash for {}: {:#}",
             relative_path,
@@ -570,6 +575,7 @@ mod tests {
     fn test_upload_worker_context(uploader: Arc<dyn Uploader>) -> UploadWorkerContext {
         UploadWorkerContext {
             sync_root: Path::new("C:/ironmesh-test").to_path_buf(),
+            provider_instance_id: uuid::Uuid::nil(),
             runtime: Arc::new(CfapiRuntime::default()),
             uploader,
         }

@@ -14,8 +14,8 @@ use crate::cfapi::{
 use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{decode_path_from_file_identity, path_to_relative};
+use crate::placeholder_metadata::record_in_sync_local_file_state;
 use crate::runtime::Uploader;
-use crate::snapshot_cache::record_local_file_hash;
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use windows_sys::Win32::Storage::CloudFilters::{
     CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
@@ -182,6 +182,7 @@ impl PlaceholderSnapshot {
 pub struct SyncRootMonitor {
     name: String,
     sync_root: PathBuf,
+    provider_instance_id: uuid::Uuid,
     uploader: Arc<dyn Uploader>,
     seen: HashMap<String, SeenEntry>,
     dehydrations_in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -199,10 +200,16 @@ struct DehydrateScanSummary {
 }
 
 impl SyncRootMonitor {
-    pub fn new(name: &str, sync_root: PathBuf, uploader: Arc<dyn Uploader>) -> Self {
+    pub fn new(
+        name: &str,
+        sync_root: PathBuf,
+        provider_instance_id: uuid::Uuid,
+        uploader: Arc<dyn Uploader>,
+    ) -> Self {
         Self {
             name: name.to_string(),
             sync_root,
+            provider_instance_id,
             uploader,
             seen: HashMap::new(),
             dehydrations_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -321,8 +328,10 @@ impl SyncRootMonitor {
                     );
                     if let Some(entry) = current.get(&rename.to_path)
                         && let Err(err) = repair_locally_renamed_materialized_file(
+                            &self.sync_root,
                             &full_path,
                             &rename.to_path,
+                            self.provider_instance_id,
                             entry,
                         )
                     {
@@ -522,7 +531,11 @@ impl SyncRootMonitor {
                 ) {
                     tracing::info!("{}: failed to upload file {}: {}", self.name, rel_path, e);
                 } else {
-                    if let Err(err) = record_local_file_hash(&self.sync_root, &rel_path) {
+                    if let Err(err) = record_in_sync_local_file_state(
+                        &self.sync_root,
+                        &rel_path,
+                        self.provider_instance_id,
+                    ) {
                         tracing::info!(
                             "{}: failed to record in-sync local file hash for {}: {:#}",
                             self.name,
@@ -535,7 +548,9 @@ impl SyncRootMonitor {
             } else {
                 // File does not exist, create placeholder
                 use crate::runtime::create_placeholder;
-                if let Err(e) = create_placeholder(&self.sync_root, &rel_path) {
+                if let Err(e) =
+                    create_placeholder(&self.sync_root, &rel_path, self.provider_instance_id)
+                {
                     tracing::info!(
                         "{}: failed to create placeholder for {}: {}",
                         self.name,
@@ -885,22 +900,28 @@ fn placeholder_identity_path_for_entry(
 }
 
 fn repair_locally_renamed_materialized_file(
+    sync_root: &std::path::Path,
     path: &std::path::Path,
     rel_path: &str,
+    provider_instance_id: uuid::Uuid,
     entry: &SeenEntry,
 ) -> anyhow::Result<()> {
-    if entry.is_dir || path_is_placeholder(path) {
+    if entry.is_dir {
         return Ok(());
     }
 
-    let metadata = std::fs::metadata(path)?;
-    try_convert_materialized_file(path, rel_path, &metadata);
+    if !path_is_placeholder(path) {
+        let metadata = std::fs::metadata(path)?;
+        try_convert_materialized_file(path, rel_path, &metadata);
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-    cf_set_in_sync(&file)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        cf_set_in_sync(&file)?;
+    }
+
+    record_in_sync_local_file_state(sync_root, rel_path, provider_instance_id)?;
     Ok(())
 }
 
@@ -1110,7 +1131,12 @@ mod tests {
             .expect("failed to seed existing file");
 
         let uploader = Arc::new(MockUploader::default());
-        let mut monitor = SyncRootMonitor::new("monitor-test", sync_root.clone(), uploader.clone());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
         monitor.seed_seen();
         monitor.walk();
 
@@ -1148,11 +1174,17 @@ mod tests {
             .expect("failed to seed local-only file");
 
         let uploader = Arc::new(MockUploader::default());
-        let mut monitor = SyncRootMonitor::new("monitor-test", sync_root.clone(), uploader.clone());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
         monitor.seed_remote_entries(&CfapiActionPlan {
             actions: vec![CfapiAction::EnsurePlaceholder {
                 path: "docs/readme.txt".to_string(),
                 remote_version: "v1".to_string(),
+                remote_content_hash: "h1".to_string(),
                 remote_size: None,
             }],
         });

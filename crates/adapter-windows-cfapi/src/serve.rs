@@ -4,14 +4,10 @@ use crate::adapter::WindowsCfapiAdapter;
 use crate::auth::{ClientEnrollmentOptions, resolve_or_enroll_client_identity};
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
 use crate::live::ServerNodeHydrator;
+use crate::placeholder_metadata::{RemoteDeleteReconcileReport, reconcile_remote_delete_state};
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
     reconcile_sync_states, register_sync_root,
-};
-use crate::snapshot_cache::{
-    RemoteDeleteReconcileReport, RemoteSnapshotCache, load_remote_snapshot_cache,
-    persist_remote_snapshot_cache,
-    reconcile_remote_delete_state,
 };
 use clap::Parser;
 use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
@@ -75,7 +71,7 @@ pub fn serve_main() -> anyhow::Result<()> {
         connection.cluster_id,
         args.prefix.as_deref(),
     );
-    let _sync_root_identity = register_sync_root(&registration)?;
+    let sync_root_identity = register_sync_root(&registration)?;
     tracing::info!("using connection target {}", connection.connection_target);
     let client_identity = resolve_or_enroll_client_identity(
         connection.enrollment_base_url.as_ref(),
@@ -114,18 +110,11 @@ pub fn serve_main() -> anyhow::Result<()> {
         client.clone(),
         RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
     );
-    let cached_remote_snapshot = match load_remote_snapshot_cache(&registration.root_path) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            tracing::warn!("failed to load remote snapshot cache: {err:#}");
-            None
-        }
-    };
     let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
     let startup_delete_report = match reconcile_remote_delete_state(
         &registration.root_path,
-        cached_remote_snapshot.as_ref(),
         &initial_snapshot,
+        sync_root_identity.provider_instance_id,
     ) {
         Ok(report) => report,
         Err(err) => {
@@ -160,9 +149,19 @@ pub fn serve_main() -> anyhow::Result<()> {
         client.clone(),
         download_stage_root,
     ));
-    let _connection = connect_sync_root(&registration, runtime.clone(), hydrator, uploader)?;
+    let _connection = connect_sync_root(
+        &registration,
+        sync_root_identity.provider_instance_id,
+        runtime.clone(),
+        hydrator,
+        uploader,
+    )?;
 
-    apply_action_plan(&registration.root_path, &action_plan)?;
+    apply_action_plan(
+        &registration.root_path,
+        &action_plan,
+        sync_root_identity.provider_instance_id,
+    )?;
     let _ = runtime.sync_from_action_plan(&action_plan);
     let sync_state_stats = reconcile_sync_states(&registration.root_path, &action_plan);
     tracing::info!(
@@ -173,17 +172,6 @@ pub fn serve_main() -> anyhow::Result<()> {
         "materialized {} planned entries under sync root",
         action_plan.actions.len()
     );
-    let mut previous_remote_snapshot = match persist_remote_snapshot_cache(
-        &registration.root_path,
-        &initial_snapshot,
-    ) {
-        Ok(cache) => cache,
-        Err(err) => {
-            tracing::warn!("failed to persist remote snapshot cache: {err:#}");
-            RemoteSnapshotCache::from_snapshot(initial_snapshot.clone())
-        }
-    };
-
     tracing::info!("connected to CFAPI callbacks; serving hydration requests");
     let running = std::sync::Arc::new(AtomicBool::new(true));
     {
@@ -198,6 +186,7 @@ pub fn serve_main() -> anyhow::Result<()> {
     let refresh_adapter = adapter.clone();
     let refresh_runtime = runtime.clone();
     let refresh_running = running.clone();
+    let refresh_provider_instance_id = sync_root_identity.provider_instance_id;
     refresh_poller.spawn_fetcher_loop(
         refresh_running,
         Some(initial_snapshot),
@@ -205,13 +194,17 @@ pub fn serve_main() -> anyhow::Result<()> {
         move |update| {
             if let Err(err) = reconcile_remote_delete_state(
                 &refresh_registration.root_path,
-                Some(&previous_remote_snapshot),
                 &update.snapshot,
+                refresh_provider_instance_id,
             ) {
                 tracing::warn!("remote-refresh: remote-delete reconciliation failed: {err:#}");
             }
             let plan = refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
-            if let Err(err) = apply_action_plan(&refresh_registration.root_path, &plan) {
+            if let Err(err) = apply_action_plan(
+                &refresh_registration.root_path,
+                &plan,
+                refresh_provider_instance_id,
+            ) {
                 tracing::info!("remote-refresh: apply_action_plan error: {err}");
                 return;
             }
@@ -229,16 +222,6 @@ pub fn serve_main() -> anyhow::Result<()> {
                     sync_state_stats
                 );
             }
-            previous_remote_snapshot = match persist_remote_snapshot_cache(
-                &refresh_registration.root_path,
-                &update.snapshot,
-            ) {
-                Ok(cache) => cache,
-                Err(err) => {
-                    tracing::warn!("remote-refresh: failed to persist remote snapshot cache: {err:#}");
-                    previous_remote_snapshot.with_snapshot(update.snapshot.clone())
-                }
-            };
         },
     );
 

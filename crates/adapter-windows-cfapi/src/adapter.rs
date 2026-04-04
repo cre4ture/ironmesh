@@ -38,11 +38,13 @@ pub enum CfapiAction {
     EnsurePlaceholder {
         path: String,
         remote_version: String,
+        remote_content_hash: String,
         remote_size: Option<u64>,
     },
     HydrateOnDemand {
         path: String,
         remote_version: String,
+        remote_content_hash: String,
         remote_size: Option<u64>,
     },
     QueueUploadOnClose {
@@ -53,6 +55,7 @@ pub enum CfapiAction {
         path: String,
         local_version: Option<String>,
         remote_version: Option<String>,
+        remote_content_hash: Option<String>,
         remote_size: Option<u64>,
     },
 }
@@ -71,19 +74,21 @@ pub fn map_sync_plan_to_cfapi_actions(
             SyncOperation::EnsurePlaceholder {
                 path,
                 remote_version,
-                ..
+                remote_content_hash,
             } => CfapiAction::EnsurePlaceholder {
                 path: path.clone(),
                 remote_version: remote_version.clone(),
+                remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_sizes_by_path.get(path).copied(),
             },
             SyncOperation::Hydrate {
                 path,
                 remote_version,
-                ..
+                remote_content_hash,
             } => CfapiAction::HydrateOnDemand {
                 path: path.clone(),
                 remote_version: remote_version.clone(),
+                remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_sizes_by_path.get(path).copied(),
             },
             SyncOperation::Upload {
@@ -97,11 +102,12 @@ pub fn map_sync_plan_to_cfapi_actions(
                 path,
                 local_version,
                 remote_version,
-                ..
+                remote_content_hash,
             } => CfapiAction::MarkConflict {
                 path: path.clone(),
                 local_version: local_version.clone(),
                 remote_version: remote_version.clone(),
+                remote_content_hash: remote_content_hash.clone(),
                 remote_size: remote_sizes_by_path.get(path).copied(),
             },
         };
@@ -132,6 +138,7 @@ mod tests {
             vec![CfapiAction::EnsurePlaceholder {
                 path: "docs/readme.md".to_string(),
                 remote_version: "v1".to_string(),
+                remote_content_hash: "h1".to_string(),
                 remote_size: None,
             }],
         );
@@ -180,6 +187,7 @@ mod tests {
                 path: "report.csv".to_string(),
                 local_version: Some("v-local".to_string()),
                 remote_version: Some("v-remote".to_string()),
+                remote_content_hash: Some("h2".to_string()),
                 remote_size: None,
             }],
         );
@@ -205,6 +213,7 @@ mod tests {
             vec![CfapiAction::EnsurePlaceholder {
                 path: "docs/readme.md".to_string(),
                 remote_version: "v1".to_string(),
+                remote_content_hash: "h1".to_string(),
                 remote_size: Some(42),
             }],
         );

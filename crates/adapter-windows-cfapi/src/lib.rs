@@ -10,6 +10,7 @@ pub mod connection_config;
 pub mod helpers;
 pub mod live;
 pub mod monitor;
+pub mod placeholder_metadata;
 pub mod register;
 pub mod runtime;
 pub mod snapshot_cache;

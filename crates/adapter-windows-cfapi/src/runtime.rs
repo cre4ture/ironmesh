@@ -21,11 +21,14 @@ use crate::close_upload::{
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{
-    decode_path_from_file_identity, encode_placeholder_file_identity, normalize_path,
-    path_to_relative, utf16_path, utf16_string,
+    PlaceholderFileIdentity, decode_path_from_file_identity,
+    encode_placeholder_file_identity_metadata, normalize_path, path_to_relative, utf16_path,
+    utf16_string,
+};
+use crate::placeholder_metadata::{
+    record_in_sync_local_file_state, refresh_remote_placeholder_state,
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
-use crate::snapshot_cache::record_local_file_hash;
 use crate::sync_root_identity::{
     SyncRootIdentity, load_registered_sync_root_context, normalize_prefix,
 };
@@ -44,9 +47,9 @@ use wincs::{
     SyncRootIdBuilder,
 };
 use windows_sys::Win32::Foundation::{
-    NTSTATUS, STATUS_CLOUD_FILE_NOT_IN_SYNC, STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT,
-    STATUS_CLOUD_FILE_PINNED, STATUS_CLOUD_FILE_REQUEST_CANCELED, STATUS_CLOUD_FILE_UNSUCCESSFUL,
-    STATUS_SUCCESS,
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, NTSTATUS, STATUS_CLOUD_FILE_NOT_IN_SYNC,
+    STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, STATUS_CLOUD_FILE_PINNED,
+    STATUS_CLOUD_FILE_REQUEST_CANCELED, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS,
 };
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
@@ -381,16 +384,22 @@ impl CfapiRuntime {
 
 // `normalize_path` now lives in `helpers.rs`.
 
-pub fn create_placeholder(sync_root: &std::path::Path, rel_path: &str) -> anyhow::Result<()> {
+pub fn create_placeholder(
+    sync_root: &std::path::Path,
+    rel_path: &str,
+    provider_instance_id: uuid::Uuid,
+) -> anyhow::Result<()> {
     use windows_sys::Win32::Storage::CloudFilters::*;
     let relative_name = rel_path.replace('/', "\\");
     let wide: Vec<u16> = relative_name.encode_utf16().chain(Some(0)).collect();
-    let identity = encode_placeholder_file_identity(rel_path, None);
+    let mut identity = PlaceholderFileIdentity::new(rel_path);
+    identity.provider_instance_id = Some(provider_instance_id);
+    let encoded_identity = encode_placeholder_file_identity_metadata(&identity);
     let mut create_info = CF_PLACEHOLDER_CREATE_INFO {
         RelativeFileName: wide.as_ptr(),
         Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
-        FileIdentity: identity.as_ptr().cast::<c_void>(),
-        FileIdentityLength: identity.len() as u32,
+        FileIdentity: encoded_identity.as_ptr().cast::<c_void>(),
+        FileIdentityLength: encoded_identity.len() as u32,
         FsMetadata: empty_fs_metadata(),
         Result: 0,
         CreateUsn: 0,
@@ -427,6 +436,7 @@ impl Drop for SyncRootConnection {
 
 pub(crate) struct CallbackContext {
     sync_root: PathBuf,
+    provider_instance_id: uuid::Uuid,
     runtime: Arc<CfapiRuntime>,
     hydrator: Box<dyn Hydrator>,
     hydrated_once_paths: Mutex<HashSet<String>>,
@@ -440,9 +450,9 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
     validate_registration(registration)?;
     std::fs::create_dir_all(&registration.root_path)?;
 
-    let expected_shell_sync_root_id = build_shell_sync_root_id(registration)?
-        .as_hstring()
-        .to_string_lossy();
+    let expected_shell_sync_root_id = build_shell_sync_root_id(registration)?;
+    let expected_shell_sync_root_id_string =
+        expected_shell_sync_root_id.as_hstring().to_string_lossy();
     let expected_identity = |provider_instance_id| {
         SyncRootIdentity::new(
             provider_instance_id,
@@ -453,15 +463,6 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
     };
 
     if let Some(existing) = load_registered_sync_root_context(&registration.root_path)? {
-        if existing.windows_sync_root_id != expected_shell_sync_root_id {
-            return Err(anyhow!(
-                "sync root {} at {} is already registered to {} instead of {}",
-                registration.display_name,
-                registration.root_path.display(),
-                existing.windows_sync_root_id,
-                expected_shell_sync_root_id
-            ));
-        }
         if existing.identity.sync_root_id != registration.sync_root_id
             || existing.identity.cluster_id != registration.cluster_id
             || existing.identity.prefix != registration.prefix
@@ -492,7 +493,6 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
         ));
     }
 
-    let sync_root_id = build_shell_sync_root_id(registration)?;
     let display_name = U16String::from_str(&registration.display_name);
     let provider_version = U16String::from_str(env!("CARGO_PKG_VERSION"));
     let icon_resource = current_executable_icon_resource()?;
@@ -506,7 +506,7 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
         sync_root_identity.provider_instance_id
     );
 
-    Registration::from_sync_root_id(&sync_root_id)
+    Registration::from_sync_root_id(&expected_shell_sync_root_id)
         .display_name(display_name.as_ref())
         .icon(icon_resource, 0)
         .version(provider_version.as_ref())
@@ -522,6 +522,29 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
         .register(&registration.root_path)
         .map_err(|error| anyhow!("failed to register sync root with Explorer shell: {error}"))?;
 
+    match load_registered_sync_root_context(&registration.root_path) {
+        Ok(Some(existing)) => {
+            tracing::info!(
+                "sync-root registration: confirmed Windows registration id={} provider_instance_id={}",
+                existing.windows_sync_root_id,
+                existing.identity.provider_instance_id
+            );
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "sync-root registration: Windows did not report id={} immediately after registration",
+                expected_shell_sync_root_id_string
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                "sync-root registration: failed to re-query Windows registration {}: {:#}",
+                expected_shell_sync_root_id_string,
+                err
+            );
+        }
+    }
+
     Ok(sync_root_identity)
 }
 
@@ -532,7 +555,14 @@ pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
 
     let root_path_utf16 = utf16_path(root_path);
     let hr = cf_unregister_sync_root(&root_path_utf16);
-    if hr == 0 || hr == STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT {
+    let hr_u32 = hr as u32;
+    let file_not_found_hr = 0x8007_0000u32 | ERROR_FILE_NOT_FOUND;
+    let path_not_found_hr = 0x8007_0000u32 | ERROR_PATH_NOT_FOUND;
+    if hr == 0
+        || hr == STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT
+        || hr_u32 == file_not_found_hr
+        || hr_u32 == path_not_found_hr
+    {
         return Ok(());
     }
 
@@ -556,10 +586,14 @@ fn placeholder_file_size(remote_version: &str, remote_size: Option<u64>) -> i64 
         .unwrap_or(0)
 }
 
-pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()> {
+pub fn apply_action_plan(
+    root_path: &Path,
+    plan: &CfapiActionPlan,
+    provider_instance_id: uuid::Uuid,
+) -> Result<()> {
     std::fs::create_dir_all(root_path)?;
 
-    let mut placeholders: BTreeMap<String, (String, Option<u64>)> = BTreeMap::new();
+    let mut placeholders: BTreeMap<String, (String, String, Option<u64>)> = BTreeMap::new();
     for action in &plan.actions {
         match action {
             CfapiAction::EnsureDirectory { path } => {
@@ -568,11 +602,13 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
             CfapiAction::EnsurePlaceholder {
                 path,
                 remote_version,
+                remote_content_hash,
                 remote_size,
             }
             | CfapiAction::HydrateOnDemand {
                 path,
                 remote_version,
+                remote_content_hash,
                 remote_size,
             } => {
                 let normalized = normalize_path(path);
@@ -585,106 +621,171 @@ pub fn apply_action_plan(root_path: &Path, plan: &CfapiActionPlan) -> Result<()>
                 {
                     std::fs::create_dir_all(root_path.join(parent))?;
                 }
-                placeholders.insert(normalized, (remote_version.clone(), *remote_size));
+                placeholders.insert(
+                    normalized,
+                    (
+                        remote_version.clone(),
+                        remote_content_hash.clone(),
+                        *remote_size,
+                    ),
+                );
             }
             CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
         }
     }
 
-    if placeholders.is_empty() {
-        return Ok(());
-    }
-
-    struct PlaceholderInput {
-        base_dir: PathBuf,
-        child_name: String,
-        relative_name_utf16: Vec<u16>,
-        identity: Vec<u8>,
-        metadata: CF_FS_METADATA,
-    }
-
-    let mut inputs = Vec::with_capacity(placeholders.len());
-    for (relative_path, (remote_version, remote_size)) in placeholders {
-        let (parent_rel, child_name) = match relative_path.rsplit_once('/') {
-            Some((parent, child)) => (parent, child),
-            None => ("", relative_path.as_str()),
-        };
-        if child_name.is_empty() || child_name.contains('\\') || child_name.contains('/') {
-            return Err(anyhow!(
-                "invalid placeholder child name derived from path '{}'",
-                relative_path
-            ));
+    if !placeholders.is_empty() {
+        struct PlaceholderInput {
+            base_dir: PathBuf,
+            child_name: String,
+            relative_name_utf16: Vec<u16>,
+            identity: Vec<u8>,
+            metadata: CF_FS_METADATA,
         }
-        let base_dir = if parent_rel.is_empty() {
-            root_path.to_path_buf()
-        } else {
-            root_path.join(parent_rel.replace('/', "\\"))
-        };
-        let basic_info = FILE_BASIC_INFO {
-            FileAttributes: FILE_ATTRIBUTE_NORMAL,
-            ..Default::default()
-        };
-        let file_size = placeholder_file_size(&remote_version, remote_size);
-        let metadata = CF_FS_METADATA {
-            BasicInfo: basic_info,
-            FileSize: file_size,
-        };
 
-        inputs.push(PlaceholderInput {
-            base_dir,
-            child_name: child_name.to_string(),
-            relative_name_utf16: utf16_string(child_name),
-            identity: encode_placeholder_file_identity(&relative_path, Some(&remote_version)),
-            metadata,
-        });
-    }
+        let mut inputs = Vec::with_capacity(placeholders.len());
+        for (relative_path, (remote_version, remote_content_hash, remote_size)) in placeholders {
+            let (parent_rel, child_name) = match relative_path.rsplit_once('/') {
+                Some((parent, child)) => (parent, child),
+                None => ("", relative_path.as_str()),
+            };
+            if child_name.is_empty() || child_name.contains('\\') || child_name.contains('/') {
+                return Err(anyhow!(
+                    "invalid placeholder child name derived from path '{}'",
+                    relative_path
+                ));
+            }
+            let base_dir = if parent_rel.is_empty() {
+                root_path.to_path_buf()
+            } else {
+                root_path.join(parent_rel.replace('/', "\\"))
+            };
+            let basic_info = FILE_BASIC_INFO {
+                FileAttributes: FILE_ATTRIBUTE_NORMAL,
+                ..Default::default()
+            };
+            let file_size = placeholder_file_size(&remote_version, remote_size);
+            let metadata = CF_FS_METADATA {
+                BasicInfo: basic_info,
+                FileSize: file_size,
+            };
+            let mut identity = PlaceholderFileIdentity::new(&relative_path);
+            identity.provider_instance_id = Some(provider_instance_id);
+            identity.remote_version = Some(remote_version.clone());
+            identity.remote_content_hash = Some(remote_content_hash.clone());
+            identity.remote_size_bytes = remote_size;
 
-    let mut by_base_dir: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-    for (idx, input) in inputs.iter().enumerate() {
-        by_base_dir
-            .entry(input.base_dir.clone())
-            .or_default()
-            .push(idx);
-    }
-
-    for (base_dir, indices) in by_base_dir {
-        let mut create_infos = Vec::with_capacity(indices.len());
-        for &idx in &indices {
-            let input = &inputs[idx];
-            create_infos.push(CF_PLACEHOLDER_CREATE_INFO {
-                RelativeFileName: input.relative_name_utf16.as_ptr(),
-                FsMetadata: input.metadata,
-                FileIdentity: input.identity.as_ptr().cast::<c_void>(),
-                FileIdentityLength: input.identity.len() as u32,
-                Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
-                Result: 0,
-                CreateUsn: 0,
+            inputs.push(PlaceholderInput {
+                base_dir,
+                child_name: child_name.to_string(),
+                relative_name_utf16: utf16_string(child_name),
+                identity: encode_placeholder_file_identity_metadata(&identity),
+                metadata,
             });
         }
 
-        let base_path = utf16_path(&base_dir);
-        let mut entries_processed = 0u32;
-        let result = cf_create_placeholders(
-            &base_path,
-            &mut create_infos,
-            CF_CREATE_FLAG_STOP_ON_ERROR,
-            Some(&mut entries_processed),
-            "CfCreatePlaceholders (apply_action_plan)",
-        );
-        if let Err(err) = &result {
-            tracing::info!("apply_action_plan: error creating placeholders: {err}");
-            tracing::info!("base_dir={}", base_dir.display());
-            for idx in indices {
+        let mut by_base_dir: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        for (idx, input) in inputs.iter().enumerate() {
+            by_base_dir
+                .entry(input.base_dir.clone())
+                .or_default()
+                .push(idx);
+        }
+
+        for (base_dir, indices) in by_base_dir {
+            let mut create_infos = Vec::with_capacity(indices.len());
+            for &idx in &indices {
                 let input = &inputs[idx];
-                tracing::info!(
-                    "placeholder: relative_name={} identity={:?} metadata={{attributes={:x} filesize={}}}",
-                    input.child_name,
-                    input.identity,
-                    input.metadata.BasicInfo.FileAttributes,
-                    input.metadata.FileSize
-                );
+                create_infos.push(CF_PLACEHOLDER_CREATE_INFO {
+                    RelativeFileName: input.relative_name_utf16.as_ptr(),
+                    FsMetadata: input.metadata,
+                    FileIdentity: input.identity.as_ptr().cast::<c_void>(),
+                    FileIdentityLength: input.identity.len() as u32,
+                    Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+                    Result: 0,
+                    CreateUsn: 0,
+                });
             }
-            return result;
+
+            let base_path = utf16_path(&base_dir);
+            let mut entries_processed = 0u32;
+            let result = cf_create_placeholders(
+                &base_path,
+                &mut create_infos,
+                CF_CREATE_FLAG_STOP_ON_ERROR,
+                Some(&mut entries_processed),
+                "CfCreatePlaceholders (apply_action_plan)",
+            );
+            if let Err(err) = &result {
+                tracing::info!("apply_action_plan: error creating placeholders: {err}");
+                tracing::info!("base_dir={}", base_dir.display());
+                for idx in indices {
+                    let input = &inputs[idx];
+                    tracing::info!(
+                        "placeholder: relative_name={} identity={:?} metadata={{attributes={:x} filesize={}}}",
+                        input.child_name,
+                        input.identity,
+                        input.metadata.BasicInfo.FileAttributes,
+                        input.metadata.FileSize
+                    );
+                }
+                return result;
+            }
+        }
+    }
+
+    for action in &plan.actions {
+        match action {
+            CfapiAction::EnsurePlaceholder {
+                path,
+                remote_version,
+                remote_content_hash,
+                remote_size,
+            }
+            | CfapiAction::HydrateOnDemand {
+                path,
+                remote_version,
+                remote_content_hash,
+                remote_size,
+            } => {
+                if let Err(err) = refresh_remote_placeholder_state(
+                    root_path,
+                    path,
+                    provider_instance_id,
+                    Some(remote_version),
+                    Some(remote_content_hash),
+                    *remote_size,
+                ) {
+                    tracing::info!(
+                        "apply_action_plan: failed to refresh placeholder metadata for {}: {:#}",
+                        path,
+                        err
+                    );
+                }
+            }
+            CfapiAction::MarkConflict {
+                path,
+                remote_version,
+                remote_content_hash,
+                remote_size,
+                ..
+            } => {
+                if let Err(err) = refresh_remote_placeholder_state(
+                    root_path,
+                    path,
+                    provider_instance_id,
+                    remote_version.as_deref(),
+                    remote_content_hash.as_deref(),
+                    *remote_size,
+                ) {
+                    tracing::info!(
+                        "apply_action_plan: failed to refresh conflict placeholder metadata for {}: {:#}",
+                        path,
+                        err
+                    );
+                }
+            }
+            CfapiAction::EnsureDirectory { .. } | CfapiAction::QueueUploadOnClose { .. } => {}
         }
     }
 
@@ -1111,6 +1212,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
 
 pub fn connect_sync_root(
     registration: &SyncRootRegistration,
+    provider_instance_id: uuid::Uuid,
     runtime: Arc<CfapiRuntime>,
     hydrator: Box<dyn Hydrator>,
     uploader: std::sync::Arc<dyn Uploader>,
@@ -1118,12 +1220,14 @@ pub fn connect_sync_root(
     let root_path = utf16_path(&registration.root_path);
     let upload_worker = Arc::new(UploadWorkerContext {
         sync_root: registration.root_path.clone(),
+        provider_instance_id,
         runtime: runtime.clone(),
         uploader: uploader.clone(),
     });
     let upload_debounce = Arc::new(UploadDebounceState::default());
     let mut callback_context = Box::new(CallbackContext {
         sync_root: registration.root_path.clone(),
+        provider_instance_id,
         runtime,
         hydrator,
         hydrated_once_paths: Mutex::new(HashSet::new()),
@@ -1408,7 +1512,11 @@ pub(crate) fn handle_callback_fetch_data(
                         if info.ModifiedDataSize == 0
                             && info.OnDiskDataSize >= result.object_size_bytes as i64 =>
                     {
-                        if let Err(err) = record_local_file_hash(&context.sync_root, &relative_path)
+                        if let Err(err) = record_in_sync_local_file_state(
+                            &context.sync_root,
+                            &relative_path,
+                            context.provider_instance_id,
+                        )
                         {
                             tracing::info!(
                                 "cfapi fetch-data complete: failed to record in-sync local file hash for {}: {:#}",
@@ -1700,7 +1808,11 @@ pub(crate) fn handle_callback_file_close_completion(
         Ok(file) => match cf_get_placeholder_standard_info(&file) {
             Ok(info) if info.ModifiedDataSize == 0 => {
                 if info.OnDiskDataSize > 0
-                    && let Err(err) = record_local_file_hash(&context.sync_root, &relative_path)
+                    && let Err(err) = record_in_sync_local_file_state(
+                        &context.sync_root,
+                        &relative_path,
+                        context.provider_instance_id,
+                    )
                 {
                     tracing::info!(
                         "close-completion: failed to record in-sync local file hash for clean placeholder {}: {:#}",
@@ -1819,6 +1931,7 @@ mod tests {
             actions: vec![CfapiAction::HydrateOnDemand {
                 path: "docs/readme.md".to_string(),
                 remote_version: "v7".to_string(),
+                remote_content_hash: "h7".to_string(),
                 remote_size: None,
             }],
         };
@@ -1849,6 +1962,7 @@ mod tests {
             actions: vec![CfapiAction::HydrateOnDemand {
                 path: "docs\\notes.txt".to_string(),
                 remote_version: "v3".to_string(),
+                remote_content_hash: "h3".to_string(),
                 remote_size: None,
             }],
         };
@@ -1952,11 +2066,13 @@ mod tests {
                 CfapiAction::EnsurePlaceholder {
                     path: "docs/readme.md".to_string(),
                     remote_version: "v1".to_string(),
+                    remote_content_hash: "h1".to_string(),
                     remote_size: None,
                 },
                 CfapiAction::HydrateOnDemand {
                     path: "docs/photo.jpg".to_string(),
                     remote_version: "v2".to_string(),
+                    remote_content_hash: "h2".to_string(),
                     remote_size: None,
                 },
                 CfapiAction::QueueUploadOnClose {
@@ -1967,6 +2083,7 @@ mod tests {
                     path: "conflict.txt".to_string(),
                     local_version: Some("local".to_string()),
                     remote_version: Some("remote".to_string()),
+                    remote_content_hash: Some("hr".to_string()),
                     remote_size: None,
                 },
             ],

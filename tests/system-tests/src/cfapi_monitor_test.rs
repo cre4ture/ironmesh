@@ -4,7 +4,7 @@
 mod tests {
     use anyhow::Context;
     use crate::framework::{
-        TEST_ADMIN_TOKEN, default_client_identity_path, fresh_data_dir,
+        TEST_ADMIN_TOKEN, binary_path, default_client_identity_path, fresh_data_dir,
         https_client_with_root_from_data_dir, issue_bootstrap_bundle, start_authenticated_server,
         start_open_server_with_public_https_env, stop_server, stop_server_without_cleanup,
     };
@@ -25,6 +25,7 @@ mod tests {
     use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+    use tokio::process::Command;
     use uuid::Uuid;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::CloudFilters::{
@@ -1259,6 +1260,54 @@ mod tests {
         )
         .await
         .expect("remote delete while offline should preserve local-only file changes on restart");
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_register_rejects_non_empty_first_time_folder() {
+        let sync_root = fresh_data_dir("cfapi-non-empty-register-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        std::fs::write(sync_root.join("local-only.txt"), b"preexisting local content")
+            .expect("failed to seed pre-existing local file");
+
+        let mut fixture = start_authenticated_cfapi_fixture(
+            "127.0.0.1:19117",
+            &sync_root,
+            "cfapi-non-empty-register",
+        )
+        .await
+        .expect("failed to start authenticated CFAPI fixture");
+        let bootstrap = ConnectionBootstrap::from_path(&fixture.bootstrap_file)
+            .expect("failed to read bootstrap bundle");
+        let os_integration_bin = binary_path("os-integration").expect("os-integration binary");
+
+        let output = Command::new(os_integration_bin)
+            .arg("register")
+            .arg("--sync-root-id")
+            .arg("ironmesh.systemtest.reject.nonempty.first.register")
+            .arg("--display-name")
+            .arg("ironmesh Reject Non-Empty First Register")
+            .arg("--root-path")
+            .arg(&sync_root)
+            .arg("--cluster-id")
+            .arg(bootstrap.cluster_id.to_string())
+            .output()
+            .await
+            .expect("failed to execute os-integration register");
+
+        assert!(
+            !output.status.success(),
+            "register unexpectedly succeeded for non-empty sync root"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("refusing to register non-empty folder"),
+            "expected non-empty registration rejection, stderr was: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
     }
 
     #[tokio::test]

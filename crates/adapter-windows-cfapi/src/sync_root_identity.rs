@@ -2,15 +2,15 @@
 
 use crate::helpers::normalize_path;
 use anyhow::{Context, Result, anyhow, bail};
+use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use uuid::Uuid;
-use wincs::ext::PathExt;
-use windows::{
-    Storage::{
-        Provider::StorageProviderSyncRootInfo,
-        Streams::DataReader,
+use windows_sys::Win32::{
+    Foundation::{ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_NOT_FOUND},
+    Storage::CloudFilters::{
+        CF_SYNC_ROOT_INFO_STANDARD, CF_SYNC_ROOT_STANDARD_INFO, CfGetSyncRootInfoByPath,
     },
-    Win32::Foundation::ERROR_NOT_FOUND,
 };
 
 const SYNC_ROOT_IDENTITY_SCHEMA_VERSION: u32 = 1;
@@ -135,57 +135,89 @@ pub fn normalize_prefix(prefix: Option<&str>) -> String {
 }
 
 pub fn load_registered_sync_root_context(root_path: &Path) -> Result<Option<RegisteredSyncRootContext>> {
-    let Some(info) = try_get_sync_root_info(root_path)? else {
+    let Some((provider_name, identity_bytes)) = try_get_sync_root_info(root_path)? else {
         return Ok(None);
     };
 
-    let windows_sync_root_id = info
-        .Id()
-        .context("failed to read Windows sync root id")?
-        .to_string_lossy();
-    let context_buffer = info
-        .Context()
-        .context("failed to read Windows sync root context blob")?;
-    let context_len = context_buffer
-        .Length()
-        .context("failed to read Windows sync root context length")?
-        as usize;
-    if context_len == 0 {
-        bail!(
-            "sync root {} at {} is missing IronMesh registration metadata",
-            windows_sync_root_id,
-            root_path.display()
-        );
-    }
-
-    let reader =
-        DataReader::FromBuffer(&context_buffer).context("failed to create context blob reader")?;
-    let mut bytes = vec![0u8; context_len];
-    reader
-        .ReadBytes(&mut bytes)
-        .context("failed to decode sync root context blob")?;
-
     Ok(Some(RegisteredSyncRootContext {
-        windows_sync_root_id,
-        identity: SyncRootIdentity::decode(&bytes)?,
+        windows_sync_root_id: provider_name,
+        identity: SyncRootIdentity::decode(&identity_bytes)
+            .with_context(|| format!("failed to decode sync root identity for {}", root_path.display()))?,
     }))
 }
 
-fn try_get_sync_root_info(root_path: &Path) -> Result<Option<StorageProviderSyncRootInfo>> {
-    match root_path.sync_root_info() {
-        Ok(info) => Ok(Some(info)),
-        Err(err) if err.code() == ERROR_NOT_FOUND.to_hresult() => Ok(None),
-        Err(err) => Err(anyhow!(
-            "failed to query Windows sync root registration for {}: {}",
+fn try_get_sync_root_info(root_path: &Path) -> Result<Option<(String, Vec<u8>)>> {
+    let mut info_buffer = vec![0u8; size_of::<CF_SYNC_ROOT_STANDARD_INFO>() + 65_536];
+    let mut returned_length = 0u32;
+    let root_path_utf16 = root_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    let hr = unsafe {
+        CfGetSyncRootInfoByPath(
+            root_path_utf16.as_ptr(),
+            CF_SYNC_ROOT_INFO_STANDARD,
+            info_buffer.as_mut_ptr().cast(),
+            info_buffer.len() as u32,
+            &mut returned_length,
+        )
+    };
+
+    if hr < 0 {
+        let hr_u32 = hr as u32;
+        if hr_u32 == hresult_from_win32(ERROR_NOT_FOUND)
+            || hr_u32 == hresult_from_win32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT)
+        {
+            return Ok(None);
+        }
+        return Err(anyhow!(
+            "failed to query CFAPI sync root info for {}: HRESULT 0x{:08x}",
             root_path.display(),
-            err
-        )),
+            hr_u32
+        ));
     }
+
+    if returned_length < size_of::<CF_SYNC_ROOT_STANDARD_INFO>() as u32 {
+        bail!(
+            "CFAPI returned short sync root info buffer for {} ({} bytes)",
+            root_path.display(),
+            returned_length
+        );
+    }
+
+    let info = unsafe { &*(info_buffer.as_ptr() as *const CF_SYNC_ROOT_STANDARD_INFO) };
+    let identity_offset = (&info.SyncRootIdentity as *const [u8; 1] as usize)
+        .saturating_sub(info as *const CF_SYNC_ROOT_STANDARD_INFO as usize);
+    let identity_length = info.SyncRootIdentityLength as usize;
+    let available = (returned_length as usize).saturating_sub(identity_offset);
+    let clamped_length = identity_length.min(available);
+    if clamped_length == 0 {
+        bail!("sync root at {} is missing IronMesh registration metadata", root_path.display());
+    }
+
+    Ok(Some((
+        wide_c_string_to_string_lossy(&info.ProviderName),
+        info_buffer[identity_offset..identity_offset + clamped_length].to_vec(),
+    )))
 }
 
 fn normalize_prefix_value(prefix: impl AsRef<str>) -> String {
     let prefix = normalize_path(prefix.as_ref());
     prefix.trim_matches('/').to_string()
+}
+
+fn hresult_from_win32(error: u32) -> u32 {
+    if error == 0 {
+        0
+    } else {
+        (error & 0x0000_FFFF) | 0x8007_0000
+    }
+}
+
+fn wide_c_string_to_string_lossy(buffer: &[u16]) -> String {
+    let len = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..len])
 }
 
 #[cfg(test)]

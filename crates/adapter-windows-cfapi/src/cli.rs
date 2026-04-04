@@ -15,15 +15,14 @@ use crate::cfapi::{cf_get_placeholder_standard_info, cf_hydrate_placeholder, cf_
 use crate::connection_config::{persist_connection_config, resolve_connection_config};
 use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
+use crate::placeholder_metadata::{
+    RemoteDeleteReconcileReport, record_in_sync_local_file_state, reconcile_remote_delete_state,
+};
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
     reconcile_sync_states, register_sync_root, unregister_sync_root,
 };
-use crate::snapshot_cache::{
-    RemoteDeleteReconcileReport, RemoteSnapshotCache, load_remote_snapshot_cache,
-    persist_remote_snapshot_cache, record_local_file_hash,
-    reconcile_remote_delete_state,
-};
+use crate::sync_root_identity::load_registered_sync_root_context;
 use sync_core::SyncPolicy;
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -255,7 +254,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                 connection.cluster_id,
                 args.prefix.as_deref(),
             );
-            let _sync_root_identity = register_sync_root(&registration)?;
+            let sync_root_identity = register_sync_root(&registration)?;
             tracing::info!("using connection target {}", connection.connection_target);
             let refresh_interval = Duration::from_millis(args.remote_refresh_interval_ms.max(250));
             let refresh_poller = RemoteSnapshotPoller::server_notifications(
@@ -299,18 +298,11 @@ pub fn cli_main() -> anyhow::Result<()> {
                 client.clone(),
                 RemoteSnapshotScope::new(args.prefix.clone(), args.depth, None),
             );
-            let cached_remote_snapshot = match load_remote_snapshot_cache(&registration.root_path) {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    tracing::warn!("failed to load remote snapshot cache: {err:#}");
-                    None
-                }
-            };
             let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
             let startup_delete_report = match reconcile_remote_delete_state(
                 &registration.root_path,
-                cached_remote_snapshot.as_ref(),
                 &initial_snapshot,
+                sync_root_identity.provider_instance_id,
             ) {
                 Ok(report) => {
                     log_remote_delete_reconcile_summary("startup", &report);
@@ -335,10 +327,19 @@ pub fn cli_main() -> anyhow::Result<()> {
                 client.clone(),
                 download_stage_root,
             ));
-            let _connection =
-                connect_sync_root(&registration, runtime.clone(), hydrator, uploader.clone())?;
+            let _connection = connect_sync_root(
+                &registration,
+                sync_root_identity.provider_instance_id,
+                runtime.clone(),
+                hydrator,
+                uploader.clone(),
+            )?;
 
-            apply_action_plan(&registration.root_path, &action_plan)?;
+            apply_action_plan(
+                &registration.root_path,
+                &action_plan,
+                sync_root_identity.provider_instance_id,
+            )?;
             let _ = runtime.sync_from_action_plan(&action_plan);
             let sync_state_stats = reconcile_sync_states(&registration.root_path, &action_plan);
             tracing::info!(
@@ -355,7 +356,12 @@ pub fn cli_main() -> anyhow::Result<()> {
                 registration.root_path.display()
             );
             let mut monitor =
-                SyncRootMonitor::new("monitor", registration.root_path.clone(), uploader.clone());
+                SyncRootMonitor::new(
+                    "monitor",
+                    registration.root_path.clone(),
+                    sync_root_identity.provider_instance_id,
+                    uploader.clone(),
+                );
             monitor.seed_remote_entries_with_suppressed_paths(
                 &action_plan,
                 &startup_delete_report.suppressed_startup_paths,
@@ -363,16 +369,6 @@ pub fn cli_main() -> anyhow::Result<()> {
             std::thread::spawn(move || {
                 monitor.run();
             });
-            let mut previous_remote_snapshot = match persist_remote_snapshot_cache(
-                &registration.root_path,
-                &initial_snapshot,
-            ) {
-                Ok(cache) => cache,
-                Err(err) => {
-                    tracing::warn!("failed to persist remote snapshot cache: {err:#}");
-                    RemoteSnapshotCache::from_snapshot(initial_snapshot.clone())
-                }
-            };
 
             tracing::info!("connected to CFAPI callbacks; serving hydration requests");
             let running = std::sync::Arc::new(AtomicBool::new(true));
@@ -388,6 +384,7 @@ pub fn cli_main() -> anyhow::Result<()> {
             let refresh_adapter = adapter.clone();
             let refresh_runtime = runtime.clone();
             let refresh_running = running.clone();
+            let refresh_provider_instance_id = sync_root_identity.provider_instance_id;
             refresh_poller.spawn_fetcher_loop(
                 refresh_running,
                 Some(initial_snapshot),
@@ -395,8 +392,8 @@ pub fn cli_main() -> anyhow::Result<()> {
                 move |update| {
                     let remote_delete_report = match reconcile_remote_delete_state(
                         &refresh_registration.root_path,
-                        Some(&previous_remote_snapshot),
                         &update.snapshot,
+                        refresh_provider_instance_id,
                     ) {
                         Ok(report) => {
                             log_remote_delete_reconcile_summary(
@@ -417,7 +414,11 @@ pub fn cli_main() -> anyhow::Result<()> {
                     let summary_label =
                         format!("remote-refresh changed_paths={}", update.changed_paths.len());
                     log_action_plan_summary(&summary_label, &plan);
-                    if let Err(err) = apply_action_plan(&refresh_registration.root_path, &plan) {
+                    if let Err(err) = apply_action_plan(
+                        &refresh_registration.root_path,
+                        &plan,
+                        refresh_provider_instance_id,
+                    ) {
                         tracing::info!("remote-refresh: apply_action_plan error: {err}");
                         return;
                     }
@@ -442,18 +443,6 @@ pub fn cli_main() -> anyhow::Result<()> {
                             remote_delete_report.suppressed_startup_paths.len()
                         );
                     }
-                    previous_remote_snapshot = match persist_remote_snapshot_cache(
-                        &refresh_registration.root_path,
-                        &update.snapshot,
-                    ) {
-                        Ok(cache) => cache,
-                        Err(err) => {
-                            tracing::warn!(
-                                "remote-refresh: failed to persist remote snapshot cache: {err:#}"
-                            );
-                            previous_remote_snapshot.with_snapshot(update.snapshot.clone())
-                        }
-                    };
                 },
             );
 
@@ -511,11 +500,32 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
         );
 
         if info.OnDiskDataSize >= total_size && info.ModifiedDataSize == 0 {
-            if let Err(err) = record_local_file_hash(&root_path, &args.path) {
-                tracing::warn!(
-                    "failed to record in-sync local file hash for pinned placeholder {}: {err:#}",
-                    target_path.display()
-                );
+            match load_registered_sync_root_context(&root_path) {
+                Ok(Some(context)) => {
+                    if let Err(err) = record_in_sync_local_file_state(
+                        &root_path,
+                        &args.path,
+                        context.identity.provider_instance_id,
+                    ) {
+                        tracing::warn!(
+                            "failed to record in-sync local file hash for pinned placeholder {}: {err:#}",
+                            target_path.display()
+                        );
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "skipping in-sync local hash capture for pinned placeholder {} because {} is not currently registered",
+                        target_path.display(),
+                        root_path.display()
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to query sync root identity for pinned placeholder {}: {err:#}",
+                        target_path.display()
+                    );
+                }
             }
             return Ok(());
         }
