@@ -1921,6 +1921,11 @@ fn current_executable_icon_resource() -> Result<U16String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::mem::size_of;
+    use std::ptr::null;
+    use std::sync::{Arc, Mutex};
+    use windows_sys::Win32::Storage::CloudFilters::CF_PROCESS_INFO;
 
     #[test]
     fn registration_validation_rejects_empty_inputs() {
@@ -2111,5 +2116,80 @@ mod tests {
         assert_eq!(stats.failed, 0);
 
         let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn close_completion_ignores_provider_originated_callbacks() {
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-close-completion-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&sync_root).expect("sync root should be created");
+        let full_path = sync_root.join("notes.txt");
+        std::fs::write(&full_path, b"provider callback should be ignored")
+            .expect("test file should be written");
+
+        let runtime = Arc::new(CfapiRuntime::default());
+        let upload_debounce = Arc::new(UploadDebounceState::default());
+        let uploader = Arc::new(DemoUploader);
+        let callback_context = CallbackContext {
+            sync_root: sync_root.clone(),
+            provider_instance_id: uuid::Uuid::new_v4(),
+            runtime: runtime.clone(),
+            hydrator: Box::new(DemoHydrator),
+            hydrated_once_paths: Mutex::new(HashSet::new()),
+            paths_by_file_id: Mutex::new(HashMap::new()),
+            fetch_cancellations: Mutex::new(HashMap::new()),
+            upload_worker: Arc::new(UploadWorkerContext {
+                sync_root: sync_root.clone(),
+                provider_instance_id: uuid::Uuid::new_v4(),
+                runtime,
+                uploader,
+            }),
+            upload_debounce: upload_debounce.clone(),
+        };
+
+        let normalized_path = full_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let image_path = std::env::current_exe()
+            .expect("current exe should resolve")
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let command_line = image_path.clone();
+
+        let mut process_info = CF_PROCESS_INFO {
+            StructSize: size_of::<CF_PROCESS_INFO>() as u32,
+            ProcessId: std::process::id(),
+            ImagePath: image_path.as_ptr(),
+            PackageName: null(),
+            ApplicationId: null(),
+            CommandLine: command_line.as_ptr(),
+            SessionId: 0,
+        };
+        let callback_info = CF_CALLBACK_INFO {
+            StructSize: size_of::<CF_CALLBACK_INFO>() as u32,
+            FileId: 42,
+            NormalizedPath: normalized_path.as_ptr(),
+            ProcessInfo: &mut process_info,
+            ..Default::default()
+        };
+
+        handle_callback_file_close_completion(
+            &callback_info,
+            &callback_context,
+            CloseCompletionCallbackParams { flags: 0 },
+        );
+
+        let snapshot = upload_debounce.debug_snapshot_for_path("notes.txt", 8);
+        assert_eq!(
+            snapshot.pending_count, 0,
+            "provider-originated close callback should not schedule debounce work: {}",
+            snapshot.to_log_string()
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
     }
 }
