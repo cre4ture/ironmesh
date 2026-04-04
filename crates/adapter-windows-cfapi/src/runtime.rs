@@ -266,6 +266,26 @@ fn path_matches_desired_sync_state(path: &Path, desired_state: DesiredSyncState)
     placeholder_info_matches_desired_sync_state(&info, desired_state)
 }
 
+fn path_is_cold_in_sync_placeholder(path: &Path) -> bool {
+    let placeholder_state = path_placeholder_state(path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
+    if (placeholder_state & CF_PLACEHOLDER_STATE_PARTIAL) == 0 {
+        return false;
+    }
+
+    let file = match open_sync_path(path, false) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let info = match cf_get_placeholder_standard_info(&file) {
+        Ok(info) => info,
+        Err(_) => return false,
+    };
+
+    info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC
+        && info.ModifiedDataSize == 0
+        && info.OnDiskDataSize == 0
+}
+
 fn path_placeholder_identity_missing(path: &Path) -> bool {
     let file = match open_sync_path(path, false) {
         Ok(file) => file,
@@ -799,6 +819,15 @@ pub fn apply_action_plan(
                 if created_placeholder_paths.contains(&normalize_path(path)) {
                     continue;
                 }
+                let full_path = root_path.join(normalize_path(path).replace('/', "\\"));
+                if path_is_cold_in_sync_placeholder(&full_path) {
+                    tracing::info!(
+                        "apply_action_plan: skipping metadata refresh for cold placeholder {} state={}",
+                        path,
+                        describe_path_state(&full_path)
+                    );
+                    continue;
+                }
                 if let Err(err) = refresh_remote_placeholder_state(
                     root_path,
                     path,
@@ -823,6 +852,15 @@ pub fn apply_action_plan(
                 remote_content_fingerprint,
                 ..
             } => {
+                let full_path = root_path.join(normalize_path(path).replace('/', "\\"));
+                if path_is_cold_in_sync_placeholder(&full_path) {
+                    tracing::info!(
+                        "apply_action_plan: skipping conflict metadata refresh for cold placeholder {} state={}",
+                        path,
+                        describe_path_state(&full_path)
+                    );
+                    continue;
+                }
                 if let Err(err) = refresh_remote_placeholder_state(
                     root_path,
                     path,

@@ -1040,6 +1040,198 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
     }
 
+    async fn run_cfapi_hydrating_one_file_keeps_dehydrated_sibling_cold_case(
+        bind: &str,
+        first_key: &str,
+        first_payload: &[u8],
+        second_key: &str,
+        second_payload: &[u8],
+    ) {
+        let sync_root = fresh_data_dir("cfapi-sibling-auto-hydration-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-sibling-hydration")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
+
+        for key in [first_key, second_key] {
+            let path_parts: Vec<&str> = key.split('/').collect();
+            let mut current_dir = String::new();
+            for dir in path_parts.iter().take(path_parts.len() - 1) {
+                if !current_dir.is_empty() {
+                    current_dir.push('/');
+                }
+                current_dir.push_str(dir);
+                fixture
+                    .sdk
+                    .put(format!("{current_dir}/"), Bytes::new())
+                    .await
+                    .expect("failed to put folder");
+            }
+        }
+        fixture
+            .sdk
+            .put_large_aware(first_key, Bytes::from(first_payload.to_vec()))
+            .await
+            .expect("failed to seed first remote object");
+        fixture
+            .sdk
+            .put_large_aware(second_key, Bytes::from(second_payload.to_vec()))
+            .await
+            .expect("failed to seed second remote object");
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.sibling.hydration.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Sibling Hydration Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let first_local = sync_root.join(first_key.replace('/', "\\"));
+        let second_local = sync_root.join(second_key.replace('/', "\\"));
+
+        for path in [&first_local, &second_local] {
+            wait_for_path(path, 220).await;
+            wait_for_placeholder_present(path, 220).await;
+            wait_for_placeholder_in_sync(path, 220).await;
+            wait_for_placeholder_dehydrated(path, 80).await;
+        }
+
+        wait_for_hydrated_payload(&second_local, second_payload, 220).await;
+        request_online_only_via_attrib(&second_local)
+            .expect("failed to request online-only for second placeholder");
+        wait_for_file_attribute_unpinned(&second_local, 120).await;
+        wait_for_placeholder_dehydrated(&second_local, 120).await;
+        assert_placeholder_stays_dehydrated(
+            &second_local,
+            Duration::from_secs(3),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        wait_for_hydrated_payload(&first_local, first_payload, 260).await;
+
+        wait_for_placeholder_dehydrated(&second_local, 120).await;
+        assert_placeholder_stays_dehydrated(
+            &second_local,
+            Duration::from_secs(8),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
+    async fn run_cfapi_restart_keeps_previously_dehydrated_placeholders_cold_case(
+        bind: &str,
+        keys_and_payloads: &[(&str, &[u8])],
+    ) {
+        let sync_root = fresh_data_dir("cfapi-restart-cold-placeholders-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-restart-cold-placeholders")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
+
+        for (key, payload) in keys_and_payloads {
+            let path_parts: Vec<&str> = key.split('/').collect();
+            let mut current_dir = String::new();
+            for dir in path_parts.iter().take(path_parts.len() - 1) {
+                if !current_dir.is_empty() {
+                    current_dir.push('/');
+                }
+                current_dir.push_str(dir);
+                fixture
+                    .sdk
+                    .put(format!("{current_dir}/"), Bytes::new())
+                    .await
+                    .expect("failed to put folder");
+            }
+            fixture
+                .sdk
+                .put_large_aware(*key, Bytes::from(payload.to_vec()))
+                .await
+                .expect("failed to seed remote object");
+        }
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.restart.cold.placeholders.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let mut adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Restart Cold Placeholders Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let local_paths = keys_and_payloads
+            .iter()
+            .map(|(key, _)| sync_root.join(key.replace('/', "\\")))
+            .collect::<Vec<_>>();
+
+        for path in &local_paths {
+            wait_for_path(path, 220).await;
+            wait_for_placeholder_present(path, 220).await;
+            wait_for_placeholder_in_sync(path, 220).await;
+            wait_for_placeholder_dehydrated(path, 80).await;
+        }
+
+        for ((_, payload), path) in keys_and_payloads.iter().zip(local_paths.iter()) {
+            wait_for_hydrated_payload(path, payload, 260).await;
+            request_online_only_via_attrib(path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to request online-only for {}: {err:#}",
+                    path.display()
+                )
+            });
+            wait_for_file_attribute_unpinned(path, 120).await;
+            wait_for_placeholder_dehydrated(path, 120).await;
+        }
+
+        stop_server_without_cleanup(&mut adapter).await;
+
+        let mut restarted_adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Restart Cold Placeholders Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to restart CFAPI adapter");
+
+        for path in &local_paths {
+            wait_for_path(path, 220).await;
+            wait_for_placeholder_present(path, 220).await;
+            wait_for_placeholder_in_sync(path, 220).await;
+            wait_for_placeholder_dehydrated(path, 120).await;
+            assert_placeholder_stays_dehydrated(
+                path,
+                Duration::from_secs(8),
+                Duration::from_millis(200),
+            )
+            .await;
+        }
+
+        stop_server(&mut restarted_adapter).await;
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
     async fn run_cfapi_pin_hydration_case(bind: &str, key: &str, payload: &[u8]) {
         let sync_root = fresh_data_dir("cfapi-pin-hydration-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
@@ -1427,6 +1619,50 @@ mod tests {
             "127.0.0.1:19116",
             "hydrate/no-auto-hydrate-after-restart-small.txt",
             b"small restart payload should stay dehydrated until accessed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_hydrating_one_file_does_not_auto_hydrate_dehydrated_sibling() {
+        let first_payload = format!(
+            "{}{}",
+            "F".repeat(4 * 1024 * 1024),
+            "\nfirst-hydrated-payload"
+        );
+        let second_payload = format!(
+            "{}{}",
+            "S".repeat(3 * 1024 * 1024),
+            "\nsecond-dehydrated-payload"
+        );
+        run_cfapi_hydrating_one_file_keeps_dehydrated_sibling_cold_case(
+            "127.0.0.1:19118",
+            "movies/first-hydrated.bin",
+            first_payload.as_bytes(),
+            "movies/second-should-stay-cold.bin",
+            second_payload.as_bytes(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_restart_does_not_auto_hydrate_previously_dehydrated_placeholders() {
+        let first_payload = format!(
+            "{}{}",
+            "R".repeat(4 * 1024 * 1024),
+            "\nrestart-first-payload"
+        );
+        let second_payload = format!(
+            "{}{}",
+            "Q".repeat(3 * 1024 * 1024),
+            "\nrestart-second-payload"
+        );
+        run_cfapi_restart_keeps_previously_dehydrated_placeholders_cold_case(
+            "127.0.0.1:19119",
+            &[
+                ("movies/restart-first.bin", first_payload.as_bytes()),
+                ("movies/restart-second.bin", second_payload.as_bytes()),
+            ],
         )
         .await;
     }
