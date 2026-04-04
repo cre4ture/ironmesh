@@ -71,6 +71,21 @@ pub fn cf_update_placeholder_file_identity(
     )
 }
 
+pub fn cf_update_placeholder_file_identity_with_oplock(
+    path: &Path,
+    file_identity: &[u8],
+) -> Result<()> {
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CF_OPEN_FILE_FLAG_EXCLUSIVE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+    };
+
+    with_cf_oplock_handle(
+        path,
+        CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+        |handle| update_placeholder(handle, file_identity, None, 0),
+    )
+}
+
 pub fn cf_ensure_placeholder_identity(file: &std::fs::File, relative_path: &str) -> Result<()> {
     match cf_get_placeholder_standard_info_with_identity(file) {
         Ok(info) if !info.file_identity().is_empty() => Ok(()),

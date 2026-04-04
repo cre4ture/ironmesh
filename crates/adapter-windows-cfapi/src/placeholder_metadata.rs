@@ -3,7 +3,8 @@
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity,
-    cf_update_placeholder_file_identity, open_sync_path,
+    cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_with_oplock,
+    open_sync_path,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{
@@ -186,11 +187,12 @@ fn mutate_placeholder_identity_for_path(
     mutator: impl FnOnce(&mut PlaceholderFileIdentity),
 ) -> Result<()> {
     let full_path = sync_root_path.join(relative_path.replace('/', "\\"));
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&full_path)
-        .with_context(|| format!("failed to open {} for placeholder metadata update", full_path.display()))?;
+    let file = open_sync_path(&full_path, false).with_context(|| {
+        format!(
+            "failed to open {} for placeholder metadata read",
+            full_path.display()
+        )
+    })?;
 
     let mut identity = match cf_get_placeholder_standard_info_with_identity(&file) {
         Ok(info) => decode_placeholder_file_identity(info.file_identity())
@@ -200,11 +202,17 @@ fn mutate_placeholder_identity_for_path(
     mutator(&mut identity);
     let encoded = encode_placeholder_file_identity_metadata(&identity);
 
-    match cf_update_placeholder_file_identity(&file, &encoded) {
+    match cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded) {
         Ok(()) => Ok(()),
         Err(_) => {
-            cf_ensure_placeholder_identity(&file, relative_path)?;
-            cf_update_placeholder_file_identity(&file, &encoded)
+            let writable_file = open_sync_path(&full_path, true).with_context(|| {
+                format!(
+                    "failed to reopen {} for placeholder metadata update fallback",
+                    full_path.display()
+                )
+            })?;
+            cf_ensure_placeholder_identity(&writable_file, relative_path)?;
+            cf_update_placeholder_file_identity(&writable_file, &encoded)
         }
     }
 }

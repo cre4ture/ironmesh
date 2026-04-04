@@ -476,6 +476,39 @@ mod tests {
         );
     }
 
+    async fn assert_placeholder_stays_dehydrated(
+        path: &Path,
+        duration: Duration,
+        poll_interval: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + duration;
+        loop {
+            let info = placeholder_standard_info(path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to read placeholder info while verifying dehydration at {}: {err:#}",
+                    path.display()
+                )
+            });
+            if info.OnDiskDataSize != 0 || info.ModifiedDataSize != 0 {
+                let streams = file_stream_names(path)
+                    .map(|value| format!("{value:?}"))
+                    .unwrap_or_else(|err| format!("stream-enum-error={err}"));
+                panic!(
+                    "placeholder hydrated unexpectedly at {}: {} streams={}",
+                    path.display(),
+                    sync_item_state_summary(path),
+                    streams
+                );
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     fn request_online_only_via_attrib(path: &Path) -> anyhow::Result<()> {
         let output = std::process::Command::new("attrib")
             .arg("+u")
@@ -719,6 +752,69 @@ mod tests {
         let local_file = sync_root.join(key.replace('/', "\\"));
         wait_for_path(&local_file, 200).await;
         wait_for_hydrated_payload(&local_file, payload, 150).await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
+    async fn run_cfapi_no_auto_hydration_on_initial_register_case(
+        bind: &str,
+        key: &str,
+        payload: &[u8],
+    ) {
+        let sync_root = fresh_data_dir("cfapi-no-auto-hydration-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-no-auto-hydration")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
+
+        let path_parts: Vec<&str> = key.split('/').collect();
+        let mut current_dir = String::new();
+        for dir in path_parts.iter().take(path_parts.len() - 1) {
+            if !current_dir.is_empty() {
+                current_dir.push('/');
+            }
+            current_dir.push_str(dir);
+            let dir_key = format!("{current_dir}/");
+            fixture
+                .sdk
+                .put(dir_key, Bytes::new())
+                .await
+                .expect("failed to put folder");
+        }
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from(payload.to_vec()))
+            .await
+            .expect("failed to seed remote object");
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.no.auto.hydration.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test No Auto Hydration Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let local_file = sync_root.join(key.replace('/', "\\"));
+        wait_for_path(&local_file, 220).await;
+        wait_for_placeholder_present(&local_file, 220).await;
+        wait_for_placeholder_in_sync(&local_file, 220).await;
+        wait_for_placeholder_dehydrated(&local_file, 80).await;
+        assert_placeholder_stays_dehydrated(
+            &local_file,
+            Duration::from_secs(7),
+            Duration::from_millis(200),
+        )
+        .await;
 
         stop_server(&mut fixture.server).await;
         let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
@@ -1040,6 +1136,16 @@ mod tests {
             "\nlarge-hydration-tail"
         );
         run_cfapi_hydration_case("127.0.0.1:19093", "hydrate/large.bin", payload.as_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_placeholder_does_not_auto_hydrate_on_initial_register() {
+        run_cfapi_no_auto_hydration_on_initial_register_case(
+            "127.0.0.1:19113",
+            "hydrate/no-auto-hydrate.txt",
+            b"remote payload should stay dehydrated until accessed",
+        )
+        .await;
     }
 
     #[tokio::test]

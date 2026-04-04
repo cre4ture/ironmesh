@@ -594,6 +594,7 @@ pub fn apply_action_plan(
     std::fs::create_dir_all(root_path)?;
 
     let mut placeholders: BTreeMap<String, (String, String, Option<u64>)> = BTreeMap::new();
+    let mut created_placeholder_paths = BTreeSet::new();
     for action in &plan.actions {
         match action {
             CfapiAction::EnsureDirectory { path } => {
@@ -622,13 +623,14 @@ pub fn apply_action_plan(
                     std::fs::create_dir_all(root_path.join(parent))?;
                 }
                 placeholders.insert(
-                    normalized,
+                    normalized.clone(),
                     (
                         remote_version.clone(),
                         remote_content_hash.clone(),
                         *remote_size,
                     ),
                 );
+                created_placeholder_paths.insert(normalized);
             }
             CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
         }
@@ -748,6 +750,9 @@ pub fn apply_action_plan(
                 remote_content_hash,
                 remote_size,
             } => {
+                if created_placeholder_paths.contains(&normalize_path(path)) {
+                    continue;
+                }
                 if let Err(err) = refresh_remote_placeholder_state(
                     root_path,
                     path,
