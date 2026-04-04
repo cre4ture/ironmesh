@@ -14,6 +14,5 @@ pub mod monitor;
 pub mod placeholder_metadata;
 pub mod register;
 pub mod runtime;
-pub mod serve;
 pub mod snapshot_cache;
 pub mod sync_root_identity;
