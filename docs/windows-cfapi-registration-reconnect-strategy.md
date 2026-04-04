@@ -180,17 +180,19 @@ The new strategy should store the following per-item metadata in each placeholde
   - remote version identifier.
 - `rh`
   - remote content hash.
+- `rf`
+  - remote content fingerprint.
 - `rs`
   - remote size in bytes.
-- `lh`
-  - last-known clean local content hash.
+- `cf`
+  - last-known clean content fingerprint.
 - `pi`
   - provider instance id from the current sync-root registration.
 
 Suggested semantics:
 
-- `rv`, `rh`, and `rs` identify the remote state this placeholder currently represents.
-- `lh` identifies the last local byte sequence that was known to be clean and in-sync.
+- `rv`, `rh`, `rf`, and `rs` identify the remote state this placeholder currently represents.
+- `cf` identifies the last local byte sequence that was known to be clean and in-sync, using the same path-independent content-fingerprint algorithm as the server.
 - `pi` lets the provider reject stale per-file metadata if the root is later re-created under a different provider instance.
 
 ### 7.2 Concrete size estimate
@@ -203,16 +205,19 @@ Using a compact newline-delimited encoding rather than pretty JSON, the non-path
   - typically 20-80 bytes.
 - `rh=<64 hex chars>`
   - about 68 bytes.
+- `rf=<content fingerprint>`
+  - about 72 bytes.
 - `rs=<decimal size>`
   - about 8-24 bytes.
-- `lh=<64 hex chars>`
-  - about 68 bytes.
+- `cf=<content fingerprint>`
+  - about 72 bytes.
 - `pi=<uuid>`
   - about 40 bytes using canonical UUID text.
 
 That means the fixed overhead excluding `p` is roughly:
 
 - about 190-300 bytes in common cases.
+- about 260-360 bytes in common cases.
 
 The dominant variable is `p`, the normalized relative path. That path is already stored in `FileIdentity` today, so the new strategy does not introduce a new fundamental limit. It mainly adds around 180-220 bytes of extra reconciliation metadata on top of the existing path payload.
 
@@ -231,6 +236,36 @@ The intended end state is:
 - no required root-wide snapshot JSON file.
 
 If we keep `.ironmesh-remote-snapshot.json` at all, it should be treated as optional diagnostics only, not as part of the provider's required restart logic.
+
+### 7.4 Clean baseline strategy
+
+The earlier draft used a local raw-byte hash as the clean baseline and proposed computing it after hydration or upload. That is no longer the preferred design.
+
+The better baseline is the server-side path-independent `content_fingerprint`, not the current `content_hash` value exposed in store-index snapshots.
+
+Important distinction:
+
+- store-index `content_hash`
+  - currently maps to the manifest hash,
+  - includes the object key/path in the manifest payload,
+  - should not be treated as a path-independent clean-content baseline.
+- store-index `content_fingerprint`
+  - is derived from the object content layout only,
+  - is path-independent,
+  - is the right clean baseline to compare against future local bytes.
+
+Implications for the Windows adapter:
+
+- after remote hydration completes, the provider should store `cf = remote content_fingerprint` directly from remote metadata,
+- after explicit pin hydration completes, the provider should do the same,
+- after local upload completes, the provider should compute the same content-fingerprint algorithm inline while streaming the upload and then store that value as `cf`,
+- the provider should not reopen and reread the hydrated placeholder just to compute a baseline,
+- local byte reads for fingerprint comparison should happen only when reconciliation actually needs to decide whether a modified local file still matches its last clean baseline.
+
+This avoids provider-triggered self-hydration while still preserving the offline-delete rule:
+
+- clean remotely deleted files are removed,
+- locally changed remotely deleted files are preserved.
 
 ## 8. Terminology Clarification
 
