@@ -16,6 +16,8 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
+  await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Collected at (UTC)" })).toBeVisible();
+  await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Storage used (bytes)" })).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
   await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
   await expect(page.getByText("Snapshot logical size:")).toBeVisible();
@@ -27,6 +29,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("cell", { name: "node-alpha", exact: true })).toBeVisible();
+  await expect(page.locator("td").filter({ hasText: /logical/ }).first()).toBeVisible();
   await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
   await expect(
     page

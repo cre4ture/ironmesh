@@ -664,8 +664,13 @@ function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
   }
 
   const width = 720;
-  const height = 180;
-  const padding = 16;
+  const height = 240;
+  const padding = {
+    top: 20,
+    right: 16,
+    bottom: 56,
+    left: 72
+  };
   const metadataValues = samples.map(
     (sample) => sample.metadata_db_bytes + sample.manifest_store_bytes + sample.media_cache_bytes
   );
@@ -675,16 +680,22 @@ function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
     ...metadataValues,
     ...samples.map((sample) => sample.latest_snapshot_unique_chunk_bytes)
   );
-  const baselineY = height - padding;
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+  const baselineY = height - padding.bottom;
+  const xAxisTicks = buildXAxisTicks(samples, width, padding);
+  const yAxisTicks = Array.from(new Set([maxima, Math.round(maxima / 2), 0])).sort(
+    (left, right) => right - left
+  );
 
   const buildPath = (values: number[]): string => {
     if (values.length === 1) {
       const y = projectY(values[0], maxima, height, padding);
-      return `M ${padding} ${y} L ${width - padding} ${y}`;
+      return `M ${padding.left} ${y} L ${width - padding.right} ${y}`;
     }
     return values
       .map((value, index) => {
-        const x = padding + (index / (values.length - 1)) * (width - padding * 2);
+        const x = projectX(index, values.length, width, padding);
         const y = projectY(value, maxima, height, padding);
         return `${index === 0 ? "M" : "L"} ${x} ${y}`;
       })
@@ -699,15 +710,72 @@ function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
         viewBox={`0 0 ${width} ${height}`}
         style={{ width: "100%", height: "auto", display: "block" }}
       >
+        <title>Storage stats history</title>
+        <desc>Chunk store, metadata footprint, and latest snapshot unique bytes by sample time.</desc>
         <rect x="0" y="0" width={width} height={height} fill="#0f172a" rx="12" />
+        {yAxisTicks.map((tickValue) => {
+          const y = projectY(tickValue, maxima, height, padding);
+          return (
+            <g key={tickValue}>
+              <line
+                x1={padding.left}
+                y1={y}
+                x2={width - padding.right}
+                y2={y}
+                stroke="#1e293b"
+                strokeWidth="1"
+                strokeDasharray="4 4"
+              />
+              <text
+                x={padding.left - 10}
+                y={y}
+                fill="#cbd5e1"
+                fontSize="11"
+                textAnchor="end"
+                dominantBaseline="middle"
+              >
+                {formatBytes(tickValue)}
+              </text>
+            </g>
+          );
+        })}
         <line
-          x1={padding}
-          y1={baselineY}
-          x2={width - padding}
+          x1={padding.left}
+          y1={padding.top}
+          x2={padding.left}
           y2={baselineY}
           stroke="#334155"
           strokeWidth="1"
         />
+        <line
+          x1={padding.left}
+          y1={baselineY}
+          x2={width - padding.right}
+          y2={baselineY}
+          stroke="#334155"
+          strokeWidth="1"
+        />
+        {xAxisTicks.map((tick) => (
+          <g key={`${tick.label}-${tick.index}`}>
+            <line
+              x1={tick.x}
+              y1={baselineY}
+              x2={tick.x}
+              y2={baselineY + 6}
+              stroke="#475569"
+              strokeWidth="1"
+            />
+            <text
+              x={tick.x}
+              y={baselineY + 22}
+              fill="#cbd5e1"
+              fontSize="11"
+              textAnchor={tick.index === 0 ? "start" : tick.isLast ? "end" : "middle"}
+            >
+              {tick.label}
+            </text>
+          </g>
+        ))}
         <path
           d={buildPath(samples.map((sample) => sample.chunk_store_bytes))}
           fill="none"
@@ -732,6 +800,27 @@ function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
           strokeLinejoin="round"
           strokeLinecap="round"
         />
+        <text
+          x={padding.left + chartWidth / 2}
+          y={height - 14}
+          fill="#e2e8f0"
+          fontSize="12"
+          fontWeight="600"
+          textAnchor="middle"
+        >
+          Collected at (UTC)
+        </text>
+        <text
+          x={18}
+          y={padding.top + chartHeight / 2}
+          fill="#e2e8f0"
+          fontSize="12"
+          fontWeight="600"
+          textAnchor="middle"
+          transform={`rotate(-90 18 ${padding.top + chartHeight / 2})`}
+        >
+          Storage used (bytes)
+        </text>
       </svg>
       <Group gap="md">
         <Badge color="cyan" variant="light">
@@ -748,8 +837,54 @@ function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
   );
 }
 
-function projectY(value: number, maxValue: number, height: number, padding: number): number {
-  const drawableHeight = height - padding * 2;
+function buildXAxisTicks(
+  samples: StorageStatsSample[],
+  width: number,
+  padding: { left: number; right: number }
+): Array<{ index: number; isLast: boolean; label: string; x: number }> {
+  const timeSpanSeconds = Math.max(
+    0,
+    (samples[samples.length - 1]?.collected_at_unix ?? 0) - (samples[0]?.collected_at_unix ?? 0)
+  );
+  const indexes = Array.from(new Set([0, Math.floor((samples.length - 1) / 2), samples.length - 1])).sort(
+    (left, right) => left - right
+  );
+
+  return indexes.map((index) => ({
+    index,
+    isLast: index === samples.length - 1,
+    label: formatChartTimestamp(samples[index]?.collected_at_unix ?? null, timeSpanSeconds >= 86_400),
+    x: projectX(index, samples.length, width, padding)
+  }));
+}
+
+function formatChartTimestamp(unixTs: number | null | undefined, includeDate: boolean): string {
+  if (!unixTs || !Number.isFinite(unixTs) || unixTs <= 0) {
+    return "unknown";
+  }
+  const iso = new Date(unixTs * 1000).toISOString();
+  return includeDate ? iso.slice(5, 16).replace("T", " ") : iso.slice(11, 16);
+}
+
+function projectX(
+  index: number,
+  sampleCount: number,
+  width: number,
+  padding: { left: number; right: number }
+): number {
+  if (sampleCount <= 1) {
+    return padding.left + (width - padding.left - padding.right) / 2;
+  }
+  return padding.left + (index / (sampleCount - 1)) * (width - padding.left - padding.right);
+}
+
+function projectY(
+  value: number,
+  maxValue: number,
+  height: number,
+  padding: { top: number; bottom: number }
+): number {
+  const drawableHeight = height - padding.top - padding.bottom;
   const normalized = maxValue <= 0 ? 0 : value / maxValue;
-  return height - padding - normalized * drawableHeight;
+  return height - padding.bottom - normalized * drawableHeight;
 }
