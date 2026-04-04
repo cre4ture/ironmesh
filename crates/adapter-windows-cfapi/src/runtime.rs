@@ -1770,19 +1770,33 @@ pub(crate) fn handle_callback_file_close_completion(
     close_completion: CloseCompletionCallbackParams,
 ) {
     let normalized_path = string_from_pcwstr(callback_info_ref.NormalizedPath);
+    let process_info = callback_process_log_info(callback_info_ref);
 
-    tracing::info!(
-        "close-completion: flags={:x} path={}",
+    if process_info.process_id == std::process::id() {
+        tracing::debug!(
+            "close-completion: ignoring provider-originated close flags={:x} path={} process_id={} process_image={}",
+            close_completion.flags,
+            normalized_path,
+            process_info.process_id,
+            process_info.image_path
+        );
+        return;
+    }
+
+    tracing::debug!(
+        "close-completion: flags={:x} path={} process_id={} process_image={}",
         close_completion.flags,
-        normalized_path
+        normalized_path,
+        process_info.process_id,
+        process_info.image_path
     );
     if (close_completion.flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
-        tracing::info!("close-completion: file deleted, skipping upload");
+        tracing::debug!("close-completion: file deleted, skipping upload");
         return;
     }
 
     if normalized_path.is_empty() {
-        tracing::info!("close-completion: empty normalized path");
+        tracing::debug!("close-completion: empty normalized path");
         return;
     }
 
@@ -1791,7 +1805,7 @@ pub(crate) fn handle_callback_file_close_completion(
         || is_internal_connection_bootstrap_relative_path(&relative_path)
         || is_internal_remote_snapshot_relative_path(&relative_path)
     {
-        tracing::info!(
+        tracing::debug!(
             "close-completion: skipping internal config file {}",
             relative_path
         );
@@ -1802,52 +1816,41 @@ pub(crate) fn handle_callback_file_close_completion(
     {
         paths_by_file_id.insert(callback_info_ref.FileId, relative_path.clone());
     }
-    tracing::info!(
-        "close-completion: relative_path={}, normalized_path={}, sync_root={:?}",
+    tracing::debug!(
+        "close-completion: relative_path={} normalized_path={} sync_root={:?}",
         relative_path,
         normalized_path,
         context.sync_root
     );
     let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
     match open_sync_path(&full_path, false) {
-        Ok(file) => match cf_get_placeholder_standard_info(&file) {
-            Ok(info) if info.ModifiedDataSize == 0 => {
-                if info.OnDiskDataSize > 0
-                    && let Err(err) = record_in_sync_local_file_state(
-                        &context.sync_root,
-                        &relative_path,
-                        context.provider_instance_id,
-                    )
-                {
-                    tracing::info!(
-                        "close-completion: failed to record in-sync local file hash for clean placeholder {}: {:#}",
-                        relative_path,
-                        err
-                    );
-                }
-                tracing::info!(
-                    "close-completion: skipping upload scheduling for clean placeholder {} state={}",
+        Ok(file) => match cf_get_placeholder_standard_info_with_identity(&file) {
+            Ok(info) if info.info().ModifiedDataSize == 0 => {
+                tracing::debug!(
+                    "close-completion: clean placeholder {} on_disk={} validated={} in_sync={} pin={}",
                     relative_path,
-                    describe_path_state(&full_path)
+                    info.info().OnDiskDataSize,
+                    info.info().ValidatedDataSize,
+                    info.info().InSyncState,
+                    info.info().PinState
                 );
                 return;
             }
             Ok(info) => {
                 tracing::info!(
-                    "close-completion: scheduling upload for dirty placeholder {} modified={} in_sync={} pin={} state={}",
+                    "close-completion: scheduling upload for dirty placeholder {} modified={} on_disk={} in_sync={} pin={}",
                     relative_path,
-                    info.ModifiedDataSize,
-                    info.InSyncState,
-                    info.PinState,
-                    describe_path_state(&full_path)
+                    info.info().ModifiedDataSize,
+                    info.info().OnDiskDataSize,
+                    info.info().InSyncState,
+                    info.info().PinState
                 );
             }
             Err(err) => {
                 tracing::info!(
-                    "close-completion: placeholder info unavailable for {}; scheduling upload conservatively: {} state={}",
+                    "close-completion: placeholder info unavailable for {}; scheduling upload conservatively: {}",
                     relative_path,
-                    err,
-                    describe_path_state(&full_path)
+                    err
                 );
             }
         },
