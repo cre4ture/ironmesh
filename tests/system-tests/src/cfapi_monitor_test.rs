@@ -20,10 +20,13 @@ mod tests {
     use std::io::Write;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::fs::{FileExt, MetadataExt};
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
     use std::time::Duration;
     use tokio::process::Command;
     use uuid::Uuid;
@@ -207,6 +210,32 @@ mod tests {
             expected.len(),
             final_bytes.len()
         );
+    }
+
+    fn read_exact_at(file: &File, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; len];
+        let mut filled = 0usize;
+        while filled < len {
+            let read = file
+                .seek_read(&mut buffer[filled..], offset + filled as u64)
+                .with_context(|| {
+                    format!(
+                        "seek_read failed at offset={} remaining={}",
+                        offset + filled as u64,
+                        len - filled
+                    )
+                })?;
+            if read == 0 {
+                anyhow::bail!(
+                    "unexpected EOF while reading offset={} len={} filled={}",
+                    offset,
+                    len,
+                    filled
+                );
+            }
+            filled += read;
+        }
+        Ok(buffer)
     }
 
     async fn wait_for_remote_payload(
@@ -821,6 +850,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
     }
 
+    async fn run_cfapi_concurrent_boundary_read_case(bind: &str, key: &str, payload: &[u8]) {
+        let sync_root = fresh_data_dir("cfapi-concurrent-boundary-read-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-boundary-read")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
+
+        let path_parts: Vec<&str> = key.split('/').collect();
+        let mut current_dir = String::new();
+        for dir in path_parts.iter().take(path_parts.len() - 1) {
+            if !current_dir.is_empty() {
+                current_dir.push('/');
+            }
+            current_dir.push_str(dir);
+            fixture
+                .sdk
+                .put(format!("{current_dir}/"), Bytes::new())
+                .await
+                .expect("failed to put folder");
+        }
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from(payload.to_vec()))
+            .await
+            .expect("failed to seed remote object");
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.concurrent.boundary.read.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Concurrent Boundary Read Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let local_file = sync_root.join(key.replace('/', "\\"));
+        wait_for_path(&local_file, 220).await;
+        wait_for_placeholder_present(&local_file, 220).await;
+        wait_for_placeholder_in_sync(&local_file, 220).await;
+        wait_for_placeholder_dehydrated(&local_file, 80).await;
+
+        let base_file = File::open(&local_file).expect("failed to open placeholder");
+        for offset in [0_u64, 65_536, 131_072, 196_608, 262_144, 327_680] {
+            let chunk = read_exact_at(&base_file, offset, 65_536).unwrap_or_else(|err| {
+                panic!("failed to prime boundary chunk at {offset}: {err:#}")
+            });
+            assert_eq!(
+                chunk.as_slice(),
+                &payload[offset as usize..offset as usize + 65_536],
+                "primed chunk mismatch at offset {offset}"
+            );
+        }
+
+        let boundary_gap_offset = 393_216_u64;
+        let boundary_gap_len = 4_096_usize;
+        let boundary_tail_offset = 397_312_u64;
+        let boundary_tail_len = 61_440_usize;
+
+        let first_handle = base_file.try_clone().expect("failed to clone first handle");
+        let second_handle = base_file
+            .try_clone()
+            .expect("failed to clone second handle");
+        let start_barrier = Arc::new(Barrier::new(3));
+
+        let gap_barrier = start_barrier.clone();
+        let gap_worker = thread::spawn(move || {
+            gap_barrier.wait();
+            read_exact_at(&first_handle, boundary_gap_offset, boundary_gap_len)
+        });
+
+        let tail_barrier = start_barrier.clone();
+        let tail_worker = thread::spawn(move || {
+            tail_barrier.wait();
+            read_exact_at(&second_handle, boundary_tail_offset, boundary_tail_len)
+        });
+
+        start_barrier.wait();
+        let gap_bytes = gap_worker
+            .join()
+            .expect("gap reader thread should join")
+            .expect("gap reader should succeed");
+        let tail_bytes = tail_worker
+            .join()
+            .expect("tail reader thread should join")
+            .expect("tail reader should succeed");
+
+        assert_eq!(
+            gap_bytes.as_slice(),
+            &payload[boundary_gap_offset as usize..boundary_gap_offset as usize + boundary_gap_len]
+        );
+        assert_eq!(
+            tail_bytes.as_slice(),
+            &payload
+                [boundary_tail_offset as usize..boundary_tail_offset as usize + boundary_tail_len]
+        );
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
     async fn run_cfapi_no_auto_hydration_after_restart_case(bind: &str, key: &str, payload: &[u8]) {
         let sync_root = fresh_data_dir("cfapi-no-auto-hydration-restart-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
@@ -1219,6 +1355,19 @@ mod tests {
             "\nlarge-hydration-tail"
         );
         run_cfapi_hydration_case("127.0.0.1:19093", "hydrate/large.bin", payload.as_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_placeholder_handles_concurrent_boundary_reads() {
+        let payload = (0..(2 * 1024 * 1024 + 17_000))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<u8>>();
+        run_cfapi_concurrent_boundary_read_case(
+            "127.0.0.1:19117",
+            "hydrate/concurrent-boundary.jpg",
+            &payload,
+        )
+        .await;
     }
 
     #[tokio::test]

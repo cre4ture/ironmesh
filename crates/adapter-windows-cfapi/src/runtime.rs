@@ -39,7 +39,7 @@ use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use walkdir::WalkDir;
 use widestring::U16String;
 use wincs::{
@@ -450,9 +450,35 @@ pub(crate) struct CallbackContext {
     hydrator: Box<dyn Hydrator>,
     hydrated_once_paths: Mutex<HashSet<String>>,
     paths_by_file_id: Mutex<HashMap<i64, String>>,
-    fetch_cancellations: Mutex<HashMap<i64, Arc<AtomicBool>>>,
+    fetch_cancellations: Mutex<HashMap<FetchCallbackIdentity, Arc<AtomicBool>>>,
+    fetch_execution_gate: FetchExecutionGate,
     upload_worker: Arc<UploadWorkerContext>,
     upload_debounce: Arc<UploadDebounceState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FetchCallbackIdentity {
+    request_identity: i64,
+    range_start: u64,
+    range_length: u64,
+}
+
+#[derive(Default)]
+struct FetchExecutionGate {
+    locks_by_file_id: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+}
+
+impl FetchExecutionGate {
+    fn lock_for_file_id(&self, file_id: i64) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .locks_by_file_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(file_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
 }
 
 pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRootIdentity> {
@@ -1261,6 +1287,7 @@ pub fn connect_sync_root(
         hydrated_once_paths: Mutex::new(HashSet::new()),
         paths_by_file_id: Mutex::new(HashMap::new()),
         fetch_cancellations: Mutex::new(HashMap::new()),
+        fetch_execution_gate: FetchExecutionGate::default(),
         upload_worker,
         upload_debounce,
     });
@@ -1285,6 +1312,18 @@ fn callback_request_identity(callback_info: &CF_CALLBACK_INFO) -> i64 {
         callback_info.TransferKey
     } else {
         callback_info.FileId
+    }
+}
+
+fn fetch_callback_identity(
+    callback_info: &CF_CALLBACK_INFO,
+    range_start: u64,
+    range_length: u64,
+) -> FetchCallbackIdentity {
+    FetchCallbackIdentity {
+        request_identity: callback_request_identity(callback_info),
+        range_start,
+        range_length,
     }
 }
 
@@ -1455,6 +1494,7 @@ pub(crate) fn handle_callback_fetch_data(
     let request_kind = describe_fetch_data_request_kind(fetch_data.flags);
     let process_info = callback_process_log_info(callback_info_ref);
     let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
+    let fetch_identity = fetch_callback_identity(callback_info_ref, range_start, range_length);
     let already_hydrated_once = context
         .hydrated_once_paths
         .lock()
@@ -1500,8 +1540,29 @@ pub(crate) fn handle_callback_fetch_data(
     );
     let cancel_flag = Arc::new(AtomicBool::new(false));
     if let Ok(mut fetch_cancellations) = context.fetch_cancellations.lock() {
-        fetch_cancellations.insert(request_identity, cancel_flag.clone());
+        fetch_cancellations.insert(fetch_identity, cancel_flag.clone());
     }
+
+    let fetch_execution_lock = context
+        .fetch_execution_gate
+        .lock_for_file_id(callback_info_ref.FileId);
+    let _fetch_execution_guard = match fetch_execution_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => {
+            tracing::debug!(
+                "cfapi fetch-data: waiting for same-file transfer slot request={} file_id={} path={} offset={} length={}",
+                request_identity,
+                callback_info_ref.FileId,
+                relative_path,
+                range_start,
+                range_length
+            );
+            fetch_execution_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
 
     let mut writer = CfapiTransferWriter::new(callback_info_ref, range_start);
     let mut progress_callback = |progress: HydrationProgress| {
@@ -1511,20 +1572,27 @@ pub(crate) fn handle_callback_fetch_data(
     };
     let should_cancel = || cancel_flag.load(Ordering::SeqCst);
 
-    let result = context.hydrator.hydrate_range_to_writer(
-        HydrationRequest {
-            path: &relative_path,
-            remote_version: &remote_version,
-            offset: range_start,
-            length: range_length,
-        },
-        &mut writer,
-        &mut progress_callback,
-        &should_cancel,
-    );
+    let result = if cancel_flag.load(Ordering::SeqCst) {
+        Err(anyhow!(
+            "hydration canceled before transfer start for {}",
+            relative_path
+        ))
+    } else {
+        context.hydrator.hydrate_range_to_writer(
+            HydrationRequest {
+                path: &relative_path,
+                remote_version: &remote_version,
+                offset: range_start,
+                length: range_length,
+            },
+            &mut writer,
+            &mut progress_callback,
+            &should_cancel,
+        )
+    };
 
     if let Ok(mut fetch_cancellations) = context.fetch_cancellations.lock() {
-        fetch_cancellations.remove(&request_identity);
+        fetch_cancellations.remove(&fetch_identity);
     }
 
     match result {
@@ -1628,8 +1696,13 @@ pub(crate) fn handle_callback_cancel_fetch_data(
     cancel: CancelFetchDataCallbackParams,
 ) {
     let request_identity = callback_request_identity(callback_info_ref);
+    let fetch_identity = FetchCallbackIdentity {
+        request_identity,
+        range_start: cancel.file_offset.max(0) as u64,
+        range_length: cancel.length.max(0) as u64,
+    };
     if let Ok(fetch_cancellations) = context.fetch_cancellations.lock()
-        && let Some(cancel_flag) = fetch_cancellations.get(&request_identity)
+        && let Some(cancel_flag) = fetch_cancellations.get(&fetch_identity)
     {
         cancel_flag.store(true, Ordering::SeqCst);
     }
@@ -1637,7 +1710,8 @@ pub(crate) fn handle_callback_cancel_fetch_data(
     let relative_path = resolve_relative_path_from_callback(callback_info_ref, context)
         .unwrap_or_else(|| String::from("<unknown>"));
     tracing::info!(
-        "cfapi cancel-fetch-data: path={} offset={} length={}",
+        "cfapi cancel-fetch-data: request={} path={} offset={} length={}",
+        request_identity,
         relative_path,
         cancel.file_offset,
         cancel.length
@@ -1948,7 +2022,10 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::mem::size_of;
     use std::ptr::null;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+    use std::time::Duration;
     use windows_sys::Win32::Storage::CloudFilters::CF_PROCESS_INFO;
 
     #[test]
@@ -2169,6 +2246,7 @@ mod tests {
             hydrated_once_paths: Mutex::new(HashSet::new()),
             paths_by_file_id: Mutex::new(HashMap::new()),
             fetch_cancellations: Mutex::new(HashMap::new()),
+            fetch_execution_gate: FetchExecutionGate::default(),
             upload_worker: Arc::new(UploadWorkerContext {
                 sync_root: sync_root.clone(),
                 provider_instance_id: uuid::Uuid::new_v4(),
@@ -2223,5 +2301,60 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn fetch_callback_identity_distinguishes_subranges_with_same_request() {
+        let callback_info = CF_CALLBACK_INFO {
+            StructSize: size_of::<CF_CALLBACK_INFO>() as u32,
+            RequestKey: 77,
+            TransferKey: 77,
+            FileId: 11,
+            ..Default::default()
+        };
+
+        let first = fetch_callback_identity(&callback_info, 65536, 4096);
+        let second = fetch_callback_identity(&callback_info, 69632, 61440);
+
+        assert_ne!(first, second);
+        assert_eq!(first.request_identity, second.request_identity);
+    }
+
+    #[test]
+    fn fetch_execution_gate_serializes_same_file_callbacks() {
+        let gate = Arc::new(FetchExecutionGate::default());
+        let ready = Arc::new(Barrier::new(3));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let gate = gate.clone();
+            let ready = ready.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            handles.push(thread::spawn(move || {
+                let file_lock = gate.lock_for_file_id(42);
+                ready.wait();
+                let _guard = file_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now_active, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(40));
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+
+        ready.wait();
+        for handle in handles {
+            handle.join().expect("worker should complete");
+        }
+
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "same-file fetch callbacks should not overlap"
+        );
     }
 }
