@@ -26,7 +26,7 @@ pub struct SyncRootIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredSyncRootContext {
-    pub windows_sync_root_id: String,
+    pub provider_name: String,
     pub identity: SyncRootIdentity,
 }
 
@@ -140,7 +140,7 @@ pub fn load_registered_sync_root_context(
     };
 
     Ok(Some(RegisteredSyncRootContext {
-        windows_sync_root_id: provider_name,
+        provider_name,
         identity: SyncRootIdentity::decode(&identity_bytes).with_context(|| {
             format!(
                 "failed to decode sync root identity for {}",

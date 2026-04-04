@@ -749,7 +749,7 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
         Ok(Some(existing)) => {
             tracing::info!(
                 "sync-root registration: confirmed Windows registration id={} provider_instance_id={}",
-                existing.windows_sync_root_id,
+                existing.provider_name,
                 existing.identity.provider_instance_id
             );
         }
