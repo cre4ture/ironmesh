@@ -16,6 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
@@ -70,6 +71,24 @@ fn header_value_for_log(headers: &HeaderMap, name: &str) -> String {
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string)
         .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .thread_name("ironmesh-client-blocking")
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(runtime) => Ok(runtime),
+        Err(error) => Err(anyhow!(
+            "failed to initialize shared blocking runtime: {error}"
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -796,10 +815,7 @@ impl IronMeshClient {
         key: impl AsRef<str>,
     ) -> Result<Option<VersionGraphSummary>> {
         let key = key.as_ref().to_string();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for versions request")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.list_versions(key))
     }
 
@@ -868,10 +884,7 @@ impl IronMeshClient {
         snapshot: Option<&str>,
         view: Option<StoreIndexView>,
     ) -> Result<StoreIndexResponse> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for store index request")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.store_index_with_view(prefix, depth, snapshot, view))
     }
 
@@ -904,10 +917,7 @@ impl IronMeshClient {
         since: u64,
         timeout_ms: u64,
     ) -> Result<StoreIndexChangeWaitResponse> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for store index change wait request")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.wait_for_store_index_change(since, timeout_ms))
     }
 
@@ -926,10 +936,7 @@ impl IronMeshClient {
 
     pub fn get_json_path_blocking(&self, path: &str) -> Result<serde_json::Value> {
         let path = path.to_string();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for JSON path request")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.get_json_path(&path))
     }
 
@@ -1452,10 +1459,7 @@ impl IronMeshClient {
             return self.put_large_aware_reader(key, &mut file, source_size_bytes);
         }
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for resumable upload")?;
+        let runtime = blocking_runtime()?;
 
         let persisted = load_json_file::<ResumableUploadFileState>(state_path)?.filter(|state| {
             state.key == key
@@ -1563,10 +1567,7 @@ impl IronMeshClient {
         total_size_bytes: u64,
     ) -> Result<UploadResult> {
         let key = key.into();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for upload")?;
+        let runtime = blocking_runtime()?;
         let session = runtime.block_on(self.start_upload_session(&key, total_size_bytes))?;
         let mut buffer = vec![0_u8; session.chunk_size_bytes];
 
@@ -1618,10 +1619,7 @@ impl IronMeshClient {
         let snapshot_owned = snapshot.map(ToString::to_string);
         let version_owned = version.map(ToString::to_string);
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for resumable download")?;
+        let runtime = blocking_runtime()?;
         let head = runtime.block_on(self.head_object_response(
             key,
             snapshot_owned.as_deref(),
@@ -1825,20 +1823,14 @@ impl IronMeshClient {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<SyncSnapshot> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for snapshot load")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.load_snapshot_from_server(prefix, depth, snapshot))
     }
 
     pub fn delete_path_blocking(&self, key: impl AsRef<str>) -> Result<()> {
         let key = key.as_ref().to_string();
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for delete request")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.delete_path(key))
     }
 
@@ -1851,10 +1843,7 @@ impl IronMeshClient {
         let from_path = from_path.into();
         let to_path = to_path.into();
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for rename request")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.rename_path(from_path, to_path, overwrite))
     }
 
@@ -1904,10 +1893,7 @@ impl IronMeshClient {
             std::io::Read::read_to_end(&mut limited, &mut buf)
                 .with_context(|| format!("failed reading payload for key={key}"))?;
 
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to create runtime for upload")?;
+            let runtime = blocking_runtime()?;
             return runtime.block_on(async {
                 let meta = self.put(key, Bytes::from(buf)).await?;
                 Ok(UploadResult {
@@ -1932,10 +1918,7 @@ impl IronMeshClient {
         writer: &mut dyn Write,
     ) -> Result<()> {
         let key = key.as_ref();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for download")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.download_with_range_requests(key, snapshot, version, writer))
     }
 
@@ -1949,10 +1932,7 @@ impl IronMeshClient {
         let key_owned = request.key.to_string();
         let snapshot_owned = request.snapshot.map(ToString::to_string);
         let version_owned = request.version.map(ToString::to_string);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for ranged download")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.download_range_to_writer_with_progress(
             DownloadRangeRequest {
                 key: key_owned.as_str(),
@@ -2007,10 +1987,7 @@ impl IronMeshClient {
         let key = key.as_ref().to_string();
         let snapshot = snapshot.map(|value| value.to_string());
         let version = version.map(|value| value.to_string());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for object head request")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.head_object(&key, snapshot.as_deref(), version.as_deref()))
     }
 
@@ -2024,10 +2001,7 @@ impl IronMeshClient {
         let snapshot = snapshot.map(|value| value.to_string());
         let version = version.map(|value| value.to_string());
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create runtime for object size request")?;
+        let runtime = blocking_runtime()?;
         runtime.block_on(self.get_object_size(&key, snapshot.as_deref(), version.as_deref()))
     }
 
@@ -2649,8 +2623,14 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::State, routing::post};
-    use std::sync::Arc;
+    use axum::{
+        Json, Router,
+        body::Body,
+        extract::{Path as AxumPath, State},
+        http::{Response, header},
+        routing::{get, post},
+    };
+    use std::sync::{Arc, Barrier};
     use tokio::sync::Mutex;
     use transport_sdk::{
         RelayTicket, RelayTicketRequest, RendezvousClientConfig, RendezvousControlClient,
@@ -3175,5 +3155,174 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn blocking_range_download_handles_concurrent_overlapping_requests() {
+        fn build_range_response(
+            payload: &[u8],
+            status: StatusCode,
+            start: usize,
+            end_inclusive: usize,
+        ) -> Response<Body> {
+            Response::builder()
+                .status(status)
+                .header("x-ironmesh-object-size", payload.len().to_string())
+                .header(ETAG.as_str(), "\"test-etag\"")
+                .header(ACCEPT_RANGES.as_str(), "bytes")
+                .header(
+                    CONTENT_LENGTH.as_str(),
+                    (end_inclusive - start + 1).to_string(),
+                )
+                .header(
+                    CONTENT_RANGE.as_str(),
+                    format!("bytes {start}-{end_inclusive}/{}", payload.len()),
+                )
+                .body(Body::from(payload[start..=end_inclusive].to_vec()))
+                .expect("range response should build")
+        }
+
+        fn parse_range_header(range: &str, total_len: usize) -> (usize, usize) {
+            let trimmed = range
+                .strip_prefix("bytes=")
+                .expect("range header should have bytes= prefix");
+            let (start, end) = trimmed
+                .split_once('-')
+                .expect("range header should contain dash");
+            let start = start.parse::<usize>().expect("range start should parse");
+            let end = end.parse::<usize>().expect("range end should parse");
+            assert!(start <= end, "range start must not exceed end");
+            assert!(end < total_len, "range end must stay within payload");
+            (start, end)
+        }
+
+        async fn head_store(
+            State(payload): State<Arc<Vec<u8>>>,
+            AxumPath(_key): AxumPath<String>,
+        ) -> Response<Body> {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("x-ironmesh-object-size", payload.len().to_string())
+                .header(ETAG.as_str(), "\"test-etag\"")
+                .header(ACCEPT_RANGES.as_str(), "bytes")
+                .header(CONTENT_LENGTH.as_str(), payload.len().to_string())
+                .body(Body::empty())
+                .expect("head response should build")
+        }
+
+        async fn get_store(
+            State(payload): State<Arc<Vec<u8>>>,
+            AxumPath(_key): AxumPath<String>,
+            headers: HeaderMap,
+        ) -> Response<Body> {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            match headers.get(RANGE).and_then(|value| value.to_str().ok()) {
+                Some(range) => {
+                    let (start, end_inclusive) = parse_range_header(range, payload.len());
+                    build_range_response(
+                        &payload,
+                        StatusCode::PARTIAL_CONTENT,
+                        start,
+                        end_inclusive,
+                    )
+                }
+                None => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("x-ironmesh-object-size", payload.len().to_string())
+                    .header(ETAG.as_str(), "\"test-etag\"")
+                    .header(ACCEPT_RANGES.as_str(), "bytes")
+                    .header(header::CONTENT_LENGTH, payload.len().to_string())
+                    .body(Body::from(payload.as_ref().clone()))
+                    .expect("full response should build"),
+            }
+        }
+
+        let payload = Arc::new(
+            (0..200_000)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+
+        let app = Router::new()
+            .route("/store/{*key}", get(get_store).head(head_store))
+            .with_state(payload.clone());
+        let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime should build");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener should bind");
+                addr_tx
+                    .send(listener.local_addr().expect("listener should have addr"))
+                    .expect("server addr should send");
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .expect("range server should run");
+            });
+        });
+
+        let addr = addr_rx.recv().expect("server addr should arrive");
+        let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
+        let requests = [
+            (0_u64, 65_536_u64),
+            (65_536_u64, 4_096_u64),
+            (69_632_u64, 61_440_u64),
+            (131_072_u64, payload.len() as u64 - 131_072_u64),
+        ];
+
+        for _round in 0..8 {
+            let barrier = Arc::new(Barrier::new(requests.len()));
+            let mut handles = Vec::new();
+            for (start, length) in requests {
+                let client = client.clone();
+                let barrier = barrier.clone();
+                let expected = payload[start as usize..(start + length) as usize].to_vec();
+                handles.push(std::thread::spawn(move || {
+                    let mut writer = Vec::new();
+                    let mut progress_updates = Vec::new();
+                    barrier.wait();
+                    let result = client
+                        .download_range_to_writer_with_progress_blocking(
+                            DownloadRangeRequest {
+                                key: "photos/test.jpg",
+                                snapshot: None,
+                                version: None,
+                                start,
+                                length,
+                            },
+                            &mut writer,
+                            &mut |progress| progress_updates.push(progress),
+                            &|| false,
+                        )
+                        .expect("blocking ranged download should succeed");
+                    assert_eq!(writer, expected);
+                    assert_eq!(result.range_start, start);
+                    assert_eq!(result.range_length, length);
+                    assert_eq!(result.bytes_downloaded, length);
+                    assert!(
+                        progress_updates
+                            .last()
+                            .is_some_and(|progress| progress.bytes_downloaded == length),
+                        "final progress update should report the completed byte count",
+                    );
+                }));
+            }
+
+            for handle in handles {
+                handle.join().expect("download worker should complete");
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().expect("server thread should stop");
     }
 }
