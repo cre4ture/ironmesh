@@ -139,7 +139,7 @@ pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<Placehol
         }
     }
 
-    let schema_version = schema_version.unwrap_or(PlaceholderFileIdentity::SCHEMA_VERSION);
+    let schema_version = schema_version?;
     if schema_version != PlaceholderFileIdentity::SCHEMA_VERSION {
         return None;
     }
