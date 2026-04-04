@@ -4,7 +4,7 @@ use crate::runtime::{
     handle_callback_file_close_completion, handle_callback_file_open,
     handle_callback_notify_dehydrate, handle_callback_notify_dehydrate_completion,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use core::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::io::AsRawHandle;
@@ -74,17 +74,6 @@ impl Drop for ProtectedCfHandle {
     }
 }
 
-fn hresult_zero_to_result(hr: i32, operation: &str) -> Result<()> {
-    if hr == 0 {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "{} failed with HRESULT 0x{:08x}",
-            operation,
-            hr as u32
-        ))
-    }
-}
 
 pub(crate) fn empty_fs_metadata() -> CF_FS_METADATA {
     unsafe { std::mem::zeroed() }
@@ -112,7 +101,7 @@ pub(crate) fn create_placeholders(
                 .unwrap_or(null_mut()),
         )
     };
-    hresult_zero_to_result(hr, operation)
+    hresult_nonneg(hr, operation)
 }
 
 pub(crate) fn connect_sync_root(
@@ -161,7 +150,7 @@ pub(crate) fn connect_sync_root(
             &mut connection_key,
         )
     };
-    hresult_zero_to_result(hr, "CfConnectSyncRoot")?;
+    hresult_nonneg(hr, "CfConnectSyncRoot")?;
 
     Ok((connection_key, callback_table))
 }
@@ -203,7 +192,7 @@ pub(crate) fn execute_ack_dehydrate(
     };
 
     let hr = unsafe { CfExecute(&op_info, &mut op_params) };
-    hresult_zero_to_result(hr, "CfExecute(AckDehydrate)")
+    hresult_nonneg(hr, "CfExecute(AckDehydrate)")
 }
 
 pub(crate) fn execute_transfer_data_chunk(
@@ -241,7 +230,7 @@ pub(crate) fn execute_transfer_data_chunk(
     };
 
     let hr = unsafe { CfExecute(&op_info, &mut op_params) };
-    hresult_zero_to_result(hr, "CfExecute")
+    hresult_nonneg(hr, "CfExecute")
 }
 
 pub(crate) fn execute_transfer_data_failure(
@@ -276,7 +265,7 @@ pub(crate) fn execute_transfer_data_failure(
     };
 
     let hr = unsafe { CfExecute(&op_info, &mut op_params) };
-    hresult_zero_to_result(hr, "CfExecute(TransferDataFailure)")
+    hresult_nonneg(hr, "CfExecute(TransferDataFailure)")
 }
 
 pub(crate) fn string_from_pcwstr(value: windows_sys::core::PCWSTR) -> String {
