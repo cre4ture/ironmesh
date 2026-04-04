@@ -39,7 +39,8 @@ use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 use widestring::U16String;
 use wincs::{
@@ -286,6 +287,12 @@ fn path_is_cold_in_sync_placeholder(path: &Path) -> bool {
         && info.OnDiskDataSize == 0
 }
 
+fn path_hydrated_frontier(path: &Path) -> Option<u64> {
+    let file = open_sync_path(path, false).ok()?;
+    let info = cf_get_placeholder_standard_info(&file).ok()?;
+    Some(info.OnDiskDataSize.max(info.ValidatedDataSize).max(0) as u64)
+}
+
 fn path_placeholder_identity_missing(path: &Path) -> bool {
     let file = match open_sync_path(path, false) {
         Ok(file) => file,
@@ -483,21 +490,179 @@ struct FetchCallbackIdentity {
     range_length: u64,
 }
 
+const FETCH_OUT_OF_ORDER_GRACE: Duration = Duration::from_millis(20);
+
 #[derive(Default)]
 struct FetchExecutionGate {
-    locks_by_file_id: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    schedulers_by_file_id: Mutex<HashMap<i64, Arc<FetchExecutionScheduler>>>,
 }
 
 impl FetchExecutionGate {
-    fn lock_for_file_id(&self, file_id: i64) -> Arc<Mutex<()>> {
-        let mut locks = self
-            .locks_by_file_id
+    fn scheduler_for_file_id(&self, file_id: i64) -> Arc<FetchExecutionScheduler> {
+        let mut schedulers = self
+            .schedulers_by_file_id
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        locks
+        schedulers
             .entry(file_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(FetchExecutionScheduler::default()))
             .clone()
+    }
+
+    fn acquire_for_file_range<F>(
+        &self,
+        file_id: i64,
+        range_start: u64,
+        frontier_provider: F,
+    ) -> FetchExecutionPermit
+    where
+        F: Fn() -> Option<u64>,
+    {
+        self.scheduler_for_file_id(file_id)
+            .acquire(range_start, frontier_provider)
+    }
+}
+
+#[derive(Default)]
+struct FetchExecutionScheduler {
+    state: Mutex<FetchExecutionSchedulerState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct FetchExecutionSchedulerState {
+    next_ticket: u64,
+    active_ticket: Option<u64>,
+    pending: BTreeMap<u64, PendingFetchExecution>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingFetchExecution {
+    range_start: u64,
+    registered_at: Instant,
+}
+
+struct FetchExecutionPermit {
+    scheduler: Arc<FetchExecutionScheduler>,
+    ticket: u64,
+}
+
+impl Drop for FetchExecutionPermit {
+    fn drop(&mut self) {
+        self.scheduler.release(self.ticket);
+    }
+}
+
+impl FetchExecutionScheduler {
+    fn acquire<F>(self: Arc<Self>, range_start: u64, frontier_provider: F) -> FetchExecutionPermit
+    where
+        F: Fn() -> Option<u64>,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.saturating_add(1);
+        state.pending.insert(
+            ticket,
+            PendingFetchExecution {
+                range_start,
+                registered_at: Instant::now(),
+            },
+        );
+        self.wake.notify_all();
+
+        loop {
+            let now = Instant::now();
+            let frontier = frontier_provider();
+            if state.active_ticket.is_none()
+                && Self::next_runnable_ticket(&state, frontier, now) == Some(ticket)
+            {
+                state.active_ticket = Some(ticket);
+                return FetchExecutionPermit {
+                    scheduler: self.clone(),
+                    ticket,
+                };
+            }
+
+            if let Some(wait_for) = Self::next_wait_duration(&state, frontier, now) {
+                let waited = self
+                    .wake
+                    .wait_timeout(state, wait_for)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = waited.0;
+            } else {
+                state = self
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+    }
+
+    fn release(&self, ticket: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active_ticket == Some(ticket) {
+            state.active_ticket = None;
+        }
+        state.pending.remove(&ticket);
+        self.wake.notify_all();
+    }
+
+    fn next_runnable_ticket(
+        state: &FetchExecutionSchedulerState,
+        frontier: Option<u64>,
+        now: Instant,
+    ) -> Option<u64> {
+        if let Some(frontier) = frontier {
+            let eligible_at_frontier = state
+                .pending
+                .iter()
+                .filter(|(_, pending)| pending.range_start <= frontier)
+                .min_by_key(|(ticket, pending)| (pending.range_start, **ticket))
+                .map(|(ticket, _)| *ticket);
+            if eligible_at_frontier.is_some() {
+                return eligible_at_frontier;
+            }
+
+            return state
+                .pending
+                .iter()
+                .filter(|(_, pending)| {
+                    now.duration_since(pending.registered_at) >= FETCH_OUT_OF_ORDER_GRACE
+                })
+                .min_by_key(|(ticket, pending)| (pending.range_start, **ticket))
+                .map(|(ticket, _)| *ticket);
+        }
+
+        state
+            .pending
+            .iter()
+            .min_by_key(|(ticket, pending)| (pending.range_start, **ticket))
+            .map(|(ticket, _)| *ticket)
+    }
+
+    fn next_wait_duration(
+        state: &FetchExecutionSchedulerState,
+        frontier: Option<u64>,
+        now: Instant,
+    ) -> Option<Duration> {
+        if frontier.is_none() {
+            return None;
+        }
+
+        state
+            .pending
+            .values()
+            .filter_map(|pending| {
+                let deadline = pending.registered_at + FETCH_OUT_OF_ORDER_GRACE;
+                (deadline > now).then_some(deadline.duration_since(now))
+            })
+            .min()
     }
 }
 
@@ -1581,26 +1746,11 @@ pub(crate) fn handle_callback_fetch_data(
         fetch_cancellations.insert(fetch_identity, cancel_flag.clone());
     }
 
-    let fetch_execution_lock = context
-        .fetch_execution_gate
-        .lock_for_file_id(callback_info_ref.FileId);
-    let _fetch_execution_guard = match fetch_execution_lock.try_lock() {
-        Ok(guard) => guard,
-        Err(TryLockError::WouldBlock) => {
-            tracing::debug!(
-                "cfapi fetch-data: waiting for same-file transfer slot request={} file_id={} path={} offset={} length={}",
-                request_identity,
-                callback_info_ref.FileId,
-                relative_path,
-                range_start,
-                range_length
-            );
-            fetch_execution_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
-        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-    };
+    let _fetch_execution_guard = context.fetch_execution_gate.acquire_for_file_range(
+        callback_info_ref.FileId,
+        range_start,
+        || path_hydrated_frontier(&full_path),
+    );
 
     let mut writer = CfapiTransferWriter::new(callback_info_ref, range_start);
     let mut progress_callback = |progress: HydrationProgress| {
@@ -2060,7 +2210,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::mem::size_of;
     use std::ptr::null;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -2372,11 +2522,8 @@ mod tests {
             let active = active.clone();
             let max_active = max_active.clone();
             handles.push(thread::spawn(move || {
-                let file_lock = gate.lock_for_file_id(42);
                 ready.wait();
-                let _guard = file_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _guard = gate.acquire_for_file_range(42, 0, || None);
                 let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(now_active, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(40));
@@ -2393,6 +2540,76 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "same-file fetch callbacks should not overlap"
+        );
+    }
+
+    #[test]
+    fn fetch_execution_gate_prefers_hydration_frontier_before_later_offset() {
+        let gate = Arc::new(FetchExecutionGate::default());
+        let frontier = Arc::new(AtomicU64::new(262_144));
+        let execution_order = Arc::new(Mutex::new(Vec::new()));
+
+        let later_gate = gate.clone();
+        let later_frontier = frontier.clone();
+        let later_order = execution_order.clone();
+        let later = thread::spawn(move || {
+            let _guard = later_gate.acquire_for_file_range(42, 266_240, || {
+                Some(later_frontier.load(Ordering::SeqCst))
+            });
+            later_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("later");
+            later_frontier.store(327_680, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(5));
+
+        let earlier_gate = gate.clone();
+        let earlier_frontier = frontier.clone();
+        let earlier_order = execution_order.clone();
+        let earlier = thread::spawn(move || {
+            let _guard = earlier_gate.acquire_for_file_range(42, 262_144, || {
+                Some(earlier_frontier.load(Ordering::SeqCst))
+            });
+            earlier_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("earlier");
+            earlier_frontier.store(266_240, Ordering::SeqCst);
+        });
+
+        earlier.join().expect("earlier worker should complete");
+        later.join().expect("later worker should complete");
+
+        assert_eq!(
+            execution_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            ["earlier", "later"],
+            "later offset should wait for the current hydration frontier"
+        );
+    }
+
+    #[test]
+    fn fetch_execution_gate_allows_random_access_after_grace_period() {
+        let gate = FetchExecutionGate::default();
+        let frontier = Arc::new(AtomicU64::new(0));
+        let started = Instant::now();
+        let _guard = gate.acquire_for_file_range(42, 262_144, || {
+            Some(frontier.load(Ordering::SeqCst))
+        });
+        let waited = started.elapsed();
+        assert!(
+            waited >= FETCH_OUT_OF_ORDER_GRACE,
+            "later offset should wait briefly for a lower frontier request (waited {:?})",
+            waited
+        );
+        assert!(
+            waited < Duration::from_secs(1),
+            "later offset should not deadlock when no lower frontier request arrives (waited {:?})",
+            waited
         );
     }
 }
