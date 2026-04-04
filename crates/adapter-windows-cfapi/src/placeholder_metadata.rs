@@ -4,7 +4,7 @@ use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity,
     cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_with_oplock,
-    open_sync_path,
+    open_sync_path, path_is_placeholder,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::content_fingerprint::file_content_fingerprint;
@@ -250,12 +250,24 @@ fn mutate_placeholder_identity_for_path(
             .unwrap_or_else(|| PlaceholderFileIdentity::new(relative_path)),
         Err(_) => PlaceholderFileIdentity::new(relative_path),
     };
+    let original_identity = identity.clone();
     mutator(&mut identity);
+    if identity == original_identity {
+        return Ok(());
+    }
     let encoded = encode_placeholder_file_identity_metadata(&identity);
 
     match cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded) {
         Ok(()) => Ok(()),
-        Err(_) => {
+        Err(oplock_err) => {
+            if path_is_placeholder(&full_path) {
+                return Err(oplock_err).with_context(|| {
+                    format!(
+                        "refusing to reopen existing placeholder {} with generic write access after oplock metadata update failed",
+                        full_path.display()
+                    )
+                });
+            }
             let writable_file = open_sync_path(&full_path, true).with_context(|| {
                 format!(
                     "failed to reopen {} for placeholder metadata update fallback",

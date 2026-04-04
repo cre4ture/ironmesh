@@ -1232,6 +1232,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cfapi_large_placeholder_does_not_auto_hydrate_on_initial_register() {
+        let payload = format!(
+            "{}{}",
+            "L".repeat(2 * 1024 * 1024),
+            "\nlarge-no-auto-hydration-tail"
+        );
+        run_cfapi_no_auto_hydration_on_initial_register_case(
+            "127.0.0.1:19115",
+            "hydrate/no-auto-hydrate-large.bin",
+            payload.as_bytes(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_cfapi_placeholder_pin_hydrates_from_remote_large() {
         let payload = format!("{}{}", "P".repeat(3 * 1024 * 1024), "\npin-hydration-tail");
         run_cfapi_pin_hydration_case(
@@ -1253,6 +1268,16 @@ mod tests {
             "127.0.0.1:19114",
             "hydrate/no-auto-hydrate-after-restart.bin",
             payload.as_bytes(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_small_placeholder_does_not_auto_hydrate_after_provider_restart() {
+        run_cfapi_no_auto_hydration_after_restart_case(
+            "127.0.0.1:19116",
+            "hydrate/no-auto-hydrate-after-restart-small.txt",
+            b"small restart payload should stay dehydrated until accessed",
         )
         .await;
     }
