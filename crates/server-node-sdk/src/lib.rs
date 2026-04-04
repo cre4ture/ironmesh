@@ -86,6 +86,7 @@ mod replication;
 mod setup;
 mod storage;
 mod ui;
+mod web_maps;
 
 const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -137,6 +138,9 @@ struct ServerState {
     cluster_id: ClusterId,
     node_id: NodeId,
     local_edge_mode: bool,
+    map_perf_logging_enabled: bool,
+    map_glyphs_root: Option<PathBuf>,
+    mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
     store: Arc<TracedRwLock<PersistentStore>>,
     upload_chunk_ingestor: ChunkIngestor,
     cluster: Arc<Mutex<ClusterService>>,
@@ -1385,6 +1389,18 @@ fn tls_metadata_sidecar_path(cert_path: &std::path::Path) -> PathBuf {
 fn existing_tls_metadata_sidecar_path(cert_path: &std::path::Path) -> Option<PathBuf> {
     let path = tls_metadata_sidecar_path(cert_path);
     path.exists().then_some(path)
+}
+
+fn env_flag_is_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn write_tls_material_metadata_sidecar(
@@ -3357,11 +3373,19 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         load_upload_sessions_phase_started_at,
     );
 
+    let map_perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
+    if map_perf_logging_enabled {
+        info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
+    }
+
     let state = ServerState {
         data_dir: config.data_dir.clone(),
         cluster_id: config.cluster_id,
         node_id: config.node_id,
         local_edge_mode: config.mode == ServerNodeMode::LocalEdge,
+        map_perf_logging_enabled,
+        map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
+        mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         store,
         upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(cluster)),
@@ -3688,6 +3712,23 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/ui/app.js", get(ui::app_js))
         .route("/logs", get(ui::list_logs))
         .route("/health", get(health))
+        .route(
+            "/api/maps/mbtiles-metadata",
+            get(web_maps::mbtiles_metadata),
+        )
+        .route(
+            "/api/maps/logical-file",
+            get(web_maps::logical_file).head(web_maps::logical_file),
+        )
+        .route("/api/maps/tiles/{z}/{x}/{y}", get(web_maps::xyz_tile))
+        .route(
+            "/api/maps/vector-tiles/{z}/{x}/{y}",
+            get(web_maps::vector_tile),
+        )
+        .route(
+            "/api/maps/fonts/{fontstack}/{range}",
+            get(web_maps::font_range),
+        )
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))

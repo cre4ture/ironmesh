@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { gzipSync } from "node:zlib";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
 test("server-admin runtime smoke flow renders and navigates", async ({ page }) => {
@@ -9,15 +11,14 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
   await expect(page.getByText(/UI build:\s*0\.1\.0 \(/)).toBeVisible();
   await expect(page.getByText("Backend build: 0.1.0 (v0.1.0-5-gmocked)")).toBeVisible();
-  await expect(page.getByRole("cell", { name: "node-alpha", exact: true })).toBeVisible();
+  await expect(page.getByText("0 discovered")).toBeVisible();
   await expect(page.getByText("runtime ready")).toBeVisible();
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
   await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
-  await expect(page.locator("td").filter({ hasText: /logical/ }).first()).toBeVisible();
-  await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
+  await expect(page.getByText("Snapshot logical size:")).toBeVisible();
   await expect(page.getByText("Sign in or provide an admin token override to inspect the live rendezvous registration details here.")).toBeVisible();
 
   await page.getByRole("button", { name: "Admin Access" }).click();
@@ -25,6 +26,8 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
+  await expect(page.getByRole("cell", { name: "node-alpha", exact: true })).toBeVisible();
+  await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
   await expect(
     page
       .getByRole("paragraph")
@@ -63,15 +66,19 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
 
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
-  await expect(page.getByText("2 images", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 photos", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Map" }).click();
+  await expect(
+    page.getByText("Using MapTiler Satellite 2017-11-02 Planet from your self-hosted basemap dataset.")
+  ).toBeVisible();
+  await expect(page.getByText("Self-hosted basemap unavailable")).toHaveCount(0);
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("2 markers")).toBeVisible();
   await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByText("Loading original image")).toBeVisible();
   await expect(page.getByText("Loading original image")).toHaveCount(0);
-  await page.getByRole("button", { name: "Next image" }).click();
+  await page.getByRole("button", { name: "Next item" }).click();
   await expect(page.getByRole("dialog").getByText("gallery/dog.jpg", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
@@ -206,6 +213,9 @@ async function installServerAdminMocks(
   }
 ) {
   const imageBody = tinyPngBuffer();
+  const logicalMapBody = readFileSync("tests/fixtures/smoke.mbtiles");
+  const emptyVectorTileBody = gzipSync(Buffer.alloc(0));
+  const glyphRangeBody = Buffer.alloc(0);
   let authenticated = false;
   const revokedDeviceIds = new Set<string>();
   const bootstrapBundle = {
@@ -359,6 +369,106 @@ async function installServerAdminMocks(
         status: 200,
         contentType: "image/png",
         body: imageBody
+      });
+      return;
+    }
+
+    if (pathname === "/api/maps/logical-file") {
+      const rangeHeader = route.request().headers().range;
+      const commonHeaders = {
+        "accept-ranges": "bytes",
+        "content-type": "application/octet-stream",
+        etag: "\"server-admin-smoke-mbtiles\""
+      };
+
+      if (method === "HEAD") {
+        await route.fulfill({
+          status: 200,
+          headers: {
+            ...commonHeaders,
+            "content-length": String(logicalMapBody.length)
+          }
+        });
+        return;
+      }
+
+      if (method === "GET") {
+        if (!rangeHeader) {
+          await route.fulfill({
+            status: 200,
+            headers: {
+              ...commonHeaders,
+              "content-length": String(logicalMapBody.length)
+            },
+            body: logicalMapBody
+          });
+          return;
+        }
+
+        const match = /^bytes=(\d+)-(\d+)?$/i.exec(rangeHeader);
+        expect(match).not.toBeNull();
+        const start = Number(match?.[1] ?? "0");
+        const inclusiveEnd = Math.min(
+          Number(match?.[2] ?? String(logicalMapBody.length - 1)),
+          logicalMapBody.length - 1
+        );
+        const sliced = logicalMapBody.subarray(start, inclusiveEnd + 1);
+        await route.fulfill({
+          status: 206,
+          headers: {
+            ...commonHeaders,
+            "content-length": String(sliced.length),
+            "content-range": `bytes ${start}-${inclusiveEnd}/${logicalMapBody.length}`
+          },
+          body: sliced
+        });
+        return;
+      }
+    }
+
+    if (pathname === "/api/maps/mbtiles-metadata" && method === "GET") {
+      return json(route, {
+        attribution: "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors.",
+        center: [0, 20, 1],
+        format: "png",
+        minzoom: 0,
+        maxzoom: 2
+      });
+    }
+
+    if (pathname.startsWith("/api/maps/tiles/") && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "cache-control": "public, max-age=3600"
+        },
+        body: imageBody
+      });
+      return;
+    }
+
+    if (pathname.startsWith("/api/maps/vector-tiles/") && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "application/vnd.mapbox-vector-tile",
+          "content-encoding": "gzip",
+          "cache-control": "public, max-age=3600"
+        },
+        body: emptyVectorTileBody
+      });
+      return;
+    }
+
+    if (pathname.startsWith("/api/maps/fonts/") && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "application/x-protobuf",
+          "cache-control": "public, max-age=3600"
+        },
+        body: glyphRangeBody
       });
       return;
     }
