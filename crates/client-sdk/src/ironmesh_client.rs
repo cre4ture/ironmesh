@@ -30,6 +30,18 @@ const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 const DOWNLOAD_SEGMENT_SIZE_BYTES: usize = 1024 * 1024;
 const STAGED_DOWNLOAD_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestedRange {
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl std::fmt::Display for RequestedRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "@{}+{}", self.offset, self.length)
+    }
+}
+
 #[derive(Clone)]
 pub struct IronMeshClient {
     transport: ClientTransport,
@@ -151,16 +163,14 @@ pub struct ObjectHeadInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadProgress {
     pub object_size_bytes: u64,
-    pub range_start: u64,
-    pub range_length: u64,
+    pub range: RequestedRange,
     pub bytes_downloaded: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadRangeResult {
     pub object_size_bytes: u64,
-    pub range_start: u64,
-    pub range_length: u64,
+    pub range: RequestedRange,
     pub bytes_downloaded: u64,
 }
 
@@ -169,8 +179,7 @@ pub struct DownloadRangeRequest<'a> {
     pub key: &'a str,
     pub snapshot: Option<&'a str>,
     pub version: Option<&'a str>,
-    pub start: u64,
-    pub length: u64,
+    pub range: RequestedRange,
 }
 
 #[derive(Debug, Serialize)]
@@ -1296,16 +1305,15 @@ impl IronMeshClient {
             format!("download canceled for key={key}"),
         )
         .await?;
-        let range_start = request.start.min(head.total_size_bytes);
+        let range_start = request.range.offset.min(head.total_size_bytes);
         let range_end_exclusive = range_start
-            .saturating_add(request.length)
+            .saturating_add(request.range.length)
             .min(head.total_size_bytes);
         let range_length = range_end_exclusive.saturating_sub(range_start);
 
         on_progress(DownloadProgress {
             object_size_bytes: head.total_size_bytes,
-            range_start,
-            range_length,
+            range: RequestedRange { offset: range_start, length: range_length },
             bytes_downloaded: 0,
         });
 
@@ -1315,8 +1323,7 @@ impl IronMeshClient {
                 .with_context(|| format!("failed to flush output for key={key}"))?;
             return Ok(DownloadRangeResult {
                 object_size_bytes: head.total_size_bytes,
-                range_start,
-                range_length,
+                range: RequestedRange { offset: range_start, length: range_length },
                 bytes_downloaded: 0,
             });
         }
@@ -1348,15 +1355,13 @@ impl IronMeshClient {
             let bytes_downloaded = payload.len() as u64;
             on_progress(DownloadProgress {
                 object_size_bytes: head.total_size_bytes,
-                range_start,
-                range_length,
+                range: RequestedRange { offset: range_start, length: range_length },
                 bytes_downloaded,
             });
 
             return Ok(DownloadRangeResult {
                 object_size_bytes: head.total_size_bytes,
-                range_start,
-                range_length,
+                range: RequestedRange { offset: range_start, length: range_length },
                 bytes_downloaded,
             });
         }
@@ -1402,8 +1407,7 @@ impl IronMeshClient {
                     offset = end_inclusive + 1;
                     on_progress(DownloadProgress {
                         object_size_bytes: head.total_size_bytes,
-                        range_start,
-                        range_length,
+                        range: RequestedRange { offset: range_start, length: range_length },
                         bytes_downloaded,
                     });
                 }
@@ -1415,8 +1419,7 @@ impl IronMeshClient {
                     offset = range_end_exclusive;
                     on_progress(DownloadProgress {
                         object_size_bytes: head.total_size_bytes,
-                        range_start,
-                        range_length,
+                        range: RequestedRange { offset: range_start, length: range_length },
                         bytes_downloaded,
                     });
                 }
@@ -1431,8 +1434,7 @@ impl IronMeshClient {
             .with_context(|| format!("failed to flush output for key={key}"))?;
         Ok(DownloadRangeResult {
             object_size_bytes: head.total_size_bytes,
-            range_start,
-            range_length,
+            range: RequestedRange { offset: range_start, length: range_length },
             bytes_downloaded,
         })
     }
@@ -1938,8 +1940,7 @@ impl IronMeshClient {
                 key: key_owned.as_str(),
                 snapshot: snapshot_owned.as_deref(),
                 version: version_owned.as_deref(),
-                start: request.start,
-                length: request.length,
+                range: request.range,
             },
             writer,
             on_progress,
@@ -3296,8 +3297,7 @@ mod tests {
                                 key: "photos/test.jpg",
                                 snapshot: None,
                                 version: None,
-                                start,
-                                length,
+                                range: RequestedRange { offset: start, length },
                             },
                             &mut writer,
                             &mut |progress| progress_updates.push(progress),
@@ -3305,8 +3305,8 @@ mod tests {
                         )
                         .expect("blocking ranged download should succeed");
                     assert_eq!(writer, expected);
-                    assert_eq!(result.range_start, start);
-                    assert_eq!(result.range_length, length);
+                    assert_eq!(result.range.offset, start);
+                    assert_eq!(result.range.length, length);
                     assert_eq!(result.bytes_downloaded, length);
                     assert!(
                         progress_updates

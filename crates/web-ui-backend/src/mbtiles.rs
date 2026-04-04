@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use client_sdk::{IronMeshClient, ironmesh_client::DownloadRangeRequest};
+use client_sdk::{IronMeshClient, RequestedRange, ironmesh_client::DownloadRangeRequest};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vfs};
 use std::borrow::Cow;
@@ -814,8 +814,7 @@ fn download_logical_range_blocking(
                 key: part.key.as_str(),
                 snapshot: None,
                 version: None,
-                start: local_start,
-                length: segment_length,
+                range: RequestedRange { offset: local_start, length: segment_length },
             },
             &mut body,
             &mut on_progress,

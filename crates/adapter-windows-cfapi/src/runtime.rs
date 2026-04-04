@@ -6,9 +6,9 @@ use crate::cfapi::{
     cf_set_not_in_sync, describe_path_state, open_sync_path, path_placeholder_state,
 };
 use crate::cfapi_safe_wrap::{
-    CancelFetchDataCallbackParams, CloseCompletionCallbackParams, FetchDataCallbackParams,
-    NotifyDehydrateCallbackParams, NotifyDehydrateCompletionCallbackParams, callback_file_identity,
-    callback_process_log_info, callback_target_session_id,
+    CancelFetchDataCallbackParams, CloseCompletionCallbackParams, ExecuteTransferDataFailureInfo,
+    FetchDataCallbackParams, NotifyDehydrateCallbackParams, NotifyDehydrateCompletionCallbackParams,
+    callback_file_identity, callback_process_log_info, callback_target_session_id,
     connect_sync_root as cf_connect_sync_root, create_placeholders as cf_create_placeholders,
     disconnect_sync_root as cf_disconnect_sync_root, empty_fs_metadata,
     execute_ack_dehydrate as cf_execute_ack_dehydrate,
@@ -16,6 +16,7 @@ use crate::cfapi_safe_wrap::{
     execute_transfer_data_failure as cf_execute_transfer_data_failure, string_from_pcwstr,
     unregister_sync_root as cf_unregister_sync_root,
 };
+use client_sdk::RequestedRange;
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
 };
@@ -96,16 +97,15 @@ pub trait Hydrator: Send + Sync + 'static {
         }
 
         let payload = self.hydrate(request.path, request.remote_version)?;
-        let range_start = request.offset.min(payload.len() as u64);
+        let range_start = request.range.offset.min(payload.len() as u64);
         let range_end_exclusive = range_start
-            .saturating_add(request.length)
+            .saturating_add(request.range.length)
             .min(payload.len() as u64);
         let range_length = range_end_exclusive.saturating_sub(range_start);
 
         on_progress(HydrationProgress {
             object_size_bytes: payload.len() as u64,
-            range_start,
-            range_length,
+            range: RequestedRange { offset: range_start, length: range_length },
             bytes_transferred: 0,
         });
 
@@ -119,15 +119,13 @@ pub trait Hydrator: Send + Sync + 'static {
 
         on_progress(HydrationProgress {
             object_size_bytes: payload.len() as u64,
-            range_start,
-            range_length,
+            range: RequestedRange { offset: range_start, length: range_length },
             bytes_transferred: slice.len() as u64,
         });
 
         Ok(HydrationResult {
             object_size_bytes: payload.len() as u64,
-            range_start,
-            range_length,
+            range: RequestedRange { offset: range_start, length: range_length },
             bytes_transferred: slice.len() as u64,
         })
     }
@@ -137,23 +135,20 @@ pub trait Hydrator: Send + Sync + 'static {
 pub struct HydrationRequest<'a> {
     pub path: &'a str,
     pub remote_version: &'a str,
-    pub offset: u64,
-    pub length: u64,
+    pub range: RequestedRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HydrationProgress {
     pub object_size_bytes: u64,
-    pub range_start: u64,
-    pub range_length: u64,
+    pub range: RequestedRange,
     pub bytes_transferred: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HydrationResult {
     pub object_size_bytes: u64,
-    pub range_start: u64,
-    pub range_length: u64,
+    pub range: RequestedRange,
     pub bytes_transferred: u64,
 }
 
@@ -1597,9 +1592,9 @@ fn report_fetch_progress(
 ) -> Result<()> {
     let total = progress
         .object_size_bytes
-        .max(progress.range_start.saturating_add(progress.range_length));
+        .max(progress.range.offset.saturating_add(progress.range.length));
     let completed = progress
-        .range_start
+        .range.offset
         .saturating_add(progress.bytes_transferred)
         .min(total);
     cf_report_provider_progress2(
@@ -1670,7 +1665,16 @@ pub(crate) fn handle_callback_fetch_data(
     callback_info_ref: &CF_CALLBACK_INFO,
     context: &CallbackContext,
     fetch_data: FetchDataCallbackParams,
-) {
+) -> Option<ExecuteTransferDataFailureInfo> {
+    let range: RequestedRange = RequestedRange {
+        offset: fetch_data.required_file_offset.max(0) as u64,
+        length: fetch_data.required_length.max(0) as u64,
+    };
+    let mut failure_info = Some(ExecuteTransferDataFailureInfo {
+        range,
+        completion_status: STATUS_CLOUD_FILE_UNSUCCESSFUL,
+    });
+
     let relative_path = match resolve_relative_path_from_callback(callback_info_ref, context) {
         Some(path) => path,
         None => {
@@ -1680,7 +1684,7 @@ pub(crate) fn handle_callback_fetch_data(
                 normalized_path,
                 callback_info_ref.FileId
             );
-            return;
+            return failure_info;
         }
     };
 
@@ -1688,19 +1692,25 @@ pub(crate) fn handle_callback_fetch_data(
         Ok(version) => version,
         Err(err) => {
             tracing::info!("cfapi fetch-data missing remote version: {err}");
-            return;
+            if let Err(exec_err) = execute_transfer_data_failure(
+                callback_info_ref,
+                range,
+                STATUS_CLOUD_FILE_UNSUCCESSFUL,
+            ) {
+                tracing::info!(
+                    "cfapi fetch-data: failed to report transfer failure for unknown remote version: {exec_err}"
+                );
+            }
+            return failure_info;
         }
     };
-
-    let range_start = fetch_data.required_file_offset.max(0) as u64;
-    let range_length = fetch_data.required_length.max(0) as u64;
     let optional_range_start = fetch_data.optional_file_offset.max(0) as u64;
     let optional_range_length = fetch_data.optional_length.max(0) as u64;
     let request_identity = callback_request_identity(callback_info_ref);
     let request_kind = describe_fetch_data_request_kind(fetch_data.flags);
     let process_info = callback_process_log_info(callback_info_ref);
     let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
-    let fetch_identity = fetch_callback_identity(callback_info_ref, range_start, range_length);
+    let fetch_identity = fetch_callback_identity(callback_info_ref, range.offset, range.length);
     let already_hydrated_once = context
         .hydrated_once_paths
         .lock()
@@ -1710,7 +1720,7 @@ pub(crate) fn handle_callback_fetch_data(
         .upload_debounce
         .debug_snapshot_for_path(&relative_path, 8);
     tracing::info!(
-        "cfapi hydration-trigger: request={} transfer={} file_id={} session={} process_id={} process_image={} package_name={} application_id={} command_line={} path={} request_kind={} fetch_flags=0x{:x} required_offset={} required_length={} optional_offset={} optional_length={} last_dehydration_reason={} last_dehydration_time={}",
+        "cfapi hydration-trigger: request={} transfer={} file_id={} session={} process_id={} process_image={} package_name={} application_id={} command_line={} path={} request_kind={} fetch_flags=0x{:x} required_range={} optional_offset={} optional_length={} last_dehydration_reason={} last_dehydration_time={}",
         request_identity,
         callback_info_ref.TransferKey,
         callback_info_ref.FileId,
@@ -1723,23 +1733,21 @@ pub(crate) fn handle_callback_fetch_data(
         relative_path,
         request_kind,
         fetch_data.flags as u32,
-        range_start,
-        range_length,
+        range,
         optional_range_start,
         optional_range_length,
         fetch_data.last_dehydration_reason,
         fetch_data.last_dehydration_time
     );
     tracing::info!(
-        "cfapi fetch-data begin: request={} transfer={} file_id={} session={} path={} remote_version={} offset={} length={} already_hydrated_once={} upload_debounce={} state={}",
+        "cfapi fetch-data begin: request={} transfer={} file_id={} session={} path={} remote_version={} range={} already_hydrated_once={} upload_debounce={} state={}",
         request_identity,
         callback_info_ref.TransferKey,
         callback_info_ref.FileId,
         callback_target_session_id(callback_info_ref),
         relative_path,
         remote_version,
-        range_start,
-        range_length,
+        range,
         already_hydrated_once,
         upload_snapshot.to_log_string(),
         describe_path_state(&full_path)
@@ -1751,11 +1759,11 @@ pub(crate) fn handle_callback_fetch_data(
 
     let _fetch_execution_guard = context.fetch_execution_gate.acquire_for_file_range(
         callback_info_ref.FileId,
-        range_start,
+        range.offset,
         || path_hydrated_frontier(&full_path),
     );
 
-    let mut writer = CfapiTransferWriter::new(callback_info_ref, range_start);
+    let mut writer = CfapiTransferWriter::new(callback_info_ref, range.offset);
     let mut progress_callback = |progress: HydrationProgress| {
         if let Err(err) = report_fetch_progress(callback_info_ref, progress) {
             tracing::info!("cfapi progress-report error: {err}");
@@ -1773,8 +1781,7 @@ pub(crate) fn handle_callback_fetch_data(
             HydrationRequest {
                 path: &relative_path,
                 remote_version: &remote_version,
-                offset: range_start,
-                length: range_length,
+                range,
             },
             &mut writer,
             &mut progress_callback,
@@ -1788,6 +1795,7 @@ pub(crate) fn handle_callback_fetch_data(
 
     match result {
         Ok(result) => {
+            failure_info = None;
             if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
                 hydrated_paths.insert(relative_path.clone());
             }
@@ -1822,12 +1830,11 @@ pub(crate) fn handle_callback_fetch_data(
                 }
             }
             tracing::info!(
-                "cfapi fetch-data complete: request={} path={} object_size={} range_start={} range_length={} bytes_transferred={} state_after={} upload_debounce={}",
+                "cfapi fetch-data complete: request={} path={} object_size={} range={} bytes_transferred={} state_after={} upload_debounce={}",
                 request_identity,
                 relative_path,
                 result.object_size_bytes,
-                result.range_start,
-                result.range_length,
+                result.range,
                 result.bytes_transferred,
                 describe_path_state(&full_path),
                 context
@@ -1837,7 +1844,7 @@ pub(crate) fn handle_callback_fetch_data(
             );
         }
         Err(err) => {
-            let request_end = range_start.saturating_add(range_length);
+            let request_end = range.offset.saturating_add(range.length);
             let failure_offset = writer.next_offset.min(request_end);
             let failure_length = request_end.saturating_sub(failure_offset);
             let completion_status = if cancel_flag.load(Ordering::SeqCst) {
@@ -1846,22 +1853,10 @@ pub(crate) fn handle_callback_fetch_data(
                 STATUS_CLOUD_FILE_UNSUCCESSFUL
             };
             if failure_length > 0 {
-                if let Err(exec_err) = execute_transfer_data_failure(
-                    callback_info_ref,
-                    failure_offset,
-                    failure_length,
+                failure_info = Some(ExecuteTransferDataFailureInfo {
+                    range: RequestedRange { offset: failure_offset, length: failure_length },
                     completion_status,
-                ) {
-                    tracing::info!(
-                        "cfapi fetch-data failure completion error: request={} path={} status=0x{:08x} offset={} length={} error={:#}",
-                        request_identity,
-                        relative_path,
-                        completion_status as u32,
-                        failure_offset,
-                        failure_length,
-                        exec_err
-                    );
-                }
+                });
             }
             tracing::info!(
                 "cfapi fetch-data hydration error: request={} path={} error={:#} completion_status=0x{:08x} failure_offset={} failure_length={} state_after={} upload_debounce={}",
@@ -1879,6 +1874,8 @@ pub(crate) fn handle_callback_fetch_data(
             );
         }
     }
+
+    failure_info
 }
 
 pub(crate) fn handle_callback_cancel_fetch_data(
@@ -2166,11 +2163,13 @@ fn execute_transfer_data_chunk(
 
 fn execute_transfer_data_failure(
     callback_info: &CF_CALLBACK_INFO,
-    offset: u64,
-    length: u64,
+    range: RequestedRange,
     completion_status: NTSTATUS,
 ) -> Result<()> {
-    cf_execute_transfer_data_failure(callback_info, offset, length, completion_status)
+    cf_execute_transfer_data_failure(callback_info, ExecuteTransferDataFailureInfo {
+        range,
+        completion_status,
+    })
 }
 
 fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {

@@ -1,4 +1,5 @@
 use crate::helpers::{hresult_nonneg, utf16_path};
+use client_sdk::RequestedRange;
 use crate::runtime::{
     CallbackContext, handle_callback_cancel_fetch_data, handle_callback_fetch_data,
     handle_callback_file_close_completion, handle_callback_file_open,
@@ -11,7 +12,9 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, NTSTATUS};
+use windows_sys::Win32::Foundation::{
+    HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_CLOUD_FILE_UNSUCCESSFUL,
+};
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 
@@ -233,18 +236,21 @@ pub(crate) fn execute_transfer_data_chunk(
     hresult_nonneg(hr, "CfExecute")
 }
 
+pub(crate) struct ExecuteTransferDataFailureInfo {
+    pub(crate) range: RequestedRange,
+    pub(crate) completion_status: NTSTATUS,
+}
+
 pub(crate) fn execute_transfer_data_failure(
     callback_info: &CF_CALLBACK_INFO,
-    offset: u64,
-    length: u64,
-    completion_status: NTSTATUS,
+    info: ExecuteTransferDataFailureInfo,
 ) -> Result<()> {
     let transfer_data = CF_OPERATION_PARAMETERS_0_0 {
         Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-        CompletionStatus: completion_status,
+        CompletionStatus: info.completion_status,
         Buffer: null(),
-        Offset: offset as i64,
-        Length: length as i64,
+        Offset: info.range.offset as i64,
+        Length: info.range.length as i64,
     };
 
     let mut op_params = CF_OPERATION_PARAMETERS {
@@ -630,14 +636,31 @@ unsafe extern "system" fn callback_fetch_data(
     let Some(callback_info_ref) = (unsafe { callback_info.as_ref() }) else {
         return;
     };
-    let Some(context) = callback_context(callback_info_ref) else {
-        return;
-    };
     let Some(fetch_data) = fetch_data_callback_params(callback_parameters) else {
         return;
     };
+    let Some(context) = callback_context(callback_info_ref) else {
+        let offset = fetch_data.required_file_offset.max(0) as u64;
+        let length = fetch_data.required_length.max(0) as u64;
+        if let Err(err) = execute_transfer_data_failure(
+            callback_info_ref,
+            ExecuteTransferDataFailureInfo {
+                range: RequestedRange { offset, length },
+                completion_status: STATUS_CLOUD_FILE_UNSUCCESSFUL,
+            },
+        ) {
+            tracing::info!("cfapi fetch-data: failed to send null-context failure: {err}");
+        }
+        return;
+    };
 
-    handle_callback_fetch_data(callback_info_ref, context, fetch_data);
+    if let Some(failure_response) = handle_callback_fetch_data(callback_info_ref, context, fetch_data) {
+        if let Err(err) = execute_transfer_data_failure(callback_info_ref, failure_response) {
+            tracing::info!(
+                "cfapi fetch-data: failed to report transfer failure for unresolved path: {err}"
+            );
+        }
+    }
 }
 
 unsafe extern "system" fn callback_cancel_fetch_data(

@@ -71,9 +71,8 @@ impl Hydrator for ServerNodeHydrator {
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<HydrationResult> {
         tracing::info!(
-            "hydrating range path {path} from server offset={} length={}",
-            request.offset,
-            request.length,
+            "hydrating range path {path} from server range: {}",
+            request.range,
             path = request.path,
         );
         let result = self
@@ -83,15 +82,13 @@ impl Hydrator for ServerNodeHydrator {
                     key: request.path,
                     snapshot: None,
                     version: None,
-                    start: request.offset,
-                    length: request.length,
+                    range: request.range,
                 },
                 writer,
                 &mut |progress: DownloadProgress| {
                     on_progress(HydrationProgress {
                         object_size_bytes: progress.object_size_bytes,
-                        range_start: progress.range_start,
-                        range_length: progress.range_length,
+                        range: progress.range,
                         bytes_transferred: progress.bytes_downloaded,
                     });
                 },
@@ -101,8 +98,7 @@ impl Hydrator for ServerNodeHydrator {
 
         Ok(HydrationResult {
             object_size_bytes: result.object_size_bytes,
-            range_start: result.range_start,
-            range_length: result.range_length,
+            range: result.range,
             bytes_transferred: result.bytes_downloaded,
         })
     }
