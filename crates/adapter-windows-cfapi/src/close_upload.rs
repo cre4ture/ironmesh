@@ -2,8 +2,10 @@ use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
     cf_set_not_in_sync, describe_path_state,
 };
-use crate::placeholder_metadata::record_in_sync_local_file_state;
-use crate::runtime::{CfapiRuntime, Uploader, reconcile_ancestor_directory_sync_states};
+use crate::placeholder_metadata::record_in_sync_content_fingerprint;
+use crate::runtime::{
+    CfapiRuntime, UploadReceipt, Uploader, reconcile_ancestor_directory_sync_states,
+};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -377,15 +379,19 @@ fn process_debounced_close_upload(
     );
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
 
-    if let Err(err) = upload_file_on_close(worker, relative_path, snapshot_before.len, file) {
-        tracing::info!(
-            "cfapi upload error: path={} bytes={} error={:#}",
-            relative_path,
-            snapshot_before.len,
-            err
-        );
-        return UploadAttemptOutcome::Retry;
-    }
+    let upload_receipt =
+        match upload_file_on_close(worker, relative_path, snapshot_before.len, file) {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                tracing::info!(
+                    "cfapi upload error: path={} bytes={} error={:#}",
+                    relative_path,
+                    snapshot_before.len,
+                    err
+                );
+                return UploadAttemptOutcome::Retry;
+            }
+        };
 
     let snapshot_after = match capture_path_snapshot(&full_path) {
         Ok(snapshot) => snapshot,
@@ -452,16 +458,19 @@ fn process_debounced_close_upload(
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
-    if let Err(err) = record_in_sync_local_file_state(
-        &worker.sync_root,
-        relative_path,
-        worker.provider_instance_id,
-    ) {
-        tracing::info!(
-            "close-completion: failed to record in-sync local file hash for {}: {:#}",
+    if let Some(clean_content_fingerprint) = upload_receipt.clean_content_fingerprint.as_deref() {
+        if let Err(err) = record_in_sync_content_fingerprint(
+            &worker.sync_root,
             relative_path,
-            err
-        );
+            worker.provider_instance_id,
+            clean_content_fingerprint,
+        ) {
+            tracing::info!(
+                "close-completion: failed to record in-sync content fingerprint for {}: {:#}",
+                relative_path,
+                err
+            );
+        }
     }
     tracing::info!(
         "cfapi uploaded local file: path={} bytes={} final_state={}",
@@ -507,7 +516,7 @@ fn upload_file_on_close(
     relative_path: &str,
     metadata_len: u64,
     file: std::fs::File,
-) -> Result<()> {
+) -> Result<UploadReceipt> {
     tracing::info!(
         "close-completion: uploading {} ({} bytes)",
         relative_path,
@@ -515,13 +524,13 @@ fn upload_file_on_close(
     );
 
     let mut reader = file;
-    let remote_version = worker
+    let upload_receipt = worker
         .uploader
         .upload_reader(relative_path, &mut reader, metadata_len)?;
-    if let Some(version) = remote_version {
+    if let Some(version) = upload_receipt.remote_version.clone() {
         worker.runtime.set_remote_version(relative_path, version);
     }
-    Ok(())
+    Ok(upload_receipt)
 }
 
 #[cfg(test)]
@@ -544,7 +553,7 @@ mod tests {
             path: &str,
             reader: &mut dyn std::io::Read,
             length: u64,
-        ) -> Result<Option<String>> {
+        ) -> Result<UploadReceipt> {
             if self.fail {
                 return Err(anyhow!("simulated upload failure"));
             }
@@ -554,7 +563,10 @@ mod tests {
                 .lock()
                 .expect("upload record lock poisoned")
                 .push((path.to_string(), payload, length));
-            Ok(Some(format!("version:size={length}")))
+            Ok(UploadReceipt {
+                remote_version: Some(format!("version:size={length}")),
+                clean_content_fingerprint: Some(format!("cfp-upload-{length}")),
+            })
         }
     }
 
@@ -588,7 +600,7 @@ mod tests {
         let payload = b"cfapi-upload-payload";
         let (path, file) = make_test_file(payload);
 
-        upload_file_on_close(&worker, "docs/photo.jpg", payload.len() as u64, file)
+        let receipt = upload_file_on_close(&worker, "docs/photo.jpg", payload.len() as u64, file)
             .expect("upload should succeed");
 
         let uploads = uploader
@@ -607,6 +619,11 @@ mod tests {
             .expect("remote version should still be updated after upload");
         let hydrated_text = String::from_utf8(hydrated).expect("demo hydrator emits utf8 payload");
         assert!(hydrated_text.contains(&format!("version:size={}", payload.len())));
+        let expected_fingerprint = format!("cfp-upload-{}", payload.len());
+        assert_eq!(
+            receipt.clean_content_fingerprint.as_deref(),
+            Some(expected_fingerprint.as_str())
+        );
 
         let _ = std::fs::remove_file(path);
     }

@@ -26,7 +26,7 @@ use crate::helpers::{
     utf16_string,
 };
 use crate::placeholder_metadata::{
-    record_in_sync_local_file_state, refresh_remote_placeholder_state,
+    record_in_sync_remote_file_state, refresh_remote_placeholder_state,
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use crate::sync_root_identity::{
@@ -157,13 +157,19 @@ pub struct HydrationResult {
     pub bytes_transferred: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UploadReceipt {
+    pub remote_version: Option<String>,
+    pub clean_content_fingerprint: Option<String>,
+}
+
 pub trait Uploader: Send + Sync + 'static {
     fn upload_reader(
         &self,
         path: &str,
         reader: &mut dyn std::io::Read,
         length: u64,
-    ) -> Result<Option<String>>;
+    ) -> Result<UploadReceipt>;
 
     fn rename_path(&self, _from_path: &str, _to_path: &str) -> Result<bool> {
         Ok(false)
@@ -195,7 +201,7 @@ impl Uploader for DemoUploader {
         path: &str,
         reader: &mut dyn std::io::Read,
         length: u64,
-    ) -> Result<Option<String>> {
+    ) -> Result<UploadReceipt> {
         // Read from the provided reader in chunks to avoid a single large allocation
         let mut read_bytes = 0usize;
         let mut buffer = [0u8; 8192];
@@ -209,7 +215,10 @@ impl Uploader for DemoUploader {
         }
 
         tracing::info!("demo upload: path={} bytes={}", path, read_bytes);
-        Ok(Some("demo-upload".to_string()))
+        Ok(UploadReceipt {
+            remote_version: Some("demo-upload".to_string()),
+            clean_content_fingerprint: None,
+        })
     }
 
     fn delete_path(&self, path: &str) -> Result<()> {
@@ -593,7 +602,8 @@ pub fn apply_action_plan(
 ) -> Result<()> {
     std::fs::create_dir_all(root_path)?;
 
-    let mut placeholders: BTreeMap<String, (String, String, Option<u64>)> = BTreeMap::new();
+    let mut placeholders: BTreeMap<String, (String, String, Option<u64>, Option<String>)> =
+        BTreeMap::new();
     let mut created_placeholder_paths = BTreeSet::new();
     for action in &plan.actions {
         match action {
@@ -605,12 +615,14 @@ pub fn apply_action_plan(
                 remote_version,
                 remote_content_hash,
                 remote_size,
+                remote_content_fingerprint,
             }
             | CfapiAction::HydrateOnDemand {
                 path,
                 remote_version,
                 remote_content_hash,
                 remote_size,
+                remote_content_fingerprint,
             } => {
                 let normalized = normalize_path(path);
                 let full_path = root_path.join(normalized.replace('/', "\\"));
@@ -628,6 +640,7 @@ pub fn apply_action_plan(
                         remote_version.clone(),
                         remote_content_hash.clone(),
                         *remote_size,
+                        remote_content_fingerprint.clone(),
                     ),
                 );
                 created_placeholder_paths.insert(normalized);
@@ -646,7 +659,11 @@ pub fn apply_action_plan(
         }
 
         let mut inputs = Vec::with_capacity(placeholders.len());
-        for (relative_path, (remote_version, remote_content_hash, remote_size)) in placeholders {
+        for (
+            relative_path,
+            (remote_version, remote_content_hash, remote_size, remote_content_fingerprint),
+        ) in placeholders
+        {
             let (parent_rel, child_name) = match relative_path.rsplit_once('/') {
                 Some((parent, child)) => (parent, child),
                 None => ("", relative_path.as_str()),
@@ -675,6 +692,7 @@ pub fn apply_action_plan(
             identity.provider_instance_id = Some(provider_instance_id);
             identity.remote_version = Some(remote_version.clone());
             identity.remote_content_hash = Some(remote_content_hash.clone());
+            identity.remote_content_fingerprint = remote_content_fingerprint.clone();
             identity.remote_size_bytes = remote_size;
 
             inputs.push(PlaceholderInput {
@@ -743,12 +761,14 @@ pub fn apply_action_plan(
                 remote_version,
                 remote_content_hash,
                 remote_size,
+                remote_content_fingerprint,
             }
             | CfapiAction::HydrateOnDemand {
                 path,
                 remote_version,
                 remote_content_hash,
                 remote_size,
+                remote_content_fingerprint,
             } => {
                 if created_placeholder_paths.contains(&normalize_path(path)) {
                     continue;
@@ -760,6 +780,7 @@ pub fn apply_action_plan(
                     Some(remote_version),
                     Some(remote_content_hash),
                     *remote_size,
+                    remote_content_fingerprint.as_deref(),
                 ) {
                     tracing::info!(
                         "apply_action_plan: failed to refresh placeholder metadata for {}: {:#}",
@@ -773,6 +794,7 @@ pub fn apply_action_plan(
                 remote_version,
                 remote_content_hash,
                 remote_size,
+                remote_content_fingerprint,
                 ..
             } => {
                 if let Err(err) = refresh_remote_placeholder_state(
@@ -782,6 +804,7 @@ pub fn apply_action_plan(
                     remote_version.as_deref(),
                     remote_content_hash.as_deref(),
                     *remote_size,
+                    remote_content_fingerprint.as_deref(),
                 ) {
                     tracing::info!(
                         "apply_action_plan: failed to refresh conflict placeholder metadata for {}: {:#}",
@@ -1510,21 +1533,20 @@ pub(crate) fn handle_callback_fetch_data(
                 hydrated_paths.insert(relative_path.clone());
             }
             if result.object_size_bytes > 0 {
-                match open_sync_path(&full_path, false)
-                    .and_then(|file| cf_get_placeholder_standard_info(&file).map_err(std::io::Error::other))
-                {
+                match open_sync_path(&full_path, false).and_then(|file| {
+                    cf_get_placeholder_standard_info(&file).map_err(std::io::Error::other)
+                }) {
                     Ok(info)
                         if info.ModifiedDataSize == 0
                             && info.OnDiskDataSize >= result.object_size_bytes as i64 =>
                     {
-                        if let Err(err) = record_in_sync_local_file_state(
+                        if let Err(err) = record_in_sync_remote_file_state(
                             &context.sync_root,
                             &relative_path,
                             context.provider_instance_id,
-                        )
-                        {
+                        ) {
                             tracing::info!(
-                                "cfapi fetch-data complete: failed to record in-sync local file hash for {}: {:#}",
+                                "cfapi fetch-data complete: failed to record in-sync remote clean fingerprint for {}: {:#}",
                                 relative_path,
                                 err
                             );
@@ -1897,7 +1919,9 @@ fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
         return Err(anyhow!("root path cannot be empty"));
     }
     if registration.prefix.contains('\\') {
-        return Err(anyhow!("prefix must use normalized forward-slash separators"));
+        return Err(anyhow!(
+            "prefix must use normalized forward-slash separators"
+        ));
     }
     Ok(())
 }
@@ -1930,11 +1954,11 @@ mod tests {
     #[test]
     fn registration_validation_rejects_empty_inputs() {
         let cluster_id = uuid::Uuid::nil();
-        let registration = SyncRootRegistration::new("", "Ironmesh", "C:/ironmesh", cluster_id, None);
+        let registration =
+            SyncRootRegistration::new("", "Ironmesh", "C:/ironmesh", cluster_id, None);
         assert!(register_sync_root(&registration).is_err());
 
-        let registration =
-            SyncRootRegistration::new("id", "", "C:/ironmesh", cluster_id, None);
+        let registration = SyncRootRegistration::new("id", "", "C:/ironmesh", cluster_id, None);
         assert!(register_sync_root(&registration).is_err());
     }
 
@@ -1946,6 +1970,7 @@ mod tests {
                 remote_version: "v7".to_string(),
                 remote_content_hash: "h7".to_string(),
                 remote_size: None,
+                remote_content_fingerprint: None,
             }],
         };
 
@@ -1977,6 +2002,7 @@ mod tests {
                 remote_version: "v3".to_string(),
                 remote_content_hash: "h3".to_string(),
                 remote_size: None,
+                remote_content_fingerprint: None,
             }],
         };
 
@@ -2081,12 +2107,14 @@ mod tests {
                     remote_version: "v1".to_string(),
                     remote_content_hash: "h1".to_string(),
                     remote_size: None,
+                    remote_content_fingerprint: None,
                 },
                 CfapiAction::HydrateOnDemand {
                     path: "docs/photo.jpg".to_string(),
                     remote_version: "v2".to_string(),
                     remote_content_hash: "h2".to_string(),
                     remote_size: None,
+                    remote_content_fingerprint: None,
                 },
                 CfapiAction::QueueUploadOnClose {
                     path: "draft.txt".to_string(),
@@ -2098,6 +2126,7 @@ mod tests {
                     remote_version: Some("remote".to_string()),
                     remote_content_hash: Some("hr".to_string()),
                     remote_size: None,
+                    remote_content_fingerprint: None,
                 },
             ],
         };
@@ -2120,8 +2149,10 @@ mod tests {
 
     #[test]
     fn close_completion_ignores_provider_originated_callbacks() {
-        let sync_root =
-            std::env::temp_dir().join(format!("ironmesh-close-completion-{}", uuid::Uuid::new_v4()));
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-close-completion-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&sync_root).expect("sync root should be created");
         let full_path = sync_root.join("notes.txt");
         std::fs::write(&full_path, b"provider callback should be ignored")
@@ -2185,7 +2216,8 @@ mod tests {
 
         let snapshot = upload_debounce.debug_snapshot_for_path("notes.txt", 8);
         assert_eq!(
-            snapshot.pending_count, 0,
+            snapshot.pending_count,
+            0,
             "provider-originated close callback should not schedule debounce work: {}",
             snapshot.to_log_string()
         );

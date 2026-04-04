@@ -14,7 +14,11 @@ use crate::cfapi::{
 use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{decode_path_from_file_identity, path_to_relative};
-use crate::placeholder_metadata::record_in_sync_local_file_state;
+use crate::placeholder_metadata::{
+    record_in_sync_content_fingerprint, record_in_sync_local_file_state,
+};
+#[cfg(test)]
+use crate::runtime::UploadReceipt;
 use crate::runtime::Uploader;
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use windows_sys::Win32::Storage::CloudFilters::{
@@ -524,26 +528,34 @@ impl SyncRootMonitor {
                 // File is materialized, convert to placeholder using a file HANDLE
                 try_convert_materialized_file(path, &rel_path, &metadata);
                 // upload content to server
-                if let Err(e) = self.uploader.upload_reader(
+                match self.uploader.upload_reader(
                     &rel_path,
                     &mut std::fs::File::open(path).unwrap(),
                     metadata.len(),
                 ) {
-                    tracing::info!("{}: failed to upload file {}: {}", self.name, rel_path, e);
-                } else {
-                    if let Err(err) = record_in_sync_local_file_state(
-                        &self.sync_root,
-                        &rel_path,
-                        self.provider_instance_id,
-                    ) {
-                        tracing::info!(
-                            "{}: failed to record in-sync local file hash for {}: {:#}",
-                            self.name,
-                            rel_path,
-                            err
-                        );
+                    Ok(receipt) => {
+                        if let Some(clean_content_fingerprint) =
+                            receipt.clean_content_fingerprint.as_deref()
+                        {
+                            if let Err(err) = record_in_sync_content_fingerprint(
+                                &self.sync_root,
+                                &rel_path,
+                                self.provider_instance_id,
+                                clean_content_fingerprint,
+                            ) {
+                                tracing::info!(
+                                    "{}: failed to record in-sync content fingerprint for {}: {:#}",
+                                    self.name,
+                                    rel_path,
+                                    err
+                                );
+                            }
+                        }
+                        tracing::info!("{}: uploaded file {}", self.name, rel_path);
                     }
-                    tracing::info!("{}: uploaded file {}", self.name, rel_path);
+                    Err(e) => {
+                        tracing::info!("{}: failed to upload file {}: {}", self.name, rel_path, e);
+                    }
                 }
             } else {
                 // File does not exist, create placeholder
@@ -1103,14 +1115,14 @@ mod tests {
             path: &str,
             reader: &mut dyn Read,
             _length: u64,
-        ) -> anyhow::Result<Option<String>> {
+        ) -> anyhow::Result<UploadReceipt> {
             let mut sink = Vec::new();
             let _ = reader.read_to_end(&mut sink)?;
             self.uploads
                 .lock()
                 .expect("uploads lock poisoned")
                 .push(path.to_string());
-            Ok(None)
+            Ok(UploadReceipt::default())
         }
 
         fn delete_path(&self, path: &str) -> anyhow::Result<()> {
@@ -1186,6 +1198,7 @@ mod tests {
                 remote_version: "v1".to_string(),
                 remote_content_hash: "h1".to_string(),
                 remote_size: None,
+                remote_content_fingerprint: None,
             }],
         });
         monitor.walk();

@@ -7,6 +7,7 @@ use crate::cfapi::{
     open_sync_path,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
+use crate::content_fingerprint::file_content_fingerprint;
 use crate::helpers::{
     PlaceholderFileIdentity, decode_placeholder_file_identity,
     encode_placeholder_file_identity_metadata, normalize_path, path_to_relative,
@@ -15,7 +16,6 @@ use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 use sync_core::{EntryKind, SyncSnapshot};
 use uuid::Uuid;
@@ -45,11 +45,52 @@ pub fn record_in_sync_local_file_state(
         return Ok(());
     }
 
-    let local_hash = hash_file(&full_path)?;
+    let clean_content_fingerprint = file_content_fingerprint(&full_path)?;
+    record_in_sync_content_fingerprint(
+        sync_root_path,
+        &normalized,
+        provider_instance_id,
+        &clean_content_fingerprint,
+    )
+}
+
+pub fn record_in_sync_content_fingerprint(
+    sync_root_path: &Path,
+    relative_path: &str,
+    provider_instance_id: Uuid,
+    clean_content_fingerprint: &str,
+) -> Result<()> {
+    let normalized = normalize_path(relative_path);
+    if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
+        return Ok(());
+    }
+
     mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
-        identity.last_clean_local_content_hash = Some(local_hash.clone());
+        if identity.remote_content_fingerprint.is_none() {
+            identity.remote_content_fingerprint = Some(clean_content_fingerprint.to_string());
+        }
+        identity.clean_content_fingerprint = Some(clean_content_fingerprint.to_string());
+    })
+}
+
+pub fn record_in_sync_remote_file_state(
+    sync_root_path: &Path,
+    relative_path: &str,
+    provider_instance_id: Uuid,
+) -> Result<()> {
+    let normalized = normalize_path(relative_path);
+    if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
+        return Ok(());
+    }
+
+    mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
+        identity.path = normalized.clone();
+        identity.provider_instance_id = Some(provider_instance_id);
+        if let Some(remote_content_fingerprint) = identity.remote_content_fingerprint.clone() {
+            identity.clean_content_fingerprint = Some(remote_content_fingerprint);
+        }
     })
 }
 
@@ -60,6 +101,7 @@ pub fn refresh_remote_placeholder_state(
     remote_version: Option<&str>,
     remote_content_hash: Option<&str>,
     remote_size_bytes: Option<u64>,
+    remote_content_fingerprint: Option<&str>,
 ) -> Result<()> {
     let normalized = normalize_path(relative_path);
     if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
@@ -71,8 +113,7 @@ pub fn refresh_remote_placeholder_state(
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to inspect {}", full_path.display()));
+            return Err(err).with_context(|| format!("failed to inspect {}", full_path.display()));
         }
     };
     if metadata.is_dir() {
@@ -90,6 +131,10 @@ pub fn refresh_remote_placeholder_state(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
+        identity.remote_content_fingerprint = remote_content_fingerprint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         identity.remote_size_bytes = remote_size_bytes;
     })
 }
@@ -103,7 +148,11 @@ pub fn reconcile_remote_delete_state(
     let mut report = RemoteDeleteReconcileReport::default();
     let mut local_file_candidates = Vec::new();
 
-    for entry in WalkDir::new(sync_root_path).min_depth(1).into_iter().flatten() {
+    for entry in WalkDir::new(sync_root_path)
+        .min_depth(1)
+        .into_iter()
+        .flatten()
+    {
         if entry.file_type().is_dir() {
             continue;
         }
@@ -155,9 +204,11 @@ pub fn reconcile_remote_delete_state(
 
         let clean_local = if placeholder_info.info().ModifiedDataSize == 0 {
             true
-        } else if let Some(last_clean_hash) = identity.last_clean_local_content_hash.as_deref() {
-            hash_file(&full_path)
-                .map(|current_hash| current_hash == last_clean_hash)
+        } else if let Some(clean_content_fingerprint) =
+            identity.clean_content_fingerprint.as_deref()
+        {
+            file_content_fingerprint(&full_path)
+                .map(|current_fingerprint| current_fingerprint == clean_content_fingerprint)
                 .unwrap_or(false)
         } else {
             false
@@ -229,27 +280,9 @@ fn current_remote_file_paths(snapshot: &SyncSnapshot) -> BTreeSet<String> {
 fn identity_has_remote_baseline(identity: &PlaceholderFileIdentity) -> bool {
     identity.remote_version.is_some()
         || identity.remote_content_hash.is_some()
+        || identity.remote_content_fingerprint.is_some()
         || identity.remote_size_bytes.is_some()
-        || identity.last_clean_local_content_hash.is_some()
-}
-
-fn hash_file(path: &Path) -> Result<String> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0u8; 64 * 1024];
-
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(hasher.finalize().to_hex().to_string())
+        || identity.clean_content_fingerprint.is_some()
 }
 
 fn is_internal_sync_root_relative_path(path: &str) -> bool {
@@ -265,10 +298,8 @@ mod tests {
 
     #[test]
     fn reconcile_remote_delete_preserves_local_only_plain_files() {
-        let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-placeholder-meta-{}",
-            Uuid::now_v7()
-        ));
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-placeholder-meta-{}", Uuid::now_v7()));
         fs::create_dir_all(&sync_root).expect("sync root should exist");
         let full_path = sync_root.join("notes.txt");
         fs::write(&full_path, b"offline local").expect("local file should exist");

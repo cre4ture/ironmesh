@@ -318,8 +318,16 @@ pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) ->
     changed_paths
 }
 
-type RemoteSnapshotIndex =
-    BTreeMap<String, (EntryKind, Option<String>, Option<String>, Option<u64>)>;
+type RemoteSnapshotIndex = BTreeMap<
+    String,
+    (
+        EntryKind,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+    ),
+>;
 
 fn remote_snapshot_index(snapshot: &SyncSnapshot) -> RemoteSnapshotIndex {
     let mut index = BTreeMap::new();
@@ -330,6 +338,7 @@ fn remote_snapshot_index(snapshot: &SyncSnapshot) -> RemoteSnapshotIndex {
                 entry.kind,
                 entry.version.clone(),
                 entry.content_hash.clone(),
+                entry.content_fingerprint.clone(),
                 entry.size_bytes,
             ),
         );
@@ -416,6 +425,29 @@ mod tests {
                 "docs/old.txt".to_string(),
                 "docs/readme.md".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn changed_paths_between_detects_content_fingerprint_updates() {
+        let mut previous_entry =
+            NamespaceEntry::file_sized("docs/readme.txt", "v1", "h1", Some(42));
+        previous_entry.content_fingerprint = None;
+        let mut current_entry = NamespaceEntry::file_sized("docs/readme.txt", "v1", "h1", Some(42));
+        current_entry.content_fingerprint = Some("cfp-readme".to_string());
+
+        let previous = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![previous_entry],
+        };
+        let current = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![current_entry],
+        };
+
+        assert_eq!(
+            changed_paths_between(&previous, &current),
+            vec!["docs/readme.txt".to_string()]
         );
     }
 

@@ -71,12 +71,10 @@ impl SyncRootIdentity {
             };
             match key {
                 "v" => {
-                    schema_version = Some(
-                        value
-                            .trim()
-                            .parse::<u32>()
-                            .with_context(|| format!("invalid sync root identity version {value}"))?,
-                    );
+                    schema_version =
+                        Some(value.trim().parse::<u32>().with_context(|| {
+                            format!("invalid sync root identity version {value}")
+                        })?);
                 }
                 "pi" => {
                     provider_instance_id = Some(
@@ -134,15 +132,21 @@ pub fn normalize_prefix(prefix: Option<&str>) -> String {
     normalize_prefix_value(prefix.unwrap_or_default())
 }
 
-pub fn load_registered_sync_root_context(root_path: &Path) -> Result<Option<RegisteredSyncRootContext>> {
+pub fn load_registered_sync_root_context(
+    root_path: &Path,
+) -> Result<Option<RegisteredSyncRootContext>> {
     let Some((provider_name, identity_bytes)) = try_get_sync_root_info(root_path)? else {
         return Ok(None);
     };
 
     Ok(Some(RegisteredSyncRootContext {
         windows_sync_root_id: provider_name,
-        identity: SyncRootIdentity::decode(&identity_bytes)
-            .with_context(|| format!("failed to decode sync root identity for {}", root_path.display()))?,
+        identity: SyncRootIdentity::decode(&identity_bytes).with_context(|| {
+            format!(
+                "failed to decode sync root identity for {}",
+                root_path.display()
+            )
+        })?,
     }))
 }
 
@@ -193,7 +197,10 @@ fn try_get_sync_root_info(root_path: &Path) -> Result<Option<(String, Vec<u8>)>>
     let available = (returned_length as usize).saturating_sub(identity_offset);
     let clamped_length = identity_length.min(available);
     if clamped_length == 0 {
-        bail!("sync root at {} is missing IronMesh registration metadata", root_path.display());
+        bail!(
+            "sync root at {} is missing IronMesh registration metadata",
+            root_path.display()
+        );
     }
 
     Ok(Some((
@@ -216,7 +223,10 @@ fn hresult_from_win32(error: u32) -> u32 {
 }
 
 fn wide_c_string_to_string_lossy(buffer: &[u16]) -> String {
-    let len = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+    let len = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..len])
 }
 

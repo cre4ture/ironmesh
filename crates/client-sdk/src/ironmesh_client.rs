@@ -2634,12 +2634,10 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
         let content_hash = entry
             .content_hash
             .unwrap_or_else(|| format!("server-head:{}", entry.path));
-        remote.push(NamespaceEntry::file_sized(
-            entry.path.clone(),
-            version,
-            content_hash,
-            entry.size_bytes,
-        ));
+        let mut remote_entry =
+            NamespaceEntry::file_sized(entry.path.clone(), version, content_hash, entry.size_bytes);
+        remote_entry.content_fingerprint = entry.content_fingerprint;
+        remote.push(remote_entry);
     }
 
     SyncSnapshot {
@@ -2693,7 +2691,7 @@ mod tests {
                 content_hash: None,
                 size_bytes: Some(42),
                 modified_at_unix: None,
-                content_fingerprint: None,
+                content_fingerprint: Some("cfp-readme".to_string()),
                 media: None,
             },
         ]);
@@ -2701,15 +2699,17 @@ mod tests {
         assert_eq!(snapshot.local.len(), 0);
         assert_eq!(snapshot.remote.len(), 2);
         assert_eq!(snapshot.remote[0], NamespaceEntry::directory("docs"));
+        assert_eq!(snapshot.remote[1].path, "docs/readme.txt");
+        assert_eq!(snapshot.remote[1].version.as_deref(), Some("server-head"));
         assert_eq!(
-            snapshot.remote[1],
-            NamespaceEntry::file_sized(
-                "docs/readme.txt",
-                "server-head",
-                "server-head:docs/readme.txt",
-                Some(42),
-            )
+            snapshot.remote[1].content_hash.as_deref(),
+            Some("server-head:docs/readme.txt")
         );
+        assert_eq!(
+            snapshot.remote[1].content_fingerprint.as_deref(),
+            Some("cfp-readme")
+        );
+        assert_eq!(snapshot.remote[1].size_bytes, Some(42));
     }
 
     #[test]

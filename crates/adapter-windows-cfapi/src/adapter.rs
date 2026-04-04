@@ -16,12 +16,18 @@ impl WindowsCfapiAdapter {
 
     pub fn plan_actions(&self, snapshot: &SyncSnapshot, policy: &SyncPolicy) -> CfapiActionPlan {
         let sync_plan = plan_sync(snapshot, policy);
-        let remote_sizes_by_path = snapshot
+        let remote_metadata_by_path = snapshot
             .remote
             .iter()
-            .filter_map(|entry| entry.size_bytes.map(|size| (entry.path.clone(), size)))
+            .filter(|entry| entry.kind == sync_core::EntryKind::File)
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    (entry.size_bytes, entry.content_fingerprint.clone()),
+                )
+            })
             .collect::<HashMap<_, _>>();
-        map_sync_plan_to_cfapi_actions(&sync_plan, &remote_sizes_by_path)
+        map_sync_plan_to_cfapi_actions(&sync_plan, &remote_metadata_by_path)
     }
 }
 
@@ -40,12 +46,14 @@ pub enum CfapiAction {
         remote_version: String,
         remote_content_hash: String,
         remote_size: Option<u64>,
+        remote_content_fingerprint: Option<String>,
     },
     HydrateOnDemand {
         path: String,
         remote_version: String,
         remote_content_hash: String,
         remote_size: Option<u64>,
+        remote_content_fingerprint: Option<String>,
     },
     QueueUploadOnClose {
         path: String,
@@ -57,12 +65,13 @@ pub enum CfapiAction {
         remote_version: Option<String>,
         remote_content_hash: Option<String>,
         remote_size: Option<u64>,
+        remote_content_fingerprint: Option<String>,
     },
 }
 
 pub fn map_sync_plan_to_cfapi_actions(
     sync_plan: &SyncPlan,
-    remote_sizes_by_path: &HashMap<String, u64>,
+    remote_metadata_by_path: &HashMap<String, (Option<u64>, Option<String>)>,
 ) -> CfapiActionPlan {
     let mut actions = Vec::with_capacity(sync_plan.operations.len());
 
@@ -79,7 +88,12 @@ pub fn map_sync_plan_to_cfapi_actions(
                 path: path.clone(),
                 remote_version: remote_version.clone(),
                 remote_content_hash: remote_content_hash.clone(),
-                remote_size: remote_sizes_by_path.get(path).copied(),
+                remote_size: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|(size, _)| *size),
+                remote_content_fingerprint: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|(_, fingerprint)| fingerprint.clone()),
             },
             SyncOperation::Hydrate {
                 path,
@@ -89,7 +103,12 @@ pub fn map_sync_plan_to_cfapi_actions(
                 path: path.clone(),
                 remote_version: remote_version.clone(),
                 remote_content_hash: remote_content_hash.clone(),
-                remote_size: remote_sizes_by_path.get(path).copied(),
+                remote_size: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|(size, _)| *size),
+                remote_content_fingerprint: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|(_, fingerprint)| fingerprint.clone()),
             },
             SyncOperation::Upload {
                 path,
@@ -108,7 +127,12 @@ pub fn map_sync_plan_to_cfapi_actions(
                 local_version: local_version.clone(),
                 remote_version: remote_version.clone(),
                 remote_content_hash: remote_content_hash.clone(),
-                remote_size: remote_sizes_by_path.get(path).copied(),
+                remote_size: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|(size, _)| *size),
+                remote_content_fingerprint: remote_metadata_by_path
+                    .get(path)
+                    .and_then(|(_, fingerprint)| fingerprint.clone()),
             },
         };
 
@@ -140,6 +164,7 @@ mod tests {
                 remote_version: "v1".to_string(),
                 remote_content_hash: "h1".to_string(),
                 remote_size: None,
+                remote_content_fingerprint: None,
             }],
         );
     }
@@ -189,6 +214,7 @@ mod tests {
                 remote_version: Some("v-remote".to_string()),
                 remote_content_hash: Some("h2".to_string()),
                 remote_size: None,
+                remote_content_fingerprint: None,
             }],
         );
     }
@@ -215,6 +241,7 @@ mod tests {
                 remote_version: "v1".to_string(),
                 remote_content_hash: "h1".to_string(),
                 remote_size: Some(42),
+                remote_content_fingerprint: None,
             }],
         );
     }

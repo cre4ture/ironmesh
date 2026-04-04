@@ -26,13 +26,14 @@ pub struct PlaceholderFileIdentity {
     pub path: String,
     pub remote_version: Option<String>,
     pub remote_content_hash: Option<String>,
+    pub remote_content_fingerprint: Option<String>,
     pub remote_size_bytes: Option<u64>,
-    pub last_clean_local_content_hash: Option<String>,
+    pub clean_content_fingerprint: Option<String>,
     pub provider_instance_id: Option<Uuid>,
 }
 
 impl PlaceholderFileIdentity {
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 
     pub fn new(relative_path: &str) -> Self {
         Self {
@@ -42,7 +43,7 @@ impl PlaceholderFileIdentity {
     }
 
     pub fn encoded(&self) -> Vec<u8> {
-        let mut lines = Vec::with_capacity(7);
+        let mut lines = Vec::with_capacity(8);
         lines.push(format!("v={}", Self::SCHEMA_VERSION));
         lines.push(format!("p={}", normalize_path(&self.path)));
         if let Some(remote_version) = self
@@ -61,16 +62,24 @@ impl PlaceholderFileIdentity {
         {
             lines.push(format!("rh={remote_content_hash}"));
         }
-        if let Some(remote_size_bytes) = self.remote_size_bytes {
-            lines.push(format!("rs={remote_size_bytes}"));
-        }
-        if let Some(last_clean_local_content_hash) = self
-            .last_clean_local_content_hash
+        if let Some(remote_content_fingerprint) = self
+            .remote_content_fingerprint
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            lines.push(format!("lh={last_clean_local_content_hash}"));
+            lines.push(format!("rf={remote_content_fingerprint}"));
+        }
+        if let Some(remote_size_bytes) = self.remote_size_bytes {
+            lines.push(format!("rs={remote_size_bytes}"));
+        }
+        if let Some(clean_content_fingerprint) = self
+            .clean_content_fingerprint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!("cf={clean_content_fingerprint}"));
         }
         if let Some(provider_instance_id) = self.provider_instance_id {
             lines.push(format!("pi={provider_instance_id}"));
@@ -114,11 +123,14 @@ pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<Placehol
             "rh" => {
                 identity.remote_content_hash = Some(value.to_string());
             }
+            "rf" => {
+                identity.remote_content_fingerprint = Some(value.to_string());
+            }
             "rs" => {
                 identity.remote_size_bytes = value.trim().parse::<u64>().ok();
             }
-            "lh" => {
-                identity.last_clean_local_content_hash = Some(value.to_string());
+            "cf" => {
+                identity.clean_content_fingerprint = Some(value.to_string());
             }
             "pi" => {
                 identity.provider_instance_id = Uuid::parse_str(value.trim()).ok();
@@ -256,9 +268,9 @@ fn strip_to_after_root_name_case_insensitive<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlaceholderFileIdentity, decode_path_from_file_identity,
-        decode_placeholder_file_identity, encode_placeholder_file_identity,
-        encode_placeholder_file_identity_metadata, path_to_relative,
+        PlaceholderFileIdentity, decode_path_from_file_identity, decode_placeholder_file_identity,
+        encode_placeholder_file_identity, encode_placeholder_file_identity_metadata,
+        path_to_relative,
     };
     use std::path::Path;
     use uuid::Uuid;
@@ -327,9 +339,13 @@ mod tests {
         identity.remote_version = Some("v2".to_string());
         identity.remote_content_hash =
             Some("b47898c3f17e6f35f2f5f7e2a28c8d7fe6cb0a58b89ea4b1d172bc5342f0cb83".to_string());
+        identity.remote_content_fingerprint = Some(
+            "cfp-b47898c3f17e6f35f2f5f7e2a28c8d7fe6cb0a58b89ea4b1d172bc5342f0cb83".to_string(),
+        );
         identity.remote_size_bytes = Some(42);
-        identity.last_clean_local_content_hash =
-            Some("42f776f4d1b1e8ea8eaf9e3f7f3a814c8fdabf52c52c520909b7eb98d8eb4d2f".to_string());
+        identity.clean_content_fingerprint = Some(
+            "cfp-42f776f4d1b1e8ea8eaf9e3f7f3a814c8fdabf52c52c520909b7eb98d8eb4d2f".to_string(),
+        );
         identity.provider_instance_id =
             Some(Uuid::parse_str("0195ff90-a273-7ef4-9ea5-b2c6e6b99539").unwrap());
 

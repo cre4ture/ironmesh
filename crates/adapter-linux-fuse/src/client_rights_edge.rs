@@ -399,6 +399,7 @@ impl ClientRightsEdgeState {
                     kind: EntryKind::File,
                     version: local_version,
                     content_hash: Some(entry.content_hash.clone()),
+                    content_fingerprint: None,
                     size_bytes: Some(entry.size),
                 },
                 PinState::Pinned,

@@ -1,4 +1,7 @@
-use crate::runtime::{HydrationProgress, HydrationRequest, HydrationResult, Hydrator, Uploader};
+use crate::content_fingerprint::FingerprintingReader;
+use crate::runtime::{
+    HydrationProgress, HydrationRequest, HydrationResult, Hydrator, UploadReceipt, Uploader,
+};
 use anyhow::{Context, Result};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
@@ -111,12 +114,19 @@ impl Uploader for ServerNodeHydrator {
         path: &str,
         reader: &mut dyn std::io::Read,
         length: u64,
-    ) -> Result<Option<String>> {
+    ) -> Result<UploadReceipt> {
+        let mut fingerprinting_reader = FingerprintingReader::new(reader, length);
         self.sdk
-            .put_large_aware_reader(path.to_string(), reader, length)
+            .put_large_aware_reader(path.to_string(), &mut fingerprinting_reader, length)
             .with_context(|| format!("failed to upload object for path {path}"))?;
+        let clean_content_fingerprint = fingerprinting_reader
+            .finish()
+            .with_context(|| format!("failed to finalize content fingerprint for {path}"))?;
 
-        Ok(Some(format!("server-head:size={length}")))
+        Ok(UploadReceipt {
+            remote_version: Some(format!("server-head:size={length}")),
+            clean_content_fingerprint: Some(clean_content_fingerprint),
+        })
     }
 
     fn delete_path(&self, path: &str) -> Result<()> {

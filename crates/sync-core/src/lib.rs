@@ -26,6 +26,8 @@ pub struct NamespaceEntry {
     pub version: Option<String>,
     pub content_hash: Option<String>,
     #[serde(default)]
+    pub content_fingerprint: Option<String>,
+    #[serde(default)]
     pub size_bytes: Option<u64>,
 }
 
@@ -49,6 +51,7 @@ impl NamespaceEntry {
             kind: EntryKind::File,
             version: Some(version.into()),
             content_hash: Some(hash.into()),
+            content_fingerprint: None,
             size_bytes,
         }
     }
@@ -59,6 +62,7 @@ impl NamespaceEntry {
             kind: EntryKind::Directory,
             version: None,
             content_hash: None,
+            content_fingerprint: None,
             size_bytes: None,
         }
     }

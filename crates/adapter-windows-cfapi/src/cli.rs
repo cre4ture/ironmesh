@@ -16,7 +16,7 @@ use crate::connection_config::{persist_connection_config, resolve_connection_con
 use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
 use crate::placeholder_metadata::{
-    RemoteDeleteReconcileReport, record_in_sync_local_file_state, reconcile_remote_delete_state,
+    RemoteDeleteReconcileReport, reconcile_remote_delete_state, record_in_sync_remote_file_state,
 };
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
@@ -355,13 +355,12 @@ pub fn cli_main() -> anyhow::Result<()> {
                 "startup-scan: scanning {} for pre-existing files",
                 registration.root_path.display()
             );
-            let mut monitor =
-                SyncRootMonitor::new(
-                    "monitor",
-                    registration.root_path.clone(),
-                    sync_root_identity.provider_instance_id,
-                    uploader.clone(),
-                );
+            let mut monitor = SyncRootMonitor::new(
+                "monitor",
+                registration.root_path.clone(),
+                sync_root_identity.provider_instance_id,
+                uploader.clone(),
+            );
             monitor.seed_remote_entries_with_suppressed_paths(
                 &action_plan,
                 &startup_delete_report.suppressed_startup_paths,
@@ -502,13 +501,13 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
         if info.OnDiskDataSize >= total_size && info.ModifiedDataSize == 0 {
             match load_registered_sync_root_context(&root_path) {
                 Ok(Some(context)) => {
-                    if let Err(err) = record_in_sync_local_file_state(
+                    if let Err(err) = record_in_sync_remote_file_state(
                         &root_path,
                         &args.path,
                         context.identity.provider_instance_id,
                     ) {
                         tracing::warn!(
-                            "failed to record in-sync local file hash for pinned placeholder {}: {err:#}",
+                            "failed to record in-sync remote clean fingerprint for pinned placeholder {}: {err:#}",
                             target_path.display()
                         );
                     }

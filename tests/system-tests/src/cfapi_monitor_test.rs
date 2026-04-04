@@ -2,13 +2,13 @@
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Context;
     use crate::framework::{
         TEST_ADMIN_TOKEN, binary_path, default_client_identity_path, fresh_data_dir,
         https_client_with_root_from_data_dir, issue_bootstrap_bundle, start_authenticated_server,
         start_open_server_with_public_https_env, stop_server, stop_server_without_cleanup,
     };
     use crate::framework_win::{pin_cfapi_placeholder, start_cfapi_adapter_with_bootstrap};
+    use anyhow::Context;
     use bytes::Bytes;
     use client_sdk::{
         ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
@@ -1372,8 +1372,11 @@ mod tests {
     async fn test_cfapi_register_rejects_non_empty_first_time_folder() {
         let sync_root = fresh_data_dir("cfapi-non-empty-register-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
-        std::fs::write(sync_root.join("local-only.txt"), b"preexisting local content")
-            .expect("failed to seed pre-existing local file");
+        std::fs::write(
+            sync_root.join("local-only.txt"),
+            b"preexisting local content",
+        )
+        .expect("failed to seed pre-existing local file");
 
         let mut fixture = start_authenticated_cfapi_fixture(
             "127.0.0.1:19117",
