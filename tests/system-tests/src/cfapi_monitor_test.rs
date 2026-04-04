@@ -821,6 +821,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
     }
 
+    async fn run_cfapi_no_auto_hydration_after_restart_case(bind: &str, key: &str, payload: &[u8]) {
+        let sync_root = fresh_data_dir("cfapi-no-auto-hydration-restart-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-no-auto-hydration-restart")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
+
+        let path_parts: Vec<&str> = key.split('/').collect();
+        let mut current_dir = String::new();
+        for dir in path_parts.iter().take(path_parts.len() - 1) {
+            if !current_dir.is_empty() {
+                current_dir.push('/');
+            }
+            current_dir.push_str(dir);
+            let dir_key = format!("{current_dir}/");
+            fixture
+                .sdk
+                .put(dir_key, Bytes::new())
+                .await
+                .expect("failed to put folder");
+        }
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from(payload.to_vec()))
+            .await
+            .expect("failed to seed remote object");
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.no.auto.hydration.restart.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let mut adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test No Auto Hydration Restart Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let local_file = sync_root.join(key.replace('/', "\\"));
+        wait_for_path(&local_file, 220).await;
+        wait_for_placeholder_present(&local_file, 220).await;
+        wait_for_placeholder_in_sync(&local_file, 220).await;
+        wait_for_placeholder_dehydrated(&local_file, 80).await;
+        assert_placeholder_stays_dehydrated(
+            &local_file,
+            Duration::from_secs(4),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        stop_server_without_cleanup(&mut adapter).await;
+
+        let mut restarted_adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test No Auto Hydration Restart Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to restart CFAPI adapter");
+
+        wait_for_path(&local_file, 220).await;
+        wait_for_placeholder_present(&local_file, 220).await;
+        wait_for_placeholder_in_sync(&local_file, 220).await;
+        wait_for_placeholder_dehydrated(&local_file, 80).await;
+        assert_placeholder_stays_dehydrated(
+            &local_file,
+            Duration::from_secs(7),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        stop_server(&mut restarted_adapter).await;
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
     async fn run_cfapi_pin_hydration_case(bind: &str, key: &str, payload: &[u8]) {
         let sync_root = fresh_data_dir("cfapi-pin-hydration-sync-root");
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
@@ -1154,6 +1237,21 @@ mod tests {
         run_cfapi_pin_hydration_case(
             "127.0.0.1:19101",
             "hydrate/pinned-large.bin",
+            payload.as_bytes(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_placeholder_does_not_auto_hydrate_after_provider_restart() {
+        let payload = format!(
+            "{}{}",
+            "R".repeat(2 * 1024 * 1024),
+            "\nrestart-no-auto-hydration-tail"
+        );
+        run_cfapi_no_auto_hydration_after_restart_case(
+            "127.0.0.1:19114",
+            "hydrate/no-auto-hydrate-after-restart.bin",
             payload.as_bytes(),
         )
         .await;

@@ -183,6 +183,23 @@ impl PlaceholderSnapshot {
     }
 }
 
+fn should_schedule_placeholder_hydration(
+    previous_entry: Option<&SeenEntry>,
+    entry: &SeenEntry,
+    placeholder_state: PlaceholderSnapshot,
+) -> bool {
+    if !entry.has_pinned_attribute() || !placeholder_state.should_hydrate() {
+        return false;
+    }
+
+    let previous_was_hydrate_eligible = previous_entry
+        .filter(|previous| previous.has_pinned_attribute())
+        .and_then(|previous| previous.placeholder_state)
+        .is_some_and(PlaceholderSnapshot::should_hydrate);
+
+    previous_entry != Some(entry) && !previous_was_hydrate_eligible
+}
+
 pub struct SyncRootMonitor {
     name: String,
     sync_root: PathBuf,
@@ -738,6 +755,10 @@ impl SyncRootMonitor {
             return;
         }
 
+        if !should_schedule_placeholder_hydration(previous_entry, entry, placeholder_state) {
+            return;
+        }
+
         if previous_entry != Some(entry) {
             tracing::info!(
                 "{}: hydrate candidate accepted path={} snapshot={} raw_state={} action=request-provider-hydrate",
@@ -1277,5 +1298,62 @@ mod tests {
             ..partial_pinned
         };
         assert!(!fully_hydrated_pinned.should_hydrate());
+    }
+
+    #[test]
+    fn startup_seed_does_not_schedule_hydration_for_unchanged_pinned_placeholder() {
+        let pinned_partial = PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: CF_PIN_STATE_PINNED,
+            is_partial: true,
+        };
+        let entry = SeenEntry {
+            is_dir: false,
+            file_attributes: FILE_ATTRIBUTE_PINNED,
+            local_file_identity: None,
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: Some(pinned_partial),
+        };
+
+        assert!(
+            !should_schedule_placeholder_hydration(Some(&entry), &entry, pinned_partial),
+            "seeded startup snapshot should not auto-hydrate an unchanged pinned placeholder",
+        );
+    }
+
+    #[test]
+    fn monitor_only_schedules_hydration_when_entry_newly_becomes_eligible() {
+        let pinned_partial = PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: CF_PIN_STATE_PINNED,
+            is_partial: true,
+        };
+        let previous = SeenEntry {
+            is_dir: false,
+            file_attributes: 0,
+            local_file_identity: None,
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: None,
+        };
+        let current = SeenEntry {
+            is_dir: false,
+            file_attributes: FILE_ATTRIBUTE_PINNED,
+            local_file_identity: None,
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: Some(pinned_partial),
+        };
+
+        assert!(
+            should_schedule_placeholder_hydration(Some(&previous), &current, pinned_partial),
+            "a placeholder that newly becomes pinned and partially hydrated should be eligible",
+        );
+        assert!(
+            !should_schedule_placeholder_hydration(Some(&current), &current, pinned_partial),
+            "already-eligible placeholders should not reschedule hydration on every walk",
+        );
     }
 }
