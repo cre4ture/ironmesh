@@ -180,9 +180,11 @@ pub trait Uploader: Send + Sync + 'static {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, Clone)]
 pub struct DemoHydrator;
 
+#[cfg(test)]
 impl Hydrator for DemoHydrator {
     fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>> {
         Ok(
@@ -192,9 +194,11 @@ impl Hydrator for DemoHydrator {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, Clone)]
 pub struct DemoUploader;
 
+#[cfg(test)]
 impl Uploader for DemoUploader {
     fn upload_reader(
         &self,
