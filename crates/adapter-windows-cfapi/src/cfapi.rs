@@ -393,7 +393,7 @@ pub fn try_convert_materialized_file(
 ) {
     if path_is_placeholder(file_path) {
         tracing::info!(
-            "x: skipping convert for {} because placeholder state already present",
+            "convert-materialized: skipping convert for {} because placeholder state already present",
             rel_path
         );
         return;
@@ -417,24 +417,24 @@ pub fn try_convert_materialized_file(
             let result = cf_ensure_placeholder_identity(&fh_file, rel_path);
             if result.is_ok() {
                 tracing::info!(
-                    "x: converted materialized file to placeholder: {}",
+                    "convert-materialized: converted materialized file to placeholder: {}",
                     rel_path
                 );
             } else {
                 tracing::info!(
-                    "x: failed to convert materialized file to placeholder {}: {:?}",
+                    "convert-materialized: failed to convert materialized file to placeholder {}: {:?}",
                     rel_path,
                     result.err()
                 );
                 if let Ok(m) = std::fs::metadata(file_path) {
                     let attrs = m.file_attributes();
-                    tracing::info!("x: post-fail attrs=0x{:08x} size={}", attrs, m.len());
+                    tracing::info!("convert-materialized: post-fail attrs=0x{:08x} size={}", attrs, m.len());
                 }
             }
         }
         Err(err) => {
             tracing::info!(
-                "x: failed to open materialized file {} for conversion: {}",
+                "convert-materialized: failed to open materialized file {} for conversion: {}",
                 rel_path,
                 err
             );
