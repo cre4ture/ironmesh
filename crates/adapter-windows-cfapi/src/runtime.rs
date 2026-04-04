@@ -21,9 +21,8 @@ use crate::close_upload::{
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{
-    PlaceholderFileIdentity, decode_path_from_file_identity,
-    encode_placeholder_file_identity_metadata, normalize_path, path_to_relative, utf16_path,
-    utf16_string,
+    PlaceholderFileIdentity, decode_path_from_file_identity, normalize_path, path_to_relative,
+    utf16_path, utf16_string,
 };
 use crate::placeholder_metadata::{
     record_in_sync_remote_file_state, refresh_remote_placeholder_state,
@@ -430,7 +429,7 @@ pub fn create_placeholder(
     let wide: Vec<u16> = relative_name.encode_utf16().chain(Some(0)).collect();
     let mut identity = PlaceholderFileIdentity::new(rel_path);
     identity.provider_instance_id = Some(provider_instance_id);
-    let encoded_identity = encode_placeholder_file_identity_metadata(&identity);
+    let encoded_identity = identity.encoded();
     let mut create_info = CF_PLACEHOLDER_CREATE_INFO {
         RelativeFileName: wide.as_ptr(),
         Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
@@ -910,7 +909,7 @@ pub fn apply_action_plan(
                 base_dir,
                 child_name: child_name.to_string(),
                 relative_name_utf16: utf16_string(child_name),
-                identity: encode_placeholder_file_identity_metadata(&identity),
+                identity: identity.encoded(),
                 metadata,
             });
         }

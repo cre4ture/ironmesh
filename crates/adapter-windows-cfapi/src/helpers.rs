@@ -97,9 +97,6 @@ pub fn encode_placeholder_file_identity(
     identity.encoded()
 }
 
-pub fn encode_placeholder_file_identity_metadata(identity: &PlaceholderFileIdentity) -> Vec<u8> {
-    identity.encoded()
-}
 
 pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<PlaceholderFileIdentity> {
     let text = std::str::from_utf8(file_identity).ok()?;
@@ -269,8 +266,7 @@ fn strip_to_after_root_name_case_insensitive<'a>(
 mod tests {
     use super::{
         PlaceholderFileIdentity, decode_path_from_file_identity, decode_placeholder_file_identity,
-        encode_placeholder_file_identity, encode_placeholder_file_identity_metadata,
-        path_to_relative,
+        encode_placeholder_file_identity, path_to_relative,
     };
     use std::path::Path;
     use uuid::Uuid;
@@ -349,7 +345,7 @@ mod tests {
         identity.provider_instance_id =
             Some(Uuid::parse_str("0195ff90-a273-7ef4-9ea5-b2c6e6b99539").unwrap());
 
-        let encoded = encode_placeholder_file_identity_metadata(&identity);
+        let encoded = identity.encoded();
         let decoded =
             decode_placeholder_file_identity(&encoded).expect("extended metadata should decode");
 

@@ -9,8 +9,7 @@ use crate::cfapi::{
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::content_fingerprint::file_content_fingerprint;
 use crate::helpers::{
-    PlaceholderFileIdentity, decode_placeholder_file_identity,
-    encode_placeholder_file_identity_metadata, normalize_path, path_to_relative,
+    PlaceholderFileIdentity, decode_placeholder_file_identity, normalize_path, path_to_relative,
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use anyhow::{Context, Result};
@@ -255,7 +254,7 @@ fn mutate_placeholder_identity_for_path(
     if identity == original_identity {
         return Ok(());
     }
-    let encoded = encode_placeholder_file_identity_metadata(&identity);
+    let encoded = identity.encoded();
 
     match cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded) {
         Ok(()) => Ok(()),
