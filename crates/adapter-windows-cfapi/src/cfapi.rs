@@ -320,7 +320,7 @@ pub fn get_and_log_placeholder_info(
 }
 
 pub fn is_placeholder(file: &std::fs::File) -> bool {
-    get_and_log_placeholder_info(file, "", "").is_ok()
+    cf_get_placeholder_standard_info(file).is_ok()
 }
 
 pub fn path_placeholder_state(path: &Path) -> Result<CF_PLACEHOLDER_STATE> {
