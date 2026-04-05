@@ -30,9 +30,13 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByText("signed in", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(page.getByRole("cell", { name: "node-alpha", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "node-alpha", exact: true }).first()).toBeVisible();
   await expect(page.locator("td").filter({ hasText: /logical/ }).first()).toBeVisible();
   await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Replication progress" })).toBeVisible();
+  await expect(page.getByText("photos/cover.jpg", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 / 2 desired nodes currently present", { exact: true })).toBeVisible();
+  await expect(page.getByText("under replicated", { exact: true })).toBeVisible();
   await expect(
     page
       .getByRole("paragraph")

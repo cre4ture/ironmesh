@@ -10,6 +10,7 @@ import {
   getRecentLogs,
   getReplicationPlan,
   triggerReplicationRepair,
+  type ReplicationPlan,
   type StorageStatsSample
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
@@ -24,6 +25,7 @@ import {
   Group,
   Loader,
   Modal,
+  Progress,
   ScrollArea,
   Stack,
   Table,
@@ -215,13 +217,23 @@ export function DashboardPage() {
   const selectedStorageHistoryRange =
     STORAGE_HISTORY_RANGE_OPTIONS.find((option) => option.key === storageHistoryRange) ??
     STORAGE_HISTORY_RANGE_OPTIONS[0];
+  const replicationPlanEntries = replicationPlan
+    ? replicationPlan.items
+        .map((item) => ({
+          item,
+          status: getReplicationItemStatus(item),
+          progress: getReplicationItemProgress(item)
+        }))
+        .sort(compareReplicationPlanEntries)
+    : [];
 
   return (
     <Stack gap="lg">
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={680}>
           The dashboard focuses on the current cluster shape, replication pressure, and recent runtime output.
-          Refreshing keeps the cards fast, while the raw JSON blocks still make backend parity easy to inspect during migration.
+          Refreshing keeps the cards fast, while repair payloads and diagnostics still stay close to the backend during
+          the migration.
         </Text>
         <Group>
           <Button variant="default" onClick={() => void runRepair()} loading={repairPending}>
@@ -671,21 +683,6 @@ export function DashboardPage() {
             </Card>
             <Card withBorder radius="md" padding="lg">
               <Stack gap="sm">
-                <Group justify="space-between">
-                  <Text fw={700}>Replication plan</Text>
-                  <Badge variant="light">
-                    {replicationPlan ? formatUnixTs(replicationPlan.generated_at_unix) : "not loaded"}
-                  </Badge>
-                </Group>
-                <Text c="dimmed">Shows the current reconciliation view from the cluster leader perspective.</Text>
-                <JsonBlock value={replicationPlan ?? { status: "loading" }} />
-                <Divider />
-                <Text fw={600}>Last repair result</Text>
-                <JsonBlock value={repairResult ?? { status: "no repair pass triggered yet" }} />
-              </Stack>
-            </Card>
-            <Card withBorder radius="md" padding="lg">
-              <Stack gap="sm">
                 <Text fw={700}>Recent logs</Text>
                 <ScrollArea type="auto" mah={320}>
                   <Text ff="monospace" size="sm" style={{ whiteSpace: "pre-wrap" }}>
@@ -695,6 +692,170 @@ export function DashboardPage() {
               </Stack>
             </Card>
           </Stack>
+        </Grid.Col>
+        <Grid.Col span={12}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Group justify="space-between" align="flex-start">
+                <Stack gap={4}>
+                  <Text fw={700}>Replication plan</Text>
+                  <Text size="sm" c="dimmed">
+                    Lists only the subjects that still need repair or cleanup attention from the planner&apos;s point
+                    of view.
+                  </Text>
+                </Stack>
+                <Stack gap="xs" align="flex-end">
+                  <Badge variant="light">
+                    {replicationPlan ? formatUnixTs(replicationPlan.generated_at_unix) : "not loaded"}
+                  </Badge>
+                  <Badge
+                    variant="light"
+                    color={!replicationPlan ? "gray" : replicationPlanEntries.length === 0 ? "teal" : "orange"}
+                  >
+                    {replicationPlan
+                      ? `${replicationPlanEntries.length} attention item${replicationPlanEntries.length === 1 ? "" : "s"}`
+                      : "loading"}
+                  </Badge>
+                </Stack>
+              </Group>
+              {replicationPlan ? (
+                <Stack gap="md">
+                  <Group gap="xs">
+                    <Badge
+                      variant="light"
+                      color={replicationPlan.under_replicated > 0 ? "orange" : "teal"}
+                    >
+                      {replicationPlan.under_replicated} under-replicated
+                    </Badge>
+                    <Badge
+                      variant="light"
+                      color={replicationPlan.over_replicated > 0 ? "yellow" : "gray"}
+                    >
+                      {replicationPlan.over_replicated} cleanup recommended
+                    </Badge>
+                    <Badge
+                      variant="light"
+                      color={replicationPlan.cleanup_deferred_items > 0 ? "blue" : "gray"}
+                    >
+                      {replicationPlan.cleanup_deferred_items} cleanup deferred
+                    </Badge>
+                  </Group>
+
+                  {replicationPlanEntries.length > 0 ? (
+                    <Table.ScrollContainer minWidth={980}>
+                      <Table striped highlightOnHover withTableBorder>
+                        <Table.Thead>
+                          <Table.Tr>
+                            <Table.Th>Subject</Table.Th>
+                            <Table.Th>Status</Table.Th>
+                            <Table.Th>Replication progress</Table.Th>
+                            <Table.Th>Desired nodes</Table.Th>
+                            <Table.Th>Current nodes</Table.Th>
+                            <Table.Th>Cleanup</Table.Th>
+                          </Table.Tr>
+                        </Table.Thead>
+                        <Table.Tbody>
+                          {replicationPlanEntries.map(({ item, status, progress }) => (
+                            <Table.Tr key={item.key}>
+                              <Table.Td maw={240}>
+                                <Text
+                                  size="sm"
+                                  fw={600}
+                                  ff="monospace"
+                                  style={{ wordBreak: "break-word" }}
+                                >
+                                  {item.key}
+                                </Text>
+                              </Table.Td>
+                              <Table.Td miw={180}>
+                                <Stack gap={4}>
+                                  <Badge color={status.color} variant="light">
+                                    {status.label}
+                                  </Badge>
+                                  <Text size="xs" c="dimmed">
+                                    {status.detail}
+                                  </Text>
+                                </Stack>
+                              </Table.Td>
+                              <Table.Td miw={220}>
+                                <Stack gap={6}>
+                                  <Group gap="xs" wrap="nowrap">
+                                    <Progress
+                                      value={progress.percent}
+                                      color={status.color}
+                                      animated={progress.percent < 100}
+                                      style={{ flex: 1 }}
+                                    />
+                                    <Text size="xs" c="dimmed" miw={40}>
+                                      {progress.percent}%
+                                    </Text>
+                                  </Group>
+                                  <Text size="xs" c="dimmed">
+                                    {progress.present} / {progress.total} desired nodes currently present
+                                  </Text>
+                                  {item.missing_nodes.length > 0 ? (
+                                    <Stack gap={4}>
+                                      <Text size="xs" c="dimmed">
+                                        Missing nodes
+                                      </Text>
+                                      {renderNodeBadges(item.missing_nodes, "orange", "none")}
+                                    </Stack>
+                                  ) : null}
+                                </Stack>
+                              </Table.Td>
+                              <Table.Td miw={220}>
+                                {renderNodeBadges(item.desired_nodes, "blue", "none planned")}
+                              </Table.Td>
+                              <Table.Td miw={220}>
+                                {renderNodeBadges(item.current_nodes, "teal", "not stored anywhere")}
+                              </Table.Td>
+                              <Table.Td miw={220}>
+                                <Stack gap={6}>
+                                  <Badge
+                                    color={replicationCleanupColor(item.cleanup_option)}
+                                    variant="light"
+                                  >
+                                    {formatReplicationCleanupOption(item.cleanup_option)}
+                                  </Badge>
+                                  {item.extra_nodes.length > 0 ? (
+                                    <Stack gap={4}>
+                                      <Text size="xs" c="dimmed">
+                                        Extra nodes
+                                      </Text>
+                                      {renderNodeBadges(item.extra_nodes, "yellow", "none")}
+                                    </Stack>
+                                  ) : null}
+                                  {item.deferred_extra_nodes > 0 ? (
+                                    <Text size="xs" c="dimmed">
+                                      {item.deferred_extra_nodes} extra node
+                                      {item.deferred_extra_nodes === 1 ? "" : "s"} retained within tolerance.
+                                    </Text>
+                                  ) : item.cleanup_option === "none" ? (
+                                    <Text size="xs" c="dimmed">
+                                      No cleanup action pending.
+                                    </Text>
+                                  ) : null}
+                                </Stack>
+                              </Table.Td>
+                            </Table.Tr>
+                          ))}
+                        </Table.Tbody>
+                      </Table>
+                    </Table.ScrollContainer>
+                  ) : (
+                    <Alert color="teal" variant="light" title="Replication plan is healthy">
+                      The planner does not currently report any subjects that need repair or cleanup.
+                    </Alert>
+                  )}
+                </Stack>
+              ) : (
+                <Text c="dimmed">{loading ? "Loading replication plan..." : "Replication plan not loaded."}</Text>
+              )}
+              <Divider />
+              <Text fw={600}>Last repair result</Text>
+              <JsonBlock value={repairResult ?? { status: "no repair pass triggered yet" }} />
+            </Stack>
+          </Card>
         </Grid.Col>
       </Grid>
       <Modal
@@ -744,6 +905,140 @@ function firstErrorMessage(errors: Array<unknown>): string | null {
     return error instanceof Error ? error.message : String(error);
   }
   return null;
+}
+
+type ReplicationPlanItem = ReplicationPlan["items"][number];
+
+type ReplicationPlanEntry = {
+  item: ReplicationPlanItem;
+  status: {
+    label: string;
+    color: string;
+    detail: string;
+    severity: number;
+  };
+  progress: {
+    present: number;
+    total: number;
+    percent: number;
+  };
+};
+
+function compareReplicationPlanEntries(left: ReplicationPlanEntry, right: ReplicationPlanEntry): number {
+  if (left.status.severity !== right.status.severity) {
+    return left.status.severity - right.status.severity;
+  }
+  if (left.progress.percent !== right.progress.percent) {
+    return left.progress.percent - right.progress.percent;
+  }
+  return left.item.key.localeCompare(right.item.key);
+}
+
+function getReplicationItemStatus(item: ReplicationPlanItem): ReplicationPlanEntry["status"] {
+  if (item.missing_nodes.length > 0 && item.extra_nodes.length > 0) {
+    return {
+      label: "repair + cleanup",
+      color: "orange",
+      detail: `${item.missing_nodes.length} missing and ${item.extra_nodes.length} extra node${item.extra_nodes.length === 1 ? "" : "s"}`,
+      severity: 0
+    };
+  }
+
+  if (item.missing_nodes.length > 0) {
+    return {
+      label: "under replicated",
+      color: "orange",
+      detail: `${item.missing_nodes.length} desired node${item.missing_nodes.length === 1 ? "" : "s"} still missing`,
+      severity: 1
+    };
+  }
+
+  if (item.extra_nodes.length > 0) {
+    return {
+      label: "cleanup recommended",
+      color: "yellow",
+      detail: `${item.extra_nodes.length} extra node${item.extra_nodes.length === 1 ? "" : "s"} can be removed`,
+      severity: 2
+    };
+  }
+
+  if (item.deferred_extra_nodes > 0 || item.cleanup_option === "deferred_within_tolerance") {
+    return {
+      label: "cleanup deferred",
+      color: "blue",
+      detail: `${item.deferred_extra_nodes} extra node${item.deferred_extra_nodes === 1 ? "" : "s"} retained within tolerance`,
+      severity: 3
+    };
+  }
+
+  return {
+    label: "healthy",
+    color: "teal",
+    detail: "Desired placement is fully satisfied",
+    severity: 4
+  };
+}
+
+function getReplicationItemProgress(item: ReplicationPlanItem): ReplicationPlanEntry["progress"] {
+  const total = item.desired_nodes.length;
+  if (total === 0) {
+    return {
+      present: 0,
+      total: 0,
+      percent: 100
+    };
+  }
+
+  const present = Math.max(0, total - item.missing_nodes.length);
+  return {
+    present,
+    total,
+    percent: Math.max(0, Math.min(100, Math.round((present / total) * 100)))
+  };
+}
+
+function formatReplicationCleanupOption(option: ReplicationPlanItem["cleanup_option"]): string {
+  switch (option) {
+    case "recommended":
+      return "cleanup recommended";
+    case "deferred_within_tolerance":
+      return "cleanup deferred";
+    case "none":
+    default:
+      return "no cleanup";
+  }
+}
+
+function replicationCleanupColor(option: ReplicationPlanItem["cleanup_option"]): string {
+  switch (option) {
+    case "recommended":
+      return "yellow";
+    case "deferred_within_tolerance":
+      return "blue";
+    case "none":
+    default:
+      return "gray";
+  }
+}
+
+function renderNodeBadges(nodes: string[], color: string, emptyLabel: string) {
+  if (nodes.length === 0) {
+    return (
+      <Text size="xs" c="dimmed">
+        {emptyLabel}
+      </Text>
+    );
+  }
+
+  return (
+    <Group gap={6} wrap="wrap">
+      {nodes.map((node) => (
+        <Badge key={node} color={color} variant="light">
+          {node}
+        </Badge>
+      ))}
+    </Group>
+  );
 }
 
 function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {

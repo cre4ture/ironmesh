@@ -61,7 +61,7 @@ export type ReplicationPlan = {
     current_nodes: string[];
     missing_nodes: string[];
     extra_nodes: string[];
-    cleanup_option: string;
+    cleanup_option: "none" | "deferred_within_tolerance" | "recommended";
     deferred_extra_nodes: number;
   }>;
 };
