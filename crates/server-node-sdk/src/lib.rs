@@ -12479,7 +12479,7 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
 const ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
 const ADMIN_ACTOR_HEADER: &str = "x-ironmesh-admin-actor";
 const ADMIN_SOURCE_NODE_HEADER: &str = "x-ironmesh-node-id";
-const ADMIN_SESSION_COOKIE: &str = "ironmesh_admin_session";
+const ADMIN_SESSION_COOKIE_PREFIX: &str = "ironmesh_admin_session";
 
 #[derive(Debug, Clone)]
 struct AdminRequestMetadata {
@@ -12520,7 +12520,7 @@ fn parse_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 async fn current_admin_session_expiry(state: &ServerState, headers: &HeaderMap) -> Option<u64> {
-    let session_id = parse_cookie_value(headers, ADMIN_SESSION_COOKIE)?;
+    let session_id = parse_cookie_value(headers, &admin_session_cookie_name(state))?;
     let mut sessions = state.admin_sessions.lock().await;
     sessions.is_valid(&session_id, unix_ts())
 }
@@ -12530,13 +12530,18 @@ fn password_hash_matches(expected_hash: &str, password: &str) -> bool {
     constant_time_eq(expected_hash.as_bytes(), provided_hash.as_bytes())
 }
 
+fn admin_session_cookie_name(state: &ServerState) -> String {
+    format!("{ADMIN_SESSION_COOKIE_PREFIX}_{}", state.node_id.simple())
+}
+
 fn build_admin_session_cookie(
+    cookie_name: &str,
     session_id: &str,
     secure: bool,
     max_age_secs: u64,
 ) -> Result<HeaderValue> {
     let mut cookie = format!(
-        "{ADMIN_SESSION_COOKIE}={session_id}; Path=/; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax"
+        "{cookie_name}={session_id}; Path=/; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax"
     );
     if secure {
         cookie.push_str("; Secure");
@@ -12544,8 +12549,8 @@ fn build_admin_session_cookie(
     HeaderValue::from_str(&cookie).context("failed building admin session cookie header")
 }
 
-fn clear_admin_session_cookie(secure: bool) -> Result<HeaderValue> {
-    let mut cookie = format!("{ADMIN_SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+fn clear_admin_session_cookie(cookie_name: &str, secure: bool) -> Result<HeaderValue> {
+    let mut cookie = format!("{cookie_name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -12667,7 +12672,9 @@ async fn login_admin_session(
         let mut sessions = state.admin_sessions.lock().await;
         sessions.create_session(unix_ts())
     };
+    let cookie_name = admin_session_cookie_name(&state);
     let cookie = match build_admin_session_cookie(
+        &cookie_name,
         &session_id,
         state.public_tls_runtime.is_some(),
         ADMIN_SESSION_TTL_SECS,
@@ -12727,13 +12734,15 @@ async fn logout_admin_session(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let session_id = parse_cookie_value(&headers, ADMIN_SESSION_COOKIE);
+    let cookie_name = admin_session_cookie_name(&state);
+    let session_id = parse_cookie_value(&headers, &cookie_name);
     if let Some(session_id) = session_id.as_deref() {
         let mut sessions = state.admin_sessions.lock().await;
         sessions.revoke(session_id);
     }
 
-    let cookie = match clear_admin_session_cookie(state.public_tls_runtime.is_some()) {
+    let cookie = match clear_admin_session_cookie(&cookie_name, state.public_tls_runtime.is_some())
+    {
         Ok(cookie) => cookie,
         Err(err) => {
             return (

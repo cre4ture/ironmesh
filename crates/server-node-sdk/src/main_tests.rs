@@ -1741,7 +1741,8 @@ async fn admin_password_login_creates_session_cookie() {
         .and_then(|value| value.to_str().ok())
         .unwrap()
         .to_string();
-    assert!(set_cookie.contains("ironmesh_admin_session="));
+    let expected_cookie_name = format!("ironmesh_admin_session_{}", state.node_id.simple());
+    assert!(set_cookie.contains(&format!("{expected_cookie_name}=")));
     assert!(set_cookie.contains("HttpOnly"));
 
     cleanup_test_state(&state).await;
@@ -1778,6 +1779,82 @@ async fn admin_session_cookie_authorizes_admin_request() {
     assert_eq!(response.status(), StatusCode::OK);
 
     cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn admin_session_cookies_are_isolated_per_node() {
+    let mut node_a = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let mut node_b = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    node_a.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
+    node_b.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
+
+    let login_a = super::login_admin_session(
+        State(node_a.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "super-secret-password".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let login_b = super::login_admin_session(
+        State(node_b.clone()),
+        HeaderMap::new(),
+        Json(super::AdminLoginRequest {
+            password: "super-secret-password".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+
+    let cookie_a = login_a
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let cookie_b = login_b
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    assert_ne!(cookie_a, cookie_b);
+    assert!(cookie_a.starts_with(&format!(
+        "ironmesh_admin_session_{}=",
+        node_a.node_id.simple()
+    )));
+    assert!(cookie_b.starts_with(&format!(
+        "ironmesh_admin_session_{}=",
+        node_b.node_id.simple()
+    )));
+
+    let mut combined_headers = HeaderMap::new();
+    combined_headers.insert(
+        axum::http::header::COOKIE,
+        format!("{cookie_a}; {cookie_b}").parse().unwrap(),
+    );
+
+    let response_a =
+        super::list_client_credentials(State(node_a.clone()), combined_headers.clone())
+            .await
+            .into_response();
+    assert_eq!(response_a.status(), StatusCode::OK);
+
+    let response_b = super::list_client_credentials(State(node_b.clone()), combined_headers)
+        .await
+        .into_response();
+    assert_eq!(response_b.status(), StatusCode::OK);
+
+    cleanup_test_state(&node_a).await;
+    cleanup_test_state(&node_b).await;
 }
 
 #[tokio::test]
