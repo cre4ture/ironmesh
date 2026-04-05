@@ -233,7 +233,7 @@ if ($Install) {
         -Thumbprint $certificate.Thumbprint
 
     Write-Step "Installing package"
-    Add-AppxPackage -Path $packagePath
+    Add-AppxPackage -Path $packagePath -ForceApplicationShutdown
 }
 
 Write-Host ""

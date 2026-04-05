@@ -329,12 +329,16 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     ]
 }
 
+fn rgba_to_bgra(color: [u8; 4]) -> [u8; 4] {
+    [color[2], color[1], color[0], color[3]]
+}
+
 fn put_pixel(buffer: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4]) {
     if x >= size || y >= size {
         return;
     }
     let offset = (y * size + x) * 4;
-    buffer[offset..offset + 4].copy_from_slice(&color);
+    buffer[offset..offset + 4].copy_from_slice(&rgba_to_bgra(color));
 }
 
 fn draw_line(
@@ -428,5 +432,11 @@ mod tests {
     fn prototype_bitmap_is_opaque() {
         let pixels = prototype_bgra_pixels(64);
         assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn prototype_bitmap_writes_pixels_in_bgra_order() {
+        let pixels = prototype_bgra_pixels(64);
+        assert_eq!(&pixels[..4], &[70, 48, 24, 255]);
     }
 }

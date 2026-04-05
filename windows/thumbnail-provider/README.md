@@ -92,7 +92,7 @@ The helper will:
   - create/reuse a self-signed developer certificate
   - generate an `.msix`
   - sign it
-  - optionally install it with `Add-AppxPackage`
+  - optionally install it with `Add-AppxPackage -ForceApplicationShutdown`
 
 Notes:
 
@@ -100,6 +100,33 @@ Notes:
 - `-StageOnly` is the safest way to verify the prototype package contents today
 - full `.msix` packing and signing now work on a machine with the Windows SDK tools available
 - `-Install` is optional and may require both the usual Windows developer/sideloading settings and an elevated PowerShell so the self-signed cert can be imported into `Cert:\LocalMachine\TrustedPeople`
+
+## Install and Reinstall Workflow
+
+Use this when iterating on the thumbnail provider DLL, the manifest, or the packaged `os-integration.exe`.
+
+1. Build, pack, sign, and install from an elevated PowerShell:
+   - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install`
+2. Start the packaged host from the installed package location:
+   - `$pkg = Get-AppxPackage Ironmesh.ThumbnailProvider.Prototype`
+   - `$exe = Join-Path $pkg.InstallLocation 'os-integration.exe'`
+   - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
+3. If you changed any packaged content and Windows reports `0x80073CFB`, bump the package version in `windows/thumbnail-provider/AppxManifest.xml`:
+   - update `<Identity ... Version="...">`
+   - reinstall with the helper script
+4. If Windows reports `0x80073D02`, the installed package is still loaded by Explorer, `dllhost.exe`, or the packaged `os-integration.exe`:
+   - the helper now installs with `Add-AppxPackage -ForceApplicationShutdown`, which is usually enough
+   - if that still fails, stop the packaged host if it is running, restart Explorer, and rerun the helper
+   - example fallback:
+     - `Stop-Process -Name explorer -Force`
+     - `Start-Process explorer.exe`
+5. After a successful reinstall, start the packaged `os-integration.exe` again from the installed package location before testing Explorer integration.
+
+Why the version bump matters:
+
+- Windows treats `Name + Publisher + Version` as the package identity
+- reinstalling different contents under the same identity is blocked
+- increasing the version is the normal way to publish the next local prototype build
 
 ## Diagnostics
 
