@@ -6,7 +6,7 @@ use crate::cfapi_safe_wrap::{
 };
 use crate::helpers::{encode_placeholder_file_identity, hresult_nonneg};
 use anyhow::{Context, Result};
-use std::mem::size_of;
+use std::mem::offset_of;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
@@ -38,7 +38,7 @@ impl PlaceholderStandardInfo {
             return &[];
         }
 
-        let offset = size_of::<CF_PLACEHOLDER_STANDARD_INFO>() - 1;
+        let offset = offset_of!(CF_PLACEHOLDER_STANDARD_INFO, FileIdentity);
         let available = self.raw.len().saturating_sub(offset);
         let clamped_len = len.min(available);
         &self.raw[offset..offset + clamped_len]
@@ -439,5 +439,28 @@ pub fn try_convert_materialized_file(
                 err
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlaceholderStandardInfo;
+    use std::mem::{offset_of, size_of};
+    use windows_sys::Win32::Storage::CloudFilters::CF_PLACEHOLDER_STANDARD_INFO;
+
+    #[test]
+    fn placeholder_standard_info_reads_identity_from_field_offset() {
+        let identity = b"v=2\np=docs/readme.txt";
+        let mut raw = vec![0u8; size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + identity.len()];
+        let offset = offset_of!(CF_PLACEHOLDER_STANDARD_INFO, FileIdentity);
+        raw[offset..offset + identity.len()].copy_from_slice(identity);
+
+        let info = CF_PLACEHOLDER_STANDARD_INFO {
+            FileIdentityLength: identity.len() as u32,
+            ..Default::default()
+        };
+        let placeholder_info = PlaceholderStandardInfo::from_parts(info, raw);
+
+        assert_eq!(placeholder_info.file_identity(), identity);
     }
 }
