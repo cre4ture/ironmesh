@@ -45,7 +45,11 @@ mod tests {
         FILE_SHARE_WRITE, FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
         OPEN_EXISTING, WIN32_FIND_STREAM_DATA,
     };
-    use windows_thumbnail_provider::debug_fetch_thumbnail_for_source_path;
+    use windows_sys::Win32::UI::Shell::{WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION};
+    use windows_thumbnail_provider::{
+        DebugThumbnailOutcome, debug_fetch_thumbnail_for_source_path,
+        debug_thumbnail_outcome_for_source_path,
+    };
 
     const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "ironmesh-client-bootstrap.json";
     const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
@@ -2486,6 +2490,281 @@ mod tests {
         let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
 
         result.expect("thumbnail provider should surface unauthorized errors without identity");
+    }
+
+    #[tokio::test]
+    async fn test_thumbnail_provider_reports_failed_extraction_for_unsupported_placeholder() {
+        let bind = "127.0.0.1:19116";
+        let base_url = format!("https://{bind}");
+        let admin_token = "system-tests-admin-secret";
+        let server_data_dir = fresh_data_dir("cfapi-thumbnail-provider-unsupported-server");
+        let sync_root = fresh_data_dir("cfapi-thumbnail-provider-unsupported-sync-root");
+        let local_appdata_root = actual_local_appdata_root();
+        let local_appdata_state_dir =
+            local_appdata_sync_root_state_dir(&local_appdata_root, &sync_root);
+        let local_appdata_bootstrap =
+            local_appdata_connection_bootstrap_path(&local_appdata_root, &sync_root);
+        let local_appdata_identity =
+            local_appdata_client_identity_path(&local_appdata_root, &sync_root);
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
+        let rendezvous_urls = base_url.clone();
+
+        let mut server = start_open_server_with_public_https_env(
+            bind,
+            &server_data_dir,
+            "",
+            1,
+            &[
+                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+                ("IRONMESH_ADMIN_TOKEN", admin_token),
+                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+            ],
+        )
+        .await
+        .expect("failed to start auth-enabled server-node");
+
+        let result = async {
+            let http = https_client_with_root_from_data_dir(&server_data_dir)?;
+            let bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                admin_token,
+                Some("cfapi-thumbnail-provider-unsupported"),
+                Some(600),
+            )
+            .await?;
+
+            let client_config_dir =
+                server_data_dir.join("client-config-thumbnail-provider-unsupported");
+            std::fs::create_dir_all(&client_config_dir)
+                .expect("failed to create client config dir");
+            let bootstrap_file = client_config_dir.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+            bootstrap
+                .write_to_path(&bootstrap_file)
+                .expect("failed to write bootstrap bundle");
+
+            let sync_root_id = format!(
+                "ironmesh.systemtest.thumbnail.provider.unsupported.{}",
+                bind.replace(['.', ':'], "_")
+            );
+            let mut adapter = start_cfapi_adapter_with_bootstrap(
+                &sync_root_id,
+                "ironmesh System Test Thumbnail Provider Unsupported Root",
+                &sync_root,
+                500,
+                &bootstrap_file,
+            )
+            .await?;
+
+            wait_for_path(&local_appdata_bootstrap, 120).await;
+            wait_for_path(&local_appdata_identity, 120).await;
+
+            let thumbnail_client = {
+                let bootstrap_path = local_appdata_bootstrap.clone();
+                let identity_path = local_appdata_identity.clone();
+                tokio::task::spawn_blocking(move || {
+                    let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)
+                        .expect("failed to load persisted LocalAppData bootstrap");
+                    let identity = ClientIdentityMaterial::from_path(&identity_path)
+                        .expect("failed to load persisted LocalAppData client identity");
+                    bootstrap
+                        .build_client_with_identity(&identity)
+                        .expect("failed to build authenticated thumbnail test client")
+                })
+                .await
+                .expect("thumbnail client builder task should join")
+            };
+
+            thumbnail_client
+                .put_large_aware(
+                    "docs/no-thumbnail.txt",
+                    Bytes::from_static(b"thumbnail system test unsupported"),
+                )
+                .await
+                .expect("failed to seed remote unsupported file");
+
+            let local_file = sync_root.join("docs").join("no-thumbnail.txt");
+            wait_for_path(&local_file, 250).await;
+            wait_for_placeholder_present(&local_file, 220).await;
+            wait_for_placeholder_in_sync(&local_file, 220).await;
+            wait_for_placeholder_dehydrated(&local_file, 120).await;
+
+            let source_path = local_file.to_string_lossy().to_string();
+            let outcome = tokio::task::spawn_blocking(move || {
+                debug_thumbnail_outcome_for_source_path(&source_path, 256)
+            })
+            .await
+            .expect("thumbnail provider debug outcome task should join");
+
+            match outcome {
+                DebugThumbnailOutcome::Failure(failure) => {
+                    assert_eq!(failure.error_kind, "failed-extraction");
+                    assert_eq!(failure.hresult, WTS_E_FAILEDEXTRACTION);
+                    assert!(
+                        failure.message.contains("thumbnail not available"),
+                        "expected no-thumbnail failure message, got: {}",
+                        failure.message
+                    );
+                }
+                DebugThumbnailOutcome::Success(success) => {
+                    panic!(
+                        "unsupported placeholder should not resolve a thumbnail: {:?}",
+                        success
+                    );
+                }
+            }
+
+            stop_server(&mut adapter).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = std::fs::remove_dir_all(&server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
+
+        result.expect(
+            "thumbnail provider should classify unsupported placeholders as failed extraction",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thumbnail_provider_reports_extraction_pending_when_server_is_unreachable() {
+        let bind = "127.0.0.1:19117";
+        let base_url = format!("https://{bind}");
+        let admin_token = "system-tests-admin-secret";
+        let server_data_dir = fresh_data_dir("cfapi-thumbnail-provider-pending-server");
+        let sync_root = fresh_data_dir("cfapi-thumbnail-provider-pending-sync-root");
+        let local_appdata_root = actual_local_appdata_root();
+        let local_appdata_state_dir =
+            local_appdata_sync_root_state_dir(&local_appdata_root, &sync_root);
+        let local_appdata_bootstrap =
+            local_appdata_connection_bootstrap_path(&local_appdata_root, &sync_root);
+        let local_appdata_identity =
+            local_appdata_client_identity_path(&local_appdata_root, &sync_root);
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
+        let rendezvous_urls = base_url.clone();
+
+        let mut server = start_open_server_with_public_https_env(
+            bind,
+            &server_data_dir,
+            "",
+            1,
+            &[
+                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+                ("IRONMESH_ADMIN_TOKEN", admin_token),
+                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+            ],
+        )
+        .await
+        .expect("failed to start auth-enabled server-node");
+
+        let result = async {
+            let http = https_client_with_root_from_data_dir(&server_data_dir)?;
+            let bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                admin_token,
+                Some("cfapi-thumbnail-provider-pending"),
+                Some(600),
+            )
+            .await?;
+
+            let client_config_dir =
+                server_data_dir.join("client-config-thumbnail-provider-pending");
+            std::fs::create_dir_all(&client_config_dir)
+                .expect("failed to create client config dir");
+            let bootstrap_file = client_config_dir.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+            bootstrap
+                .write_to_path(&bootstrap_file)
+                .expect("failed to write bootstrap bundle");
+
+            let sync_root_id = format!(
+                "ironmesh.systemtest.thumbnail.provider.pending.{}",
+                bind.replace(['.', ':'], "_")
+            );
+            let mut adapter = start_cfapi_adapter_with_bootstrap(
+                &sync_root_id,
+                "ironmesh System Test Thumbnail Provider Pending Root",
+                &sync_root,
+                500,
+                &bootstrap_file,
+            )
+            .await?;
+
+            wait_for_path(&local_appdata_bootstrap, 120).await;
+            wait_for_path(&local_appdata_identity, 120).await;
+
+            let thumbnail_client = {
+                let bootstrap_path = local_appdata_bootstrap.clone();
+                let identity_path = local_appdata_identity.clone();
+                tokio::task::spawn_blocking(move || {
+                    let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)
+                        .expect("failed to load persisted LocalAppData bootstrap");
+                    let identity = ClientIdentityMaterial::from_path(&identity_path)
+                        .expect("failed to load persisted LocalAppData client identity");
+                    bootstrap
+                        .build_client_with_identity(&identity)
+                        .expect("failed to build authenticated thumbnail test client")
+                })
+                .await
+                .expect("thumbnail client builder task should join")
+            };
+
+            thumbnail_client
+                .put_large_aware("gallery/retry-later.png", Bytes::from(sample_png_bytes()))
+                .await
+                .expect("failed to seed remote image");
+
+            let local_file = sync_root.join("gallery").join("retry-later.png");
+            wait_for_path(&local_file, 250).await;
+            wait_for_placeholder_present(&local_file, 220).await;
+            wait_for_placeholder_in_sync(&local_file, 220).await;
+            wait_for_placeholder_dehydrated(&local_file, 120).await;
+
+            stop_server(&mut server).await;
+
+            let source_path = local_file.to_string_lossy().to_string();
+            let outcome = tokio::task::spawn_blocking(move || {
+                debug_thumbnail_outcome_for_source_path(&source_path, 256)
+            })
+            .await
+            .expect("thumbnail provider debug outcome task should join");
+
+            match outcome {
+                DebugThumbnailOutcome::Failure(failure) => {
+                    assert_eq!(failure.error_kind, "extraction-pending");
+                    assert_eq!(failure.hresult, WTS_E_EXTRACTIONPENDING);
+                    assert!(
+                        failure.message.contains("request failed"),
+                        "expected transient request failure message, got: {}",
+                        failure.message
+                    );
+                }
+                DebugThumbnailOutcome::Success(success) => {
+                    panic!(
+                        "unreachable server should not resolve a thumbnail: {:?}",
+                        success
+                    );
+                }
+            }
+
+            stop_server(&mut adapter).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = std::fs::remove_dir_all(&server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
+
+        result.expect(
+            "thumbnail provider should classify transient connection failures as extraction pending",
+        );
     }
 
     #[tokio::test]

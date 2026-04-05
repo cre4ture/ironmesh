@@ -11,7 +11,8 @@ Current status:
   - `IClassFactory`
 - it now tries to fetch the real media thumbnail for the placeholder's remote object without hydrating the placeholder itself
 - it uses the sync root registration plus per-sync-root state under `%LocalAppData%\Ironmesh\sync-roots\...` for the persisted connection bootstrap and client identity
-- if the server has no thumbnail, the sync root is not fully configured, or the thumbnail request fails, it falls back to the fixed Ironmesh-branded bitmap
+- if the server has no thumbnail or the request fails permanently, the provider now lets Explorer keep the normal file-type icon instead of replacing it with a dummy bitmap
+- if the thumbnail request fails transiently, the provider returns a retry-later shell status so Explorer can ask again
 - the package scaffold in this folder is the Explorer/MSIX side of the prototype
 
 ## Files
@@ -59,7 +60,7 @@ The manifest currently points the `Application` executable at `os-integration.ex
    - Later runs for the same sync root can omit `--bootstrap-file`.
 7. Restart Explorer.
 8. Open an Ironmesh sync root in large-icon view and confirm that dehydrated placeholders use the real server thumbnail when available.
-9. If a file type has no generated thumbnail yet, expect the fallback Ironmesh-branded bitmap instead.
+9. If a file type has no generated thumbnail yet, expect Explorer's normal file-type icon rather than an Ironmesh-branded fallback image.
 
 Why this matters:
 
@@ -75,7 +76,7 @@ That is still intentionally incremental:
 
 - Explorer must load the packaged thumbnail handler
 - the handler should return real thumbnails for supported media without hydrating placeholders
-- unsupported or unavailable thumbnails should degrade cleanly to the branded fallback
+- unsupported or unavailable thumbnails should degrade cleanly to Explorer's normal iconography
 - packaging/install remains script-driven for now
 
 ## Helper script
@@ -149,7 +150,8 @@ Useful signals:
 - if `thumbnail-auth ... identity_state=load-error ...` appears there, the handler found an identity candidate but could not load it successfully
 - if `GetThumbnail` appears there, Explorer is loading the packaged thumbnail handler
 - if `thumbnail-fetch remote_key=...` appears there, the handler successfully resolved a sync root, built a client, and downloaded thumbnail bytes from the server
-- if `GetThumbnail source=fallback ... error=...` appears there, the handler could not produce a real thumbnail and used the branded fallback instead
+- if `GetThumbnail source=error ... error_kind=failed-extraction ...` appears there, the handler declined to provide a thumbnail and Explorer should keep the normal icon or other shell fallback
+- if `GetThumbnail source=error ... error_kind=extraction-pending ...` appears there, the handler treated the failure as temporary and asked Explorer to retry later
 - if the log stays empty while browsing a dehydrated placeholder folder in large-icon view, the packaged handler is still not being invoked
 
 ## What you need installed for MSIX

@@ -24,7 +24,7 @@ use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
 use image::{DynamicImage, RgbaImage};
 use reqwest::{StatusCode, Url};
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_NOINTERFACE, E_POINTER, S_FALSE,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_POINTER, S_FALSE,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, HBITMAP,
@@ -32,7 +32,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{CoTaskMemFree, IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::Shell::{
     IInitializeWithItem, IInitializeWithItem_Impl, IShellItem, IThumbnailProvider,
-    IThumbnailProvider_Impl, SIGDN_FILESYSPATH, WTS_ALPHATYPE, WTSAT_ARGB,
+    IThumbnailProvider_Impl, SIGDN_FILESYSPATH, WTS_ALPHATYPE, WTS_E_EXTRACTIONPENDING,
+    WTS_E_FAILEDEXTRACTION, WTSAT_ARGB, WTSAT_UNKNOWN,
 };
 use windows_core::{BOOL, GUID, HRESULT, IUnknown, Interface, PWSTR, Ref, Result, implement};
 
@@ -66,6 +67,81 @@ pub struct DebugThumbnailFetchResult {
     pub decoded_width: u32,
     pub decoded_height: u32,
 }
+
+#[derive(Debug, Clone)]
+pub struct DebugThumbnailFailure {
+    pub error_kind: String,
+    pub hresult: i32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum DebugThumbnailOutcome {
+    Success(DebugThumbnailFetchResult),
+    Failure(DebugThumbnailFailure),
+}
+
+type ThumbnailProviderResult<T> = std::result::Result<T, ThumbnailProviderError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThumbnailFailureKind {
+    Permanent,
+    RetryLater,
+}
+
+#[derive(Debug)]
+struct ThumbnailProviderError {
+    kind: ThumbnailFailureKind,
+    error: anyhow::Error,
+}
+
+impl ThumbnailProviderError {
+    fn permanent(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ThumbnailFailureKind::Permanent,
+            error: error.into(),
+        }
+    }
+
+    fn retry_later(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ThumbnailFailureKind::RetryLater,
+            error: error.into(),
+        }
+    }
+
+    fn with_context<C>(self, context: C) -> Self
+    where
+        C: std::fmt::Display + Send + Sync + 'static,
+    {
+        Self {
+            kind: self.kind,
+            error: self.error.context(context),
+        }
+    }
+
+    fn hresult(&self) -> HRESULT {
+        match self.kind {
+            ThumbnailFailureKind::Permanent => WTS_E_FAILEDEXTRACTION,
+            ThumbnailFailureKind::RetryLater => WTS_E_EXTRACTIONPENDING,
+        }
+    }
+
+    fn kind_label(&self) -> &'static str {
+        match self.kind {
+            ThumbnailFailureKind::Permanent => "failed-extraction",
+            ThumbnailFailureKind::RetryLater => "extraction-pending",
+        }
+    }
+}
+
+impl std::fmt::Display for ThumbnailProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for ThumbnailProviderError {}
 
 #[implement(IInitializeWithItem, IThumbnailProvider)]
 struct IronmeshThumbnailProvider {
@@ -196,6 +272,11 @@ impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
             return Err(E_POINTER.into());
         }
 
+        unsafe {
+            *phbmp = HBITMAP::default();
+            *pdwalpha = WTSAT_UNKNOWN;
+        }
+
         log_provider_banner_once();
         let clamped_size = cx.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE);
         let source_path = self
@@ -218,12 +299,16 @@ impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
                 bitmap
             }
             Err(error) => {
+                let hresult = error.hresult();
                 append_diagnostic_log(&format!(
-                    "GetThumbnail source=fallback size={} source_path={} error={:#}",
-                    clamped_size, source_path, error
+                    "GetThumbnail source=error size={} source_path={} error_kind={} hresult=0x{:08X} error={:#}",
+                    clamped_size,
+                    source_path,
+                    error.kind_label(),
+                    hresult.0 as u32,
+                    error
                 ));
-                unsafe { create_prototype_bitmap(clamped_size) }
-                    .map_err(|error| windows_core::Error::new(E_FAIL, format!("{error:#}")))?
+                return Err(windows_core::Error::new(hresult, format!("{error:#}")));
             }
         };
 
@@ -358,18 +443,19 @@ fn pwstr_to_string(value: PWSTR) -> Option<String> {
 fn try_create_real_thumbnail_bitmap(
     source_path: &str,
     requested_size: u32,
-) -> AnyhowResult<HBITMAP> {
+) -> ThumbnailProviderResult<HBITMAP> {
     let fetched = fetch_thumbnail_for_source_path(source_path)
-        .with_context(|| "failed to resolve thumbnail")?;
+        .map_err(|error| error.with_context("failed to resolve thumbnail"))?;
     create_bitmap_from_thumbnail_bytes(
         &fetched.thumbnail_bytes,
         requested_size.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE),
     )
-    .with_context(|| {
-        format!(
+    .map_err(ThumbnailProviderError::permanent)
+    .map_err(|error| {
+        error.with_context(format!(
             "failed to decode thumbnail payload for {}",
             fetched.remote_key
-        )
+        ))
     })
 }
 
@@ -394,10 +480,40 @@ struct FetchedThumbnail {
     thumbnail_bytes: Vec<u8>,
 }
 
+fn build_debug_fetch_result(
+    fetched: FetchedThumbnail,
+    requested_size: u32,
+) -> AnyhowResult<DebugThumbnailFetchResult> {
+    let decoded = resize_for_requested_size(
+        image::load_from_memory(&fetched.thumbnail_bytes)
+            .context("failed to decode thumbnail image")?,
+        requested_size.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE),
+    );
+    Ok(DebugThumbnailFetchResult {
+        remote_key: fetched.remote_key,
+        request_path: fetched.request_path,
+        bootstrap_path: fetched.bootstrap_path,
+        identity_path: fetched.client_build.selected_path,
+        candidate_identity_paths: fetched.client_build.candidate_paths,
+        auth_mode: fetched.client_build.auth_mode.to_string(),
+        payload_len: fetched.thumbnail_bytes.len(),
+        decoded_width: decoded.width(),
+        decoded_height: decoded.height(),
+    })
+}
+
+fn debug_failure_from_error(error: ThumbnailProviderError) -> DebugThumbnailFailure {
+    DebugThumbnailFailure {
+        error_kind: error.kind_label().to_string(),
+        hresult: error.hresult().0,
+        message: format!("{error:#}"),
+    }
+}
+
 fn build_thumbnail_client(
     sync_root_path: &Path,
     resolved: &adapter_windows_cfapi::connection_config::ResolvedConnectionConfig,
-) -> AnyhowResult<ThumbnailClientBuild> {
+) -> ThumbnailProviderResult<ThumbnailClientBuild> {
     match load_thumbnail_client_identity(sync_root_path, &resolved.bootstrap_path) {
         Ok(identity_load) => {
             let candidate_paths = format_path_list(&identity_load.candidate_paths);
@@ -493,11 +609,12 @@ fn build_thumbnail_client(
             candidate_paths: discovery.candidate_paths,
             selected_path: discovery.selected_path,
         })
-        .with_context(|| {
-            format!(
+        .map_err(ThumbnailProviderError::permanent)
+        .map_err(|error| {
+            error.with_context(format!(
                 "failed to build anonymous client for thumbnail requests using bootstrap {}",
                 resolved.bootstrap_path.display()
-            )
+            ))
         })
 }
 
@@ -523,37 +640,56 @@ fn load_thumbnail_client_identity(
     })
 }
 
-fn fetch_thumbnail_for_source_path(source_path: &str) -> AnyhowResult<FetchedThumbnail> {
+fn fetch_thumbnail_for_source_path(source_path: &str) -> ThumbnailProviderResult<FetchedThumbnail> {
     let source_path = PathBuf::from(source_path);
     let (sync_root_path, sync_root_context) = find_registered_sync_root(&source_path)
-        .with_context(|| format!("failed to resolve sync root for {}", source_path.display()))?;
+        .map_err(ThumbnailProviderError::permanent)
+        .map_err(|error| {
+            error.with_context(format!(
+                "failed to resolve sync root for {}",
+                source_path.display()
+            ))
+        })?;
     let relative_path = path_to_relative(&sync_root_path, &source_path.to_string_lossy());
     if relative_path.is_empty() {
-        bail!(
+        return Err(ThumbnailProviderError::permanent(anyhow!(
             "resolved empty sync-root relative path for {} under {}",
             source_path.display(),
             sync_root_path.display()
-        );
+        )));
     }
     if is_internal_connection_bootstrap_relative_path(&relative_path)
         || is_internal_client_identity_relative_path(&relative_path)
     {
-        bail!("skipping internal sync-root metadata file {relative_path}");
+        return Err(ThumbnailProviderError::permanent(anyhow!(
+            "skipping internal sync-root metadata file {relative_path}"
+        )));
     }
 
     let remote_key = remote_key_for_item(&sync_root_context.identity.prefix, &relative_path);
-    let request_path = media_thumbnail_request_path(&remote_key)?;
+    let request_path =
+        media_thumbnail_request_path(&remote_key).map_err(ThumbnailProviderError::permanent)?;
     let resolved = resolve_connection_config(&sync_root_path, None, None, None, None, None, None)
-        .with_context(|| {
-        format!(
-            "failed to resolve connection config for {}",
+        .map_err(ThumbnailProviderError::permanent)
+        .map_err(|error| {
+            error.with_context(format!(
+                "failed to resolve connection config for {}",
+                sync_root_path.display()
+            ))
+        })?;
+    let client_build = build_thumbnail_client(&sync_root_path, &resolved).map_err(|error| {
+        error.with_context(format!(
+            "failed to build client for {}",
             sync_root_path.display()
-        )
+        ))
     })?;
-    let client_build = build_thumbnail_client(&sync_root_path, &resolved)
-        .with_context(|| format!("failed to build client for {}", sync_root_path.display()))?;
-    let thumbnail_bytes = fetch_thumbnail_bytes(&client_build.client, &request_path)
-        .with_context(|| format!("failed to fetch thumbnail for remote key {}", remote_key))?;
+    let thumbnail_bytes =
+        fetch_thumbnail_bytes(&client_build.client, &request_path).map_err(|error| {
+            error.with_context(format!(
+                "failed to fetch thumbnail for remote key {}",
+                remote_key
+            ))
+        })?;
 
     append_diagnostic_log(&format!(
         "thumbnail-fetch remote_key={} request_path={} bytes={}",
@@ -577,22 +713,24 @@ pub fn debug_fetch_thumbnail_for_source_path(
 ) -> AnyhowResult<DebugThumbnailFetchResult> {
     log_provider_banner_once();
     let fetched = fetch_thumbnail_for_source_path(source_path)?;
-    let decoded = resize_for_requested_size(
-        image::load_from_memory(&fetched.thumbnail_bytes)
-            .context("failed to decode thumbnail image")?,
-        requested_size.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE),
-    );
-    Ok(DebugThumbnailFetchResult {
-        remote_key: fetched.remote_key,
-        request_path: fetched.request_path,
-        bootstrap_path: fetched.bootstrap_path,
-        identity_path: fetched.client_build.selected_path,
-        candidate_identity_paths: fetched.client_build.candidate_paths,
-        auth_mode: fetched.client_build.auth_mode.to_string(),
-        payload_len: fetched.thumbnail_bytes.len(),
-        decoded_width: decoded.width(),
-        decoded_height: decoded.height(),
-    })
+    build_debug_fetch_result(fetched, requested_size)
+}
+
+pub fn debug_thumbnail_outcome_for_source_path(
+    source_path: &str,
+    requested_size: u32,
+) -> DebugThumbnailOutcome {
+    log_provider_banner_once();
+    match fetch_thumbnail_for_source_path(source_path) {
+        Ok(fetched) => match build_debug_fetch_result(fetched, requested_size) {
+            Ok(result) => DebugThumbnailOutcome::Success(result),
+            Err(error) => {
+                let error = ThumbnailProviderError::permanent(error);
+                DebugThumbnailOutcome::Failure(debug_failure_from_error(error))
+            }
+        },
+        Err(error) => DebugThumbnailOutcome::Failure(debug_failure_from_error(error)),
+    }
 }
 
 fn find_registered_sync_root(path: &Path) -> AnyhowResult<(PathBuf, RegisteredSyncRootContext)> {
@@ -678,7 +816,7 @@ fn relative_request_path(url: &Url) -> String {
 fn fetch_thumbnail_bytes(
     client: &client_sdk::IronMeshClient,
     request_path: &str,
-) -> AnyhowResult<Vec<u8>> {
+) -> ThumbnailProviderResult<Vec<u8>> {
     if let Some(cached) = thumbnail_bytes_cache()
         .lock()
         .expect("thumbnail cache lock poisoned")
@@ -690,11 +828,14 @@ fn fetch_thumbnail_bytes(
 
     let response = client
         .get_relative_path_blocking(request_path)
-        .with_context(|| format!("request failed for {request_path}"))?;
+        .map_err(ThumbnailProviderError::retry_later)
+        .map_err(|error| error.with_context(format!("request failed for {request_path}")))?;
     match response.status {
         StatusCode::OK => {
             if response.body.is_empty() {
-                bail!("thumbnail endpoint returned an empty body");
+                return Err(ThumbnailProviderError::permanent(anyhow!(
+                    "thumbnail endpoint returned an empty body"
+                )));
             }
             let payload = response.body.to_vec();
             thumbnail_bytes_cache()
@@ -703,9 +844,28 @@ fn fetch_thumbnail_bytes(
                 .insert(request_path.to_string(), payload.clone());
             Ok(payload)
         }
-        StatusCode::NOT_FOUND => bail!("thumbnail not available"),
-        status => bail!("thumbnail endpoint returned {status}"),
+        StatusCode::NOT_FOUND => Err(ThumbnailProviderError::permanent(anyhow!(
+            "thumbnail not available"
+        ))),
+        status if thumbnail_status_should_retry(status) => Err(
+            ThumbnailProviderError::retry_later(anyhow!("thumbnail endpoint returned {status}")),
+        ),
+        status => Err(ThumbnailProviderError::permanent(anyhow!(
+            "thumbnail endpoint returned {status}"
+        ))),
     }
+}
+
+fn thumbnail_status_should_retry(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 fn create_bitmap_from_thumbnail_bytes(bytes: &[u8], requested_size: u32) -> AnyhowResult<HBITMAP> {
@@ -770,11 +930,7 @@ unsafe fn create_bitmap_from_bgra_pixels(
     Ok(bitmap)
 }
 
-unsafe fn create_prototype_bitmap(size: u32) -> AnyhowResult<HBITMAP> {
-    let pixels = prototype_bgra_pixels(size);
-    unsafe { create_bitmap_from_bgra_pixels(size, size, &pixels) }
-}
-
+#[cfg(test)]
 fn prototype_bgra_pixels(size: u32) -> Vec<u8> {
     let size = size.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE) as usize;
     let mut pixels = vec![0u8; size * size * 4];
@@ -820,6 +976,7 @@ fn prototype_bgra_pixels(size: u32) -> Vec<u8> {
     pixels
 }
 
+#[cfg(test)]
 fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     let mix = |start: u8, end: u8| -> u8 {
         ((start as f32) + ((end as f32) - (start as f32)) * t)
@@ -834,10 +991,12 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     ]
 }
 
+#[cfg(test)]
 fn rgba_to_bgra(color: [u8; 4]) -> [u8; 4] {
     [color[2], color[1], color[0], color[3]]
 }
 
+#[cfg(test)]
 fn put_pixel(buffer: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4]) {
     if x >= size || y >= size {
         return;
@@ -846,6 +1005,7 @@ fn put_pixel(buffer: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4])
     buffer[offset..offset + 4].copy_from_slice(&rgba_to_bgra(color));
 }
 
+#[cfg(test)]
 fn draw_line(
     buffer: &mut [u8],
     size: usize,
@@ -889,6 +1049,7 @@ fn draw_line(
     }
 }
 
+#[cfg(test)]
 fn fill_circle(
     buffer: &mut [u8],
     size: usize,
@@ -917,9 +1078,13 @@ fn fill_circle(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE, media_thumbnail_request_path,
-        prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
+        MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE, ThumbnailFailureKind, ThumbnailProviderError,
+        media_thumbnail_request_path, prototype_bgra_pixels, remote_key_for_item,
+        rgba_pixels_to_bgra, thumbnail_status_should_retry,
     };
+    use anyhow::anyhow;
+    use reqwest::StatusCode;
+    use windows::Win32::UI::Shell::{WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION};
 
     #[test]
     fn prototype_bitmap_respects_size_bounds() {
@@ -971,5 +1136,49 @@ mod tests {
     fn rgba_pixels_are_repacked_to_bgra() {
         let bgra = rgba_pixels_to_bgra(&[10, 20, 30, 255, 40, 50, 60, 128]);
         assert_eq!(bgra, vec![30, 20, 10, 255, 60, 50, 40, 128]);
+    }
+
+    #[test]
+    fn transient_http_statuses_request_retry() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(
+                thumbnail_status_should_retry(status),
+                "{status} should retry"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_http_statuses_do_not_request_retry() {
+        for status in [
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ] {
+            assert!(
+                !thumbnail_status_should_retry(status),
+                "{status} should not retry"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_kind_maps_to_expected_shell_hresult() {
+        let permanent = ThumbnailProviderError::permanent(anyhow!("no thumbnail"));
+        assert_eq!(permanent.kind, ThumbnailFailureKind::Permanent);
+        assert_eq!(permanent.hresult(), WTS_E_FAILEDEXTRACTION);
+
+        let retry_later = ThumbnailProviderError::retry_later(anyhow!("server busy"));
+        assert_eq!(retry_later.kind, ThumbnailFailureKind::RetryLater);
+        assert_eq!(retry_later.hresult(), WTS_E_EXTRACTIONPENDING);
     }
 }
