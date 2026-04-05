@@ -13,7 +13,7 @@ use clap::{Parser, ValueEnum};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
     ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, RemoteSnapshotFetcher,
-    RemoteSnapshotPoller, RemoteSnapshotScope, build_http_client_from_pem,
+    RemoteSnapshotPoller, RemoteSnapshotScope, RequestedRange, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
 use std::fs;
@@ -614,8 +614,10 @@ impl Hydrator for ClientRightsEdgeIo {
                             key: path,
                             snapshot: None,
                             version: version_selector,
-                            start: chunk_start,
-                            length: chunk_size,
+                            range: RequestedRange {
+                                offset: chunk_start,
+                                length: chunk_size,
+                            },
                         },
                         &mut downloaded,
                         &mut on_progress,

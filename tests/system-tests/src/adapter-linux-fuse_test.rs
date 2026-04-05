@@ -6,20 +6,18 @@ mod tests {
         ChildGuard, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
         issue_bootstrap_bundle_and_enroll_client, lock_test_resources, path_resource_key,
         register_node, start_authenticated_server, start_open_server_with_env,
-        start_rendezvous_service, stop_server, wait_for_online_nodes,
-        wait_for_rendezvous_registered_endpoints, wait_for_store_index_entry, wait_for_url_status,
+        stop_server, wait_for_online_nodes, wait_for_store_index_entry,
     };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
     use client_sdk::IronMeshClient;
-    use reqwest::StatusCode;
     use std::ffi::CString;
     use std::fs;
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
     use tokio::process::Command;
     use tokio::time::sleep;
     use uuid::Uuid;
