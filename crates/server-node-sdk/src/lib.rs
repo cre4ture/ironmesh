@@ -2383,8 +2383,8 @@ impl ServerNodeConfig {
             replication_repair_enabled: match mode {
                 ServerNodeMode::Cluster => std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
                     .ok()
-                    .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-                    .unwrap_or(false),
+                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                    .unwrap_or(true),
                 ServerNodeMode::LocalEdge => local_edge_clustered,
             },
             replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
@@ -2407,7 +2407,7 @@ impl ServerNodeConfig {
             repair_busy_throttle_enabled: std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(false),
+                .unwrap_or(true),
             repair_busy_inflight_threshold: std::env::var(
                 "IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD",
             )
@@ -2694,8 +2694,8 @@ impl ServerNodeConfig {
             replication_repair_enabled: match mode {
                 ServerNodeMode::Cluster => std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
                     .ok()
-                    .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-                    .unwrap_or(false),
+                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                    .unwrap_or(true),
                 ServerNodeMode::LocalEdge => local_edge_clustered,
             },
             replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
@@ -2718,7 +2718,7 @@ impl ServerNodeConfig {
             repair_busy_throttle_enabled: std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(false),
+                .unwrap_or(true),
             repair_busy_inflight_threshold: std::env::var(
                 "IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD",
             )

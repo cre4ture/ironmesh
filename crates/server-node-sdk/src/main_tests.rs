@@ -141,6 +141,16 @@ fn metadata_backend_parser_handles_turso_feature_gate() {
     assert!(result.unwrap_err().to_string().contains("turso-metadata"));
 }
 
+#[test]
+fn local_edge_constructor_keeps_repair_features_disabled() {
+    let config = ServerNodeConfig::local_edge("./tmp/test-node", free_bind_addr());
+
+    assert!(!config.autonomous_replication_on_put_enabled);
+    assert!(!config.replication_repair_enabled);
+    assert!(!config.repair_busy_throttle_enabled);
+    assert!(!config.startup_repair_enabled);
+}
+
 fn sample_png_bytes() -> Vec<u8> {
     let image = image::DynamicImage::new_rgba8(4, 3);
     let mut cursor = std::io::Cursor::new(Vec::new());
@@ -1293,6 +1303,10 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
         config.enrollment_issuer_url.as_deref(),
         Some("https://issuer.example")
     );
+    assert!(config.autonomous_replication_on_put_enabled);
+    assert!(config.replication_repair_enabled);
+    assert!(config.repair_busy_throttle_enabled);
+    assert!(config.startup_repair_enabled);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1352,6 +1366,7 @@ async fn local_edge_bootstrap_with_rendezvous_enables_cluster_sync_defaults() {
     assert_eq!(config.audit_interval_secs, 5);
     assert!(config.autonomous_replication_on_put_enabled);
     assert!(config.replication_repair_enabled);
+    assert!(config.repair_busy_throttle_enabled);
     assert!(config.startup_repair_enabled);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -2036,6 +2051,10 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
     let internal_metadata_path = internal_tls.metadata_path.as_ref().unwrap();
     let public_metadata_path = public_tls.metadata_path.as_ref().unwrap();
 
+    assert!(config.autonomous_replication_on_put_enabled);
+    assert!(config.replication_repair_enabled);
+    assert!(config.repair_busy_throttle_enabled);
+    assert!(config.startup_repair_enabled);
     assert!(internal_tls.ca_cert_path.exists());
     assert!(internal_tls.cert_path.exists());
     assert!(internal_tls.key_path.exists());
