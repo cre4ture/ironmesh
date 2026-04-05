@@ -17,6 +17,9 @@ use adapter_windows_cfapi::connection_config::{
     is_internal_connection_bootstrap_relative_path, resolve_connection_config,
 };
 use adapter_windows_cfapi::helpers::{normalize_path, path_to_relative};
+use adapter_windows_cfapi::hydration_control::{
+    is_active_hydration_marked, request_hydration_cancel,
+};
 use adapter_windows_cfapi::sync_root_identity::{
     RegisteredSyncRootContext, load_registered_sync_root_context,
 };
@@ -24,18 +27,21 @@ use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
 use image::{DynamicImage, RgbaImage};
 use reqwest::{StatusCode, Url};
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_POINTER, S_FALSE,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_NOTIMPL, E_POINTER, S_FALSE,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, HBITMAP,
 };
 use windows::Win32::System::Com::{CoTaskMemFree, IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::Shell::{
-    IInitializeWithItem, IInitializeWithItem_Impl, IShellItem, IThumbnailProvider,
-    IThumbnailProvider_Impl, SIGDN_FILESYSPATH, WTS_ALPHATYPE, WTS_E_EXTRACTIONPENDING,
-    WTS_E_FAILEDEXTRACTION, WTSAT_ARGB, WTSAT_UNKNOWN,
+    ECF_DEFAULT, ECS_ENABLED, ECS_HIDDEN, IEnumExplorerCommand, IExplorerCommand,
+    IExplorerCommand_Impl, IInitializeWithItem, IInitializeWithItem_Impl, IShellItem,
+    IShellItemArray, IThumbnailProvider, IThumbnailProvider_Impl, SHStrDupW, SIGDN_FILESYSPATH,
+    WTS_ALPHATYPE, WTS_E_EXTRACTIONPENDING, WTS_E_FAILEDEXTRACTION, WTSAT_ARGB, WTSAT_UNKNOWN,
 };
-use windows_core::{BOOL, GUID, HRESULT, IUnknown, Interface, PWSTR, Ref, Result, implement};
+use windows_core::{
+    BOOL, GUID, HRESULT, IUnknown, Interface, PCWSTR, PWSTR, Ref, Result, implement,
+};
 
 pub const THUMBNAIL_PROVIDER_CLSID: GUID = GUID::from_u128(0xd2e0fd2a_1d7b_4be4_920a_8a6d019454cb);
 pub const CUSTOM_STATE_HANDLER_CLSID: GUID =
@@ -156,6 +162,15 @@ impl IronmeshThumbnailProvider {
     }
 }
 
+#[implement(IExplorerCommand)]
+struct IronmeshCancelHydrationCommand;
+
+impl IronmeshCancelHydrationCommand {
+    fn new() -> Self {
+        Self
+    }
+}
+
 #[derive(Default)]
 struct ThumbnailBytesCache {
     order: VecDeque<String>,
@@ -242,6 +257,11 @@ fn format_path_list(paths: &[PathBuf]) -> String {
         .join("|")
 }
 
+fn duplicate_shell_text(value: &str) -> Result<PWSTR> {
+    let utf16 = value.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    unsafe { SHStrDupW(PCWSTR::from_raw(utf16.as_ptr())) }
+}
+
 #[allow(non_snake_case)]
 impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
     fn Initialize(&self, psi: Ref<'_, IShellItem>, _grfmode: u32) -> Result<()> {
@@ -320,6 +340,81 @@ impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
     }
 }
 
+#[allow(non_snake_case)]
+impl IExplorerCommand_Impl for IronmeshCancelHydrationCommand_Impl {
+    fn GetTitle(&self, _psiitemarray: Ref<'_, IShellItemArray>) -> Result<PWSTR> {
+        duplicate_shell_text("Cancel Hydration")
+    }
+
+    fn GetIcon(&self, _psiitemarray: Ref<'_, IShellItemArray>) -> Result<PWSTR> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetToolTip(&self, _psiitemarray: Ref<'_, IShellItemArray>) -> Result<PWSTR> {
+        duplicate_shell_text(
+            "Abort an active Ironmesh on-demand hydration for the selected placeholder",
+        )
+    }
+
+    fn GetCanonicalName(&self) -> Result<GUID> {
+        Ok(CONTEXT_MENU_HANDLER_CLSID)
+    }
+
+    fn GetState(&self, psiitemarray: Ref<'_, IShellItemArray>, _foktobeslow: BOOL) -> Result<u32> {
+        let has_cancelable_selection =
+            selected_shell_item_paths(psiitemarray)
+                .into_iter()
+                .any(|source_path| {
+                    is_cancel_hydration_available_for_source_path(&source_path).unwrap_or(false)
+                });
+        Ok(if has_cancelable_selection {
+            ECS_ENABLED.0 as u32
+        } else {
+            ECS_HIDDEN.0 as u32
+        })
+    }
+
+    fn Invoke(
+        &self,
+        psiitemarray: Ref<'_, IShellItemArray>,
+        _pbc: Ref<'_, windows::Win32::System::Com::IBindCtx>,
+    ) -> Result<()> {
+        let selected_paths = selected_shell_item_paths(psiitemarray);
+        let mut requested = 0usize;
+        let mut skipped = 0usize;
+        let mut failures = Vec::new();
+
+        for source_path in selected_paths {
+            match request_cancel_hydration_for_source_path(&source_path) {
+                Ok(true) => requested += 1,
+                Ok(false) => skipped += 1,
+                Err(error) => failures.push(format!("{source_path}: {error:#}")),
+            }
+        }
+
+        append_diagnostic_log(&format!(
+            "CancelHydration requested={} skipped={} failures={} failure_sample={}",
+            requested,
+            skipped,
+            failures.len(),
+            if failures.is_empty() {
+                "-".to_string()
+            } else {
+                failures.join(" | ")
+            }
+        ));
+        Ok(())
+    }
+
+    fn GetFlags(&self) -> Result<u32> {
+        Ok(ECF_DEFAULT.0 as u32)
+    }
+
+    fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
 #[implement(IClassFactory)]
 struct IronmeshThumbnailProviderFactory;
 
@@ -343,6 +438,37 @@ impl IClassFactory_Impl for IronmeshThumbnailProviderFactory_Impl {
         }
 
         let unknown: IUnknown = IronmeshThumbnailProvider::new().into();
+        unsafe { unknown.query(riid, ppvobject).ok() }
+    }
+
+    fn LockServer(&self, _flock: BOOL) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[implement(IClassFactory)]
+struct IronmeshCancelHydrationCommandFactory;
+
+#[allow(non_snake_case)]
+impl IClassFactory_Impl for IronmeshCancelHydrationCommandFactory_Impl {
+    fn CreateInstance(
+        &self,
+        punkouter: Ref<'_, IUnknown>,
+        riid: *const GUID,
+        ppvobject: *mut *mut c_void,
+    ) -> Result<()> {
+        if !punkouter.is_null() {
+            return Err(CLASS_E_NOAGGREGATION.into());
+        }
+        if riid.is_null() || ppvobject.is_null() {
+            return Err(E_POINTER.into());
+        }
+
+        unsafe {
+            *ppvobject = null_mut();
+        }
+
+        let unknown: IUnknown = IronmeshCancelHydrationCommand::new().into();
         unsafe { unknown.query(riid, ppvobject).ok() }
     }
 
@@ -397,6 +523,8 @@ pub unsafe extern "system" fn DllGetClassObject(
     let clsid = unsafe { *rclsid };
     let factory: IUnknown = if clsid == THUMBNAIL_PROVIDER_CLSID {
         IronmeshThumbnailProviderFactory.into()
+    } else if clsid == CONTEXT_MENU_HANDLER_CLSID {
+        IronmeshCancelHydrationCommandFactory.into()
     } else if is_unsupported_handler_clsid(clsid) {
         UnsupportedHandlerFactory.into()
     } else {
@@ -419,7 +547,6 @@ fn is_unsupported_handler_clsid(clsid: GUID) -> bool {
     clsid == CUSTOM_STATE_HANDLER_CLSID
         || clsid == EXTENDED_PROPERTY_HANDLER_CLSID
         || clsid == BANNERS_HANDLER_CLSID
-        || clsid == CONTEXT_MENU_HANDLER_CLSID
         || clsid == CONTENT_URI_SOURCE_CLSID
         || clsid == STATUS_UI_SOURCE_FACTORY_CLSID
 }
@@ -438,6 +565,57 @@ fn pwstr_to_string(value: PWSTR) -> Option<String> {
         return None;
     }
     unsafe { value.to_string().ok() }
+}
+
+fn selected_shell_item_paths(psiitemarray: Ref<'_, IShellItemArray>) -> Vec<String> {
+    let Some(item_array) = psiitemarray.as_ref() else {
+        return Vec::new();
+    };
+
+    let count = unsafe { item_array.GetCount() }.unwrap_or(0);
+    let mut paths = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        if let Ok(item) = unsafe { item_array.GetItemAt(index) }
+            && let Some(path) = unsafe { shell_item_path(&item) }
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn is_cancel_hydration_available_for_source_path(source_path: &str) -> AnyhowResult<bool> {
+    let source_path = PathBuf::from(source_path);
+    let (sync_root_path, _) = find_registered_sync_root(&source_path)?;
+    let relative_path = path_to_relative(&sync_root_path, &source_path.to_string_lossy());
+    if relative_path.is_empty() {
+        return Ok(false);
+    }
+    if is_internal_connection_bootstrap_relative_path(&relative_path)
+        || is_internal_client_identity_relative_path(&relative_path)
+    {
+        return Ok(false);
+    }
+    Ok(is_active_hydration_marked(&sync_root_path, &relative_path))
+}
+
+fn request_cancel_hydration_for_source_path(source_path: &str) -> AnyhowResult<bool> {
+    let source_path = PathBuf::from(source_path);
+    let (sync_root_path, _) = find_registered_sync_root(&source_path)?;
+    let relative_path = path_to_relative(&sync_root_path, &source_path.to_string_lossy());
+    if relative_path.is_empty() {
+        bail!(
+            "resolved empty sync-root relative path for {} under {}",
+            source_path.display(),
+            sync_root_path.display()
+        );
+    }
+    if is_internal_connection_bootstrap_relative_path(&relative_path)
+        || is_internal_client_identity_relative_path(&relative_path)
+    {
+        return Ok(false);
+    }
+    request_hydration_cancel(&sync_root_path, &relative_path)
 }
 
 fn try_create_real_thumbnail_bitmap(

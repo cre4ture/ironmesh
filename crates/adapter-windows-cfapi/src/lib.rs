@@ -9,6 +9,7 @@ pub(crate) mod close_upload;
 pub mod connection_config;
 pub(crate) mod content_fingerprint;
 pub mod helpers;
+pub mod hydration_control;
 pub mod live;
 pub(crate) mod local_state;
 pub mod monitor;

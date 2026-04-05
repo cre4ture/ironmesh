@@ -18,6 +18,8 @@ use crate::cfapi::{cf_get_placeholder_standard_info, cf_hydrate_placeholder, cf_
 use crate::connection_config::{
     persist_connection_config, persist_local_appdata_connection_config, resolve_connection_config,
 };
+use crate::helpers::{normalize_path, path_to_relative};
+use crate::hydration_control::request_hydration_cancel;
 use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
 use crate::placeholder_metadata::{
@@ -157,6 +159,7 @@ enum Commands {
     Register(RegisterArgs),
     Unregister(UnregisterArgs),
     Pin(PinArgs),
+    CancelHydration(CancelHydrationArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -223,6 +226,14 @@ struct PinArgs {
     poll_interval_ms: u64,
 }
 
+#[derive(Debug, Parser)]
+struct CancelHydrationArgs {
+    #[arg(long)]
+    root_path: String,
+    #[arg(long)]
+    path: String,
+}
+
 pub fn cli_main() -> anyhow::Result<()> {
     common::logging::init_compact_tracing_default("info");
     let cli = Cli::parse();
@@ -240,6 +251,7 @@ pub fn cli_main() -> anyhow::Result<()> {
         }
         Commands::Unregister(args) => unregister_sync_root(&PathBuf::from(args.root_path)),
         Commands::Pin(args) => pin_placeholder_locally(args),
+        Commands::CancelHydration(args) => cancel_placeholder_hydration(args),
 
         Commands::Serve(args) => {
             let root_path = PathBuf::from(&args.root_path);
@@ -575,4 +587,39 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
 
         thread::sleep(poll_interval);
     }
+}
+
+fn cancel_placeholder_hydration(args: CancelHydrationArgs) -> anyhow::Result<()> {
+    let root_path = PathBuf::from(&args.root_path);
+    let normalized_relative_path = resolve_cli_relative_path(&root_path, &args.path);
+    if normalized_relative_path.is_empty() {
+        anyhow::bail!(
+            "failed to resolve a relative path from {} under {}",
+            args.path,
+            root_path.display()
+        );
+    }
+
+    if request_hydration_cancel(&root_path, &normalized_relative_path)? {
+        tracing::info!(
+            "requested hydration cancel for {} under {}",
+            normalized_relative_path,
+            root_path.display()
+        );
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "no active hydration found for {} under {}",
+        normalized_relative_path,
+        root_path.display()
+    )
+}
+
+fn resolve_cli_relative_path(root_path: &std::path::Path, requested_path: &str) -> String {
+    let candidate = PathBuf::from(requested_path);
+    if candidate.is_absolute() {
+        return path_to_relative(root_path, requested_path);
+    }
+    normalize_path(requested_path)
 }

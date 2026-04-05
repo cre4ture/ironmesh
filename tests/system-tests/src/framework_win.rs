@@ -295,3 +295,27 @@ pub async fn pin_cfapi_placeholder(
 
     Ok(())
 }
+
+pub async fn cancel_cfapi_placeholder_hydration(
+    root_path: &Path,
+    relative_path: &str,
+) -> Result<()> {
+    let os_integration_bin = binary_path("os-integration")?;
+    let output = Command::new(os_integration_bin)
+        .arg("cancel-hydration")
+        .arg("--root-path")
+        .arg(root_path)
+        .arg("--path")
+        .arg(relative_path)
+        .output()
+        .await
+        .context("failed to execute os-integration cancel-hydration")?;
+    if !output.status.success() {
+        bail!(
+            "os-integration cancel-hydration failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}

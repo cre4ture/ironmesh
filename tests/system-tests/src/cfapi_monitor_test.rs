@@ -8,9 +8,13 @@ mod tests {
         start_open_server_with_public_https_env, stop_server, stop_server_without_cleanup,
     };
     use crate::framework_win::{
-        pin_cfapi_placeholder, start_cfapi_adapter_with_bootstrap,
-        start_cfapi_adapter_with_bootstrap_and_local_appdata,
+        cancel_cfapi_placeholder_hydration, pin_cfapi_placeholder,
+        start_cfapi_adapter_with_bootstrap, start_cfapi_adapter_with_bootstrap_and_local_appdata,
         start_cfapi_adapter_with_local_appdata,
+    };
+    use adapter_windows_cfapi::hydration_control::{
+        clear_active_hydration, clear_hydration_cancel_request, has_hydration_cancel_request,
+        mark_active_hydration,
     };
     use anyhow::Context;
     use bytes::Bytes;
@@ -2925,6 +2929,36 @@ mod tests {
         result.expect(
             "CFAPI adapter should persist LocalAppData state and restart without --bootstrap-file",
         );
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_cancel_hydration_command_marks_cancel_request_for_active_path() {
+        let sync_root = fresh_data_dir("cfapi-cancel-hydration-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let relative_path = "videos/large.bin";
+        let absolute_path = sync_root.join(relative_path.replace('/', "\\"));
+
+        clear_hydration_cancel_request(&sync_root, relative_path)
+            .expect("stale cancel marker cleanup should succeed");
+        clear_active_hydration(&sync_root, relative_path)
+            .expect("stale active marker cleanup should succeed");
+        mark_active_hydration(&sync_root, relative_path)
+            .expect("active hydration marker should be created");
+
+        cancel_cfapi_placeholder_hydration(&sync_root, &absolute_path.to_string_lossy())
+            .await
+            .expect("cancel-hydration command should succeed for active hydration");
+
+        assert!(
+            has_hydration_cancel_request(&sync_root, relative_path),
+            "cancel-hydration command should write the cancel marker for the active path"
+        );
+
+        clear_hydration_cancel_request(&sync_root, relative_path)
+            .expect("cancel marker cleanup should succeed");
+        clear_active_hydration(&sync_root, relative_path)
+            .expect("active marker cleanup should succeed");
+        let _ = std::fs::remove_dir_all(&sync_root);
     }
 
     #[tokio::test]

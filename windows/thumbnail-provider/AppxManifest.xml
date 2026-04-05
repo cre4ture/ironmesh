@@ -13,7 +13,7 @@
   <Identity
     Name="Ironmesh.ThumbnailProvider.Prototype"
     Publisher="CN=Ironmesh Dev"
-    Version="0.1.0.10" />
+    Version="0.1.0.11" />
   <Properties>
     <DisplayName>Ironmesh Thumbnail Provider Prototype</DisplayName>
     <PublisherDisplayName>Ironmesh</PublisherDisplayName>
@@ -84,7 +84,7 @@
             <desktop3:BannersHandler Clsid="8A98E31D-1D95-4D26-9DD9-32E2BB3C652A" />
             <cloudfiles2:StorageProviderStatusUISourceFactory Clsid="47E87BA5-1EB9-4F16-A944-4684850839B5" />
             <desktop3:CloudFilesContextMenus>
-              <desktop3:Verb Id="IronmeshOpen" Clsid="8D3BF08A-6C23-40BF-9FCB-46BB6F6BE13A" />
+              <desktop3:Verb Id="IronmeshCancelHydration" Clsid="8D3BF08A-6C23-40BF-9FCB-46BB6F6BE13A" />
             </desktop3:CloudFilesContextMenus>
             <desktop4:ContentUriSource Clsid="F1AA7371-0C71-4519-8C04-A41DC77F6AF1" />
           </desktop3:CloudFiles>

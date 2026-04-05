@@ -19,6 +19,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
+adapter-windows-cfapi = { path = "../../crates/adapter-windows-cfapi" }
 blake3 = "1"
 windows-thumbnail-provider = { path = "../../crates/windows-thumbnail-provider" }
 windows-sys = { version = "0.61", features = [

@@ -24,6 +24,10 @@ use crate::helpers::{
     PlaceholderFileIdentity, decode_path_from_file_identity, normalize_path, path_to_relative,
     utf16_path, utf16_string,
 };
+use crate::hydration_control::{
+    clear_active_hydration, clear_hydration_cancel_request, has_hydration_cancel_request,
+    mark_active_hydration,
+};
 use crate::placeholder_metadata::{
     record_in_sync_remote_file_state, refresh_remote_placeholder_state,
 };
@@ -485,6 +489,7 @@ pub(crate) struct CallbackContext {
     hydrated_once_paths: Mutex<HashSet<String>>,
     paths_by_file_id: Mutex<HashMap<i64, String>>,
     fetch_cancellations: Mutex<HashMap<FetchCallbackIdentity, Arc<AtomicBool>>>,
+    active_hydration_counts: Mutex<HashMap<String, usize>>,
     fetch_execution_gate: Arc<FetchExecutionGate>,
     upload_worker: Arc<UploadWorkerContext>,
     upload_debounce: Arc<UploadDebounceState>,
@@ -557,6 +562,95 @@ struct FetchExecutionPermit {
     gate: Arc<FetchExecutionGate>,
     file_id: i64,
     ticket: u64,
+}
+
+struct ActiveHydrationMarkerGuard<'a> {
+    context: &'a CallbackContext,
+    relative_path: String,
+    active: bool,
+}
+
+impl<'a> ActiveHydrationMarkerGuard<'a> {
+    fn begin(context: &'a CallbackContext, relative_path: &str) -> Self {
+        let normalized_relative_path = normalize_path(relative_path);
+        let first_for_path = context
+            .active_hydration_counts
+            .lock()
+            .map(|mut counts| {
+                let count = counts.entry(normalized_relative_path.clone()).or_insert(0);
+                let first = *count == 0;
+                *count += 1;
+                first
+            })
+            .unwrap_or(false);
+
+        if first_for_path {
+            if let Err(err) =
+                clear_hydration_cancel_request(&context.sync_root, &normalized_relative_path)
+            {
+                tracing::info!(
+                    "cfapi hydration-control: failed to clear stale cancel marker for {}: {err:#}",
+                    normalized_relative_path
+                );
+            }
+            if let Err(err) = mark_active_hydration(&context.sync_root, &normalized_relative_path) {
+                tracing::info!(
+                    "cfapi hydration-control: failed to mark active hydration for {}: {err:#}",
+                    normalized_relative_path
+                );
+            }
+        }
+
+        Self {
+            context,
+            relative_path: normalized_relative_path,
+            active: true,
+        }
+    }
+}
+
+impl Drop for ActiveHydrationMarkerGuard<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        let last_for_path = self
+            .context
+            .active_hydration_counts
+            .lock()
+            .map(|mut counts| {
+                let Some(count) = counts.get_mut(&self.relative_path) else {
+                    return false;
+                };
+                if *count > 1 {
+                    *count -= 1;
+                    return false;
+                }
+                counts.remove(&self.relative_path);
+                true
+            })
+            .unwrap_or(true);
+
+        if !last_for_path {
+            return;
+        }
+
+        if let Err(err) = clear_active_hydration(&self.context.sync_root, &self.relative_path) {
+            tracing::info!(
+                "cfapi hydration-control: failed to clear active marker for {}: {err:#}",
+                self.relative_path
+            );
+        }
+        if let Err(err) =
+            clear_hydration_cancel_request(&self.context.sync_root, &self.relative_path)
+        {
+            tracing::info!(
+                "cfapi hydration-control: failed to clear cancel marker for {}: {err:#}",
+                self.relative_path
+            );
+        }
+    }
 }
 
 impl Drop for FetchExecutionPermit {
@@ -1544,6 +1638,7 @@ pub fn connect_sync_root(
         hydrated_once_paths: Mutex::new(HashSet::new()),
         paths_by_file_id: Mutex::new(HashMap::new()),
         fetch_cancellations: Mutex::new(HashMap::new()),
+        active_hydration_counts: Mutex::new(HashMap::new()),
         fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
         upload_worker,
         upload_debounce,
@@ -1813,6 +1908,7 @@ pub(crate) fn handle_callback_fetch_data(
     if let Ok(mut fetch_cancellations) = context.fetch_cancellations.lock() {
         fetch_cancellations.insert(fetch_identity, cancel_flag.clone());
     }
+    let _active_hydration_guard = ActiveHydrationMarkerGuard::begin(context, &relative_path);
 
     let _fetch_execution_guard = context.fetch_execution_gate.acquire_for_file_range(
         callback_info_ref.FileId,
@@ -1826,9 +1922,27 @@ pub(crate) fn handle_callback_fetch_data(
             tracing::info!("cfapi progress-report error: {err}");
         }
     };
-    let should_cancel = || cancel_flag.load(Ordering::SeqCst);
+    let should_cancel = || {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return true;
+        }
 
-    let result = if cancel_flag.load(Ordering::SeqCst) {
+        if has_hydration_cancel_request(&context.sync_root, &relative_path) {
+            let already_canceled = cancel_flag.swap(true, Ordering::SeqCst);
+            if !already_canceled {
+                tracing::info!(
+                    "cfapi hydration-control: manual cancel requested for path={} request={}",
+                    relative_path,
+                    request_identity
+                );
+            }
+            return true;
+        }
+
+        false
+    };
+
+    let result = if should_cancel() {
         Err(anyhow!(
             "hydration canceled before transfer start for {}",
             relative_path
@@ -2504,6 +2618,7 @@ mod tests {
             hydrated_once_paths: Mutex::new(HashSet::new()),
             paths_by_file_id: Mutex::new(HashMap::new()),
             fetch_cancellations: Mutex::new(HashMap::new()),
+            active_hydration_counts: Mutex::new(HashMap::new()),
             fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
             upload_worker: Arc::new(UploadWorkerContext {
                 sync_root: sync_root.clone(),
