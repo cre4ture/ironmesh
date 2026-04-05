@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use crate::local_state::local_appdata_connection_bootstrap_path;
 use anyhow::{Context, Result, anyhow};
 use client_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
@@ -26,10 +27,6 @@ pub struct ResolvedConnectionConfig {
     pub bootstrap_path: PathBuf,
 }
 
-pub fn default_connection_bootstrap_path(sync_root_path: &Path) -> PathBuf {
-    sync_root_path.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME)
-}
-
 pub fn is_internal_connection_bootstrap_relative_path(path: &str) -> bool {
     let normalized = path.trim().trim_matches(['/', '\\']).replace('\\', "/");
     normalized == DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME
@@ -45,9 +42,7 @@ pub fn resolve_connection_config(
     device_id: Option<&str>,
     device_label: Option<&str>,
 ) -> Result<ResolvedConnectionConfig> {
-    let bootstrap_path = bootstrap_file
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_connection_bootstrap_path(sync_root_path));
+    let bootstrap_path = discover_connection_bootstrap_path(sync_root_path, bootstrap_file);
     let direct_ca_pem = server_ca_cert
         .map(|path| {
             fs::read_to_string(path)
@@ -135,6 +130,33 @@ pub fn persist_connection_config(
     bundle.write_to_path(path)
 }
 
+pub fn persist_local_appdata_connection_config(
+    sync_root_path: &Path,
+    bootstrap: &ConnectionBootstrap,
+    server_ca_pem: Option<&str>,
+    device_id: Option<&str>,
+    device_label: Option<&str>,
+) -> Result<()> {
+    persist_connection_config(
+        &local_appdata_connection_bootstrap_path(sync_root_path),
+        bootstrap,
+        server_ca_pem,
+        device_id,
+        device_label,
+    )
+}
+
+fn discover_connection_bootstrap_path(
+    sync_root_path: &Path,
+    bootstrap_file: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = bootstrap_file {
+        return path.to_path_buf();
+    }
+
+    local_appdata_connection_bootstrap_path(sync_root_path)
+}
+
 impl ResolvedConnectionConfig {
     pub fn build_client(
         &self,
@@ -159,12 +181,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_connection_bootstrap_path_uses_sync_root() {
-        let path = default_connection_bootstrap_path(Path::new("C:\\sync-root"));
+    fn resolve_connection_config_without_existing_bootstrap_targets_local_appdata_path() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-sync-root-local-appdata-bootstrap-{}",
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&sync_root).expect("sync root should exist");
+
+        let resolved = resolve_connection_config(
+            &sync_root,
+            Some("https://public.example"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolve should succeed");
+
         assert_eq!(
-            path,
-            Path::new("C:\\sync-root").join(".ironmesh-connection.json")
+            resolved.bootstrap_path,
+            local_appdata_connection_bootstrap_path(&sync_root)
         );
+
+        let _ = std::fs::remove_dir_all(sync_root);
     }
 
     #[test]
@@ -244,7 +284,7 @@ mod tests {
     fn resolve_connection_config_keeps_relay_bootstrap_without_direct_probe() {
         let sync_root = std::env::temp_dir().join(format!("ironmesh-sync-root-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&sync_root).expect("sync root should exist");
-        let bootstrap_path = default_connection_bootstrap_path(&sync_root);
+        let bootstrap_path = local_appdata_connection_bootstrap_path(&sync_root);
         let bootstrap = ConnectionBootstrap {
             version: 1,
             cluster_id: Uuid::now_v7(),
@@ -299,7 +339,7 @@ mod tests {
             Uuid::now_v7()
         ));
         std::fs::create_dir_all(&sync_root).expect("sync root should exist");
-        let bootstrap_path = default_connection_bootstrap_path(&sync_root);
+        let bootstrap_path = local_appdata_connection_bootstrap_path(&sync_root);
         let bootstrap = ConnectionBootstrap {
             version: 1,
             cluster_id: Uuid::now_v7(),
@@ -342,6 +382,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(bootstrap_path);
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn resolve_connection_config_does_not_read_legacy_sync_root_bootstrap_without_explicit_path() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-sync-root-legacy-bootstrap-{}",
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&sync_root).expect("sync root should exist");
+        let legacy_bootstrap_path = sync_root.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+        let bootstrap = ConnectionBootstrap {
+            version: 1,
+            cluster_id: Uuid::now_v7(),
+            rendezvous_urls: vec!["https://rendezvous.example".to_string()],
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "https://public.example".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: Some(Uuid::new_v4()),
+            }],
+            relay_mode: RelayMode::Fallback,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+        };
+        bootstrap
+            .write_to_path(&legacy_bootstrap_path)
+            .expect("legacy bootstrap should persist");
+
+        let error = resolve_connection_config(&sync_root, None, None, None, None, None, None)
+            .expect_err("legacy sync-root bootstrap should no longer be used implicitly");
+        assert!(
+            error
+                .to_string()
+                .contains("server-base-url or bootstrap-file is required for first connection")
+        );
+
+        let _ = std::fs::remove_file(legacy_bootstrap_path);
         let _ = std::fs::remove_dir_all(sync_root);
     }
 }

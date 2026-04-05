@@ -10,6 +10,7 @@ pub mod connection_config;
 pub(crate) mod content_fingerprint;
 pub mod helpers;
 pub mod live;
+pub(crate) mod local_state;
 pub mod monitor;
 pub mod placeholder_metadata;
 pub mod register;

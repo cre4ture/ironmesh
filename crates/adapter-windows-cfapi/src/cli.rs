@@ -10,9 +10,14 @@ use std::thread;
 use std::time::Duration;
 
 use crate::adapter::{CfapiAction, CfapiActionPlan, WindowsCfapiAdapter};
-use crate::auth::{ClientEnrollmentOptions, resolve_or_enroll_client_identity};
+use crate::auth::{
+    ClientEnrollmentOptions, persist_local_appdata_client_identity,
+    resolve_or_enroll_client_identity,
+};
 use crate::cfapi::{cf_get_placeholder_standard_info, cf_hydrate_placeholder, cf_set_pin_state};
-use crate::connection_config::{persist_connection_config, resolve_connection_config};
+use crate::connection_config::{
+    persist_connection_config, persist_local_appdata_connection_config, resolve_connection_config,
+};
 use crate::live::ServerNodeHydrator;
 use crate::monitor::SyncRootMonitor;
 use crate::placeholder_metadata::{
@@ -292,6 +297,30 @@ pub fn cli_main() -> anyhow::Result<()> {
                     .and_then(|identity| identity.label.as_deref())
                     .or(connection.device_label.as_deref()),
             )?;
+            if let Err(err) = persist_local_appdata_connection_config(
+                &registration.root_path,
+                &connection.bootstrap,
+                connection.server_ca_pem.as_deref(),
+                persisted_device_id.as_deref(),
+                client_identity
+                    .as_ref()
+                    .and_then(|identity| identity.label.as_deref())
+                    .or(connection.device_label.as_deref()),
+            ) {
+                tracing::warn!(
+                    "failed to persist connection bootstrap into local app data for {}: {err:#}",
+                    registration.root_path.display()
+                );
+            }
+            if let Some(identity) = client_identity.as_ref()
+                && let Err(err) =
+                    persist_local_appdata_client_identity(&registration.root_path, identity)
+            {
+                tracing::warn!(
+                    "failed to persist client identity into local app data for {}: {err:#}",
+                    registration.root_path.display()
+                );
+            }
 
             let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
             let fetcher = RemoteSnapshotFetcher::new(

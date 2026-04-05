@@ -19,6 +19,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
+blake3 = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_CloudFilters",

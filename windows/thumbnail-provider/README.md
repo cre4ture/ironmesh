@@ -9,7 +9,9 @@ Current status:
   - `IInitializeWithItem`
   - `IThumbnailProvider`
   - `IClassFactory`
-- it currently returns a fixed Ironmesh-branded bitmap without hydrating the placeholder
+- it now tries to fetch the real media thumbnail for the placeholder's remote object without hydrating the placeholder itself
+- it uses the sync root registration plus per-sync-root state under `%LocalAppData%\Ironmesh\sync-roots\...` for the persisted connection bootstrap and client identity
+- if the server has no thumbnail, the sync root is not fully configured, or the thumbnail request fails, it falls back to the fixed Ironmesh-branded bitmap
 - the package scaffold in this folder is the Explorer/MSIX side of the prototype
 
 ## Files
@@ -53,8 +55,11 @@ The manifest currently points the `Application` executable at `os-integration.ex
      - `$pkg = Get-AppxPackage Ironmesh.ThumbnailProvider.Prototype`
      - `$exe = Join-Path $pkg.InstallLocation 'os-integration.exe'`
      - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
+   - The first run uses `--bootstrap-file` to seed `%LocalAppData%\Ironmesh\sync-roots\...`.
+   - Later runs for the same sync root can omit `--bootstrap-file`.
 7. Restart Explorer.
-8. Open an Ironmesh sync root in large-icon view and confirm that dehydrated placeholders use the fixed thumbnail.
+8. Open an Ironmesh sync root in large-icon view and confirm that dehydrated placeholders use the real server thumbnail when available.
+9. If a file type has no generated thumbnail yet, expect the fallback Ironmesh-branded bitmap instead.
 
 Why this matters:
 
@@ -66,11 +71,12 @@ Why this matters:
 
 This repo currently does not include a fully automated MSIX/sparse-package build pipeline for the prototype yet.
 
-That is intentional for this first slice:
+That is still intentionally incremental:
 
-- first prove that Explorer loads the thumbnail handler at all,
-- then wire in real Ironmesh thumbnail fetching,
-- then automate packaging/install.
+- Explorer must load the packaged thumbnail handler
+- the handler should return real thumbnails for supported media without hydrating placeholders
+- unsupported or unavailable thumbnails should degrade cleanly to the branded fallback
+- packaging/install remains script-driven for now
 
 ## Helper script
 
@@ -111,6 +117,7 @@ Use this when iterating on the thumbnail provider DLL, the manifest, or the pack
    - `$pkg = Get-AppxPackage Ironmesh.ThumbnailProvider.Prototype`
    - `$exe = Join-Path $pkg.InstallLocation 'os-integration.exe'`
    - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
+   - After that first successful run, the packaged host will reuse the canonical `%LocalAppData%\Ironmesh\sync-roots\...` bootstrap and client identity for the same sync root.
 3. If you changed any packaged content and Windows reports `0x80073CFB`, bump the package version in `windows/thumbnail-provider/AppxManifest.xml`:
    - update `<Identity ... Version="...">`
    - reinstall with the helper script
@@ -137,6 +144,8 @@ The prototype DLL now writes a simple log file to:
 Useful signals:
 
 - if `GetThumbnail` appears there, Explorer is loading the packaged thumbnail handler
+- if `thumbnail-fetch remote_key=...` appears there, the handler successfully resolved a sync root, built a client, and downloaded thumbnail bytes from the server
+- if `GetThumbnail source=fallback ... error=...` appears there, the handler could not produce a real thumbnail and used the branded fallback instead
 - if the log stays empty while browsing a dehydrated placeholder folder in large-icon view, the packaged handler is still not being invoked
 
 ## What you need installed for MSIX

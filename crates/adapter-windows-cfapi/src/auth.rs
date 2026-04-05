@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use crate::local_state::local_appdata_client_identity_path;
 use anyhow::{Context, Result, bail};
 use client_sdk::{
     ClientIdentityMaterial, DeviceEnrollmentRequest, enroll_device_blocking_from_pem,
@@ -28,13 +29,14 @@ pub fn resolve_or_enroll_client_identity(
     bootstrap_file: Option<&Path>,
     options: &ClientEnrollmentOptions,
 ) -> Result<Option<ClientIdentityMaterial>> {
-    let identity_file = options
-        .client_identity_file
-        .clone()
-        .unwrap_or_else(|| default_client_identity_path(sync_root_path, bootstrap_file));
-
-    if identity_file.exists() && !options.force_reenroll {
-        return load_client_identity(&identity_file).map(Some);
+    if !options.force_reenroll
+        && let Some(identity) = load_persisted_client_identity(
+            sync_root_path,
+            bootstrap_file,
+            options.client_identity_file.as_deref(),
+        )?
+    {
+        return Ok(Some(identity));
     }
 
     let pairing_token = options
@@ -52,19 +54,27 @@ pub fn resolve_or_enroll_client_identity(
         )
     })?;
     let identity = enroll_client_identity(base_url, pairing_token, options)?;
-    persist_client_identity(&identity_file, &identity)?;
+    if let Some(identity_file) = options.client_identity_file.as_deref() {
+        persist_client_identity(identity_file, &identity)?;
+    }
+    persist_local_appdata_client_identity(sync_root_path, &identity)?;
     Ok(Some(identity))
 }
 
-pub fn default_client_identity_path(
+pub fn load_persisted_client_identity(
     sync_root_path: &Path,
     bootstrap_file: Option<&Path>,
-) -> PathBuf {
-    if let Some(bootstrap_path) = bootstrap_file {
-        return sibling_client_identity_path(bootstrap_path);
+    client_identity_file: Option<&Path>,
+) -> Result<Option<ClientIdentityMaterial>> {
+    for identity_file in
+        candidate_client_identity_paths(sync_root_path, bootstrap_file, client_identity_file)
+    {
+        if identity_file.exists() {
+            return load_client_identity(&identity_file).map(Some);
+        }
     }
 
-    sync_root_path.join(DEFAULT_CLIENT_IDENTITY_FILE_NAME)
+    Ok(None)
 }
 
 fn sibling_client_identity_path(bootstrap_path: &Path) -> PathBuf {
@@ -149,6 +159,46 @@ fn persist_client_identity(path: &Path, identity: &ClientIdentityMaterial) -> Re
         .with_context(|| format!("failed to write client identity file {}", path.display()))
 }
 
+pub fn persist_local_appdata_client_identity(
+    sync_root_path: &Path,
+    identity: &ClientIdentityMaterial,
+) -> Result<()> {
+    persist_client_identity(
+        &local_appdata_client_identity_path(sync_root_path),
+        identity,
+    )
+}
+
+fn candidate_client_identity_paths(
+    sync_root_path: &Path,
+    bootstrap_file: Option<&Path>,
+    client_identity_file: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    push_unique_path(&mut candidates, client_identity_file.map(Path::to_path_buf));
+    push_unique_path(
+        &mut candidates,
+        Some(local_appdata_client_identity_path(sync_root_path)),
+    );
+    push_unique_path(
+        &mut candidates,
+        bootstrap_file.map(sibling_client_identity_path),
+    );
+
+    candidates
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, candidate: Option<PathBuf>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if candidates.iter().any(|existing| existing == &candidate) {
+        return;
+    }
+    candidates.push(candidate);
+}
+
 fn validate_client_identity(identity: &ClientIdentityMaterial, path: &Path) -> Result<()> {
     identity
         .validate()
@@ -171,18 +221,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_client_identity_path_uses_sync_root_without_bootstrap_file() {
-        let path = default_client_identity_path(Path::new("C:\\sync-root"), None);
-        assert_eq!(
-            path,
-            Path::new("C:\\sync-root").join(".ironmesh-client-identity.json")
-        );
-    }
-
-    #[test]
-    fn default_client_identity_path_uses_bootstrap_sibling_when_bootstrap_file_is_provided() {
+    fn sibling_client_identity_path_uses_bootstrap_sibling_when_bootstrap_file_is_provided() {
         let bootstrap_path = Path::new("C:\\config\\ironmesh-client-bootstrap.json");
-        let path = default_client_identity_path(Path::new("C:\\sync-root"), Some(bootstrap_path));
+        let path = sibling_client_identity_path(bootstrap_path);
         assert_eq!(
             path,
             Path::new("C:\\config\\ironmesh-client-bootstrap.client-identity.json")
@@ -229,5 +270,34 @@ mod tests {
         assert_eq!(reloaded, identity);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_persisted_client_identity_does_not_read_legacy_sync_root_file_without_explicit_path() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-sync-root-legacy-identity-{}",
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&sync_root).expect("sync root should exist");
+        let legacy_identity_path = sync_root.join(DEFAULT_CLIENT_IDENTITY_FILE_NAME);
+        let mut identity = ClientIdentityMaterial::generate(
+            Uuid::now_v7(),
+            None,
+            Some("legacy-sync-root-test".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        persist_client_identity(&legacy_identity_path, &identity)
+            .expect("legacy identity should persist");
+
+        let loaded = load_persisted_client_identity(&sync_root, None, None)
+            .expect("legacy lookup should not fail");
+        assert!(
+            loaded.is_none(),
+            "legacy sync-root identity should no longer be loaded implicitly"
+        );
+
+        let _ = std::fs::remove_file(legacy_identity_path);
+        let _ = std::fs::remove_dir_all(sync_root);
     }
 }

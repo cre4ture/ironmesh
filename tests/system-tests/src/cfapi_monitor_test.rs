@@ -7,7 +7,11 @@ mod tests {
         https_client_with_root_from_data_dir, issue_bootstrap_bundle, start_authenticated_server,
         start_open_server_with_public_https_env, stop_server, stop_server_without_cleanup,
     };
-    use crate::framework_win::{pin_cfapi_placeholder, start_cfapi_adapter_with_bootstrap};
+    use crate::framework_win::{
+        pin_cfapi_placeholder, start_cfapi_adapter_with_bootstrap,
+        start_cfapi_adapter_with_bootstrap_and_local_appdata,
+        start_cfapi_adapter_with_local_appdata,
+    };
     use anyhow::Context;
     use bytes::Bytes;
     use client_sdk::{
@@ -43,6 +47,67 @@ mod tests {
     };
 
     const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "ironmesh-client-bootstrap.json";
+    const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
+    const LOCAL_STATE_SYNC_ROOTS_DIR: &str = "sync-roots";
+    const LOCAL_STATE_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "connection-bootstrap.json";
+    const LOCAL_STATE_CLIENT_IDENTITY_FILE_NAME: &str = "client-identity.json";
+
+    fn local_appdata_sync_root_state_dir(
+        local_appdata_root: &Path,
+        sync_root_path: &Path,
+    ) -> PathBuf {
+        local_appdata_root
+            .join(LOCAL_STATE_ROOT_DIR)
+            .join(LOCAL_STATE_SYNC_ROOTS_DIR)
+            .join(sync_root_state_label(sync_root_path))
+    }
+
+    fn local_appdata_connection_bootstrap_path(
+        local_appdata_root: &Path,
+        sync_root_path: &Path,
+    ) -> PathBuf {
+        local_appdata_sync_root_state_dir(local_appdata_root, sync_root_path)
+            .join(LOCAL_STATE_CONNECTION_BOOTSTRAP_FILE_NAME)
+    }
+
+    fn local_appdata_client_identity_path(
+        local_appdata_root: &Path,
+        sync_root_path: &Path,
+    ) -> PathBuf {
+        local_appdata_sync_root_state_dir(local_appdata_root, sync_root_path)
+            .join(LOCAL_STATE_CLIENT_IDENTITY_FILE_NAME)
+    }
+
+    fn sync_root_state_label(sync_root_path: &Path) -> String {
+        let normalized = sync_root_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        let hash = blake3::hash(normalized.as_bytes()).to_hex().to_string();
+        let leaf = sync_root_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("sync-root");
+        let sanitized_leaf = leaf
+            .chars()
+            .map(|value| {
+                if value.is_ascii_alphanumeric() {
+                    value.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('_')
+            .to_string();
+        let label = if sanitized_leaf.is_empty() {
+            "sync_root".to_string()
+        } else {
+            sanitized_leaf
+        };
+        format!("{label}-{hash}")
+    }
 
     struct AuthenticatedCfapiFixture {
         server: crate::framework::ChildGuard,
@@ -2140,6 +2205,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
 
         result.expect("authenticated CFAPI adapter should reuse existing sibling identity");
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_adapter_persists_local_appdata_state_and_restarts_without_bootstrap_argument()
+     {
+        let bind = "127.0.0.1:19113";
+        let base_url = format!("https://{bind}");
+        let admin_token = "system-tests-admin-secret";
+        let server_data_dir = fresh_data_dir("cfapi-auth-local-appdata-server");
+        let sync_root = fresh_data_dir("cfapi-auth-local-appdata-sync-root");
+        let local_appdata_dir = fresh_data_dir("cfapi-auth-local-appdata-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        std::fs::create_dir_all(&local_appdata_dir).expect("failed to create local app data root");
+        let rendezvous_urls = base_url.clone();
+
+        let mut server = start_open_server_with_public_https_env(
+            bind,
+            &server_data_dir,
+            "",
+            1,
+            &[
+                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+                ("IRONMESH_ADMIN_TOKEN", admin_token),
+                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+            ],
+        )
+        .await
+        .expect("failed to start auth-enabled server-node");
+
+        let result = async {
+            let http = https_client_with_root_from_data_dir(&server_data_dir)?;
+            let issued_bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                admin_token,
+                Some("cfapi-local-appdata"),
+                Some(600),
+            )
+            .await?;
+
+            let client_config_dir = server_data_dir.join("client-config-local-appdata");
+            std::fs::create_dir_all(&client_config_dir)
+                .expect("failed to create client config dir");
+            let bootstrap_file = client_config_dir.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+            issued_bootstrap
+                .write_to_path(&bootstrap_file)
+                .expect("failed to write bootstrap bundle");
+
+            let local_appdata_state_dir =
+                local_appdata_sync_root_state_dir(&local_appdata_dir, &sync_root);
+            let local_appdata_bootstrap =
+                local_appdata_connection_bootstrap_path(&local_appdata_dir, &sync_root);
+            let local_appdata_identity =
+                local_appdata_client_identity_path(&local_appdata_dir, &sync_root);
+
+            let sync_root_id = format!(
+                "ironmesh.systemtest.authenticated.localappdata.{}",
+                bind.replace(['.', ':'], "_")
+            );
+            let mut adapter = start_cfapi_adapter_with_bootstrap_and_local_appdata(
+                &sync_root_id,
+                "ironmesh System Test LocalAppData Root",
+                &sync_root,
+                500,
+                &bootstrap_file,
+                &local_appdata_dir,
+            )
+            .await?;
+
+            wait_for_path(&local_appdata_bootstrap, 120).await;
+            wait_for_path(&local_appdata_identity, 120).await;
+            assert!(
+                local_appdata_bootstrap.starts_with(
+                    local_appdata_dir
+                        .join(LOCAL_STATE_ROOT_DIR)
+                        .join(LOCAL_STATE_SYNC_ROOTS_DIR)
+                ),
+                "bootstrap should be persisted under the LocalAppData sync-root state directory"
+            );
+            assert_eq!(
+                local_appdata_bootstrap.parent(),
+                Some(local_appdata_state_dir.as_path())
+            );
+            assert_eq!(
+                local_appdata_identity.parent(),
+                Some(local_appdata_state_dir.as_path())
+            );
+            assert!(
+                !sync_root.join(".ironmesh-connection.json").exists(),
+                "legacy sync-root bootstrap file should not be created"
+            );
+            assert!(
+                !sync_root.join(".ironmesh-client-identity.json").exists(),
+                "legacy sync-root identity file should not be created"
+            );
+
+            let persisted_bootstrap = ConnectionBootstrap::from_path(&local_appdata_bootstrap)
+                .expect("failed to reload LocalAppData bootstrap");
+            assert_eq!(
+                persisted_bootstrap.pairing_token, None,
+                "persisted LocalAppData bootstrap should not keep the pairing token"
+            );
+            let persisted_identity = ClientIdentityMaterial::from_path(&local_appdata_identity)
+                .expect("failed to reload LocalAppData client identity");
+            let sdk = tokio::task::spawn_blocking(move || {
+                persisted_bootstrap.build_client_with_identity(&persisted_identity)
+            })
+            .await
+            .expect("bootstrap client builder task should join")
+            .expect("failed to build authenticated SDK client from LocalAppData state");
+
+            let first_upload = sync_root.join("localappdata-first-run-upload.txt");
+            std::fs::write(&first_upload, b"cfapi local app data first upload")
+                .expect("failed to write initial upload file");
+            wait_for_remote_payload(
+                &sdk,
+                "localappdata-first-run-upload.txt",
+                b"cfapi local app data first upload",
+                220,
+            )
+            .await;
+
+            stop_server_without_cleanup(&mut adapter).await;
+            std::fs::remove_file(&bootstrap_file)
+                .expect("failed to remove original bootstrap file before restart");
+            wait_for_path_absence(&bootstrap_file, 80).await;
+
+            let mut restarted_adapter = start_cfapi_adapter_with_local_appdata(
+                &sync_root_id,
+                "ironmesh System Test LocalAppData Root",
+                &sync_root,
+                500,
+                &local_appdata_dir,
+            )
+            .await?;
+
+            let restarted_upload = sync_root.join("localappdata-restart-upload.txt");
+            std::fs::write(&restarted_upload, b"cfapi local app data restart upload")
+                .expect("failed to write restart upload file");
+            wait_for_remote_payload(
+                &sdk,
+                "localappdata-restart-upload.txt",
+                b"cfapi local app data restart upload",
+                220,
+            )
+            .await;
+
+            stop_server(&mut restarted_adapter).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = std::fs::remove_dir_all(&server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        let _ = std::fs::remove_dir_all(&local_appdata_dir);
+
+        result.expect(
+            "CFAPI adapter should persist LocalAppData state and restart without --bootstrap-file",
+        );
     }
 
     #[tokio::test]

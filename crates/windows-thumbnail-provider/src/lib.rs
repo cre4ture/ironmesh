@@ -1,15 +1,29 @@
 #![cfg(windows)]
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::{copy_nonoverlapping, null_mut};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use adapter_windows_cfapi::auth::{
+    is_internal_client_identity_relative_path, load_persisted_client_identity,
+};
+use adapter_windows_cfapi::connection_config::{
+    is_internal_connection_bootstrap_relative_path, resolve_connection_config,
+};
+use adapter_windows_cfapi::helpers::{normalize_path, path_to_relative};
+use adapter_windows_cfapi::sync_root_identity::{
+    RegisteredSyncRootContext, load_registered_sync_root_context,
+};
+use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
+use image::{DynamicImage, RgbaImage};
+use reqwest::{StatusCode, Url};
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_POINTER, S_FALSE,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_NOINTERFACE, E_POINTER, S_FALSE,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, HBITMAP,
@@ -35,6 +49,7 @@ pub const STATUS_UI_SOURCE_FACTORY_CLSID: GUID =
 
 const MIN_THUMBNAIL_SIZE: u32 = 32;
 const MAX_THUMBNAIL_SIZE: u32 = 512;
+const MAX_CACHED_THUMBNAILS: usize = 128;
 
 #[implement(IInitializeWithItem, IThumbnailProvider)]
 struct IronmeshThumbnailProvider {
@@ -47,6 +62,49 @@ impl IronmeshThumbnailProvider {
             source_path: Mutex::new(None),
         }
     }
+}
+
+#[derive(Default)]
+struct ThumbnailBytesCache {
+    order: VecDeque<String>,
+    items: HashMap<String, Vec<u8>>,
+}
+
+impl ThumbnailBytesCache {
+    fn get(&mut self, key: &str) -> Option<Vec<u8>> {
+        let value = self.items.get(key)?.clone();
+        self.touch(key);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: String, value: Vec<u8>) {
+        if self.items.contains_key(&key) {
+            self.items.insert(key.clone(), value);
+            self.touch(&key);
+            return;
+        }
+
+        self.items.insert(key.clone(), value);
+        self.order.push_back(key);
+
+        while self.items.len() > MAX_CACHED_THUMBNAILS {
+            if let Some(stale) = self.order.pop_front() {
+                self.items.remove(&stale);
+            }
+        }
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(index) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(index);
+        }
+        self.order.push_back(key.to_string());
+    }
+}
+
+fn thumbnail_bytes_cache() -> &'static Mutex<ThumbnailBytesCache> {
+    static CACHE: OnceLock<Mutex<ThumbnailBytesCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ThumbnailBytesCache::default()))
 }
 
 fn append_diagnostic_log(message: &str) {
@@ -112,7 +170,24 @@ impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
             clamped_size, source_path
         ));
 
-        let bitmap = unsafe { create_prototype_bitmap(clamped_size)? };
+        let bitmap = match try_create_real_thumbnail_bitmap(&source_path, clamped_size) {
+            Ok(bitmap) => {
+                append_diagnostic_log(&format!(
+                    "GetThumbnail source=server size={} source_path={}",
+                    clamped_size, source_path
+                ));
+                bitmap
+            }
+            Err(error) => {
+                append_diagnostic_log(&format!(
+                    "GetThumbnail source=fallback size={} source_path={} error={:#}",
+                    clamped_size, source_path, error
+                ));
+                unsafe { create_prototype_bitmap(clamped_size) }
+                    .map_err(|error| windows_core::Error::new(E_FAIL, format!("{error:#}")))?
+            }
+        };
+
         unsafe {
             *phbmp = bitmap;
             *pdwalpha = WTSAT_ARGB;
@@ -241,18 +316,245 @@ fn pwstr_to_string(value: PWSTR) -> Option<String> {
     unsafe { value.to_string().ok() }
 }
 
-unsafe fn create_prototype_bitmap(size: u32) -> Result<HBITMAP> {
-    let pixels = prototype_bgra_pixels(size);
+fn try_create_real_thumbnail_bitmap(
+    source_path: &str,
+    requested_size: u32,
+) -> AnyhowResult<HBITMAP> {
+    let source_path = PathBuf::from(source_path);
+    let (sync_root_path, sync_root_context) = find_registered_sync_root(&source_path)
+        .with_context(|| format!("failed to resolve sync root for {}", source_path.display()))?;
+    let relative_path = path_to_relative(&sync_root_path, &source_path.to_string_lossy());
+    if relative_path.is_empty() {
+        bail!(
+            "resolved empty sync-root relative path for {} under {}",
+            source_path.display(),
+            sync_root_path.display()
+        );
+    }
+    if is_internal_connection_bootstrap_relative_path(&relative_path)
+        || is_internal_client_identity_relative_path(&relative_path)
+    {
+        bail!("skipping internal sync-root metadata file {relative_path}");
+    }
+
+    let remote_key = remote_key_for_item(&sync_root_context.identity.prefix, &relative_path);
+    let thumbnail_request_path = media_thumbnail_request_path(&remote_key)?;
+    let resolved = resolve_connection_config(&sync_root_path, None, None, None, None, None, None)
+        .with_context(|| {
+        format!(
+            "failed to resolve connection config for {}",
+            sync_root_path.display()
+        )
+    })?;
+    let client = build_thumbnail_client(&sync_root_path, &resolved)
+        .with_context(|| format!("failed to build client for {}", sync_root_path.display()))?;
+    let thumbnail_bytes = fetch_thumbnail_bytes(&client, &thumbnail_request_path)
+        .with_context(|| format!("failed to fetch thumbnail for remote key {}", remote_key))?;
+
+    append_diagnostic_log(&format!(
+        "thumbnail-fetch remote_key={} request_path={} bytes={}",
+        remote_key,
+        thumbnail_request_path,
+        thumbnail_bytes.len()
+    ));
+
+    create_bitmap_from_thumbnail_bytes(&thumbnail_bytes, requested_size)
+        .with_context(|| format!("failed to decode thumbnail payload for {}", remote_key))
+}
+
+fn build_thumbnail_client(
+    sync_root_path: &Path,
+    resolved: &adapter_windows_cfapi::connection_config::ResolvedConnectionConfig,
+) -> AnyhowResult<client_sdk::IronMeshClient> {
+    match resolved.build_client(None) {
+        Ok(client) => return Ok(client),
+        Err(initial_error) => {
+            let client_identity =
+                load_thumbnail_client_identity(sync_root_path, &resolved.bootstrap_path)?;
+            if let Some(identity) = client_identity.as_ref() {
+                return resolved.build_client(Some(identity)).with_context(|| {
+                    format!(
+                        "failed to build client with persisted identity after unauthenticated attempt failed: {initial_error:#}"
+                    )
+                });
+            }
+
+            return Err(initial_error)
+                .with_context(|| "failed to build client without persisted identity".to_string());
+        }
+    }
+}
+
+fn load_thumbnail_client_identity(
+    sync_root_path: &Path,
+    bootstrap_path: &Path,
+) -> AnyhowResult<Option<client_sdk::ClientIdentityMaterial>> {
+    load_persisted_client_identity(sync_root_path, Some(bootstrap_path), None).with_context(|| {
+        format!(
+            "failed to load persisted client identity for {}",
+            sync_root_path.display()
+        )
+    })
+}
+
+fn find_registered_sync_root(path: &Path) -> AnyhowResult<(PathBuf, RegisteredSyncRootContext)> {
+    let mut last_error = None;
+    let mut current_context = None;
+    let mut current_root = None;
+
+    for ancestor in path.ancestors() {
+        match load_registered_sync_root_context(ancestor) {
+            Ok(Some(context)) => {
+                if let Some(existing) = current_context.as_ref() {
+                    if existing == &context {
+                        current_root = Some(ancestor.to_path_buf());
+                        continue;
+                    }
+                    break;
+                }
+
+                current_root = Some(ancestor.to_path_buf());
+                current_context = Some(context);
+            }
+            Ok(None) => {
+                if current_context.is_some() {
+                    break;
+                }
+            }
+            Err(error) => {
+                last_error = Some((ancestor.to_path_buf(), error));
+            }
+        }
+    }
+
+    if let (Some(root), Some(context)) = (current_root, current_context) {
+        return Ok((root, context));
+    }
+
+    if let Some((ancestor, error)) = last_error {
+        return Err(error).with_context(|| {
+            format!(
+                "encountered sync-root lookup error while walking ancestors of {} (last ancestor {})",
+                path.display(),
+                ancestor.display()
+            )
+        });
+    }
+
+    Err(anyhow!(
+        "{} is not under a registered Ironmesh sync root",
+        path.display()
+    ))
+}
+
+fn remote_key_for_item(prefix: &str, relative_path: &str) -> String {
+    let prefix = normalize_path(prefix).trim_matches('/').to_string();
+    let relative_path = normalize_path(relative_path);
+
+    match (prefix.is_empty(), relative_path.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => relative_path,
+        (false, true) => prefix,
+        (false, false) => format!("{prefix}/{relative_path}"),
+    }
+}
+
+fn media_thumbnail_request_path(remote_key: &str) -> AnyhowResult<String> {
+    if remote_key.trim().is_empty() {
+        bail!("remote key is empty");
+    }
+
+    let mut url = Url::parse("https://ironmesh.invalid/media/thumbnail")
+        .context("invalid base thumbnail URL")?;
+    url.query_pairs_mut().append_pair("key", remote_key);
+    Ok(relative_request_path(&url))
+}
+
+fn relative_request_path(url: &Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
+fn fetch_thumbnail_bytes(
+    client: &client_sdk::IronMeshClient,
+    request_path: &str,
+) -> AnyhowResult<Vec<u8>> {
+    if let Some(cached) = thumbnail_bytes_cache()
+        .lock()
+        .expect("thumbnail cache lock poisoned")
+        .get(request_path)
+    {
+        append_diagnostic_log(&format!("thumbnail-cache hit request_path={request_path}"));
+        return Ok(cached);
+    }
+
+    let response = client
+        .get_relative_path_blocking(request_path)
+        .with_context(|| format!("request failed for {request_path}"))?;
+    match response.status {
+        StatusCode::OK => {
+            if response.body.is_empty() {
+                bail!("thumbnail endpoint returned an empty body");
+            }
+            let payload = response.body.to_vec();
+            thumbnail_bytes_cache()
+                .lock()
+                .expect("thumbnail cache lock poisoned")
+                .insert(request_path.to_string(), payload.clone());
+            Ok(payload)
+        }
+        StatusCode::NOT_FOUND => bail!("thumbnail not available"),
+        status => bail!("thumbnail endpoint returned {status}"),
+    }
+}
+
+fn create_bitmap_from_thumbnail_bytes(bytes: &[u8], requested_size: u32) -> AnyhowResult<HBITMAP> {
+    let image = image::load_from_memory(bytes).context("failed to decode thumbnail image")?;
+    let image = resize_for_requested_size(
+        image,
+        requested_size.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE),
+    );
+    create_bitmap_from_rgba_image(&image.to_rgba8())
+}
+
+fn resize_for_requested_size(image: DynamicImage, requested_size: u32) -> DynamicImage {
+    if image.width() > requested_size || image.height() > requested_size {
+        image.thumbnail(requested_size, requested_size)
+    } else {
+        image
+    }
+}
+
+fn create_bitmap_from_rgba_image(image: &RgbaImage) -> AnyhowResult<HBITMAP> {
+    let pixels = rgba_pixels_to_bgra(image.as_raw());
+    unsafe { create_bitmap_from_bgra_pixels(image.width(), image.height(), &pixels) }
+}
+
+fn rgba_pixels_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    let mut bgra = Vec::with_capacity(rgba.len());
+    for pixel in rgba.chunks_exact(4) {
+        bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    bgra
+}
+
+unsafe fn create_bitmap_from_bgra_pixels(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> AnyhowResult<HBITMAP> {
     let mut bits = null_mut();
     let bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size as i32,
-            biHeight: -(size as i32),
+            biWidth: width as i32,
+            biHeight: -(height as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
-            biSizeImage: (pixels.len()) as u32,
+            biSizeImage: pixels.len() as u32,
             ..Default::default()
         },
         ..Default::default()
@@ -261,13 +563,18 @@ unsafe fn create_prototype_bitmap(size: u32) -> Result<HBITMAP> {
     let bitmap =
         unsafe { CreateDIBSection(None, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0)? };
     if bits.is_null() {
-        return Err(E_POINTER.into());
+        bail!("CreateDIBSection returned a null bitmap buffer");
     }
 
     unsafe {
         copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u8>(), pixels.len());
     }
     Ok(bitmap)
+}
+
+unsafe fn create_prototype_bitmap(size: u32) -> AnyhowResult<HBITMAP> {
+    let pixels = prototype_bgra_pixels(size);
+    unsafe { create_bitmap_from_bgra_pixels(size, size, &pixels) }
 }
 
 fn prototype_bgra_pixels(size: u32) -> Vec<u8> {
@@ -411,7 +718,10 @@ fn fill_circle(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE, prototype_bgra_pixels};
+    use super::{
+        MAX_THUMBNAIL_SIZE, MIN_THUMBNAIL_SIZE, media_thumbnail_request_path,
+        prototype_bgra_pixels, remote_key_for_item, rgba_pixels_to_bgra,
+    };
 
     #[test]
     fn prototype_bitmap_respects_size_bounds() {
@@ -438,5 +748,30 @@ mod tests {
     fn prototype_bitmap_writes_pixels_in_bgra_order() {
         let pixels = prototype_bgra_pixels(64);
         assert_eq!(&pixels[..4], &[70, 48, 24, 255]);
+    }
+
+    #[test]
+    fn remote_key_joins_prefix_and_relative_path() {
+        assert_eq!(
+            remote_key_for_item("docs/team", r"folder\photo.jpg"),
+            "docs/team/folder/photo.jpg"
+        );
+        assert_eq!(
+            remote_key_for_item("", "gallery/cat.png"),
+            "gallery/cat.png"
+        );
+    }
+
+    #[test]
+    fn media_thumbnail_request_path_percent_encodes_remote_key() {
+        let path = media_thumbnail_request_path("gallery/cat one.png")
+            .expect("thumbnail request path should build");
+        assert_eq!(path, "/media/thumbnail?key=gallery%2Fcat+one.png");
+    }
+
+    #[test]
+    fn rgba_pixels_are_repacked_to_bgra() {
+        let bgra = rgba_pixels_to_bgra(&[10, 20, 30, 255, 40, 50, 60, 128]);
+        assert_eq!(bgra, vec![30, 20, 10, 255, 60, 50, 40, 128]);
     }
 }

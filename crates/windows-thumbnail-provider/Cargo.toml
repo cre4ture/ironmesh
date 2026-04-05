@@ -9,6 +9,11 @@ authors.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(windows)'.dependencies]
+adapter-windows-cfapi = { path = "../adapter-windows-cfapi" }
+anyhow.workspace = true
+client-sdk = { path = "../client-sdk" }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls-tls"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

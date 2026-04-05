@@ -89,6 +89,7 @@ pub async fn start_cfapi_adapter_with_refresh_pairing_and_ca(
         pairing_token,
         server_ca_cert,
         None,
+        None,
     )
     .await
 }
@@ -109,6 +110,50 @@ pub async fn start_cfapi_adapter_with_bootstrap(
         None,
         None,
         Some(bootstrap_file),
+        None,
+    )
+    .await
+}
+
+pub async fn start_cfapi_adapter_with_bootstrap_and_local_appdata(
+    sync_root_id: &str,
+    display_name: &str,
+    root_path: &Path,
+    remote_refresh_interval_ms: u64,
+    bootstrap_file: &Path,
+    local_appdata_dir: &Path,
+) -> Result<ChildGuard> {
+    start_cfapi_adapter_with_resolved_inputs(
+        sync_root_id,
+        display_name,
+        root_path,
+        None,
+        remote_refresh_interval_ms,
+        None,
+        None,
+        Some(bootstrap_file),
+        Some(local_appdata_dir),
+    )
+    .await
+}
+
+pub async fn start_cfapi_adapter_with_local_appdata(
+    sync_root_id: &str,
+    display_name: &str,
+    root_path: &Path,
+    remote_refresh_interval_ms: u64,
+    local_appdata_dir: &Path,
+) -> Result<ChildGuard> {
+    start_cfapi_adapter_with_resolved_inputs(
+        sync_root_id,
+        display_name,
+        root_path,
+        None,
+        remote_refresh_interval_ms,
+        None,
+        None,
+        None,
+        Some(local_appdata_dir),
     )
     .await
 }
@@ -123,6 +168,7 @@ async fn start_cfapi_adapter_with_resolved_inputs(
     pairing_token: Option<&str>,
     server_ca_cert: Option<&Path>,
     bootstrap_file: Option<&Path>,
+    local_appdata_dir: Option<&Path>,
 ) -> Result<ChildGuard> {
     let os_integration_bin = binary_path("os-integration")?;
     let root_path_arg = root_path.to_string_lossy().to_string();
@@ -163,6 +209,9 @@ async fn start_cfapi_adapter_with_resolved_inputs(
     }
     if let Some(bootstrap_file) = bootstrap_file {
         command.arg("--bootstrap-file").arg(bootstrap_file);
+    }
+    if let Some(local_appdata_dir) = local_appdata_dir {
+        command.env("LOCALAPPDATA", local_appdata_dir);
     }
 
     let child = match command

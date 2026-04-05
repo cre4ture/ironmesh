@@ -962,6 +962,12 @@ impl IronMeshClient {
         })
     }
 
+    pub fn get_relative_path_blocking(&self, path: &str) -> Result<RelativePathResponse> {
+        let path = path.to_string();
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.get_relative_path(&path))
+    }
+
     async fn start_upload_session(
         &self,
         key: &str,
