@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::windows::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -206,8 +206,10 @@ pub struct SyncRootMonitor {
     provider_instance_id: uuid::Uuid,
     uploader: Arc<dyn Uploader>,
     seen: HashMap<String, SeenEntry>,
-    dehydrations_in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
-    hydrations_in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
+    dehydrations_in_flight: Arc<Mutex<HashSet<String>>>,
+    hydrations_in_flight: Arc<Mutex<HashSet<String>>>,
+    remote_applied_tracker: RemoteAppliedTracker,
+    refresh_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -218,6 +220,47 @@ struct DehydrateScanSummary {
     probed_placeholder_count: usize,
     hydrate_eligible_count: usize,
     eligible_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RemoteAppliedTracker {
+    directories: Arc<Mutex<HashSet<String>>>,
+}
+
+impl RemoteAppliedTracker {
+    pub fn record_plan(&self, plan: &CfapiActionPlan) {
+        let mut directories = self
+            .directories
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        for action in &plan.actions {
+            match action {
+                CfapiAction::EnsureDirectory { path } => {
+                    record_remote_applied_directory(path, &mut directories);
+                }
+                CfapiAction::EnsurePlaceholder { path, .. }
+                | CfapiAction::HydrateOnDemand { path, .. } => {
+                    for parent in parent_directories_for_path(path) {
+                        record_remote_applied_directory(&parent, &mut directories);
+                    }
+                }
+                CfapiAction::QueueUploadOnClose { .. } | CfapiAction::MarkConflict { .. } => {}
+            }
+        }
+    }
+
+    fn take_directory_suppression(&self, path: &str) -> bool {
+        let normalized = normalize_monitor_relative_path(path);
+        if normalized.is_empty() {
+            return false;
+        }
+
+        self.directories
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&normalized)
+    }
 }
 
 impl SyncRootMonitor {
@@ -233,9 +276,19 @@ impl SyncRootMonitor {
             provider_instance_id,
             uploader,
             seen: HashMap::new(),
-            dehydrations_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            hydrations_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            dehydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            hydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            remote_applied_tracker: RemoteAppliedTracker::default(),
+            refresh_gate: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub fn remote_applied_tracker(&self) -> RemoteAppliedTracker {
+        self.remote_applied_tracker.clone()
+    }
+
+    pub fn refresh_gate(&self) -> Arc<Mutex<()>> {
+        self.refresh_gate.clone()
     }
 
     pub fn run(&mut self) {
@@ -285,6 +338,10 @@ impl SyncRootMonitor {
     }
 
     pub fn walk(&mut self) {
+        let refresh_gate = self.refresh_gate.clone();
+        let _refresh_gate = refresh_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut current = self.snapshot_entries();
         let handled_renames = self.handle_local_file_renames(&current);
         let dehydrate_summary = summarize_dehydrate_scan(&current);
@@ -522,6 +579,14 @@ impl SyncRootMonitor {
         }
 
         if entry.is_dir {
+            if self.remote_applied_tracker.take_directory_suppression(&rel_path) {
+                tracing::info!(
+                    "{}: suppressing local upload for remote-applied directory {}",
+                    self.name,
+                    rel_path
+                );
+                return;
+            }
             tracing::info!("{}: detected new directory {}", self.name, rel_path);
             let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
             let remote_path = directory_marker_path(&rel_path);
@@ -906,11 +971,27 @@ impl SyncRootMonitor {
 }
 
 fn directory_marker_path(path: &str) -> String {
-    let trimmed = path.trim_matches(['/', '\\']);
+    let trimmed = normalize_monitor_relative_path(path);
     if trimmed.is_empty() {
         String::new()
     } else {
-        format!("{}{}", trimmed.replace('\\', "/"), "/")
+        format!("{trimmed}/")
+    }
+}
+
+fn normalize_monitor_relative_path(path: &str) -> String {
+    path.trim_matches(['/', '\\']).replace('\\', "/")
+}
+
+fn record_remote_applied_directory(path: &str, directories: &mut HashSet<String>) {
+    let normalized = normalize_monitor_relative_path(path);
+    if normalized.is_empty() {
+        return;
+    }
+
+    directories.insert(normalized.clone());
+    for parent in parent_directories_for_path(&normalized) {
+        directories.insert(parent);
     }
 }
 
@@ -1238,6 +1319,60 @@ mod tests {
                 .iter()
                 .all(|path| path != "docs/" && path != "docs/readme.txt"),
             "startup walk should not re-upload remote-seeded entries"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn remote_applied_directory_is_suppressed_but_later_local_directory_uploads() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-remote-apply-{unique}"));
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        monitor.seed_seen();
+        let remote_applied = monitor.remote_applied_tracker();
+
+        std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create remote directory");
+        remote_applied.record_plan(&CfapiActionPlan {
+            actions: vec![CfapiAction::EnsureDirectory {
+                path: "docs".to_string(),
+            }],
+        });
+        monitor.walk();
+
+        assert!(
+            uploader
+                .uploads
+                .lock()
+                .expect("uploads lock poisoned")
+                .is_empty(),
+            "remote-applied directory should not be echoed back as local upload"
+        );
+
+        std::fs::create_dir_all(sync_root.join("local")).expect("failed to create local directory");
+        monitor.walk();
+
+        let uploads = uploader
+            .uploads
+            .lock()
+            .expect("uploads lock poisoned")
+            .clone();
+        assert!(
+            uploads.iter().any(|path| path == "local/"),
+            "later local directory should still upload normally, uploads={uploads:?}"
+        );
+        assert!(
+            uploads.iter().all(|path| path != "docs/"),
+            "remote-applied directory should remain suppressed, uploads={uploads:?}"
         );
 
         let _ = std::fs::remove_dir_all(sync_root);

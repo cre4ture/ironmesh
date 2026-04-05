@@ -361,6 +361,8 @@ pub fn cli_main() -> anyhow::Result<()> {
                 sync_root_identity.provider_instance_id,
                 uploader.clone(),
             );
+            let remote_applied_tracker = monitor.remote_applied_tracker();
+            let refresh_gate = monitor.refresh_gate();
             monitor.seed_remote_entries_with_suppressed_paths(
                 &action_plan,
                 &startup_delete_report.suppressed_startup_paths,
@@ -384,43 +386,47 @@ pub fn cli_main() -> anyhow::Result<()> {
             let refresh_runtime = runtime.clone();
             let refresh_running = running.clone();
             let refresh_provider_instance_id = sync_root_identity.provider_instance_id;
+            let refresh_remote_applied_tracker = remote_applied_tracker.clone();
+            let refresh_monitor_gate = refresh_gate.clone();
             refresh_poller.spawn_fetcher_loop(
                 refresh_running,
                 Some(initial_snapshot),
                 fetcher,
                 move |update| {
-                    let remote_delete_report = match reconcile_remote_delete_state(
-                        &refresh_registration.root_path,
-                        &update.snapshot,
-                        refresh_provider_instance_id,
-                    ) {
-                        Ok(report) => {
-                            log_remote_delete_reconcile_summary(
-                                &format!("refresh changed_paths={}", update.changed_paths.len()),
-                                &report,
-                            );
-                            report
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                "remote-refresh: remote-delete reconciliation failed: {err:#}"
-                            );
-                            RemoteDeleteReconcileReport::default()
-                        }
-                    };
                     let plan =
                         refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
                     let summary_label =
                         format!("remote-refresh changed_paths={}", update.changed_paths.len());
                     log_action_plan_summary(&summary_label, &plan);
-                    if let Err(err) = apply_action_plan(
-                        &refresh_registration.root_path,
-                        &plan,
-                        refresh_provider_instance_id,
-                    ) {
-                        tracing::info!("remote-refresh: apply_action_plan error: {err}");
-                        return;
-                    }
+                    let remote_delete_report = {
+                        let _monitor_gate = refresh_monitor_gate
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let report = match reconcile_remote_delete_state(
+                            &refresh_registration.root_path,
+                            &update.snapshot,
+                            refresh_provider_instance_id,
+                        ) {
+                            Ok(report) => report,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "remote-refresh: remote-delete reconciliation failed: {err:#}"
+                                );
+                                RemoteDeleteReconcileReport::default()
+                            }
+                        };
+                        if let Err(err) = apply_action_plan(
+                            &refresh_registration.root_path,
+                            &plan,
+                            refresh_provider_instance_id,
+                        ) {
+                            tracing::info!("remote-refresh: apply_action_plan error: {err}");
+                            return;
+                        }
+                        refresh_remote_applied_tracker.record_plan(&plan);
+                        report
+                    };
+                    log_remote_delete_reconcile_summary(&summary_label, &remote_delete_report);
                     let reconciled_paths = refresh_runtime.sync_from_action_plan(&plan);
                     let sync_state_stats =
                         reconcile_sync_states(&refresh_registration.root_path, &plan);
