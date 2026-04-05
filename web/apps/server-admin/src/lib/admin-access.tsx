@@ -11,6 +11,8 @@ import {
 } from "react";
 
 const ADMIN_TOKEN_STORAGE_KEY = "ironmesh.server-admin.admin-token-override";
+const ADMIN_SESSION_CONFIRMATION_ATTEMPTS = 8;
+const ADMIN_SESSION_CONFIRMATION_DELAY_MS = 100;
 
 type AdminAccessContextValue = {
   adminTokenOverride: string;
@@ -41,6 +43,12 @@ function errorMessage(error: unknown): string | null {
     return null;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+async function delay(timeoutMs: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    window.setTimeout(resolve, timeoutMs);
+  });
 }
 
 export function AdminAccessProvider({ children }: { children: ReactNode }) {
@@ -79,11 +87,26 @@ export function AdminAccessProvider({ children }: { children: ReactNode }) {
   const loginMutation = useMutation({
     mutationFn: async (password: string) => {
       await loginAdmin(password);
-      await queryClient.invalidateQueries({
-        queryKey: sessionQueryOptions.queryKey,
-        exact: true
-      });
-      return queryClient.fetchQuery(sessionQueryOptions);
+      let lastStatus: AdminSessionStatus | null = null;
+      for (let attempt = 0; attempt < ADMIN_SESSION_CONFIRMATION_ATTEMPTS; attempt += 1) {
+        await queryClient.invalidateQueries({
+          queryKey: sessionQueryOptions.queryKey,
+          exact: true
+        });
+        const status = await queryClient.fetchQuery(sessionQueryOptions);
+        lastStatus = status;
+        if (!status.login_required || status.authenticated) {
+          return status;
+        }
+        if (attempt + 1 < ADMIN_SESSION_CONFIRMATION_ATTEMPTS) {
+          await delay(ADMIN_SESSION_CONFIRMATION_DELAY_MS);
+        }
+      }
+      throw new Error(
+        lastStatus?.login_required
+          ? "admin session cookie was not confirmed after login"
+          : "failed to confirm admin session state after login"
+      );
     },
     onSuccess: (status) => {
       queryClient.setQueryData(sessionQueryOptions.queryKey, status);

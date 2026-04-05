@@ -59,8 +59,9 @@ export function DashboardPage() {
   const normalizedAdminTokenOverride = adminTokenOverride.trim();
   const hasExplicitAdminAccess =
     Boolean(normalizedAdminTokenOverride) || Boolean(sessionStatus?.authenticated);
+  const loginRequired = sessionStatus?.login_required ?? true;
   const canRunAdminMaintenance =
-    !sessionLoading && (!sessionStatus?.login_required || hasExplicitAdminAccess);
+    !sessionLoading && (!loginRequired || hasExplicitAdminAccess);
   const canInspectCluster = canRunAdminMaintenance;
   const canInspectRendezvous = canRunAdminMaintenance;
 

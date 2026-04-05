@@ -209,12 +209,44 @@ test("server-admin runtime ignores auth-protected setup probes", async ({ page }
   await expect(page.getByText("Setup endpoint error", { exact: true })).toHaveCount(0);
 });
 
+test("server-admin login ignores stale unauthenticated session probes", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    delayedInitialUnauthenticatedSessionMs: 250
+  });
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await expect(page.getByText("not authenticated", { exact: true })).toHaveCount(0);
+});
+
+test("server-admin waits for session confirmation before protected dashboard fetches", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    postLoginUnauthenticatedSessionResponses: 2,
+    protectDashboardAdminRoutesUntilSessionConfirmed: true
+  });
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await expect(page.getByText("Failed to load dashboard", { exact: true })).toHaveCount(0);
+});
+
 async function installServerAdminMocks(
   page: Page,
   options?: {
     setupMode?: boolean;
     bootstrapClaimMode?: "success" | "bad_gateway";
     setupProbeStatus?: 401 | 403 | 404;
+    delayedInitialUnauthenticatedSessionMs?: number;
+    postLoginUnauthenticatedSessionResponses?: number;
+    protectDashboardAdminRoutesUntilSessionConfirmed?: boolean;
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -222,6 +254,10 @@ async function installServerAdminMocks(
   const emptyVectorTileBody = gzipSync(Buffer.alloc(0));
   const glyphRangeBody = Buffer.alloc(0);
   let authenticated = false;
+  let sessionConfirmed = false;
+  let sessionStatusRequestCount = 0;
+  let remainingPostLoginUnauthenticatedSessionResponses =
+    options?.postLoginUnauthenticatedSessionResponses ?? 0;
   const revokedDeviceIds = new Set<string>();
   const bootstrapBundle = {
     cluster_id: "cluster-alpha",
@@ -275,21 +311,44 @@ async function installServerAdminMocks(
     const method = route.request().method();
 
     if (pathname === "/auth/admin/session" && method === "GET") {
+      let sessionAuthenticated = authenticated;
+      if (sessionAuthenticated && remainingPostLoginUnauthenticatedSessionResponses > 0) {
+        remainingPostLoginUnauthenticatedSessionResponses -= 1;
+        sessionAuthenticated = false;
+      }
+      if (sessionAuthenticated) {
+        sessionConfirmed = true;
+      }
+      const shouldDelayInitialUnauthenticatedSession =
+        sessionStatusRequestCount === 0 &&
+        !sessionAuthenticated &&
+        (options?.delayedInitialUnauthenticatedSessionMs ?? 0) > 0;
+      sessionStatusRequestCount += 1;
+      if (shouldDelayInitialUnauthenticatedSession) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, options?.delayedInitialUnauthenticatedSessionMs ?? 0)
+        );
+      }
       return json(route, {
         login_required: true,
-        authenticated,
-        session_expires_at_unix: authenticated ? 1_900_000_000 : null,
+        authenticated: sessionAuthenticated,
+        session_expires_at_unix: sessionAuthenticated ? 1_900_000_000 : null,
         token_override_enabled: true
       });
     }
 
     if (pathname === "/auth/admin/login" && method === "POST") {
       authenticated = true;
+      sessionConfirmed = false;
+      remainingPostLoginUnauthenticatedSessionResponses =
+        options?.postLoginUnauthenticatedSessionResponses ?? 0;
       return json(route, { status: "ok" });
     }
 
     if (pathname === "/auth/admin/logout" && method === "POST") {
       authenticated = false;
+      sessionConfirmed = false;
+      remainingPostLoginUnauthenticatedSessionResponses = 0;
       return json(route, { status: "ok" });
     }
 
@@ -479,6 +538,10 @@ async function installServerAdminMocks(
     }
 
     if (pathname === "/cluster/status" && method === "GET") {
+      if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
+        await route.fulfill({ status: 401 });
+        return;
+      }
       return json(route, {
         local_node_id: "node-alpha",
         total_nodes: 2,
@@ -493,6 +556,10 @@ async function installServerAdminMocks(
     }
 
     if (pathname === "/cluster/nodes" && method === "GET") {
+      if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
+        await route.fulfill({ status: 401 });
+        return;
+      }
       return json(route, [
         {
           node_id: "node-alpha",
@@ -562,6 +629,10 @@ async function installServerAdminMocks(
     }
 
     if (pathname === "/cluster/replication/plan" && method === "GET") {
+      if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
+        await route.fulfill({ status: 401 });
+        return;
+      }
       return json(route, {
         generated_at_unix: 1_900_000_005,
         under_replicated: 1,
@@ -784,6 +855,10 @@ async function installServerAdminMocks(
     }
 
     if (pathname === "/auth/rendezvous-config" && method === "GET") {
+      if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
+        await route.fulfill({ status: 401 });
+        return;
+      }
       return json(route, rendezvousConfig);
     }
 
