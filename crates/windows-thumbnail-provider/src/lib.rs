@@ -10,7 +10,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use adapter_windows_cfapi::auth::{
-    is_internal_client_identity_relative_path, load_persisted_client_identity,
+    inspect_persisted_client_identity_paths, is_internal_client_identity_relative_path,
+    load_persisted_client_identity,
 };
 use adapter_windows_cfapi::connection_config::{
     is_internal_connection_bootstrap_relative_path, resolve_connection_config,
@@ -47,9 +48,24 @@ pub const CONTENT_URI_SOURCE_CLSID: GUID = GUID::from_u128(0xf1aa7371_0c71_4519_
 pub const STATUS_UI_SOURCE_FACTORY_CLSID: GUID =
     GUID::from_u128(0x47e87ba5_1eb9_4f16_a944_4684850839b5);
 
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROVIDER_BUILD_REVISION: &str = git_version::git_version!(fallback = "unknown");
 const MIN_THUMBNAIL_SIZE: u32 = 32;
 const MAX_THUMBNAIL_SIZE: u32 = 512;
 const MAX_CACHED_THUMBNAILS: usize = 128;
+
+#[derive(Debug, Clone)]
+pub struct DebugThumbnailFetchResult {
+    pub remote_key: String,
+    pub request_path: String,
+    pub bootstrap_path: PathBuf,
+    pub identity_path: Option<PathBuf>,
+    pub candidate_identity_paths: Vec<PathBuf>,
+    pub auth_mode: String,
+    pub payload_len: usize,
+    pub decoded_width: u32,
+    pub decoded_height: u32,
+}
 
 #[implement(IInitializeWithItem, IThumbnailProvider)]
 struct IronmeshThumbnailProvider {
@@ -128,6 +144,28 @@ fn append_diagnostic_log(message: &str) {
         .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
+fn log_provider_banner_once() {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    if LOGGED.set(()).is_ok() {
+        append_diagnostic_log(&format!(
+            "thumbnail-provider version={} build_revision={}",
+            PROVIDER_VERSION, PROVIDER_BUILD_REVISION
+        ));
+    }
+}
+
+fn format_path_list(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "-".to_string();
+    }
+
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 #[allow(non_snake_case)]
 impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
     fn Initialize(&self, psi: Ref<'_, IShellItem>, _grfmode: u32) -> Result<()> {
@@ -158,6 +196,7 @@ impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
             return Err(E_POINTER.into());
         }
 
+        log_provider_banner_once();
         let clamped_size = cx.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE);
         let source_path = self
             .source_path
@@ -320,6 +359,171 @@ fn try_create_real_thumbnail_bitmap(
     source_path: &str,
     requested_size: u32,
 ) -> AnyhowResult<HBITMAP> {
+    let fetched = fetch_thumbnail_for_source_path(source_path)
+        .with_context(|| "failed to resolve thumbnail")?;
+    create_bitmap_from_thumbnail_bytes(
+        &fetched.thumbnail_bytes,
+        requested_size.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE),
+    )
+    .with_context(|| {
+        format!(
+            "failed to decode thumbnail payload for {}",
+            fetched.remote_key
+        )
+    })
+}
+
+struct ThumbnailIdentityLoad {
+    candidate_paths: Vec<PathBuf>,
+    selected_path: Option<PathBuf>,
+    client_identity: Option<client_sdk::ClientIdentityMaterial>,
+}
+
+struct ThumbnailClientBuild {
+    client: client_sdk::IronMeshClient,
+    auth_mode: &'static str,
+    candidate_paths: Vec<PathBuf>,
+    selected_path: Option<PathBuf>,
+}
+
+struct FetchedThumbnail {
+    remote_key: String,
+    request_path: String,
+    bootstrap_path: PathBuf,
+    client_build: ThumbnailClientBuild,
+    thumbnail_bytes: Vec<u8>,
+}
+
+fn build_thumbnail_client(
+    sync_root_path: &Path,
+    resolved: &adapter_windows_cfapi::connection_config::ResolvedConnectionConfig,
+) -> AnyhowResult<ThumbnailClientBuild> {
+    match load_thumbnail_client_identity(sync_root_path, &resolved.bootstrap_path) {
+        Ok(identity_load) => {
+            let candidate_paths = format_path_list(&identity_load.candidate_paths);
+            let selected_path = identity_load
+                .selected_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+
+            if let Some(identity) = identity_load.client_identity.as_ref() {
+                append_diagnostic_log(&format!(
+                    "thumbnail-auth version={} build_revision={} bootstrap_path={} bootstrap_version={} identity_state=loaded identity_path={} device_id={} label={} auth_mode=client-identity candidate_paths={}",
+                    PROVIDER_VERSION,
+                    PROVIDER_BUILD_REVISION,
+                    resolved.bootstrap_path.display(),
+                    resolved.bootstrap.version,
+                    selected_path,
+                    identity.device_id,
+                    identity.label.as_deref().unwrap_or("-"),
+                    candidate_paths
+                ));
+                match resolved.build_client(Some(identity)) {
+                    Ok(client) => {
+                        return Ok(ThumbnailClientBuild {
+                            client,
+                            auth_mode: "client-identity",
+                            candidate_paths: identity_load.candidate_paths,
+                            selected_path: identity_load.selected_path,
+                        });
+                    }
+                    Err(error) => {
+                        append_diagnostic_log(&format!(
+                            "thumbnail-auth version={} build_revision={} bootstrap_path={} bootstrap_version={} identity_state=loaded identity_path={} device_id={} label={} auth_mode=client-identity-build-failed fallback_auth_mode=anonymous candidate_paths={} error={:#}",
+                            PROVIDER_VERSION,
+                            PROVIDER_BUILD_REVISION,
+                            resolved.bootstrap_path.display(),
+                            resolved.bootstrap.version,
+                            selected_path,
+                            identity.device_id,
+                            identity.label.as_deref().unwrap_or("-"),
+                            candidate_paths,
+                            error
+                        ));
+                    }
+                }
+            } else {
+                append_diagnostic_log(&format!(
+                    "thumbnail-auth version={} build_revision={} bootstrap_path={} bootstrap_version={} identity_state=missing identity_path={} auth_mode=anonymous candidate_paths={}",
+                    PROVIDER_VERSION,
+                    PROVIDER_BUILD_REVISION,
+                    resolved.bootstrap_path.display(),
+                    resolved.bootstrap.version,
+                    selected_path,
+                    candidate_paths
+                ));
+            }
+        }
+        Err(error) => {
+            let discovery = inspect_persisted_client_identity_paths(
+                sync_root_path,
+                Some(&resolved.bootstrap_path),
+                None,
+            );
+            let candidate_paths = format_path_list(&discovery.candidate_paths);
+            let selected_path = discovery
+                .selected_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            append_diagnostic_log(&format!(
+                "thumbnail-auth version={} build_revision={} bootstrap_path={} bootstrap_version={} identity_state=load-error identity_path={} auth_mode=anonymous candidate_paths={} error={:#}",
+                PROVIDER_VERSION,
+                PROVIDER_BUILD_REVISION,
+                resolved.bootstrap_path.display(),
+                resolved.bootstrap.version,
+                selected_path,
+                candidate_paths,
+                error
+            ));
+        }
+    }
+
+    let discovery = inspect_persisted_client_identity_paths(
+        sync_root_path,
+        Some(&resolved.bootstrap_path),
+        None,
+    );
+    resolved
+        .build_client(None)
+        .map(|client| ThumbnailClientBuild {
+            client,
+            auth_mode: "anonymous",
+            candidate_paths: discovery.candidate_paths,
+            selected_path: discovery.selected_path,
+        })
+        .with_context(|| {
+            format!(
+                "failed to build anonymous client for thumbnail requests using bootstrap {}",
+                resolved.bootstrap_path.display()
+            )
+        })
+}
+
+fn load_thumbnail_client_identity(
+    sync_root_path: &Path,
+    bootstrap_path: &Path,
+) -> AnyhowResult<ThumbnailIdentityLoad> {
+    let discovery =
+        inspect_persisted_client_identity_paths(sync_root_path, Some(bootstrap_path), None);
+    let client_identity =
+        load_persisted_client_identity(sync_root_path, Some(bootstrap_path), None).with_context(
+            || {
+                format!(
+                    "failed to load persisted client identity for {}",
+                    sync_root_path.display()
+                )
+            },
+        )?;
+    Ok(ThumbnailIdentityLoad {
+        candidate_paths: discovery.candidate_paths,
+        selected_path: discovery.selected_path,
+        client_identity,
+    })
+}
+
+fn fetch_thumbnail_for_source_path(source_path: &str) -> AnyhowResult<FetchedThumbnail> {
     let source_path = PathBuf::from(source_path);
     let (sync_root_path, sync_root_context) = find_registered_sync_root(&source_path)
         .with_context(|| format!("failed to resolve sync root for {}", source_path.display()))?;
@@ -338,7 +542,7 @@ fn try_create_real_thumbnail_bitmap(
     }
 
     let remote_key = remote_key_for_item(&sync_root_context.identity.prefix, &relative_path);
-    let thumbnail_request_path = media_thumbnail_request_path(&remote_key)?;
+    let request_path = media_thumbnail_request_path(&remote_key)?;
     let resolved = resolve_connection_config(&sync_root_path, None, None, None, None, None, None)
         .with_context(|| {
         format!(
@@ -346,54 +550,48 @@ fn try_create_real_thumbnail_bitmap(
             sync_root_path.display()
         )
     })?;
-    let client = build_thumbnail_client(&sync_root_path, &resolved)
+    let client_build = build_thumbnail_client(&sync_root_path, &resolved)
         .with_context(|| format!("failed to build client for {}", sync_root_path.display()))?;
-    let thumbnail_bytes = fetch_thumbnail_bytes(&client, &thumbnail_request_path)
+    let thumbnail_bytes = fetch_thumbnail_bytes(&client_build.client, &request_path)
         .with_context(|| format!("failed to fetch thumbnail for remote key {}", remote_key))?;
 
     append_diagnostic_log(&format!(
         "thumbnail-fetch remote_key={} request_path={} bytes={}",
         remote_key,
-        thumbnail_request_path,
+        request_path,
         thumbnail_bytes.len()
     ));
 
-    create_bitmap_from_thumbnail_bytes(&thumbnail_bytes, requested_size)
-        .with_context(|| format!("failed to decode thumbnail payload for {}", remote_key))
+    Ok(FetchedThumbnail {
+        remote_key,
+        request_path,
+        bootstrap_path: resolved.bootstrap_path,
+        client_build,
+        thumbnail_bytes,
+    })
 }
 
-fn build_thumbnail_client(
-    sync_root_path: &Path,
-    resolved: &adapter_windows_cfapi::connection_config::ResolvedConnectionConfig,
-) -> AnyhowResult<client_sdk::IronMeshClient> {
-    match resolved.build_client(None) {
-        Ok(client) => return Ok(client),
-        Err(initial_error) => {
-            let client_identity =
-                load_thumbnail_client_identity(sync_root_path, &resolved.bootstrap_path)?;
-            if let Some(identity) = client_identity.as_ref() {
-                return resolved.build_client(Some(identity)).with_context(|| {
-                    format!(
-                        "failed to build client with persisted identity after unauthenticated attempt failed: {initial_error:#}"
-                    )
-                });
-            }
-
-            return Err(initial_error)
-                .with_context(|| "failed to build client without persisted identity".to_string());
-        }
-    }
-}
-
-fn load_thumbnail_client_identity(
-    sync_root_path: &Path,
-    bootstrap_path: &Path,
-) -> AnyhowResult<Option<client_sdk::ClientIdentityMaterial>> {
-    load_persisted_client_identity(sync_root_path, Some(bootstrap_path), None).with_context(|| {
-        format!(
-            "failed to load persisted client identity for {}",
-            sync_root_path.display()
-        )
+pub fn debug_fetch_thumbnail_for_source_path(
+    source_path: &str,
+    requested_size: u32,
+) -> AnyhowResult<DebugThumbnailFetchResult> {
+    log_provider_banner_once();
+    let fetched = fetch_thumbnail_for_source_path(source_path)?;
+    let decoded = resize_for_requested_size(
+        image::load_from_memory(&fetched.thumbnail_bytes)
+            .context("failed to decode thumbnail image")?,
+        requested_size.clamp(MIN_THUMBNAIL_SIZE, MAX_THUMBNAIL_SIZE),
+    );
+    Ok(DebugThumbnailFetchResult {
+        remote_key: fetched.remote_key,
+        request_path: fetched.request_path,
+        bootstrap_path: fetched.bootstrap_path,
+        identity_path: fetched.client_build.selected_path,
+        candidate_identity_paths: fetched.client_build.candidate_paths,
+        auth_mode: fetched.client_build.auth_mode.to_string(),
+        payload_len: fetched.thumbnail_bytes.len(),
+        decoded_width: decoded.width(),
+        decoded_height: decoded.height(),
     })
 }
 

@@ -143,6 +143,10 @@ The prototype DLL now writes a simple log file to:
 
 Useful signals:
 
+- if `thumbnail-provider version=... build_revision=...` appears there, you are looking at the current DLL build
+- if `thumbnail-auth ... auth_mode=client-identity ...` appears there, the handler found and used a persisted client identity
+- if `thumbnail-auth ... identity_state=missing auth_mode=anonymous ...` appears there, the handler did not find a persisted client identity and will likely fail against auth-required servers
+- if `thumbnail-auth ... identity_state=load-error ...` appears there, the handler found an identity candidate but could not load it successfully
 - if `GetThumbnail` appears there, Explorer is loading the packaged thumbnail handler
 - if `thumbnail-fetch remote_key=...` appears there, the handler successfully resolved a sync root, built a client, and downloaded thumbnail bytes from the server
 - if `GetThumbnail source=fallback ... error=...` appears there, the handler could not produce a real thumbnail and used the branded fallback instead

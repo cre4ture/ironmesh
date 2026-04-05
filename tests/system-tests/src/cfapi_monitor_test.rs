@@ -45,12 +45,28 @@ mod tests {
         FILE_SHARE_WRITE, FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
         OPEN_EXISTING, WIN32_FIND_STREAM_DATA,
     };
+    use windows_thumbnail_provider::debug_fetch_thumbnail_for_source_path;
 
     const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "ironmesh-client-bootstrap.json";
     const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
     const LOCAL_STATE_SYNC_ROOTS_DIR: &str = "sync-roots";
     const LOCAL_STATE_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "connection-bootstrap.json";
     const LOCAL_STATE_CLIENT_IDENTITY_FILE_NAME: &str = "client-identity.json";
+
+    fn sample_png_bytes() -> Vec<u8> {
+        let image = image::DynamicImage::new_rgba8(4, 3);
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("sample PNG encode should succeed");
+        cursor.into_inner()
+    }
+
+    fn actual_local_appdata_root() -> PathBuf {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .expect("LOCALAPPDATA should be set on Windows")
+    }
 
     fn local_appdata_sync_root_state_dir(
         local_appdata_root: &Path,
@@ -2205,6 +2221,271 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
 
         result.expect("authenticated CFAPI adapter should reuse existing sibling identity");
+    }
+
+    #[tokio::test]
+    async fn test_thumbnail_provider_fetches_remote_thumbnail_for_authenticated_placeholder() {
+        let bind = "127.0.0.1:19114";
+        let base_url = format!("https://{bind}");
+        let admin_token = "system-tests-admin-secret";
+        let server_data_dir = fresh_data_dir("cfapi-thumbnail-provider-server");
+        let sync_root = fresh_data_dir("cfapi-thumbnail-provider-sync-root");
+        let local_appdata_root = actual_local_appdata_root();
+        let local_appdata_state_dir =
+            local_appdata_sync_root_state_dir(&local_appdata_root, &sync_root);
+        let local_appdata_bootstrap =
+            local_appdata_connection_bootstrap_path(&local_appdata_root, &sync_root);
+        let local_appdata_identity =
+            local_appdata_client_identity_path(&local_appdata_root, &sync_root);
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
+        let rendezvous_urls = base_url.clone();
+
+        let mut server = start_open_server_with_public_https_env(
+            bind,
+            &server_data_dir,
+            "",
+            1,
+            &[
+                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+                ("IRONMESH_ADMIN_TOKEN", admin_token),
+                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+            ],
+        )
+        .await
+        .expect("failed to start auth-enabled server-node");
+
+        let result = async {
+            let http = https_client_with_root_from_data_dir(&server_data_dir)?;
+            let bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                admin_token,
+                Some("cfapi-thumbnail-provider"),
+                Some(600),
+            )
+            .await?;
+
+            let client_config_dir = server_data_dir.join("client-config-thumbnail-provider");
+            std::fs::create_dir_all(&client_config_dir)
+                .expect("failed to create client config dir");
+            let bootstrap_file = client_config_dir.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+            bootstrap
+                .write_to_path(&bootstrap_file)
+                .expect("failed to write bootstrap bundle");
+
+            let sync_root_id = format!(
+                "ironmesh.systemtest.thumbnail.provider.{}",
+                bind.replace(['.', ':'], "_")
+            );
+            let mut adapter = start_cfapi_adapter_with_bootstrap(
+                &sync_root_id,
+                "ironmesh System Test Thumbnail Provider Root",
+                &sync_root,
+                500,
+                &bootstrap_file,
+            )
+            .await?;
+
+            wait_for_path(&local_appdata_bootstrap, 120).await;
+            wait_for_path(&local_appdata_identity, 120).await;
+
+            let thumbnail_client = {
+                let bootstrap_path = local_appdata_bootstrap.clone();
+                let identity_path = local_appdata_identity.clone();
+                tokio::task::spawn_blocking(move || {
+                    let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)
+                        .expect("failed to load persisted LocalAppData bootstrap");
+                    let identity = ClientIdentityMaterial::from_path(&identity_path)
+                        .expect("failed to load persisted LocalAppData client identity");
+                    bootstrap
+                        .build_client_with_identity(&identity)
+                        .expect("failed to build authenticated thumbnail test client")
+                })
+                .await
+                .expect("thumbnail client builder task should join")
+            };
+
+            thumbnail_client
+                .put_large_aware("gallery/cat.png", Bytes::from(sample_png_bytes()))
+                .await
+                .expect("failed to seed remote image");
+
+            let local_file = sync_root.join("gallery").join("cat.png");
+            wait_for_path(&local_file, 250).await;
+            wait_for_placeholder_present(&local_file, 220).await;
+            wait_for_placeholder_in_sync(&local_file, 220).await;
+            wait_for_placeholder_dehydrated(&local_file, 120).await;
+
+            let source_path = local_file.to_string_lossy().to_string();
+            let thumbnail = tokio::task::spawn_blocking(move || {
+                debug_fetch_thumbnail_for_source_path(&source_path, 256)
+            })
+            .await
+            .expect("thumbnail provider debug fetch task should join")?;
+
+            assert_eq!(thumbnail.remote_key, "gallery/cat.png");
+            assert_eq!(
+                thumbnail.request_path,
+                "/media/thumbnail?key=gallery%2Fcat.png"
+            );
+            assert_eq!(thumbnail.bootstrap_path, local_appdata_bootstrap);
+            assert_eq!(
+                thumbnail.identity_path.as_deref(),
+                Some(local_appdata_identity.as_path())
+            );
+            assert!(
+                thumbnail
+                    .candidate_identity_paths
+                    .iter()
+                    .any(|path| path == &local_appdata_identity),
+                "expected LocalAppData client identity path in candidate list"
+            );
+            assert_eq!(thumbnail.auth_mode, "client-identity");
+            assert!(
+                thumbnail.payload_len > 0,
+                "thumbnail payload should not be empty"
+            );
+            assert!(
+                thumbnail.decoded_width > 0 && thumbnail.decoded_height > 0,
+                "thumbnail should decode to non-zero dimensions"
+            );
+
+            stop_server(&mut adapter).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = std::fs::remove_dir_all(&server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
+
+        result.expect("thumbnail provider should fetch an authenticated remote thumbnail");
+    }
+
+    #[tokio::test]
+    async fn test_thumbnail_provider_returns_unauthorized_without_persisted_identity() {
+        let bind = "127.0.0.1:19115";
+        let base_url = format!("https://{bind}");
+        let admin_token = "system-tests-admin-secret";
+        let server_data_dir = fresh_data_dir("cfapi-thumbnail-provider-anon-server");
+        let sync_root = fresh_data_dir("cfapi-thumbnail-provider-anon-sync-root");
+        let local_appdata_root = actual_local_appdata_root();
+        let local_appdata_state_dir =
+            local_appdata_sync_root_state_dir(&local_appdata_root, &sync_root);
+        let local_appdata_bootstrap =
+            local_appdata_connection_bootstrap_path(&local_appdata_root, &sync_root);
+        let local_appdata_identity =
+            local_appdata_client_identity_path(&local_appdata_root, &sync_root);
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
+        let rendezvous_urls = base_url.clone();
+
+        let mut server = start_open_server_with_public_https_env(
+            bind,
+            &server_data_dir,
+            "",
+            1,
+            &[
+                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+                ("IRONMESH_ADMIN_TOKEN", admin_token),
+                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+            ],
+        )
+        .await
+        .expect("failed to start auth-enabled server-node");
+
+        let result = async {
+            let http = https_client_with_root_from_data_dir(&server_data_dir)?;
+            let bootstrap = issue_bootstrap_bundle(
+                &http,
+                &base_url,
+                admin_token,
+                Some("cfapi-thumbnail-provider-anon"),
+                Some(600),
+            )
+            .await?;
+
+            let client_config_dir = server_data_dir.join("client-config-thumbnail-provider-anon");
+            std::fs::create_dir_all(&client_config_dir)
+                .expect("failed to create client config dir");
+            let bootstrap_file = client_config_dir.join(DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME);
+            bootstrap
+                .write_to_path(&bootstrap_file)
+                .expect("failed to write bootstrap bundle");
+
+            let sync_root_id = format!(
+                "ironmesh.systemtest.thumbnail.provider.anon.{}",
+                bind.replace(['.', ':'], "_")
+            );
+            let mut adapter = start_cfapi_adapter_with_bootstrap(
+                &sync_root_id,
+                "ironmesh System Test Thumbnail Provider Anonymous Root",
+                &sync_root,
+                500,
+                &bootstrap_file,
+            )
+            .await?;
+
+            wait_for_path(&local_appdata_bootstrap, 120).await;
+            wait_for_path(&local_appdata_identity, 120).await;
+
+            let thumbnail_client = {
+                let bootstrap_path = local_appdata_bootstrap.clone();
+                let identity_path = local_appdata_identity.clone();
+                tokio::task::spawn_blocking(move || {
+                    let bootstrap = ConnectionBootstrap::from_path(&bootstrap_path)
+                        .expect("failed to load persisted LocalAppData bootstrap");
+                    let identity = ClientIdentityMaterial::from_path(&identity_path)
+                        .expect("failed to load persisted LocalAppData client identity");
+                    bootstrap
+                        .build_client_with_identity(&identity)
+                        .expect("failed to build authenticated thumbnail test client")
+                })
+                .await
+                .expect("thumbnail client builder task should join")
+            };
+
+            thumbnail_client
+                .put_large_aware("gallery/no-identity.png", Bytes::from(sample_png_bytes()))
+                .await
+                .expect("failed to seed remote image");
+
+            let local_file = sync_root.join("gallery").join("no-identity.png");
+            wait_for_path(&local_file, 250).await;
+            wait_for_placeholder_present(&local_file, 220).await;
+            wait_for_placeholder_in_sync(&local_file, 220).await;
+            wait_for_placeholder_dehydrated(&local_file, 120).await;
+
+            std::fs::remove_file(&local_appdata_identity)
+                .expect("failed to remove persisted LocalAppData client identity");
+            wait_for_path_absence(&local_appdata_identity, 80).await;
+
+            let source_path = local_file.to_string_lossy().to_string();
+            let error = tokio::task::spawn_blocking(move || {
+                debug_fetch_thumbnail_for_source_path(&source_path, 256)
+            })
+            .await
+            .expect("thumbnail provider debug fetch task should join")
+            .expect_err("thumbnail provider should fail without a persisted client identity");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("401 Unauthorized"),
+                "expected unauthorized thumbnail fetch error, got: {rendered}"
+            );
+
+            stop_server(&mut adapter).await;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut server).await;
+        let _ = std::fs::remove_dir_all(&server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+        let _ = std::fs::remove_dir_all(&local_appdata_state_dir);
+
+        result.expect("thumbnail provider should surface unauthorized errors without identity");
     }
 
     #[tokio::test]

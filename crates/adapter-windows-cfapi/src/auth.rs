@@ -23,6 +23,12 @@ pub struct ClientEnrollmentOptions {
     pub server_ca_pem: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PersistedClientIdentityDiscovery {
+    pub candidate_paths: Vec<PathBuf>,
+    pub selected_path: Option<PathBuf>,
+}
+
 pub fn resolve_or_enroll_client_identity(
     base_url: Option<&Url>,
     sync_root_path: &Path,
@@ -66,15 +72,30 @@ pub fn load_persisted_client_identity(
     bootstrap_file: Option<&Path>,
     client_identity_file: Option<&Path>,
 ) -> Result<Option<ClientIdentityMaterial>> {
-    for identity_file in
-        candidate_client_identity_paths(sync_root_path, bootstrap_file, client_identity_file)
-    {
-        if identity_file.exists() {
-            return load_client_identity(&identity_file).map(Some);
-        }
+    let discovery = inspect_persisted_client_identity_paths(
+        sync_root_path,
+        bootstrap_file,
+        client_identity_file,
+    );
+    if let Some(identity_file) = discovery.selected_path {
+        return load_client_identity(&identity_file).map(Some);
     }
 
     Ok(None)
+}
+
+pub fn inspect_persisted_client_identity_paths(
+    sync_root_path: &Path,
+    bootstrap_file: Option<&Path>,
+    client_identity_file: Option<&Path>,
+) -> PersistedClientIdentityDiscovery {
+    let candidate_paths =
+        candidate_client_identity_paths(sync_root_path, bootstrap_file, client_identity_file);
+    let selected_path = candidate_paths.iter().find(|path| path.exists()).cloned();
+    PersistedClientIdentityDiscovery {
+        candidate_paths,
+        selected_path,
+    }
 }
 
 fn sibling_client_identity_path(bootstrap_path: &Path) -> PathBuf {
@@ -299,5 +320,26 @@ mod tests {
 
         let _ = std::fs::remove_file(legacy_identity_path);
         let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn inspect_persisted_client_identity_paths_prefers_local_appdata_then_bootstrap_sibling() {
+        let sync_root = Path::new(r"C:\Users\Example\IronMesh\Wiz3");
+        let bootstrap_path = Path::new(r"C:\config\ironmesh-client-bootstrap.json");
+        let discovery =
+            inspect_persisted_client_identity_paths(sync_root, Some(bootstrap_path), None);
+
+        assert_eq!(discovery.selected_path, None);
+        assert_eq!(discovery.candidate_paths.len(), 2);
+        assert!(
+            discovery.candidate_paths[0].ends_with(Path::new("Ironmesh").join("sync-roots"))
+                || discovery.candidate_paths[0]
+                    .to_string_lossy()
+                    .contains(r"\Ironmesh\sync-roots\")
+        );
+        assert_eq!(
+            discovery.candidate_paths[1],
+            Path::new(r"C:\config\ironmesh-client-bootstrap.client-identity.json")
+        );
     }
 }

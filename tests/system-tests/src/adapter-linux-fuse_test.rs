@@ -5,8 +5,8 @@ mod tests {
     use crate::framework::{
         ChildGuard, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
         issue_bootstrap_bundle_and_enroll_client, lock_test_resources, path_resource_key,
-        register_node, start_authenticated_server, start_open_server_with_env,
-        stop_server, wait_for_online_nodes, wait_for_store_index_entry,
+        register_node, start_authenticated_server, start_open_server_with_env, stop_server,
+        wait_for_online_nodes, wait_for_store_index_entry,
     };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
