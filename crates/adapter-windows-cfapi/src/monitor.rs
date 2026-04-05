@@ -579,7 +579,10 @@ impl SyncRootMonitor {
         }
 
         if entry.is_dir {
-            if self.remote_applied_tracker.take_directory_suppression(&rel_path) {
+            if self
+                .remote_applied_tracker
+                .take_directory_suppression(&rel_path)
+            {
                 tracing::info!(
                     "{}: suppressing local upload for remote-applied directory {}",
                     self.name,

@@ -428,7 +428,11 @@ pub fn try_convert_materialized_file(
                 );
                 if let Ok(m) = std::fs::metadata(file_path) {
                     let attrs = m.file_attributes();
-                    tracing::info!("convert-materialized: post-fail attrs=0x{:08x} size={}", attrs, m.len());
+                    tracing::info!(
+                        "convert-materialized: post-fail attrs=0x{:08x} size={}",
+                        attrs,
+                        m.len()
+                    );
                 }
             }
         }

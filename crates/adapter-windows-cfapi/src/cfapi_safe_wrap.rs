@@ -1,11 +1,11 @@
 use crate::helpers::{hresult_nonneg, utf16_path};
-use client_sdk::RequestedRange;
 use crate::runtime::{
     CallbackContext, handle_callback_cancel_fetch_data, handle_callback_fetch_data,
     handle_callback_file_close_completion, handle_callback_file_open,
     handle_callback_notify_dehydrate, handle_callback_notify_dehydrate_completion,
 };
 use anyhow::{Context, Result};
+use client_sdk::RequestedRange;
 use core::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::io::AsRawHandle;
@@ -76,7 +76,6 @@ impl Drop for ProtectedCfHandle {
         }
     }
 }
-
 
 pub(crate) fn empty_fs_metadata() -> CF_FS_METADATA {
     unsafe { std::mem::zeroed() }
@@ -654,7 +653,9 @@ unsafe extern "system" fn callback_fetch_data(
         return;
     };
 
-    if let Some(failure_response) = handle_callback_fetch_data(callback_info_ref, context, fetch_data) {
+    if let Some(failure_response) =
+        handle_callback_fetch_data(callback_info_ref, context, fetch_data)
+    {
         if let Err(err) = execute_transfer_data_failure(callback_info_ref, failure_response) {
             tracing::info!(
                 "cfapi fetch-data: failed to report transfer failure for unresolved path: {err}"

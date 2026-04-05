@@ -1313,7 +1313,10 @@ impl IronMeshClient {
 
         on_progress(DownloadProgress {
             object_size_bytes: head.total_size_bytes,
-            range: RequestedRange { offset: range_start, length: range_length },
+            range: RequestedRange {
+                offset: range_start,
+                length: range_length,
+            },
             bytes_downloaded: 0,
         });
 
@@ -1323,7 +1326,10 @@ impl IronMeshClient {
                 .with_context(|| format!("failed to flush output for key={key}"))?;
             return Ok(DownloadRangeResult {
                 object_size_bytes: head.total_size_bytes,
-                range: RequestedRange { offset: range_start, length: range_length },
+                range: RequestedRange {
+                    offset: range_start,
+                    length: range_length,
+                },
                 bytes_downloaded: 0,
             });
         }
@@ -1355,13 +1361,19 @@ impl IronMeshClient {
             let bytes_downloaded = payload.len() as u64;
             on_progress(DownloadProgress {
                 object_size_bytes: head.total_size_bytes,
-                range: RequestedRange { offset: range_start, length: range_length },
+                range: RequestedRange {
+                    offset: range_start,
+                    length: range_length,
+                },
                 bytes_downloaded,
             });
 
             return Ok(DownloadRangeResult {
                 object_size_bytes: head.total_size_bytes,
-                range: RequestedRange { offset: range_start, length: range_length },
+                range: RequestedRange {
+                    offset: range_start,
+                    length: range_length,
+                },
                 bytes_downloaded,
             });
         }
@@ -1407,7 +1419,10 @@ impl IronMeshClient {
                     offset = end_inclusive + 1;
                     on_progress(DownloadProgress {
                         object_size_bytes: head.total_size_bytes,
-                        range: RequestedRange { offset: range_start, length: range_length },
+                        range: RequestedRange {
+                            offset: range_start,
+                            length: range_length,
+                        },
                         bytes_downloaded,
                     });
                 }
@@ -1419,7 +1434,10 @@ impl IronMeshClient {
                     offset = range_end_exclusive;
                     on_progress(DownloadProgress {
                         object_size_bytes: head.total_size_bytes,
-                        range: RequestedRange { offset: range_start, length: range_length },
+                        range: RequestedRange {
+                            offset: range_start,
+                            length: range_length,
+                        },
                         bytes_downloaded,
                     });
                 }
@@ -1434,7 +1452,10 @@ impl IronMeshClient {
             .with_context(|| format!("failed to flush output for key={key}"))?;
         Ok(DownloadRangeResult {
             object_size_bytes: head.total_size_bytes,
-            range: RequestedRange { offset: range_start, length: range_length },
+            range: RequestedRange {
+                offset: range_start,
+                length: range_length,
+            },
             bytes_downloaded,
         })
     }
@@ -3297,7 +3318,10 @@ mod tests {
                                 key: "photos/test.jpg",
                                 snapshot: None,
                                 version: None,
-                                range: RequestedRange { offset: start, length },
+                                range: RequestedRange {
+                                    offset: start,
+                                    length,
+                                },
                             },
                             &mut writer,
                             &mut |progress| progress_updates.push(progress),

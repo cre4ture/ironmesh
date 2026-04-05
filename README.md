@@ -279,12 +279,12 @@ Notes:
 
 - Cluster-mode nodes run a background replication auditor and execute repair passes for under-replicated data by default.
 - Configuration:
-	- `IRONMESH_REPLICATION_REPAIR_ENABLED` (default: `true` for cluster-mode nodes, `true` for clustered local-edge nodes, `false` for standalone local-edge nodes)
-	- `IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS` (default: `3600` for cluster-mode nodes, `5` for clustered local-edge nodes)
+	- `IRONMESH_REPLICATION_REPAIR_ENABLED` (default: `true`)
+	- `IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS` (default: `3600`)
 	- `IRONMESH_REPLICATION_REPAIR_BATCH_SIZE` (default: `256`)
 	- `IRONMESH_REPLICATION_REPAIR_MAX_RETRIES` (default: `3`)
-	- `IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS` (default: `30` for cluster-mode nodes, `2` for clustered local-edge nodes)
-	- `IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED` (default: `true` for cluster-mode nodes and clustered local-edge nodes, `false` for standalone local-edge nodes)
+	- `IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS` (default: `30`)
+	- `IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED` (default: `true`)
 	- `IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
 	- `IRONMESH_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)
 

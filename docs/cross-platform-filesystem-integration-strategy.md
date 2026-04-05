@@ -321,7 +321,7 @@ cargo run -p os-integration -- \
 
 Obsolete path kept for design history:
 
-- The embedded Linux FUSE `--local-edge` helper is obsolete and removed.
+- The old embedded Linux FUSE `--local-edge` helper is obsolete and has been removed.
 - It is not being revived because it still required local `server-node` authority rather than a
   plain client identity.
 - The rationale is preserved in `docs/client-rights-edge-sync-idea.md`.

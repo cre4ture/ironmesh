@@ -228,7 +228,7 @@ async function installClientUiMocks(page: Page) {
     }
 
     if (pathname === "/api/health" && method === "GET") {
-      return json(route, { mode: "local_edge", status: "ok" });
+      return json(route, { mode: "cluster", status: "ok" });
     }
 
     if (pathname === "/api/cluster/status" && method === "GET") {

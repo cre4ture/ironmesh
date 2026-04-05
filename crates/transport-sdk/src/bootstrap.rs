@@ -51,7 +51,6 @@ pub struct BootstrapTrustRoots {
 pub enum NodeBootstrapMode {
     #[default]
     Cluster,
-    LocalEdge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -270,8 +269,8 @@ impl NodeBootstrap {
         )?;
         validate_optional_server_tls_files("public_tls", self.public_tls.as_ref())?;
         validate_optional_tls_files("internal_tls", self.internal_tls.as_ref())?;
-        if self.mode == NodeBootstrapMode::Cluster && self.internal_tls.is_none() {
-            bail!("cluster node bootstrap must include internal_tls");
+        if self.internal_tls.is_none() {
+            bail!("node bootstrap must include internal_tls");
         }
         if self.internal_tls.is_some() && self.internal_bind_addr.is_none() {
             bail!("node bootstrap internal_tls requires internal_bind_addr");
@@ -324,8 +323,8 @@ impl NodeJoinRequest {
         validate_optional_url("internal_url", self.internal_url.as_deref())?;
         validate_optional_server_tls_files("public_tls", self.public_tls.as_ref())?;
         validate_optional_tls_files("internal_tls", self.internal_tls.as_ref())?;
-        if self.mode == NodeBootstrapMode::Cluster && self.internal_tls.is_none() {
-            bail!("cluster node join request must include internal_tls");
+        if self.internal_tls.is_none() {
+            bail!("node join request must include internal_tls");
         }
         if self.internal_tls.is_some() && self.internal_bind_addr.is_none() {
             bail!("node join request internal_tls requires internal_bind_addr");
@@ -742,7 +741,7 @@ mod tests {
                 version: CLIENT_BOOTSTRAP_VERSION,
                 cluster_id: Uuid::now_v7(),
                 node_id: Uuid::now_v7(),
-                mode: NodeBootstrapMode::LocalEdge,
+                mode: NodeBootstrapMode::Cluster,
                 data_dir: "./data/node-a".to_string(),
                 bind_addr: "127.0.0.1:8080".to_string(),
                 public_url: Some("https://node-a.example".to_string()),
@@ -753,22 +752,26 @@ mod tests {
                 }),
                 public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
                 public_peer_api_enabled: false,
-                internal_bind_addr: None,
-                internal_url: None,
-                internal_tls: None,
+                internal_bind_addr: Some("127.0.0.1:18080".to_string()),
+                internal_url: Some("https://127.0.0.1:18080".to_string()),
+                internal_tls: Some(BootstrapTlsFiles {
+                    ca_cert_path: "tls/ca.pem".to_string(),
+                    cert_path: "tls/node.pem".to_string(),
+                    key_path: "tls/node.key".to_string(),
+                }),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),
                 relay_mode: RelayMode::Fallback,
                 trust_roots: BootstrapTrustRoots {
-                    cluster_ca_pem: None,
+                    cluster_ca_pem: Some("cluster-ca".to_string()),
                     public_api_ca_pem: Some("public-ca".to_string()),
                     rendezvous_ca_pem: None,
                 },
                 enrollment_issuer_url: None,
             },
             public_tls_material: None,
-            internal_tls_material: None,
+            internal_tls_material: Some(sample_tls_material()),
         };
 
         assert!(package.validate().is_err());
@@ -826,7 +829,7 @@ mod tests {
                 version: CLIENT_BOOTSTRAP_VERSION,
                 cluster_id: Uuid::now_v7(),
                 node_id: Uuid::now_v7(),
-                mode: NodeBootstrapMode::LocalEdge,
+                mode: NodeBootstrapMode::Cluster,
                 data_dir: "./data/node-a".to_string(),
                 bind_addr: "127.0.0.1:8080".to_string(),
                 public_url: Some("https://node-a.example".to_string()),
@@ -837,22 +840,26 @@ mod tests {
                 }),
                 public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
                 public_peer_api_enabled: false,
-                internal_bind_addr: None,
-                internal_url: None,
-                internal_tls: None,
+                internal_bind_addr: Some("127.0.0.1:18080".to_string()),
+                internal_url: Some("https://127.0.0.1:18080".to_string()),
+                internal_tls: Some(BootstrapTlsFiles {
+                    ca_cert_path: "tls/ca.pem".to_string(),
+                    cert_path: "tls/node.pem".to_string(),
+                    key_path: "tls/node.key".to_string(),
+                }),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),
                 relay_mode: RelayMode::Fallback,
                 trust_roots: BootstrapTrustRoots {
-                    cluster_ca_pem: None,
+                    cluster_ca_pem: Some("cluster-ca".to_string()),
                     public_api_ca_pem: Some("public-ca".to_string()),
                     rendezvous_ca_pem: None,
                 },
                 enrollment_issuer_url: Some("https://issuer.example".to_string()),
             },
             public_tls_material: Some(invalid),
-            internal_tls_material: None,
+            internal_tls_material: Some(sample_tls_material()),
         };
 
         assert!(package.validate().is_err());

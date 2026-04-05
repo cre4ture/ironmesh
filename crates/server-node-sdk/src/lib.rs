@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -139,7 +139,6 @@ struct ServerState {
     data_dir: PathBuf,
     cluster_id: ClusterId,
     node_id: NodeId,
-    local_edge_mode: bool,
     storage_stats_history_retention_secs: u64,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
@@ -1178,7 +1177,6 @@ pub enum MetadataCommitMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerNodeMode {
     Cluster,
-    LocalEdge,
 }
 
 #[derive(Debug, Clone)]
@@ -2263,10 +2261,7 @@ impl ServerNodeConfig {
     pub fn from_bootstrap(bootstrap: TransportNodeBootstrap) -> Result<Self> {
         bootstrap.validate()?;
 
-        let mode = match bootstrap.mode {
-            NodeBootstrapMode::Cluster => ServerNodeMode::Cluster,
-            NodeBootstrapMode::LocalEdge => ServerNodeMode::LocalEdge,
-        };
+        let mode = ServerNodeMode::Cluster;
         let bind_addr: SocketAddr = bootstrap
             .bind_addr
             .parse()
@@ -2303,7 +2298,6 @@ impl ServerNodeConfig {
             }
         });
         let rendezvous_configured = !bootstrap.rendezvous_urls.is_empty();
-        let local_edge_clustered = mode == ServerNodeMode::LocalEdge && rendezvous_configured;
 
         Ok(Self {
             mode,
@@ -2343,7 +2337,7 @@ impl ServerNodeConfig {
             audit_interval_secs: std::env::var("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(if local_edge_clustered { 5 } else { 3600 }),
+                .unwrap_or(3600),
             replica_view_sync_interval_secs: std::env::var(
                 "IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS",
             )
@@ -2353,13 +2347,7 @@ impl ServerNodeConfig {
             replication_factor: std::env::var("IRONMESH_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(if local_edge_clustered {
-                    2
-                } else if mode == ServerNodeMode::LocalEdge {
-                    1
-                } else {
-                    3
-                }),
+                .unwrap_or(3),
             accepted_over_replication_items: std::env::var(
                 "IRONMESH_ACCEPTED_OVER_REPLICATION_ITEMS",
             )
@@ -2371,22 +2359,16 @@ impl ServerNodeConfig {
                     .unwrap_or_else(|_| "local".to_string())
                     .as_str(),
             )?,
-            autonomous_replication_on_put_enabled: match mode {
-                ServerNodeMode::Cluster => {
-                    std::env::var("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED")
-                        .ok()
-                        .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                        .unwrap_or(true)
-                }
-                ServerNodeMode::LocalEdge => local_edge_clustered,
-            },
-            replication_repair_enabled: match mode {
-                ServerNodeMode::Cluster => std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
-                    .ok()
-                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                    .unwrap_or(true),
-                ServerNodeMode::LocalEdge => local_edge_clustered,
-            },
+            autonomous_replication_on_put_enabled: std::env::var(
+                "IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            replication_repair_enabled: std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
             replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -2403,7 +2385,7 @@ impl ServerNodeConfig {
             )
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(if local_edge_clustered { 2 } else { 30 }),
+            .unwrap_or(30),
             repair_busy_throttle_enabled: std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
                 .ok()
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
@@ -2418,24 +2400,18 @@ impl ServerNodeConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(100),
-            startup_repair_enabled: match mode {
-                ServerNodeMode::Cluster => std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
-                    .ok()
-                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                    .unwrap_or(true),
-                ServerNodeMode::LocalEdge => local_edge_clustered,
-            },
+            startup_repair_enabled: std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
             startup_repair_delay_secs: std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(5),
-            peer_heartbeat_enabled: match mode {
-                ServerNodeMode::Cluster => std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
-                    .ok()
-                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                    .unwrap_or(true),
-                ServerNodeMode::LocalEdge => false,
-            },
+            peer_heartbeat_enabled: std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
             peer_heartbeat_interval_secs: std::env::var(
                 "IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS",
             )
@@ -2472,14 +2448,7 @@ impl ServerNodeConfig {
             return Self::from_bootstrap_path(path);
         }
 
-        let mode = match std::env::var("IRONMESH_NODE_MODE")
-            .unwrap_or_else(|_| "cluster".to_string())
-            .as_str()
-        {
-            "cluster" => ServerNodeMode::Cluster,
-            "local-edge" => ServerNodeMode::LocalEdge,
-            raw => bail!("invalid IRONMESH_NODE_MODE '{raw}', expected 'cluster' or 'local-edge'"),
-        };
+        let mode = ServerNodeMode::Cluster;
 
         let node_id = std::env::var("IRONMESH_NODE_ID")
             .ok()
@@ -2554,37 +2523,32 @@ impl ServerNodeConfig {
                 .as_str(),
         )?;
 
-        let internal_tls = match mode {
-            ServerNodeMode::Cluster => {
-                let internal_bind_addr: SocketAddr = std::env::var("IRONMESH_INTERNAL_BIND")
-                    .unwrap_or_else(|_| "127.0.0.1:18080".to_string())
-                    .parse()
-                    .context("invalid IRONMESH_INTERNAL_BIND")?;
-                let ca_cert_path = PathBuf::from(
-                    std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
-                        .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
-                );
-                let cert_path = PathBuf::from(
-                    std::env::var("IRONMESH_INTERNAL_TLS_CERT")
-                        .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
-                );
-                let key_path = PathBuf::from(
-                    std::env::var("IRONMESH_INTERNAL_TLS_KEY")
-                        .context("missing IRONMESH_INTERNAL_TLS_KEY")?,
-                );
-                Some(InternalTlsConfig {
-                    bind_addr: internal_bind_addr,
-                    internal_url: std::env::var("IRONMESH_INTERNAL_URL")
-                        .ok()
-                        .or_else(|| Some(format!("https://{internal_bind_addr}"))),
-                    metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
-                    ca_cert_path,
-                    cert_path,
-                    key_path,
-                })
-            }
-            ServerNodeMode::LocalEdge => None,
-        };
+        let internal_bind_addr: SocketAddr = std::env::var("IRONMESH_INTERNAL_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:18080".to_string())
+            .parse()
+            .context("invalid IRONMESH_INTERNAL_BIND")?;
+        let ca_cert_path = PathBuf::from(
+            std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
+                .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
+        );
+        let cert_path = PathBuf::from(
+            std::env::var("IRONMESH_INTERNAL_TLS_CERT")
+                .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
+        );
+        let key_path = PathBuf::from(
+            std::env::var("IRONMESH_INTERNAL_TLS_KEY")
+                .context("missing IRONMESH_INTERNAL_TLS_KEY")?,
+        );
+        let internal_tls = Some(InternalTlsConfig {
+            bind_addr: internal_bind_addr,
+            internal_url: std::env::var("IRONMESH_INTERNAL_URL")
+                .ok()
+                .or_else(|| Some(format!("https://{internal_bind_addr}"))),
+            metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
+            ca_cert_path,
+            cert_path,
+            key_path,
+        });
 
         let mut labels = HashMap::new();
         labels.insert(
@@ -2600,21 +2564,13 @@ impl ServerNodeConfig {
             std::env::var("IRONMESH_RACK").unwrap_or_else(|_| "local-rack".to_string()),
         );
 
-        let local_edge_clustered =
-            mode == ServerNodeMode::LocalEdge && rendezvous_registration_enabled;
-        let default_replication_factor = if local_edge_clustered {
-            2
-        } else if mode == ServerNodeMode::LocalEdge {
-            1
-        } else {
-            3
-        };
+        let default_replication_factor = 3;
         let public_peer_api_enabled = std::env::var("IRONMESH_PUBLIC_PEER_API_ENABLED")
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(local_edge_clustered);
-        let default_audit_interval_secs = if local_edge_clustered { 5 } else { 3600 };
-        let default_replication_repair_backoff_secs = if local_edge_clustered { 2 } else { 30 };
+            .unwrap_or(false);
+        let default_audit_interval_secs = 3600;
+        let default_replication_repair_backoff_secs = 30;
 
         Ok(Self {
             mode,
@@ -2682,22 +2638,16 @@ impl ServerNodeConfig {
                     .unwrap_or_else(|_| "local".to_string())
                     .as_str(),
             )?,
-            autonomous_replication_on_put_enabled: match mode {
-                ServerNodeMode::Cluster => {
-                    std::env::var("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED")
-                        .ok()
-                        .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                        .unwrap_or(true)
-                }
-                ServerNodeMode::LocalEdge => local_edge_clustered,
-            },
-            replication_repair_enabled: match mode {
-                ServerNodeMode::Cluster => std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
-                    .ok()
-                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                    .unwrap_or(true),
-                ServerNodeMode::LocalEdge => local_edge_clustered,
-            },
+            autonomous_replication_on_put_enabled: std::env::var(
+                "IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            replication_repair_enabled: std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
             replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -2729,24 +2679,18 @@ impl ServerNodeConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(100),
-            startup_repair_enabled: match mode {
-                ServerNodeMode::Cluster => std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
-                    .ok()
-                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                    .unwrap_or(true),
-                ServerNodeMode::LocalEdge => local_edge_clustered,
-            },
+            startup_repair_enabled: std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
             startup_repair_delay_secs: std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(5),
-            peer_heartbeat_enabled: match mode {
-                ServerNodeMode::Cluster => std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
-                    .ok()
-                    .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                    .unwrap_or(true),
-                ServerNodeMode::LocalEdge => false,
-            },
+            peer_heartbeat_enabled: std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
             peer_heartbeat_interval_secs: std::env::var(
                 "IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS",
             )
@@ -2764,63 +2708,6 @@ impl ServerNodeConfig {
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
                 .unwrap_or(true),
         })
-    }
-
-    pub fn local_edge(data_dir: impl Into<PathBuf>, bind_addr: SocketAddr) -> Self {
-        let mut labels = HashMap::new();
-        labels.insert("region".to_string(), "local".to_string());
-        labels.insert("dc".to_string(), "local-edge".to_string());
-        labels.insert("rack".to_string(), "local-edge".to_string());
-
-        Self {
-            mode: ServerNodeMode::LocalEdge,
-            cluster_id: Uuid::now_v7(),
-            node_id: NodeId::new_v4(),
-            data_dir: data_dir.into(),
-            metadata_backend: MetadataBackendKind::Sqlite,
-            bind_addr,
-            public_url: Some(format!("http://{bind_addr}")),
-            labels,
-            public_tls: None,
-            public_ca_cert_path: None,
-            public_ca_key_path: None,
-            bootstrap_trust_roots: None,
-            public_peer_api_enabled: false,
-            internal_tls: None,
-            internal_ca_key_path: None,
-            rendezvous_ca_cert_path: None,
-            rendezvous_urls: vec![format!("http://{bind_addr}")],
-            rendezvous_registration_enabled: false,
-            rendezvous_mtls_required: false,
-            managed_rendezvous: None,
-            relay_mode: RelayMode::Fallback,
-            enrollment_issuer_url: None,
-            node_enrollment_path: None,
-            node_enrollment_auto_renew_enabled: false,
-            node_enrollment_auto_renew_check_secs: node_enrollment_auto_renew_check_secs(),
-            node_enrollment_renewal_admin_token: None,
-            heartbeat_timeout_secs: 90,
-            audit_interval_secs: 3600,
-            replica_view_sync_interval_secs: DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS,
-            replication_factor: 1,
-            accepted_over_replication_items: 0,
-            metadata_commit_mode: MetadataCommitMode::Local,
-            autonomous_replication_on_put_enabled: false,
-            replication_repair_enabled: false,
-            replication_repair_batch_size: 256,
-            replication_repair_max_retries: 3,
-            replication_repair_backoff_secs: 30,
-            repair_busy_throttle_enabled: false,
-            repair_busy_inflight_threshold: 32,
-            repair_busy_wait_millis: 100,
-            startup_repair_enabled: false,
-            startup_repair_delay_secs: 5,
-            peer_heartbeat_enabled: false,
-            peer_heartbeat_interval_secs: 15,
-            admin_token: None,
-            admin_password_hash: None,
-            require_client_auth: false,
-        }
     }
 
     fn metadata_backend(&self) -> MetadataBackendKind {
@@ -2863,12 +2750,6 @@ impl ServerNodeConfig {
 }
 
 impl LocalNodeHandle {
-    pub fn start_local_edge(data_dir: impl Into<PathBuf>) -> Result<Self> {
-        let bind_addr = local_loopback_bind_addr()?;
-        let config = ServerNodeConfig::local_edge(data_dir, bind_addr);
-        Self::start(config)
-    }
-
     pub fn start(config: ServerNodeConfig) -> Result<Self> {
         let base_url = config.public_url.clone().unwrap_or_else(|| {
             let scheme = if config.public_tls.is_some() {
@@ -2939,16 +2820,6 @@ impl Drop for LocalNodeHandle {
             let _ = thread.join();
         }
     }
-}
-
-fn local_loopback_bind_addr() -> Result<SocketAddr> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .context("failed to allocate local loopback port")?;
-    let bind_addr = listener
-        .local_addr()
-        .context("failed to read allocated local loopback port")?;
-    drop(listener);
-    Ok(bind_addr)
 }
 
 fn wait_for_local_node_ready(
@@ -3413,7 +3284,6 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         data_dir: config.data_dir.clone(),
         cluster_id: config.cluster_id,
         node_id: config.node_id,
-        local_edge_mode: config.mode == ServerNodeMode::LocalEdge,
         storage_stats_history_retention_secs,
         map_perf_logging_enabled,
         map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
@@ -3560,21 +3430,16 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         }
     }
 
-    let peer_sync_enabled =
-        config.mode == ServerNodeMode::Cluster || config.rendezvous_registration_enabled;
-
-    if peer_sync_enabled {
-        spawn_replication_auditor(state.clone(), config.audit_interval_secs);
-        spawn_replica_view_synchronizer(state.clone(), config.replica_view_sync_interval_secs);
-        if state.repair_config.startup_repair_enabled {
-            spawn_startup_replication_repair(
-                state.clone(),
-                state.repair_config.startup_repair_delay_secs,
-            );
-        }
-        if peer_heartbeat_config.enabled {
-            spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
-        }
+    spawn_replication_auditor(state.clone(), config.audit_interval_secs);
+    spawn_replica_view_synchronizer(state.clone(), config.replica_view_sync_interval_secs);
+    if state.repair_config.startup_repair_enabled {
+        spawn_startup_replication_repair(
+            state.clone(),
+            state.repair_config.startup_repair_delay_secs,
+        );
+    }
+    if peer_heartbeat_config.enabled {
+        spawn_peer_heartbeat_emitter(state.clone(), peer_heartbeat_config.interval_secs);
     }
 
     if config.node_enrollment_auto_renew_enabled {
@@ -9015,16 +8880,13 @@ fn build_issued_node_bootstrap(
     let public_url = request
         .public_url
         .or_else(|| Some(default_public_url(&bind_addr, request.public_tls.is_some())));
-    let internal_bind_addr = request.internal_bind_addr.or_else(|| match mode {
-        NodeBootstrapMode::Cluster => Some("127.0.0.1:18080".to_string()),
-        NodeBootstrapMode::LocalEdge => None,
-    });
+    let internal_bind_addr = request
+        .internal_bind_addr
+        .or_else(|| Some("127.0.0.1:18080".to_string()));
     let internal_url = request
         .internal_url
         .or_else(|| internal_bind_addr.as_deref().map(default_internal_url));
-    let public_peer_api_enabled = request
-        .public_peer_api_enabled
-        .unwrap_or(mode == NodeBootstrapMode::LocalEdge && !rendezvous_urls.is_empty());
+    let public_peer_api_enabled = request.public_peer_api_enabled.unwrap_or(false);
     let bootstrap = TransportNodeBootstrap {
         version: 1,
         cluster_id: state.cluster_id,

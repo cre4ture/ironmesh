@@ -3003,7 +3003,6 @@ mod tests {
         let client_dir = fresh_data_dir("relay-rendezvous-client");
 
         let node_env = [
-            ("IRONMESH_NODE_MODE", "local-edge"),
             ("IRONMESH_CLUSTER_ID", cluster_id),
             ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
             ("IRONMESH_RELAY_MODE", "required"),
@@ -3264,7 +3263,6 @@ mod tests {
         let client_dir = fresh_data_dir("relay-client-unreachable-direct-client");
 
         let node_env = [
-            ("IRONMESH_NODE_MODE", "local-edge"),
             ("IRONMESH_CLUSTER_ID", cluster_id),
             ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
             ("IRONMESH_RELAY_MODE", "fallback"),
@@ -3372,7 +3370,6 @@ mod tests {
         let client_dir = fresh_data_dir("relay-client-direct-then-relay-client");
 
         let node_env = [
-            ("IRONMESH_NODE_MODE", "local-edge"),
             ("IRONMESH_CLUSTER_ID", cluster_id),
             ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
             ("IRONMESH_RELAY_MODE", "fallback"),
@@ -3487,7 +3484,6 @@ mod tests {
         let data_b = fresh_data_dir("relay-restart-repl-node-b");
 
         let node_env = [
-            ("IRONMESH_NODE_MODE", "local-edge"),
             ("IRONMESH_CLUSTER_ID", cluster_id),
             ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
             ("IRONMESH_RELAY_MODE", "required"),

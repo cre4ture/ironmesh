@@ -814,7 +814,10 @@ fn download_logical_range_blocking(
                 key: part.key.as_str(),
                 snapshot: None,
                 version: None,
-                range: RequestedRange { offset: local_start, length: segment_length },
+                range: RequestedRange {
+                    offset: local_start,
+                    length: segment_length,
+                },
             },
             &mut body,
             &mut on_progress,

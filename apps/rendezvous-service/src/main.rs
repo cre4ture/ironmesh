@@ -438,7 +438,8 @@ mod tests {
         BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
         ConnectionBootstrap,
     };
-    use server_node_sdk::{InternalTlsConfig, ServerNodeConfig, ServerNodeMode, run};
+    use server_node_sdk::{ServerNodeConfig, run};
+    use std::collections::HashMap;
     use std::net::IpAddr;
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::path::Path;
@@ -476,18 +477,37 @@ mod tests {
         )
         .await;
 
+        let ca = issue_test_ca().expect("test CA should generate");
         let cluster_id = Uuid::now_v7();
         let source_dir = fresh_test_dir("relay-required-source");
+        let source_node_id = Uuid::now_v7();
+        let source_tls = write_tls_material(
+            &source_dir,
+            &ca.ca_pem,
+            &issue_node_cert(&ca, source_node_id).expect("source node cert should issue"),
+        )
+        .expect("source TLS material should write");
         let source_bind_addr = free_bind_addr();
         let source_public_url = format!("http://{source_bind_addr}");
-        let mut source_config = ServerNodeConfig::local_edge(&source_dir, source_bind_addr);
-        source_config.mode = ServerNodeMode::Cluster;
-        source_config.cluster_id = cluster_id;
-        source_config.public_url = Some(source_public_url.clone());
+        let mut source_config = build_cluster_config_from_bootstrap(
+            &source_dir,
+            cluster_id,
+            source_node_id,
+            source_bind_addr,
+            source_public_url.clone(),
+            true,
+            vec![rendezvous_public_url.clone()],
+            false,
+            RelayMode::Required,
+            &source_tls,
+            transport_sdk::BootstrapTrustRoots {
+                cluster_ca_pem: Some(ca.ca_pem.clone()),
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+        );
         source_config.public_peer_api_enabled = true;
-        source_config.rendezvous_urls = vec![rendezvous_public_url.clone()];
         source_config.rendezvous_registration_enabled = true;
-        source_config.relay_mode = RelayMode::Required;
         source_config.replica_view_sync_interval_secs = 1;
         source_config.peer_heartbeat_enabled = true;
         source_config.peer_heartbeat_interval_secs = 1;
@@ -497,16 +517,34 @@ mod tests {
         source_config.startup_repair_enabled = false;
 
         let target_dir = fresh_test_dir("relay-required-target");
+        let target_node_id = Uuid::now_v7();
+        let target_tls = write_tls_material(
+            &target_dir,
+            &ca.ca_pem,
+            &issue_node_cert(&ca, target_node_id).expect("target node cert should issue"),
+        )
+        .expect("target TLS material should write");
         let target_bind_addr = free_bind_addr();
         let target_public_url = format!("http://{target_bind_addr}");
-        let mut target_config = ServerNodeConfig::local_edge(&target_dir, target_bind_addr);
-        target_config.mode = ServerNodeMode::Cluster;
-        target_config.cluster_id = cluster_id;
-        target_config.public_url = Some(target_public_url.clone());
+        let mut target_config = build_cluster_config_from_bootstrap(
+            &target_dir,
+            cluster_id,
+            target_node_id,
+            target_bind_addr,
+            target_public_url.clone(),
+            true,
+            vec![rendezvous_public_url.clone()],
+            false,
+            RelayMode::Required,
+            &target_tls,
+            transport_sdk::BootstrapTrustRoots {
+                cluster_ca_pem: Some(ca.ca_pem.clone()),
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+        );
         target_config.public_peer_api_enabled = true;
-        target_config.rendezvous_urls = vec![rendezvous_public_url.clone()];
         target_config.rendezvous_registration_enabled = true;
-        target_config.relay_mode = RelayMode::Required;
         target_config.replica_view_sync_interval_secs = 1;
         target_config.peer_heartbeat_enabled = true;
         target_config.peer_heartbeat_interval_secs = 1;
@@ -787,25 +825,25 @@ mod tests {
         let cluster_id = Uuid::now_v7();
         let source_bind_addr = free_bind_addr();
         let source_public_url = format!("http://{source_bind_addr}");
-        let source_internal_bind_addr = free_bind_addr();
-        let source_internal_url = format!("https://{source_internal_bind_addr}");
-        let mut source_config = ServerNodeConfig::local_edge(&source_dir, source_bind_addr);
-        source_config.mode = ServerNodeMode::Cluster;
-        source_config.cluster_id = cluster_id;
-        source_config.node_id = source_node_id;
-        source_config.public_url = Some(source_public_url.clone());
+        let mut source_config = build_cluster_config_from_bootstrap(
+            &source_dir,
+            cluster_id,
+            source_node_id,
+            source_bind_addr,
+            source_public_url.clone(),
+            false,
+            vec![rendezvous_public_url.clone()],
+            true,
+            RelayMode::Required,
+            &source_tls,
+            transport_sdk::BootstrapTrustRoots {
+                cluster_ca_pem: Some(ca.ca_pem.clone()),
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: Some(ca.ca_pem.clone()),
+            },
+        );
         source_config.public_peer_api_enabled = false;
-        source_config.internal_tls = Some(InternalTlsConfig {
-            bind_addr: source_internal_bind_addr,
-            internal_url: Some(source_internal_url),
-            ca_cert_path: source_tls.0.clone(),
-            cert_path: source_tls.1.clone(),
-            key_path: source_tls.2.clone(),
-            metadata_path: None,
-        });
-        source_config.rendezvous_urls = vec![rendezvous_public_url.clone()];
         source_config.rendezvous_registration_enabled = true;
-        source_config.relay_mode = RelayMode::Required;
         source_config.replica_view_sync_interval_secs = 1;
         source_config.peer_heartbeat_enabled = true;
         source_config.peer_heartbeat_interval_secs = 1;
@@ -824,25 +862,25 @@ mod tests {
         .expect("target TLS material should write");
         let target_bind_addr = free_bind_addr();
         let target_public_url = format!("http://{target_bind_addr}");
-        let target_internal_bind_addr = free_bind_addr();
-        let target_internal_url = format!("https://{target_internal_bind_addr}");
-        let mut target_config = ServerNodeConfig::local_edge(&target_dir, target_bind_addr);
-        target_config.mode = ServerNodeMode::Cluster;
-        target_config.cluster_id = cluster_id;
-        target_config.node_id = target_node_id;
-        target_config.public_url = Some(target_public_url.clone());
+        let mut target_config = build_cluster_config_from_bootstrap(
+            &target_dir,
+            cluster_id,
+            target_node_id,
+            target_bind_addr,
+            target_public_url.clone(),
+            false,
+            vec![rendezvous_public_url.clone()],
+            true,
+            RelayMode::Required,
+            &target_tls,
+            transport_sdk::BootstrapTrustRoots {
+                cluster_ca_pem: Some(ca.ca_pem.clone()),
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: Some(ca.ca_pem.clone()),
+            },
+        );
         target_config.public_peer_api_enabled = false;
-        target_config.internal_tls = Some(InternalTlsConfig {
-            bind_addr: target_internal_bind_addr,
-            internal_url: Some(target_internal_url),
-            ca_cert_path: target_tls.0.clone(),
-            cert_path: target_tls.1.clone(),
-            key_path: target_tls.2.clone(),
-            metadata_path: None,
-        });
-        target_config.rendezvous_urls = vec![rendezvous_public_url.clone()];
         target_config.rendezvous_registration_enabled = true;
-        target_config.relay_mode = RelayMode::Required;
         target_config.replica_view_sync_interval_secs = 1;
         target_config.peer_heartbeat_enabled = true;
         target_config.peer_heartbeat_interval_secs = 1;
@@ -1541,6 +1579,53 @@ mod tests {
         std::fs::write(&cert_path, &cert_and_key.0).context("failed writing cert pem")?;
         std::fs::write(&key_path, &cert_and_key.1).context("failed writing key pem")?;
         Ok((ca_path, cert_path, key_path))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_cluster_config_from_bootstrap(
+        data_dir: &Path,
+        cluster_id: Uuid,
+        node_id: Uuid,
+        bind_addr: SocketAddr,
+        public_url: String,
+        public_peer_api_enabled: bool,
+        rendezvous_urls: Vec<String>,
+        rendezvous_mtls_required: bool,
+        relay_mode: RelayMode,
+        tls_paths: &(PathBuf, PathBuf, PathBuf),
+        trust_roots: transport_sdk::BootstrapTrustRoots,
+    ) -> ServerNodeConfig {
+        let internal_bind_addr = free_bind_addr();
+        let internal_url = format!("https://{internal_bind_addr}");
+        let mut config = ServerNodeConfig::from_bootstrap(transport_sdk::NodeBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            node_id,
+            mode: transport_sdk::NodeBootstrapMode::Cluster,
+            data_dir: data_dir.display().to_string(),
+            bind_addr: bind_addr.to_string(),
+            public_url: Some(public_url),
+            labels: HashMap::new(),
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_peer_api_enabled,
+            internal_bind_addr: Some(internal_bind_addr.to_string()),
+            internal_url: Some(internal_url),
+            internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+                ca_cert_path: tls_paths.0.display().to_string(),
+                cert_path: tls_paths.1.display().to_string(),
+                key_path: tls_paths.2.display().to_string(),
+            }),
+            rendezvous_urls,
+            rendezvous_mtls_required,
+            direct_endpoints: Vec::new(),
+            relay_mode,
+            trust_roots,
+            enrollment_issuer_url: None,
+        })
+        .expect("cluster bootstrap config should build");
+        config.require_client_auth = false;
+        config
     }
 
     fn build_https_client_with_identity(

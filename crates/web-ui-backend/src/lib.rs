@@ -12,8 +12,9 @@ use bytes::Bytes;
 use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, RelayMode,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
-    RendezvousEndpointStatus, RequestedRange, StoreIndexView, UploadMode, build_http_client_from_pem,
-    build_http_client_with_identity_from_pem, ironmesh_client::DownloadRangeRequest,
+    RendezvousEndpointStatus, RequestedRange, StoreIndexView, UploadMode,
+    build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    ironmesh_client::DownloadRangeRequest,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -1080,7 +1081,10 @@ async fn download_object_range_bytes(request: ObjectRangeDownloadRequest) -> Res
                 key: key.as_str(),
                 snapshot: snapshot.as_deref(),
                 version: version.as_deref(),
-                range: RequestedRange { offset: start, length },
+                range: RequestedRange {
+                    offset: start,
+                    length,
+                },
             },
             &mut body,
             &mut on_progress,

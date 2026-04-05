@@ -7,16 +7,15 @@ use crate::cfapi::{
 };
 use crate::cfapi_safe_wrap::{
     CancelFetchDataCallbackParams, CloseCompletionCallbackParams, ExecuteTransferDataFailureInfo,
-    FetchDataCallbackParams, NotifyDehydrateCallbackParams, NotifyDehydrateCompletionCallbackParams,
-    callback_file_identity, callback_process_log_info, callback_target_session_id,
-    connect_sync_root as cf_connect_sync_root, create_placeholders as cf_create_placeholders,
-    disconnect_sync_root as cf_disconnect_sync_root, empty_fs_metadata,
-    execute_ack_dehydrate as cf_execute_ack_dehydrate,
+    FetchDataCallbackParams, NotifyDehydrateCallbackParams,
+    NotifyDehydrateCompletionCallbackParams, callback_file_identity, callback_process_log_info,
+    callback_target_session_id, connect_sync_root as cf_connect_sync_root,
+    create_placeholders as cf_create_placeholders, disconnect_sync_root as cf_disconnect_sync_root,
+    empty_fs_metadata, execute_ack_dehydrate as cf_execute_ack_dehydrate,
     execute_transfer_data_chunk as cf_execute_transfer_data_chunk,
     execute_transfer_data_failure as cf_execute_transfer_data_failure, string_from_pcwstr,
     unregister_sync_root as cf_unregister_sync_root,
 };
-use client_sdk::RequestedRange;
 use crate::close_upload::{
     UploadDebounceState, UploadWorkerContext, schedule_debounced_close_upload,
 };
@@ -33,6 +32,7 @@ use crate::sync_root_identity::{
     SyncRootIdentity, load_registered_sync_root_context, normalize_prefix,
 };
 use anyhow::{Context, Result, anyhow};
+use client_sdk::RequestedRange;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::Write;
@@ -105,7 +105,10 @@ pub trait Hydrator: Send + Sync + 'static {
 
         on_progress(HydrationProgress {
             object_size_bytes: payload.len() as u64,
-            range: RequestedRange { offset: range_start, length: range_length },
+            range: RequestedRange {
+                offset: range_start,
+                length: range_length,
+            },
             bytes_transferred: 0,
         });
 
@@ -119,13 +122,19 @@ pub trait Hydrator: Send + Sync + 'static {
 
         on_progress(HydrationProgress {
             object_size_bytes: payload.len() as u64,
-            range: RequestedRange { offset: range_start, length: range_length },
+            range: RequestedRange {
+                offset: range_start,
+                length: range_length,
+            },
             bytes_transferred: slice.len() as u64,
         });
 
         Ok(HydrationResult {
             object_size_bytes: payload.len() as u64,
-            range: RequestedRange { offset: range_start, length: range_length },
+            range: RequestedRange {
+                offset: range_start,
+                length: range_length,
+            },
             bytes_transferred: slice.len() as u64,
         })
     }
@@ -516,8 +525,12 @@ impl FetchExecutionGate {
     where
         F: Fn() -> Option<u64>,
     {
-        self.scheduler_for_file_id(file_id)
-            .acquire(self.clone(), file_id, range_start, frontier_provider)
+        self.scheduler_for_file_id(file_id).acquire(
+            self.clone(),
+            file_id,
+            range_start,
+            frontier_provider,
+        )
     }
 }
 
@@ -1637,7 +1650,8 @@ fn report_fetch_progress(
         .object_size_bytes
         .max(progress.range.offset.saturating_add(progress.range.length));
     let completed = progress
-        .range.offset
+        .range
+        .offset
         .saturating_add(progress.bytes_transferred)
         .min(total);
     cf_report_provider_progress2(
@@ -1897,7 +1911,10 @@ pub(crate) fn handle_callback_fetch_data(
             };
             if failure_length > 0 {
                 failure_info = Some(ExecuteTransferDataFailureInfo {
-                    range: RequestedRange { offset: failure_offset, length: failure_length },
+                    range: RequestedRange {
+                        offset: failure_offset,
+                        length: failure_length,
+                    },
                     completion_status,
                 });
             }
@@ -2152,10 +2169,7 @@ pub(crate) fn handle_callback_file_close_completion(
     );
     let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
     if full_path.is_dir() {
-        tracing::debug!(
-            "close-completion: skipping directory {}",
-            relative_path
-        );
+        tracing::debug!("close-completion: skipping directory {}", relative_path);
         return;
     }
     match open_sync_path(&full_path, false) {
@@ -2217,10 +2231,13 @@ fn execute_transfer_data_failure(
     range: RequestedRange,
     completion_status: NTSTATUS,
 ) -> Result<()> {
-    cf_execute_transfer_data_failure(callback_info, ExecuteTransferDataFailureInfo {
-        range,
-        completion_status,
-    })
+    cf_execute_transfer_data_failure(
+        callback_info,
+        ExecuteTransferDataFailureInfo {
+            range,
+            completion_status,
+        },
+    )
 }
 
 fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
@@ -2650,9 +2667,8 @@ mod tests {
         let gate = Arc::new(FetchExecutionGate::default());
         let frontier = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
-        let _guard = gate.acquire_for_file_range(42, 262_144, || {
-            Some(frontier.load(Ordering::SeqCst))
-        });
+        let _guard =
+            gate.acquire_for_file_range(42, 262_144, || Some(frontier.load(Ordering::SeqCst)));
         let waited = started.elapsed();
         assert!(
             waited >= FETCH_OUT_OF_ORDER_GRACE,

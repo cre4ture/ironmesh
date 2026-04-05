@@ -1,10 +1,9 @@
 use super::{
-    AdminControl, LocalNodeHandle, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig,
-    RepairExecutorState, ServerNodeConfig, ServerState, StartupRepairStatus,
-    await_repair_busy_threshold, build_rendezvous_presence_registration, build_store_index_entries,
-    cluster, constant_time_eq, jittered_backoff_secs, lock_store, new_store_rwlock,
-    node_descriptor_from_presence_entry, plan_peer_transport,
-    replication::build_internal_replication_put_url, resolve_peer_base_url, run,
+    AdminControl, MetadataCommitMode, PeerHeartbeatConfig, RepairConfig, RepairExecutorState,
+    ServerNodeConfig, ServerState, StartupRepairStatus, await_repair_busy_threshold,
+    build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
+    jittered_backoff_secs, lock_store, new_store_rwlock, node_descriptor_from_presence_entry,
+    plan_peer_transport, replication::build_internal_replication_put_url, resolve_peer_base_url,
     run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
     token_matches,
 };
@@ -40,6 +39,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use tokio::time::{Duration, Instant};
 use tower::{Service, ServiceExt};
+use uuid::Uuid;
 
 #[derive(Clone, Copy)]
 enum MainTestBackend {
@@ -139,16 +139,6 @@ fn metadata_backend_parser_handles_turso_feature_gate() {
     ));
     #[cfg(not(feature = "turso-metadata"))]
     assert!(result.unwrap_err().to_string().contains("turso-metadata"));
-}
-
-#[test]
-fn local_edge_constructor_keeps_repair_features_disabled() {
-    let config = ServerNodeConfig::local_edge("./tmp/test-node", free_bind_addr());
-
-    assert!(!config.autonomous_replication_on_put_enabled);
-    assert!(!config.replication_repair_enabled);
-    assert!(!config.repair_busy_throttle_enabled);
-    assert!(!config.startup_repair_enabled);
 }
 
 fn sample_png_bytes() -> Vec<u8> {
@@ -260,6 +250,81 @@ fn generate_test_internal_ca() -> (String, String) {
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     (cert.pem(), key_pair.serialize_pem())
+}
+
+fn test_cluster_config_without_internal_tls(
+    data_dir: impl Into<PathBuf>,
+    bind_addr: SocketAddr,
+) -> ServerNodeConfig {
+    let mut labels = HashMap::new();
+    labels.insert("region".to_string(), "local".to_string());
+    labels.insert("dc".to_string(), "local-dc".to_string());
+    labels.insert("rack".to_string(), "local-rack".to_string());
+
+    ServerNodeConfig {
+        mode: super::ServerNodeMode::Cluster,
+        cluster_id: Uuid::now_v7(),
+        node_id: NodeId::new_v4(),
+        data_dir: data_dir.into(),
+        metadata_backend: super::storage::MetadataBackendKind::Sqlite,
+        bind_addr,
+        public_url: Some(format!("http://{bind_addr}")),
+        labels,
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_ca_key_path: None,
+        bootstrap_trust_roots: None,
+        public_peer_api_enabled: false,
+        internal_tls: None,
+        internal_ca_key_path: None,
+        rendezvous_ca_cert_path: None,
+        rendezvous_urls: vec![format!("http://{bind_addr}")],
+        rendezvous_registration_enabled: false,
+        rendezvous_mtls_required: false,
+        managed_rendezvous: None,
+        relay_mode: super::RelayMode::Fallback,
+        enrollment_issuer_url: None,
+        node_enrollment_path: None,
+        node_enrollment_auto_renew_enabled: false,
+        node_enrollment_auto_renew_check_secs: 300,
+        node_enrollment_renewal_admin_token: None,
+        heartbeat_timeout_secs: 90,
+        audit_interval_secs: 3600,
+        replica_view_sync_interval_secs: 5,
+        replication_factor: 1,
+        accepted_over_replication_items: 0,
+        metadata_commit_mode: MetadataCommitMode::Local,
+        autonomous_replication_on_put_enabled: false,
+        replication_repair_enabled: false,
+        replication_repair_batch_size: 256,
+        replication_repair_max_retries: 3,
+        replication_repair_backoff_secs: 30,
+        repair_busy_throttle_enabled: false,
+        repair_busy_inflight_threshold: 32,
+        repair_busy_wait_millis: 100,
+        startup_repair_enabled: false,
+        startup_repair_delay_secs: 5,
+        peer_heartbeat_enabled: false,
+        peer_heartbeat_interval_secs: 15,
+        admin_token: None,
+        admin_password_hash: None,
+        require_client_auth: false,
+    }
+}
+
+fn sample_tls_material() -> transport_sdk::BootstrapMutualTlsMaterial {
+    transport_sdk::BootstrapMutualTlsMaterial {
+        ca_cert_pem: "ca".to_string(),
+        cert_pem: "cert".to_string(),
+        key_pem: "key".to_string(),
+        metadata: transport_sdk::BootstrapTlsMaterialMetadata {
+            issued_at_unix: 200,
+            not_before_unix: 100,
+            not_after_unix: 300,
+            renew_after_unix: 250,
+            certificate_fingerprint: "fingerprint".to_string(),
+        },
+    }
 }
 
 fn default_tls_issue_policy() -> super::NodeTlsIssuePolicy {
@@ -1312,67 +1377,6 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
 }
 
 #[tokio::test]
-async fn local_edge_bootstrap_with_rendezvous_enables_cluster_sync_defaults() {
-    let root = fresh_test_dir("local-edge-bootstrap-config");
-    let bootstrap_path = root.join("node-bootstrap.json");
-    let node_id = NodeId::new_v4();
-    let cluster_id = uuid::Uuid::now_v7();
-    transport_sdk::NodeBootstrap {
-        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
-        cluster_id,
-        node_id,
-        mode: transport_sdk::NodeBootstrapMode::LocalEdge,
-        data_dir: root.join("data").to_string_lossy().into_owned(),
-        bind_addr: "127.0.0.1:28080".to_string(),
-        public_url: Some("https://edge.example".to_string()),
-        labels: HashMap::new(),
-        public_tls: None,
-        public_ca_cert_path: None,
-        public_peer_api_enabled: true,
-        internal_bind_addr: None,
-        internal_url: None,
-        internal_tls: None,
-        rendezvous_urls: vec!["https://rendezvous.example".to_string()],
-        rendezvous_mtls_required: false,
-        direct_endpoints: vec![
-            transport_sdk::BootstrapEndpoint {
-                url: "https://edge.example".to_string(),
-                usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
-                node_id: Some(node_id),
-            },
-            transport_sdk::BootstrapEndpoint {
-                url: "https://edge.example".to_string(),
-                usage: Some(transport_sdk::BootstrapEndpointUse::PeerApi),
-                node_id: Some(node_id),
-            },
-        ],
-        relay_mode: transport_sdk::RelayMode::Fallback,
-        trust_roots: transport_sdk::BootstrapTrustRoots {
-            cluster_ca_pem: Some("cluster-ca".to_string()),
-            public_api_ca_pem: Some("public-ca".to_string()),
-            rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
-        },
-        enrollment_issuer_url: Some("https://issuer.example".to_string()),
-    }
-    .write_to_path(&bootstrap_path)
-    .unwrap();
-
-    let config = super::ServerNodeConfig::from_bootstrap_path(&bootstrap_path).unwrap();
-
-    assert!(matches!(config.mode, super::ServerNodeMode::LocalEdge));
-    assert!(config.rendezvous_registration_enabled);
-    assert!(config.public_peer_api_enabled);
-    assert_eq!(config.replication_factor, 2);
-    assert_eq!(config.audit_interval_secs, 5);
-    assert!(config.autonomous_replication_on_put_enabled);
-    assert!(config.replication_repair_enabled);
-    assert!(config.repair_busy_throttle_enabled);
-    assert!(config.startup_repair_enabled);
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
 async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
@@ -1475,62 +1479,6 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
     assert_eq!(
         bootstrap.direct_endpoints[1].node_id,
         Some(requested_node_id)
-    );
-
-    cleanup_test_state(&state).await;
-}
-
-#[tokio::test]
-async fn issue_local_edge_bootstrap_defaults_public_peer_api_when_rendezvous_is_enabled() {
-    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
-    state.public_ca_pem = Some("public-ca".to_string());
-    state.cluster_ca_pem = Some("cluster-ca".to_string());
-    state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
-    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
-    state.rendezvous_registration_enabled = true;
-    state.relay_mode = transport_sdk::RelayMode::Fallback;
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
-
-    let response = super::issue_node_bootstrap(
-        State(state.clone()),
-        headers,
-        Json(super::NodeBootstrapIssueRequest {
-            node_id: Some(NodeId::new_v4()),
-            mode: Some(transport_sdk::NodeBootstrapMode::LocalEdge),
-            data_dir: Some("./data/edge".to_string()),
-            bind_addr: Some("127.0.0.1:28080".to_string()),
-            public_url: Some("https://edge.example".to_string()),
-            labels: None,
-            public_tls: None,
-            public_ca_cert_path: None,
-            public_peer_api_enabled: None,
-            internal_bind_addr: None,
-            internal_url: None,
-            internal_tls: None,
-            enrollment_issuer_url: None,
-            tls_validity_secs: None,
-            tls_renewal_window_secs: None,
-        }),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let bootstrap: transport_sdk::NodeBootstrap = serde_json::from_slice(&body).unwrap();
-
-    assert!(matches!(
-        bootstrap.mode,
-        transport_sdk::NodeBootstrapMode::LocalEdge
-    ));
-    assert!(bootstrap.public_peer_api_enabled);
-    assert_eq!(bootstrap.direct_endpoints.len(), 2);
-    assert_eq!(
-        bootstrap.direct_endpoints[1].usage,
-        Some(transport_sdk::BootstrapEndpointUse::PeerApi)
     );
 
     cleanup_test_state(&state).await;
@@ -1936,56 +1884,6 @@ async fn import_managed_signer_backup_persists_signer_material_and_requires_rest
 }
 
 #[tokio::test]
-async fn issue_node_enrollment_allows_local_edge_with_public_tls_only() {
-    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
-    let (public_ca_pem, public_ca_key_pem) = generate_test_internal_ca();
-    state.public_ca_pem = Some(public_ca_pem);
-    state.public_ca_key_pem = Some(public_ca_key_pem);
-    *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
-    state.rendezvous_registration_enabled = true;
-
-    let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
-
-    let response = super::issue_node_enrollment(
-        State(state.clone()),
-        headers,
-        Json(super::NodeBootstrapIssueRequest {
-            node_id: Some(NodeId::new_v4()),
-            mode: Some(transport_sdk::NodeBootstrapMode::LocalEdge),
-            data_dir: Some("./data/edge-node".to_string()),
-            bind_addr: Some("127.0.0.1:28080".to_string()),
-            public_url: Some("https://edge.example".to_string()),
-            labels: None,
-            public_tls: Some(transport_sdk::BootstrapServerTlsFiles {
-                cert_path: "tls/public.pem".to_string(),
-                key_path: "tls/public.key".to_string(),
-            }),
-            public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
-            public_peer_api_enabled: Some(false),
-            internal_bind_addr: None,
-            internal_url: None,
-            internal_tls: None,
-            enrollment_issuer_url: None,
-            tls_validity_secs: None,
-            tls_renewal_window_secs: None,
-        }),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let package: transport_sdk::NodeEnrollmentPackage = serde_json::from_slice(&body).unwrap();
-
-    assert!(package.public_tls_material.is_some());
-    assert!(package.internal_tls_material.is_none());
-
-    cleanup_test_state(&state).await;
-}
-
-#[tokio::test]
 async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls_files() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
@@ -2082,63 +1980,6 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
     assert_eq!(stored_public_metadata, public_material.metadata);
 
     cleanup_test_state(&state).await;
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn node_bootstrap_file_can_start_local_edge_node() {
-    let root = fresh_test_dir("node-bootstrap-startup");
-    let bootstrap_path = root.join("node-bootstrap.json");
-    let bind_addr = free_bind_addr();
-    let public_url = format!("http://{bind_addr}");
-
-    transport_sdk::NodeBootstrap {
-        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
-        cluster_id: uuid::Uuid::now_v7(),
-        node_id: NodeId::new_v4(),
-        mode: transport_sdk::NodeBootstrapMode::LocalEdge,
-        data_dir: root.join("data").to_string_lossy().into_owned(),
-        bind_addr: bind_addr.to_string(),
-        public_url: Some(public_url.clone()),
-        labels: HashMap::new(),
-        public_tls: None,
-        public_ca_cert_path: None,
-        public_peer_api_enabled: false,
-        internal_bind_addr: None,
-        internal_url: None,
-        internal_tls: None,
-        rendezvous_urls: vec!["http://127.0.0.1:9".to_string()],
-        rendezvous_mtls_required: false,
-        direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
-            url: public_url.clone(),
-            usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
-            node_id: Some(NodeId::new_v4()),
-        }],
-        relay_mode: transport_sdk::RelayMode::Fallback,
-        trust_roots: transport_sdk::BootstrapTrustRoots {
-            cluster_ca_pem: None,
-            public_api_ca_pem: None,
-            rendezvous_ca_pem: None,
-        },
-        enrollment_issuer_url: None,
-    }
-    .write_to_path(&bootstrap_path)
-    .unwrap();
-
-    let config = super::ServerNodeConfig::from_bootstrap_path(&bootstrap_path).unwrap();
-    let http = reqwest::Client::new();
-    let handle = tokio::spawn(async move { super::run(config).await });
-
-    wait_for_http_status(
-        &http,
-        &format!("{public_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    handle.abort();
-    let _ = handle.await;
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2367,7 +2208,7 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
-    let mut issuer_config = super::ServerNodeConfig::local_edge(&issuer_dir, issuer_bind_addr);
+    let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
     issuer_config.admin_token = Some("admin-secret".to_string());
     issuer_config.public_url = Some(issuer_public_url.clone());
     issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
@@ -2613,7 +2454,7 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
-    let mut issuer_config = super::ServerNodeConfig::local_edge(&issuer_dir, issuer_bind_addr);
+    let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
     issuer_config.admin_token = Some("admin-secret".to_string());
     issuer_config.public_url = Some(issuer_public_url.clone());
     issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
@@ -2853,7 +2694,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
-    let mut issuer_config = super::ServerNodeConfig::local_edge(&issuer_dir, issuer_bind_addr);
+    let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
     issuer_config.admin_token = Some("admin-secret".to_string());
     issuer_config.public_url = Some(issuer_public_url.clone());
     issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
@@ -3117,6 +2958,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
 
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let rendezvous_url = format!("https://{bind_addr}");
+    let internal_bind_addr = free_bind_addr();
     *state.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
     state.rendezvous_registration_enabled = true;
 
@@ -3125,7 +2967,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
             version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
             cluster_id: state.cluster_id,
             node_id: state.node_id,
-            mode: transport_sdk::NodeBootstrapMode::LocalEdge,
+            mode: transport_sdk::NodeBootstrapMode::Cluster,
             data_dir: root.join("node").to_string_lossy().into_owned(),
             bind_addr: free_bind_addr().to_string(),
             public_url: None,
@@ -3133,22 +2975,26 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
             public_tls: None,
             public_ca_cert_path: None,
             public_peer_api_enabled: false,
-            internal_bind_addr: None,
-            internal_url: None,
-            internal_tls: None,
+            internal_bind_addr: Some(internal_bind_addr.to_string()),
+            internal_url: Some(format!("https://{internal_bind_addr}")),
+            internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+                ca_cert_path: "tls/cluster-ca.pem".to_string(),
+                cert_path: "tls/internal.pem".to_string(),
+                key_path: "tls/internal.key".to_string(),
+            }),
             rendezvous_urls: vec![rendezvous_url.clone()],
             rendezvous_mtls_required: false,
             direct_endpoints: Vec::new(),
             relay_mode: transport_sdk::RelayMode::Fallback,
             trust_roots: transport_sdk::BootstrapTrustRoots {
-                cluster_ca_pem: None,
+                cluster_ca_pem: Some("cluster-ca".to_string()),
                 public_api_ca_pem: None,
                 rendezvous_ca_pem: Some(ca1_pem.clone()),
             },
             enrollment_issuer_url: None,
         },
         public_tls_material: None,
-        internal_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
     }
     .write_to_path(&package_path)
     .unwrap();
@@ -5144,156 +4990,6 @@ run_on_main_metadata_backends!(
     get_object_supports_range_requests_turso
 );
 
-async fn local_edge_mode_serves_health_without_internal_tls_impl(backend: MainTestBackend) {
-    let bind_addr = free_bind_addr();
-    let data_dir = std::env::temp_dir().join(format!(
-        "ironmesh-local-edge-{}-{}-{}",
-        backend.suffix(),
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    let mut config = ServerNodeConfig::local_edge(&data_dir, bind_addr);
-    config.public_url = Some(format!("http://{bind_addr}"));
-    config.metadata_backend = backend.kind();
-
-    let handle = tokio::spawn(async move { run(config).await });
-    let client = reqwest::Client::new();
-    let health_url = format!("http://{bind_addr}/health");
-
-    let started = async {
-        for _ in 0..50 {
-            match client.get(&health_url).send().await {
-                Ok(response) if response.status() == StatusCode::OK => return Ok(()),
-                _ => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-        anyhow::bail!("local-edge server did not become healthy at {health_url}");
-    }
-    .await;
-
-    handle.abort();
-    let _ = handle.await;
-    let _ = std::fs::remove_dir_all(&data_dir);
-
-    started.unwrap();
-}
-
-run_on_main_metadata_backends!(
-    local_edge_mode_serves_health_without_internal_tls_impl,
-    local_edge_mode_serves_health_without_internal_tls,
-    local_edge_mode_serves_health_without_internal_tls_turso
-);
-
-async fn local_edge_persists_objects_across_restart_impl(
-    backend: super::storage::MetadataBackendKind,
-    label: &str,
-    payload: &str,
-) {
-    let bind_addr = free_bind_addr();
-    let data_dir = std::env::temp_dir().join(format!(
-        "ironmesh-local-edge-{label}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    let mut config = ServerNodeConfig::local_edge(&data_dir, bind_addr);
-    config.public_url = Some(format!("http://{bind_addr}"));
-    config.metadata_backend = backend;
-
-    let handle = tokio::spawn(async move { run(config).await });
-    let client = reqwest::Client::new();
-    let base_url = format!("http://{bind_addr}");
-    let health_url = format!("{base_url}/health");
-
-    wait_for_http_status(&client, &health_url, StatusCode::OK, Duration::from_secs(5)).await;
-
-    let put = client
-        .put(format!("{base_url}/store/persist.txt"))
-        .body(payload.to_string())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(put.status(), StatusCode::CREATED);
-
-    handle.abort();
-    let _ = handle.await;
-
-    let restart_bind_addr = free_bind_addr();
-    let mut restart_config = ServerNodeConfig::local_edge(&data_dir, restart_bind_addr);
-    restart_config.public_url = Some(format!("http://{restart_bind_addr}"));
-    restart_config.metadata_backend = backend;
-
-    let restart_handle = tokio::spawn(async move { run(restart_config).await });
-    let restart_base_url = format!("http://{restart_bind_addr}");
-    wait_for_http_status(
-        &client,
-        &format!("{restart_base_url}/health"),
-        StatusCode::OK,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let get = client
-        .get(format!("{restart_base_url}/store/persist.txt"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get.status(), StatusCode::OK);
-    let body = get.text().await.unwrap();
-    assert_eq!(body, payload);
-
-    restart_handle.abort();
-    let _ = restart_handle.await;
-    let _ = std::fs::remove_dir_all(&data_dir);
-}
-
-#[tokio::test]
-async fn local_edge_sqlite_persists_objects_across_restart() {
-    local_edge_persists_objects_across_restart_impl(
-        super::storage::MetadataBackendKind::Sqlite,
-        "sqlite",
-        "hello-sqlite",
-    )
-    .await;
-}
-
-#[cfg(feature = "turso-metadata")]
-#[tokio::test]
-async fn local_edge_turso_persists_objects_across_restart() {
-    local_edge_persists_objects_across_restart_impl(
-        super::storage::MetadataBackendKind::Turso,
-        "turso",
-        "hello-turso",
-    )
-    .await;
-}
-
-#[test]
-fn local_node_handle_starts_and_reports_base_url() {
-    let data_dir = std::env::temp_dir().join(format!(
-        "ironmesh-local-edge-handle-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    let handle = LocalNodeHandle::start_local_edge(&data_dir).unwrap();
-    let response = reqwest::blocking::get(format!("{}/health", handle.base_url())).unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    drop(handle);
-    let _ = std::fs::remove_dir_all(&data_dir);
-}
-
 async fn build_test_state(
     replication_factor: usize,
     seed_gap: bool,
@@ -5368,7 +5064,6 @@ async fn build_test_state(
         data_dir: root.clone(),
         cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
-        local_edge_mode: false,
         storage_stats_history_retention_secs: super::STORAGE_STATS_HISTORY_RETENTION_SECS,
         map_perf_logging_enabled: false,
         map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),

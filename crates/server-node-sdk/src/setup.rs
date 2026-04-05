@@ -8,6 +8,7 @@ use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use rcgen::BasicConstraints;
 use sha2::Sha256;
+use std::net::Ipv4Addr;
 use tokio::sync::mpsc;
 
 const SETUP_STATE_VERSION: u32 = 1;
@@ -684,7 +685,6 @@ fn explicit_runtime_env_present() -> bool {
     [
         "IRONMESH_NODE_ENROLLMENT_FILE",
         "IRONMESH_NODE_BOOTSTRAP_FILE",
-        "IRONMESH_NODE_MODE",
         "IRONMESH_NODE_ID",
         "IRONMESH_CLUSTER_ID",
         "IRONMESH_PUBLIC_URL",
@@ -1512,6 +1512,66 @@ mod tests {
         path
     }
 
+    fn test_cluster_config_without_internal_tls(
+        data_dir: impl Into<PathBuf>,
+        bind_addr: SocketAddr,
+    ) -> ServerNodeConfig {
+        let mut labels = HashMap::new();
+        labels.insert("region".to_string(), "local".to_string());
+        labels.insert("dc".to_string(), "local-dc".to_string());
+        labels.insert("rack".to_string(), "local-rack".to_string());
+
+        ServerNodeConfig {
+            mode: ServerNodeMode::Cluster,
+            cluster_id: Uuid::now_v7(),
+            node_id: NodeId::new_v4(),
+            data_dir: data_dir.into(),
+            metadata_backend: storage::MetadataBackendKind::Sqlite,
+            bind_addr,
+            public_url: Some(format!("http://{bind_addr}")),
+            labels,
+            public_tls: None,
+            public_ca_cert_path: None,
+            public_ca_key_path: None,
+            bootstrap_trust_roots: None,
+            public_peer_api_enabled: false,
+            internal_tls: None,
+            internal_ca_key_path: None,
+            rendezvous_ca_cert_path: None,
+            rendezvous_urls: vec![format!("http://{bind_addr}")],
+            rendezvous_registration_enabled: false,
+            rendezvous_mtls_required: false,
+            managed_rendezvous: None,
+            relay_mode: RelayMode::Fallback,
+            enrollment_issuer_url: None,
+            node_enrollment_path: None,
+            node_enrollment_auto_renew_enabled: false,
+            node_enrollment_auto_renew_check_secs: node_enrollment_auto_renew_check_secs(),
+            node_enrollment_renewal_admin_token: None,
+            heartbeat_timeout_secs: 90,
+            audit_interval_secs: 3600,
+            replica_view_sync_interval_secs: DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS,
+            replication_factor: 1,
+            accepted_over_replication_items: 0,
+            metadata_commit_mode: MetadataCommitMode::Local,
+            autonomous_replication_on_put_enabled: false,
+            replication_repair_enabled: false,
+            replication_repair_batch_size: 256,
+            replication_repair_max_retries: 3,
+            replication_repair_backoff_secs: 30,
+            repair_busy_throttle_enabled: false,
+            repair_busy_inflight_threshold: 32,
+            repair_busy_wait_millis: 100,
+            startup_repair_enabled: false,
+            startup_repair_delay_secs: 5,
+            peer_heartbeat_enabled: false,
+            peer_heartbeat_interval_secs: 15,
+            admin_token: None,
+            admin_password_hash: None,
+            require_client_auth: false,
+        }
+    }
+
     #[test]
     fn managed_setup_state_roundtrip() {
         let dir = temp_dir("state-roundtrip");
@@ -1649,7 +1709,7 @@ mod tests {
             managed_rendezvous_public_url: Some("https://node-a.local:9443".to_string()),
             ..ManagedSetupState::default()
         };
-        let mut config = ServerNodeConfig::local_edge(
+        let mut config = test_cluster_config_without_internal_tls(
             dir.join("data"),
             "127.0.0.1:28080".parse::<SocketAddr>().unwrap(),
         );
@@ -1690,7 +1750,7 @@ mod tests {
             managed_rendezvous_public_url: Some("https://node-a.local:9443".to_string()),
             ..ManagedSetupState::default()
         };
-        let mut config = ServerNodeConfig::local_edge(
+        let mut config = test_cluster_config_without_internal_tls(
             dir.join("data"),
             "127.0.0.1:28080".parse::<SocketAddr>().unwrap(),
         );
@@ -1713,7 +1773,7 @@ mod tests {
     fn apply_managed_signer_paths_sets_runtime_ca_key_paths() {
         let dir = temp_dir("managed-signer");
         write_managed_signer_material(&dir, "ca-cert", "ca-key").unwrap();
-        let mut config = ServerNodeConfig::local_edge(
+        let mut config = test_cluster_config_without_internal_tls(
             dir.join("data"),
             "127.0.0.1:28080".parse::<SocketAddr>().unwrap(),
         );

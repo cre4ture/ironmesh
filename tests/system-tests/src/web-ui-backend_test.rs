@@ -1654,7 +1654,6 @@ mod tests {
         let client_dir = fresh_data_dir("web-ui-relay-only-client");
 
         let node_env = [
-            ("IRONMESH_NODE_MODE", "local-edge"),
             ("IRONMESH_CLUSTER_ID", cluster_id),
             ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
             ("IRONMESH_RELAY_MODE", "fallback"),

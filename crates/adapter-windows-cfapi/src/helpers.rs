@@ -97,7 +97,6 @@ pub fn encode_placeholder_file_identity(
     identity.encoded()
 }
 
-
 pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<PlaceholderFileIdentity> {
     let text = std::str::from_utf8(file_identity).ok()?;
     let mut schema_version = None;

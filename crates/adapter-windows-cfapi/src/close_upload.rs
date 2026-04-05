@@ -280,10 +280,7 @@ fn process_debounced_close_upload(
     };
 
     if metadata.is_dir() {
-        tracing::debug!(
-            "close-completion: skipping directory {}",
-            relative_path
-        );
+        tracing::debug!("close-completion: skipping directory {}", relative_path);
         return UploadAttemptOutcome::Settled;
     }
 

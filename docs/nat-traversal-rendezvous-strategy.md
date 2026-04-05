@@ -10,7 +10,6 @@ Ironmesh needs reliable communication between:
 
 - server-node <-> server-node,
 - client/device <-> server-node,
-- local-edge/client agents <-> upstream nodes,
 
 even when some or all participants are behind NAT and do not have port forwarding.
 
