@@ -326,16 +326,19 @@ impl ClusterService {
         changed_to_offline
     }
 
-    pub fn note_replica(&mut self, key: impl Into<String>, node_id: NodeId) {
+    pub fn note_replica(&mut self, key: impl Into<String>, node_id: NodeId) -> bool {
         let key = key.into();
-        self.replicas_by_key
+        let replica_inserted = self
+            .replicas_by_key
             .entry(key.clone())
             .or_default()
             .insert(node_id);
-        self.available_by_key
+        let available_inserted = self
+            .available_by_key
             .entry(key)
             .or_default()
             .insert(node_id);
+        replica_inserted || available_inserted
     }
 
     pub fn replace_node_available_view(&mut self, node_id: NodeId, subjects: &[String]) -> bool {
@@ -394,9 +397,25 @@ impl ClusterService {
     }
 
     pub fn known_replication_subjects(&self) -> Vec<String> {
-        let mut subjects = self.replicas_by_key.keys().cloned().collect::<Vec<_>>();
+        let mut subjects = self
+            .replicas_by_key
+            .keys()
+            .chain(self.available_by_key.keys())
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         subjects.sort();
         subjects
+    }
+
+    fn current_replica_nodes_for_subject(&self, key: &str) -> HashSet<NodeId> {
+        let available = self.available_by_key.get(key).cloned().unwrap_or_default();
+        if !available.is_empty() {
+            return available;
+        }
+
+        self.replicas_by_key.get(key).cloned().unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -490,7 +509,7 @@ impl ClusterService {
             let desired_set: HashSet<_> = desired_nodes.iter().copied().collect();
             let target_replica_count = desired_nodes.len();
 
-            let current_set = self.replicas_by_key.get(key).cloned().unwrap_or_default();
+            let current_set = self.current_replica_nodes_for_subject(key);
             let mut current_nodes: Vec<_> = current_set.iter().copied().collect();
             current_nodes.sort();
 
@@ -1025,6 +1044,48 @@ mod tests {
 
         let changed = svc.replace_node_available_view(node_a, &["subject-a".to_string()]);
         assert!(!changed);
+    }
+
+    #[test]
+    fn known_replication_subjects_include_available_only_subjects() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.replace_node_available_view(node_a, &["subject-a".to_string()]);
+
+        assert_eq!(svc.known_replication_subjects(), vec!["subject-a".to_string()]);
+    }
+
+    #[test]
+    fn replication_plan_uses_available_subject_view_when_replica_map_is_stale() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 2,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.replace_node_available_view(node_a, &["subject-a".to_string()]);
+
+        let plan = svc.replication_plan(&["subject-a".to_string()]);
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.key == "subject-a")
+            .expect("expected replication plan item for available subject");
+
+        assert_eq!(item.current_nodes, vec![node_a]);
+        assert_eq!(item.missing_nodes.len(), 1);
+        assert!(item.missing_nodes.contains(&node_b));
     }
 
     #[test]

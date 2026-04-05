@@ -2,7 +2,7 @@ use super::*;
 use bytes::BytesMut;
 use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReplicationRepairReport {
     pub(crate) attempted_transfers: usize,
     pub(crate) successful_transfers: usize,
@@ -13,9 +13,41 @@ pub(crate) struct ReplicationRepairReport {
     pub(crate) last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReplicationRepairScope {
+    #[default]
+    Local,
+    Cluster,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ClusterReplicationRepairNodeReport {
+    pub(crate) node_id: NodeId,
+    pub(crate) attempted_transfers: usize,
+    pub(crate) successful_transfers: usize,
+    pub(crate) failed_transfers: usize,
+    pub(crate) skipped_items: usize,
+    pub(crate) skipped_backoff: usize,
+    pub(crate) skipped_max_retries: usize,
+    pub(crate) last_error: Option<String>,
+    pub(crate) request_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ClusterReplicationRepairReport {
+    #[serde(flatten)]
+    pub(crate) totals: ReplicationRepairReport,
+    pub(crate) scope: ReplicationRepairScope,
+    pub(crate) nodes_contacted: usize,
+    pub(crate) failed_nodes: usize,
+    pub(crate) node_reports: Vec<ClusterReplicationRepairNodeReport>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReplicationRepairQuery {
     batch_size: Option<usize>,
+    scope: Option<ReplicationRepairScope>,
 }
 
 pub(crate) async fn execute_replication_repair(
@@ -23,9 +55,16 @@ pub(crate) async fn execute_replication_repair(
     Query(query): Query<ReplicationRepairQuery>,
 ) -> impl IntoResponse {
     let batch_override = query.batch_size.filter(|v| *v > 0);
-    let report = execute_replication_repair_inner(&state, batch_override).await;
-
-    (StatusCode::OK, Json(report))
+    match query.scope.unwrap_or_default() {
+        ReplicationRepairScope::Local => {
+            let report = execute_replication_repair_inner(&state, batch_override).await;
+            (StatusCode::OK, Json(report)).into_response()
+        }
+        ReplicationRepairScope::Cluster => {
+            let report = execute_cluster_replication_repair_inner(&state, batch_override).await;
+            (StatusCode::OK, Json(report)).into_response()
+        }
+    }
 }
 
 pub(crate) async fn execute_replication_repair_inner(
@@ -284,6 +323,171 @@ pub(crate) async fn execute_replication_repair_inner(
         skipped_max_retries,
         last_error,
     }
+}
+
+async fn execute_cluster_replication_repair_inner(
+    state: &ServerState,
+    batch_size_override: Option<usize>,
+) -> ClusterReplicationRepairReport {
+    let mut node_reports = Vec::new();
+    let mut totals = ReplicationRepairReport {
+        attempted_transfers: 0,
+        successful_transfers: 0,
+        failed_transfers: 0,
+        skipped_items: 0,
+        skipped_backoff: 0,
+        skipped_max_retries: 0,
+        last_error: None,
+    };
+    let mut failed_nodes = 0usize;
+
+    let local_report = execute_replication_repair_inner(state, batch_size_override).await;
+    accumulate_repair_report(&mut totals, &local_report);
+    node_reports.push(ClusterReplicationRepairNodeReport {
+        node_id: state.node_id,
+        attempted_transfers: local_report.attempted_transfers,
+        successful_transfers: local_report.successful_transfers,
+        failed_transfers: local_report.failed_transfers,
+        skipped_items: local_report.skipped_items,
+        skipped_backoff: local_report.skipped_backoff,
+        skipped_max_retries: local_report.skipped_max_retries,
+        last_error: local_report.last_error.clone(),
+        request_error: None,
+    });
+
+    let peers = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        cluster
+            .list_nodes()
+            .into_iter()
+            .filter(|node| node.node_id != state.node_id && node.status == cluster::NodeStatus::Online)
+            .collect::<Vec<_>>()
+    };
+
+    for peer in peers {
+        let path = build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
+        match execute_peer_request(
+            state,
+            &peer,
+            reqwest::Method::POST,
+            &path,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => match response.json::<ReplicationRepairReport>() {
+                Ok(report) => {
+                    accumulate_repair_report(&mut totals, &report);
+                    node_reports.push(ClusterReplicationRepairNodeReport {
+                        node_id: peer.node_id,
+                        attempted_transfers: report.attempted_transfers,
+                        successful_transfers: report.successful_transfers,
+                        failed_transfers: report.failed_transfers,
+                        skipped_items: report.skipped_items,
+                        skipped_backoff: report.skipped_backoff,
+                        skipped_max_retries: report.skipped_max_retries,
+                        last_error: report.last_error.clone(),
+                        request_error: None,
+                    });
+                }
+                Err(err) => {
+                    failed_nodes += 1;
+                    let error = format!("failed decoding peer repair report: {err}");
+                    totals.last_error = Some(error.clone());
+                    node_reports.push(ClusterReplicationRepairNodeReport {
+                        node_id: peer.node_id,
+                        attempted_transfers: 0,
+                        successful_transfers: 0,
+                        failed_transfers: 0,
+                        skipped_items: 0,
+                        skipped_backoff: 0,
+                        skipped_max_retries: 0,
+                        last_error: None,
+                        request_error: Some(error),
+                    });
+                }
+            },
+            Ok(response) => {
+                failed_nodes += 1;
+                let error = format!(
+                    "peer repair request returned HTTP {}",
+                    response.status
+                );
+                totals.last_error = Some(error.clone());
+                node_reports.push(ClusterReplicationRepairNodeReport {
+                    node_id: peer.node_id,
+                    attempted_transfers: 0,
+                    successful_transfers: 0,
+                    failed_transfers: 0,
+                    skipped_items: 0,
+                    skipped_backoff: 0,
+                    skipped_max_retries: 0,
+                    last_error: None,
+                    request_error: Some(error),
+                });
+            }
+            Err(err) => {
+                failed_nodes += 1;
+                let error = format!("peer repair request failed: {err:#}");
+                totals.last_error = Some(error.clone());
+                node_reports.push(ClusterReplicationRepairNodeReport {
+                    node_id: peer.node_id,
+                    attempted_transfers: 0,
+                    successful_transfers: 0,
+                    failed_transfers: 0,
+                    skipped_items: 0,
+                    skipped_backoff: 0,
+                    skipped_max_retries: 0,
+                    last_error: None,
+                    request_error: Some(error),
+                });
+            }
+        }
+    }
+
+    ClusterReplicationRepairReport {
+        totals,
+        scope: ReplicationRepairScope::Cluster,
+        nodes_contacted: node_reports.len(),
+        failed_nodes,
+        node_reports,
+    }
+}
+
+fn accumulate_repair_report(totals: &mut ReplicationRepairReport, report: &ReplicationRepairReport) {
+    totals.attempted_transfers =
+        totals.attempted_transfers.saturating_add(report.attempted_transfers);
+    totals.successful_transfers =
+        totals.successful_transfers.saturating_add(report.successful_transfers);
+    totals.failed_transfers = totals.failed_transfers.saturating_add(report.failed_transfers);
+    totals.skipped_items = totals.skipped_items.saturating_add(report.skipped_items);
+    totals.skipped_backoff = totals.skipped_backoff.saturating_add(report.skipped_backoff);
+    totals.skipped_max_retries =
+        totals.skipped_max_retries.saturating_add(report.skipped_max_retries);
+    if report.last_error.is_some() {
+        totals.last_error = report.last_error.clone();
+    }
+}
+
+fn build_replication_repair_path(
+    batch_size_override: Option<usize>,
+    scope: ReplicationRepairScope,
+) -> String {
+    let mut query = Vec::new();
+    if let Some(batch_size) = batch_size_override {
+        query.push(format!("batch_size={batch_size}"));
+    }
+    query.push(format!(
+        "scope={}",
+        match scope {
+            ReplicationRepairScope::Local => "local",
+            ReplicationRepairScope::Cluster => "cluster",
+        }
+    ));
+
+    format!("/cluster/replication/repair?{}", query.join("&"))
 }
 
 async fn pull_bundle_from_source(

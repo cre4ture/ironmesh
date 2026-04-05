@@ -132,7 +132,7 @@ export async function getReplicationPlan(
 }
 
 export async function triggerReplicationRepair(): Promise<Record<string, unknown>> {
-  return fetchJson<Record<string, unknown>>("/cluster/replication/repair", {
+  return fetchJson<Record<string, unknown>>("/cluster/replication/repair?scope=cluster", {
     method: "POST",
     credentials: "same-origin",
     cache: "no-store"

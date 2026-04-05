@@ -2116,6 +2116,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_scoped_manual_replication_repair_runs_on_relevant_peers() -> Result<()> {
+        let bind_a = "127.0.0.1:19165";
+        let bind_b = "127.0.0.1:19166";
+        let bind_c = "127.0.0.1:19167";
+
+        let node_id_a = "00000000-0000-0000-0000-0000000006a1";
+        let node_id_b = "00000000-0000-0000-0000-0000000006b2";
+        let node_id_c = "00000000-0000-0000-0000-0000000006c3";
+
+        let data_a = fresh_data_dir("repair-cluster-a");
+        let data_b = fresh_data_dir("repair-cluster-b");
+        let data_c = fresh_data_dir("repair-cluster-c");
+
+        let mut node_a = start_authenticated_server(bind_a, &data_a, node_id_a, 2).await?;
+        let mut node_b = start_authenticated_server(bind_b, &data_b, node_id_b, 2).await?;
+        let mut node_c = start_authenticated_server(bind_c, &data_c, node_id_c, 2).await?;
+
+        let base_a = format!("http://{bind_a}");
+        let base_b = format!("http://{bind_b}");
+        let base_c = format!("http://{bind_c}");
+        let http = reqwest::Client::new();
+        let client_a = enroll_authenticated_http_client(&base_a, "repair-cluster-a-client").await?;
+        let client_b = enroll_authenticated_http_client(&base_b, "repair-cluster-b-client").await?;
+        let client_c = enroll_authenticated_http_client(&base_c, "repair-cluster-c-client").await?;
+
+        let result = async {
+            register_node(&http, &base_a, node_id_b, &base_b, "dc-b", "rack-2").await?;
+            register_node(&http, &base_a, node_id_c, &base_c, "dc-c", "rack-3").await?;
+            register_node(&http, &base_c, node_id_a, &base_a, "dc-a", "rack-1").await?;
+            register_node(&http, &base_c, node_id_b, &base_b, "dc-b", "rack-2").await?;
+
+            client_a
+                .http
+                .request(Method::PUT, "/store/repair-cluster-key")?
+                .body("repair-cluster-payload")
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let repair_report: serde_json::Value = http
+                .post(format!("{base_c}/cluster/replication/repair?scope=cluster"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let successful = repair_report
+                .get("successful_transfers")
+                .and_then(|v| v.as_u64())
+                .context("missing successful_transfers for cluster-scoped repair")?;
+            assert!(
+                successful >= 1,
+                "expected at least one successful transfer from cluster-scoped repair, report={repair_report:?}"
+            );
+            assert_eq!(
+                repair_report.get("scope").and_then(|v| v.as_str()),
+                Some("cluster")
+            );
+            assert!(
+                repair_report
+                    .get("node_reports")
+                    .and_then(|v| v.as_array())
+                    .map(|reports| reports.len() >= 2)
+                    .unwrap_or(false),
+                "expected per-node repair reports in cluster-scoped response: {repair_report:?}"
+            );
+
+            let b_read = client_b
+                .http
+                .request(Method::GET, "/store/repair-cluster-key")?
+                .send()
+                .await?;
+            let c_read = client_c
+                .http
+                .request(Method::GET, "/store/repair-cluster-key")?
+                .send()
+                .await?;
+            assert!(
+                b_read.status() == StatusCode::OK || c_read.status() == StatusCode::OK,
+                "expected cluster-scoped repair to land on a missing peer"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        stop_server(&mut node_c).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
+        let _ = fs::remove_dir_all(&data_c);
+        let _ = fs::remove_dir_all(&client_a.client_dir);
+        let _ = fs::remove_dir_all(&client_b.client_dir);
+        let _ = fs::remove_dir_all(&client_c.client_dir);
+
+        result
+    }
+
+    #[tokio::test]
     async fn autonomous_replication_after_put_populates_peer_without_manual_repair() -> Result<()> {
         let bind_a = "127.0.0.1:19131";
         let bind_b = "127.0.0.1:19132";

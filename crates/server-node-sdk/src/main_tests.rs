@@ -4384,6 +4384,14 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     assert!(after_subject_list.contains(&"photos/cat.png"));
     assert!(after_subject_list.contains(&format!("photos/cat.png@{}", put.version_id).as_str()));
 
+    {
+        let cluster = target.cluster.lock().await;
+        let cluster_subjects = cluster.subjects_for_node(target.node_id);
+        assert_eq!(cluster_subjects.len(), 2);
+        assert!(cluster_subjects.contains(&"photos/cat.png".to_string()));
+        assert!(cluster_subjects.contains(&format!("photos/cat.png@{}", put.version_id)));
+    }
+
     handle.abort();
     let _ = handle.await;
     cleanup_test_state(&source).await;

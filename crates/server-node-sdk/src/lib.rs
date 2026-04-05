@@ -5291,8 +5291,38 @@ async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
     let _refresh_guard = state.local_availability_refresh_lock.lock().await;
     let local_subjects = recompute_local_cluster_available_subjects(state).await;
     let subject_count = local_subjects.len();
-    let mut cluster = state.cluster.lock().await;
-    cluster.replace_node_available_view(state.node_id, &local_subjects);
+    let desired_subjects = local_subjects.iter().cloned().collect::<HashSet<_>>();
+    let replicas_changed = {
+        let mut cluster = state.cluster.lock().await;
+        let mut replicas_changed = false;
+
+        for subject in cluster.subjects_for_node(state.node_id) {
+            if !desired_subjects.contains(&subject) {
+                cluster.remove_replica(&subject, state.node_id);
+                replicas_changed = true;
+            }
+        }
+
+        cluster.replace_node_available_view(state.node_id, &local_subjects);
+
+        for subject in &local_subjects {
+            if cluster.note_replica(subject.clone(), state.node_id) {
+                replicas_changed = true;
+            }
+        }
+
+        replicas_changed
+    };
+
+    if replicas_changed
+        && let Err(err) = persist_cluster_replicas_state(state).await
+    {
+        warn!(
+            error = %err,
+            subject_count,
+            "failed to persist cluster replicas after local availability refresh"
+        );
+    }
     subject_count
 }
 
@@ -12876,6 +12906,9 @@ async fn run_tombstone_compaction(
     };
     match result {
         Ok(report) => {
+            if !dry_run {
+                request_local_availability_refresh(&state);
+            }
             append_admin_audit(
                 &state,
                 action,
@@ -13022,6 +13055,9 @@ async fn run_tombstone_archive_restore(
     };
     match result {
         Ok(report) => {
+            if !dry_run && report.restored {
+                request_local_availability_refresh(&state);
+            }
             append_admin_audit(
                 &state,
                 action,

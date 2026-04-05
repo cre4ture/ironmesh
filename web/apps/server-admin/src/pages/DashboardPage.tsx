@@ -237,7 +237,7 @@ export function DashboardPage() {
         </Text>
         <Group>
           <Button variant="default" onClick={() => void runRepair()} loading={repairPending}>
-            Run repair pass
+            Run cluster repair pass
           </Button>
           <Button variant="light" onClick={() => void refresh()} loading={loading}>
           Refresh
