@@ -476,7 +476,7 @@ pub(crate) struct CallbackContext {
     hydrated_once_paths: Mutex<HashSet<String>>,
     paths_by_file_id: Mutex<HashMap<i64, String>>,
     fetch_cancellations: Mutex<HashMap<FetchCallbackIdentity, Arc<AtomicBool>>>,
-    fetch_execution_gate: FetchExecutionGate,
+    fetch_execution_gate: Arc<FetchExecutionGate>,
     upload_worker: Arc<UploadWorkerContext>,
     upload_debounce: Arc<UploadDebounceState>,
 }
@@ -508,7 +508,7 @@ impl FetchExecutionGate {
     }
 
     fn acquire_for_file_range<F>(
-        &self,
+        self: &Arc<Self>,
         file_id: i64,
         range_start: u64,
         frontier_provider: F,
@@ -517,7 +517,7 @@ impl FetchExecutionGate {
         F: Fn() -> Option<u64>,
     {
         self.scheduler_for_file_id(file_id)
-            .acquire(range_start, frontier_provider)
+            .acquire(self.clone(), file_id, range_start, frontier_provider)
     }
 }
 
@@ -541,18 +541,60 @@ struct PendingFetchExecution {
 }
 
 struct FetchExecutionPermit {
-    scheduler: Arc<FetchExecutionScheduler>,
+    gate: Arc<FetchExecutionGate>,
+    file_id: i64,
     ticket: u64,
 }
 
 impl Drop for FetchExecutionPermit {
     fn drop(&mut self) {
-        self.scheduler.release(self.ticket);
+        // Step 1: clone the scheduler Arc without holding the gate lock long
+        let scheduler = {
+            let schedulers = self
+                .gate
+                .schedulers_by_file_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            schedulers.get(&self.file_id).cloned()
+        };
+        let Some(scheduler) = scheduler else {
+            return;
+        };
+
+        // Step 2: release the ticket (locks scheduler state, not gate map)
+        scheduler.release(self.ticket);
+        drop(scheduler); // drop our clone before the strong_count check
+
+        // Step 3: prune if idle — holding gate lock prevents new scheduler_for_file_id clones
+        let mut schedulers = self
+            .gate
+            .schedulers_by_file_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(s) = schedulers.get(&self.file_id) {
+            let state = s
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.pending.is_empty()
+                && state.active_ticket.is_none()
+                && Arc::strong_count(s) == 1
+            {
+                drop(state);
+                schedulers.remove(&self.file_id);
+            }
+        }
     }
 }
 
 impl FetchExecutionScheduler {
-    fn acquire<F>(self: Arc<Self>, range_start: u64, frontier_provider: F) -> FetchExecutionPermit
+    fn acquire<F>(
+        self: Arc<Self>,
+        gate: Arc<FetchExecutionGate>,
+        file_id: i64,
+        range_start: u64,
+        frontier_provider: F,
+    ) -> FetchExecutionPermit
     where
         F: Fn() -> Option<u64>,
     {
@@ -579,7 +621,8 @@ impl FetchExecutionScheduler {
             {
                 state.active_ticket = Some(ticket);
                 return FetchExecutionPermit {
-                    scheduler: self.clone(),
+                    gate: gate.clone(),
+                    file_id,
                     ticket,
                 };
             }
@@ -1488,7 +1531,7 @@ pub fn connect_sync_root(
         hydrated_once_paths: Mutex::new(HashSet::new()),
         paths_by_file_id: Mutex::new(HashMap::new()),
         fetch_cancellations: Mutex::new(HashMap::new()),
-        fetch_execution_gate: FetchExecutionGate::default(),
+        fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
         upload_worker,
         upload_debounce,
     });
@@ -2076,6 +2119,9 @@ pub(crate) fn handle_callback_file_close_completion(
     );
     if (close_completion.flags & CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0 {
         tracing::debug!("close-completion: file deleted, skipping upload");
+        if let Ok(mut paths_by_file_id) = context.paths_by_file_id.lock() {
+            paths_by_file_id.remove(&callback_info_ref.FileId);
+        }
         return;
     }
 
@@ -2095,10 +2141,8 @@ pub(crate) fn handle_callback_file_close_completion(
         );
         return;
     }
-    if !relative_path.is_empty()
-        && let Ok(mut paths_by_file_id) = context.paths_by_file_id.lock()
-    {
-        paths_by_file_id.insert(callback_info_ref.FileId, relative_path.clone());
+    if let Ok(mut paths_by_file_id) = context.paths_by_file_id.lock() {
+        paths_by_file_id.remove(&callback_info_ref.FileId);
     }
     tracing::debug!(
         "close-completion: relative_path={} normalized_path={} sync_root={:?}",
@@ -2443,7 +2487,7 @@ mod tests {
             hydrated_once_paths: Mutex::new(HashSet::new()),
             paths_by_file_id: Mutex::new(HashMap::new()),
             fetch_cancellations: Mutex::new(HashMap::new()),
-            fetch_execution_gate: FetchExecutionGate::default(),
+            fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
             upload_worker: Arc::new(UploadWorkerContext {
                 sync_root: sync_root.clone(),
                 provider_instance_id: uuid::Uuid::new_v4(),
@@ -2603,7 +2647,7 @@ mod tests {
 
     #[test]
     fn fetch_execution_gate_allows_random_access_after_grace_period() {
-        let gate = FetchExecutionGate::default();
+        let gate = Arc::new(FetchExecutionGate::default());
         let frontier = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
         let _guard = gate.acquire_for_file_range(42, 262_144, || {
