@@ -1,3 +1,4 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   clearAdminMediaCache,
   getClusterNodes,
@@ -9,14 +10,6 @@ import {
   getRecentLogs,
   getReplicationPlan,
   triggerReplicationRepair,
-  type AdminMediaCacheClearResponse,
-  type ClusterSummary,
-  type LogsResponse,
-  type NodeDescriptor,
-  type RendezvousConfigView,
-  type ReplicationPlan,
-  type ServerHealthResponse,
-  type StorageStatsCurrentResponse,
   type StorageStatsSample
 } from "@ironmesh/api";
 import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
@@ -38,7 +31,7 @@ import {
 } from "@mantine/core";
 import { JsonBlock, StatCard } from "@ironmesh/ui";
 import { useDisclosure } from "@mantine/hooks";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
@@ -59,106 +52,150 @@ const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
 ];
 
 export function DashboardPage() {
+  const queryClient = useQueryClient();
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
-  const [clusterSummary, setClusterSummary] = useState<ClusterSummary | null>(null);
-  const [nodes, setNodes] = useState<NodeDescriptor[]>([]);
-  const [replicationPlan, setReplicationPlan] = useState<ReplicationPlan | null>(null);
-  const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
-  const [logs, setLogs] = useState<LogsResponse | null>(null);
-  const [backendHealth, setBackendHealth] = useState<ServerHealthResponse | null>(null);
-  const [storageStats, setStorageStats] = useState<StorageStatsCurrentResponse | null>(null);
-  const [storageHistory, setStorageHistory] = useState<StorageStatsSample[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [repairResult, setRepairResult] = useState<Record<string, unknown> | null>(null);
-  const [repairPending, setRepairPending] = useState(false);
-  const [mediaCacheClearResult, setMediaCacheClearResult] =
-    useState<AdminMediaCacheClearResponse | null>(null);
-  const [mediaCacheClearPending, setMediaCacheClearPending] = useState(false);
   const [storageHistoryRange, setStorageHistoryRange] = useState<StorageHistoryRangeKey>("30d");
   const [clearMediaCacheOpened, clearMediaCacheDisclosure] = useDisclosure(false);
+  const normalizedAdminTokenOverride = adminTokenOverride.trim();
   const hasExplicitAdminAccess =
-    Boolean(adminTokenOverride.trim()) || Boolean(sessionStatus?.authenticated);
+    Boolean(normalizedAdminTokenOverride) || Boolean(sessionStatus?.authenticated);
   const canRunAdminMaintenance =
     !sessionLoading && (!sessionStatus?.login_required || hasExplicitAdminAccess);
   const canInspectCluster = canRunAdminMaintenance;
   const canInspectRendezvous = canRunAdminMaintenance;
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [recentLogs, health, currentStorageStats, storageStatsHistory] = await Promise.all([
-        getRecentLogs(120),
-        getServerHealth(),
-        getStorageStatsCurrent(),
-        getStorageStatsHistory(storageHistoryRequestForRange(storageHistoryRange))
-      ]);
-      setLogs(recentLogs);
-      setBackendHealth(health);
-      setStorageStats(currentStorageStats);
-      setStorageHistory(storageStatsHistory);
-      if (canInspectCluster) {
-        const [summary, nodeList, plan] = await Promise.all([
-          getClusterSummary(adminTokenOverride),
-          getClusterNodes(adminTokenOverride),
-          getReplicationPlan(adminTokenOverride)
-        ]);
-        setClusterSummary(summary);
-        setNodes(nodeList);
-        setReplicationPlan(plan);
-      } else {
-        setClusterSummary(null);
-        setNodes([]);
-        setReplicationPlan(null);
-      }
-      if (canInspectRendezvous) {
-        try {
-          setRendezvousConfig(await getRendezvousConfig(adminTokenOverride));
-        } catch {
-          setRendezvousConfig(null);
-        }
-      } else {
-        setRendezvousConfig(null);
-      }
-    } catch (refreshError) {
-      setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
-    } finally {
-      setLoading(false);
-    }
-  }, [adminTokenOverride, canInspectCluster, canInspectRendezvous, storageHistoryRange]);
+  const logsQuery = useQuery({
+    queryKey: ["dashboard", "logs", 120],
+    queryFn: () => getRecentLogs(120)
+  });
+  const backendHealthQuery = useQuery({
+    queryKey: ["dashboard", "health"],
+    queryFn: () => getServerHealth()
+  });
+  const storageStatsQuery = useQuery({
+    queryKey: ["dashboard", "storage-stats-current"],
+    queryFn: () => getStorageStatsCurrent()
+  });
+  const storageHistoryQuery = useQuery({
+    queryKey: ["dashboard", "storage-stats-history", storageHistoryRange],
+    queryFn: () => getStorageStatsHistory(storageHistoryRequestForRange(storageHistoryRange))
+  });
+  const clusterSummaryQuery = useQuery({
+    queryKey: ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
+    queryFn: () =>
+      getClusterSummary(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster
+  });
+  const nodesQuery = useQuery({
+    queryKey: ["dashboard", "cluster-nodes", normalizedAdminTokenOverride],
+    queryFn: () => getClusterNodes(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster
+  });
+  const replicationPlanQuery = useQuery({
+    queryKey: ["dashboard", "replication-plan", normalizedAdminTokenOverride],
+    queryFn: () => getReplicationPlan(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster
+  });
+  const rendezvousConfigQuery = useQuery({
+    queryKey: ["dashboard", "rendezvous-config", normalizedAdminTokenOverride],
+    queryFn: () => getRendezvousConfig(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectRendezvous
+  });
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  const refresh = useCallback(async () => {
+    const queryKeys: ReadonlyArray<readonly unknown[]> = [
+      ["dashboard", "logs", 120],
+      ["dashboard", "health"],
+      ["dashboard", "storage-stats-current"],
+      ["dashboard", "storage-stats-history", storageHistoryRange],
+      ...(canInspectCluster
+        ? [
+            ["dashboard", "cluster-summary", normalizedAdminTokenOverride],
+            ["dashboard", "cluster-nodes", normalizedAdminTokenOverride],
+            ["dashboard", "replication-plan", normalizedAdminTokenOverride]
+          ]
+        : []),
+      ...(canInspectRendezvous
+        ? [["dashboard", "rendezvous-config", normalizedAdminTokenOverride]]
+        : [])
+    ];
+
+    await Promise.all(
+      queryKeys.map((queryKey) =>
+        queryClient.refetchQueries({
+          queryKey,
+          exact: true
+        })
+      )
+    );
+  }, [
+    canInspectCluster,
+    canInspectRendezvous,
+    normalizedAdminTokenOverride,
+    queryClient,
+    storageHistoryRange
+  ]);
+
+  const repairMutation = useMutation({
+    mutationFn: () => triggerReplicationRepair(),
+    onSuccess: async () => {
+      await refresh();
+    }
+  });
+
+  const mediaCacheClearMutation = useMutation({
+    mutationFn: () => clearAdminMediaCache(normalizedAdminTokenOverride || undefined),
+    onSuccess: async () => {
+      clearMediaCacheDisclosure.close();
+      await refresh();
+    }
+  });
+
+  const clusterSummary =
+    canInspectCluster ? clusterSummaryQuery.data ?? null : null;
+  const nodes = canInspectCluster ? nodesQuery.data ?? [] : [];
+  const replicationPlan =
+    canInspectCluster ? replicationPlanQuery.data ?? null : null;
+  const rendezvousConfig =
+    canInspectRendezvous && !rendezvousConfigQuery.isError
+      ? rendezvousConfigQuery.data ?? null
+      : null;
+  const logs = logsQuery.data ?? null;
+  const backendHealth = backendHealthQuery.data ?? null;
+  const storageStats = storageStatsQuery.data ?? null;
+  const storageHistory = storageHistoryQuery.data ?? [];
+  const repairResult = repairMutation.data ?? null;
+  const mediaCacheClearResult = mediaCacheClearMutation.data ?? null;
+  const repairPending = repairMutation.isPending;
+  const mediaCacheClearPending = mediaCacheClearMutation.isPending;
+  const loading =
+    logsQuery.isFetching ||
+    backendHealthQuery.isFetching ||
+    storageStatsQuery.isFetching ||
+    storageHistoryQuery.isFetching ||
+    (canInspectCluster &&
+      (clusterSummaryQuery.isFetching ||
+        nodesQuery.isFetching ||
+        replicationPlanQuery.isFetching)) ||
+    (canInspectRendezvous && rendezvousConfigQuery.isFetching);
+  const error = firstErrorMessage([
+    repairMutation.error,
+    mediaCacheClearMutation.error,
+    logsQuery.error,
+    backendHealthQuery.error,
+    storageStatsQuery.error,
+    storageHistoryQuery.error,
+    canInspectCluster ? clusterSummaryQuery.error : null,
+    canInspectCluster ? nodesQuery.error : null,
+    canInspectCluster ? replicationPlanQuery.error : null
+  ]);
 
   async function runRepair() {
-    setRepairPending(true);
-    setError(null);
-    try {
-      const payload = await triggerReplicationRepair();
-      setRepairResult(payload);
-      await refresh();
-    } catch (repairError) {
-      setError(repairError instanceof Error ? repairError.message : String(repairError));
-    } finally {
-      setRepairPending(false);
-    }
+    await repairMutation.mutateAsync();
   }
 
   async function confirmMediaCacheClear() {
-    setMediaCacheClearPending(true);
-    setError(null);
-    try {
-      const payload = await clearAdminMediaCache(adminTokenOverride);
-      setMediaCacheClearResult(payload);
-      clearMediaCacheDisclosure.close();
-      await refresh();
-    } catch (clearError) {
-      setError(clearError instanceof Error ? clearError.message : String(clearError));
-    } finally {
-      setMediaCacheClearPending(false);
-    }
+    await mediaCacheClearMutation.mutateAsync();
   }
 
   const localNode = clusterSummary
@@ -696,6 +733,16 @@ function formatFullVersion(version: string | null | undefined, revision: string 
     return `${version} (${revision})`;
   }
   return version ?? revision ?? "unknown";
+}
+
+function firstErrorMessage(errors: Array<unknown>): string | null {
+  for (const error of errors) {
+    if (!error) {
+      continue;
+    }
+    return error instanceof Error ? error.message : String(error);
+  }
+  return null;
 }
 
 function StorageStatsSparkline({ samples }: { samples: StorageStatsSample[] }) {
