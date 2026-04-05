@@ -619,17 +619,62 @@ impl MetadataStore for TursoMetadataStore {
         Ok(Some(sample))
     }
 
-    async fn list_storage_stats_history(&self, limit: usize) -> Result<Vec<StorageStatsSample>> {
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT sample_json
-                 FROM storage_stats_history
-                 ORDER BY collected_at_unix DESC, rowid DESC
-                 LIMIT ?1",
-                (i64::try_from(limit).context("storage stats history limit overflow")?,),
-            )
-            .await?;
+    async fn list_storage_stats_history(
+        &self,
+        limit: Option<usize>,
+        collected_since_unix: Option<u64>,
+    ) -> Result<Vec<StorageStatsSample>> {
+        let mut rows = match (collected_since_unix, limit) {
+            (Some(collected_since_unix), Some(limit)) => {
+                self.connection
+                    .query(
+                        "SELECT sample_json
+                         FROM storage_stats_history
+                         WHERE collected_at_unix >= ?1
+                         ORDER BY collected_at_unix DESC, rowid DESC
+                         LIMIT ?2",
+                        (
+                            i64::try_from(collected_since_unix)
+                                .context("storage stats since timestamp overflow")?,
+                            i64::try_from(limit).context("storage stats history limit overflow")?,
+                        ),
+                    )
+                    .await?
+            }
+            (Some(collected_since_unix), None) => {
+                self.connection
+                    .query(
+                        "SELECT sample_json
+                         FROM storage_stats_history
+                         WHERE collected_at_unix >= ?1
+                         ORDER BY collected_at_unix DESC, rowid DESC",
+                        (i64::try_from(collected_since_unix)
+                            .context("storage stats since timestamp overflow")?,),
+                    )
+                    .await?
+            }
+            (None, Some(limit)) => {
+                self.connection
+                    .query(
+                        "SELECT sample_json
+                         FROM storage_stats_history
+                         ORDER BY collected_at_unix DESC, rowid DESC
+                         LIMIT ?1",
+                        (i64::try_from(limit).context("storage stats history limit overflow")?,),
+                    )
+                    .await?
+            }
+            (None, None) => {
+                self.connection
+                    .query(
+                        "SELECT sample_json
+                         FROM storage_stats_history
+                         ORDER BY collected_at_unix DESC, rowid DESC",
+                        (),
+                    )
+                    .await?
+            }
+        };
         let mut samples = Vec::new();
         while let Some(row) = rows.next().await? {
             let payload = row_blob(&row, 0, "storage_stats_history.sample_json")?;

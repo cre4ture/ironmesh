@@ -102,6 +102,8 @@ const RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 5;
 const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
 const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
 const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
+const MAX_STORAGE_STATS_HISTORY_LIMIT: usize = 250_000;
+const MAX_STORAGE_STATS_HISTORY_POINTS: usize = 4_096;
 const UPLOAD_SESSION_PERSIST_INACTIVITY_SECS: u64 = 60;
 const DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS: u64 = 30;
 const SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS: u128 = 250;
@@ -138,6 +140,7 @@ struct ServerState {
     cluster_id: ClusterId,
     node_id: NodeId,
     local_edge_mode: bool,
+    storage_stats_history_retention_secs: u64,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -1401,6 +1404,24 @@ fn env_flag_is_truthy(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn env_u64_or(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            _ => {
+                warn!(
+                    env_var = name,
+                    value = %value,
+                    fallback = default,
+                    "invalid unsigned integer environment override; using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 fn write_tls_material_metadata_sidecar(
@@ -3377,12 +3398,23 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     if map_perf_logging_enabled {
         info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
     }
+    let storage_stats_history_retention_secs = env_u64_or(
+        "IRONMESH_STORAGE_STATS_HISTORY_RETENTION_SECS",
+        STORAGE_STATS_HISTORY_RETENTION_SECS,
+    );
+    if storage_stats_history_retention_secs != STORAGE_STATS_HISTORY_RETENTION_SECS {
+        info!(
+            retention_secs = storage_stats_history_retention_secs,
+            "storage stats history retention override enabled"
+        );
+    }
 
     let state = ServerState {
         data_dir: config.data_dir.clone(),
         cluster_id: config.cluster_id,
         node_id: config.node_id,
         local_edge_mode: config.mode == ServerNodeMode::LocalEdge,
+        storage_stats_history_retention_secs,
         map_perf_logging_enabled,
         map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
         mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -4075,7 +4107,7 @@ async fn refresh_storage_stats_once(state: &ServerState) {
                 } else {
                     let retention_cutoff = sample
                         .collected_at_unix
-                        .saturating_sub(STORAGE_STATS_HISTORY_RETENTION_SECS);
+                        .saturating_sub(state.storage_stats_history_retention_secs);
                     storage_stats_collector
                         .prune_storage_stats_history_before(retention_cutoff)
                         .await
@@ -8284,6 +8316,8 @@ struct ApprovalQuery {
 #[derive(Debug, Deserialize)]
 struct StorageStatsHistoryQuery {
     limit: Option<usize>,
+    since_unix: Option<u64>,
+    max_points: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -11532,19 +11566,87 @@ async fn storage_stats_history(
     State(state): State<ServerState>,
     Query(query): Query<StorageStatsHistoryQuery>,
 ) -> impl IntoResponse {
-    let limit = query.limit.unwrap_or(120).clamp(1, 2000);
+    let limit = query
+        .limit
+        .map(|limit| limit.clamp(1, MAX_STORAGE_STATS_HISTORY_LIMIT))
+        .or_else(|| {
+            if query.since_unix.is_none() && query.max_points.is_none() {
+                Some(120)
+            } else {
+                None
+            }
+        });
+    let max_points = query
+        .max_points
+        .map(|max_points| max_points.clamp(2, MAX_STORAGE_STATS_HISTORY_POINTS));
     let samples = {
         let store = read_store(&state, "storage_stats.load_history").await;
-        match store.list_storage_stats_history(limit).await {
+        match store
+            .list_storage_stats_history(limit, query.since_unix)
+            .await
+        {
             Ok(samples) => samples,
             Err(err) => {
-                tracing::error!(error = %err, limit, "failed loading storage stats history");
+                tracing::error!(
+                    error = %err,
+                    ?limit,
+                    since_unix = query.since_unix,
+                    ?max_points,
+                    "failed loading storage stats history"
+                );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
     };
 
+    let samples = downsample_storage_stats_samples(samples, max_points);
+
     (StatusCode::OK, Json(samples)).into_response()
+}
+
+fn downsample_storage_stats_samples(
+    samples: Vec<StorageStatsSample>,
+    max_points: Option<usize>,
+) -> Vec<StorageStatsSample> {
+    let Some(max_points) = max_points else {
+        return samples;
+    };
+    if samples.len() <= max_points || max_points < 2 {
+        return samples;
+    }
+
+    let chronological = samples.into_iter().rev().collect::<Vec<_>>();
+    let last_index = chronological.len() - 1;
+    let mut selected = Vec::with_capacity(max_points);
+    let mut previous_index = None;
+
+    for step in 0..max_points {
+        let position = step as f64 / (max_points - 1) as f64;
+        let index = (position * last_index as f64).round() as usize;
+        if Some(index) == previous_index {
+            continue;
+        }
+        selected.push(chronological[index].clone());
+        previous_index = Some(index);
+    }
+
+    if selected.first().map(|sample| sample.collected_at_unix)
+        != chronological.first().map(|sample| sample.collected_at_unix)
+    {
+        if let Some(first) = chronological.first() {
+            selected.insert(0, first.clone());
+        }
+    }
+    if selected.last().map(|sample| sample.collected_at_unix)
+        != chronological.last().map(|sample| sample.collected_at_unix)
+    {
+        if let Some(last) = chronological.last() {
+            selected.push(last.clone());
+        }
+    }
+
+    selected.reverse();
+    selected
 }
 
 async fn local_public_enrollment_issuer_url(state: &ServerState) -> Option<String> {

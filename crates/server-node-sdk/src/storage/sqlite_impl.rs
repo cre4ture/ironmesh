@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use common::NodeId;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
@@ -525,16 +526,37 @@ impl MetadataStore for SqliteMetadataStore {
         }
     }
 
-    async fn list_storage_stats_history(&self, limit: usize) -> Result<Vec<StorageStatsSample>> {
+    async fn list_storage_stats_history(
+        &self,
+        limit: Option<usize>,
+        collected_since_unix: Option<u64>,
+    ) -> Result<Vec<StorageStatsSample>> {
         let db = self.metadata_conn()?;
-        let limit = i64::try_from(limit).context("storage stats history limit overflow")?;
-        let mut stmt = db.prepare(
+        let mut query = String::from(
             "SELECT sample_json
-             FROM storage_stats_history
-             ORDER BY collected_at_unix DESC, rowid DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |row| row.get::<_, Vec<u8>>(0))?;
+             FROM storage_stats_history",
+        );
+        let mut query_params = Vec::<Value>::new();
+        if let Some(collected_since_unix) = collected_since_unix {
+            query.push_str("\n             WHERE collected_at_unix >= ?1");
+            query_params.push(Value::Integer(
+                u64_to_i64(collected_since_unix)
+                    .context("storage stats since timestamp overflow")?,
+            ));
+        }
+        query.push_str("\n             ORDER BY collected_at_unix DESC, rowid DESC");
+        if let Some(limit) = limit {
+            let placeholder_index = query_params.len() + 1;
+            query.push_str(&format!("\n             LIMIT ?{placeholder_index}"));
+            query_params.push(Value::Integer(
+                i64::try_from(limit).context("storage stats history limit overflow")?,
+            ));
+        }
+
+        let mut stmt = db.prepare(&query)?;
+        let rows = stmt.query_map(params_from_iter(query_params), |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
         let mut samples = Vec::new();
         for row in rows {
             let payload = row?;

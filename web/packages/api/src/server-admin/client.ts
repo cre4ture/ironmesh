@@ -169,8 +169,26 @@ export async function getStorageStatsCurrent(): Promise<StorageStatsCurrentRespo
   });
 }
 
-export async function getStorageStatsHistory(limit = 120): Promise<StorageStatsSample[]> {
-  return fetchJson<StorageStatsSample[]>(`/storage/stats/history?limit=${Math.max(1, limit)}`, {
+export async function getStorageStatsHistory(options?: {
+  limit?: number;
+  sinceUnix?: number;
+  maxPoints?: number;
+}): Promise<StorageStatsSample[]> {
+  const query = new URLSearchParams();
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.trunc(options.limit))));
+  }
+  if (typeof options?.sinceUnix === "number" && Number.isFinite(options.sinceUnix)) {
+    query.set("since_unix", String(Math.max(0, Math.trunc(options.sinceUnix))));
+  }
+  if (typeof options?.maxPoints === "number" && Number.isFinite(options.maxPoints)) {
+    query.set("max_points", String(Math.max(2, Math.trunc(options.maxPoints))));
+  }
+  if (!query.has("limit") && !query.has("since_unix") && !query.has("max_points")) {
+    query.set("limit", "120");
+  }
+
+  return fetchJson<StorageStatsSample[]>(`/storage/stats/history?${query.toString()}`, {
     credentials: "same-origin",
     cache: "no-store"
   });

@@ -42,6 +42,22 @@ import { useCallback, useEffect, useState } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
+type StorageHistoryRangeKey = "24h" | "7d" | "30d" | "90d" | "1y" | "all";
+
+const STORAGE_HISTORY_MAX_POINTS = 360;
+const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
+  key: StorageHistoryRangeKey;
+  label: string;
+  windowSecs: number | null;
+}> = [
+  { key: "24h", label: "24h", windowSecs: 24 * 60 * 60 },
+  { key: "7d", label: "7d", windowSecs: 7 * 24 * 60 * 60 },
+  { key: "30d", label: "30d", windowSecs: 30 * 24 * 60 * 60 },
+  { key: "90d", label: "90d", windowSecs: 90 * 24 * 60 * 60 },
+  { key: "1y", label: "1y", windowSecs: 365 * 24 * 60 * 60 },
+  { key: "all", label: "All", windowSecs: null }
+];
+
 export function DashboardPage() {
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
   const [clusterSummary, setClusterSummary] = useState<ClusterSummary | null>(null);
@@ -59,6 +75,7 @@ export function DashboardPage() {
   const [mediaCacheClearResult, setMediaCacheClearResult] =
     useState<AdminMediaCacheClearResponse | null>(null);
   const [mediaCacheClearPending, setMediaCacheClearPending] = useState(false);
+  const [storageHistoryRange, setStorageHistoryRange] = useState<StorageHistoryRangeKey>("30d");
   const [clearMediaCacheOpened, clearMediaCacheDisclosure] = useDisclosure(false);
   const hasExplicitAdminAccess =
     Boolean(adminTokenOverride.trim()) || Boolean(sessionStatus?.authenticated);
@@ -75,7 +92,7 @@ export function DashboardPage() {
         getRecentLogs(120),
         getServerHealth(),
         getStorageStatsCurrent(),
-        getStorageStatsHistory(120)
+        getStorageStatsHistory(storageHistoryRequestForRange(storageHistoryRange))
       ]);
       setLogs(recentLogs);
       setBackendHealth(health);
@@ -109,7 +126,7 @@ export function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, [adminTokenOverride, canInspectCluster, canInspectRendezvous]);
+  }, [adminTokenOverride, canInspectCluster, canInspectRendezvous, storageHistoryRange]);
 
   useEffect(() => {
     void refresh();
@@ -157,6 +174,9 @@ export function DashboardPage() {
       latestStorageSample.media_cache_bytes
     : null;
   const storageHistoryChronological = [...storageHistory].reverse();
+  const selectedStorageHistoryRange =
+    STORAGE_HISTORY_RANGE_OPTIONS.find((option) => option.key === storageHistoryRange) ??
+    STORAGE_HISTORY_RANGE_OPTIONS[0];
 
   return (
     <Stack gap="lg">
@@ -373,17 +393,37 @@ export function DashboardPage() {
                     Background collection keeps these numbers off the request path. The chart shows chunk-store growth,
                     metadata footprint, and the deduplicated size of the latest snapshot over time.
                   </Text>
+                  <Text size="sm" c="dimmed">
+                    {describeStorageHistoryWindow(
+                      selectedStorageHistoryRange.label,
+                      storageHistoryChronological
+                    )}
+                  </Text>
                 </Stack>
-                <Group gap="xs">
-                  <Badge variant="light" color={storageStats?.collecting ? "blue" : "gray"}>
-                    {storageStats?.collecting ? "collecting" : "idle"}
-                  </Badge>
-                  <Badge variant="light">
-                    {storageStats?.last_success_unix
-                      ? `updated ${formatUnixTs(storageStats.last_success_unix)}`
-                      : "no sample yet"}
-                  </Badge>
-                </Group>
+                <Stack gap="xs" align="flex-end">
+                  <Group gap="xs">
+                    <Badge variant="light" color={storageStats?.collecting ? "blue" : "gray"}>
+                      {storageStats?.collecting ? "collecting" : "idle"}
+                    </Badge>
+                    <Badge variant="light">
+                      {storageStats?.last_success_unix
+                        ? `updated ${formatUnixTs(storageStats.last_success_unix)}`
+                        : "no sample yet"}
+                    </Badge>
+                  </Group>
+                  <Group gap={6}>
+                    {STORAGE_HISTORY_RANGE_OPTIONS.map((option) => (
+                      <Button
+                        key={option.key}
+                        size="xs"
+                        variant={option.key === storageHistoryRange ? "filled" : "default"}
+                        onClick={() => setStorageHistoryRange(option.key)}
+                      >
+                        {option.label}
+                      </Button>
+                    ))}
+                  </Group>
+                </Stack>
               </Group>
               {storageStats?.last_error ? (
                 <Alert color="yellow" variant="light" title="Latest storage stats refresh failed">
@@ -853,17 +893,58 @@ function buildXAxisTicks(
   return indexes.map((index) => ({
     index,
     isLast: index === samples.length - 1,
-    label: formatChartTimestamp(samples[index]?.collected_at_unix ?? null, timeSpanSeconds >= 86_400),
+    label: formatChartTimestamp(samples[index]?.collected_at_unix ?? null, timeSpanSeconds),
     x: projectX(index, samples.length, width, padding)
   }));
 }
 
-function formatChartTimestamp(unixTs: number | null | undefined, includeDate: boolean): string {
+function formatChartTimestamp(unixTs: number | null | undefined, timeSpanSeconds: number): string {
   if (!unixTs || !Number.isFinite(unixTs) || unixTs <= 0) {
     return "unknown";
   }
   const iso = new Date(unixTs * 1000).toISOString();
-  return includeDate ? iso.slice(5, 16).replace("T", " ") : iso.slice(11, 16);
+  if (timeSpanSeconds >= 365 * 24 * 60 * 60) {
+    return iso.slice(0, 10);
+  }
+  if (timeSpanSeconds >= 30 * 24 * 60 * 60) {
+    return iso.slice(5, 10);
+  }
+  if (timeSpanSeconds >= 86_400) {
+    return iso.slice(5, 16).replace("T", " ");
+  }
+  return iso.slice(11, 16);
+}
+
+function storageHistoryRequestForRange(rangeKey: StorageHistoryRangeKey): {
+  sinceUnix?: number;
+  maxPoints: number;
+} {
+  const selectedRange =
+    STORAGE_HISTORY_RANGE_OPTIONS.find((option) => option.key === rangeKey) ??
+    STORAGE_HISTORY_RANGE_OPTIONS[0];
+
+  return {
+    sinceUnix:
+      selectedRange.windowSecs === null
+        ? undefined
+        : Math.max(0, Math.floor(Date.now() / 1000) - selectedRange.windowSecs),
+    maxPoints: STORAGE_HISTORY_MAX_POINTS
+  };
+}
+
+function describeStorageHistoryWindow(
+  requestedLabel: string,
+  samples: StorageStatsSample[]
+): string {
+  if (samples.length === 0) {
+    return `Showing ${requestedLabel} view. No storage stats samples have been collected yet.`;
+  }
+
+  const oldestSample = samples[0];
+  const newestSample = samples[samples.length - 1];
+  return `Showing ${requestedLabel} view with ${samples.length} sampled points from ${formatUnixTs(
+    oldestSample.collected_at_unix
+  )} to ${formatUnixTs(newestSample.collected_at_unix)}.`;
 }
 
 function projectX(

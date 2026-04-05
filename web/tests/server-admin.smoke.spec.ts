@@ -18,6 +18,8 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Collected at (UTC)" })).toBeVisible();
   await expect(page.locator('svg[aria-label="Storage stats history chart"] text').filter({ hasText: "Storage used (bytes)" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "30d", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "All", exact: true })).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
   await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
   await expect(page.getByText("Snapshot logical size:")).toBeVisible();
@@ -628,6 +630,8 @@ async function installServerAdminMocks(
     }
 
     if (pathname === "/storage/stats/history" && method === "GET") {
+      expect(searchParams.get("max_points")).toBe("360");
+      expect(searchParams.get("since_unix")).not.toBeNull();
       return json(route, [
         {
           collected_at_unix: 1_900_000_120,

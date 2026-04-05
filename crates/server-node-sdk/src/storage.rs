@@ -736,7 +736,11 @@ trait MetadataStore: Send + Sync {
     async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()>;
     async fn list_locally_owned_manifests(&self) -> Result<Vec<String>>;
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>>;
-    async fn list_storage_stats_history(&self, limit: usize) -> Result<Vec<StorageStatsSample>>;
+    async fn list_storage_stats_history(
+        &self,
+        limit: Option<usize>,
+        collected_since_unix: Option<u64>,
+    ) -> Result<Vec<StorageStatsSample>>;
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()>;
     async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()>;
     async fn has_version_index(&self, object_id: &str) -> Result<bool>;
@@ -4102,9 +4106,12 @@ impl PersistentStore {
 
     pub async fn list_storage_stats_history(
         &self,
-        limit: usize,
+        limit: Option<usize>,
+        collected_since_unix: Option<u64>,
     ) -> Result<Vec<StorageStatsSample>> {
-        self.metadata_store.list_storage_stats_history(limit).await
+        self.metadata_store
+            .list_storage_stats_history(limit, collected_since_unix)
+            .await
     }
 
     #[cfg(test)]
