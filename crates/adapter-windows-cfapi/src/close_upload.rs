@@ -280,29 +280,11 @@ fn process_debounced_close_upload(
     };
 
     if metadata.is_dir() {
-        tracing::info!(
-            "close-completion: {} is a directory, uploading directory metadata",
+        tracing::debug!(
+            "close-completion: skipping directory {}",
             relative_path
         );
-        let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
-        return match worker.uploader.upload_reader(
-            relative_path,
-            &mut cursor,
-            b"<DIR>".len() as u64,
-        ) {
-            Ok(_) => {
-                tracing::info!("cfapi uploaded directory: path={}", relative_path);
-                UploadAttemptOutcome::Settled
-            }
-            Err(err) => {
-                tracing::info!(
-                    "cfapi upload error (dir): path={} error={:#}",
-                    relative_path,
-                    err
-                );
-                UploadAttemptOutcome::Retry
-            }
-        };
+        return UploadAttemptOutcome::Settled;
     }
 
     let file = match std::fs::OpenOptions::new()

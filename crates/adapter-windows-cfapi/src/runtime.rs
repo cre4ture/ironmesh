@@ -2107,6 +2107,13 @@ pub(crate) fn handle_callback_file_close_completion(
         context.sync_root
     );
     let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
+    if full_path.is_dir() {
+        tracing::debug!(
+            "close-completion: skipping directory {}",
+            relative_path
+        );
+        return;
+    }
     match open_sync_path(&full_path, false) {
         Ok(file) => match cf_get_placeholder_standard_info_with_identity(&file) {
             Ok(info) if info.info().ModifiedDataSize == 0 => {
