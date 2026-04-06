@@ -1,4 +1,5 @@
 #![cfg(windows)]
+#![allow(unsafe_code)]
 
 use crate::helpers::normalize_path;
 use anyhow::{Context, Result, anyhow, bail};

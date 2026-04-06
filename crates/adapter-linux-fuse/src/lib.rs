@@ -460,6 +460,7 @@ pub mod runtime {
     }
 
     impl IronmeshFuseFs {
+        #[allow(unsafe_code)]
         pub fn from_action_plan(
             action_plan: &FuseActionPlan,
             hydrator: Box<dyn Hydrator>,

@@ -28,3 +28,6 @@ uuid = { workspace = true }
 # Prevent compilation on Windows targets
 [target.'cfg(windows)'.dependencies]
 # No dependencies; crate will not build
+
+[lints]
+workspace = true

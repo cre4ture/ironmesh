@@ -17,3 +17,6 @@ git-version.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winres.workspace = true
+
+[lints]
+workspace = true

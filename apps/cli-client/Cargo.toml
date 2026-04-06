@@ -26,3 +26,6 @@ assert_cmd.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winres.workspace = true
+
+[lints]
+workspace = true

@@ -471,6 +471,7 @@ fn throw_java_error(env: &mut JNIEnv, message: impl AsRef<str>) {
     let _ = env.throw_new("java/lang/RuntimeException", message.as_ref());
 }
 
+#[allow(unsafe_code)]
 fn optional_jstring(env: &mut JNIEnv, value: jstring) -> Result<Option<String>> {
     if value.is_null() {
         return Ok(None);
@@ -481,10 +482,12 @@ fn optional_jstring(env: &mut JNIEnv, value: jstring) -> Result<Option<String>> 
     Ok(Some(value))
 }
 
+#[allow(unsafe_code)]
 fn as_jbyte_slice(bytes: &[u8]) -> &[jbyte] {
     unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const jbyte, bytes.len()) }
 }
 
+#[allow(unsafe_code)]
 fn as_mut_jbyte_slice(bytes: &mut [u8]) -> &mut [jbyte] {
     unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut jbyte, bytes.len()) }
 }
@@ -732,6 +735,7 @@ fn parse_client_identity_json(
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_startWebUi(
     mut env: JNIEnv,
@@ -768,6 +772,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enrollWithBootstrap(
     mut env: JNIEnv,
@@ -812,6 +817,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enr
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_putObject(
     mut env: JNIEnv,
@@ -847,6 +853,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_put
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getObject(
     mut env: JNIEnv,
@@ -899,6 +906,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_storeIndex(
     mut env: JNIEnv,
@@ -946,6 +954,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamPutObject<
     'local,
@@ -983,6 +992,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_deleteObject(
     mut env: JNIEnv,
@@ -1014,6 +1024,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_del
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamObjectTo<
     'local,
@@ -1055,6 +1066,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamRelativeUrlTo<
     'local,
@@ -1101,6 +1113,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_runFolderSyncOnce(
     mut env: JNIEnv,
@@ -1157,6 +1170,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_startContinuousFolderSync(
     mut env: JNIEnv,
@@ -1219,6 +1233,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopContinuousFolderSync(
     mut env: JNIEnv,
@@ -1244,6 +1259,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopAllContinuousFolderSync(
     mut env: JNIEnv,
@@ -1267,6 +1283,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getContinuousFolderSyncStatus(
     mut env: JNIEnv,
@@ -1297,6 +1314,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 
 /// # Safety
 /// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_hasContinuousFolderSyncActive(
     _env: JNIEnv,

@@ -296,6 +296,7 @@ pub fn create_handle(
     Ok(Box::into_raw(Box::new(facade)) as *mut c_void)
 }
 
+#[allow(unsafe_code)]
 pub fn free_handle(handle: *mut c_void) {
     if handle.is_null() {
         return;
@@ -306,6 +307,7 @@ pub fn free_handle(handle: *mut c_void) {
     }
 }
 
+#[allow(unsafe_code)]
 fn list_json(
     handle: *mut c_void,
     prefix: Option<&str>,
@@ -317,27 +319,32 @@ fn list_json(
         .context("failed to serialize Apple list response")
 }
 
+#[allow(unsafe_code)]
 fn metadata_json(handle: *mut c_void, key: impl AsRef<str>) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
     serde_json::to_string(&app.metadata(key)?)
         .context("failed to serialize Apple metadata response")
 }
 
+#[allow(unsafe_code)]
 fn fetch_bytes(handle: *mut c_void, key: impl AsRef<str>) -> Result<Vec<u8>> {
     let app = unsafe { handle_to_app(handle)? };
     app.fetch(key)
 }
 
+#[allow(unsafe_code)]
 fn put_json(handle: *mut c_void, key: impl Into<String>, data: Vec<u8>) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
     serde_json::to_string(&app.put(key, data)?).context("failed to serialize Apple put response")
 }
 
+#[allow(unsafe_code)]
 fn delete_path(handle: *mut c_void, key: impl AsRef<str>) -> Result<()> {
     let app = unsafe { handle_to_app(handle)? };
     app.delete_path(key)
 }
 
+#[allow(unsafe_code)]
 fn move_path(
     handle: *mut c_void,
     from_path: impl Into<String>,
@@ -352,6 +359,7 @@ pub fn web_gui_html() -> String {
     web_ui_backend::assets::app_html()
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_create(
     connection_input: *const c_char,
@@ -376,6 +384,7 @@ pub extern "C" fn ironmesh_ios_facade_create(
     }
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_free(handle: *mut c_void) {
     free_handle(handle);
@@ -385,6 +394,7 @@ pub extern "C" fn ironmesh_ios_facade_free(handle: *mut c_void) {
 ///
 /// `value` must be a pointer previously returned by this library via
 /// `CString::into_raw`, and it must not be freed more than once.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ironmesh_ios_string_free(value: *mut c_char) {
     if value.is_null() {
@@ -396,6 +406,7 @@ pub unsafe extern "C" fn ironmesh_ios_string_free(value: *mut c_char) {
     }
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_bytes_free(value: IronmeshIosBytes) {
     if value.data.is_null() && value.len == 0 && value.capacity == 0 {
@@ -407,6 +418,7 @@ pub extern "C" fn ironmesh_ios_bytes_free(value: IronmeshIosBytes) {
     }
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_list_json(
     handle: *mut c_void,
@@ -425,6 +437,7 @@ pub extern "C" fn ironmesh_ios_facade_list_json(
     })
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_metadata_json(
     handle: *mut c_void,
@@ -439,6 +452,7 @@ pub extern "C" fn ironmesh_ios_facade_metadata_json(
     })
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_fetch_bytes(
     handle: *mut c_void,
@@ -454,6 +468,7 @@ pub extern "C" fn ironmesh_ios_facade_fetch_bytes(
     })
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_put_bytes(
     handle: *mut c_void,
@@ -472,6 +487,7 @@ pub extern "C" fn ironmesh_ios_facade_put_bytes(
     })
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_delete_path(
     handle: *mut c_void,
@@ -484,6 +500,7 @@ pub extern "C" fn ironmesh_ios_facade_delete_path(
     })
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_move_path(
     handle: *mut c_void,
@@ -510,6 +527,7 @@ fn build_runtime() -> Result<Runtime> {
         .context("failed to create iOS facade runtime")
 }
 
+#[allow(unsafe_code)]
 unsafe fn handle_to_app<'a>(handle: *mut c_void) -> Result<&'a IosStorageApp> {
     if handle.is_null() {
         bail!("iOS facade handle is null");
@@ -591,6 +609,7 @@ fn required_c_string(value: *const c_char, name: &str) -> Result<String> {
     value.ok_or_else(|| anyhow!("{name} pointer must not be null"))
 }
 
+#[allow(unsafe_code)]
 fn optional_c_string(value: *const c_char) -> Result<Option<String>> {
     if value.is_null() {
         return Ok(None);
@@ -609,6 +628,7 @@ fn optional_c_string(value: *const c_char) -> Result<Option<String>> {
     }
 }
 
+#[allow(unsafe_code)]
 fn raw_bytes_to_vec(data: *const u8, len: usize) -> Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
@@ -622,6 +642,7 @@ fn raw_bytes_to_vec(data: *const u8, len: usize) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+#[allow(unsafe_code)]
 fn write_error(out_error: *mut *mut c_char, error: anyhow::Error) {
     if out_error.is_null() {
         return;
@@ -634,6 +655,7 @@ fn write_error(out_error: *mut *mut c_char, error: anyhow::Error) {
     }
 }
 
+#[allow(unsafe_code)]
 fn clear_error(out_error: *mut *mut c_char) {
     if out_error.is_null() {
         return;
@@ -644,6 +666,7 @@ fn clear_error(out_error: *mut *mut c_char) {
     }
 }
 
+#[allow(unsafe_code)]
 fn clear_string_out(out_value: *mut *mut c_char) {
     if out_value.is_null() {
         return;
@@ -654,6 +677,7 @@ fn clear_string_out(out_value: *mut *mut c_char) {
     }
 }
 
+#[allow(unsafe_code)]
 fn clear_bytes_out(out_value: *mut IronmeshIosBytes) {
     if out_value.is_null() {
         return;
@@ -668,6 +692,7 @@ fn clear_bytes_out(out_value: *mut IronmeshIosBytes) {
     }
 }
 
+#[allow(unsafe_code)]
 fn write_string(out_value: *mut *mut c_char, value: String) -> Result<()> {
     if out_value.is_null() {
         bail!("output string pointer must not be null");
@@ -680,6 +705,7 @@ fn write_string(out_value: *mut *mut c_char, value: String) -> Result<()> {
     Ok(())
 }
 
+#[allow(unsafe_code)]
 fn write_bytes(out_value: *mut IronmeshIosBytes, bytes: Vec<u8>) -> Result<()> {
     if out_value.is_null() {
         bail!("output byte buffer pointer must not be null");
@@ -755,6 +781,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use axum::extract::{Path, State};

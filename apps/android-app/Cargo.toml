@@ -24,3 +24,6 @@ sync-core = { path = "../../crates/sync-core" }
 tokio.workspace = true
 tracing.workspace = true
 web-ui-backend = { path = "../../crates/web-ui-backend" }
+
+[lints]
+workspace = true

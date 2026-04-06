@@ -21,3 +21,6 @@ sqlite-vfs = "0.2.0"
 tokio.workspace = true
 tracing.workspace = true
 mime_guess = "2.0.5"
+
+[lints]
+workspace = true

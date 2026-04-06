@@ -48,3 +48,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 x509-parser = "0.16"
+
+[lints]
+workspace = true

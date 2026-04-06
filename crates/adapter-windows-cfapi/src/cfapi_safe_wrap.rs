@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use crate::helpers::{hresult_nonneg, utf16_path};
 use crate::runtime::{
     CallbackContext, handle_callback_cancel_fetch_data, handle_callback_fetch_data,

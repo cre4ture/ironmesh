@@ -43,3 +43,6 @@ walkdir = "2.3"
 # Prevent compilation on non-Windows targets
 [target.'cfg(not(windows))'.dependencies]
 # No dependencies; crate will not build
+
+[lints]
+workspace = true

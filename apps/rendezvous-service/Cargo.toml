@@ -40,3 +40,6 @@ server-node-sdk = { path = "../../crates/server-node-sdk" }
 
 [target.'cfg(windows)'.build-dependencies]
 winres.workspace = true
+
+[lints]
+workspace = true

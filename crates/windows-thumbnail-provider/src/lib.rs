@@ -1,4 +1,5 @@
 #![cfg(windows)]
+#![allow(unsafe_code)]
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -149,6 +150,7 @@ impl std::fmt::Display for ThumbnailProviderError {
 
 impl std::error::Error for ThumbnailProviderError {}
 
+#[allow(unsafe_code)]
 #[implement(IInitializeWithItem, IThumbnailProvider)]
 struct IronmeshThumbnailProvider {
     source_path: Mutex<Option<String>>,
@@ -162,6 +164,7 @@ impl IronmeshThumbnailProvider {
     }
 }
 
+#[allow(unsafe_code)]
 #[implement(IExplorerCommand)]
 struct IronmeshCancelHydrationCommand;
 
@@ -257,11 +260,13 @@ fn format_path_list(paths: &[PathBuf]) -> String {
         .join("|")
 }
 
+#[allow(unsafe_code)]
 fn duplicate_shell_text(value: &str) -> Result<PWSTR> {
     let utf16 = value.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     unsafe { SHStrDupW(PCWSTR::from_raw(utf16.as_ptr())) }
 }
 
+#[allow(unsafe_code)]
 #[allow(non_snake_case)]
 impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
     fn Initialize(&self, psi: Ref<'_, IShellItem>, _grfmode: u32) -> Result<()> {
@@ -280,6 +285,7 @@ impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
     }
 }
 
+#[allow(unsafe_code)]
 #[allow(non_snake_case)]
 impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
     fn GetThumbnail(
@@ -415,9 +421,11 @@ impl IExplorerCommand_Impl for IronmeshCancelHydrationCommand_Impl {
     }
 }
 
+#[allow(unsafe_code)]
 #[implement(IClassFactory)]
 struct IronmeshThumbnailProviderFactory;
 
+#[allow(unsafe_code)]
 #[allow(non_snake_case)]
 impl IClassFactory_Impl for IronmeshThumbnailProviderFactory_Impl {
     fn CreateInstance(
@@ -446,9 +454,11 @@ impl IClassFactory_Impl for IronmeshThumbnailProviderFactory_Impl {
     }
 }
 
+#[allow(unsafe_code)]
 #[implement(IClassFactory)]
 struct IronmeshCancelHydrationCommandFactory;
 
+#[allow(unsafe_code)]
 #[allow(non_snake_case)]
 impl IClassFactory_Impl for IronmeshCancelHydrationCommandFactory_Impl {
     fn CreateInstance(
@@ -477,6 +487,7 @@ impl IClassFactory_Impl for IronmeshCancelHydrationCommandFactory_Impl {
     }
 }
 
+#[allow(unsafe_code)]
 #[implement(IClassFactory)]
 struct UnsupportedHandlerFactory;
 
@@ -500,6 +511,7 @@ impl IClassFactory_Impl for UnsupportedHandlerFactory_Impl {
     }
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
 /// # Safety
@@ -537,6 +549,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     }
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
@@ -551,6 +564,7 @@ fn is_unsupported_handler_clsid(clsid: GUID) -> bool {
         || clsid == STATUS_UI_SOURCE_FACTORY_CLSID
 }
 
+#[allow(unsafe_code)]
 unsafe fn shell_item_path(item: &IShellItem) -> Option<String> {
     let value = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.ok()?;
     let result = pwstr_to_string(value);
@@ -560,6 +574,7 @@ unsafe fn shell_item_path(item: &IShellItem) -> Option<String> {
     result
 }
 
+#[allow(unsafe_code)]
 fn pwstr_to_string(value: PWSTR) -> Option<String> {
     if value.is_null() {
         return None;
@@ -567,6 +582,7 @@ fn pwstr_to_string(value: PWSTR) -> Option<String> {
     unsafe { value.to_string().ok() }
 }
 
+#[allow(unsafe_code)]
 fn selected_shell_item_paths(psiitemarray: Ref<'_, IShellItemArray>) -> Vec<String> {
     let Some(item_array) = psiitemarray.as_ref() else {
         return Vec::new();
@@ -1063,6 +1079,7 @@ fn resize_for_requested_size(image: DynamicImage, requested_size: u32) -> Dynami
     }
 }
 
+#[allow(unsafe_code)]
 fn create_bitmap_from_rgba_image(image: &RgbaImage) -> AnyhowResult<HBITMAP> {
     let pixels = rgba_pixels_to_bgra(image.as_raw());
     unsafe { create_bitmap_from_bgra_pixels(image.width(), image.height(), &pixels) }
@@ -1076,6 +1093,7 @@ fn rgba_pixels_to_bgra(rgba: &[u8]) -> Vec<u8> {
     bgra
 }
 
+#[allow(unsafe_code)]
 unsafe fn create_bitmap_from_bgra_pixels(
     width: u32,
     height: u32,

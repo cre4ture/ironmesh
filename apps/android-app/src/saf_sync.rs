@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use anyhow::{Context, Result};
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,

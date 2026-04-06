@@ -20,3 +20,6 @@ web-ui-backend = { path = "../../crates/web-ui-backend" }
 
 [dev-dependencies]
 axum.workspace = true
+
+[lints]
+workspace = true

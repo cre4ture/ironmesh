@@ -27,6 +27,9 @@ edition = "2024"
 license = "MIT"
 authors = ["ironmesh contributors"]
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [workspace.dependencies]
 anyhow = "1"
 assert_cmd = "2"
