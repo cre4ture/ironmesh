@@ -412,6 +412,7 @@ impl ChildGuard {
         Ok(())
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub async fn stop_without_cleanup(&mut self) -> Result<()> {
         if let Some(child) = self.child.as_mut() {
             child.kill().await.context("failed to kill child process")?;
@@ -426,6 +427,7 @@ impl ChildGuard {
         self._resource_guards.clear();
         Ok(())
     }
+
 }
 
 impl Drop for ChildGuard {
@@ -1266,6 +1268,7 @@ pub async fn stop_server(child: &mut ChildGuard) {
     child.stop().await.ok();
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub async fn stop_server_without_cleanup(child: &mut ChildGuard) {
     child.stop_without_cleanup().await.ok();
 }
