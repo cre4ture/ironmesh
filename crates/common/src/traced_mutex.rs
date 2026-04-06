@@ -179,3 +179,84 @@ impl<T> Drop for TracedMutexGuard<'_, T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn log_wait_without_owner_is_safe() {
+        let mutex = TracedMutex::new(
+            "test-mutex",
+            1_u32,
+            TracedMutexConfig::new(Duration::from_millis(10), Duration::ZERO, Duration::ZERO),
+        );
+
+        mutex.log_wait("probe", 25);
+    }
+
+    #[tokio::test]
+    async fn traced_mutex_tracks_owner_waits_and_mutations() {
+        let mutex = Arc::new(TracedMutex::new(
+            "test-mutex",
+            1_u32,
+            TracedMutexConfig::new(
+                Duration::from_millis(1),
+                Duration::ZERO,
+                Duration::from_millis(1),
+            ),
+        ));
+
+        assert_eq!(mutex.config.wait_log_every, Duration::from_secs(1));
+
+        let mut first_guard = mutex.lock("first").await;
+        assert_eq!(first_guard.waited_ms(), 0);
+        assert_eq!(*first_guard, 1);
+        *first_guard = 2;
+        assert_eq!(
+            mutex
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|owner| owner.operation),
+            Some("first")
+        );
+
+        let waiter_mutex = Arc::clone(&mutex);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let mut second_guard = waiter_mutex.lock("second").await;
+            *second_guard += 1;
+            let waited_ms = second_guard.waited_ms();
+            release_rx.await.unwrap();
+            waited_ms
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(first_guard);
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mutex
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|owner| owner.operation),
+            Some("second")
+        );
+
+        release_tx.send(()).unwrap();
+        let waited_ms = waiter.await.unwrap();
+        assert!(waited_ms >= 1);
+
+        assert!(mutex.owner.lock().unwrap().is_none());
+
+        let final_guard = mutex.lock("final").await;
+        assert_eq!(final_guard.waited_ms(), 0);
+        assert_eq!(*final_guard, 3);
+    }
+}
