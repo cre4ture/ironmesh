@@ -139,6 +139,7 @@ pub mod runtime {
         EACCES, EBADF, EEXIST, EINVAL, EIO, EISDIR, ENODATA, ENOENT, ENOTDIR, ENOTEMPTY, EPERM,
         ERANGE,
     };
+    use nix::unistd::{Gid, Uid};
     use std::collections::{BTreeMap, HashMap};
     use std::ffi::OsStr;
     use std::io::Cursor;
@@ -460,17 +461,14 @@ pub mod runtime {
     }
 
     impl IronmeshFuseFs {
-        #[allow(unsafe_code)]
         pub fn from_action_plan(
             action_plan: &FuseActionPlan,
             hydrator: Box<dyn Hydrator>,
             uploader: Box<dyn Uploader>,
             refresh_rx: Option<Receiver<FuseActionPlan>>,
         ) -> Self {
-            // Safe: libc getters have no preconditions.
-            let uid = unsafe { libc::geteuid() };
-            // Safe: libc getters have no preconditions.
-            let gid = unsafe { libc::getegid() };
+            let uid = Uid::effective().as_raw();
+            let gid = Gid::effective().as_raw();
 
             let mut fs = Self {
                 nodes: HashMap::new(),
