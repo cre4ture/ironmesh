@@ -1,0 +1,34 @@
+.ironmesh-header {
+    font-weight: 700;
+}
+
+.ironmesh-status-row {
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+
+.ironmesh-status-title {
+    font-size: 0.84em;
+    color: rgba(255, 255, 255, 0.72);
+}
+
+.ironmesh-status-value {
+    font-weight: 600;
+}
+
+.ironmesh-status-detail {
+    font-size: 0.88em;
+    color: rgba(255, 255, 255, 0.78);
+}
+
+.ironmesh-state-error .ironmesh-status-value {
+    color: #ffb4a8;
+}
+
+.ironmesh-state-warning .ironmesh-status-value {
+    color: #ffd37a;
+}
+
+.ironmesh-state-syncing .ironmesh-status-value {
+    color: #9fd0ff;
+}

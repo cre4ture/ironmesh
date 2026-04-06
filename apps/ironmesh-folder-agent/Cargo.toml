@@ -13,6 +13,8 @@ client-sdk = { path = "../../crates/client-sdk" }
 common = { path = "../../crates/common" }
 git-version.workspace = true
 reqwest.workspace = true
+serde.workspace = true
+tracing.workspace = true
 sync-agent-core = { path = "../../crates/sync-agent-core" }
 sync-core = { path = "../../crates/sync-core" }
 serde_json.workspace = true

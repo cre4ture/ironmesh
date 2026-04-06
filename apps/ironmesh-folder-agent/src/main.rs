@@ -1,3 +1,5 @@
+mod gnome;
+
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{ClientIdentityMaterial, ConnectionBootstrap, normalize_server_base_url};
@@ -52,6 +54,19 @@ struct Args {
     /// Start a local web UI (example: `--ui-bind 127.0.0.1:3030`).
     #[arg(long, global = true)]
     ui_bind: Option<String>,
+    /// Publish status for the GNOME Shell extension to the default runtime JSON file.
+    #[arg(long, default_value_t = false, global = true)]
+    publish_gnome_status: bool,
+    /// Override the JSON path used by the GNOME Shell extension.
+    #[arg(long, global = true)]
+    gnome_status_file: Option<PathBuf>,
+    /// How often to poll authenticated server endpoints for connection and replication status.
+    #[arg(
+        long,
+        default_value_t = gnome::default_remote_status_poll_interval_ms(),
+        global = true
+    )]
+    remote_status_poll_interval_ms: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,6 +81,11 @@ enum Command {
         /// Only print the number of files that would be removed.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+    },
+    /// Install or inspect the native GNOME Shell indicator integration.
+    Gnome {
+        #[command(subcommand)]
+        command: GnomeCommand,
     },
 }
 
@@ -90,6 +110,14 @@ enum ConflictCommand {
         #[arg(long, default_value_t = false)]
         delete_conflict_copies: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum GnomeCommand {
+    /// Copy the GNOME Shell extension into ~/.local/share/gnome-shell/extensions and try to enable it.
+    InstallExtension,
+    /// Print the JSON path consumed by the GNOME Shell extension.
+    PrintStatusPath,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -128,6 +156,32 @@ fn run_command(args: &Args, command: &Command) -> Result<()> {
             Ok(())
         }
         Command::Conflicts { command } => run_conflict_command(args, command),
+        Command::Gnome { command } => run_gnome_command(args, command),
+    }
+}
+
+fn run_gnome_command(args: &Args, command: &GnomeCommand) -> Result<()> {
+    match command {
+        GnomeCommand::InstallExtension => {
+            let outcome = gnome::install_extension(true)?;
+            println!(
+                "gnome: installed extension {} to {}",
+                gnome::GNOME_EXTENSION_UUID,
+                outcome.install_dir.display()
+            );
+            if let Some(note) = outcome.enable_note {
+                println!("gnome: {note}");
+            }
+            Ok(())
+        }
+        GnomeCommand::PrintStatusPath => {
+            let path = match args.gnome_status_file.as_ref() {
+                Some(path) => path.clone(),
+                None => gnome::default_status_file_path()?,
+            };
+            println!("{}", path.display());
+            Ok(())
+        }
     }
 }
 
@@ -238,15 +292,15 @@ fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
 
 fn run_agent(args: &Args) -> Result<()> {
     let target = resolve_startup_target(args)?;
-    run_folder_agent(&FolderAgentRuntimeOptions {
+    let client_identity_json =
+        read_optional_client_identity_json(args.client_identity_file.as_deref())?;
+    let runtime_options = FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
         local_tree_uri: None,
-        server_base_url: target.server_base_url,
-        client_bootstrap_json: target.client_bootstrap_json,
-        server_ca_pem: target.server_ca_pem,
-        client_identity_json: read_optional_client_identity_json(
-            args.client_identity_file.as_deref(),
-        )?,
+        server_base_url: target.server_base_url.clone(),
+        client_bootstrap_json: target.client_bootstrap_json.clone(),
+        server_ca_pem: target.server_ca_pem.clone(),
+        client_identity_json: client_identity_json.clone(),
         prefix: args.prefix.clone(),
         depth: args.depth,
         remote_refresh_interval_ms: args.remote_refresh_interval_ms,
@@ -254,7 +308,28 @@ fn run_agent(args: &Args) -> Result<()> {
         no_watch_local: args.no_watch_local,
         run_once: args.run_once,
         ui_bind: args.ui_bind.clone(),
-    })
+    };
+
+    if args.publish_gnome_status {
+        let status_file = match args.gnome_status_file.as_ref() {
+            Some(path) => path.clone(),
+            None => gnome::default_status_file_path()?,
+        };
+        let gnome_options = gnome::GnomeRunOptions {
+            profile_label: gnome::derive_profile_label(args.prefix.as_deref(), &args.root_dir),
+            root_dir: args.root_dir.clone(),
+            connection_target: target.connection_target,
+            server_base_url: target.server_base_url,
+            client_bootstrap_json: target.client_bootstrap_json,
+            server_ca_pem: target.server_ca_pem,
+            client_identity_json,
+            status_file,
+            remote_status_poll_interval_ms: args.remote_status_poll_interval_ms,
+        };
+        return gnome::run_with_gnome_status(&runtime_options, &gnome_options);
+    }
+
+    run_folder_agent(&runtime_options)
 }
 
 fn resolve_startup_target(args: &Args) -> Result<ResolvedStartupTarget> {

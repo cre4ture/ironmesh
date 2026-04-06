@@ -1,0 +1,7 @@
+{
+  "uuid": "ironmesh-status@ironmesh.io",
+  "name": "IronMesh Status",
+  "description": "Shows IronMesh connection, sync, and replication state directly in the GNOME top bar.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}
