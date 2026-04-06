@@ -427,7 +427,6 @@ impl ChildGuard {
         self._resource_guards.clear();
         Ok(())
     }
-
 }
 
 impl Drop for ChildGuard {
