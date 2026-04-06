@@ -180,7 +180,7 @@ pub fn cf_hydrate_placeholder_with_oplock(path: &Path) -> Result<()> {
         "cfapi hydrate-placeholder: opening protected oplock handle path={}",
         path.display()
     );
-    let result = with_cf_oplock_handle(
+    with_cf_oplock_handle(
         path,
         CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
         |handle| {
@@ -194,8 +194,7 @@ pub fn cf_hydrate_placeholder_with_oplock(path: &Path) -> Result<()> {
             );
             hresult_nonneg(hr, "CfHydratePlaceholder")
         },
-    );
-    result
+    )
 }
 
 pub fn cf_dehydrate_placeholder_with_oplock(path: &Path, relative_path: &str) -> Result<()> {

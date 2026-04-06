@@ -7,7 +7,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use uuid::Uuid;
 use windows_sys::Win32::{
-    Foundation::{ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_NOT_FOUND},
+    Foundation::{ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_INVALID_FUNCTION, ERROR_NOT_FOUND},
     Storage::CloudFilters::{
         CF_SYNC_ROOT_INFO_STANDARD, CF_SYNC_ROOT_STANDARD_INFO, CfGetSyncRootInfoByPath,
     },
@@ -170,9 +170,7 @@ fn try_get_sync_root_info(root_path: &Path) -> Result<Option<(String, Vec<u8>)>>
 
     if hr < 0 {
         let hr_u32 = hr as u32;
-        if hr_u32 == hresult_from_win32(ERROR_NOT_FOUND)
-            || hr_u32 == hresult_from_win32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT)
-        {
+        if is_unregistered_sync_root_hresult(hr_u32) {
             return Ok(None);
         }
         return Err(anyhow!(
@@ -222,6 +220,12 @@ fn hresult_from_win32(error: u32) -> u32 {
     }
 }
 
+fn is_unregistered_sync_root_hresult(hr_u32: u32) -> bool {
+    hr_u32 == hresult_from_win32(ERROR_NOT_FOUND)
+        || hr_u32 == hresult_from_win32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT)
+        || hr_u32 == hresult_from_win32(ERROR_INVALID_FUNCTION)
+}
+
 fn wide_c_string_to_string_lossy(buffer: &[u16]) -> String {
     let len = buffer
         .iter()
@@ -247,5 +251,12 @@ mod tests {
 
         assert_eq!(decoded, identity);
         assert_eq!(decoded.prefix, "docs/team");
+    }
+
+    #[test]
+    fn invalid_function_hresult_is_treated_as_unregistered_sync_root() {
+        assert!(is_unregistered_sync_root_hresult(hresult_from_win32(
+            ERROR_INVALID_FUNCTION,
+        )));
     }
 }

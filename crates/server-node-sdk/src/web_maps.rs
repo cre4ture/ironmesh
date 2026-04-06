@@ -77,7 +77,7 @@ pub(crate) async fn mbtiles_metadata(
 ) -> impl IntoResponse {
     let manifest_key = match validate_manifest_key(&query.manifest_key) {
         Ok(key) => key,
-        Err(response) => return response,
+        Err((status, message)) => return error_response(status, message),
     };
     let started = Instant::now();
 
@@ -121,7 +121,7 @@ pub(crate) async fn logical_file(
 ) -> impl IntoResponse {
     let manifest_key = match validate_manifest_key(&query.manifest_key) {
         Ok(key) => key,
-        Err(response) => return response,
+        Err((status, message)) => return error_response(status, message),
     };
     let started = Instant::now();
 
@@ -275,7 +275,7 @@ pub(crate) async fn xyz_tile(
 ) -> impl IntoResponse {
     let manifest_key = match validate_manifest_key(&query.manifest_key) {
         Ok(key) => key,
-        Err(response) => return response,
+        Err((status, message)) => return error_response(status, message),
     };
     let started = Instant::now();
 
@@ -325,7 +325,7 @@ pub(crate) async fn vector_tile(
 ) -> impl IntoResponse {
     let manifest_key = match validate_manifest_key(&query.manifest_key) {
         Ok(key) => key,
-        Err(response) => return response,
+        Err((status, message)) => return error_response(status, message),
     };
     let started = Instant::now();
 
@@ -496,16 +496,16 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
-fn validate_manifest_key(raw: &str) -> std::result::Result<String, Response> {
+fn validate_manifest_key(raw: &str) -> std::result::Result<String, (StatusCode, String)> {
     let manifest_key = raw.trim();
     if manifest_key.is_empty() {
-        return Err(error_response(
+        return Err((
             StatusCode::BAD_REQUEST,
-            "manifest_key must not be empty",
+            "manifest_key must not be empty".to_string(),
         ));
     }
     if !manifest_key.starts_with(MAP_MANIFEST_PREFIX) {
-        return Err(error_response(
+        return Err((
             StatusCode::BAD_REQUEST,
             format!("manifest_key must be under {MAP_MANIFEST_PREFIX}"),
         ));

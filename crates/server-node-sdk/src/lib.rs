@@ -5317,9 +5317,7 @@ async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
         replicas_changed
     };
 
-    if replicas_changed
-        && let Err(err) = persist_cluster_replicas_state(state).await
-    {
+    if replicas_changed && let Err(err) = persist_cluster_replicas_state(state).await {
         warn!(
             error = %err,
             subject_count,
@@ -11623,17 +11621,15 @@ fn downsample_storage_stats_samples(
 
     if selected.first().map(|sample| sample.collected_at_unix)
         != chronological.first().map(|sample| sample.collected_at_unix)
+        && let Some(first) = chronological.first()
     {
-        if let Some(first) = chronological.first() {
-            selected.insert(0, first.clone());
-        }
+        selected.insert(0, first.clone());
     }
     if selected.last().map(|sample| sample.collected_at_unix)
         != chronological.last().map(|sample| sample.collected_at_unix)
+        && let Some(last) = chronological.last()
     {
-        if let Some(last) = chronological.last() {
-            selected.push(last.clone());
-        }
+        selected.push(last.clone());
     }
 
     selected.reverse();

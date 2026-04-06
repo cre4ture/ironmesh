@@ -437,19 +437,19 @@ fn process_debounced_close_upload(
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
-    if let Some(clean_content_fingerprint) = upload_receipt.clean_content_fingerprint.as_deref() {
-        if let Err(err) = record_in_sync_content_fingerprint(
+    if let Some(clean_content_fingerprint) = upload_receipt.clean_content_fingerprint.as_deref()
+        && let Err(err) = record_in_sync_content_fingerprint(
             &worker.sync_root,
             relative_path,
             worker.provider_instance_id,
             clean_content_fingerprint,
-        ) {
-            tracing::info!(
-                "close-completion: failed to record in-sync content fingerprint for {}: {:#}",
-                relative_path,
-                err
-            );
-        }
+        )
+    {
+        tracing::info!(
+            "close-completion: failed to record in-sync content fingerprint for {}: {:#}",
+            relative_path,
+            err
+        );
     }
     tracing::info!(
         "cfapi uploaded local file: path={} bytes={} final_state={}",

@@ -967,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_replica_clears_subject_membership() {
+    fn remove_replica_keeps_live_availability_until_cleared() {
         let local = NodeId::new_v4();
         let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
 
@@ -979,8 +979,18 @@ mod tests {
 
         svc.remove_replica("subject-a", node_a);
 
-        let after = svc.replication_plan(&["subject-a".to_string()]);
-        assert!(after.items.is_empty());
+        let after_replica_removal = svc.replication_plan(&["subject-a".to_string()]);
+        let item = after_replica_removal
+            .items
+            .iter()
+            .find(|item| item.key == "subject-a")
+            .expect("expected live availability to keep subject visible");
+        assert_eq!(item.current_nodes, vec![node_a]);
+
+        svc.remove_available("subject-a", node_a);
+
+        let after_availability_removal = svc.replication_plan(&["subject-a".to_string()]);
+        assert!(after_availability_removal.items.is_empty());
     }
 
     #[test]
@@ -1055,7 +1065,10 @@ mod tests {
         svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
         svc.replace_node_available_view(node_a, &["subject-a".to_string()]);
 
-        assert_eq!(svc.known_replication_subjects(), vec!["subject-a".to_string()]);
+        assert_eq!(
+            svc.known_replication_subjects(),
+            vec!["subject-a".to_string()]
+        );
     }
 
     #[test]

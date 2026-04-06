@@ -340,7 +340,7 @@ pub(crate) fn callback_process_log_info(
     }
 }
 
-pub(crate) fn callback_file_identity<'a>(callback_info: &'a CF_CALLBACK_INFO) -> &'a [u8] {
+pub(crate) fn callback_file_identity(callback_info: &CF_CALLBACK_INFO) -> &[u8] {
     if callback_info.FileIdentity.is_null() || callback_info.FileIdentityLength == 0 {
         &[]
     } else {
@@ -655,12 +655,11 @@ unsafe extern "system" fn callback_fetch_data(
 
     if let Some(failure_response) =
         handle_callback_fetch_data(callback_info_ref, context, fetch_data)
+        && let Err(err) = execute_transfer_data_failure(callback_info_ref, failure_response)
     {
-        if let Err(err) = execute_transfer_data_failure(callback_info_ref, failure_response) {
-            tracing::info!(
-                "cfapi fetch-data: failed to report transfer failure for unresolved path: {err}"
-            );
-        }
+        tracing::info!(
+            "cfapi fetch-data: failed to report transfer failure for unresolved path: {err}"
+        );
     }
 }
 

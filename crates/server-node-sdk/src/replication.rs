@@ -361,12 +361,15 @@ async fn execute_cluster_replication_repair_inner(
         cluster
             .list_nodes()
             .into_iter()
-            .filter(|node| node.node_id != state.node_id && node.status == cluster::NodeStatus::Online)
+            .filter(|node| {
+                node.node_id != state.node_id && node.status == cluster::NodeStatus::Online
+            })
             .collect::<Vec<_>>()
     };
 
     for peer in peers {
-        let path = build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
+        let path =
+            build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
         match execute_peer_request(
             state,
             &peer,
@@ -377,44 +380,43 @@ async fn execute_cluster_replication_repair_inner(
         )
         .await
         {
-            Ok(response) if response.is_success() => match response.json::<ReplicationRepairReport>() {
-                Ok(report) => {
-                    accumulate_repair_report(&mut totals, &report);
-                    node_reports.push(ClusterReplicationRepairNodeReport {
-                        node_id: peer.node_id,
-                        attempted_transfers: report.attempted_transfers,
-                        successful_transfers: report.successful_transfers,
-                        failed_transfers: report.failed_transfers,
-                        skipped_items: report.skipped_items,
-                        skipped_backoff: report.skipped_backoff,
-                        skipped_max_retries: report.skipped_max_retries,
-                        last_error: report.last_error.clone(),
-                        request_error: None,
-                    });
+            Ok(response) if response.is_success() => {
+                match response.json::<ReplicationRepairReport>() {
+                    Ok(report) => {
+                        accumulate_repair_report(&mut totals, &report);
+                        node_reports.push(ClusterReplicationRepairNodeReport {
+                            node_id: peer.node_id,
+                            attempted_transfers: report.attempted_transfers,
+                            successful_transfers: report.successful_transfers,
+                            failed_transfers: report.failed_transfers,
+                            skipped_items: report.skipped_items,
+                            skipped_backoff: report.skipped_backoff,
+                            skipped_max_retries: report.skipped_max_retries,
+                            last_error: report.last_error.clone(),
+                            request_error: None,
+                        });
+                    }
+                    Err(err) => {
+                        failed_nodes += 1;
+                        let error = format!("failed decoding peer repair report: {err}");
+                        totals.last_error = Some(error.clone());
+                        node_reports.push(ClusterReplicationRepairNodeReport {
+                            node_id: peer.node_id,
+                            attempted_transfers: 0,
+                            successful_transfers: 0,
+                            failed_transfers: 0,
+                            skipped_items: 0,
+                            skipped_backoff: 0,
+                            skipped_max_retries: 0,
+                            last_error: None,
+                            request_error: Some(error),
+                        });
+                    }
                 }
-                Err(err) => {
-                    failed_nodes += 1;
-                    let error = format!("failed decoding peer repair report: {err}");
-                    totals.last_error = Some(error.clone());
-                    node_reports.push(ClusterReplicationRepairNodeReport {
-                        node_id: peer.node_id,
-                        attempted_transfers: 0,
-                        successful_transfers: 0,
-                        failed_transfers: 0,
-                        skipped_items: 0,
-                        skipped_backoff: 0,
-                        skipped_max_retries: 0,
-                        last_error: None,
-                        request_error: Some(error),
-                    });
-                }
-            },
+            }
             Ok(response) => {
                 failed_nodes += 1;
-                let error = format!(
-                    "peer repair request returned HTTP {}",
-                    response.status
-                );
+                let error = format!("peer repair request returned HTTP {}", response.status);
                 totals.last_error = Some(error.clone());
                 node_reports.push(ClusterReplicationRepairNodeReport {
                     node_id: peer.node_id,
@@ -456,16 +458,26 @@ async fn execute_cluster_replication_repair_inner(
     }
 }
 
-fn accumulate_repair_report(totals: &mut ReplicationRepairReport, report: &ReplicationRepairReport) {
-    totals.attempted_transfers =
-        totals.attempted_transfers.saturating_add(report.attempted_transfers);
-    totals.successful_transfers =
-        totals.successful_transfers.saturating_add(report.successful_transfers);
-    totals.failed_transfers = totals.failed_transfers.saturating_add(report.failed_transfers);
+fn accumulate_repair_report(
+    totals: &mut ReplicationRepairReport,
+    report: &ReplicationRepairReport,
+) {
+    totals.attempted_transfers = totals
+        .attempted_transfers
+        .saturating_add(report.attempted_transfers);
+    totals.successful_transfers = totals
+        .successful_transfers
+        .saturating_add(report.successful_transfers);
+    totals.failed_transfers = totals
+        .failed_transfers
+        .saturating_add(report.failed_transfers);
     totals.skipped_items = totals.skipped_items.saturating_add(report.skipped_items);
-    totals.skipped_backoff = totals.skipped_backoff.saturating_add(report.skipped_backoff);
-    totals.skipped_max_retries =
-        totals.skipped_max_retries.saturating_add(report.skipped_max_retries);
+    totals.skipped_backoff = totals
+        .skipped_backoff
+        .saturating_add(report.skipped_backoff);
+    totals.skipped_max_retries = totals
+        .skipped_max_retries
+        .saturating_add(report.skipped_max_retries);
     if report.last_error.is_some() {
         totals.last_error = report.last_error.clone();
     }

@@ -52,8 +52,8 @@ use wincs::{
     SyncRootIdBuilder,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, NTSTATUS, STATUS_CLOUD_FILE_NOT_IN_SYNC,
-    STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, STATUS_CLOUD_FILE_PINNED,
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_PATH_NOT_FOUND, NTSTATUS,
+    STATUS_CLOUD_FILE_NOT_IN_SYNC, STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, STATUS_CLOUD_FILE_PINNED,
     STATUS_CLOUD_FILE_REQUEST_CANCELED, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS,
 };
 use windows_sys::Win32::Storage::CloudFilters::*;
@@ -799,9 +799,7 @@ impl FetchExecutionScheduler {
         frontier: Option<u64>,
         now: Instant,
     ) -> Option<Duration> {
-        if frontier.is_none() {
-            return None;
-        }
+        frontier?;
 
         state
             .pending
@@ -925,10 +923,12 @@ pub fn unregister_sync_root(root_path: &Path) -> Result<()> {
     let hr = cf_unregister_sync_root(&root_path_utf16);
     let hr_u32 = hr as u32;
     let file_not_found_hr = 0x8007_0000u32 | ERROR_FILE_NOT_FOUND;
+    let invalid_function_hr = 0x8007_0000u32 | ERROR_INVALID_FUNCTION;
     let path_not_found_hr = 0x8007_0000u32 | ERROR_PATH_NOT_FOUND;
     if hr == 0
         || hr == STATUS_CLOUD_FILE_NOT_UNDER_SYNC_ROOT
         || hr_u32 == file_not_found_hr
+        || hr_u32 == invalid_function_hr
         || hr_u32 == path_not_found_hr
     {
         return Ok(());
@@ -1722,12 +1722,12 @@ fn resolve_relative_path_from_callback(
     {
         relative_path = mapped.clone();
     }
-    if relative_path.is_empty() && !callback_file_identity(callback_info).is_empty() {
-        if let Some(decoded_path) =
+    if relative_path.is_empty()
+        && !callback_file_identity(callback_info).is_empty()
+        && let Some(decoded_path) =
             decode_path_from_file_identity(callback_file_identity(callback_info))
-        {
-            relative_path = decoded_path;
-        }
+    {
+        relative_path = decoded_path;
     }
 
     if relative_path.is_empty() {

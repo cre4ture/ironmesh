@@ -622,20 +622,19 @@ impl SyncRootMonitor {
                     Ok(receipt) => {
                         if let Some(clean_content_fingerprint) =
                             receipt.clean_content_fingerprint.as_deref()
-                        {
-                            if let Err(err) = record_in_sync_content_fingerprint(
+                            && let Err(err) = record_in_sync_content_fingerprint(
                                 &self.sync_root,
                                 &rel_path,
                                 self.provider_instance_id,
                                 clean_content_fingerprint,
-                            ) {
-                                tracing::info!(
-                                    "{}: failed to record in-sync content fingerprint for {}: {:#}",
-                                    self.name,
-                                    rel_path,
-                                    err
-                                );
-                            }
+                            )
+                        {
+                            tracing::info!(
+                                "{}: failed to record in-sync content fingerprint for {}: {:#}",
+                                self.name,
+                                rel_path,
+                                err
+                            );
                         }
                         tracing::info!("{}: uploaded file {}", self.name, rel_path);
                     }
