@@ -3510,6 +3510,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/admin/logout", post(logout_admin_session))
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
+        .route("/auth/versions/{key}", get(list_versions_admin))
+        .route("/auth/store/delete", post(delete_object_by_query_admin))
+        .route("/auth/store/rename", post(rename_object_path_admin))
         .route("/auth/media/thumbnail", get(get_media_thumbnail_admin))
         .route("/auth/media/cache/clear", post(clear_media_cache_admin))
         .route("/auth/store/{key}", get(get_object_admin))
@@ -5852,12 +5855,47 @@ async fn delete_object_by_query(
     State(state): State<ServerState>,
     Query(query): Query<DeleteObjectByQuery>,
 ) -> Response {
+    delete_object_by_query_response(&state, query).await
+}
+
+async fn delete_object_by_query_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<DeleteObjectByQuery>,
+) -> Response {
+    let action = "auth/store/delete";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "key": query.key.clone(),
+            "state": query.state.clone(),
+            "parent": query.parent.clone(),
+            "version_id": query.version_id.clone(),
+            "recursive": query.recursive,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    delete_object_by_query_response(&state, query).await
+}
+
+async fn delete_object_by_query_response(
+    state: &ServerState,
+    query: DeleteObjectByQuery,
+) -> Response {
     if query.key.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
     delete_object(
-        State(state),
+        State(state.clone()),
         Path(query.key),
         Query(PutObjectQuery {
             state: query.state,
@@ -5875,6 +5913,39 @@ async fn rename_object_path(
     State(state): State<ServerState>,
     Json(request): Json<PathMutationRequest>,
 ) -> Response {
+    rename_object_path_response(&state, request).await
+}
+
+async fn rename_object_path_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<PathMutationRequest>,
+) -> Response {
+    let action = "auth/store/rename";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "from_path": request.from_path.clone(),
+            "to_path": request.to_path.clone(),
+            "overwrite": request.overwrite,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    rename_object_path_response(&state, request).await
+}
+
+async fn rename_object_path_response(
+    state: &ServerState,
+    request: PathMutationRequest,
+) -> Response {
     if request.from_path.trim().is_empty() || request.to_path.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -5886,7 +5957,7 @@ async fn rename_object_path(
         overwrite = request.overwrite,
         "store path rename request start"
     );
-    let mut store = lock_store(&state, "store_path.rename").await;
+    let mut store = lock_store(state, "store_path.rename").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_started = Instant::now();
     match store
@@ -5903,8 +5974,8 @@ async fn rename_object_path(
                 "store path rename applied; publishing namespace change"
             );
             drop(store);
-            publish_namespace_change(&state);
-            request_local_availability_refresh(&state);
+            publish_namespace_change(state);
+            request_local_availability_refresh(state);
             info!(
                 from_path = %request.from_path,
                 to_path = %request.to_path,
@@ -8110,8 +8181,36 @@ async fn list_versions(
     State(state): State<ServerState>,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
+    list_versions_response(&state, &key).await
+}
+
+async fn list_versions_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    let action = "auth/versions/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "key": key.clone(),
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    list_versions_response(&state, &key).await
+}
+
+async fn list_versions_response(state: &ServerState, key: &str) -> Response {
     let store = read_store(&state, "versions.list").await;
-    match store.list_versions(&key).await {
+    match store.list_versions(key).await {
         Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => {

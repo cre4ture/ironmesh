@@ -1,4 +1,4 @@
-import { IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconFolder, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
 import { SetupPage } from "../pages/SetupPage";
 import { BootstrapBundlesPage } from "../pages/BootstrapBundlesPage";
@@ -7,6 +7,7 @@ import { CertificatesPage } from "../pages/CertificatesPage";
 import { ControlPlanePage } from "../pages/ControlPlanePage";
 import { LogsPage } from "../pages/LogsPage";
 import { GalleryPage } from "../pages/GalleryPage";
+import { ExplorerPage } from "../pages/ExplorerPage";
 
 export const serverAdminRoutes = [
   {
@@ -29,6 +30,13 @@ export const serverAdminRoutes = [
     description: "Browse image objects from the server node side using admin-authenticated snapshot, index, and preview routes.",
     icon: IconPhoto,
     element: <GalleryPage />
+  },
+  {
+    id: "explorer",
+    label: "Explorer",
+    description: "Browse prefixes, snapshots, and version history from the node side, with admin-authenticated rename and delete on current data.",
+    icon: IconFolder,
+    element: <ExplorerPage />
   },
   {
     id: "bootstrap",

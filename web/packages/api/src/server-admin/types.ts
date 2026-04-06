@@ -1,3 +1,4 @@
+import type { VersionGraphResponse } from "../client-ui/types";
 import type { StoreIndexEntry, StoreIndexResponse, StoreListView } from "../shared/store-index";
 
 export type AdminSessionStatus = {
@@ -14,6 +15,18 @@ export type AdminSnapshotSummary = {
 export type AdminStoreEntry = StoreIndexEntry;
 
 export type AdminStoreListResponse = StoreIndexResponse;
+
+export type AdminStoreGetResponse = {
+  key: string;
+  snapshot?: string | null;
+  version?: string | null;
+  value: string;
+  truncated?: boolean;
+  total_size_bytes?: number;
+  preview_size_bytes?: number | null;
+};
+
+export type AdminVersionGraphResponse = VersionGraphResponse;
 
 export type { StoreListView };
 

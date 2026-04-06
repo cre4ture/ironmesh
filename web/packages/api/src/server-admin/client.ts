@@ -1,8 +1,10 @@
 import { fetchJson } from "../shared/http";
 import type {
   AdminMediaCacheClearResponse,
+  AdminStoreGetResponse,
   AdminSnapshotSummary,
   AdminStoreListResponse,
+  AdminVersionGraphResponse,
   AdminSessionStatus,
   BootstrapClaimIssueResponse,
   BootstrapBundle,
@@ -107,6 +109,108 @@ export async function listAdminStoreEntries(
   });
 }
 
+export function getAdminStoreDownloadUrl(
+  key: string,
+  snapshot?: string | null,
+  version?: string | null
+): string {
+  const query = new URLSearchParams();
+  if (snapshot?.trim()) {
+    query.set("snapshot", snapshot.trim());
+  }
+  if (version?.trim()) {
+    query.set("version", version.trim());
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return `/auth/store/${encodeURIComponent(key)}${suffix}`;
+}
+
+export async function getAdminStoreValue(
+  key: string,
+  snapshot?: string | null,
+  version?: string | null,
+  previewBytes?: number | null,
+  adminTokenOverride?: string
+): Promise<AdminStoreGetResponse> {
+  const headers = new Headers(buildAdminHeaders(adminTokenOverride));
+  const previewLimit =
+    typeof previewBytes === "number" && Number.isFinite(previewBytes) && previewBytes > 0
+      ? Math.max(1, Math.floor(previewBytes))
+      : null;
+  if (previewLimit !== null) {
+    headers.set("range", `bytes=0-${previewLimit - 1}`);
+  }
+
+  const response = await fetch(getAdminStoreDownloadUrl(key, snapshot, version), {
+    credentials: "same-origin",
+    cache: "no-store",
+    headers
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response));
+  }
+
+  const buffer = await response.arrayBuffer();
+  const payloadBytes = new Uint8Array(buffer);
+  const totalSizeBytes =
+    parseAdminTotalSizeBytes(response.headers.get("content-range")) ??
+    parseAdminHeaderInteger(response.headers.get("content-length")) ??
+    payloadBytes.byteLength;
+
+  return {
+    key,
+    snapshot: snapshot ?? null,
+    version: version ?? null,
+    value: new TextDecoder().decode(payloadBytes),
+    truncated: previewLimit !== null ? totalSizeBytes > payloadBytes.byteLength : false,
+    total_size_bytes: totalSizeBytes,
+    preview_size_bytes: previewLimit !== null ? payloadBytes.byteLength : null
+  };
+}
+
+export async function getAdminVersionGraph(
+  key: string,
+  adminTokenOverride?: string
+): Promise<AdminVersionGraphResponse> {
+  return fetchAdminJson<AdminVersionGraphResponse>(
+    `/auth/versions/${encodeURIComponent(key)}`,
+    {
+      adminTokenOverride
+    }
+  );
+}
+
+export async function deleteAdminStorePath(
+  path: string,
+  adminTokenOverride?: string
+): Promise<Record<string, unknown> | null> {
+  const query = new URLSearchParams({ key: path });
+  return fetchAdminJson<Record<string, unknown> | null>(
+    `/auth/store/delete?${query.toString()}`,
+    {
+      method: "POST",
+      adminTokenOverride
+    }
+  );
+}
+
+export async function renameAdminStorePath(
+  fromPath: string,
+  toPath: string,
+  overwrite = false,
+  adminTokenOverride?: string
+): Promise<Record<string, unknown> | null> {
+  return fetchAdminJson<Record<string, unknown> | null>("/auth/store/rename", {
+    method: "POST",
+    adminTokenOverride,
+    body: {
+      from_path: fromPath,
+      to_path: toPath,
+      overwrite
+    }
+  });
+}
+
 export async function getClusterSummary(
   adminTokenOverride?: string
 ): Promise<ClusterSummary> {
@@ -137,6 +241,35 @@ export async function triggerReplicationRepair(): Promise<Record<string, unknown
     credentials: "same-origin",
     cache: "no-store"
   });
+}
+
+function parseAdminHeaderInteger(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function parseAdminTotalSizeBytes(contentRange: string | null): number | null {
+  if (!contentRange) {
+    return null;
+  }
+  const match = contentRange.match(/\/(\d+)$/);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+async function readAdminErrorMessage(response: Response): Promise<string> {
+  const payload = await response.text().catch(() => "");
+  const normalizedPayload = payload.trim();
+  if (normalizedPayload) {
+    return normalizedPayload;
+  }
+  return `HTTP ${response.status} ${response.statusText}`;
 }
 
 export async function clearAdminMediaCache(
