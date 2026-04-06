@@ -295,7 +295,7 @@ export function GallerySurface({
       {error ? <Alert color="red">{error}</Alert> : null}
 
       <Grid>
-        <Grid.Col span={{ base: 12, xl: 4 }}>
+        <Grid.Col span={12}>
           <Card withBorder radius="md" padding="lg">
             <Stack gap="sm">
               <Group justify="space-between" align="flex-start">
@@ -457,7 +457,7 @@ export function GallerySurface({
           </Card>
         </Grid.Col>
 
-        <Grid.Col span={{ base: 12, xl: 8 }}>
+        <Grid.Col span={12}>
           {viewMode === "map" ? (
             <Stack gap="md">
               {navigationItems.length > 0 ? (
