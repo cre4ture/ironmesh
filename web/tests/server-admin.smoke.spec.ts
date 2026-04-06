@@ -12,7 +12,6 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText(/UI build:\s*0\.1\.0 \(/)).toBeVisible();
   await expect(page.getByText("Backend build: 0.1.0 (v0.1.0-5-gmocked)")).toBeVisible();
   await expect(page.getByText("0 discovered")).toBeVisible();
-  await expect(page.getByText("runtime ready")).toBeVisible();
   await expect(page.getByText("This node", { exact: true })).toBeVisible();
   await expect(page.getByText("Rendezvous participation", { exact: true })).toBeVisible();
   await expect(page.getByText("Storage stats", { exact: true })).toBeVisible();
@@ -71,6 +70,8 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("Fingerprint: internal-cert-fingerprint", { exact: true })).toBeVisible();
 
   await page.getByText("Logs", { exact: true }).click();
+  await expect(page.getByText("Recent server logs", { exact: true })).toBeVisible();
+  await expect(page.getByText("runtime ready")).toBeVisible();
   await expect(page.getByText("replication audit healthy")).toBeVisible();
 
   await page.getByText("Gallery", { exact: true }).click();

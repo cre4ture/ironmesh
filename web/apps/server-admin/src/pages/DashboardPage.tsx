@@ -7,7 +7,6 @@ import {
   getServerHealth,
   getStorageStatsCurrent,
   getStorageStatsHistory,
-  getRecentLogs,
   getReplicationPlan,
   triggerReplicationRepair,
   type ReplicationPlan,
@@ -67,10 +66,6 @@ export function DashboardPage() {
   const canInspectCluster = canRunAdminMaintenance;
   const canInspectRendezvous = canRunAdminMaintenance;
 
-  const logsQuery = useQuery({
-    queryKey: ["dashboard", "logs", 120],
-    queryFn: () => getRecentLogs(120)
-  });
   const backendHealthQuery = useQuery({
     queryKey: ["dashboard", "health"],
     queryFn: () => getServerHealth()
@@ -107,7 +102,6 @@ export function DashboardPage() {
 
   const refresh = useCallback(async () => {
     const queryKeys: ReadonlyArray<readonly unknown[]> = [
-      ["dashboard", "logs", 120],
       ["dashboard", "health"],
       ["dashboard", "storage-stats-current"],
       ["dashboard", "storage-stats-history", storageHistoryRange],
@@ -163,7 +157,6 @@ export function DashboardPage() {
     canInspectRendezvous && !rendezvousConfigQuery.isError
       ? rendezvousConfigQuery.data ?? null
       : null;
-  const logs = logsQuery.data ?? null;
   const backendHealth = backendHealthQuery.data ?? null;
   const storageStats = storageStatsQuery.data ?? null;
   const storageHistory = storageHistoryQuery.data ?? [];
@@ -172,7 +165,6 @@ export function DashboardPage() {
   const repairPending = repairMutation.isPending;
   const mediaCacheClearPending = mediaCacheClearMutation.isPending;
   const loading =
-    logsQuery.isFetching ||
     backendHealthQuery.isFetching ||
     storageStatsQuery.isFetching ||
     storageHistoryQuery.isFetching ||
@@ -184,7 +176,6 @@ export function DashboardPage() {
   const error = firstErrorMessage([
     repairMutation.error,
     mediaCacheClearMutation.error,
-    logsQuery.error,
     backendHealthQuery.error,
     storageStatsQuery.error,
     storageHistoryQuery.error,
@@ -231,7 +222,7 @@ export function DashboardPage() {
     <Stack gap="lg">
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={680}>
-          The dashboard focuses on the current cluster shape, replication pressure, and recent runtime output.
+          The dashboard focuses on the current cluster shape, replication pressure, and node health.
           Refreshing keeps the cards fast, while repair payloads and diagnostics still stay close to the backend during
           the migration.
         </Text>
@@ -679,16 +670,6 @@ export function DashboardPage() {
                     needed.
                   </Text>
                 )}
-              </Stack>
-            </Card>
-            <Card withBorder radius="md" padding="lg">
-              <Stack gap="sm">
-                <Text fw={700}>Recent logs</Text>
-                <ScrollArea type="auto" mah={320}>
-                  <Text ff="monospace" size="sm" style={{ whiteSpace: "pre-wrap" }}>
-                    {logs?.entries?.join("\n") || (loading ? "loading..." : "no logs yet")}
-                  </Text>
-                </ScrollArea>
               </Stack>
             </Card>
           </Stack>
