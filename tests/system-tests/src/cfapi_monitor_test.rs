@@ -2066,6 +2066,9 @@ mod tests {
                 "ironmesh.systemtest.authenticated.{}",
                 bind.replace(['.', ':'], "_")
             );
+            let local_appdata_root = actual_local_appdata_root();
+            let local_appdata_identity =
+                local_appdata_client_identity_path(&local_appdata_root, &sync_root);
             let client_config_dir = server_data_dir.join("client-config");
             std::fs::create_dir_all(&client_config_dir)
                 .expect("failed to create client config dir");
@@ -2082,7 +2085,7 @@ mod tests {
             )
             .await?;
 
-            let client_identity_file = default_client_identity_path(&bootstrap_file);
+            let client_identity_file = local_appdata_identity;
             wait_for_path(&client_identity_file, 120).await;
 
             let client_identity = ClientIdentityMaterial::from_path(&client_identity_file)
