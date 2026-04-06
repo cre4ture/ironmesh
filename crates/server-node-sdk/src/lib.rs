@@ -8207,7 +8207,7 @@ async fn list_versions_admin(
 }
 
 async fn list_versions_response(state: &ServerState, key: &str) -> Response {
-    let store = read_store(&state, "versions.list").await;
+    let store = read_store(state, "versions.list").await;
     match store.list_versions(key).await {
         Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
