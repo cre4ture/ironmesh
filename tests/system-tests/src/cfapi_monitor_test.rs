@@ -1503,7 +1503,18 @@ mod tests {
             "local rename should preserve remote object identity instead of reuploading"
         );
 
-        wait_for_hydrated_payload(&new_path, payload, 220).await;
+        if hydrate_before_rename {
+            wait_for_hydrated_payload(&new_path, payload, 220).await;
+        } else {
+            wait_for_placeholder_in_sync(&new_path, 220).await;
+            wait_for_placeholder_dehydrated(&new_path, 120).await;
+            assert_placeholder_stays_dehydrated(
+                &new_path,
+                Duration::from_secs(3),
+                Duration::from_millis(200),
+            )
+            .await;
+        }
 
         stop_server(&mut fixture.server).await;
         let _ = std::fs::remove_dir_all(&fixture.server_data_dir);

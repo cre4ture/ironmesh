@@ -16,6 +16,7 @@ use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{decode_path_from_file_identity, path_to_relative};
 use crate::placeholder_metadata::{
     record_in_sync_content_fingerprint, record_in_sync_local_file_state,
+    record_in_sync_remote_file_state,
 };
 #[cfg(test)]
 use crate::runtime::UploadReceipt;
@@ -1027,18 +1028,46 @@ fn repair_locally_renamed_materialized_file(
         return Ok(());
     }
 
-    if !path_is_placeholder(path) {
-        let metadata = std::fs::metadata(path)?;
-        try_convert_materialized_file(path, rel_path, &metadata);
+    let is_placeholder = path_is_placeholder(path);
+    tracing::info!(
+        "monitor: repairing local renamed file {} mode={} entry_snapshot={} state_before={}",
+        rel_path,
+        if is_placeholder {
+            "placeholder-metadata-only"
+        } else {
+            "materialized-convert-and-fingerprint"
+        },
+        entry.to_log_string(),
+        describe_path_state(path)
+    );
 
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+    if is_placeholder {
+        // Renamed placeholders must be repaired without reading file content, or the
+        // fingerprinting path will implicitly hydrate them. Repoint the stored
+        // FileIdentity metadata to the new relative path and restore the clean
+        // in-sync state as a metadata-only operation.
+        record_in_sync_remote_file_state(sync_root, rel_path, provider_instance_id)?;
+        let file = open_sync_path(path, true)?;
         cf_set_in_sync(&file)?;
+        tracing::info!(
+            "monitor: repaired local renamed file {} mode=placeholder-metadata-only state_after={}",
+            rel_path,
+            describe_path_state(path)
+        );
+        return Ok(());
     }
 
+    let metadata = std::fs::metadata(path)?;
+    try_convert_materialized_file(path, rel_path, &metadata);
+
+    let file = open_sync_path(path, true)?;
+    cf_set_in_sync(&file)?;
     record_in_sync_local_file_state(sync_root, rel_path, provider_instance_id)?;
+    tracing::info!(
+        "monitor: repaired local renamed file {} mode=materialized-convert-and-fingerprint state_after={}",
+        rel_path,
+        describe_path_state(path)
+    );
     Ok(())
 }
 
