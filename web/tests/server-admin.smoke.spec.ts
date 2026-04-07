@@ -147,7 +147,7 @@ test("server-admin provisioning can target a selected rendezvous service", async
   await page.keyboard.press("Escape");
 
   await page.getByText("Provisioning", { exact: true }).click();
-  await page.getByLabel("Preferred rendezvous service").selectOption("https://rendezvous-a.local:9443/");
+  await page.getByLabel("Primary rendezvous service").selectOption("https://rendezvous-a.local:9443/");
   await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
 
   await expect(page.locator("pre").filter({ hasText: '"rendezvous_url": "https://rendezvous-a.local:9443/"' })).toBeVisible();
@@ -187,7 +187,7 @@ test("server-admin provisioning does not fall back when a specific rendezvous se
   await page.keyboard.press("Escape");
 
   await page.getByText("Provisioning", { exact: true }).click();
-  await page.getByLabel("Preferred rendezvous service").selectOption("https://rendezvous-a.local:9443/");
+  await page.getByLabel("Primary rendezvous service").selectOption("https://rendezvous-a.local:9443/");
   await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
 
   await expect(page.getByText("Request failed", { exact: true })).toBeVisible();

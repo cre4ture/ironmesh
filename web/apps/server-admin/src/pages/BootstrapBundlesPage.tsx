@@ -282,15 +282,15 @@ export function BootstrapBundlesPage() {
                 onChange={setExpiresInSecs}
               />
               <NativeSelect
-                label="Preferred rendezvous service"
+                label="Primary rendezvous service"
                 data={rendezvousSelectData}
                 value={selectedRendezvousUrl}
                 onChange={(event) => setSelectedRendezvousUrl(event.currentTarget.value)}
               />
               <Text size="sm" c="dimmed">
-                Leave this on automatic to let the node try the configured rendezvous services in order.
-                If you pick a specific rendezvous endpoint, claim publication uses only that endpoint and
-                fails instead of falling back.
+                Leave this on automatic to let the node choose the first healthy rendezvous endpoint.
+                If you pick a specific rendezvous endpoint, the issued claim uses it as the primary
+                redeem URL and includes healthy fallbacks when available.
               </Text>
               <Group>
                 <Button onClick={() => void handleIssueBootstrap()} loading={pendingAction === "bootstrap"}>
