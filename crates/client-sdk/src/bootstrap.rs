@@ -100,6 +100,14 @@ impl PlannedConnectionBootstrapTarget {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConnectionBootstrapDiagnosticTargets {
+    #[serde(default)]
+    pub direct: Option<PlannedConnectionBootstrapTarget>,
+    #[serde(default)]
+    pub relay: Vec<PlannedConnectionBootstrapTarget>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapEnrollmentResult {
     pub cluster_id: ClusterId,
@@ -405,6 +413,54 @@ impl ConnectionBootstrap {
             Some(identity) => self.build_client_with_identity(identity),
             None => self.build_client(),
         }
+    }
+
+    pub fn diagnostic_targets(&self) -> Result<ConnectionBootstrapDiagnosticTargets> {
+        self.validate()?;
+
+        let direct_targets = self.direct_https_targets()?;
+        let direct = direct_targets.first().cloned();
+        let relay = if self.relay_mode == RelayMode::Disabled || self.rendezvous_urls.is_empty() {
+            Vec::new()
+        } else {
+            let Some(target_node_id) = direct_targets
+                .iter()
+                .find_map(|target| target.target_node_id)
+            else {
+                return Ok(ConnectionBootstrapDiagnosticTargets {
+                    direct,
+                    relay: Vec::new(),
+                });
+            };
+
+            let mut seen_urls = BTreeSet::new();
+            self.rendezvous_urls
+                .iter()
+                .filter_map(|url| {
+                    let normalized = url.trim().trim_end_matches('/').to_string();
+                    if normalized.is_empty() || !seen_urls.insert(normalized.clone()) {
+                        return None;
+                    }
+                    Some(PlannedConnectionBootstrapTarget {
+                        cluster_id: self.cluster_id,
+                        rendezvous_urls: vec![normalized],
+                        rendezvous_mtls_required: self.rendezvous_mtls_required,
+                        relay_mode: self.relay_mode,
+                        path_kind: TransportPathKind::RelayTunnel,
+                        server_base_url: None,
+                        target_node_id: Some(target_node_id),
+                        server_ca_pem: self.trust_roots.public_api_ca_pem.clone(),
+                        cluster_ca_pem: self.trust_roots.cluster_ca_pem.clone(),
+                        rendezvous_ca_pem: self.trust_roots.rendezvous_ca_pem.clone(),
+                        pairing_token: self.pairing_token.clone(),
+                        device_label: self.device_label.clone(),
+                        device_id: self.device_id.clone(),
+                    })
+                })
+                .collect()
+        };
+
+        Ok(ConnectionBootstrapDiagnosticTargets { direct, relay })
     }
 
     pub fn connection_target_label(&self) -> Result<String> {

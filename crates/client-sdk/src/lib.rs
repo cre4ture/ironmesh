@@ -4,19 +4,23 @@ pub mod connection;
 pub mod content_addressed_client_cache;
 pub mod device_auth;
 pub mod ironmesh_client;
+pub mod latency_probe;
 pub mod remote_sync;
 
 pub use bootstrap::{
-    BootstrapEnrollmentResult, ConnectionBootstrap, PlannedConnectionBootstrapTarget,
-    ResolvedConnectionBootstrap, enroll_bootstrap_claim_blocking, enroll_connection_input_blocking,
+    BootstrapEnrollmentResult, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
+    PlannedConnectionBootstrapTarget, ResolvedConnectionBootstrap, enroll_bootstrap_claim_blocking,
+    enroll_connection_input_blocking,
 };
 pub use client_node::ClientNode;
 pub use connection::{
     build_blocking_http_client, build_blocking_reqwest_client_from_pem,
-    build_blocking_reqwest_client_from_pem_for_url, build_http_client, build_http_client_from_pem,
-    build_http_client_with_identity, build_http_client_with_identity_from_pem,
-    build_http_client_with_identity_from_planned_target, build_reqwest_client_from_pem,
-    build_reqwest_client_from_pem_for_url, load_root_certificate, load_root_certificate_pem,
+    build_blocking_reqwest_client_from_pem_for_url,
+    build_client_with_optional_identity_from_planned_target, build_http_client,
+    build_http_client_from_pem, build_http_client_with_identity,
+    build_http_client_with_identity_from_pem, build_http_client_with_identity_from_planned_target,
+    build_reqwest_client_from_pem, build_reqwest_client_from_pem_for_url, load_root_certificate,
+    load_root_certificate_pem,
 };
 pub use content_addressed_client_cache::ContentAddressedClientCache;
 pub use device_auth::{
@@ -29,6 +33,10 @@ pub use ironmesh_client::{
     UploadSessionChunkStatus, UploadSessionCompleteInfo, UploadSessionStatus,
     VersionConsistencyState, VersionGraphSummary, VersionRecordSummary, normalize_server_base_url,
     snapshot_from_store_index_entries,
+};
+pub use latency_probe::{
+    LatencyProbeAssessment, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,
+    LatencyProbeSample, LatencyProbeSummary, compare_direct_and_relay_latency,
 };
 pub use remote_sync::{
     RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,

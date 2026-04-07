@@ -1,5 +1,6 @@
 import { fetchJson } from "../shared/http";
 import type {
+  ClientLatencyTestResponse,
   ClientRendezvousView,
   ClientUiPingResponse,
   JsonObject,
@@ -52,6 +53,22 @@ export async function getClientRendezvous(): Promise<ClientRendezvousView> {
 export async function refreshClientRendezvous(): Promise<ClientRendezvousView> {
   return fetchJson<ClientRendezvousView>("/api/rendezvous/refresh", {
     method: "POST"
+  });
+}
+
+export async function runClientLatencyTest(request?: {
+  sample_count?: number;
+  warmup_count?: number;
+  response_bytes?: number;
+  server_delay_ms?: number;
+  pause_between_samples_ms?: number;
+}): Promise<ClientLatencyTestResponse> {
+  return fetchJson<ClientLatencyTestResponse>("/api/latency-test", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(request ?? {})
   });
 }
 

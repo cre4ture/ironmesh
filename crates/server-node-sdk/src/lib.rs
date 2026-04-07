@@ -118,6 +118,8 @@ const SLOW_STORE_LOCK_HOLD_LOG_THRESHOLD_MS: u128 = 500;
 const SLOW_SERVER_STARTUP_PHASE_LOG_THRESHOLD_MS: u128 = 500;
 const SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS: u128 = 250;
+const MAX_LATENCY_DIAGNOSTIC_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_LATENCY_DIAGNOSTIC_SERVER_DELAY_MS: u64 = 5_000;
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -464,6 +466,12 @@ struct UploadSessionStartRequest {
     #[serde(default)]
     parent: Vec<String>,
     version_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LatencyDiagnosticQuery {
+    response_bytes: Option<usize>,
+    server_delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3477,6 +3485,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     let build_http_routers_phase_started_at =
         log_server_startup_phase_begin("build_http_routers", startup_phase_anchor);
     let public_client_api = Router::new()
+        .route("/diagnostics/latency", get(latency_diagnostic))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
         .route(
@@ -3712,6 +3721,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
     let internal_app = Router::new()
         .route("/health", get(health))
+        .route("/diagnostics/latency", get(latency_diagnostic))
         .route(
             "/auth/bootstrap-claims/redeem",
             post(redeem_client_bootstrap_claim),
@@ -5793,6 +5803,81 @@ async fn health(State(state): State<ServerState>) -> Json<HealthStatus> {
         version: BUILD_VERSION.to_string(),
         revision: BUILD_REVISION.to_string(),
     })
+}
+
+async fn latency_diagnostic(
+    State(state): State<ServerState>,
+    Query(query): Query<LatencyDiagnosticQuery>,
+) -> Response {
+    let response_bytes = query.response_bytes.unwrap_or(0);
+    if response_bytes > MAX_LATENCY_DIAGNOSTIC_RESPONSE_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "response_bytes must be <= {MAX_LATENCY_DIAGNOSTIC_RESPONSE_BYTES}"
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    let server_delay_ms = query.server_delay_ms.unwrap_or(0);
+    if server_delay_ms > MAX_LATENCY_DIAGNOSTIC_SERVER_DELAY_MS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "server_delay_ms must be <= {MAX_LATENCY_DIAGNOSTIC_SERVER_DELAY_MS}"
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    let started_unix_ms = unix_ts_ms();
+    let started_at = Instant::now();
+    if server_delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(server_delay_ms)).await;
+    }
+    let server_duration_ms = started_at.elapsed().as_millis() as u64;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&response_bytes.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        "x-ironmesh-latency-node-id",
+        HeaderValue::from_str(&state.node_id.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+    );
+    headers.insert(
+        "x-ironmesh-latency-response-bytes",
+        HeaderValue::from_str(&response_bytes.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        "x-ironmesh-latency-server-duration-ms",
+        HeaderValue::from_str(&server_duration_ms.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        "x-ironmesh-latency-started-unix-ms",
+        HeaderValue::from_str(&started_unix_ms.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+
+    (StatusCode::OK, headers, vec![0_u8; response_bytes]).into_response()
 }
 
 async fn node_certificate_status(
@@ -13381,6 +13466,13 @@ fn unix_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_ts_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 

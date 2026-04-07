@@ -25,6 +25,7 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import {
   IconFiles,
+  IconActivity,
   IconFolder,
   IconPlugConnected,
   IconPhoto,
@@ -39,15 +40,19 @@ import {
   StatCard
 } from "@ironmesh/ui";
 import {
+  runClientLatencyTest,
   deleteStoreValue,
   getBinaryObjectDownloadUrl,
   getClientHealth,
   getClientClusterNodes,
   getClientClusterStatus,
+  type ClientLatencyTestResponse,
+  type ClientLatencyProbeTargetResult,
   getClientRendezvous,
   getClientReplicationPlan,
   getClientPing,
   getStoreValue,
+  type LatencyProbeAssessment,
   restoreStorePathFromSnapshot,
   getVersionGraph,
   listSnapshots,
@@ -71,7 +76,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
 import { GalleryPage } from "../pages/GalleryPage";
 
-type PageId = "overview" | "rendezvous" | "store" | "explorer" | "gallery" | "cluster";
+type PageId = "overview" | "rendezvous" | "latency" | "store" | "explorer" | "gallery" | "cluster";
 type BinaryUploadQueueStatus =
   | "queued"
   | "starting"
@@ -142,6 +147,12 @@ const pages = [
     label: "Rendezvous",
     icon: IconPlugConnected,
     description: "Inspect relay endpoint status, active URL selection, and editable bootstrap rendezvous URLs."
+  },
+  {
+    id: "latency" as const,
+    label: "Latency",
+    icon: IconActivity,
+    description: "Probe current, direct, and relay transport latency through the embedded Rust client runtime."
   },
   {
     id: "store" as const,
@@ -276,6 +287,8 @@ export function ClientShell() {
             ) : null}
 
             {activePageId === "rendezvous" ? <RendezvousPage /> : null}
+
+            {activePageId === "latency" ? <LatencyPage /> : null}
 
             {activePageId === "store" ? <StorePage binaryUpload={binaryUpload} /> : null}
 
@@ -1093,6 +1106,235 @@ function RendezvousPage() {
   );
 }
 
+function LatencyPage() {
+  const [sampleCount, setSampleCount] = useState(6);
+  const [warmupCount, setWarmupCount] = useState(1);
+  const [responseBytes, setResponseBytes] = useState(1024);
+  const [pauseBetweenSamplesMs, setPauseBetweenSamplesMs] = useState(125);
+  const [serverDelayMs, setServerDelayMs] = useState(0);
+  const [result, setResult] = useState<ClientLatencyTestResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void handleRun();
+  }, []);
+
+  async function handleRun() {
+    setLoading(true);
+    setError(null);
+    try {
+      const payload = await runClientLatencyTest({
+        sample_count: sampleCount,
+        warmup_count: warmupCount,
+        response_bytes: responseBytes,
+        pause_between_samples_ms: pauseBetweenSamplesMs,
+        server_delay_ms: serverDelayMs
+      });
+      setResult(payload);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed running latency probe");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const targets = result?.targets ?? [];
+  const currentTarget = targets.find((target) => target.path_id === "current") ?? null;
+  const directTarget =
+    targets.find((target) => target.path_id === "direct") ??
+    targets.find((target) => target.transport_mode === "direct") ??
+    null;
+  const relayTargets = targets.filter((target) => target.transport_mode === "relay");
+  const bestRelayTarget = selectLatencyTargetByAverage(relayTargets, "min");
+  const worstRelayTarget = selectLatencyTargetByAverage(relayTargets, "max");
+
+  return (
+    <>
+      <PageHeader
+        title="Latency"
+        description="Run small, repeated end-to-end probes through the embedded Rust client and compare direct latency against every configured rendezvous relay service."
+        actions={
+          <Button leftSection={<IconRefresh size={16} />} loading={loading} onClick={() => void handleRun()}>
+            Run probe
+          </Button>
+        }
+      />
+
+      {error ? <Alert color="red">{error}</Alert> : null}
+      {result?.comparison?.observations.length ? (
+        <Alert color={latencyAssessmentColor(result.comparison.assessment)} title="Direct vs relay comparison">
+          {result.comparison.observations.join(" ")}
+        </Alert>
+      ) : null}
+
+      <Grid>
+        <Grid.Col span={{ base: 12, xl: 5 }}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>Probe settings</Text>
+              <Text c="dimmed" size="sm">
+                The browser triggers this probe, but the actual network requests run inside the Rust client runtime so the numbers reflect client-to-server transport behavior.
+              </Text>
+              <NumberInput
+                label="Measured samples"
+                value={sampleCount}
+                min={1}
+                max={32}
+                step={1}
+                clampBehavior="strict"
+                onChange={(value) => setSampleCount(clampLatencyInput(value, 1, 32, 6))}
+              />
+              <NumberInput
+                label="Warmup samples"
+                value={warmupCount}
+                min={0}
+                max={8}
+                step={1}
+                clampBehavior="strict"
+                onChange={(value) => setWarmupCount(clampLatencyInput(value, 0, 8, 1))}
+              />
+              <NumberInput
+                label="Response bytes"
+                value={responseBytes}
+                min={0}
+                max={262144}
+                step={256}
+                clampBehavior="strict"
+                onChange={(value) => setResponseBytes(clampLatencyInput(value, 0, 262144, 1024))}
+              />
+              <NumberInput
+                label="Pause between samples (ms)"
+                value={pauseBetweenSamplesMs}
+                min={0}
+                max={2000}
+                step={25}
+                clampBehavior="strict"
+                onChange={(value) => setPauseBetweenSamplesMs(clampLatencyInput(value, 0, 2000, 125))}
+              />
+              <NumberInput
+                label="Injected server delay (ms)"
+                description="Optional. Useful when you want to confirm the probe captures server-side delay separately from transport overhead."
+                value={serverDelayMs}
+                min={0}
+                max={5000}
+                step={50}
+                clampBehavior="strict"
+                onChange={(value) => setServerDelayMs(clampLatencyInput(value, 0, 5000, 0))}
+              />
+            </Stack>
+          </Card>
+        </Grid.Col>
+
+        <Grid.Col span={{ base: 12, xl: 7 }}>
+          <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }}>
+            <StatCard
+              label="Current path avg"
+              value={formatLatencyAverage(currentTarget)}
+              hint={currentTarget?.label ?? "Current runtime route."}
+            />
+            <StatCard
+              label="Direct path avg"
+              value={formatLatencyAverage(directTarget)}
+              hint={directTarget?.label ?? "Direct probe unavailable for this session."}
+            />
+            <StatCard
+              label="Best relay avg"
+              value={formatLatencyAverage(bestRelayTarget)}
+              hint={bestRelayTarget?.label ?? "Relay probe unavailable for this session."}
+            />
+            <StatCard
+              label="Worst relay avg"
+              value={formatLatencyAverage(worstRelayTarget)}
+              hint={worstRelayTarget?.label ?? "Relay probe unavailable for this session."}
+            />
+          </SimpleGrid>
+
+          <Card withBorder radius="md" padding="lg" mt="md">
+            <Stack gap="sm">
+              <Text fw={700}>Probe results</Text>
+              <Text c="dimmed" size="sm">
+                Current runtime uses the live embedded client. If bootstrap data is available, the page also probes every configured rendezvous URL individually so relay services can be compared side by side.
+              </Text>
+              <Table.ScrollContainer minWidth={920}>
+                <Table striped highlightOnHover withTableBorder>
+                  <Table.Thead>
+                    <Table.Tr>
+                      <Table.Th>Path</Table.Th>
+                      <Table.Th>Mode</Table.Th>
+                      <Table.Th>Assessment</Table.Th>
+                      <Table.Th>Average</Table.Th>
+                      <Table.Th>P95</Table.Th>
+                      <Table.Th>Avg overhead</Table.Th>
+                      <Table.Th>Avg throughput</Table.Th>
+                      <Table.Th>Notes</Table.Th>
+                    </Table.Tr>
+                  </Table.Thead>
+                  <Table.Tbody>
+                    {targets.map((target) => (
+                      <Table.Tr key={`${target.path_id}:${target.label}`}>
+                        <Table.Td>
+                          <Stack gap={2}>
+                            <Text size="sm" fw={600}>
+                              {target.label}
+                            </Text>
+                            <Text size="xs" c="dimmed">
+                              {target.target ?? "no explicit target"}
+                            </Text>
+                          </Stack>
+                        </Table.Td>
+                        <Table.Td>
+                          <Badge color={target.transport_mode === "relay" ? "teal" : "blue"} variant="light">
+                            {target.transport_mode}
+                          </Badge>
+                        </Table.Td>
+                        <Table.Td>
+                          <Badge
+                            color={latencyAssessmentColor(target.result?.summary.assessment ?? "warn")}
+                            variant="light"
+                          >
+                            {target.result?.summary.assessment ?? "failed"}
+                          </Badge>
+                        </Table.Td>
+                        <Table.Td>{formatDurationValue(target.result?.summary.avg_total_duration_ms)}</Table.Td>
+                        <Table.Td>{formatDurationValue(target.result?.summary.p95_total_duration_ms)}</Table.Td>
+                        <Table.Td>{formatDurationValue(target.result?.summary.avg_transport_overhead_ms)}</Table.Td>
+                        <Table.Td>{formatBinaryTransferSpeed(target.result?.summary.avg_throughput_bytes_per_sec)}</Table.Td>
+                        <Table.Td>
+                          <Text size="xs" c={target.error ? "red" : "dimmed"}>
+                            {target.error ??
+                              target.result?.summary.observations.join(" ") ??
+                              "No additional notes."}
+                          </Text>
+                        </Table.Td>
+                      </Table.Tr>
+                    ))}
+                  </Table.Tbody>
+                </Table>
+              </Table.ScrollContainer>
+            </Stack>
+          </Card>
+        </Grid.Col>
+
+        <Grid.Col span={12}>
+          <Card withBorder radius="md" padding="lg">
+            <Stack gap="sm">
+              <Text fw={700}>Raw result</Text>
+              <JsonBlock
+                value={
+                  result ?? {
+                    status: loading ? "running" : "idle"
+                  }
+                }
+              />
+            </Stack>
+          </Card>
+        </Grid.Col>
+      </Grid>
+    </>
+  );
+}
+
 function StorePage({ binaryUpload }: { binaryUpload: BinaryUploadController }) {
   const [textUploadKey, setTextUploadKey] = useState("docs/readme.txt");
   const [textUploadValue, setTextUploadValue] = useState("hello from the React client UI");
@@ -1595,6 +1837,74 @@ function formatUnixTimestamp(value: number | null): string {
   }
 
   return new Date(value * 1000).toLocaleString();
+}
+
+function clampLatencyInput(
+  value: number | string | null | undefined,
+  min: number,
+  max: number,
+  fallback: number
+): number {
+  const numericValue =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim()
+        ? Number(value)
+        : fallback;
+  if (!Number.isFinite(numericValue)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.round(numericValue)));
+}
+
+function latencyAssessmentColor(assessment: LatencyProbeAssessment | "failed"): string {
+  if (assessment === "healthy") {
+    return "green";
+  }
+  if (assessment === "degraded" || assessment === "failed") {
+    return "red";
+  }
+  return "yellow";
+}
+
+function formatDurationValue(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) {
+    return "n/a";
+  }
+  return `${value.toFixed(1)} ms`;
+}
+
+function formatLatencyAverage(target: ClientLatencyProbeTargetResult | null): string {
+  if (!target) {
+    return "Unavailable";
+  }
+  if (target.error) {
+    return "Failed";
+  }
+  return formatDurationValue(target.result?.summary.avg_total_duration_ms);
+}
+
+function selectLatencyTargetByAverage(
+  targets: ClientLatencyProbeTargetResult[],
+  mode: "min" | "max"
+): ClientLatencyProbeTargetResult | null {
+  const successfulTargets = targets.filter(
+    (target) =>
+      target.result?.summary.avg_total_duration_ms != null &&
+      !target.error
+  );
+  if (successfulTargets.length === 0) {
+    return targets[0] ?? null;
+  }
+
+  return successfulTargets.reduce((selected, target) => {
+    const selectedValue = selected.result?.summary.avg_total_duration_ms ?? 0;
+    const targetValue = target.result?.summary.avg_total_duration_ms ?? 0;
+    if (mode === "min") {
+      return targetValue < selectedValue ? target : selected;
+    }
+    return targetValue > selectedValue ? target : selected;
+  });
 }
 
 function summarizeClientConnection(connection: ClientRendezvousView | null): {

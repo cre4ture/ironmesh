@@ -153,6 +153,28 @@ pub fn build_http_client_with_identity_from_planned_target(
     )
 }
 
+pub fn build_client_with_optional_identity_from_planned_target(
+    target: &PlannedConnectionBootstrapTarget,
+    identity: Option<&ClientIdentityMaterial>,
+) -> Result<IronMeshClient> {
+    match identity {
+        Some(identity) => build_http_client_with_identity_from_planned_target(target, identity),
+        None => {
+            if let Some(server_base_url) = target.server_base_url.as_deref() {
+                return build_http_client_from_pem(
+                    target
+                        .server_ca_pem
+                        .as_deref()
+                        .or(target.cluster_ca_pem.as_deref()),
+                    server_base_url,
+                );
+            }
+
+            bail!("relay-backed client transport requires enrolled client identity material");
+        }
+    }
+}
+
 pub fn build_http_client(
     server_ca_cert: Option<&Path>,
     base_url_str: &str,

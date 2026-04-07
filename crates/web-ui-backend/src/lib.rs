@@ -10,10 +10,12 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use client_sdk::{
-    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, RelayMode,
+    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
+    IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult, RelayMode,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
     RendezvousEndpointStatus, RequestedRange, StoreIndexView, UploadMode,
-    build_http_client_from_pem, build_http_client_with_identity_from_pem,
+    build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
+    build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     ironmesh_client::DownloadRangeRequest,
 };
 use reqwest::Url;
@@ -22,7 +24,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -322,6 +324,7 @@ pub fn router(config: WebUiConfig) -> Router {
             get(web_rendezvous).put(web_update_rendezvous),
         )
         .route("/api/rendezvous/refresh", post(web_refresh_rendezvous))
+        .route("/api/latency-test", post(web_latency_test))
         .route("/api/ping", get(web_ping))
         .route("/{*path}", get(web_static_file))
         .with_state(state)
@@ -357,6 +360,13 @@ fn env_flag_is_truthy(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn unix_ts_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Deserialize)]
@@ -488,6 +498,15 @@ struct WebRendezvousUpdateRequest {
     rendezvous_urls: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WebLatencyProbeRequest {
+    sample_count: Option<usize>,
+    warmup_count: Option<usize>,
+    response_bytes: Option<usize>,
+    server_delay_ms: Option<u64>,
+    pause_between_samples_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct WebClientRendezvousView {
     available: bool,
@@ -516,6 +535,29 @@ struct WebClientRendezvousEndpointStatus {
     active: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct WebLatencyProbeTargetResult {
+    path_id: String,
+    label: String,
+    transport_mode: String,
+    uses_current_runtime: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<LatencyProbeResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebLatencyProbeResponse {
+    generated_at_unix_ms: u64,
+    config: LatencyProbeConfig,
+    targets: Vec<WebLatencyProbeTargetResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comparison: Option<LatencyProbeComparison>,
+}
+
 fn error_response(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
 }
@@ -530,6 +572,188 @@ async fn current_sdk(state: &WebState) -> IronMeshClient {
 
 async fn current_client(state: &WebState) -> ClientNode {
     state.runtime.read().await.client.clone()
+}
+
+fn web_latency_probe_config(payload: WebLatencyProbeRequest) -> LatencyProbeConfig {
+    let mut config = LatencyProbeConfig::default();
+    if let Some(sample_count) = payload.sample_count {
+        config.sample_count = sample_count;
+    }
+    if let Some(warmup_count) = payload.warmup_count {
+        config.warmup_count = warmup_count;
+    }
+    if let Some(response_bytes) = payload.response_bytes {
+        config.response_bytes = response_bytes;
+    }
+    if let Some(server_delay_ms) = payload.server_delay_ms {
+        config.server_delay_ms = server_delay_ms;
+    }
+    if let Some(pause_between_samples_ms) = payload.pause_between_samples_ms {
+        config.pause_between_samples_ms = pause_between_samples_ms;
+    }
+    config
+}
+
+fn web_latency_target_description(client: &IronMeshClient) -> Option<String> {
+    if client.uses_relay_transport() {
+        let rendezvous_hint = client
+            .rendezvous_client()
+            .and_then(|rendezvous| rendezvous.config().rendezvous_urls.first().cloned())
+            .unwrap_or_else(|| "rendezvous".to_string());
+        return client.relay_target_node_id().map(|node_id| {
+            format!(
+                "relay://{node_id}@{}",
+                rendezvous_hint.trim_end_matches('/')
+            )
+        });
+    }
+
+    client
+        .direct_server_base_url()
+        .map(|url| url.trim_end_matches('/').to_string())
+}
+
+async fn probe_web_latency_client(
+    path_id: &str,
+    label: String,
+    transport_mode: String,
+    uses_current_runtime: bool,
+    target: Option<String>,
+    client: &IronMeshClient,
+    config: &LatencyProbeConfig,
+) -> WebLatencyProbeTargetResult {
+    match client.run_latency_probe(config.clone()).await {
+        Ok(result) => WebLatencyProbeTargetResult {
+            path_id: path_id.to_string(),
+            label,
+            transport_mode,
+            uses_current_runtime,
+            target,
+            result: Some(result),
+            error: None,
+        },
+        Err(error) => WebLatencyProbeTargetResult {
+            path_id: path_id.to_string(),
+            label,
+            transport_mode,
+            uses_current_runtime,
+            target,
+            result: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+async fn probe_web_relay_latency_targets(
+    current_client: &IronMeshClient,
+    diagnostic_targets: &ConnectionBootstrapDiagnosticTargets,
+    identity: Option<&ClientIdentityMaterial>,
+    config: &LatencyProbeConfig,
+    include_current_runtime_if_relay: bool,
+) -> Vec<WebLatencyProbeTargetResult> {
+    let mut results = Vec::new();
+
+    if include_current_runtime_if_relay && current_client.uses_relay_transport() {
+        results.push(
+            probe_web_latency_client(
+                "relay-current",
+                "Relay path (current runtime)".to_string(),
+                "relay".to_string(),
+                true,
+                web_latency_target_description(current_client),
+                current_client,
+                config,
+            )
+            .await,
+        );
+    }
+
+    if diagnostic_targets.relay.is_empty() {
+        if results.is_empty() {
+            results.push(WebLatencyProbeTargetResult {
+                path_id: "relay".to_string(),
+                label: "Relay path".to_string(),
+                transport_mode: "relay".to_string(),
+                uses_current_runtime: false,
+                target: None,
+                result: None,
+                error: Some("no relay bootstrap target is available for diagnostics".to_string()),
+            });
+        }
+        return results;
+    }
+
+    for (index, target) in diagnostic_targets.relay.iter().enumerate() {
+        let rendezvous_hint = target
+            .rendezvous_urls
+            .first()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| "rendezvous".to_string());
+        let target_description = target
+            .target_node_id
+            .map(|node_id| format!("relay://{node_id}@{rendezvous_hint}"));
+        let path_id = format!("relay-{}", index + 1);
+        let label = format!("Relay via {rendezvous_hint}");
+
+        match build_client_with_optional_identity_from_planned_target(target, identity) {
+            Ok(client) => {
+                results.push(
+                    probe_web_latency_client(
+                        &path_id,
+                        label,
+                        "relay".to_string(),
+                        false,
+                        target_description,
+                        &client,
+                        config,
+                    )
+                    .await,
+                );
+            }
+            Err(error) => {
+                results.push(WebLatencyProbeTargetResult {
+                    path_id,
+                    label,
+                    transport_mode: "relay".to_string(),
+                    uses_current_runtime: false,
+                    target: target_description
+                        .or_else(|| target.target_node_id.map(|node_id| node_id.to_string())),
+                    result: None,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+fn dedup_web_latency_targets(targets: &mut Vec<WebLatencyProbeTargetResult>) {
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|target| {
+        let key = format!(
+            "{}:{}",
+            target.transport_mode,
+            target.target.as_deref().unwrap_or_default()
+        );
+        seen.insert(key)
+    });
+}
+
+fn select_web_direct_and_relay_results(
+    targets: &[WebLatencyProbeTargetResult],
+) -> Option<(&LatencyProbeResult, &LatencyProbeResult)> {
+    let direct = targets.iter().find_map(|target| {
+        (target.path_id == "direct" || target.transport_mode == "direct")
+            .then(|| target.result.as_ref())
+            .flatten()
+    })?;
+    let relay = targets.iter().find_map(|target| {
+        (target.path_id == "relay" || target.transport_mode == "relay")
+            .then(|| target.result.as_ref())
+            .flatten()
+    })?;
+    Some((direct, relay))
 }
 
 fn normalize_store_restore_path(path: &str, is_prefix: bool) -> String {
@@ -2211,6 +2435,112 @@ async fn web_refresh_rendezvous(State(state): State<WebState>) -> impl IntoRespo
     (
         StatusCode::OK,
         Json(probe_rendezvous_and_build_view(&state).await),
+    )
+        .into_response()
+}
+
+async fn web_latency_test(
+    State(state): State<WebState>,
+    Json(payload): Json<WebLatencyProbeRequest>,
+) -> impl IntoResponse {
+    let config = web_latency_probe_config(payload);
+    if let Err(error) = config.validate() {
+        return error_response(StatusCode::BAD_REQUEST, error.to_string());
+    }
+
+    let (current_client, diagnostic_targets, identity) = {
+        let runtime = state.runtime.read().await;
+        let diagnostic_targets = runtime
+            .rendezvous
+            .as_ref()
+            .map(|config| config.bootstrap.diagnostic_targets())
+            .transpose();
+        let diagnostic_targets = match diagnostic_targets {
+            Ok(targets) => targets.unwrap_or_default(),
+            Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+        };
+        (
+            runtime.sdk.clone(),
+            diagnostic_targets,
+            runtime
+                .rendezvous
+                .as_ref()
+                .and_then(|config| config.client_identity.clone()),
+        )
+    };
+
+    let mut targets = vec![
+        probe_web_latency_client(
+            "current",
+            "Current runtime path".to_string(),
+            if current_client.uses_relay_transport() {
+                "relay".to_string()
+            } else {
+                "direct".to_string()
+            },
+            true,
+            web_latency_target_description(&current_client),
+            &current_client,
+            &config,
+        )
+        .await,
+    ];
+
+    if current_client.uses_relay_transport() {
+        if let Some(target) = diagnostic_targets.direct.as_ref() {
+            match build_client_with_optional_identity_from_planned_target(target, identity.as_ref())
+            {
+                Ok(client) => {
+                    targets.push(
+                        probe_web_latency_client(
+                            "direct",
+                            "Direct bootstrap path".to_string(),
+                            "direct".to_string(),
+                            false,
+                            target.server_base_url.clone(),
+                            &client,
+                            &config,
+                        )
+                        .await,
+                    );
+                }
+                Err(error) => targets.push(WebLatencyProbeTargetResult {
+                    path_id: "direct".to_string(),
+                    label: "Direct bootstrap path".to_string(),
+                    transport_mode: "direct".to_string(),
+                    uses_current_runtime: false,
+                    target: target.server_base_url.clone(),
+                    result: None,
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+    }
+
+    targets.extend(
+        probe_web_relay_latency_targets(
+            &current_client,
+            &diagnostic_targets,
+            identity.as_ref(),
+            &config,
+            true,
+        )
+        .await,
+    );
+    dedup_web_latency_targets(&mut targets);
+
+    let comparison = select_web_direct_and_relay_results(&targets)
+        .map(|(direct, relay)| compare_direct_and_relay_latency(Some(direct), Some(relay)))
+        .flatten();
+
+    (
+        StatusCode::OK,
+        Json(WebLatencyProbeResponse {
+            generated_at_unix_ms: unix_ts_ms(),
+            config,
+            targets,
+            comparison,
+        }),
     )
         .into_response()
 }

@@ -15,6 +15,78 @@ export type ClientUiRuntimeInfo = {
   service_name?: string;
 };
 
+export type LatencyProbeAssessment = "healthy" | "warn" | "degraded";
+
+export type LatencyProbeSample = {
+  index: number;
+  started_unix_ms: number;
+  successful: boolean;
+  status_code?: number | null;
+  total_duration_ms: number;
+  server_duration_ms?: number | null;
+  transport_overhead_ms?: number | null;
+  response_bytes: number;
+  throughput_bytes_per_sec?: number | null;
+  node_id?: string | null;
+  error?: string | null;
+};
+
+export type LatencyProbeSummary = {
+  requested_samples: number;
+  success_count: number;
+  failure_count: number;
+  min_total_duration_ms?: number | null;
+  avg_total_duration_ms?: number | null;
+  p50_total_duration_ms?: number | null;
+  p95_total_duration_ms?: number | null;
+  max_total_duration_ms?: number | null;
+  avg_server_duration_ms?: number | null;
+  avg_transport_overhead_ms?: number | null;
+  p95_transport_overhead_ms?: number | null;
+  avg_throughput_bytes_per_sec?: number | null;
+  assessment: LatencyProbeAssessment;
+  observations: string[];
+};
+
+export type LatencyProbeResult = {
+  config: {
+    sample_count: number;
+    warmup_count: number;
+    response_bytes: number;
+    server_delay_ms: number;
+    pause_between_samples_ms: number;
+  };
+  route: string;
+  generated_at_unix_ms: number;
+  samples: LatencyProbeSample[];
+  summary: LatencyProbeSummary;
+};
+
+export type LatencyProbeComparison = {
+  assessment: LatencyProbeAssessment;
+  relay_avg_total_delta_ms?: number | null;
+  relay_avg_total_ratio?: number | null;
+  relay_avg_transport_overhead_delta_ms?: number | null;
+  observations: string[];
+};
+
+export type ClientLatencyProbeTargetResult = {
+  path_id: string;
+  label: string;
+  transport_mode: "direct" | "relay" | string;
+  uses_current_runtime: boolean;
+  target?: string | null;
+  result?: LatencyProbeResult | null;
+  error?: string | null;
+};
+
+export type ClientLatencyTestResponse = {
+  generated_at_unix_ms: number;
+  config: LatencyProbeResult["config"];
+  targets: ClientLatencyProbeTargetResult[];
+  comparison?: LatencyProbeComparison | null;
+};
+
 export type ClientRendezvousEndpointStatus = {
   url: string;
   status: "unknown" | "connected" | "disconnected";
