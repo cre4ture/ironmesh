@@ -49,6 +49,7 @@ pub use rendezvous::{
     PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
     RendezvousEndpointStatus, RendezvousRuntimeState, TransportCapability,
+    is_expected_idle_relay_tunnel_accept_timeout,
 };
 pub use rendezvous_runtime::{
     BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayBroker, RelayBrokerStats,

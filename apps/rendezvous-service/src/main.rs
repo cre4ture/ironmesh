@@ -397,7 +397,14 @@ async fn serve_relay_tunnel_websocket(
     mut socket: WebSocket,
 ) {
     if let Err(err) = run_relay_tunnel_websocket(&state, &authenticated_peer, &mut socket).await {
-        warn!(error = %err, "relay tunnel websocket failed");
+        if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(&err.to_string()) {
+            tracing::debug!(
+                error = %err,
+                "relay tunnel websocket closed after idle target wait"
+            );
+        } else {
+            warn!(error = %err, "relay tunnel websocket failed");
+        }
         let _ = send_relay_tunnel_control(
             &mut socket,
             &RelayTunnelControlMessage::Error {

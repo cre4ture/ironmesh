@@ -4858,11 +4858,21 @@ fn spawn_rendezvous_relay_tunnel_agent(state: ServerState, local_base_url: Strin
                         break;
                     }
                     Err(err) => {
-                        warn!(
-                            error = %err,
-                            rendezvous_url = %endpoint.url,
-                            "relay tunnel accept failed"
-                        );
+                        if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(
+                            &err.to_string(),
+                        ) {
+                            tracing::debug!(
+                                error = %err,
+                                rendezvous_url = %endpoint.url,
+                                "relay tunnel accept timed out without a source connection"
+                            );
+                        } else {
+                            warn!(
+                                error = %err,
+                                rendezvous_url = %endpoint.url,
+                                "relay tunnel accept failed"
+                            );
+                        }
                     }
                 }
             }

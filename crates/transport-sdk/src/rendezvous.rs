@@ -489,6 +489,10 @@ impl RendezvousControlClient {
     }
 }
 
+pub fn is_expected_idle_relay_tunnel_accept_timeout(error: &str) -> bool {
+    error.contains("timed out waiting for relay tunnel source")
+}
+
 impl TrackedRendezvousRuntimeState {
     fn new(urls: &[String]) -> Self {
         let mut state = Self::default();
@@ -545,6 +549,7 @@ impl TrackedRendezvousRuntimeState {
                     self.active_url = Some(endpoint.url.clone());
                 }
             }
+            Err(error) if is_expected_idle_relay_tunnel_accept_timeout(&error) => {}
             Err(error) => {
                 endpoint.status = RendezvousEndpointConnectionState::Disconnected;
                 endpoint.consecutive_failures = endpoint.consecutive_failures.saturating_add(1);
@@ -768,5 +773,39 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn idle_relay_tunnel_accept_timeout_does_not_mark_endpoint_disconnected() {
+        let cluster_id = Uuid::now_v7();
+        let url = "https://rendezvous.example:9443";
+        let client = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id,
+                rendezvous_urls: vec![url.to_string()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+
+        client.record_endpoint_result(url, Ok(()), true);
+        client.record_endpoint_result(
+            url,
+            Err(format!(
+                "failed accepting relay tunnel target at {url}: relay tunnel establishment failed: timed out waiting for relay tunnel source"
+            )),
+            true,
+        );
+
+        let runtime_state = client.runtime_state();
+        assert_eq!(
+            runtime_state.endpoint_statuses[0].status,
+            RendezvousEndpointConnectionState::Connected
+        );
+        assert_eq!(runtime_state.endpoint_statuses[0].consecutive_failures, 0);
+        assert_eq!(runtime_state.endpoint_statuses[0].last_error, None);
+        assert_eq!(runtime_state.active_url.as_deref(), Some(url));
     }
 }
