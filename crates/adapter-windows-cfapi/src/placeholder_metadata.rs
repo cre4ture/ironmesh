@@ -4,7 +4,7 @@ use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity,
     cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_with_oplock,
-    open_sync_path, path_is_placeholder,
+    describe_path_state, open_sync_path, path_is_placeholder,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::content_fingerprint::file_content_fingerprint;
@@ -144,6 +144,7 @@ pub fn reconcile_remote_delete_state(
     provider_instance_id: Uuid,
 ) -> Result<RemoteDeleteReconcileReport> {
     let current_remote_files = current_remote_file_paths(current_snapshot);
+    let current_remote_directories = current_remote_directory_paths(current_snapshot);
     let mut report = RemoteDeleteReconcileReport::default();
     let mut local_file_candidates = Vec::new();
 
@@ -228,6 +229,95 @@ pub fn reconcile_remote_delete_state(
         }
     }
 
+    let mut local_directory_candidates = Vec::new();
+    for entry in WalkDir::new(sync_root_path)
+        .min_depth(1)
+        .into_iter()
+        .flatten()
+    {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let relative_path = path_to_relative(sync_root_path, &entry.path().to_string_lossy());
+        if relative_path.is_empty()
+            || is_internal_sync_root_relative_path(&relative_path)
+            || current_remote_directories.contains(relative_path.as_str())
+        {
+            continue;
+        }
+        local_directory_candidates.push((relative_path, entry.into_path()));
+    }
+
+    local_directory_candidates.sort_by(|(left, _), (right, _)| {
+        right
+            .matches('/')
+            .count()
+            .cmp(&left.matches('/').count())
+            .then_with(|| right.cmp(left))
+    });
+
+    for (relative_path, full_path) in local_directory_candidates {
+        let file = match open_sync_path(&full_path, false) {
+            Ok(file) => file,
+            Err(_) => {
+                report.preserved_paths.insert(relative_path);
+                continue;
+            }
+        };
+        let placeholder_info = match cf_get_placeholder_standard_info_with_identity(&file) {
+            Ok(info) => info,
+            Err(_) => {
+                report.preserved_paths.insert(relative_path);
+                continue;
+            }
+        };
+        let Some(identity) = decode_placeholder_file_identity(placeholder_info.file_identity())
+        else {
+            report.preserved_paths.insert(relative_path);
+            continue;
+        };
+        if identity.path != relative_path
+            || !matches!(
+                identity.provider_instance_id,
+                Some(identity_provider) if identity_provider == provider_instance_id
+            ) && identity.provider_instance_id.is_some()
+        {
+            report.preserved_paths.insert(relative_path);
+            continue;
+        }
+
+        let state_before = describe_path_state(&full_path);
+        match fs::remove_dir(&full_path) {
+            Ok(()) => {
+                tracing::info!(
+                    "remote-delete-reconcile: removed stale remote-managed directory {} state_before={}",
+                    full_path.display(),
+                    state_before
+                );
+                report.deleted_paths.insert(relative_path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                tracing::info!(
+                    "remote-delete-reconcile: preserved non-empty stale directory {} error={} state={}",
+                    full_path.display(),
+                    error,
+                    state_before
+                );
+                report.preserved_paths.insert(relative_path);
+            }
+            Err(error) => {
+                tracing::info!(
+                    "remote-delete-reconcile: failed to remove stale remote-managed directory {} error={} state={}",
+                    full_path.display(),
+                    error,
+                    state_before
+                );
+                report.suppressed_startup_paths.insert(relative_path);
+            }
+        }
+    }
+
     Ok(report)
 }
 
@@ -286,6 +376,35 @@ fn current_remote_file_paths(snapshot: &SyncSnapshot) -> BTreeSet<String> {
         .filter(|entry| entry.kind == EntryKind::File)
         .map(|entry| normalize_path(&entry.path))
         .collect()
+}
+
+fn current_remote_directory_paths(snapshot: &SyncSnapshot) -> BTreeSet<String> {
+    let mut directories = BTreeSet::new();
+
+    for entry in &snapshot.remote {
+        let normalized = normalize_path(&entry.path);
+        if normalized.is_empty() {
+            continue;
+        }
+
+        if entry.kind == EntryKind::Directory {
+            directories.insert(normalized.clone());
+        }
+
+        let segments = normalized
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let limit = match entry.kind {
+            EntryKind::Directory => segments.len(),
+            EntryKind::File => segments.len().saturating_sub(1),
+        };
+        for depth in 1..=limit {
+            directories.insert(segments[..depth].join("/"));
+        }
+    }
+
+    directories
 }
 
 fn identity_has_remote_baseline(identity: &PlaceholderFileIdentity) -> bool {

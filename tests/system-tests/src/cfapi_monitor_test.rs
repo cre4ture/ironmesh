@@ -282,6 +282,21 @@ mod tests {
         panic!("timed out waiting for path absence {}", path.display());
     }
 
+    async fn assert_path_stays_absent(path: &Path, duration: Duration, poll_interval: Duration) {
+        let deadline = tokio::time::Instant::now() + duration;
+        loop {
+            if path.exists() {
+                panic!("path unexpectedly reappeared at {}", path.display());
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     async fn wait_for_hydrated_payload(path: &Path, expected: &[u8], retries: usize) {
         for _ in 0..retries {
             if let Ok(bytes) = std::fs::read(path)
@@ -1522,6 +1537,176 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sync_root);
     }
 
+    async fn run_cfapi_local_folder_rename_with_content_case(bind: &str) {
+        let sync_root = fresh_data_dir("cfapi-local-folder-rename-with-content-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture = start_authenticated_cfapi_fixture(
+            bind,
+            &sync_root,
+            "cfapi-local-folder-rename-with-content",
+        )
+        .await
+        .expect("failed to start authenticated CFAPI fixture");
+
+        let old_root_marker = "local-folder-move/from/";
+        let old_nested_marker = "local-folder-move/from/nested/";
+        let old_file = "local-folder-move/from/nested/inside.txt";
+        let new_root = "local-folder-move/to";
+        let new_file = "local-folder-move/to/nested/inside.txt";
+        let payload = b"cfapi-local-folder-move-payload".to_vec();
+
+        fixture
+            .sdk
+            .put(old_root_marker, Bytes::new())
+            .await
+            .expect("failed to seed remote root marker");
+        fixture
+            .sdk
+            .put(old_nested_marker, Bytes::new())
+            .await
+            .expect("failed to seed remote nested marker");
+        fixture
+            .sdk
+            .put_large_aware(old_file, Bytes::from(payload.clone()))
+            .await
+            .expect("failed to seed remote file for folder rename");
+
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            "ironmesh.systemtest.local.folder.rename.with.content",
+            "ironmesh System Test Local Folder Rename With Content",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let old_root_path = sync_root.join("local-folder-move").join("from");
+        let old_file_path = old_root_path.join("nested").join("inside.txt");
+        let new_root_path = sync_root.join("local-folder-move").join("to");
+        let new_file_path = new_root_path.join("nested").join("inside.txt");
+
+        wait_for_path(&old_file_path, 220).await;
+        wait_for_placeholder_in_sync(&old_file_path, 220).await;
+        request_online_only_via_attrib(&old_file_path)
+            .expect("failed to request online-only state before local folder rename");
+        wait_for_file_attribute_unpinned(&old_file_path, 220).await;
+        wait_for_placeholder_dehydrated(&old_file_path, 220).await;
+
+        std::fs::rename(&old_root_path, &new_root_path)
+            .expect("failed to rename local folder with content inside sync root");
+
+        wait_for_path(&new_file_path, 120).await;
+        wait_for_path_absence(&old_root_path, 220).await;
+        wait_for_remote_payload(&fixture.sdk, new_file, &payload, 260).await;
+        wait_for_remote_file_absence(&fixture.sdk, old_file, 260).await;
+        wait_for_remote_directory_presence_any_shape(&fixture.sdk, new_root, 260).await;
+        wait_for_remote_directory_absence(&fixture.sdk, "local-folder-move/from", 260).await;
+        assert_path_stays_absent(
+            &old_root_path,
+            Duration::from_secs(4),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
+    async fn run_cfapi_remote_folder_rename_refresh_case(bind: &str) {
+        let sync_root = fresh_data_dir("cfapi-remote-folder-rename-refresh-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture = start_authenticated_cfapi_fixture(
+            bind,
+            &sync_root,
+            "cfapi-remote-folder-rename-refresh",
+        )
+        .await
+        .expect("failed to start authenticated CFAPI fixture");
+
+        let old_root = "remote-folder-move/from";
+        let old_root_marker = "remote-folder-move/from/";
+        let old_nested_marker = "remote-folder-move/from/nested/";
+        let old_file = "remote-folder-move/from/nested/inside.txt";
+        let new_root = "remote-folder-move/to";
+        let new_root_marker = "remote-folder-move/to/";
+        let new_nested_marker = "remote-folder-move/to/nested/";
+        let new_file = "remote-folder-move/to/nested/inside.txt";
+        let payload = b"cfapi-remote-folder-move-payload".to_vec();
+
+        fixture
+            .sdk
+            .put(old_root_marker, Bytes::new())
+            .await
+            .expect("failed to seed remote root marker");
+        fixture
+            .sdk
+            .put(old_nested_marker, Bytes::new())
+            .await
+            .expect("failed to seed remote nested marker");
+        fixture
+            .sdk
+            .put_large_aware(old_file, Bytes::from(payload.clone()))
+            .await
+            .expect("failed to seed remote file for remote folder rename");
+
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            "ironmesh.systemtest.remote.folder.rename.refresh",
+            "ironmesh System Test Remote Folder Rename Refresh",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let old_root_path = sync_root.join("remote-folder-move").join("from");
+        let old_file_path = old_root_path.join("nested").join("inside.txt");
+        let new_root_path = sync_root.join("remote-folder-move").join("to");
+        let new_file_path = new_root_path.join("nested").join("inside.txt");
+
+        wait_for_path(&old_file_path, 220).await;
+        wait_for_placeholder_in_sync(&old_file_path, 220).await;
+        request_online_only_via_attrib(&old_file_path)
+            .expect("failed to request online-only state before remote folder rename");
+        wait_for_file_attribute_unpinned(&old_file_path, 220).await;
+        wait_for_placeholder_dehydrated(&old_file_path, 220).await;
+
+        fixture
+            .sdk
+            .rename_path(old_file, new_file, false)
+            .await
+            .expect("failed to rename remote file inside folder");
+        fixture
+            .sdk
+            .rename_path(old_nested_marker, new_nested_marker, false)
+            .await
+            .expect("failed to rename remote nested folder marker");
+        fixture
+            .sdk
+            .rename_path(old_root_marker, new_root_marker, false)
+            .await
+            .expect("failed to rename remote root folder marker");
+
+        wait_for_path(&new_file_path, 260).await;
+        wait_for_path_absence(&old_root_path, 260).await;
+        wait_for_hydrated_payload(&new_file_path, &payload, 260).await;
+        wait_for_remote_directory_presence_any_shape(&fixture.sdk, new_root, 260).await;
+        wait_for_remote_directory_absence(&fixture.sdk, old_root, 260).await;
+        wait_for_remote_file_absence(&fixture.sdk, old_file, 260).await;
+        assert_path_stays_absent(
+            &old_root_path,
+            Duration::from_secs(4),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
     async fn run_cfapi_remote_delete_restart_case(
         bind: &str,
         key: &str,
@@ -1930,6 +2115,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cfapi_local_folder_rename_with_content_does_not_resurrect_original() {
+        run_cfapi_local_folder_rename_with_content_case("127.0.0.1:19155").await;
+    }
+
+    #[tokio::test]
     async fn test_cfapi_dehydrated_in_sync_file_rename_preserves_remote_object_identity() {
         run_cfapi_remote_file_rename_case(
             "127.0.0.1:19113",
@@ -1951,6 +2141,11 @@ mod tests {
             true,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_cfapi_remote_folder_rename_refresh_does_not_resurrect_original() {
+        run_cfapi_remote_folder_rename_refresh_case("127.0.0.1:19156").await;
     }
 
     #[tokio::test]
