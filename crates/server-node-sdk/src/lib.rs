@@ -11,13 +11,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Body;
 use axum::extract::FromRequestParts;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::ws::{Message as AxumWsMessage, WebSocket as AxumWebSocket};
+use axum::extract::{Path, Query, Request, State, WebSocketUpgrade};
 use axum::http::header;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -32,7 +34,7 @@ use bytes::Bytes;
 use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
-use common::{ClusterId, HealthStatus, NodeId};
+use common::{ClusterId, DeviceId, HealthStatus, NodeId};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -63,7 +65,7 @@ use transport_sdk::{
     ClientBootstrapClaim, ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
     ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ClientEnrollmentRequest,
-    ConnectionCandidate, MultiplexConfig, MultiplexedSession,
+    ConnectionCandidate, MultiplexConfig, MultiplexMode, MultiplexedSession,
     NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
     NodeJoinRequest, ParsedRelayWireHttpRequest, PeerIdentity, PeerTransportClient,
     PeerTransportClientConfig, PresenceRegistration, RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES,
@@ -79,6 +81,7 @@ use transport_sdk::{
     verify_signed_request_headers, write_buffered_transport_response,
 };
 use uuid::Uuid;
+use futures_util::{Sink, Stream};
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_REVISION: &str =
@@ -3490,6 +3493,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     let build_http_routers_phase_started_at =
         log_server_startup_phase_begin("build_http_routers", startup_phase_anchor);
     let public_client_api = Router::new()
+        .route("/transport/ws", get(client_transport_ws))
         .route("/diagnostics/latency", get(latency_diagnostic))
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
@@ -4763,6 +4767,245 @@ fn normalize_peer_path_and_query(path_and_query: &str) -> Result<String> {
     } else {
         Ok(format!("/{trimmed}"))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectTransportWsMessage {
+    Binary(Vec<u8>),
+    Text(String),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    Close,
+}
+
+impl transport_sdk::WebSocketMessageCodec for DirectTransportWsMessage {
+    fn decode(self) -> std::io::Result<transport_sdk::DecodedWebSocketMessage> {
+        Ok(match self {
+            Self::Binary(bytes) => transport_sdk::DecodedWebSocketMessage::Binary(bytes),
+            Self::Text(_) => transport_sdk::DecodedWebSocketMessage::Ignore,
+            Self::Ping(payload) => transport_sdk::DecodedWebSocketMessage::Ping(payload),
+            Self::Pong(_) => transport_sdk::DecodedWebSocketMessage::Pong,
+            Self::Close => transport_sdk::DecodedWebSocketMessage::Close,
+        })
+    }
+
+    fn binary(bytes: Vec<u8>) -> Self {
+        Self::Binary(bytes)
+    }
+
+    fn pong(bytes: Vec<u8>) -> Self {
+        Self::Pong(bytes)
+    }
+}
+
+struct DirectTransportSocketAdapter {
+    socket: AxumWebSocket,
+}
+
+impl Stream for DirectTransportSocketAdapter {
+    type Item = Result<DirectTransportWsMessage, axum::Error>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.socket).poll_next(cx) {
+            Poll::Ready(Some(Ok(AxumWsMessage::Binary(bytes)))) => {
+                Poll::Ready(Some(Ok(DirectTransportWsMessage::Binary(bytes.to_vec()))))
+            }
+            Poll::Ready(Some(Ok(AxumWsMessage::Text(text)))) => {
+                Poll::Ready(Some(Ok(DirectTransportWsMessage::Text(text.to_string()))))
+            }
+            Poll::Ready(Some(Ok(AxumWsMessage::Ping(payload)))) => {
+                Poll::Ready(Some(Ok(DirectTransportWsMessage::Ping(payload.to_vec()))))
+            }
+            Poll::Ready(Some(Ok(AxumWsMessage::Pong(payload)))) => {
+                Poll::Ready(Some(Ok(DirectTransportWsMessage::Pong(payload.to_vec()))))
+            }
+            Poll::Ready(Some(Ok(AxumWsMessage::Close(_)))) => {
+                Poll::Ready(Some(Ok(DirectTransportWsMessage::Close)))
+            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Sink<DirectTransportWsMessage> for DirectTransportSocketAdapter {
+    type Error = axum::Error;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().socket).poll_ready(cx)
+    }
+
+    fn start_send(
+        self: Pin<&mut Self>,
+        item: DirectTransportWsMessage,
+    ) -> Result<(), Self::Error> {
+        let message = match item {
+            DirectTransportWsMessage::Binary(bytes) => AxumWsMessage::Binary(bytes.into()),
+            DirectTransportWsMessage::Text(text) => AxumWsMessage::Text(text.into()),
+            DirectTransportWsMessage::Ping(payload) => AxumWsMessage::Ping(payload.into()),
+            DirectTransportWsMessage::Pong(payload) => AxumWsMessage::Pong(payload.into()),
+            DirectTransportWsMessage::Close => AxumWsMessage::Close(None),
+        };
+        Pin::new(&mut self.get_mut().socket).start_send(message)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().socket).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().socket).poll_close(cx)
+    }
+}
+
+fn direct_transport_base_url(state: &ServerState, headers: &HeaderMap) -> Result<String> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("direct transport websocket request is missing a host header"))?;
+    let scheme = if state.public_tls_runtime.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    Ok(format!("{scheme}://{host}/"))
+}
+
+fn direct_transport_http_client(state: &ServerState) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(ca_pem) = state
+        .public_ca_pem
+        .as_deref()
+        .or(state.cluster_ca_pem.as_deref())
+    {
+        let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
+            .context("failed parsing direct transport public CA certificate")?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .context("failed building direct transport local HTTP client")
+}
+
+async fn serve_direct_transport_session(
+    state: ServerState,
+    peer: PeerIdentity,
+    mut session: MultiplexedSession,
+    local_http: reqwest::Client,
+    local_base_url: String,
+) -> Result<()> {
+    let hello = perform_transport_server_handshake(
+        &mut session,
+        TransportSessionControlMessage::Ready {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            session_id: format!("direct-{}", Uuid::now_v7()),
+            max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+        },
+    )
+    .await
+    .context("failed completing direct transport handshake")?;
+    let TransportSessionControlMessage::Hello {
+        cluster_id,
+        peer: hello_peer,
+        ..
+    } = hello
+    else {
+        bail!("direct transport handshake did not return a hello control message");
+    };
+    if cluster_id != state.cluster_id {
+        bail!(
+            "direct transport handshake cluster_id {} did not match local cluster {}",
+            cluster_id,
+            state.cluster_id
+        );
+    }
+    if hello_peer != peer {
+        bail!(
+            "direct transport handshake peer {} did not match authenticated peer {}",
+            hello_peer,
+            peer
+        );
+    }
+
+    loop {
+        let next = session
+            .accept_stream()
+            .await
+            .context("failed accepting direct transport stream")?;
+        let Some(stream) = next else {
+            return Ok(());
+        };
+
+        let local_http = local_http.clone();
+        let local_base_url = local_base_url.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_multiplexed_relay_stream(local_http, local_base_url, stream).await
+            {
+                warn!(error = %err, "direct transport request stream failed");
+            }
+        });
+    }
+}
+
+async fn client_transport_ws(
+    State(state): State<ServerState>,
+    websocket: WebSocketUpgrade,
+    headers: HeaderMap,
+) -> Response {
+    let Some(device_id) = request_device_id(&headers).and_then(|value| DeviceId::parse_str(&value).ok()) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let local_base_url = match direct_transport_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    let local_http = match direct_transport_http_client(&state) {
+        Ok(client) => client,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
+    let peer = PeerIdentity::Device(device_id);
+
+    websocket
+        .on_upgrade(move |socket| async move {
+            let transport = transport_sdk::WebSocketByteStream::new(DirectTransportSocketAdapter {
+                socket,
+            });
+            let session = match MultiplexedSession::spawn(
+                transport,
+                MultiplexMode::Server,
+                MultiplexConfig::default(),
+            ) {
+                Ok(session) => session,
+                Err(err) => {
+                    warn!(error = %err, "failed spawning direct transport session");
+                    return;
+                }
+            };
+
+            if let Err(err) =
+                serve_direct_transport_session(state, peer, session, local_http, local_base_url)
+                    .await
+            {
+                warn!(error = %err, "direct transport session failed");
+            }
+        })
+        .into_response()
 }
 
 fn transport_headers_from_response(headers: &HeaderMap) -> Vec<TransportHeader> {

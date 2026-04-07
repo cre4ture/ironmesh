@@ -22,11 +22,12 @@ use sync_core::{NamespaceEntry, SyncSnapshot};
 use tokio::sync::Mutex;
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
-    ClientIdentityMaterial, MultiplexConfig, MultiplexedSession, PeerIdentity, RelayHttpHeader,
-    RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind, RendezvousControlClient,
-    TransportHeader, TransportSessionControlMessage,
+    ClientIdentityMaterial, MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity,
+    RelayHttpHeader, RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind,
+    RendezvousControlClient, TransportHeader, TransportSessionControlMessage,
     TransportSessionRole, TransportStreamKind, TRANSPORT_PROTOCOL_VERSION,
-    build_signed_request_headers, perform_transport_client_handshake,
+    WebSocketByteStream, build_signed_request_headers, connect_websocket,
+    perform_transport_client_handshake, websocket_url,
     read_buffered_transport_response, write_buffered_transport_request,
 };
 
@@ -64,8 +65,14 @@ enum ClientTransport {
     Direct {
         http: HttpClient,
         server_base_url: String,
+        server_ca_pem: Option<String>,
+        multiplex_session: Arc<Mutex<Option<DirectMultiplexSession>>>,
     },
     Relay(ClientRelayTransport),
+}
+
+struct DirectMultiplexSession {
+    session: Arc<MultiplexedSession>,
 }
 
 #[derive(Clone)]
@@ -94,6 +101,41 @@ fn header_value_for_log(headers: &HeaderMap, name: &str) -> String {
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string)
         .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn build_identity_request_auth_headers(
+    identity: &ClientIdentityMaterial,
+    method: &str,
+    path_and_query: &str,
+) -> Result<Vec<RelayHttpHeader>> {
+    let signed_headers =
+        build_signed_request_headers(identity, method, path_and_query, unix_ts(), None)?;
+    Ok(vec![
+        RelayHttpHeader {
+            name: transport_sdk::HEADER_CLUSTER_ID.to_string(),
+            value: signed_headers.cluster_id.to_string(),
+        },
+        RelayHttpHeader {
+            name: transport_sdk::HEADER_DEVICE_ID.to_string(),
+            value: signed_headers.device_id,
+        },
+        RelayHttpHeader {
+            name: transport_sdk::HEADER_CREDENTIAL_FINGERPRINT.to_string(),
+            value: signed_headers.credential_fingerprint,
+        },
+        RelayHttpHeader {
+            name: transport_sdk::HEADER_AUTH_TIMESTAMP.to_string(),
+            value: signed_headers.timestamp_unix.to_string(),
+        },
+        RelayHttpHeader {
+            name: transport_sdk::HEADER_AUTH_NONCE.to_string(),
+            value: signed_headers.nonce,
+        },
+        RelayHttpHeader {
+            name: transport_sdk::HEADER_AUTH_SIGNATURE.to_string(),
+            value: signed_headers.signature_base64,
+        },
+    ])
 }
 
 fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime> {
@@ -428,10 +470,20 @@ impl IronMeshClient {
     }
 
     pub fn from_direct_http_client(server_base_url: impl Into<String>, http: HttpClient) -> Self {
+        Self::from_direct_http_client_with_ca_pem(server_base_url, http, None)
+    }
+
+    pub fn from_direct_http_client_with_ca_pem(
+        server_base_url: impl Into<String>,
+        http: HttpClient,
+        server_ca_pem: Option<String>,
+    ) -> Self {
         Self {
             transport: ClientTransport::Direct {
                 http,
                 server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
+                server_ca_pem,
+                multiplex_session: Arc::new(Mutex::new(None)),
             },
             auth: ClientRequestAuth::None,
         }
@@ -498,40 +550,7 @@ impl IronMeshClient {
         match &self.auth {
             ClientRequestAuth::None => Ok(Vec::new()),
             ClientRequestAuth::SignedIdentity(identity) => {
-                let path_and_query = path_and_query(url);
-                let signed_headers = build_signed_request_headers(
-                    identity,
-                    method.as_str(),
-                    &path_and_query,
-                    unix_ts(),
-                    None,
-                )?;
-                Ok(vec![
-                    RelayHttpHeader {
-                        name: transport_sdk::HEADER_CLUSTER_ID.to_string(),
-                        value: signed_headers.cluster_id.to_string(),
-                    },
-                    RelayHttpHeader {
-                        name: transport_sdk::HEADER_DEVICE_ID.to_string(),
-                        value: signed_headers.device_id,
-                    },
-                    RelayHttpHeader {
-                        name: transport_sdk::HEADER_CREDENTIAL_FINGERPRINT.to_string(),
-                        value: signed_headers.credential_fingerprint,
-                    },
-                    RelayHttpHeader {
-                        name: transport_sdk::HEADER_AUTH_TIMESTAMP.to_string(),
-                        value: signed_headers.timestamp_unix.to_string(),
-                    },
-                    RelayHttpHeader {
-                        name: transport_sdk::HEADER_AUTH_NONCE.to_string(),
-                        value: signed_headers.nonce,
-                    },
-                    RelayHttpHeader {
-                        name: transport_sdk::HEADER_AUTH_SIGNATURE.to_string(),
-                        value: signed_headers.signature_base64,
-                    },
-                ])
+                build_identity_request_auth_headers(identity, method.as_str(), &path_and_query(url))
             }
         }
     }
@@ -568,11 +587,31 @@ impl IronMeshClient {
         auth_headers.append(&mut headers);
 
         match &self.transport {
-            ClientTransport::Direct { http, .. } => {
-                let mut request = self.apply_headers_to_request(
-                    http.request(method.clone(), url.clone()),
-                    &auth_headers,
-                );
+            ClientTransport::Direct {
+                http,
+                server_base_url,
+                server_ca_pem,
+                multiplex_session,
+            } => {
+                if let ClientRequestAuth::SignedIdentity(identity) = &self.auth {
+                    return execute_direct_multiplex_buffered_request(
+                        server_base_url,
+                        server_ca_pem.as_deref(),
+                        multiplex_session,
+                        identity,
+                        &method,
+                        &url,
+                        &auth_headers,
+                        body.as_deref().unwrap_or_default(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to execute multiplexed {} {}", method, url)
+                    });
+                }
+
+                let mut request =
+                    self.apply_headers_to_request(http.request(method.clone(), url.clone()), &auth_headers);
                 if let Some(body) = body {
                     request = request.body(body);
                 }
@@ -2301,6 +2340,132 @@ fn transport_stream_kind_for_path(path: &str) -> TransportStreamKind {
     }
 }
 
+fn websocket_header_pairs(headers: &[RelayHttpHeader]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|header| (header.name.clone(), header.value.clone()))
+        .collect()
+}
+
+async fn invalidate_direct_multiplex_session(
+    multiplex_session: &Arc<Mutex<Option<DirectMultiplexSession>>>,
+) {
+    let mut guard = multiplex_session.lock().await;
+    *guard = None;
+}
+
+async fn ensure_direct_multiplex_session(
+    server_base_url: &str,
+    server_ca_pem: Option<&str>,
+    multiplex_session: &Arc<Mutex<Option<DirectMultiplexSession>>>,
+    identity: &ClientIdentityMaterial,
+) -> Result<Arc<MultiplexedSession>> {
+    let mut guard = multiplex_session.lock().await;
+    if let Some(existing) = guard.as_ref() {
+        return Ok(Arc::clone(&existing.session));
+    }
+
+    let ws_url = websocket_url(server_base_url, "transport/ws")
+        .with_context(|| format!("failed building direct transport websocket URL from {server_base_url}"))?;
+    let ws_headers = websocket_header_pairs(&build_identity_request_auth_headers(
+        identity,
+        "GET",
+        "/transport/ws",
+    )?);
+    let websocket = connect_websocket(&ws_url, server_ca_pem, None, &ws_headers)
+        .await
+        .with_context(|| format!("failed opening direct transport websocket {}", ws_url))?;
+    let transport = WebSocketByteStream::new(websocket);
+    let multiplexed = MultiplexedSession::spawn(transport, MultiplexMode::Client, MultiplexConfig::default())
+        .context("failed creating direct multiplexed transport session")?;
+    perform_transport_client_handshake(
+        &multiplexed,
+        TransportSessionControlMessage::Hello {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            cluster_id: identity.cluster_id,
+            role: TransportSessionRole::Client,
+            peer: PeerIdentity::Device(identity.device_id),
+            target: None,
+        },
+    )
+    .await
+    .context("failed performing direct transport handshake")?;
+
+    let session = Arc::new(multiplexed);
+    *guard = Some(DirectMultiplexSession {
+        session: Arc::clone(&session),
+    });
+    Ok(session)
+}
+
+async fn execute_direct_multiplex_buffered_request(
+    server_base_url: &str,
+    server_ca_pem: Option<&str>,
+    multiplex_session: &Arc<Mutex<Option<DirectMultiplexSession>>>,
+    identity: &ClientIdentityMaterial,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body: &[u8],
+) -> Result<BufferedTransportResponse> {
+    let request_path = path_and_query(url);
+    let request_headers = transport_headers_from_relay_headers(headers);
+
+    for attempt in 0..2 {
+        let session = ensure_direct_multiplex_session(
+            server_base_url,
+            server_ca_pem,
+            multiplex_session,
+            identity,
+        )
+        .await
+        .context("failed ensuring direct multiplex session")?;
+        let request = BufferedTransportRequest::new(
+            transport_stream_kind_for_path(&request_path),
+            method.as_str(),
+            request_path.clone(),
+            request_headers.clone(),
+            body.to_vec(),
+        );
+
+        let result = async {
+            let mut stream = session
+                .open_stream()
+                .await
+                .context("failed opening direct multiplex request stream")?;
+            write_buffered_transport_request(&mut stream, &request)
+                .await
+                .context("failed writing direct multiplex request")?;
+            let response = read_buffered_transport_response(&mut stream)
+                .await
+                .context("failed reading direct multiplex response")?;
+            buffered_response_from_multiplex(response)
+        }
+        .await;
+
+        match result {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt == 0 => {
+                invalidate_direct_multiplex_session(multiplex_session).await;
+                tracing::debug!(
+                    error = %err,
+                    server_base_url,
+                    "retrying direct multiplex request after resetting cached session"
+                );
+            }
+            Err(err) => {
+                invalidate_direct_multiplex_session(multiplex_session).await;
+                return Err(err);
+            }
+        }
+    }
+
+    bail!(
+        "direct multiplex request retried without producing a response for {}",
+        server_base_url
+    )
+}
+
 impl ClientRelayTransport {
     async fn invalidate_multiplex_session(&self) {
         let mut guard = self.multiplex_session.lock().await;
@@ -3063,6 +3228,21 @@ mod tests {
         })
     }
 
+    async fn direct_transport_ws(
+        State(state): State<RelayTestState>,
+        websocket: WebSocketUpgrade,
+    ) -> impl axum::response::IntoResponse {
+        websocket.on_upgrade(move |socket| async move {
+            state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+            serve_test_multiplex_socket(
+                state,
+                socket,
+                format!("direct-session-{}", uuid::Uuid::now_v7()),
+            )
+            .await;
+        })
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RelayTestWsMessage {
         Binary(Vec<u8>),
@@ -3249,10 +3429,10 @@ mod tests {
             .expect("close_write should send");
     }
 
-    async fn serve_relay_multiplex_test_socket(
+    async fn serve_test_multiplex_socket(
         state: RelayTestState,
         socket: WebSocket,
-        ticket: RelayTicket,
+        session_id: String,
     ) {
         let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
         let mut session = MultiplexedSession::spawn(
@@ -3266,7 +3446,7 @@ mod tests {
             &mut session,
             TransportSessionControlMessage::Ready {
                 protocol_version: TRANSPORT_PROTOCOL_VERSION,
-                session_id: ticket.session_id,
+                session_id,
                 max_concurrent_streams: MultiplexConfig::default().max_num_streams,
             },
         )
@@ -3323,6 +3503,14 @@ mod tests {
         }
     }
 
+    async fn serve_relay_multiplex_test_socket(
+        state: RelayTestState,
+        socket: WebSocket,
+        ticket: RelayTicket,
+    ) {
+        serve_test_multiplex_socket(state, socket, ticket.session_id).await;
+    }
+
     async fn spawn_relay_test_server(
         response_status: u16,
         response_headers: Vec<RelayHttpHeader>,
@@ -3353,6 +3541,35 @@ mod tests {
         (state, server)
     }
 
+    async fn spawn_direct_transport_test_server(
+        response_status: u16,
+        response_headers: Vec<RelayHttpHeader>,
+        response_body: Vec<u8>,
+    ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let state = RelayTestState {
+            public_url: format!("http://{addr}"),
+            captured_request: Arc::new(Mutex::new(None)),
+            issued_ticket_count: Arc::new(AtomicUsize::new(0)),
+            paired_session_count: Arc::new(AtomicUsize::new(0)),
+            response_status,
+            response_headers,
+            response_body,
+        };
+        let router = Router::new()
+            .route("/transport/ws", get(direct_transport_ws))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("direct transport test server should run");
+        });
+        (state, server)
+    }
+
     fn relay_test_client(
         state: &RelayTestState,
         identity: ClientIdentityMaterial,
@@ -3370,6 +3587,13 @@ mod tests {
         .expect("rendezvous client should build");
         IronMeshClient::with_relay_transport("https://relay.invalid/", rendezvous, target_node_id)
             .with_client_identity(identity)
+    }
+
+    fn direct_transport_test_client(
+        state: &RelayTestState,
+        identity: ClientIdentityMaterial,
+    ) -> IronMeshClient {
+        IronMeshClient::from_direct_base_url(state.public_url.clone()).with_client_identity(identity)
     }
 
     #[tokio::test]
@@ -3669,6 +3893,65 @@ mod tests {
         assert_eq!(second["status"], "ok");
         assert_eq!(relay_state.issued_ticket_count.load(Ordering::SeqCst), 1);
         assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 1);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn direct_transport_executes_and_reuses_multiplexed_session() {
+        let (direct_state, server) = spawn_direct_transport_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: br#"{"status":"ok"}"#.len().to_string(),
+                },
+            ],
+            br#"{"status":"ok"}"#.to_vec(),
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = direct_transport_test_client(&direct_state, identity.clone());
+
+        let first = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("first direct multiplex request should succeed");
+        let second = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("second direct multiplex request should succeed");
+
+        assert_eq!(first["status"], "ok");
+        assert_eq!(second["status"], "ok");
+        assert_eq!(direct_state.paired_session_count.load(Ordering::SeqCst), 1);
+
+        let captured = direct_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("direct request should be captured");
+        assert_eq!(captured.path_and_query, "/cluster/status");
+        assert!(
+            captured
+                .headers
+                .iter()
+                .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID
+                    && header.value == identity.device_id.to_string())
+        );
 
         server.abort();
         let _ = server.await;

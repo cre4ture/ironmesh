@@ -70,6 +70,13 @@ Primary files:
 - [ ] Run the same Yamux/session protocol for direct and relay paths.
 - [ ] Add tests covering direct multiplexed requests.
 
+Current slice landed:
+
+- [x] Add a direct `/transport/ws` endpoint on `server-node` for authenticated client sessions.
+- [x] Reuse the shared buffered multiplex transport framing and handshake over direct WebSocket sessions.
+- [x] Route buffered authenticated direct client requests through a cached multiplexed session.
+- [ ] Expand direct coverage beyond the current buffered request slice.
+
 Primary files:
 
 - [ ] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
@@ -186,3 +193,9 @@ Primary files:
   - `cargo test -p transport-sdk`
   - `cargo test -p client-sdk relay_transport`
   - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
+- [x] 2026-04-08: Extend the shared multiplexed transport to authenticated direct client sessions with `/transport/ws` and cached direct buffered requests.
+  Verification:
+  - `cargo test -p client-sdk direct_transport`
+  - `cargo test -p client-sdk relay_transport`
+  - `cargo test -p transport-sdk`
+  - `cargo check -p transport-sdk -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`

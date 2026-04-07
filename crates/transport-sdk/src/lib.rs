@@ -14,6 +14,7 @@ pub mod rendezvous_runtime;
 pub mod request_auth;
 pub mod session;
 pub mod transport_protocol;
+pub mod websocket_client;
 pub mod ws_stream;
 
 pub use bootstrap::{
@@ -80,4 +81,5 @@ pub use transport_protocol::{
     TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
     TransportSessionRole, TransportStreamControlMessage, TransportStreamKind,
 };
+pub use websocket_client::{connect_websocket, websocket_url};
 pub use ws_stream::{DecodedWebSocketMessage, WebSocketByteStream, WebSocketMessageCodec};
