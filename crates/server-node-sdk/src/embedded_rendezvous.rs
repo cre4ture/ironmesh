@@ -6,9 +6,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use axum::extract::ws::{Message, WebSocket};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::FromRequestParts;
 use axum::extract::State;
+use axum::extract::WebSocketUpgrade;
 use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
@@ -21,7 +23,7 @@ use rustls::server::WebPkiClientVerifier;
 use serde::{Deserialize, Serialize};
 use tokio_rustls::server::TlsStream;
 use tower::Service;
-use tracing::info;
+use tracing::{info, warn};
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::rendezvous::{
     PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
@@ -31,7 +33,8 @@ use transport_sdk::{
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, ClientEnrollmentRequest,
     PresenceRegistry, RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayBroker, RelayHttpPollRequest,
     RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket, RelayTicketRequest,
-    encode_optional_body_base64, issue_relay_ticket as issue_runtime_relay_ticket,
+    RelayTunnelBroker, RelayTunnelControlMessage, RelayTunnelFrame, encode_optional_body_base64,
+    issue_relay_ticket as issue_runtime_relay_ticket,
 };
 use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
@@ -51,6 +54,7 @@ struct AppState {
     config: EmbeddedRendezvousConfig,
     presence: PresenceRegistry,
     relay: RelayBroker,
+    relay_tunnel: RelayTunnelBroker,
     bootstrap_claims: BootstrapClaimBroker,
 }
 
@@ -60,6 +64,7 @@ impl AppState {
             config,
             presence: PresenceRegistry::new(),
             relay: RelayBroker::new(),
+            relay_tunnel: RelayTunnelBroker::new(),
             bootstrap_claims: BootstrapClaimBroker::new(),
         }
     }
@@ -90,6 +95,7 @@ pub(crate) async fn run_listener(config: EmbeddedRendezvousConfig) -> Result<()>
         .route("/relay/http/request", post(submit_relay_http_request))
         .route("/relay/http/poll", post(poll_relay_http_request))
         .route("/relay/http/respond", post(complete_relay_http_request))
+        .route("/relay/tunnel/ws", get(relay_tunnel_ws))
         .layer(DefaultBodyLimit::max(RELAY_HTTP_JSON_BODY_LIMIT_BYTES));
     let app = Router::new()
         .route("/health", get(health))
@@ -418,6 +424,176 @@ async fn complete_relay_http_request(
         ));
     }
     Ok(Json(serde_json::json!({ "accepted": true })))
+}
+
+async fn relay_tunnel_ws(
+    State(state): State<AppState>,
+    authenticated_peer: MaybeAuthenticatedPeer,
+    websocket: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    websocket.on_upgrade(move |socket| async move {
+        serve_relay_tunnel_websocket(state, authenticated_peer, socket).await;
+    })
+}
+
+async fn serve_relay_tunnel_websocket(
+    state: AppState,
+    authenticated_peer: MaybeAuthenticatedPeer,
+    mut socket: WebSocket,
+) {
+    if let Err(err) = run_relay_tunnel_websocket(&state, &authenticated_peer, &mut socket).await {
+        warn!(error = %err, "embedded relay tunnel websocket failed");
+        let _ = send_relay_tunnel_control(
+            &mut socket,
+            &RelayTunnelControlMessage::Error {
+                message: err.to_string(),
+            },
+        )
+        .await;
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+async fn run_relay_tunnel_websocket(
+    state: &AppState,
+    authenticated_peer: &MaybeAuthenticatedPeer,
+    socket: &mut WebSocket,
+) -> anyhow::Result<()> {
+    let initial = read_relay_tunnel_initial_message(socket).await?;
+    let mut endpoint = establish_relay_tunnel_endpoint(state, authenticated_peer, initial).await?;
+    send_relay_tunnel_control(
+        socket,
+        &RelayTunnelControlMessage::Paired {
+            session: endpoint.session().clone(),
+        },
+    )
+    .await?;
+
+    loop {
+        tokio::select! {
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        endpoint.send(RelayTunnelFrame::Data(bytes.to_vec())).await?;
+                    }
+                    Some(Ok(Message::Text(text))) => match parse_relay_tunnel_control(&text)? {
+                        RelayTunnelControlMessage::CloseWrite => {
+                            endpoint.send(RelayTunnelFrame::CloseWrite).await?;
+                        }
+                        other => {
+                            anyhow::bail!(
+                                "unexpected embedded relay tunnel control after pairing: {}",
+                                serde_json::to_string(&other)
+                                    .unwrap_or_else(|_| "<unserializable>".to_string())
+                            );
+                        }
+                    },
+                    Some(Ok(Message::Ping(payload))) => {
+                        socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("failed sending embedded relay tunnel pong")?;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(err)) => {
+                        return Err(err).context("embedded relay tunnel websocket read failed");
+                    }
+                }
+            }
+            frame = endpoint.recv() => {
+                match frame {
+                    Some(RelayTunnelFrame::Data(bytes)) => {
+                        socket
+                            .send(Message::Binary(bytes.into()))
+                            .await
+                            .context("failed sending embedded relay tunnel data frame")?;
+                    }
+                    Some(RelayTunnelFrame::CloseWrite) => {
+                        send_relay_tunnel_control(socket, &RelayTunnelControlMessage::CloseWrite)
+                            .await?;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_relay_tunnel_initial_message(
+    socket: &mut WebSocket,
+) -> anyhow::Result<RelayTunnelControlMessage> {
+    loop {
+        let message = socket
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("embedded relay tunnel websocket closed before pairing"))?
+            .context("embedded relay tunnel websocket read failed before pairing")?;
+        match message {
+            Message::Text(text) => return parse_relay_tunnel_control(&text),
+            Message::Ping(payload) => {
+                socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .context("failed sending embedded relay tunnel pong")?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => {
+                anyhow::bail!("embedded relay tunnel websocket closed before pairing");
+            }
+            Message::Binary(_) => {
+                anyhow::bail!("embedded relay tunnel websocket sent data before pairing");
+            }
+        }
+    }
+}
+
+async fn establish_relay_tunnel_endpoint(
+    state: &AppState,
+    authenticated_peer: &MaybeAuthenticatedPeer,
+    control: RelayTunnelControlMessage,
+) -> anyhow::Result<transport_sdk::RelayTunnelEndpoint> {
+    match control {
+        RelayTunnelControlMessage::ConnectSource { ticket } => {
+            ensure_authenticated_peer_identity(
+                authenticated_peer,
+                &ticket.source,
+                "relay tunnel source",
+            )?;
+            state.relay_tunnel.connect_source(ticket).await
+        }
+        RelayTunnelControlMessage::AcceptTarget { request } => {
+            ensure_authenticated_peer_identity(
+                authenticated_peer,
+                &request.target,
+                "relay tunnel target",
+            )?;
+            state.relay_tunnel.accept_target(request).await
+        }
+        RelayTunnelControlMessage::Paired { .. }
+        | RelayTunnelControlMessage::CloseWrite
+        | RelayTunnelControlMessage::Error { .. } => {
+            anyhow::bail!("unexpected embedded relay tunnel control before pairing");
+        }
+    }
+}
+
+fn parse_relay_tunnel_control(text: &str) -> anyhow::Result<RelayTunnelControlMessage> {
+    serde_json::from_str(text).context("failed parsing embedded relay tunnel control message")
+}
+
+async fn send_relay_tunnel_control(
+    socket: &mut WebSocket,
+    control: &RelayTunnelControlMessage,
+) -> anyhow::Result<()> {
+    let payload =
+        serde_json::to_string(control).context("failed encoding embedded relay tunnel control")?;
+    socket
+        .send(Message::Text(payload.into()))
+        .await
+        .context("failed sending embedded relay tunnel control message")
 }
 
 #[derive(Debug, Clone)]

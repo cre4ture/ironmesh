@@ -20,9 +20,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
-    ClientIdentityMaterial, PeerIdentity, RelayHttpHeader, RelayHttpRequest, RelayHttpResponse,
-    RelayTicketRequest, RendezvousControlClient, build_signed_request_headers,
-    encode_optional_body_base64,
+    ClientIdentityMaterial, ParsedRelayWireHttpResponse, PeerIdentity, RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES,
+    RelayHttpHeader, RelayTicketRequest, RelayTunnelClient, RelayTunnelEvent,
+    RendezvousControlClient, build_signed_request_headers, encode_relay_wire_http_request,
+    parse_relay_wire_http_head_response, parse_relay_wire_http_response,
 };
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
@@ -581,34 +582,16 @@ impl IronMeshClient {
             }
             ClientTransport::Relay(relay) => {
                 let source = self.relay_source_identity()?;
-                let ticket = relay
-                    .rendezvous
-                    .issue_relay_ticket(&RelayTicketRequest {
-                        cluster_id: relay.rendezvous.config().cluster_id,
-                        source,
-                        target: PeerIdentity::Node(relay.target_node_id),
-                        requested_expires_in_secs: Some(30),
-                    })
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed issuing relay ticket for client target node {}",
-                            relay.target_node_id
-                        )
-                    })?;
-                let response = relay
-                    .rendezvous
-                    .submit_relay_http_request(&RelayHttpRequest {
-                        ticket,
-                        request_id: uuid::Uuid::now_v7().to_string(),
-                        method: method.as_str().to_string(),
-                        path_and_query: path_and_query(&url),
-                        headers: auth_headers,
-                        body_base64: body.as_deref().and_then(encode_optional_body_base64),
-                    })
-                    .await
-                    .with_context(|| format!("failed to relay {} {}", method, url))?;
-                buffered_response_from_relay(response)
+                execute_relay_tunnel_buffered_request(
+                    relay,
+                    source,
+                    &method,
+                    &url,
+                    &auth_headers,
+                    body.as_deref().unwrap_or_default(),
+                )
+                .await
+                .with_context(|| format!("failed to relay {} {}", method, url))
             }
         }
     }
@@ -2262,23 +2245,104 @@ async fn wait_for_download_cancellation(should_cancel: &dyn Fn() -> bool) {
     }
 }
 
-fn buffered_response_from_relay(response: RelayHttpResponse) -> Result<BufferedTransportResponse> {
+fn buffered_response_from_relay_wire(
+    response: ParsedRelayWireHttpResponse,
+) -> Result<BufferedTransportResponse> {
     let status = StatusCode::from_u16(response.status)
-        .with_context(|| format!("invalid relayed HTTP status {}", response.status))?;
-    let body = Bytes::from(response.body_bytes()?);
+        .with_context(|| format!("invalid relayed tunnel HTTP status {}", response.status))?;
     let mut headers = HeaderMap::new();
     for header in response.headers {
         let name = HeaderName::from_bytes(header.name.as_bytes())
-            .with_context(|| format!("invalid relayed header name {}", header.name))?;
+            .with_context(|| format!("invalid relayed tunnel header name {}", header.name))?;
         let value = HeaderValue::from_str(&header.value)
-            .with_context(|| format!("invalid relayed header value for {}", header.name))?;
+            .with_context(|| format!("invalid relayed tunnel header value for {}", header.name))?;
         headers.append(name, value);
     }
     Ok(BufferedTransportResponse {
         status,
         headers,
-        body,
+        body: Bytes::from(response.body),
     })
+}
+
+async fn execute_relay_tunnel_buffered_request(
+    relay: &ClientRelayTransport,
+    source: PeerIdentity,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body: &[u8],
+) -> Result<BufferedTransportResponse> {
+    let ticket = relay
+        .rendezvous
+        .issue_relay_ticket(&RelayTicketRequest {
+            cluster_id: relay.rendezvous.config().cluster_id,
+            source,
+            target: PeerIdentity::Node(relay.target_node_id),
+            requested_expires_in_secs: Some(30),
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed issuing relay ticket for client target node {}",
+                relay.target_node_id
+            )
+        })?;
+    let mut tunnel = relay
+        .rendezvous
+        .connect_relay_tunnel_source(&ticket)
+        .await
+        .with_context(|| {
+            format!(
+                "failed opening relay tunnel for client target node {}",
+                relay.target_node_id
+            )
+        })?;
+
+    let request_bytes = encode_relay_wire_http_request(
+        method.as_str(),
+        &path_and_query(url),
+        &host_header_value(url)?,
+        headers,
+        body,
+    )
+    .context("failed encoding relayed tunnel HTTP request")?;
+    send_relay_tunnel_bytes(&mut tunnel, &request_bytes).await?;
+    tunnel
+        .send_close_write()
+        .await
+        .context("failed finishing relayed tunnel HTTP request")?;
+
+    let response_bytes = collect_relay_tunnel_response_bytes(&mut tunnel).await?;
+    let _ = tunnel.close().await;
+    let response = if method == Method::HEAD {
+        parse_relay_wire_http_head_response(&response_bytes)
+    } else {
+        parse_relay_wire_http_response(&response_bytes)
+    }
+    .context("failed parsing relayed tunnel HTTP response")?;
+    buffered_response_from_relay_wire(response)
+}
+
+async fn send_relay_tunnel_bytes(tunnel: &mut RelayTunnelClient, bytes: &[u8]) -> Result<()> {
+    for chunk in bytes.chunks(RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
+        tunnel
+            .send_data(chunk)
+            .await
+            .context("failed sending relayed tunnel bytes")?;
+    }
+    Ok(())
+}
+
+async fn collect_relay_tunnel_response_bytes(tunnel: &mut RelayTunnelClient) -> Result<Vec<u8>> {
+    let mut response_bytes = Vec::new();
+    loop {
+        match tunnel.recv_event().await? {
+            RelayTunnelEvent::Data(bytes) => response_bytes.extend_from_slice(&bytes),
+            RelayTunnelEvent::CloseWrite | RelayTunnelEvent::Closed => break,
+        }
+    }
+    Ok(response_bytes)
 }
 
 fn json_content_type_header() -> RelayHttpHeader {
@@ -2613,6 +2677,21 @@ fn path_and_query(url: &Url) -> String {
     }
 }
 
+fn host_header_value(url: &Url) -> Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("request URL is missing a host: {url}"))?;
+    let port = url.port_or_known_default();
+    let include_port = port.is_some_and(|port| {
+        !(url.scheme() == "http" && port == 80 || url.scheme() == "https" && port == 443)
+    });
+    if let Some(port) = port.filter(|_| include_port) {
+        Ok(format!("{host}:{port}"))
+    } else {
+        Ok(host.to_string())
+    }
+}
+
 fn unix_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2654,14 +2733,20 @@ mod tests {
     use axum::{
         Json, Router,
         body::Body,
-        extract::{Path as AxumPath, State},
+        extract::{
+            Path as AxumPath, State,
+            ws::{Message, WebSocket, WebSocketUpgrade},
+        },
         http::{Response, header},
         routing::{get, post},
     };
     use std::sync::{Arc, Barrier};
     use tokio::sync::Mutex;
     use transport_sdk::{
-        RelayTicket, RelayTicketRequest, RendezvousClientConfig, RendezvousControlClient,
+        ParsedRelayWireHttpRequest, RelayHttpHeader, RelayTicket, RelayTicketRequest,
+        RelayTunnelControlMessage, RelayTunnelSession, RendezvousClientConfig,
+        RendezvousControlClient, encode_relay_wire_http_response_head,
+        parse_relay_wire_http_request,
     };
 
     #[test]
@@ -2847,40 +2932,171 @@ mod tests {
 
     #[derive(Clone)]
     struct RelayTestState {
-        captured_request: Arc<Mutex<Option<RelayHttpRequest>>>,
+        public_url: String,
+        captured_request: Arc<Mutex<Option<ParsedRelayWireHttpRequest>>>,
+        response_status: u16,
+        response_headers: Vec<RelayHttpHeader>,
+        response_body: Vec<u8>,
+    }
+
+    async fn issue_ticket(State(state): State<RelayTestState>, Json(request): Json<RelayTicketRequest>) -> Json<RelayTicket> {
+        Json(RelayTicket {
+            cluster_id: request.cluster_id,
+            session_id: format!("relay-session-{}", uuid::Uuid::now_v7()),
+            source: request.source,
+            target: request.target,
+            relay_urls: vec![state.public_url],
+            issued_at_unix: 1,
+            expires_at_unix: 61,
+        })
+    }
+
+    async fn relay_tunnel_ws(
+        State(state): State<RelayTestState>,
+        websocket: WebSocketUpgrade,
+    ) -> impl axum::response::IntoResponse {
+        websocket.on_upgrade(move |socket| async move {
+            serve_relay_tunnel_test_socket(state, socket).await;
+        })
+    }
+
+    async fn serve_relay_tunnel_test_socket(state: RelayTestState, mut socket: WebSocket) {
+        let initial = match socket.recv().await {
+            Some(Ok(Message::Text(text))) => text,
+            _ => return,
+        };
+        let RelayTunnelControlMessage::ConnectSource { ticket } = serde_json::from_str(&initial)
+            .expect("test relay tunnel control should parse")
+        else {
+            return;
+        };
+
+        let session = RelayTunnelSession {
+            cluster_id: ticket.cluster_id,
+            session_id: ticket.session_id.clone(),
+            source: ticket.source.clone(),
+            target: ticket.target.clone(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&RelayTunnelControlMessage::Paired { session })
+                    .expect("paired control should serialize")
+                    .into(),
+            ))
+            .await
+            .expect("paired response should send");
+
+        let mut request_bytes = Vec::new();
+        loop {
+            match socket.recv().await {
+                Some(Ok(Message::Binary(bytes))) => request_bytes.extend_from_slice(&bytes),
+                Some(Ok(Message::Text(text))) => {
+                    let control: RelayTunnelControlMessage =
+                        serde_json::from_str(&text).expect("relay control should parse");
+                    if matches!(control, RelayTunnelControlMessage::CloseWrite) {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => return,
+                Some(Ok(Message::Ping(payload))) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("pong should send");
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Err(_)) => return,
+            }
+        }
+
+        let parsed =
+            parse_relay_wire_http_request(&request_bytes).expect("relay tunnel request should parse");
+        *state.captured_request.lock().await = Some(parsed);
+
+        let response_head = encode_relay_wire_http_response_head(
+            state.response_status,
+            &state.response_headers,
+        )
+        .expect("response head should encode");
+        socket
+            .send(Message::Binary(response_head.into()))
+            .await
+            .expect("response head should send");
+        if !state.response_body.is_empty() {
+            socket
+                .send(Message::Binary(state.response_body.into()))
+                .await
+                .expect("response body should send");
+        }
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&RelayTunnelControlMessage::CloseWrite)
+                    .expect("close_write should serialize")
+                    .into(),
+            ))
+            .await
+            .expect("close_write should send");
+    }
+
+    async fn spawn_relay_test_server(
+        response_status: u16,
+        response_headers: Vec<RelayHttpHeader>,
+        response_body: Vec<u8>,
+    ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let state = RelayTestState {
+            public_url: format!("http://{addr}"),
+            captured_request: Arc::new(Mutex::new(None)),
+            response_status,
+            response_headers,
+            response_body,
+        };
+        let router = Router::new()
+            .route("/control/relay/ticket", post(issue_ticket))
+            .route("/relay/tunnel/ws", get(relay_tunnel_ws))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("relay test server should run");
+        });
+        (state, server)
+    }
+
+    fn relay_test_client(
+        state: &RelayTestState,
+        identity: ClientIdentityMaterial,
+        target_node_id: NodeId,
+    ) -> IronMeshClient {
+        let rendezvous = RendezvousControlClient::new(
+            RendezvousClientConfig {
+                cluster_id: identity.cluster_id,
+                rendezvous_urls: vec![state.public_url.clone()],
+                heartbeat_interval_secs: 15,
+            },
+            None,
+            None,
+        )
+        .expect("rendezvous client should build");
+        IronMeshClient::with_relay_transport("https://relay.invalid/", rendezvous, target_node_id)
+            .with_client_identity(identity)
     }
 
     #[tokio::test]
     async fn relay_transport_executes_store_index_request_with_signed_device_identity() {
-        async fn issue_ticket(Json(request): Json<RelayTicketRequest>) -> Json<RelayTicket> {
-            Json(RelayTicket {
-                cluster_id: request.cluster_id,
-                session_id: "relay-session-1".to_string(),
-                source: request.source,
-                target: request.target,
-                relay_urls: vec!["http://127.0.0.1:1".to_string()],
-                issued_at_unix: 1,
-                expires_at_unix: 61,
-            })
-        }
-
-        async fn relay_request(
-            State(state): State<RelayTestState>,
-            Json(request): Json<RelayHttpRequest>,
-        ) -> Json<RelayHttpResponse> {
-            *state.captured_request.lock().await = Some(request.clone());
-            Json(RelayHttpResponse {
-                cluster_id: request.ticket.cluster_id,
-                session_id: request.ticket.session_id.clone(),
-                request_id: request.request_id.clone(),
-                responder: request.ticket.target.clone(),
-                status: 200,
-                headers: vec![RelayHttpHeader {
+        let (relay_state, server) = spawn_relay_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
                     name: "content-type".to_string(),
                     value: "application/json".to_string(),
-                }],
-                body_base64: encode_optional_body_base64(
-                    serde_json::to_string(&StoreIndexResponse {
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: serde_json::to_vec(&StoreIndexResponse {
                         prefix: String::new(),
                         depth: 1,
                         entry_count: 1,
@@ -2896,27 +3112,28 @@ mod tests {
                         }],
                     })
                     .expect("store index response should serialize")
-                    .as_bytes(),
-                ),
+                    .len()
+                    .to_string(),
+                },
+            ],
+            serde_json::to_vec(&StoreIndexResponse {
+                prefix: String::new(),
+                depth: 1,
+                entry_count: 1,
+                entries: vec![StoreIndexEntry {
+                    path: "docs/readme.txt".to_string(),
+                    entry_type: "key".to_string(),
+                    version: Some("v1".to_string()),
+                    content_hash: Some("hash-1".to_string()),
+                    size_bytes: Some(42),
+                    modified_at_unix: None,
+                    content_fingerprint: None,
+                    media: None,
+                }],
             })
-        }
-
-        let relay_state = RelayTestState {
-            captured_request: Arc::new(Mutex::new(None)),
-        };
-        let router = Router::new()
-            .route("/control/relay/ticket", post(issue_ticket))
-            .route("/relay/http/request", post(relay_request))
-            .with_state(relay_state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .expect("relay test server should run");
-        });
+            .expect("store index response should serialize"),
+        )
+        .await;
 
         let mut identity = ClientIdentityMaterial::generate(
             uuid::Uuid::now_v7(),
@@ -2926,23 +3143,7 @@ mod tests {
         .expect("identity should generate");
         identity.credential_pem = Some("issued-credential".to_string());
         let target_node_id = NodeId::new_v4();
-        let rendezvous = RendezvousControlClient::new(
-            RendezvousClientConfig {
-                cluster_id: identity.cluster_id,
-                rendezvous_urls: vec![format!("http://{addr}")],
-                heartbeat_interval_secs: 15,
-            },
-            None,
-            None,
-        )
-        .expect("rendezvous client should build");
-
-        let client = IronMeshClient::with_relay_transport(
-            "https://relay.invalid/",
-            rendezvous,
-            target_node_id,
-        )
-        .with_client_identity(identity.clone());
+        let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
 
         let response = client
             .store_index(None, 1, None)
@@ -2959,11 +3160,7 @@ mod tests {
             .await
             .clone()
             .expect("relay request should be captured");
-        assert_eq!(
-            captured.ticket.source,
-            PeerIdentity::Device(identity.device_id)
-        );
-        assert_eq!(captured.ticket.target, PeerIdentity::Node(target_node_id));
+        assert_eq!(captured.method, "GET");
         assert_eq!(captured.path_and_query, "/store/index?depth=1");
         assert!(
             captured
@@ -2979,53 +3176,21 @@ mod tests {
 
     #[tokio::test]
     async fn relay_transport_executes_generic_json_get_request() {
-        async fn issue_ticket(Json(request): Json<RelayTicketRequest>) -> Json<RelayTicket> {
-            Json(RelayTicket {
-                cluster_id: request.cluster_id,
-                session_id: "relay-session-2".to_string(),
-                source: request.source,
-                target: request.target,
-                relay_urls: vec!["http://127.0.0.1:1".to_string()],
-                issued_at_unix: 1,
-                expires_at_unix: 61,
-            })
-        }
-
-        async fn relay_request(
-            State(state): State<RelayTestState>,
-            Json(request): Json<RelayHttpRequest>,
-        ) -> Json<RelayHttpResponse> {
-            *state.captured_request.lock().await = Some(request.clone());
-            Json(RelayHttpResponse {
-                cluster_id: request.ticket.cluster_id,
-                session_id: request.ticket.session_id.clone(),
-                request_id: request.request_id.clone(),
-                responder: request.ticket.target.clone(),
-                status: 200,
-                headers: vec![RelayHttpHeader {
+        let (relay_state, server) = spawn_relay_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
                     name: "content-type".to_string(),
                     value: "application/json".to_string(),
-                }],
-                body_base64: encode_optional_body_base64(br#"{"status":"ok"}"#),
-            })
-        }
-
-        let relay_state = RelayTestState {
-            captured_request: Arc::new(Mutex::new(None)),
-        };
-        let router = Router::new()
-            .route("/control/relay/ticket", post(issue_ticket))
-            .route("/relay/http/request", post(relay_request))
-            .with_state(relay_state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .expect("relay test server should run");
-        });
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: br#"{"status":"ok"}"#.len().to_string(),
+                },
+            ],
+            br#"{"status":"ok"}"#.to_vec(),
+        )
+        .await;
 
         let mut identity = ClientIdentityMaterial::generate(
             uuid::Uuid::now_v7(),
@@ -3035,23 +3200,7 @@ mod tests {
         .expect("identity should generate");
         identity.credential_pem = Some("issued-credential".to_string());
         let target_node_id = NodeId::new_v4();
-        let rendezvous = RendezvousControlClient::new(
-            RendezvousClientConfig {
-                cluster_id: identity.cluster_id,
-                rendezvous_urls: vec![format!("http://{addr}")],
-                heartbeat_interval_secs: 15,
-            },
-            None,
-            None,
-        )
-        .expect("rendezvous client should build");
-
-        let client = IronMeshClient::with_relay_transport(
-            "https://relay.invalid/",
-            rendezvous,
-            target_node_id,
-        )
-        .with_client_identity(identity.clone());
+        let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
 
         let response = client
             .get_json_path("/cluster/status")
@@ -3081,53 +3230,21 @@ mod tests {
 
     #[tokio::test]
     async fn relay_transport_executes_relative_path_get_request() {
-        async fn issue_ticket(Json(request): Json<RelayTicketRequest>) -> Json<RelayTicket> {
-            Json(RelayTicket {
-                cluster_id: request.cluster_id,
-                session_id: "relay-session-3".to_string(),
-                source: request.source,
-                target: request.target,
-                relay_urls: vec!["http://127.0.0.1:1".to_string()],
-                issued_at_unix: 1,
-                expires_at_unix: 61,
-            })
-        }
-
-        async fn relay_request(
-            State(state): State<RelayTestState>,
-            Json(request): Json<RelayHttpRequest>,
-        ) -> Json<RelayHttpResponse> {
-            *state.captured_request.lock().await = Some(request.clone());
-            Json(RelayHttpResponse {
-                cluster_id: request.ticket.cluster_id,
-                session_id: request.ticket.session_id.clone(),
-                request_id: request.request_id.clone(),
-                responder: request.ticket.target.clone(),
-                status: 200,
-                headers: vec![RelayHttpHeader {
+        let (relay_state, server) = spawn_relay_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
                     name: "content-type".to_string(),
                     value: "image/jpeg".to_string(),
-                }],
-                body_base64: encode_optional_body_base64(b"thumb-jpeg-bytes"),
-            })
-        }
-
-        let relay_state = RelayTestState {
-            captured_request: Arc::new(Mutex::new(None)),
-        };
-        let router = Router::new()
-            .route("/control/relay/ticket", post(issue_ticket))
-            .route("/relay/http/request", post(relay_request))
-            .with_state(relay_state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .expect("relay test server should run");
-        });
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: b"thumb-jpeg-bytes".len().to_string(),
+                },
+            ],
+            b"thumb-jpeg-bytes".to_vec(),
+        )
+        .await;
 
         let mut identity = ClientIdentityMaterial::generate(
             uuid::Uuid::now_v7(),
@@ -3137,23 +3254,7 @@ mod tests {
         .expect("identity should generate");
         identity.credential_pem = Some("issued-credential".to_string());
         let target_node_id = NodeId::new_v4();
-        let rendezvous = RendezvousControlClient::new(
-            RendezvousClientConfig {
-                cluster_id: identity.cluster_id,
-                rendezvous_urls: vec![format!("http://{addr}")],
-                heartbeat_interval_secs: 15,
-            },
-            None,
-            None,
-        )
-        .expect("rendezvous client should build");
-
-        let client = IronMeshClient::with_relay_transport(
-            "https://relay.invalid/",
-            rendezvous,
-            target_node_id,
-        )
-        .with_client_identity(identity.clone());
+        let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
 
         let response = client
             .get_relative_path("/media/thumbnail?key=gallery%2Fcat.png")
@@ -3180,6 +3281,61 @@ mod tests {
                 .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID
                     && header.value == identity.device_id.to_string())
         );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_transport_preserves_head_response_headers() {
+        let payload = b"head-only-payload";
+        let (relay_state, server) = spawn_relay_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: ACCEPT_RANGES.as_str().to_string(),
+                    value: "bytes".to_string(),
+                },
+                RelayHttpHeader {
+                    name: CONTENT_LENGTH.as_str().to_string(),
+                    value: payload.len().to_string(),
+                },
+                RelayHttpHeader {
+                    name: ETAG.as_str().to_string(),
+                    value: "\"relay-head-etag\"".to_string(),
+                },
+            ],
+            Vec::new(),
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("relay-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let target_node_id = NodeId::new_v4();
+        let client = relay_test_client(&relay_state, identity.clone(), target_node_id);
+
+        let response = client
+            .head_object("gallery/cat.png", None, None)
+            .await
+            .expect("HEAD over relay should succeed");
+
+        assert_eq!(response.total_size_bytes, payload.len() as u64);
+        assert!(response.accept_ranges);
+        assert_eq!(response.etag.as_deref(), Some("\"relay-head-etag\""));
+
+        let captured = relay_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("relay request should be captured");
+        assert_eq!(captured.method, "HEAD");
+        assert_eq!(captured.path_and_query, "/store/gallery%2Fcat.png");
 
         server.abort();
         let _ = server.await;

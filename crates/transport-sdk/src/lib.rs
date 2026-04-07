@@ -5,6 +5,8 @@ pub mod http_connector;
 pub mod identity;
 pub mod peer;
 pub mod relay;
+pub mod relay_http_wire;
+pub mod relay_tunnel;
 pub mod rendezvous;
 pub mod rendezvous_runtime;
 pub mod request_auth;
@@ -33,6 +35,16 @@ pub use relay::{
     RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
     RelayTicketRequest, encode_optional_body_base64,
 };
+pub use relay_http_wire::{
+    ParsedRelayWireHttpRequest, ParsedRelayWireHttpResponse, RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES,
+    encode_relay_wire_http_request, encode_relay_wire_http_response_head,
+    parse_relay_wire_http_head_response, parse_relay_wire_http_request,
+    parse_relay_wire_http_response,
+};
+pub use relay_tunnel::{
+    RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelControlMessage, RelayTunnelEvent,
+    RelayTunnelSession, relay_tunnel_ws_url,
+};
 pub use rendezvous::{
     PresenceEntry, PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
     RendezvousClientConfig, RendezvousControlClient, RendezvousEndpointConnectionState,
@@ -40,7 +52,7 @@ pub use rendezvous::{
 };
 pub use rendezvous_runtime::{
     BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayBroker, RelayBrokerStats,
-    issue_relay_ticket,
+    RelayTunnelBroker, RelayTunnelEndpoint, RelayTunnelFrame, issue_relay_ticket,
 };
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,

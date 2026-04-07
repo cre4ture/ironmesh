@@ -1652,6 +1652,29 @@ mod tests {
         let web_base = format!("http://{web_bind}");
         let data_dir = fresh_data_dir("web-ui-relay-only-node");
         let client_dir = fresh_data_dir("web-ui-relay-only-client");
+        let fixture_dir = fresh_data_dir("web-ui-relay-only-vector-fixture");
+        let (fixture_path, zoom_level, tile_column, tile_row_tms, expected_tile_bytes) =
+            create_sample_vector_mbtiles_fixture(&fixture_dir)?;
+        let expected_xyz_y = (1_u32 << zoom_level) - 1 - tile_row_tms;
+        let fixture_bytes =
+            fs::read(&fixture_path).context("failed reading relay-only vector MBTiles fixture")?;
+        let split_one = fixture_bytes.len() / 3;
+        let split_two = (fixture_bytes.len() * 2) / 3;
+        let part_aa = fixture_bytes[..split_one].to_vec();
+        let part_ab = fixture_bytes[split_one..split_two].to_vec();
+        let part_ac = fixture_bytes[split_two..].to_vec();
+        let glyphs_dir = fresh_data_dir("web-ui-relay-only-glyph-fixture");
+        let font_dir = glyphs_dir.join("Noto Sans Regular");
+        fs::create_dir_all(&font_dir).context("failed creating relay-only glyph directory")?;
+        let glyph_bytes = b"synthetic-relay-glyph-range".to_vec();
+        fs::write(font_dir.join("0-255.pbf"), &glyph_bytes)
+            .context("failed writing relay-only glyph file")?;
+        let glyphs_dir_env = glyphs_dir.to_string_lossy().into_owned();
+        let manifest_key = "sys/maps/relay-openmaptiles.mbtiles.manifest.json";
+        let logical_key = "sys/maps/relay-openmaptiles.mbtiles";
+        let part_aa_key = "sys/maps/relay-openmaptiles.mbtiles-part-aa";
+        let part_ab_key = "sys/maps/relay-openmaptiles.mbtiles-part-ab";
+        let part_ac_key = "sys/maps/relay-openmaptiles.mbtiles-part-ac";
 
         let node_env = [
             ("IRONMESH_CLUSTER_ID", cluster_id),
@@ -1712,9 +1735,10 @@ mod tests {
             }
             bootstrap.write_to_path(&bootstrap_path)?;
 
-            let mut web = start_web_backend_with_args(
+            let mut web = start_web_backend_with_args_and_env(
                 web_bind,
                 &["--bootstrap-file", bootstrap_arg.as_str()],
+                &[("IRONMESH_MAP_GLYPHS_DIR", glyphs_dir_env.as_str())],
             )
             .await?;
 
@@ -1802,6 +1826,91 @@ mod tests {
                     Some("payload-via-relay-web-ui")
                 );
 
+                for (key, payload) in [
+                    (part_aa_key, part_aa.clone()),
+                    (part_ab_key, part_ab.clone()),
+                    (part_ac_key, part_ac.clone()),
+                ] {
+                    upload_binary_via_web(&http, &web_base, key, &payload).await?;
+                }
+
+                let manifest_payload = sample_split_manifest_json(
+                    manifest_key,
+                    logical_key,
+                    &[
+                        ("aa", part_aa_key, part_aa.as_slice()),
+                        ("ab", part_ab_key, part_ab.as_slice()),
+                        ("ac", part_ac_key, part_ac.as_slice()),
+                    ],
+                );
+                http.post(format!("{web_base}/api/store/put"))
+                    .json(&serde_json::json!({
+                        "key": manifest_key,
+                        "value": serde_json::to_string(&manifest_payload)?,
+                    }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+
+                let metadata: serde_json::Value = http
+                    .get(format!("{web_base}/api/maps/mbtiles-metadata"))
+                    .query(&[("manifest_key", manifest_key)])
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                assert_eq!(
+                    metadata.get("format").and_then(|value| value.as_str()),
+                    Some("pbf")
+                );
+                assert_eq!(
+                    metadata.get("name").and_then(|value| value.as_str()),
+                    Some("OpenMapTiles")
+                );
+
+                let tile_response = http
+                    .get(format!(
+                        "{web_base}/api/maps/vector-tiles/{zoom_level}/{tile_column}/{expected_xyz_y}"
+                    ))
+                    .query(&[("manifest_key", manifest_key)])
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                assert_eq!(
+                    tile_response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/vnd.mapbox-vector-tile")
+                );
+                assert_eq!(
+                    tile_response
+                        .headers()
+                        .get(reqwest::header::CONTENT_ENCODING)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("gzip")
+                );
+                let tile_body = tile_response.bytes().await?;
+                assert_eq!(tile_body.as_ref(), expected_tile_bytes.as_slice());
+
+                let glyph_response = http
+                    .get(format!(
+                        "{web_base}/api/maps/fonts/Noto%20Sans%20Regular/0-255.pbf"
+                    ))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                assert_eq!(
+                    glyph_response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/x-protobuf")
+                );
+                let glyph_body = glyph_response.bytes().await?;
+                assert_eq!(glyph_body.as_ref(), glyph_bytes.as_slice());
+
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -1815,6 +1924,8 @@ mod tests {
         stop_server(&mut rendezvous).await;
         let _ = fs::remove_dir_all(&data_dir);
         let _ = fs::remove_dir_all(&client_dir);
+        let _ = fs::remove_dir_all(&fixture_dir);
+        let _ = fs::remove_dir_all(&glyphs_dir);
         result
     }
 }

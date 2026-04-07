@@ -23,7 +23,7 @@ Today:
 - each chunk is uploaded independently,
 - the object becomes visible only after a final `complete` request,
 - downloads stream only on the direct HTTP client path,
-- relay-backed downloads buffer full responses,
+- relay-backed high-level client APIs still return buffered responses today,
 - server reads currently assemble the full object in memory before responding.
 
 Implications:
@@ -49,7 +49,7 @@ Implications:
 
 4. Bounded memory
 - no full-object buffering for large direct downloads,
-- relay path may still buffer per request, but each request must be size-bounded.
+- relay path should still prefer bounded segments at the client API layer, even though the rendezvous relay itself now supports stream-oriented transport.
 
 ## 4. Proposal Overview
 Use two different mechanisms:
@@ -322,12 +322,13 @@ If `etag` changed:
 - optionally record a conflict if the local consumer expected the old version.
 
 ### 6.5 Relay behavior
-Current relay HTTP transport carries a fully buffered base64 body per request.
-That makes true large streaming over relay a poor fit.
+Current relay transport no longer uses the older JSON/base64 body envelope.
+The rendezvous service now brokers a stream-oriented WebSocket tunnel carrying opaque HTTP bytes.
+However, current high-level client APIs still collect each relayed response for the individual request before returning it to the caller.
 
 For relay-backed downloads, use segmented range requests:
 - request small bounded windows, for example `4 MiB` or `8 MiB`,
-- each relayed response may still buffer fully,
+- each high-level relayed request may still buffer fully at the client edge,
 - but memory stays bounded by segment size,
 - resume uses the last confirmed byte offset.
 

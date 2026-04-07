@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use common::NodeId;
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::bootstrap::ClientBootstrap;
@@ -16,6 +16,7 @@ use crate::relay::{
     PendingRelayHttpRequest, RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest,
     RelayHttpResponse, RelayTicket, RelayTicketRequest,
 };
+use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelSession};
 use crate::rendezvous::{PresenceEntry, PresenceRegistration};
 
 #[derive(Clone, Default)]
@@ -379,6 +380,256 @@ impl RelayBroker {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayTunnelFrame {
+    Data(Vec<u8>),
+    CloseWrite,
+}
+
+pub struct RelayTunnelEndpoint {
+    session: RelayTunnelSession,
+    inbound: mpsc::Receiver<RelayTunnelFrame>,
+    outbound: mpsc::Sender<RelayTunnelFrame>,
+}
+
+impl RelayTunnelEndpoint {
+    pub fn session(&self) -> &RelayTunnelSession {
+        &self.session
+    }
+
+    pub async fn send(&self, frame: RelayTunnelFrame) -> Result<()> {
+        self.outbound
+            .send(frame)
+            .await
+            .map_err(|_| anyhow!("relay tunnel peer disconnected before frame delivery"))
+    }
+
+    pub async fn recv(&mut self) -> Option<RelayTunnelFrame> {
+        self.inbound.recv().await
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RelayTunnelBroker {
+    inner: Arc<Mutex<RelayTunnelBrokerState>>,
+}
+
+#[derive(Default)]
+struct RelayTunnelBrokerState {
+    pending_sources_by_target: HashMap<String, VecDeque<PendingRelayTunnelSource>>,
+    waiting_targets_by_key: HashMap<String, VecDeque<WaitingRelayTunnelTarget>>,
+}
+
+struct PendingRelayTunnelSource {
+    session: RelayTunnelSession,
+    waiter: oneshot::Sender<RelayTunnelEndpoint>,
+}
+
+struct WaitingRelayTunnelTarget {
+    waiter: oneshot::Sender<RelayTunnelEndpoint>,
+}
+
+impl RelayTunnelBroker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn connect_source(&self, ticket: RelayTicket) -> Result<RelayTunnelEndpoint> {
+        ticket.validate()?;
+        if ticket.expires_at_unix <= unix_ts() {
+            bail!("relay tunnel ticket has expired");
+        }
+
+        let session = RelayTunnelSession {
+            cluster_id: ticket.cluster_id,
+            session_id: ticket.session_id.clone(),
+            source: ticket.source.clone(),
+            target: ticket.target.clone(),
+        };
+        session.validate()?;
+
+        let target_key = relay_target_key(ticket.cluster_id, &ticket.target);
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        let source = PendingRelayTunnelSource {
+            session: session.clone(),
+            waiter: waiter_tx,
+        };
+
+        let paired = {
+            let mut state = self.inner.lock().await;
+            let mut paired = None;
+            while let Some(waiting) =
+                pop_waiting_target(&mut state.waiting_targets_by_key, &target_key)
+            {
+                let (source_endpoint, target_endpoint) =
+                    paired_tunnel_endpoints(session.clone());
+                if waiting.waiter.send(target_endpoint).is_ok() {
+                    paired = Some(source_endpoint);
+                    break;
+                }
+            }
+            if paired.is_none() {
+                state
+                    .pending_sources_by_target
+                    .entry(target_key.clone())
+                    .or_default()
+                    .push_back(source);
+            }
+            paired
+        };
+
+        if let Some(endpoint) = paired {
+            return Ok(endpoint);
+        }
+
+        let wait_secs = ticket
+            .expires_at_unix
+            .saturating_sub(unix_ts())
+            .clamp(5, 60);
+        match tokio::time::timeout(Duration::from_secs(wait_secs), waiter_rx).await {
+            Ok(Ok(endpoint)) => Ok(endpoint),
+            Ok(Err(_)) => {
+                self.remove_pending_source(&target_key, &ticket.session_id).await;
+                Err(anyhow!("relay tunnel target disconnected before session pairing"))
+            }
+            Err(_) => {
+                self.remove_pending_source(&target_key, &ticket.session_id).await;
+                bail!("timed out waiting for relay tunnel target acceptance")
+            }
+        }
+    }
+
+    pub async fn accept_target(
+        &self,
+        request: RelayTunnelAcceptRequest,
+    ) -> Result<RelayTunnelEndpoint> {
+        request.validate()?;
+        let target_key = relay_target_key(request.cluster_id, &request.target);
+        let timeout =
+            Duration::from_millis(request.wait_timeout_ms.unwrap_or(15_000).clamp(100, 30_000));
+
+        if let Some(endpoint) = self.try_pair_target(&target_key).await? {
+            return Ok(endpoint);
+        }
+
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        {
+            let mut state = self.inner.lock().await;
+            state
+                .waiting_targets_by_key
+                .entry(target_key.clone())
+                .or_default()
+                .push_back(WaitingRelayTunnelTarget { waiter: waiter_tx });
+        }
+
+        match tokio::time::timeout(timeout, waiter_rx).await {
+            Ok(Ok(endpoint)) => Ok(endpoint),
+            Ok(Err(_)) => {
+                self.remove_waiting_target(&target_key).await;
+                Err(anyhow!("relay tunnel source disconnected before session pairing"))
+            }
+            Err(_) => {
+                self.remove_waiting_target(&target_key).await;
+                bail!("timed out waiting for relay tunnel source")
+            }
+        }
+    }
+
+    async fn try_pair_target(&self, target_key: &str) -> Result<Option<RelayTunnelEndpoint>> {
+        let mut state = self.inner.lock().await;
+        while let Some(source) = pop_pending_source(&mut state.pending_sources_by_target, target_key) {
+            let (source_endpoint, target_endpoint) = paired_tunnel_endpoints(source.session);
+            if source.waiter.send(source_endpoint).is_ok() {
+                return Ok(Some(target_endpoint));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn remove_pending_source(&self, target_key: &str, session_id: &str) {
+        let mut state = self.inner.lock().await;
+        if let Some(queue) = state.pending_sources_by_target.get_mut(target_key) {
+            queue.retain(|pending| pending.session.session_id != session_id);
+            if queue.is_empty() {
+                state.pending_sources_by_target.remove(target_key);
+            }
+        }
+    }
+
+    async fn remove_waiting_target(&self, target_key: &str) {
+        let mut state = self.inner.lock().await;
+        if let Some(queue) = state.waiting_targets_by_key.get_mut(target_key) {
+            if !queue.is_empty() {
+                queue.pop_front();
+            }
+            if queue.is_empty() {
+                state.waiting_targets_by_key.remove(target_key);
+            }
+        }
+    }
+}
+
+fn paired_tunnel_endpoints(session: RelayTunnelSession) -> (RelayTunnelEndpoint, RelayTunnelEndpoint) {
+    let (source_to_target_tx, source_to_target_rx) = mpsc::channel(16);
+    let (target_to_source_tx, target_to_source_rx) = mpsc::channel(16);
+    (
+        RelayTunnelEndpoint {
+            session: session.clone(),
+            inbound: target_to_source_rx,
+            outbound: source_to_target_tx,
+        },
+        RelayTunnelEndpoint {
+            session,
+            inbound: source_to_target_rx,
+            outbound: target_to_source_tx,
+        },
+    )
+}
+
+fn pop_pending_source(
+    pending_by_target: &mut HashMap<String, VecDeque<PendingRelayTunnelSource>>,
+    target_key: &str,
+) -> Option<PendingRelayTunnelSource> {
+    loop {
+        let pending = pending_by_target
+            .get_mut(target_key)
+            .and_then(|queue| queue.pop_front());
+        if pending_by_target
+            .get(target_key)
+            .map(|queue| queue.is_empty())
+            .unwrap_or(false)
+        {
+            pending_by_target.remove(target_key);
+        }
+        let pending = pending?;
+        if !pending.waiter.is_closed() {
+            return Some(pending);
+        }
+    }
+}
+
+fn pop_waiting_target(
+    waiting_targets_by_key: &mut HashMap<String, VecDeque<WaitingRelayTunnelTarget>>,
+    target_key: &str,
+) -> Option<WaitingRelayTunnelTarget> {
+    loop {
+        let waiting = waiting_targets_by_key
+            .get_mut(target_key)
+            .and_then(|queue| queue.pop_front());
+        if waiting_targets_by_key
+            .get(target_key)
+            .map(|queue| queue.is_empty())
+            .unwrap_or(false)
+        {
+            waiting_targets_by_key.remove(target_key);
+        }
+        let waiting = waiting?;
+        if !waiting.waiter.is_closed() {
+            return Some(waiting);
+        }
+    }
+}
+
 fn remove_pending_request(
     pending_by_target: &mut HashMap<String, VecDeque<PendingRelayHttpRequest>>,
     request_id: &str,
@@ -590,5 +841,70 @@ mod tests {
             .expect("relay poll should succeed")
             .request;
         assert!(pending.is_none(), "abandoned request should be removed");
+    }
+
+    #[tokio::test]
+    async fn relay_tunnel_broker_pairs_source_and_target_and_relays_frames() {
+        let broker = RelayTunnelBroker::new();
+        let cluster_id = uuid::Uuid::now_v7();
+        let source = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let ticket = issue_relay_ticket(
+            RelayTicketRequest {
+                cluster_id,
+                source: source.clone(),
+                target: target.clone(),
+                requested_expires_in_secs: Some(60),
+            },
+            &["https://relay.example".to_string()],
+        );
+
+        let broker_for_source = broker.clone();
+        let source_task = tokio::spawn(async move {
+            let mut endpoint = broker_for_source
+                .connect_source(ticket)
+                .await
+                .expect("source should pair");
+            endpoint
+                .send(RelayTunnelFrame::Data(b"hello".to_vec()))
+                .await
+                .expect("source data should send");
+            endpoint
+                .send(RelayTunnelFrame::CloseWrite)
+                .await
+                .expect("source close_write should send");
+            let response = endpoint.recv().await.expect("target response should arrive");
+            assert_eq!(response, RelayTunnelFrame::Data(b"world".to_vec()));
+            assert_eq!(endpoint.recv().await, Some(RelayTunnelFrame::CloseWrite));
+        });
+
+        let mut target_endpoint = broker
+            .accept_target(RelayTunnelAcceptRequest {
+                cluster_id,
+                target,
+                wait_timeout_ms: Some(500),
+            })
+            .await
+            .expect("target should pair");
+        assert_eq!(target_endpoint.session().cluster_id, cluster_id);
+        assert_eq!(target_endpoint.session().source, source);
+        assert_eq!(
+            target_endpoint.recv().await,
+            Some(RelayTunnelFrame::Data(b"hello".to_vec()))
+        );
+        assert_eq!(
+            target_endpoint.recv().await,
+            Some(RelayTunnelFrame::CloseWrite)
+        );
+        target_endpoint
+            .send(RelayTunnelFrame::Data(b"world".to_vec()))
+            .await
+            .expect("target data should send");
+        target_endpoint
+            .send(RelayTunnelFrame::CloseWrite)
+            .await
+            .expect("target close_write should send");
+
+        source_task.await.expect("source task should join");
     }
 }

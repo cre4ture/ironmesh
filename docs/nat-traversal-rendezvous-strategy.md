@@ -1,6 +1,6 @@
 # NAT Traversal, Rendezvous, and Relay Strategy
 
-Status: Proposed architecture for Ironmesh connectivity across NATed clients and server nodes
+Status: Implemented pre-release architecture direction for Ironmesh connectivity across NATed clients and server nodes
 
 Implementation checklist: `docs/nat-traversal-implementation-checklist.md`
 
@@ -73,11 +73,12 @@ Responsibilities:
 - collect connection candidates,
 - broker connection attempts between peers,
 - authorize relay use,
-- avoid handling plaintext application data.
+- avoid depending on feature-specific application semantics.
 
 Transport recommendation:
 
 - use `wss://` or HTTPS-based long-lived streams for the control channel because they work through most NATs and restrictive firewalls.
+- the current implementation uses HTTPS for presence/ticket control APIs and a `wss://` relay tunnel endpoint for the data path.
 
 ### 3.3 Data layer
 
@@ -95,6 +96,12 @@ QUIC is the best direct-path target because it supports:
 - one transport for replication, heartbeats, and client RPC traffic.
 
 But QUIC will not always succeed. Relay fallback is mandatory for guaranteed connectivity.
+
+Current implementation note:
+
+- the relay fallback is now an authenticated WebSocket tunnel that bridges opaque byte streams between peers,
+- Ironmesh currently serializes HTTP/1.1 requests and responses onto that tunnel, so existing APIs and auth flows continue to work without rendezvous parsing per-feature payloads,
+- this is intentionally closer to a generic SOCKS-style relay than the earlier JSON/base64 relay envelope.
 
 ## 4. Proposed Ironmesh components
 
@@ -156,7 +163,7 @@ Direct mode:
 Relay mode:
 
 - node A asks the relay for a tunnel to node B,
-- the relay bridges raw bytes,
+- the relay bridges raw bytes over the rendezvous tunnel,
 - node A and node B perform mTLS inside the tunnel,
 - the relay sees metadata and ciphertext, but not application plaintext.
 
@@ -172,6 +179,12 @@ Use:
 
 That improves security over replayable bearer tokens and fits rendezvous/relay better.
 
+Current implementation note:
+
+- client-to-node relay traffic also uses the same rendezvous tunnel,
+- rendezvous may authenticate the client connection itself when rendezvous mTLS is enabled,
+- regardless of rendezvous mTLS, request authorization still happens at the Ironmesh endpoint using the existing signed client request model.
+
 ### 5.3 Relay trust boundary
 
 The relay should be treated like a network carrier, not an application server.
@@ -179,7 +192,7 @@ The relay should be treated like a network carrier, not an application server.
 That means:
 
 - outer TLS protects endpoint-to-relay transport,
-- inner peer TLS or Noise-like session protects endpoint-to-endpoint payloads,
+- inner peer TLS or endpoint-authenticated HTTP semantics protect endpoint-to-endpoint payloads,
 - relay operators cannot impersonate peers without the peer private keys,
 - authorization decisions remain at Ironmesh endpoints, not the relay.
 

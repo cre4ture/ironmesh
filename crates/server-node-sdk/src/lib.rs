@@ -62,12 +62,17 @@ use transport_sdk::{
     ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
     ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
     ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ConnectionCandidate,
+    ParsedRelayWireHttpRequest, RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES,
     NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
     NodeJoinRequest, PeerIdentity, PeerTransportClient, PeerTransportClientConfig,
-    PresenceRegistration, RelayHttpHeader, RelayHttpPollRequest, RelayHttpRequest,
-    RelayHttpResponse, RelayMode, RelayTicketRequest, RendezvousClientConfig,
-    RendezvousControlClient, SignedRequestHeaders, TransportCapability, TransportPathKind,
-    credential_fingerprint, encode_optional_body_base64, verify_signed_request_headers,
+    PresenceRegistration, RelayHttpHeader, RelayHttpPollRequest, RelayHttpResponse, RelayMode,
+    RelayTicketRequest, RelayTunnelAcceptRequest,
+    RelayTunnelClient, RelayTunnelEvent, RendezvousClientConfig, RendezvousControlClient,
+    SignedRequestHeaders, TransportCapability, TransportPathKind, credential_fingerprint,
+    encode_optional_body_base64, encode_relay_wire_http_request,
+    encode_relay_wire_http_response_head, parse_relay_wire_http_request,
+    parse_relay_wire_http_head_response, parse_relay_wire_http_response,
+    verify_signed_request_headers,
 };
 use uuid::Uuid;
 
@@ -3426,6 +3431,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         if state.relay_mode != RelayMode::Disabled
             && let Some(self_base_url) = relay_self_base_url
         {
+            spawn_rendezvous_relay_tunnel_agent(state.clone(), self_base_url.clone());
             spawn_rendezvous_relay_http_agent(state.clone(), self_base_url);
         }
     }
@@ -4639,33 +4645,63 @@ async fn execute_relay_peer_request(
         })
         .await
         .with_context(|| format!("failed issuing relay ticket for node {}", node.node_id))?;
-
-    let response = rendezvous
-        .submit_relay_http_request(&RelayHttpRequest {
-            ticket,
-            request_id: Uuid::now_v7().to_string(),
-            method: method.as_str().to_string(),
-            path_and_query: normalize_peer_path_and_query(path_and_query)?,
-            headers,
-            body_base64: encode_optional_body_base64(&body),
-        })
+    let mut tunnel = rendezvous
+        .connect_relay_tunnel_source(&ticket)
         .await
-        .with_context(|| {
-            format!(
-                "failed executing relayed peer request for node {}",
-                node.node_id
-            )
-        })?;
+        .with_context(|| format!("failed opening relay tunnel for node {}", node.node_id))?;
+    let request_bytes = encode_relay_wire_http_request(
+        method.as_str(),
+        &normalize_peer_path_and_query(path_and_query)?,
+        &relay_tunnel_request_host(node.node_id),
+        &headers,
+        &body,
+    )
+    .context("failed encoding relayed peer HTTP request")?;
+    send_relay_tunnel_bytes(&mut tunnel, &request_bytes).await?;
+    tunnel
+        .send_close_write()
+        .await
+        .context("failed finishing relayed peer HTTP request")?;
 
-    let status = response.status;
-    let body = Bytes::from(response.body_bytes()?);
-    let headers = response.headers;
+    let response_bytes = collect_relay_tunnel_bytes(&mut tunnel).await?;
+    let _ = tunnel.close().await;
+    let response = if method == reqwest::Method::HEAD {
+        parse_relay_wire_http_head_response(&response_bytes)
+    } else {
+        parse_relay_wire_http_response(&response_bytes)
+    }
+    .context("failed parsing relayed peer HTTP response")?;
 
     Ok(PeerHttpResponse {
-        status,
-        headers,
-        body,
+        status: response.status,
+        headers: response.headers,
+        body: Bytes::from(response.body),
     })
+}
+
+fn relay_tunnel_request_host(node_id: NodeId) -> String {
+    format!("peer-{node_id}")
+}
+
+async fn send_relay_tunnel_bytes(tunnel: &mut RelayTunnelClient, bytes: &[u8]) -> Result<()> {
+    for chunk in bytes.chunks(RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
+        tunnel
+            .send_data(chunk)
+            .await
+            .context("failed sending relay tunnel bytes")?;
+    }
+    Ok(())
+}
+
+async fn collect_relay_tunnel_bytes(tunnel: &mut RelayTunnelClient) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        match tunnel.recv_event().await? {
+            RelayTunnelEvent::Data(chunk) => bytes.extend_from_slice(&chunk),
+            RelayTunnelEvent::CloseWrite | RelayTunnelEvent::Closed => break,
+        }
+    }
+    Ok(bytes)
 }
 
 fn join_peer_url(base_url: &str, path_and_query: &str) -> Result<reqwest::Url> {
@@ -4685,6 +4721,131 @@ fn normalize_peer_path_and_query(path_and_query: &str) -> Result<String> {
     } else {
         Ok(format!("/{trimmed}"))
     }
+}
+
+fn spawn_rendezvous_relay_tunnel_agent(state: ServerState, local_base_url: String) {
+    tokio::spawn(async move {
+        loop {
+            let clients = current_rendezvous_endpoint_clients(&state).await;
+            if clients.is_empty() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            let cluster_id = state.cluster_id;
+            let node_id = state.node_id;
+            let mut accepts = tokio::task::JoinSet::new();
+            for endpoint in clients {
+                accepts.spawn(async move {
+                    let result = endpoint
+                        .control
+                        .accept_relay_tunnel(&RelayTunnelAcceptRequest {
+                            cluster_id,
+                            target: PeerIdentity::Node(node_id),
+                            wait_timeout_ms: Some(15_000),
+                        })
+                        .await;
+                    (endpoint, result)
+                });
+            }
+
+            let mut handled_tunnel = false;
+            while let Some(result) = accepts.join_next().await {
+                let Ok((endpoint, result)) = result else {
+                    continue;
+                };
+                match result {
+                    Ok(mut tunnel) => {
+                        handled_tunnel = true;
+                        accepts.abort_all();
+
+                        let request = match read_relay_tunnel_http_request(&mut tunnel).await {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let body = format!("invalid relayed tunnel request: {err:#}");
+                                if let Err(send_err) =
+                                    write_relay_tunnel_error_response(&mut tunnel, 400, &body).await
+                                {
+                                    warn!(
+                                        error = %send_err,
+                                        rendezvous_url = %endpoint.url,
+                                        session_id = %tunnel.session().session_id,
+                                        "failed writing invalid relay tunnel request response"
+                                    );
+                                }
+                                warn!(
+                                    error = %err,
+                                    rendezvous_url = %endpoint.url,
+                                    session_id = %tunnel.session().session_id,
+                                    "failed parsing relay tunnel request"
+                                );
+                                let _ = tunnel.close().await;
+                                break;
+                            }
+                        };
+
+                        let local_http = current_internal_http(&state).await;
+                        match execute_local_relay_tunnel_request(
+                            &local_http,
+                            &local_base_url,
+                            &request,
+                            &mut tunnel,
+                        )
+                        .await
+                        {
+                            Ok(relay_response_body_bytes) => {
+                                if relay_response_body_bytes
+                                    >= LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES
+                                {
+                                    info!(
+                                        session_id = %tunnel.session().session_id,
+                                        path_and_query = %request.path_and_query,
+                                        relay_response_body_bytes,
+                                        "large relayed tunnel HTTP response"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                let body = format!("relay execution failed: {err:#}");
+                                if let Err(send_err) =
+                                    write_relay_tunnel_error_response(&mut tunnel, 502, &body).await
+                                {
+                                    warn!(
+                                        error = %send_err,
+                                        rendezvous_url = %endpoint.url,
+                                        session_id = %tunnel.session().session_id,
+                                        path_and_query = %request.path_and_query,
+                                        "failed writing relay tunnel error response"
+                                    );
+                                }
+                                warn!(
+                                    error = %err,
+                                    rendezvous_url = %endpoint.url,
+                                    session_id = %tunnel.session().session_id,
+                                    path_and_query = %request.path_and_query,
+                                    "failed executing local relay tunnel request"
+                                );
+                            }
+                        }
+
+                        let _ = tunnel.close().await;
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            rendezvous_url = %endpoint.url,
+                            "relay tunnel accept failed"
+                        );
+                    }
+                }
+            }
+
+            if !handled_tunnel {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    });
 }
 
 fn spawn_rendezvous_relay_http_agent(state: ServerState, local_base_url: String) {
@@ -4802,6 +4963,100 @@ fn spawn_rendezvous_relay_http_agent(state: ServerState, local_base_url: String)
             }
         }
     });
+}
+
+async fn read_relay_tunnel_http_request(
+    tunnel: &mut RelayTunnelClient,
+) -> Result<ParsedRelayWireHttpRequest> {
+    let request_bytes = collect_relay_tunnel_bytes(tunnel)
+        .await
+        .context("failed reading relay tunnel request bytes")?;
+    parse_relay_wire_http_request(&request_bytes).context("failed parsing relay tunnel request")
+}
+
+async fn write_relay_tunnel_error_response(
+    tunnel: &mut RelayTunnelClient,
+    status: u16,
+    body: &str,
+) -> Result<usize> {
+    let headers = vec![
+        RelayHttpHeader {
+            name: "content-type".to_string(),
+            value: "text/plain; charset=utf-8".to_string(),
+        },
+        RelayHttpHeader {
+            name: "content-length".to_string(),
+            value: body.len().to_string(),
+        },
+    ];
+    let head = encode_relay_wire_http_response_head(status, &headers)
+        .context("failed encoding relay tunnel error response head")?;
+    send_relay_tunnel_bytes(tunnel, &head).await?;
+    if !body.is_empty() {
+        send_relay_tunnel_bytes(tunnel, body.as_bytes()).await?;
+    }
+    tunnel
+        .send_close_write()
+        .await
+        .context("failed finishing relay tunnel error response")?;
+    Ok(body.len())
+}
+
+async fn execute_local_relay_tunnel_request(
+    local_http: &reqwest::Client,
+    local_base_url: &str,
+    request: &ParsedRelayWireHttpRequest,
+    tunnel: &mut RelayTunnelClient,
+) -> Result<usize> {
+    let url = join_peer_url(local_base_url, &request.path_and_query)?;
+    let method = reqwest::Method::from_bytes(request.method.as_bytes())
+        .with_context(|| format!("invalid relayed tunnel HTTP method {}", request.method))?;
+    let mut outbound = local_http.request(method, url);
+    for header in &request.headers {
+        if header.name.eq_ignore_ascii_case("host")
+            || header.name.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        outbound = outbound.header(&header.name, &header.value);
+    }
+    if !request.body.is_empty() {
+        outbound = outbound.body(request.body.clone());
+    }
+
+    let mut response = outbound
+        .send()
+        .await
+        .context("failed executing local relay tunnel request")?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| RelayHttpHeader {
+                name: name.as_str().to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let response_head = encode_relay_wire_http_response_head(status, &headers)
+        .context("failed encoding local relay tunnel response head")?;
+    send_relay_tunnel_bytes(tunnel, &response_head).await?;
+
+    let mut response_body_bytes = 0usize;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed reading local relay tunnel response body")?
+    {
+        response_body_bytes = response_body_bytes.saturating_add(chunk.len());
+        send_relay_tunnel_bytes(tunnel, &chunk).await?;
+    }
+    tunnel
+        .send_close_write()
+        .await
+        .context("failed finishing local relay tunnel response")?;
+    Ok(response_body_bytes)
 }
 
 async fn execute_local_relay_http_request(

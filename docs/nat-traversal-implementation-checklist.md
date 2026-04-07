@@ -43,8 +43,9 @@ Status: Concrete repo-mapped implementation plan for the target architecture
 
 Use this section as the current source of truth for remaining work. The detailed checklist below still contains older task wording and should be reconciled over time.
 
-1. Client transport target model and relay-capable client sessions. Status: in progress.
+1. Client transport target model and relay-capable client sessions. Status: substantially implemented.
    The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs, `IronMeshClient` can execute relay-backed requests through rendezvous for the non-mTLS client path, enrolled client devices can now use relay against an mTLS-required rendezvous service when enrollment provided a rendezvous client TLS identity, the shared sync-agent plus Linux FUSE startup paths can now build clients directly from bootstrap artifacts instead of collapsing them to one direct URL up front, Windows CFAPI now preserves bootstrap metadata and builds its runtime fetcher/hydrator/uploader from a bootstrap-aware client rather than re-resolving everything to a direct URL, Android now persists bootstrap plus client identity material and uses bootstrap-aware clients for object operations, folder sync, SAF access, and the embedded web UI, the iOS wrapper now accepts the same bootstrap-or-direct connection input shape, normal CLI data plus read-only commands use the shared bootstrap-aware client transport instead of raw direct `reqwest` calls, the embedded web UI backend now runs on top of `IronMeshClient` so CLI and Android `serve-web` flows can use relay-capable client transport too, and the remaining `client-sdk` convenience types like remote snapshot fetchers and content-addressed caches now also have bootstrap-aware constructors instead of only `base_url` entry points.
+   New relay transport milestone: the primary relay path now uses an authenticated rendezvous WebSocket tunnel that carries opaque HTTP bytes instead of the older JSON/base64 HTTP envelope. Server-node peer relay requests use the same tunnel model, and relay-only web UI coverage now includes map tile and glyph routes.
    Remaining work: reduce the remaining direct-resolution compatibility paths and helper APIs in `client-sdk` and the smaller direct-only convenience layers that still exist outside the main app/runtime flows. The old `resolve_blocking()` bootstrap shim is gone, and the remaining direct-only convenience constructors in `client-sdk`, including `IronMeshClient`, now use explicit `from_direct_*` naming instead of looking like the primary API shape.
 2. Remove the legacy direct-upstream path from server-node. Status: completed.
    `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, `refresh_upstream_peer(...)`, and the old embedded upstream helper flow are gone. Rendezvous-first discovery is now the supported peer discovery model, and Linux FUSE no longer tries to smuggle a remote upstream URL through a local server-node helper path.
@@ -197,7 +198,7 @@ Recommended responsibilities:
 - [x] Replace `crates/client-sdk/src/device_auth.rs` token enrollment with keypair-based enrollment.
 - [x] Replace `BootstrapEnrollmentResult.device_token` with signed credential material or credential references.
 - [ ] Refactor `crates/client-sdk/src/connection.rs` so it creates transport-aware clients instead of direct `reqwest` clients from one base URL.
-- [ ] Refactor `crates/client-sdk/src/ironmesh_client.rs` to depend on a transport handle plus logical target, not `server_base_url` plus bearer token.
+- [x] Refactor `crates/client-sdk/src/ironmesh_client.rs` so relay-backed requests use the rendezvous tunnel transport rather than the legacy JSON/base64 relay envelope.
 - [ ] Refactor `crates/client-sdk/src/client_node.rs` constructors to take the new transport-aware client setup.
 - [ ] Re-export transport bootstrap and identity types from `crates/client-sdk/src/lib.rs` only if that keeps app code simpler.
 
@@ -211,7 +212,7 @@ Recommended responsibilities:
 - [ ] Replace `BootstrapBundleIssueResponse` with the final bootstrap schema emitted directly by `/auth/bootstrap-bundles/issue`.
 - [x] Replace `ClientDeviceEnrollRequest` / `ClientDeviceEnrollResponse` with key-bound client enrollment.
 - [x] Replace `require_client_auth()` so it verifies proof-of-possession credentials instead of matching a bearer token hash.
-- [ ] Update peer heartbeat and replication callers to use the new peer transport layer instead of direct `reqwest`.
+- [x] Update relay-backed peer callers to use the rendezvous tunnel transport instead of the legacy JSON/base64 relay envelope.
 
 ### `crates/server-node-sdk/src/cluster.rs`
 
@@ -325,6 +326,7 @@ This is implementation order, not product rollout order.
 - [ ] Add outbound-only connectivity scenarios:
   - one relay-required rendezvous-backed cluster/client bootstrap-enrollment-replication scenario now exists end to end
   - client can read/write through relay when the direct endpoint is unusable
+  - relay-backed web UI map metadata, tile, and glyph requests succeed when the direct endpoint is unusable
   - two server nodes can replicate through relay-only paths and reconnect after rendezvous restart
   - direct path is preferred when available and relay is used after forced failure and rendezvous restart.
 - [x] Update Windows CFAPI tests so they consume the persisted client identity artifact instead of expecting a `device_token`.

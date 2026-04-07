@@ -80,6 +80,15 @@ Certificate rotation:
   - client <-> server-node (including `ironmesh-folder-agent`).
 - Reject plaintext HTTP outside explicit local-dev mode.
 
+### 4.2.1 Rendezvous and Relay Transport
+- Rendezvous control APIs run over HTTPS and the relay tunnel runs over `wss://` when TLS is enabled.
+- When rendezvous mTLS is enabled, nodes and enrolled clients authenticate to rendezvous with certificate-backed identities before they can register presence, issue relay tickets, or open relay tunnels.
+- The relay tunnel brokers opaque byte streams and does not need feature-specific knowledge of gallery, maps, replication, or other HTTP routes.
+- Current implementation detail:
+  - Ironmesh carries serialized HTTP/1.1 request/response bytes through the tunnel,
+  - rendezvous no longer buffers JSON-wrapped base64 request/response envelopes for the primary relay path,
+  - node-side and client-side authorization still happens at the Ironmesh endpoint layer after the tunneled request is replayed locally.
+
 ### 4.3 Human/Admin Authentication
 - Replace shared token with identity-backed auth:
   - OIDC/JWT or mTLS client certs for operators and automation.
@@ -119,6 +128,9 @@ Optional future improvement:
 ### 6.1 In Transit
 - TLS 1.2+ minimum, TLS 1.3 preferred.
 - Strong cipher suites only; disable legacy ciphers/protocols.
+- For relayed traffic, distinguish:
+  - outer transport protection between endpoint and rendezvous,
+  - inner endpoint authentication and authorization between the actual Ironmesh peers.
 
 ### 6.2 At Rest
 - Encrypt server state storage where feasible (disk/volume encryption baseline).

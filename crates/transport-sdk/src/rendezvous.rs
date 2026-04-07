@@ -16,6 +16,7 @@ use crate::relay::{
     RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
     RelayTicketRequest,
 };
+use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelClient};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +112,8 @@ pub struct RendezvousRuntimeState {
 pub struct RendezvousControlClient {
     config: RendezvousClientConfig,
     http: Client,
+    server_ca_pem: Option<String>,
+    client_identity_pem: Option<Vec<u8>>,
     runtime_state: Arc<Mutex<TrackedRendezvousRuntimeState>>,
 }
 
@@ -185,6 +188,8 @@ impl RendezvousControlClient {
             runtime_state: Arc::new(Mutex::new(TrackedRendezvousRuntimeState::new(
                 &config.rendezvous_urls,
             ))),
+            server_ca_pem: server_ca_pem.map(ToString::to_string),
+            client_identity_pem: client_identity_pem.map(|value| value.to_vec()),
             config,
             http,
         })
@@ -288,6 +293,89 @@ impl RendezvousControlClient {
             );
         }
         self.post_json("/relay/http/request", request).await
+    }
+
+    pub async fn connect_relay_tunnel_source(
+        &self,
+        ticket: &RelayTicket,
+    ) -> Result<RelayTunnelClient> {
+        ticket.validate()?;
+        if ticket.cluster_id != self.config.cluster_id {
+            bail!(
+                "relay tunnel ticket cluster_id {} does not match rendezvous client cluster_id {}",
+                ticket.cluster_id,
+                self.config.cluster_id
+            );
+        }
+
+        let relay_urls = if ticket.relay_urls.is_empty() {
+            self.config.rendezvous_urls.as_slice()
+        } else {
+            ticket.relay_urls.as_slice()
+        };
+        let mut last_error = None;
+        for base_url in relay_urls {
+            match RelayTunnelClient::connect_source(
+                base_url,
+                self.server_ca_pem.as_deref(),
+                self.client_identity_pem.as_deref(),
+                ticket,
+            )
+            .await
+            {
+                Ok(client) => {
+                    self.record_endpoint_result(base_url, Ok(()), true);
+                    return Ok(client);
+                }
+                Err(err) => {
+                    let message =
+                        format!("failed establishing relay tunnel source at {base_url}: {err}");
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+    }
+
+    pub async fn accept_relay_tunnel(
+        &self,
+        request: &RelayTunnelAcceptRequest,
+    ) -> Result<RelayTunnelClient> {
+        request.validate()?;
+        if request.cluster_id != self.config.cluster_id {
+            bail!(
+                "relay tunnel accept request cluster_id {} does not match rendezvous client cluster_id {}",
+                request.cluster_id,
+                self.config.cluster_id
+            );
+        }
+
+        let mut last_error = None;
+        for base_url in &self.config.rendezvous_urls {
+            match RelayTunnelClient::accept_target(
+                base_url,
+                self.server_ca_pem.as_deref(),
+                self.client_identity_pem.as_deref(),
+                request.clone(),
+            )
+            .await
+            {
+                Ok(client) => {
+                    self.record_endpoint_result(base_url, Ok(()), true);
+                    return Ok(client);
+                }
+                Err(err) => {
+                    let message =
+                        format!("failed accepting relay tunnel target at {base_url}: {err}");
+                    self.record_endpoint_result(base_url, Err(message.clone()), true);
+                    last_error = Some(anyhow!(message));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
     }
 
     pub async fn poll_relay_http_request(
