@@ -39,19 +39,11 @@ pub struct RelayTunnelSession {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayTunnelControlMessage {
-    ConnectSource {
-        ticket: RelayTicket,
-    },
-    AcceptTarget {
-        request: RelayTunnelAcceptRequest,
-    },
-    Paired {
-        session: RelayTunnelSession,
-    },
+    ConnectSource { ticket: RelayTicket },
+    AcceptTarget { request: RelayTunnelAcceptRequest },
+    Paired { session: RelayTunnelSession },
     CloseWrite,
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +116,8 @@ impl RelayTunnelClient {
     }
 
     pub async fn send_close_write(&mut self) -> Result<()> {
-        self.send_control(&RelayTunnelControlMessage::CloseWrite).await
+        self.send_control(&RelayTunnelControlMessage::CloseWrite)
+            .await
     }
 
     pub async fn recv_event(&mut self) -> Result<RelayTunnelEvent> {
@@ -136,21 +129,23 @@ impl RelayTunnelClient {
             let message = next.context("relay tunnel websocket read failed")?;
             match message {
                 Message::Binary(bytes) => return Ok(RelayTunnelEvent::Data(bytes)),
-                Message::Text(text) => match serde_json::from_str::<RelayTunnelControlMessage>(&text)
-                    .context("failed parsing relay tunnel control message")?
-                {
-                    RelayTunnelControlMessage::CloseWrite => {
-                        return Ok(RelayTunnelEvent::CloseWrite);
+                Message::Text(text) => {
+                    match serde_json::from_str::<RelayTunnelControlMessage>(&text)
+                        .context("failed parsing relay tunnel control message")?
+                    {
+                        RelayTunnelControlMessage::CloseWrite => {
+                            return Ok(RelayTunnelEvent::CloseWrite);
+                        }
+                        RelayTunnelControlMessage::Error { message } => {
+                            bail!("relay tunnel peer reported error: {message}");
+                        }
+                        RelayTunnelControlMessage::Paired { .. }
+                        | RelayTunnelControlMessage::ConnectSource { .. }
+                        | RelayTunnelControlMessage::AcceptTarget { .. } => {
+                            bail!("unexpected relay tunnel control message after pairing");
+                        }
                     }
-                    RelayTunnelControlMessage::Error { message } => {
-                        bail!("relay tunnel peer reported error: {message}");
-                    }
-                    RelayTunnelControlMessage::Paired { .. }
-                    | RelayTunnelControlMessage::ConnectSource { .. }
-                    | RelayTunnelControlMessage::AcceptTarget { .. } => {
-                        bail!("unexpected relay tunnel control message after pairing");
-                    }
-                },
+                }
                 Message::Close(_) => return Ok(RelayTunnelEvent::Closed),
                 Message::Ping(payload) => {
                     self.websocket
@@ -190,21 +185,24 @@ impl RelayTunnelClient {
                 .await
                 .ok_or_else(|| anyhow!("relay tunnel websocket closed before pairing"))?;
             match next.context("failed reading relay tunnel pairing response")? {
-                Message::Text(text) => match serde_json::from_str::<RelayTunnelControlMessage>(&text)
-                    .context("failed parsing relay tunnel pairing response")?
-                {
-                    RelayTunnelControlMessage::Paired { session } => {
-                        session.validate()?;
-                        break session;
+                Message::Text(text) => {
+                    match serde_json::from_str::<RelayTunnelControlMessage>(&text)
+                        .context("failed parsing relay tunnel pairing response")?
+                    {
+                        RelayTunnelControlMessage::Paired { session } => {
+                            session.validate()?;
+                            break session;
+                        }
+                        RelayTunnelControlMessage::Error { message } => {
+                            bail!("relay tunnel establishment failed: {message}");
+                        }
+                        other => bail!(
+                            "unexpected relay tunnel pairing message: {}",
+                            serde_json::to_string(&other)
+                                .unwrap_or_else(|_| "<unserializable>".to_string())
+                        ),
                     }
-                    RelayTunnelControlMessage::Error { message } => {
-                        bail!("relay tunnel establishment failed: {message}");
-                    }
-                    other => bail!(
-                        "unexpected relay tunnel pairing message: {}",
-                        serde_json::to_string(&other).unwrap_or_else(|_| "<unserializable>".to_string())
-                    ),
-                },
+                }
                 Message::Ping(payload) => {
                     websocket
                         .send(Message::Pong(payload))
@@ -284,7 +282,9 @@ async fn open_websocket_io(
             )?))
             .connect(server_name, tcp)
             .await
-            .with_context(|| format!("failed establishing relay tunnel TLS stream to {host}:{port}"))?;
+            .with_context(|| {
+                format!("failed establishing relay tunnel TLS stream to {host}:{port}")
+            })?;
             Ok(Box::new(tls_stream))
         }
         other => bail!("unsupported relay tunnel scheme {other}"),

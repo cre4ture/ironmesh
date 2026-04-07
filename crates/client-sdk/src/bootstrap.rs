@@ -651,6 +651,7 @@ pub fn enroll_bootstrap_claim_blocking(
             .post(redeem_url)
             .json(&ClientBootstrapClaimRedeemRequest {
                 claim_token: claim.claim_token.clone(),
+                target_node_id: claim.target_node_id,
                 device_id: Some(identity.device_id.to_string()),
                 label,
                 public_key_pem: identity.public_key_pem.clone(),

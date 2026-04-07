@@ -281,13 +281,9 @@ mod tests {
                 .any(|header| header.name.eq_ignore_ascii_case("host")
                     && header.value == "relay.invalid")
         );
-        assert!(
-            parsed
-                .headers
-                .iter()
-                .any(|header| header.name.eq_ignore_ascii_case("range")
-                    && header.value == "bytes=0-10")
-        );
+        assert!(parsed.headers.iter().any(
+            |header| header.name.eq_ignore_ascii_case("range") && header.value == "bytes=0-10"
+        ));
     }
 
     #[test]

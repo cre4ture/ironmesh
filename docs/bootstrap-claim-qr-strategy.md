@@ -58,7 +58,8 @@ If only the rendezvous service is directly reachable, the redeem flow is still p
 Recommended rule:
 
 - the public redeem endpoint should live on the rendezvous service,
-- server nodes may issue claims, but they should publish/store those claims through rendezvous-facing control-plane APIs,
+- server nodes may issue claims and store them locally,
+- the claim payload must include `target_node_id` so rendezvous can route redemption to the right node,
 - the mobile client should not need direct reachability to the issuing node just to fetch the bootstrap.
 
 This keeps the bootstrap retrieval path aligned with the NAT/relay model rather than fighting it.
@@ -108,6 +109,7 @@ Example QR payload:
   "version": 1,
   "kind": "client_bootstrap_claim",
   "cluster_id": "cluster-alpha",
+  "target_node_id": "7a4f2a38-8e32-4b37-919d-9bb07a5a0a27",
   "rendezvous_url": "https://rendezvous.example:9443",
   "trust": {
     "mode": "rendezvous_ca_der_b64u",
@@ -133,7 +135,7 @@ Notes:
 1. Operator clicks `Issue bootstrap claim`.
 2. Server node creates the full client bootstrap bundle as it does today.
 3. Server node creates a short-lived one-time claim record.
-4. Server node registers that claim with the rendezvous service or another rendezvous-fronted claim store.
+4. Server node stores that claim locally on the issuing node.
 5. Server node returns the small claim payload to the admin UI.
 6. Admin UI renders the QR from that small claim payload.
 
@@ -144,13 +146,15 @@ Notes:
 3. App establishes HTTPS to `rendezvous_url`, using the trust bootstrap from the QR instead of the public system trust store.
 4. App redeems the claim with an explicit request such as:
    - `POST /bootstrap-claims/redeem`
-5. Rendezvous validates:
+5. Rendezvous validates that the target node is currently present and then relays the redeem request over the authenticated relay tunnel to `target_node_id`.
+6. The target node validates:
    - token exists,
    - token not expired,
    - token not consumed,
-   - optional cluster binding / issuing-node binding.
-6. Rendezvous returns the full client bootstrap bundle.
-7. App continues normal enrollment/bootstrap handling from that point onward.
+   - target-node binding matches the local node.
+7. The target node returns the full client bootstrap bundle and issued client credentials through that same tunnel.
+8. Rendezvous forwards the response to the app.
+9. App continues normal enrollment/bootstrap handling from that point onward.
 
 ## 8. Security requirements
 
@@ -167,6 +171,12 @@ Required safeguards:
 - responses should use `Cache-Control: no-store`,
 - redemption attempts should be rate-limited.
 
+Operational safeguards for node-owned claims:
+
+- rendezvous should reject redeem attempts early when `target_node_id` is not currently present,
+- invalid redeem attempts will reach the target node, so rate limits should apply at rendezvous and the node,
+- node-side redeem handlers should check the claim record before doing expensive enrollment work.
+
 Important implementation rule:
 
 - scanning a URL must not immediately consume the claim through browser/scanner prefetch behavior.
@@ -182,7 +192,7 @@ Preferred pattern:
 This claim strategy is compatible with the broader NAT/relay architecture:
 
 - the rendezvous service is already the public connectivity anchor,
-- redeeming via rendezvous avoids assuming direct access to a particular node,
+- redeeming via rendezvous avoids assuming direct access to a particular node while still letting the issuing node own claim state,
 - the full bootstrap can still contain direct endpoint hints for later path optimization,
 - relay/direct path selection remains a later transport concern, not part of QR delivery itself.
 

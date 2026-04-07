@@ -6,11 +6,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use axum::extract::ws::{Message, WebSocket};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::FromRequestParts;
 use axum::extract::State;
 use axum::extract::WebSocketUpgrade;
+use axum::extract::ws::{Message, WebSocket};
 use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
@@ -20,7 +20,7 @@ use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio_rustls::server::TlsStream;
 use tower::Service;
 use tracing::{info, warn};
@@ -29,14 +29,13 @@ use transport_sdk::rendezvous::{
     PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
 };
 use transport_sdk::{
-    BootstrapClaimBroker, ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
-    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, ClientEnrollmentRequest,
-    PresenceRegistry, RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayBroker, RelayHttpPollRequest,
-    RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket, RelayTicketRequest,
-    RelayTunnelBroker, RelayTunnelControlMessage, RelayTunnelFrame, encode_optional_body_base64,
-    issue_relay_ticket as issue_runtime_relay_ticket,
+    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, PresenceRegistry,
+    RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayBroker, RelayHttpPollRequest, RelayHttpPollResponse,
+    RelayHttpRequest, RelayHttpResponse, RelayTicket, RelayTicketRequest, RelayTunnelBroker,
+    RelayTunnelControlMessage, RelayTunnelEndpoint, RelayTunnelFrame,
+    encode_relay_wire_http_request, issue_relay_ticket as issue_runtime_relay_ticket,
+    parse_relay_wire_http_response,
 };
-use uuid::Uuid;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
@@ -55,7 +54,6 @@ struct AppState {
     presence: PresenceRegistry,
     relay: RelayBroker,
     relay_tunnel: RelayTunnelBroker,
-    bootstrap_claims: BootstrapClaimBroker,
 }
 
 impl AppState {
@@ -65,7 +63,6 @@ impl AppState {
             presence: PresenceRegistry::new(),
             relay: RelayBroker::new(),
             relay_tunnel: RelayTunnelBroker::new(),
-            bootstrap_claims: BootstrapClaimBroker::new(),
         }
     }
 }
@@ -75,18 +72,6 @@ struct HealthResponse {
     status: &'static str,
     public_url: String,
     registered_endpoints: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayedEnrollmentResponse {
-    cluster_id: uuid::Uuid,
-    device_id: String,
-    label: Option<String>,
-    public_key_pem: String,
-    credential_pem: String,
-    rendezvous_client_identity_pem: Option<String>,
-    created_at_unix: Option<u64>,
-    expires_at_unix: Option<u64>,
 }
 
 pub(crate) async fn run_listener(config: EmbeddedRendezvousConfig) -> Result<()> {
@@ -102,10 +87,6 @@ pub(crate) async fn run_listener(config: EmbeddedRendezvousConfig) -> Result<()>
         .route("/control/presence", get(list_presence))
         .route("/control/presence/register", post(register_presence))
         .route("/control/relay/ticket", post(issue_relay_ticket))
-        .route(
-            "/control/bootstrap-claims/publish",
-            post(publish_bootstrap_claim),
-        )
         .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
         .merge(relay_router)
         .with_state(state);
@@ -191,29 +172,6 @@ async fn issue_relay_ticket(
     Ok(Json(ticket))
 }
 
-async fn publish_bootstrap_claim(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(request): Json<ClientBootstrapClaimPublishRequest>,
-) -> std::result::Result<Json<ClientBootstrapClaimPublishResponse>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        &authenticated_peer,
-        &request.issuer,
-        "bootstrap claim issuer",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-
-    let response = state
-        .bootstrap_claims
-        .publish(request)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    Ok(Json(response))
-}
-
 async fn redeem_bootstrap_claim(
     State(state): State<AppState>,
     Json(request): Json<ClientBootstrapClaimRedeemRequest>,
@@ -222,135 +180,127 @@ async fn redeem_bootstrap_claim(
         .validate()
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let claim_token = request.claim_token.clone();
-    let claim = state
-        .bootstrap_claims
-        .take_for_redeem(&claim_token)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::NOT_FOUND,
-                "bootstrap claim is unavailable".to_string(),
-            )
-        })?;
+    let response = relay_bootstrap_claim_redeem_over_tunnel(&state, &request).await?;
 
-    let pairing_token = claim
-        .bootstrap
-        .pairing_token
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "bootstrap claim is missing a pairing token".to_string(),
-            )
-        })?;
+    Ok(([(CACHE_CONTROL, "no-store")], Json(response)))
+}
 
-    let device_id = request
+fn bootstrap_claim_relay_source_identity(
+    request: &ClientBootstrapClaimRedeemRequest,
+) -> PeerIdentity {
+    request
         .device_id
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            value.parse().map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid device_id {value}"),
-                )
-            })
-        })
-        .transpose()?;
-    let label = request
-        .label
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let enroll_request = ClientEnrollmentRequest {
-        cluster_id: claim.bootstrap.cluster_id,
-        pairing_token,
-        device_id,
-        label,
-        public_key_pem: request.public_key_pem.clone(),
-    };
-    enroll_request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+        .and_then(|value| value.trim().parse::<DeviceId>().ok())
+        .map(PeerIdentity::Device)
+        .unwrap_or(PeerIdentity::Node(request.target_node_id))
+}
 
-    let relay_request = RelayHttpRequest {
-        ticket: issue_runtime_relay_ticket(
-            RelayTicketRequest {
-                cluster_id: claim.bootstrap.cluster_id,
-                source: claim.issuer.clone(),
-                target: PeerIdentity::Node(claim.target_node_id),
-                requested_expires_in_secs: Some(30),
-            },
-            std::slice::from_ref(&state.config.public_url),
-        ),
-        request_id: Uuid::now_v7().to_string(),
-        method: "POST".to_string(),
-        path_and_query: "/auth/device/enroll".to_string(),
-        headers: vec![transport_sdk::RelayHttpHeader {
+fn bootstrap_claim_relay_request_host(target_node_id: NodeId) -> String {
+    format!("bootstrap-claim-node-{target_node_id}")
+}
+
+async fn send_relay_tunnel_bytes(
+    endpoint: &RelayTunnelEndpoint,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    for chunk in bytes.chunks(transport_sdk::RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
+        endpoint
+            .send(RelayTunnelFrame::Data(chunk.to_vec()))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn collect_relay_tunnel_bytes(endpoint: &mut RelayTunnelEndpoint) -> anyhow::Result<Vec<u8>> {
+    let mut collected = Vec::new();
+    loop {
+        match endpoint.recv().await {
+            Some(RelayTunnelFrame::Data(bytes)) => collected.extend_from_slice(&bytes),
+            Some(RelayTunnelFrame::CloseWrite) => return Ok(collected),
+            None => anyhow::bail!("relay tunnel closed before response completed"),
+        }
+    }
+}
+
+async fn relay_bootstrap_claim_redeem_over_tunnel(
+    state: &AppState,
+    request: &ClientBootstrapClaimRedeemRequest,
+) -> std::result::Result<ClientBootstrapClaimRedeemResponse, (StatusCode, String)> {
+    let target = PeerIdentity::Node(request.target_node_id);
+    let target_presence = state.presence.entry_for_identity(&target).ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "bootstrap claim target node {} is not currently connected to rendezvous",
+                request.target_node_id
+            ),
+        )
+    })?;
+
+    let ticket = issue_runtime_relay_ticket(
+        RelayTicketRequest {
+            cluster_id: target_presence.registration.cluster_id,
+            source: bootstrap_claim_relay_source_identity(request),
+            target,
+            requested_expires_in_secs: Some(30),
+        },
+        std::slice::from_ref(&state.config.public_url),
+    );
+    let mut tunnel = state
+        .relay_tunnel
+        .connect_source(ticket)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let request_bytes = encode_relay_wire_http_request(
+        "POST",
+        "/auth/bootstrap-claims/redeem",
+        &bootstrap_claim_relay_request_host(request.target_node_id),
+        &[transport_sdk::RelayHttpHeader {
             name: "content-type".to_string(),
             value: "application/json".to_string(),
         }],
-        body_base64: encode_optional_body_base64(
-            serde_json::to_vec(&enroll_request)
-                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-                .as_slice(),
-        ),
-    };
-
-    let relay_response = match state.relay.submit_and_await(relay_request).await {
-        Ok(response) => response,
-        Err(err) => {
-            state.bootstrap_claims.restore(&claim_token, claim).await;
-            return Err((StatusCode::BAD_GATEWAY, err.to_string()));
-        }
-    };
-
-    let relay_status =
-        StatusCode::from_u16(relay_response.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let relay_body = relay_response
-        .body_bytes()
+        &serde_json::to_vec(request).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed encoding bootstrap claim redeem request: {err}"),
+            )
+        })?,
+    )
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    send_relay_tunnel_bytes(&tunnel, &request_bytes)
+        .await
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    if relay_status.is_server_error() {
-        state.bootstrap_claims.restore(&claim_token, claim).await;
+    tunnel
+        .send(RelayTunnelFrame::CloseWrite)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+
+    let response_bytes = collect_relay_tunnel_bytes(&mut tunnel)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let response = parse_relay_wire_http_response(&response_bytes)
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let response_status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    if response_status.is_server_error() {
         return Err((
             StatusCode::BAD_GATEWAY,
-            String::from_utf8_lossy(&relay_body).to_string(),
+            String::from_utf8_lossy(&response.body).trim().to_string(),
         ));
     }
-    if !relay_status.is_success() {
+    if !response_status.is_success() {
         return Err((
-            relay_status,
-            String::from_utf8_lossy(&relay_body).trim().to_string(),
+            response_status,
+            String::from_utf8_lossy(&response.body).trim().to_string(),
         ));
     }
 
-    let enrolled = serde_json::from_slice::<RelayedEnrollmentResponse>(&relay_body)
+    let redeemed = serde_json::from_slice::<ClientBootstrapClaimRedeemResponse>(&response.body)
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    let mut bootstrap = claim.bootstrap.clone();
-    bootstrap.pairing_token = None;
-    bootstrap.device_id = enrolled.device_id.parse().ok();
-    bootstrap.device_label = enrolled.label.clone();
-
-    let response = ClientBootstrapClaimRedeemResponse {
-        bootstrap,
-        cluster_id: enrolled.cluster_id,
-        device_id: enrolled.device_id,
-        label: enrolled.label,
-        public_key_pem: enrolled.public_key_pem,
-        credential_pem: enrolled.credential_pem,
-        rendezvous_client_identity_pem: enrolled.rendezvous_client_identity_pem,
-        created_at_unix: enrolled.created_at_unix,
-        expires_at_unix: enrolled.expires_at_unix,
-    };
-    response
+    redeemed
         .validate()
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-
-    Ok(([(CACHE_CONTROL, "no-store")], Json(response)))
+    Ok(redeemed)
 }
 
 async fn submit_relay_http_request(
@@ -529,7 +479,9 @@ async fn read_relay_tunnel_initial_message(
         let message = socket
             .recv()
             .await
-            .ok_or_else(|| anyhow::anyhow!("embedded relay tunnel websocket closed before pairing"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("embedded relay tunnel websocket closed before pairing")
+            })?
             .context("embedded relay tunnel websocket read failed before pairing")?;
         match message {
             Message::Text(text) => return parse_relay_tunnel_control(&text),

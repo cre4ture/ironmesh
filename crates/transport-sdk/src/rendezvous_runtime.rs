@@ -58,6 +58,18 @@ impl PresenceRegistry {
         values
     }
 
+    pub fn entry_for_identity(&self, identity: &PeerIdentity) -> Option<PresenceEntry> {
+        let entries = self
+            .entries
+            .lock()
+            .expect("presence registry lock poisoned");
+        entries.get(&identity.to_string()).cloned()
+    }
+
+    pub fn contains_identity(&self, identity: &PeerIdentity) -> bool {
+        self.entry_for_identity(identity).is_some()
+    }
+
     pub fn len(&self) -> usize {
         let entries = self
             .entries
@@ -461,8 +473,7 @@ impl RelayTunnelBroker {
             while let Some(waiting) =
                 pop_waiting_target(&mut state.waiting_targets_by_key, &target_key)
             {
-                let (source_endpoint, target_endpoint) =
-                    paired_tunnel_endpoints(session.clone());
+                let (source_endpoint, target_endpoint) = paired_tunnel_endpoints(session.clone());
                 if waiting.waiter.send(target_endpoint).is_ok() {
                     paired = Some(source_endpoint);
                     break;
@@ -489,11 +500,15 @@ impl RelayTunnelBroker {
         match tokio::time::timeout(Duration::from_secs(wait_secs), waiter_rx).await {
             Ok(Ok(endpoint)) => Ok(endpoint),
             Ok(Err(_)) => {
-                self.remove_pending_source(&target_key, &ticket.session_id).await;
-                Err(anyhow!("relay tunnel target disconnected before session pairing"))
+                self.remove_pending_source(&target_key, &ticket.session_id)
+                    .await;
+                Err(anyhow!(
+                    "relay tunnel target disconnected before session pairing"
+                ))
             }
             Err(_) => {
-                self.remove_pending_source(&target_key, &ticket.session_id).await;
+                self.remove_pending_source(&target_key, &ticket.session_id)
+                    .await;
                 bail!("timed out waiting for relay tunnel target acceptance")
             }
         }
@@ -526,7 +541,9 @@ impl RelayTunnelBroker {
             Ok(Ok(endpoint)) => Ok(endpoint),
             Ok(Err(_)) => {
                 self.remove_waiting_target(&target_key).await;
-                Err(anyhow!("relay tunnel source disconnected before session pairing"))
+                Err(anyhow!(
+                    "relay tunnel source disconnected before session pairing"
+                ))
             }
             Err(_) => {
                 self.remove_waiting_target(&target_key).await;
@@ -537,7 +554,9 @@ impl RelayTunnelBroker {
 
     async fn try_pair_target(&self, target_key: &str) -> Result<Option<RelayTunnelEndpoint>> {
         let mut state = self.inner.lock().await;
-        while let Some(source) = pop_pending_source(&mut state.pending_sources_by_target, target_key) {
+        while let Some(source) =
+            pop_pending_source(&mut state.pending_sources_by_target, target_key)
+        {
             let (source_endpoint, target_endpoint) = paired_tunnel_endpoints(source.session);
             if source.waiter.send(source_endpoint).is_ok() {
                 return Ok(Some(target_endpoint));
@@ -569,7 +588,9 @@ impl RelayTunnelBroker {
     }
 }
 
-fn paired_tunnel_endpoints(session: RelayTunnelSession) -> (RelayTunnelEndpoint, RelayTunnelEndpoint) {
+fn paired_tunnel_endpoints(
+    session: RelayTunnelSession,
+) -> (RelayTunnelEndpoint, RelayTunnelEndpoint) {
     let (source_to_target_tx, source_to_target_rx) = mpsc::channel(16);
     let (target_to_source_tx, target_to_source_rx) = mpsc::channel(16);
     (
@@ -873,7 +894,10 @@ mod tests {
                 .send(RelayTunnelFrame::CloseWrite)
                 .await
                 .expect("source close_write should send");
-            let response = endpoint.recv().await.expect("target response should arrive");
+            let response = endpoint
+                .recv()
+                .await
+                .expect("target response should arrive");
             assert_eq!(response, RelayTunnelFrame::Data(b"world".to_vec()));
             assert_eq!(endpoint.recv().await, Some(RelayTunnelFrame::CloseWrite));
         });

@@ -32,6 +32,7 @@ pub struct ClientBootstrapClaim {
     pub version: u32,
     pub kind: String,
     pub cluster_id: ClusterId,
+    pub target_node_id: NodeId,
     pub rendezvous_url: String,
     pub trust: ClientBootstrapClaimTrust,
     pub claim_token: String,
@@ -63,6 +64,7 @@ pub struct ClientBootstrapClaimPublishResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientBootstrapClaimRedeemRequest {
     pub claim_token: String,
+    pub target_node_id: NodeId,
     #[serde(default)]
     pub device_id: Option<String>,
     #[serde(default)]
@@ -146,6 +148,9 @@ impl ClientBootstrapClaim {
         if self.cluster_id.is_nil() {
             bail!("bootstrap claim must include a non-nil cluster_id");
         }
+        if self.target_node_id.is_nil() {
+            bail!("bootstrap claim must include a non-nil target_node_id");
+        }
         reqwest::Url::parse(self.rendezvous_url.trim()).with_context(|| {
             format!(
                 "invalid bootstrap claim rendezvous_url {}",
@@ -203,6 +208,9 @@ impl ClientBootstrapClaimRedeemRequest {
     pub fn validate(&self) -> Result<()> {
         if self.claim_token.trim().is_empty() {
             bail!("bootstrap claim redeem request must include a claim_token");
+        }
+        if self.target_node_id.is_nil() {
+            bail!("bootstrap claim redeem request must include a non-nil target_node_id");
         }
         if self.public_key_pem.trim().is_empty() {
             bail!("bootstrap claim redeem request must include a public_key_pem");

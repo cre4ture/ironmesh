@@ -20,10 +20,11 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
-    ClientIdentityMaterial, ParsedRelayWireHttpResponse, PeerIdentity, RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES,
-    RelayHttpHeader, RelayTicketRequest, RelayTunnelClient, RelayTunnelEvent,
-    RendezvousControlClient, build_signed_request_headers, encode_relay_wire_http_request,
-    parse_relay_wire_http_head_response, parse_relay_wire_http_response,
+    ClientIdentityMaterial, ParsedRelayWireHttpResponse, PeerIdentity,
+    RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES, RelayHttpHeader, RelayTicketRequest, RelayTunnelClient,
+    RelayTunnelEvent, RendezvousControlClient, build_signed_request_headers,
+    encode_relay_wire_http_request, parse_relay_wire_http_head_response,
+    parse_relay_wire_http_response,
 };
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
@@ -2939,7 +2940,10 @@ mod tests {
         response_body: Vec<u8>,
     }
 
-    async fn issue_ticket(State(state): State<RelayTestState>, Json(request): Json<RelayTicketRequest>) -> Json<RelayTicket> {
+    async fn issue_ticket(
+        State(state): State<RelayTestState>,
+        Json(request): Json<RelayTicketRequest>,
+    ) -> Json<RelayTicket> {
         Json(RelayTicket {
             cluster_id: request.cluster_id,
             session_id: format!("relay-session-{}", uuid::Uuid::now_v7()),
@@ -2965,8 +2969,8 @@ mod tests {
             Some(Ok(Message::Text(text))) => text,
             _ => return,
         };
-        let RelayTunnelControlMessage::ConnectSource { ticket } = serde_json::from_str(&initial)
-            .expect("test relay tunnel control should parse")
+        let RelayTunnelControlMessage::ConnectSource { ticket } =
+            serde_json::from_str(&initial).expect("test relay tunnel control should parse")
         else {
             return;
         };
@@ -3009,15 +3013,13 @@ mod tests {
             }
         }
 
-        let parsed =
-            parse_relay_wire_http_request(&request_bytes).expect("relay tunnel request should parse");
+        let parsed = parse_relay_wire_http_request(&request_bytes)
+            .expect("relay tunnel request should parse");
         *state.captured_request.lock().await = Some(parsed);
 
-        let response_head = encode_relay_wire_http_response_head(
-            state.response_status,
-            &state.response_headers,
-        )
-        .expect("response head should encode");
+        let response_head =
+            encode_relay_wire_http_response_head(state.response_status, &state.response_headers)
+                .expect("response head should encode");
         socket
             .send(Message::Binary(response_head.into()))
             .await

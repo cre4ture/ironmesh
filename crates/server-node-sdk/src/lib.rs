@@ -56,23 +56,23 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
-    BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial, BootstrapServerTlsFiles,
-    BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots,
+    BootstrapClaimBroker, BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial,
+    BootstrapServerTlsFiles, BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots,
     CLIENT_BOOTSTRAP_CLAIM_KIND, CLIENT_BOOTSTRAP_CLAIM_VERSION, CandidateKind,
     ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
     ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
-    ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ConnectionCandidate,
-    ParsedRelayWireHttpRequest, RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES,
-    NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
-    NodeJoinRequest, PeerIdentity, PeerTransportClient, PeerTransportClientConfig,
-    PresenceRegistration, RelayHttpHeader, RelayHttpPollRequest, RelayHttpResponse, RelayMode,
-    RelayTicketRequest, RelayTunnelAcceptRequest,
-    RelayTunnelClient, RelayTunnelEvent, RendezvousClientConfig, RendezvousControlClient,
-    SignedRequestHeaders, TransportCapability, TransportPathKind, credential_fingerprint,
-    encode_optional_body_base64, encode_relay_wire_http_request,
-    encode_relay_wire_http_response_head, parse_relay_wire_http_request,
-    parse_relay_wire_http_head_response, parse_relay_wire_http_response,
-    verify_signed_request_headers,
+    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
+    ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ClientEnrollmentRequest,
+    ConnectionCandidate, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
+    NodeEnrollmentPackage, NodeJoinRequest, ParsedRelayWireHttpRequest, PeerIdentity,
+    PeerTransportClient, PeerTransportClientConfig, PresenceRegistration,
+    RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES, RelayHttpHeader, RelayHttpPollRequest, RelayHttpResponse,
+    RelayMode, RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelEvent,
+    RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders, TransportCapability,
+    TransportPathKind, credential_fingerprint, encode_optional_body_base64,
+    encode_relay_wire_http_request, encode_relay_wire_http_response_head,
+    parse_relay_wire_http_head_response, parse_relay_wire_http_request,
+    parse_relay_wire_http_response, verify_signed_request_headers,
 };
 use uuid::Uuid;
 
@@ -152,6 +152,7 @@ struct ServerState {
     upload_chunk_ingestor: ChunkIngestor,
     cluster: Arc<Mutex<ClusterService>>,
     client_credentials: Arc<Mutex<ClientCredentialState>>,
+    bootstrap_claims: BootstrapClaimBroker,
     upload_sessions: Arc<TracedRwLock<UploadSessionStore>>,
     upload_sessions_dirty: Arc<AtomicUsize>,
     upload_sessions_persist_notify: Arc<Notify>,
@@ -3297,6 +3298,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(cluster)),
         client_credentials: Arc::new(Mutex::new(persisted_client_credentials)),
+        bootstrap_claims: BootstrapClaimBroker::new(),
         upload_sessions: new_upload_sessions_rwlock(upload_session_store),
         upload_sessions_dirty: Arc::new(AtomicUsize::new(0)),
         upload_sessions_persist_notify: Arc::new(Notify::new()),
@@ -3635,6 +3637,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "/api/maps/fonts/{fontstack}/{range}",
             get(web_maps::font_range),
         )
+        .route(
+            "/auth/bootstrap-claims/redeem",
+            post(redeem_client_bootstrap_claim),
+        )
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
@@ -3690,6 +3696,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
 
     let internal_app = Router::new()
         .route("/health", get(health))
+        .route(
+            "/auth/bootstrap-claims/redeem",
+            post(redeem_client_bootstrap_claim),
+        )
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
@@ -8774,6 +8784,33 @@ struct ClientDeviceEnrollResponse {
     expires_at_unix: Option<u64>,
 }
 
+impl ClientDeviceEnrollRequest {
+    fn into_transport_request(self) -> std::result::Result<ClientEnrollmentRequest, StatusCode> {
+        let device_id = self
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value.parse().map_err(|_| {
+                    warn!(
+                        device_id = value,
+                        "received invalid client enrollment device_id"
+                    );
+                    StatusCode::BAD_REQUEST
+                })
+            })
+            .transpose()?;
+        Ok(ClientEnrollmentRequest {
+            cluster_id: self.cluster_id,
+            pairing_token: self.pairing_token,
+            device_id,
+            label: self.label,
+            public_key_pem: self.public_key_pem,
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ClientCredentialView {
     device_id: String,
@@ -9005,7 +9042,7 @@ fn generate_bootstrap_claim_token() -> String {
     )
 }
 
-async fn resolve_bootstrap_claim_publish_target(
+async fn resolve_bootstrap_claim_rendezvous_candidates(
     state: &ServerState,
     bootstrap: &TransportClientBootstrap,
     preferred_rendezvous_url: Option<&str>,
@@ -9056,7 +9093,7 @@ async fn resolve_bootstrap_claim_publish_target(
     Ok(rendezvous_urls)
 }
 
-fn build_bootstrap_claim_publish_client(
+fn build_bootstrap_claim_rendezvous_client(
     state: &ServerState,
     rendezvous_url: &str,
 ) -> std::result::Result<RendezvousControlClient, (StatusCode, String)> {
@@ -9100,33 +9137,77 @@ fn build_bootstrap_claim_publish_client(
     .map_err(|err| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to build rendezvous client for bootstrap claim publication: {err}"),
+            format!("failed to build rendezvous client for bootstrap claim issuance: {err}"),
         )
     })
 }
 
-fn map_bootstrap_claim_publish_error(error: String) -> (StatusCode, String) {
-    if error.contains("404") {
-        (
-            StatusCode::BAD_GATEWAY,
-            "configured rendezvous service does not support bootstrap claims yet; restart it with the updated build".to_string(),
-        )
-    } else {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("failed publishing bootstrap claim to rendezvous: {error}"),
-        )
-    }
+fn map_bootstrap_claim_rendezvous_error(error: String) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "failed selecting a reachable rendezvous service for bootstrap claim redemption: {error}"
+        ),
+    )
 }
 
-async fn publish_client_bootstrap_claim(
+async fn select_bootstrap_claim_rendezvous_url(
+    state: &ServerState,
+    bootstrap: &TransportClientBootstrap,
+    preferred_rendezvous_url: Option<&str>,
+) -> std::result::Result<String, (StatusCode, String)> {
+    let rendezvous_urls =
+        resolve_bootstrap_claim_rendezvous_candidates(state, bootstrap, preferred_rendezvous_url)
+            .await?;
+    let preferred_rendezvous_selected = preferred_rendezvous_url
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let mut last_error = None;
+
+    for rendezvous_url in rendezvous_urls {
+        let rendezvous = build_bootstrap_claim_rendezvous_client(state, &rendezvous_url)?;
+        let normalized_rendezvous_url = rendezvous_url.trim_end_matches('/');
+        match rendezvous.probe_health_endpoints().await {
+            Ok(runtime) => {
+                if runtime.endpoint_statuses.iter().any(|status| {
+                    status.url == normalized_rendezvous_url
+                        && status.status
+                            == transport_sdk::RendezvousEndpointConnectionState::Connected
+                }) {
+                    return Ok(rendezvous_url);
+                }
+                let message =
+                    format!("rendezvous endpoint is not currently reachable: {rendezvous_url}");
+                if preferred_rendezvous_selected {
+                    return Err((StatusCode::BAD_GATEWAY, message));
+                }
+                last_error = Some(message);
+            }
+            Err(err) => {
+                let error = err.to_string();
+                if preferred_rendezvous_selected {
+                    return Err(map_bootstrap_claim_rendezvous_error(error));
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(map_bootstrap_claim_rendezvous_error(
+        last_error.unwrap_or_else(|| {
+            "bootstrap claim issuance requires a reachable rendezvous service".to_string()
+        }),
+    ))
+}
+
+async fn store_client_bootstrap_claim(
     state: &ServerState,
     bootstrap: &TransportClientBootstrap,
     expires_at_unix: u64,
     preferred_rendezvous_url: Option<&str>,
 ) -> std::result::Result<ClientBootstrapClaim, (StatusCode, String)> {
-    let rendezvous_urls =
-        resolve_bootstrap_claim_publish_target(state, bootstrap, preferred_rendezvous_url).await?;
+    let rendezvous_url =
+        select_bootstrap_claim_rendezvous_url(state, bootstrap, preferred_rendezvous_url).await?;
     let claim_token = generate_bootstrap_claim_token();
     let claim_trust = rendezvous_claim_trust_from_bootstrap(bootstrap).map_err(|status| {
         (
@@ -9142,47 +9223,33 @@ async fn publish_client_bootstrap_claim(
         expires_at_unix,
         bootstrap: bootstrap.clone(),
     };
-    let preferred_rendezvous_selected = preferred_rendezvous_url
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
-    let mut last_error = None;
-
-    for rendezvous_url in rendezvous_urls {
-        let rendezvous = build_bootstrap_claim_publish_client(state, &rendezvous_url)?;
-        match rendezvous.publish_bootstrap_claim(&publish_request).await {
-            Ok(_) => {
-                let claim = ClientBootstrapClaim {
-                    version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
-                    kind: CLIENT_BOOTSTRAP_CLAIM_KIND.to_string(),
-                    cluster_id: bootstrap.cluster_id,
-                    rendezvous_url,
-                    trust: claim_trust.clone(),
-                    claim_token: claim_token.clone(),
-                    expires_at_unix,
-                };
-                claim.validate().map_err(|err| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to validate generated bootstrap claim: {err}"),
-                    )
-                })?;
-                return Ok(claim);
-            }
-            Err(err) => {
-                let error = err.to_string();
-                if preferred_rendezvous_selected {
-                    return Err(map_bootstrap_claim_publish_error(error));
-                }
-                last_error = Some(error);
-            }
-        }
-    }
-
-    Err(map_bootstrap_claim_publish_error(
-        last_error.unwrap_or_else(|| {
-            "bootstrap claim issuance requires a reachable rendezvous service".to_string()
-        }),
-    ))
+    state
+        .bootstrap_claims
+        .publish(publish_request)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed storing bootstrap claim on issuing node: {err}"),
+            )
+        })?;
+    let claim = ClientBootstrapClaim {
+        version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
+        kind: CLIENT_BOOTSTRAP_CLAIM_KIND.to_string(),
+        cluster_id: bootstrap.cluster_id,
+        target_node_id: state.node_id,
+        rendezvous_url,
+        trust: claim_trust,
+        claim_token,
+        expires_at_unix,
+    };
+    claim.validate().map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to validate generated bootstrap claim: {err}"),
+        )
+    })?;
+    Ok(claim)
 }
 
 fn build_bootstrap_direct_endpoints(
@@ -9591,7 +9658,7 @@ async fn issue_bootstrap_claim(
                 return (status, Json(json!({ "error": error }))).into_response();
             }
         };
-    let bootstrap_claim = match publish_client_bootstrap_claim(
+    let bootstrap_claim = match store_client_bootstrap_claim(
         &state,
         &bootstrap_bundle,
         expires_at_unix,
@@ -11287,28 +11354,26 @@ async fn issue_pairing_token_impl(
     })
 }
 
-async fn enroll_client_device(
-    State(state): State<ServerState>,
-    Json(request): Json<ClientDeviceEnrollRequest>,
-) -> impl IntoResponse {
+async fn enroll_client_device_impl(
+    state: &ServerState,
+    request: ClientEnrollmentRequest,
+) -> std::result::Result<ClientDeviceEnrollResponse, StatusCode> {
+    request.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
     if request.cluster_id != state.cluster_id {
-        return StatusCode::BAD_REQUEST.into_response();
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let pairing_token = request.pairing_token.trim();
     let public_key_pem = request.public_key_pem.trim();
     if pairing_token.is_empty() || public_key_pem.is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let now = unix_ts();
     let credential_expires_at_unix = Some(now + (30 * 24 * 60 * 60));
     let device_id = request
         .device_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+        .map(|value| value.to_string())
         .unwrap_or_else(|| Uuid::now_v7().to_string());
     let provided_hash = hash_token(pairing_token);
     let label = request
@@ -11336,11 +11401,11 @@ async fn enroll_client_device(
                 device_id = %device_id,
                 "failed to issue rendezvous client identity during device enrollment"
             );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
-    let response = {
+    let response: std::result::Result<ClientDeviceEnrollResponse, StatusCode> = {
         let mut auth_state = state.client_credentials.lock().await;
         auth_state
             .pairing_authorizations
@@ -11351,7 +11416,7 @@ async fn enroll_client_device(
             .iter()
             .any(|device| device.device_id == device_id && device.revoked_at_unix.is_none())
         {
-            return StatusCode::CONFLICT.into_response();
+            return Err(StatusCode::CONFLICT);
         }
 
         let Some(pairing_auth) = auth_state.pairing_authorizations.iter_mut().find(|token| {
@@ -11362,7 +11427,7 @@ async fn enroll_client_device(
                     Some(provided_hash.as_str()),
                 )
         }) else {
-            return StatusCode::UNAUTHORIZED.into_response();
+            return Err(StatusCode::UNAUTHORIZED);
         };
 
         pairing_auth.used_at_unix = Some(now);
@@ -11372,7 +11437,7 @@ async fn enroll_client_device(
         let public_key_fingerprint = text_fingerprint(public_key_pem);
         let credential_fingerprint = match credential_fingerprint(&credential_pem) {
             Ok(fingerprint) => fingerprint,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         };
         let device = ClientCredentialRecord {
             device_id: device_id.clone(),
@@ -11389,7 +11454,7 @@ async fn enroll_client_device(
         };
         auth_state.credentials.push(device);
 
-        ClientDeviceEnrollResponse {
+        Ok(ClientDeviceEnrollResponse {
             cluster_id: state.cluster_id,
             device_id,
             label: final_label,
@@ -11398,18 +11463,160 @@ async fn enroll_client_device(
             rendezvous_client_identity_pem,
             created_at_unix: now,
             expires_at_unix: credential_expires_at_unix,
-        }
+        })
     };
 
-    if let Err(err) = persist_client_credential_state(&state).await {
+    let response = response?;
+
+    if let Err(err) = persist_client_credential_state(state).await {
         warn!(
             error = %err,
             "failed to persist client credential state after enrollment"
         );
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    (StatusCode::CREATED, Json(response)).into_response()
+    Ok(response)
+}
+
+async fn enroll_client_device(
+    State(state): State<ServerState>,
+    Json(request): Json<ClientDeviceEnrollRequest>,
+) -> impl IntoResponse {
+    let request = match request.into_transport_request() {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
+    match enroll_client_device_impl(&state, request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn redeem_client_bootstrap_claim(
+    State(state): State<ServerState>,
+    Json(request): Json<ClientBootstrapClaimRedeemRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = request.validate() {
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+    }
+    if request.target_node_id != state.node_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "bootstrap claim target_node_id {} does not match node {}",
+                request.target_node_id, state.node_id
+            ),
+        )
+            .into_response();
+    }
+
+    let device_id = match request
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid device_id {value}"),
+                )
+            })
+        })
+        .transpose()
+    {
+        Ok(device_id) => device_id,
+        Err((status, error)) => return (status, error).into_response(),
+    };
+    let label = request
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let claim_token = request.claim_token.clone();
+    let claim = match state.bootstrap_claims.take_for_redeem(&claim_token).await {
+        Ok(claim) => claim,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                "bootstrap claim is unavailable".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    if claim.target_node_id != state.node_id {
+        let claim_target_node_id = claim.target_node_id;
+        state.bootstrap_claims.restore(&claim_token, claim).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "bootstrap claim target node {} does not match node {}",
+                claim_target_node_id, state.node_id
+            ),
+        )
+            .into_response();
+    }
+
+    let pairing_token = match claim
+        .bootstrap
+        .pairing_token
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(pairing_token) => pairing_token,
+        None => {
+            state.bootstrap_claims.restore(&claim_token, claim).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bootstrap claim is missing a pairing token".to_string(),
+            )
+                .into_response();
+        }
+    };
+    let enroll_request = ClientEnrollmentRequest {
+        cluster_id: claim.bootstrap.cluster_id,
+        pairing_token,
+        device_id,
+        label,
+        public_key_pem: request.public_key_pem.clone(),
+    };
+
+    match enroll_client_device_impl(&state, enroll_request).await {
+        Ok(enrolled) => {
+            let mut bootstrap = claim.bootstrap.clone();
+            bootstrap.pairing_token = None;
+            bootstrap.device_id = enrolled.device_id.parse().ok();
+            bootstrap.device_label = enrolled.label.clone();
+
+            let response = ClientBootstrapClaimRedeemResponse {
+                bootstrap,
+                cluster_id: enrolled.cluster_id,
+                device_id: enrolled.device_id,
+                label: enrolled.label,
+                public_key_pem: enrolled.public_key_pem,
+                credential_pem: enrolled.credential_pem,
+                rendezvous_client_identity_pem: enrolled.rendezvous_client_identity_pem,
+                created_at_unix: Some(enrolled.created_at_unix),
+                expires_at_unix: enrolled.expires_at_unix,
+            };
+            if let Err(err) = response.validate() {
+                state.bootstrap_claims.restore(&claim_token, claim).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+            }
+
+            ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response()
+        }
+        Err(status) => {
+            if status.is_server_error() {
+                state.bootstrap_claims.restore(&claim_token, claim).await;
+            }
+            status.into_response()
+        }
+    }
 }
 
 async fn list_client_credentials(

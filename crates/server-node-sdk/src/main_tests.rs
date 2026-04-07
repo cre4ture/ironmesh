@@ -699,8 +699,15 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     .await
     .into_response();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    if status != StatusCode::CREATED {
+        panic!(
+            "unexpected status {} issuing bootstrap claim: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
     let enrolled: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(enrolled["device_id"], "device-a");
     assert!(enrolled["credential_pem"].as_str().is_some());
@@ -755,8 +762,15 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     .await
     .into_response();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    if status != StatusCode::CREATED {
+        panic!(
+            "unexpected status {} issuing bootstrap claim: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
     let enrolled: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let rendezvous_identity_pem = enrolled["rendezvous_client_identity_pem"]
         .as_str()
@@ -793,8 +807,15 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     .await
     .into_response();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    if status != StatusCode::CREATED {
+        panic!(
+            "unexpected status {} issuing bootstrap claim: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
     let bootstrap: transport_sdk::ClientBootstrap = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(
@@ -834,7 +855,7 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
 }
 
 #[tokio::test]
-async fn issue_bootstrap_claim_returns_compact_qr_payload_and_publishes_to_rendezvous() {
+async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_node() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, _) = generate_test_internal_ca();
@@ -846,10 +867,6 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_publishes_to_rende
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
 
-    let captured_publish = Arc::new(Mutex::new(
-        None::<transport_sdk::ClientBootstrapClaimPublishRequest>,
-    ));
-    let captured_publish_state = captured_publish.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("mock rendezvous should bind");
@@ -860,45 +877,20 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_publishes_to_rende
         axum::serve(
             listener,
             Router::new().route(
-                "/control/bootstrap-claims/publish",
-                post(
-                    move |Json(request): Json<
-                        transport_sdk::ClientBootstrapClaimPublishRequest,
-                    >| {
-                        let captured_publish_state = captured_publish_state.clone();
-                        async move {
-                            *captured_publish_state.lock().await = Some(request.clone());
-                            Json(transport_sdk::ClientBootstrapClaimPublishResponse {
-                                accepted: true,
-                                expires_at_unix: request.expires_at_unix,
-                            })
-                        }
-                    },
-                ),
+                "/health",
+                get(|| async { Json(serde_json::json!({"status":"ok"})) }),
             ),
         )
         .await
         .expect("mock rendezvous should serve");
     });
-
-    let rendezvous_client = transport_sdk::RendezvousControlClient::new(
-        transport_sdk::RendezvousClientConfig {
-            cluster_id: state.cluster_id,
-            rendezvous_urls: vec![rendezvous_url.clone()],
-            heartbeat_interval_secs: 15,
-        },
-        None,
-        None,
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{rendezvous_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
     )
-    .expect("rendezvous client should build");
-    *state.outbound_clients.write().await = super::OutboundClients {
-        internal_http: reqwest::Client::new(),
-        rendezvous_control: Some(rendezvous_client.clone()),
-        rendezvous_controls: vec![super::RendezvousEndpointClient {
-            url: rendezvous_url.clone(),
-            control: rendezvous_client,
-        }],
-    };
+    .await;
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -915,11 +907,19 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_publishes_to_rende
     .await
     .into_response();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    if status != StatusCode::CREATED {
+        panic!(
+            "unexpected status {} issuing bootstrap claim: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
     let issued: transport_sdk::ClientBootstrapClaimIssueResponse =
         serde_json::from_slice(&body).unwrap();
     assert_eq!(issued.bootstrap_bundle.cluster_id, state.cluster_id);
+    assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
     assert_eq!(
         issued.bootstrap_claim.rendezvous_url,
         format!("{rendezvous_url}/"),
@@ -936,24 +936,23 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_publishes_to_rende
     assert!(issued.bootstrap_claim.claim_token.starts_with("im-claim-"));
     assert!(issued.bootstrap_bundle.pairing_token.is_some());
 
-    let published = captured_publish
-        .lock()
+    let stored_claim = state
+        .bootstrap_claims
+        .take_for_redeem(&issued.bootstrap_claim.claim_token)
         .await
-        .clone()
-        .expect("claim publish request should be captured");
-    assert_eq!(published.cluster_id, state.cluster_id);
+        .expect("claim should be stored on the issuing node");
     assert_eq!(
-        published.issuer,
+        stored_claim.issuer,
         transport_sdk::PeerIdentity::Node(state.node_id)
     );
-    assert_eq!(published.target_node_id, state.node_id);
+    assert_eq!(stored_claim.target_node_id, state.node_id);
+    assert_eq!(stored_claim.bootstrap.cluster_id, state.cluster_id);
     assert_eq!(
-        published.claim_secret_hash,
-        super::hash_token(&issued.bootstrap_claim.claim_token)
-    );
-    assert_eq!(published.bootstrap.cluster_id, state.cluster_id);
-    assert_eq!(
-        published.bootstrap.trust_roots.rendezvous_ca_pem.as_deref(),
+        stored_claim
+            .bootstrap
+            .trust_roots
+            .rendezvous_ca_pem
+            .as_deref(),
         Some(rendezvous_ca_pem.as_str())
     );
 
@@ -975,121 +974,56 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
 
-    let captured_publish_a = Arc::new(Mutex::new(
-        None::<transport_sdk::ClientBootstrapClaimPublishRequest>,
-    ));
-    let captured_publish_b = Arc::new(Mutex::new(
-        None::<transport_sdk::ClientBootstrapClaimPublishRequest>,
-    ));
-
     let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("mock rendezvous A should bind");
     let rendezvous_addr_a = listener_a.local_addr().expect("mock rendezvous A addr");
     let rendezvous_url_a = format!("http://{rendezvous_addr_a}");
-    let captured_publish_a_state = captured_publish_a.clone();
     let rendezvous_server_a = tokio::spawn(async move {
         axum::serve(
             listener_a,
             Router::new().route(
-                "/control/bootstrap-claims/publish",
-                post(
-                    move |Json(request): Json<
-                        transport_sdk::ClientBootstrapClaimPublishRequest,
-                    >| {
-                        let captured_publish_a_state = captured_publish_a_state.clone();
-                        async move {
-                            *captured_publish_a_state.lock().await = Some(request.clone());
-                            Json(transport_sdk::ClientBootstrapClaimPublishResponse {
-                                accepted: true,
-                                expires_at_unix: request.expires_at_unix,
-                            })
-                        }
-                    },
-                ),
+                "/health",
+                get(|| async { Json(serde_json::json!({"status":"ok"})) }),
             ),
         )
         .await
         .expect("mock rendezvous A should serve");
     });
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{rendezvous_url_a}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
 
     let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("mock rendezvous B should bind");
     let rendezvous_addr_b = listener_b.local_addr().expect("mock rendezvous B addr");
     let rendezvous_url_b = format!("http://{rendezvous_addr_b}");
-    let captured_publish_b_state = captured_publish_b.clone();
     let rendezvous_server_b = tokio::spawn(async move {
         axum::serve(
             listener_b,
             Router::new().route(
-                "/control/bootstrap-claims/publish",
-                post(
-                    move |Json(request): Json<
-                        transport_sdk::ClientBootstrapClaimPublishRequest,
-                    >| {
-                        let captured_publish_b_state = captured_publish_b_state.clone();
-                        async move {
-                            *captured_publish_b_state.lock().await = Some(request.clone());
-                            Json(transport_sdk::ClientBootstrapClaimPublishResponse {
-                                accepted: true,
-                                expires_at_unix: request.expires_at_unix,
-                            })
-                        }
-                    },
-                ),
+                "/health",
+                get(|| async { Json(serde_json::json!({"status":"ok"})) }),
             ),
         )
         .await
         .expect("mock rendezvous B should serve");
     });
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{rendezvous_url_b}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
 
     *state.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
-    let shared_rendezvous_client = transport_sdk::RendezvousControlClient::new(
-        transport_sdk::RendezvousClientConfig {
-            cluster_id: state.cluster_id,
-            rendezvous_urls: vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()],
-            heartbeat_interval_secs: 15,
-        },
-        None,
-        None,
-    )
-    .expect("shared rendezvous client should build");
-    let rendezvous_client_a = transport_sdk::RendezvousControlClient::new(
-        transport_sdk::RendezvousClientConfig {
-            cluster_id: state.cluster_id,
-            rendezvous_urls: vec![rendezvous_url_a.clone()],
-            heartbeat_interval_secs: 15,
-        },
-        None,
-        None,
-    )
-    .expect("rendezvous client A should build");
-    let rendezvous_client_b = transport_sdk::RendezvousControlClient::new(
-        transport_sdk::RendezvousClientConfig {
-            cluster_id: state.cluster_id,
-            rendezvous_urls: vec![rendezvous_url_b.clone()],
-            heartbeat_interval_secs: 15,
-        },
-        None,
-        None,
-    )
-    .expect("rendezvous client B should build");
-    *state.outbound_clients.write().await = super::OutboundClients {
-        internal_http: reqwest::Client::new(),
-        rendezvous_control: Some(shared_rendezvous_client),
-        rendezvous_controls: vec![
-            super::RendezvousEndpointClient {
-                url: format!("{rendezvous_url_a}/"),
-                control: rendezvous_client_b.clone(),
-            },
-            super::RendezvousEndpointClient {
-                url: format!("{rendezvous_url_b}/"),
-                control: rendezvous_client_a.clone(),
-            },
-        ],
-    };
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -1106,16 +1040,28 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
     .await
     .into_response();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    if status != StatusCode::CREATED {
+        panic!(
+            "unexpected status {} issuing bootstrap claim: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
     let issued: transport_sdk::ClientBootstrapClaimIssueResponse =
         serde_json::from_slice(&body).unwrap();
     assert_eq!(
         issued.bootstrap_claim.rendezvous_url,
         format!("{rendezvous_url_b}/"),
     );
-    assert!(captured_publish_a.lock().await.is_none());
-    assert!(captured_publish_b.lock().await.is_some());
+    assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
+    let stored_claim = state
+        .bootstrap_claims
+        .take_for_redeem(&issued.bootstrap_claim.claim_token)
+        .await
+        .expect("claim should be stored on the issuing node");
+    assert_eq!(stored_claim.target_node_id, state.node_id);
 
     rendezvous_server_a.abort();
     let _ = rendezvous_server_a.await;
@@ -1125,7 +1071,7 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
 }
 
 #[tokio::test]
-async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_accepts_the_publish() {
+async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healthy() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, _) = generate_test_internal_ca();
@@ -1137,10 +1083,6 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_accepts_the_p
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
 
-    let captured_publish_b = Arc::new(Mutex::new(
-        None::<transport_sdk::ClientBootstrapClaimPublishRequest>,
-    ));
-
     let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("mock rendezvous A should bind");
@@ -1150,63 +1092,47 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_accepts_the_p
         axum::serve(
             listener_a,
             Router::new().route(
-                "/control/bootstrap-claims/publish",
-                post(|| async { (StatusCode::BAD_GATEWAY, "unavailable") }),
+                "/health",
+                get(|| async { (StatusCode::BAD_GATEWAY, "unavailable") }),
             ),
         )
         .await
         .expect("mock rendezvous A should serve");
     });
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{rendezvous_url_a}/health"),
+        StatusCode::BAD_GATEWAY,
+        Duration::from_secs(5),
+    )
+    .await;
 
     let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("mock rendezvous B should bind");
     let rendezvous_addr_b = listener_b.local_addr().expect("mock rendezvous B addr");
     let rendezvous_url_b = format!("http://{rendezvous_addr_b}");
-    let captured_publish_b_state = captured_publish_b.clone();
     let rendezvous_server_b = tokio::spawn(async move {
         axum::serve(
             listener_b,
             Router::new().route(
-                "/control/bootstrap-claims/publish",
-                post(
-                    move |Json(request): Json<
-                        transport_sdk::ClientBootstrapClaimPublishRequest,
-                    >| {
-                        let captured_publish_b_state = captured_publish_b_state.clone();
-                        async move {
-                            *captured_publish_b_state.lock().await = Some(request.clone());
-                            Json(transport_sdk::ClientBootstrapClaimPublishResponse {
-                                accepted: true,
-                                expires_at_unix: request.expires_at_unix,
-                            })
-                        }
-                    },
-                ),
+                "/health",
+                get(|| async { Json(serde_json::json!({"status":"ok"})) }),
             ),
         )
         .await
         .expect("mock rendezvous B should serve");
     });
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{rendezvous_url_b}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
 
     *state.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
-    let shared_rendezvous_client = transport_sdk::RendezvousControlClient::new(
-        transport_sdk::RendezvousClientConfig {
-            cluster_id: state.cluster_id,
-            rendezvous_urls: vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()],
-            heartbeat_interval_secs: 15,
-        },
-        None,
-        None,
-    )
-    .expect("shared rendezvous client should build");
-    *state.outbound_clients.write().await = super::OutboundClients {
-        internal_http: reqwest::Client::new(),
-        rendezvous_control: Some(shared_rendezvous_client),
-        rendezvous_controls: Vec::new(),
-    };
-
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
 
@@ -1222,15 +1148,28 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_accepts_the_p
     .await
     .into_response();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    if status != StatusCode::CREATED {
+        panic!(
+            "unexpected status {} issuing bootstrap claim: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+    }
     let issued: transport_sdk::ClientBootstrapClaimIssueResponse =
         serde_json::from_slice(&body).unwrap();
     assert_eq!(
         issued.bootstrap_claim.rendezvous_url,
         format!("{rendezvous_url_b}/"),
     );
-    assert!(captured_publish_b.lock().await.is_some());
+    assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
+    let stored_claim = state
+        .bootstrap_claims
+        .take_for_redeem(&issued.bootstrap_claim.claim_token)
+        .await
+        .expect("claim should be stored on the issuing node");
+    assert_eq!(stored_claim.target_node_id, state.node_id);
 
     rendezvous_server_a.abort();
     let _ = rendezvous_server_a.await;
@@ -5083,6 +5022,7 @@ async fn build_test_state(
         upload_chunk_ingestor,
         cluster: Arc::new(Mutex::new(service)),
         client_credentials: Arc::new(Mutex::new(super::storage::ClientCredentialState::default())),
+        bootstrap_claims: transport_sdk::BootstrapClaimBroker::new(),
         upload_sessions: super::new_upload_sessions_rwlock(super::UploadSessionStore {
             path: root.join("state").join("upload_sessions.json"),
             sessions: HashMap::new(),

@@ -1,5 +1,4 @@
 mod auth;
-mod bootstrap_claims;
 mod config;
 mod control;
 mod failover;
@@ -14,7 +13,8 @@ use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use common::NodeId;
+use serde::Serialize;
 use tracing::{info, warn};
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::relay::{
@@ -23,10 +23,9 @@ use transport_sdk::relay::{
 };
 use transport_sdk::rendezvous::PresenceRegistration;
 use transport_sdk::{
-    ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
-    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, ClientEnrollmentRequest,
-    RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayTunnelControlMessage, RelayTunnelFrame,
-    encode_optional_body_base64,
+    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
+    RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayTunnelControlMessage, RelayTunnelEndpoint,
+    RelayTunnelFrame, encode_relay_wire_http_request, parse_relay_wire_http_response,
 };
 
 use crate::auth::{
@@ -66,25 +65,9 @@ fn build_router(state: AppState) -> Router {
         .route("/control/presence", get(list_presence))
         .route("/control/presence/register", post(register_presence))
         .route("/control/relay/ticket", post(issue_relay_ticket))
-        .route(
-            "/control/bootstrap-claims/publish",
-            post(publish_bootstrap_claim),
-        )
         .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
         .merge(relay_router)
         .with_state(state)
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayedEnrollmentResponse {
-    cluster_id: uuid::Uuid,
-    device_id: String,
-    label: Option<String>,
-    public_key_pem: String,
-    credential_pem: String,
-    rendezvous_client_identity_pem: Option<String>,
-    created_at_unix: Option<u64>,
-    expires_at_unix: Option<u64>,
 }
 
 async fn run_with_state(state: AppState) -> Result<()> {
@@ -191,30 +174,6 @@ async fn issue_relay_ticket(
     Ok(Json(ticket))
 }
 
-async fn publish_bootstrap_claim(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(request): Json<ClientBootstrapClaimPublishRequest>,
-) -> std::result::Result<Json<ClientBootstrapClaimPublishResponse>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        &request.issuer,
-        "bootstrap claim issuer",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-
-    let response = state
-        .bootstrap_claims
-        .publish(request)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    Ok(Json(response))
-}
-
 async fn redeem_bootstrap_claim(
     State(state): State<AppState>,
     Json(request): Json<ClientBootstrapClaimRedeemRequest>,
@@ -223,135 +182,127 @@ async fn redeem_bootstrap_claim(
         .validate()
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let claim_token = request.claim_token.clone();
-    let claim = state
-        .bootstrap_claims
-        .take_for_redeem(&claim_token)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::NOT_FOUND,
-                "bootstrap claim is unavailable".to_string(),
-            )
-        })?;
+    let response = relay_bootstrap_claim_redeem_over_tunnel(&state, &request).await?;
 
-    let pairing_token = claim
-        .bootstrap
-        .pairing_token
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "bootstrap claim is missing a pairing token".to_string(),
-            )
-        })?;
+    Ok(([(CACHE_CONTROL, "no-store")], Json(response)))
+}
 
-    let device_id = request
+fn bootstrap_claim_relay_source_identity(
+    request: &ClientBootstrapClaimRedeemRequest,
+) -> PeerIdentity {
+    request
         .device_id
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            value.parse().map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid device_id {value}"),
-                )
-            })
-        })
-        .transpose()?;
-    let label = request
-        .label
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let enroll_request = ClientEnrollmentRequest {
-        cluster_id: claim.bootstrap.cluster_id,
-        pairing_token,
-        device_id,
-        label,
-        public_key_pem: request.public_key_pem.clone(),
-    };
-    enroll_request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+        .and_then(|value| value.trim().parse().ok())
+        .map(PeerIdentity::Device)
+        .unwrap_or(PeerIdentity::Node(request.target_node_id))
+}
 
-    let relay_request = RelayHttpRequest {
-        ticket: relay::issue_relay_ticket(
-            RelayTicketRequest {
-                cluster_id: claim.bootstrap.cluster_id,
-                source: claim.issuer.clone(),
-                target: PeerIdentity::Node(claim.target_node_id),
-                requested_expires_in_secs: Some(30),
-            },
-            &state.config.relay_public_urls,
-        ),
-        request_id: uuid::Uuid::now_v7().to_string(),
-        method: "POST".to_string(),
-        path_and_query: "/auth/device/enroll".to_string(),
-        headers: vec![transport_sdk::RelayHttpHeader {
+fn bootstrap_claim_relay_request_host(target_node_id: NodeId) -> String {
+    format!("bootstrap-claim-node-{target_node_id}")
+}
+
+async fn send_relay_tunnel_bytes(
+    endpoint: &RelayTunnelEndpoint,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    for chunk in bytes.chunks(transport_sdk::RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
+        endpoint
+            .send(RelayTunnelFrame::Data(chunk.to_vec()))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn collect_relay_tunnel_bytes(endpoint: &mut RelayTunnelEndpoint) -> anyhow::Result<Vec<u8>> {
+    let mut collected = Vec::new();
+    loop {
+        match endpoint.recv().await {
+            Some(RelayTunnelFrame::Data(bytes)) => collected.extend_from_slice(&bytes),
+            Some(RelayTunnelFrame::CloseWrite) => return Ok(collected),
+            None => anyhow::bail!("relay tunnel closed before response completed"),
+        }
+    }
+}
+
+async fn relay_bootstrap_claim_redeem_over_tunnel(
+    state: &AppState,
+    request: &ClientBootstrapClaimRedeemRequest,
+) -> std::result::Result<ClientBootstrapClaimRedeemResponse, (StatusCode, String)> {
+    let target = PeerIdentity::Node(request.target_node_id);
+    let target_presence = state.presence.entry_for_identity(&target).ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "bootstrap claim target node {} is not currently connected to rendezvous",
+                request.target_node_id
+            ),
+        )
+    })?;
+
+    let ticket = relay::issue_relay_ticket(
+        RelayTicketRequest {
+            cluster_id: target_presence.registration.cluster_id,
+            source: bootstrap_claim_relay_source_identity(request),
+            target,
+            requested_expires_in_secs: Some(30),
+        },
+        &state.config.relay_public_urls,
+    );
+    let mut tunnel = state
+        .relay_tunnel
+        .connect_source(ticket)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let request_bytes = encode_relay_wire_http_request(
+        "POST",
+        "/auth/bootstrap-claims/redeem",
+        &bootstrap_claim_relay_request_host(request.target_node_id),
+        &[transport_sdk::RelayHttpHeader {
             name: "content-type".to_string(),
             value: "application/json".to_string(),
         }],
-        body_base64: encode_optional_body_base64(
-            serde_json::to_vec(&enroll_request)
-                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-                .as_slice(),
-        ),
-    };
-
-    let relay_response = match state.relay.submit_and_await(relay_request).await {
-        Ok(response) => response,
-        Err(err) => {
-            state.bootstrap_claims.restore(&claim_token, claim).await;
-            return Err((StatusCode::BAD_GATEWAY, err.to_string()));
-        }
-    };
-
-    let relay_status =
-        StatusCode::from_u16(relay_response.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let relay_body = relay_response
-        .body_bytes()
+        &serde_json::to_vec(request).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed encoding bootstrap claim redeem request: {err}"),
+            )
+        })?,
+    )
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    send_relay_tunnel_bytes(&tunnel, &request_bytes)
+        .await
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    if relay_status.is_server_error() {
-        state.bootstrap_claims.restore(&claim_token, claim).await;
+    tunnel
+        .send(RelayTunnelFrame::CloseWrite)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+
+    let response_bytes = collect_relay_tunnel_bytes(&mut tunnel)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let response = parse_relay_wire_http_response(&response_bytes)
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let response_status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    if response_status.is_server_error() {
         return Err((
             StatusCode::BAD_GATEWAY,
-            String::from_utf8_lossy(&relay_body).to_string(),
+            String::from_utf8_lossy(&response.body).trim().to_string(),
         ));
     }
-    if !relay_status.is_success() {
+    if !response_status.is_success() {
         return Err((
-            relay_status,
-            String::from_utf8_lossy(&relay_body).trim().to_string(),
+            response_status,
+            String::from_utf8_lossy(&response.body).trim().to_string(),
         ));
     }
 
-    let enrolled = serde_json::from_slice::<RelayedEnrollmentResponse>(&relay_body)
+    let redeemed = serde_json::from_slice::<ClientBootstrapClaimRedeemResponse>(&response.body)
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    let mut bootstrap = claim.bootstrap.clone();
-    bootstrap.pairing_token = None;
-    bootstrap.device_id = enrolled.device_id.parse().ok();
-    bootstrap.device_label = enrolled.label.clone();
-
-    let response = ClientBootstrapClaimRedeemResponse {
-        bootstrap,
-        cluster_id: enrolled.cluster_id,
-        device_id: enrolled.device_id,
-        label: enrolled.label,
-        public_key_pem: enrolled.public_key_pem,
-        credential_pem: enrolled.credential_pem,
-        rendezvous_client_identity_pem: enrolled.rendezvous_client_identity_pem,
-        created_at_unix: enrolled.created_at_unix,
-        expires_at_unix: enrolled.expires_at_unix,
-    };
-    response
+    redeemed
         .validate()
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-
-    Ok(([(CACHE_CONTROL, "no-store")], Json(response)))
+    Ok(redeemed)
 }
 
 async fn submit_relay_http_request(
@@ -1472,87 +1423,126 @@ mod tests {
             device_id: None,
         };
         node_control
-            .publish_bootstrap_claim(&transport_sdk::ClientBootstrapClaimPublishRequest {
+            .register_presence(&transport_sdk::PresenceRegistration {
                 cluster_id,
-                issuer: transport_sdk::PeerIdentity::Node(target_node_id),
-                target_node_id,
-                claim_secret_hash: blake3::hash(claim_token.as_bytes()).to_hex().to_string(),
-                expires_at_unix: SystemTime::now()
+                identity: transport_sdk::PeerIdentity::Node(target_node_id),
+                public_api_url: None,
+                peer_api_url: None,
+                direct_candidates: Vec::new(),
+                labels: std::collections::HashMap::new(),
+                capacity_bytes: None,
+                free_bytes: None,
+                capabilities: vec![transport_sdk::TransportCapability::RelayTunnel],
+                relay_mode: RelayMode::Required,
+                connected_at_unix: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs()
-                    + 300,
-                bootstrap: published_bootstrap.clone(),
+                    .as_secs(),
             })
             .await
-            .expect("bootstrap claim should publish");
+            .expect("target node presence should register");
 
-        let poller_handle = tokio::spawn({
-            let rendezvous_public_url = rendezvous_public_url.clone();
-            let ca_pem = ca.ca_pem.clone();
+        let acceptor_handle = tokio::spawn({
+            let rendezvous_state = rendezvous_state.clone();
+            let published_bootstrap = published_bootstrap.clone();
             async move {
-                let client = transport_sdk::RendezvousControlClient::new(
-                    transport_sdk::RendezvousClientConfig {
-                        cluster_id,
-                        rendezvous_urls: vec![rendezvous_public_url],
-                        heartbeat_interval_secs: 15,
-                    },
-                    Some(&ca_pem),
-                    Some(target_identity_pem.as_bytes()),
-                )
-                .expect("target rendezvous client should build");
-
-                let request = loop {
-                    let polled = client
-                        .poll_relay_http_request(&transport_sdk::RelayHttpPollRequest {
+                for redeem_attempt in 0..2 {
+                    let mut tunnel = rendezvous_state
+                        .relay_tunnel
+                        .accept_target(transport_sdk::RelayTunnelAcceptRequest {
                             cluster_id,
                             target: transport_sdk::PeerIdentity::Node(target_node_id),
-                            wait_timeout_ms: Some(2_000),
+                            wait_timeout_ms: Some(15_000),
                         })
                         .await
-                        .expect("relay poll should succeed");
-                    if let Some(request) = polled.request {
-                        break request;
+                        .expect("relay tunnel should pair with target node");
+                    let request_bytes = collect_relay_tunnel_bytes(&mut tunnel)
+                        .await
+                        .expect("relay tunnel request bytes should collect");
+                    let request = transport_sdk::parse_relay_wire_http_request(&request_bytes)
+                        .expect("relay tunnel request should parse");
+                    assert_eq!(request.path_and_query, "/auth/bootstrap-claims/redeem");
+                    let redeem_request: transport_sdk::ClientBootstrapClaimRedeemRequest =
+                        serde_json::from_slice(&request.body)
+                            .expect("relay tunnel redeem request should parse");
+                    assert_eq!(redeem_request.claim_token, claim_token);
+                    assert_eq!(redeem_request.target_node_id, target_node_id);
+
+                    if redeem_attempt == 0 {
+                        assert_eq!(redeem_request.label.as_deref(), Some("Laptop"));
+                        let mut bootstrap = published_bootstrap.clone();
+                        bootstrap.pairing_token = None;
+                        bootstrap.device_id = redeem_request
+                            .device_id
+                            .as_deref()
+                            .and_then(|value| value.parse().ok());
+                        bootstrap.device_label = redeem_request.label.clone();
+                        let response_body = serde_json::to_vec(
+                            &transport_sdk::ClientBootstrapClaimRedeemResponse {
+                                bootstrap,
+                                cluster_id,
+                                device_id: redeem_request
+                                    .device_id
+                                    .expect("device id should be present"),
+                                label: redeem_request.label,
+                                public_key_pem: redeem_request.public_key_pem,
+                                credential_pem: "issued-credential".to_string(),
+                                rendezvous_client_identity_pem: Some(
+                                    "issued-rendezvous-identity".to_string(),
+                                ),
+                                created_at_unix: Some(11),
+                                expires_at_unix: Some(22),
+                            },
+                        )
+                        .expect("redeem response should serialize");
+                        let response_head = transport_sdk::encode_relay_wire_http_response_head(
+                            200,
+                            &[
+                                transport_sdk::RelayHttpHeader {
+                                    name: "content-type".to_string(),
+                                    value: "application/json".to_string(),
+                                },
+                                transport_sdk::RelayHttpHeader {
+                                    name: "content-length".to_string(),
+                                    value: response_body.len().to_string(),
+                                },
+                            ],
+                        )
+                        .expect("redeem response head should encode");
+                        send_relay_tunnel_bytes(&tunnel, &response_head)
+                            .await
+                            .expect("relay response head should send");
+                        send_relay_tunnel_bytes(&tunnel, &response_body)
+                            .await
+                            .expect("relay response body should send");
+                    } else {
+                        let response_head = transport_sdk::encode_relay_wire_http_response_head(
+                            404,
+                            &[
+                                transport_sdk::RelayHttpHeader {
+                                    name: "content-type".to_string(),
+                                    value: "text/plain; charset=utf-8".to_string(),
+                                },
+                                transport_sdk::RelayHttpHeader {
+                                    name: "content-length".to_string(),
+                                    value: "30".to_string(),
+                                },
+                            ],
+                        )
+                        .expect("not found head should encode");
+                        send_relay_tunnel_bytes(&tunnel, &response_head)
+                            .await
+                            .expect("not found head should send");
+                        send_relay_tunnel_bytes(&tunnel, b"bootstrap claim is unavailable")
+                            .await
+                            .expect("not found body should send");
                     }
-                };
 
-                assert_eq!(request.path_and_query, "/auth/device/enroll");
-                let enroll_request: transport_sdk::ClientEnrollmentRequest =
-                    serde_json::from_slice(
-                        &request.body_bytes().expect("relay body should decode"),
-                    )
-                    .expect("relay body should parse");
-                assert_eq!(enroll_request.pairing_token, "pair-token");
-                assert_eq!(enroll_request.label.as_deref(), Some("Laptop"));
-
-                client
-                    .respond_relay_http_request(&transport_sdk::RelayHttpResponse {
-                        cluster_id,
-                        session_id: request.session_id,
-                        request_id: request.request_id,
-                        responder: transport_sdk::PeerIdentity::Node(target_node_id),
-                        status: 201,
-                        headers: vec![transport_sdk::RelayHttpHeader {
-                            name: "content-type".to_string(),
-                            value: "application/json".to_string(),
-                        }],
-                        body_base64: transport_sdk::encode_optional_body_base64(
-                            serde_json::to_string(&serde_json::json!({
-                                "cluster_id": cluster_id,
-                                "device_id": enroll_request.device_id.expect("device id should be present"),
-                                "label": enroll_request.label,
-                                "public_key_pem": enroll_request.public_key_pem,
-                                "credential_pem": "issued-credential",
-                                "rendezvous_client_identity_pem": "issued-rendezvous-identity",
-                                "created_at_unix": 11,
-                                "expires_at_unix": 22
-                            }))
-                            .expect("relay enrollment response should serialize")
-                            .as_bytes(),
-                        ),
-                    })
-                    .await
-                    .expect("relay enrollment response should submit");
+                    tunnel
+                        .send(transport_sdk::RelayTunnelFrame::CloseWrite)
+                        .await
+                        .expect("relay tunnel response should finish");
+                }
             }
         });
 
@@ -1566,6 +1556,7 @@ mod tests {
             .post(format!("{rendezvous_public_url}/bootstrap-claims/redeem"))
             .json(&transport_sdk::ClientBootstrapClaimRedeemRequest {
                 claim_token: claim_token.to_string(),
+                target_node_id,
                 device_id: Some(Uuid::now_v7().to_string()),
                 label: Some("Laptop".to_string()),
                 public_key_pem: "device-public-key".to_string(),
@@ -1601,6 +1592,7 @@ mod tests {
             .post(format!("{rendezvous_public_url}/bootstrap-claims/redeem"))
             .json(&transport_sdk::ClientBootstrapClaimRedeemRequest {
                 claim_token: claim_token.to_string(),
+                target_node_id,
                 device_id: Some(Uuid::now_v7().to_string()),
                 label: Some("Laptop".to_string()),
                 public_key_pem: "device-public-key".to_string(),
@@ -1610,8 +1602,8 @@ mod tests {
             .expect("second claim redeem should return a response");
         assert_eq!(second_redeem.status(), StatusCode::NOT_FOUND);
 
-        poller_handle.abort();
-        let _ = poller_handle.await;
+        acceptor_handle.abort();
+        let _ = acceptor_handle.await;
         rendezvous_handle.abort();
         let _ = rendezvous_handle.await;
         let _ = std::fs::remove_dir_all(&rendezvous_dir);
