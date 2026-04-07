@@ -3,6 +3,7 @@ pub mod bootstrap_claim;
 pub mod candidates;
 pub mod http_connector;
 pub mod identity;
+pub mod mux;
 pub mod peer;
 pub mod relay;
 pub mod relay_http_wire;
@@ -11,6 +12,8 @@ pub mod rendezvous;
 pub mod rendezvous_runtime;
 pub mod request_auth;
 pub mod session;
+pub mod transport_protocol;
+pub mod ws_stream;
 
 pub use bootstrap::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial, BootstrapServerTlsFiles,
@@ -29,6 +32,7 @@ pub use http_connector::{HttpRouteKind, TransportHttpClientConfig, TransportHttp
 pub use identity::{
     ClientEnrollmentRequest, ClientIdentityMaterial, IssuedClientIdentity, next_device_id,
 };
+pub use mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
 pub use relay::{
     PendingRelayHttpRequest, RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayHttpHeader,
@@ -65,3 +69,8 @@ pub use session::{
     SessionPreference, TransportPathKind, TransportSessionPlan, TransportSessionRequest,
     select_session_plan,
 };
+pub use transport_protocol::{
+    TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
+    TransportSessionRole, TransportStreamControlMessage, TransportStreamKind,
+};
+pub use ws_stream::{DecodedWebSocketMessage, WebSocketByteStream, WebSocketMessageCodec};

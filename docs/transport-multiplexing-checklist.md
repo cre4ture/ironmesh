@@ -23,21 +23,21 @@ Status: active implementation checklist for replacing the pre-release relay HTTP
 
 ### Milestone 1: Transport foundation in `transport-sdk`
 
-- [ ] Add a generic WebSocket byte-stream adapter suitable for running Yamux over WebSocket frames.
-- [ ] Add Yamux dependency and a transport-friendly session wrapper.
-- [ ] Add an initial transport protocol skeleton for session and stream control messages.
-- [ ] Add tests covering:
-  - [ ] WebSocket byte-stream binary read/write behavior
-  - [ ] ping/pong handling
-  - [ ] at least two concurrent logical streams over one Yamux connection
+- [x] Add a generic WebSocket byte-stream adapter suitable for running Yamux over WebSocket frames.
+- [x] Add Yamux dependency and a transport-friendly session wrapper.
+- [x] Add an initial transport protocol skeleton for session and stream control messages.
+- [x] Add tests covering:
+  - [x] WebSocket byte-stream binary read/write behavior
+  - [x] ping/pong handling
+  - [x] at least two concurrent logical streams over one Yamux connection
 
 Primary files:
 
-- [ ] [crates/transport-sdk/Cargo.toml](/home/uli/rust-dev/ironmesh/crates/transport-sdk/Cargo.toml)
-- [ ] [crates/transport-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/lib.rs)
-- [ ] [crates/transport-sdk/src/ws_stream.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/ws_stream.rs)
-- [ ] [crates/transport-sdk/src/mux.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/mux.rs)
-- [ ] [crates/transport-sdk/src/transport_protocol.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/transport_protocol.rs)
+- [x] [crates/transport-sdk/Cargo.toml](/home/uli/rust-dev/ironmesh/crates/transport-sdk/Cargo.toml)
+- [x] [crates/transport-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/lib.rs)
+- [x] [crates/transport-sdk/src/ws_stream.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/ws_stream.rs)
+- [x] [crates/transport-sdk/src/mux.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/mux.rs)
+- [x] [crates/transport-sdk/src/transport_protocol.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/transport_protocol.rs)
 
 ### Milestone 2: Persistent relay sessions
 
@@ -159,4 +159,8 @@ Primary files:
 
 ## Progress log
 
-- [ ] 2026-04-08: Create this checklist, commit it as the migration baseline, then begin Milestone 1 in `transport-sdk`.
+- [x] 2026-04-08: Create this checklist and commit the migration baseline in `443dc4e` (`docs: add transport multiplexing checklist`).
+- [x] 2026-04-08: Complete Milestone 1 transport foundation work in `transport-sdk`.
+  Verification:
+  - `cargo test -p transport-sdk`
+  - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
