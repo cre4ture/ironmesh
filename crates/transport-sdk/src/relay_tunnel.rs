@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
-use crate::relay::RelayTicket;
+use crate::relay::{RelayTicket, RelayTunnelSessionKind};
 use crate::ws_stream::WebSocketByteStream;
 use common::ClusterId;
 
@@ -27,6 +27,8 @@ pub struct RelayTunnelAcceptRequest {
     pub cluster_id: ClusterId,
     pub target: PeerIdentity,
     #[serde(default)]
+    pub session_kind: RelayTunnelSessionKind,
+    #[serde(default)]
     pub wait_timeout_ms: Option<u64>,
 }
 
@@ -36,6 +38,8 @@ pub struct RelayTunnelSession {
     pub session_id: String,
     pub source: PeerIdentity,
     pub target: PeerIdentity,
+    #[serde(default)]
+    pub session_kind: RelayTunnelSessionKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -389,6 +393,7 @@ mod tests {
             session_id: "relay-session-test".to_string(),
             source: PeerIdentity::Device(Uuid::now_v7()),
             target: PeerIdentity::Node(Uuid::now_v7()),
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
         };
         let client = RelayTunnelClient {
             session: session.clone(),

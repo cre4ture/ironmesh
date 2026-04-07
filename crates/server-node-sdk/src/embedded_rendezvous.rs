@@ -32,7 +32,7 @@ use transport_sdk::{
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, PresenceRegistry,
     RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayBroker, RelayHttpPollRequest, RelayHttpPollResponse,
     RelayHttpRequest, RelayHttpResponse, RelayTicket, RelayTicketRequest, RelayTunnelBroker,
-    RelayTunnelControlMessage, RelayTunnelEndpoint, RelayTunnelFrame,
+    RelayTunnelControlMessage, RelayTunnelEndpoint, RelayTunnelFrame, RelayTunnelSessionKind,
     encode_relay_wire_http_request, issue_relay_ticket as issue_runtime_relay_ticket,
     parse_relay_wire_http_response,
 };
@@ -243,6 +243,7 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             cluster_id: target_presence.registration.cluster_id,
             source: bootstrap_claim_relay_source_identity(request),
             target,
+            session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
             requested_expires_in_secs: Some(30),
         },
         std::slice::from_ref(&state.config.public_url),

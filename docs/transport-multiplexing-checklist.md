@@ -50,6 +50,7 @@ Current slice landed:
 
 - [x] Bridge a paired relay tunnel WebSocket into `MultiplexedSession`.
 - [x] Add rendezvous client helpers for opening relay-backed multiplexed sessions.
+- [x] Separate legacy relay tunnels from multiplexed relay sessions with explicit `session_kind` routing keys.
 - [ ] Rewire server-node and client call paths to keep those sessions warm and reused.
 
 Primary files:
@@ -171,6 +172,10 @@ Primary files:
   - `cargo test -p transport-sdk`
   - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
 - [x] 2026-04-08: Start Milestone 2 by bridging paired relay tunnel sockets into `MultiplexedSession` and exposing rendezvous client helpers for relay-backed multiplexed sessions.
+  Verification:
+  - `cargo test -p transport-sdk`
+  - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
+- [x] 2026-04-08: Isolate legacy relay HTTP/one-shot tunnel traffic from new multiplexed relay sessions by adding `session_kind` to relay tickets, relay accept requests, and rendezvous pairing keys.
   Verification:
   - `cargo test -p transport-sdk`
   - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`

@@ -14,7 +14,7 @@ use crate::bootstrap_claim::{
 use crate::peer::PeerIdentity;
 use crate::relay::{
     PendingRelayHttpRequest, RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest,
-    RelayHttpResponse, RelayTicket, RelayTicketRequest,
+    RelayHttpResponse, RelayTicket, RelayTicketRequest, RelayTunnelSessionKind,
 };
 use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelSession};
 use crate::rendezvous::{PresenceEntry, PresenceRegistration};
@@ -164,6 +164,7 @@ pub fn issue_relay_ticket(
         session_id: Uuid::now_v7().to_string(),
         source: request.source,
         target: request.target,
+        session_kind: request.session_kind,
         relay_urls: relay_public_urls.to_vec(),
         issued_at_unix: now,
         expires_at_unix,
@@ -258,7 +259,11 @@ impl RelayBroker {
             bail!("relay ticket has expired");
         }
 
-        let target_key = relay_target_key(request.ticket.cluster_id, &request.ticket.target);
+        let target_key = relay_target_key(
+            request.ticket.cluster_id,
+            &request.ticket.target,
+            RelayTunnelSessionKind::LegacyHttpTunnel,
+        );
         let request_id = request.request_id.clone();
         let pending = PendingRelayHttpRequest {
             cluster_id: request.ticket.cluster_id,
@@ -326,7 +331,11 @@ impl RelayBroker {
 
     pub async fn poll(&self, request: RelayHttpPollRequest) -> Result<RelayHttpPollResponse> {
         request.validate()?;
-        let target_key = relay_target_key(request.cluster_id, &request.target);
+        let target_key = relay_target_key(
+            request.cluster_id,
+            &request.target,
+            RelayTunnelSessionKind::LegacyHttpTunnel,
+        );
         let timeout =
             Duration::from_millis(request.wait_timeout_ms.unwrap_or(15_000).clamp(100, 30_000));
 
@@ -457,10 +466,11 @@ impl RelayTunnelBroker {
             session_id: ticket.session_id.clone(),
             source: ticket.source.clone(),
             target: ticket.target.clone(),
+            session_kind: ticket.session_kind,
         };
         session.validate()?;
 
-        let target_key = relay_target_key(ticket.cluster_id, &ticket.target);
+        let target_key = relay_target_key(ticket.cluster_id, &ticket.target, ticket.session_kind);
         let (waiter_tx, waiter_rx) = oneshot::channel();
         let source = PendingRelayTunnelSource {
             session: session.clone(),
@@ -519,7 +529,8 @@ impl RelayTunnelBroker {
         request: RelayTunnelAcceptRequest,
     ) -> Result<RelayTunnelEndpoint> {
         request.validate()?;
-        let target_key = relay_target_key(request.cluster_id, &request.target);
+        let target_key =
+            relay_target_key(request.cluster_id, &request.target, request.session_kind);
         let timeout =
             Duration::from_millis(request.wait_timeout_ms.unwrap_or(15_000).clamp(100, 30_000));
 
@@ -666,8 +677,12 @@ fn remove_pending_request(
     }
 }
 
-fn relay_target_key(cluster_id: uuid::Uuid, target: &PeerIdentity) -> String {
-    format!("{cluster_id}:{target}")
+fn relay_target_key(
+    cluster_id: uuid::Uuid,
+    target: &PeerIdentity,
+    session_kind: RelayTunnelSessionKind,
+) -> String {
+    format!("{cluster_id}:{target}:{session_kind:?}")
 }
 
 fn retain_active_claims(state: &mut HashMap<String, BootstrapClaimRecord>) {
@@ -702,6 +717,7 @@ mod tests {
                 cluster_id,
                 source: source.clone(),
                 target: target.clone(),
+                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],
@@ -769,6 +785,7 @@ mod tests {
                 cluster_id,
                 source,
                 target: target.clone(),
+                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],
@@ -828,6 +845,7 @@ mod tests {
                 cluster_id,
                 source,
                 target: target.clone(),
+                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],
@@ -875,6 +893,7 @@ mod tests {
                 cluster_id,
                 source: source.clone(),
                 target: target.clone(),
+                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],
@@ -906,6 +925,7 @@ mod tests {
             .accept_target(RelayTunnelAcceptRequest {
                 cluster_id,
                 target,
+                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
                 wait_timeout_ms: Some(500),
             })
             .await

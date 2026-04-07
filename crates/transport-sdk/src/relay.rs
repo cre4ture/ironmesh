@@ -7,11 +7,21 @@ use crate::peer::PeerIdentity;
 
 pub const RELAY_HTTP_JSON_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayTunnelSessionKind {
+    #[default]
+    LegacyHttpTunnel,
+    MultiplexTransport,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayTicketRequest {
     pub cluster_id: ClusterId,
     pub source: PeerIdentity,
     pub target: PeerIdentity,
+    #[serde(default)]
+    pub session_kind: RelayTunnelSessionKind,
     #[serde(default)]
     pub requested_expires_in_secs: Option<u64>,
 }
@@ -22,6 +32,8 @@ pub struct RelayTicket {
     pub session_id: String,
     pub source: PeerIdentity,
     pub target: PeerIdentity,
+    #[serde(default)]
+    pub session_kind: RelayTunnelSessionKind,
     pub relay_urls: Vec<String>,
     pub issued_at_unix: u64,
     pub expires_at_unix: u64,

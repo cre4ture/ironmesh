@@ -384,7 +384,9 @@ impl RendezvousControlClient {
         ticket: &RelayTicket,
         config: MultiplexConfig,
     ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
-        self.connect_relay_tunnel_source(ticket)
+        let mut multiplex_ticket = ticket.clone();
+        multiplex_ticket.session_kind = crate::relay::RelayTunnelSessionKind::MultiplexTransport;
+        self.connect_relay_tunnel_source(&multiplex_ticket)
             .await?
             .into_multiplexed_session(MultiplexMode::Client, config)
     }
@@ -394,7 +396,9 @@ impl RendezvousControlClient {
         request: &RelayTunnelAcceptRequest,
         config: MultiplexConfig,
     ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
-        self.accept_relay_tunnel(request)
+        let mut multiplex_request = request.clone();
+        multiplex_request.session_kind = crate::relay::RelayTunnelSessionKind::MultiplexTransport;
+        self.accept_relay_tunnel(&multiplex_request)
             .await?
             .into_multiplexed_session(MultiplexMode::Server, config)
     }

@@ -245,6 +245,7 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             cluster_id: target_presence.registration.cluster_id,
             source: bootstrap_claim_relay_source_identity(request),
             target,
+            session_kind: transport_sdk::RelayTunnelSessionKind::LegacyHttpTunnel,
             requested_expires_in_secs: Some(30),
         },
         &state.config.relay_public_urls,
@@ -821,6 +822,7 @@ mod tests {
                 cluster_id,
                 source,
                 target: target.clone(),
+                session_kind: transport_sdk::RelayTunnelSessionKind::LegacyHttpTunnel,
                 requested_expires_in_secs: Some(60),
             },
             std::slice::from_ref(&state.config.public_url),
@@ -1237,6 +1239,7 @@ mod tests {
                 .accept_relay_tunnel(&transport_sdk::RelayTunnelAcceptRequest {
                     cluster_id,
                     target: transport_sdk::PeerIdentity::Node(target_node_id),
+                    session_kind: transport_sdk::RelayTunnelSessionKind::LegacyHttpTunnel,
                     wait_timeout_ms: Some(15_000),
                 })
                 .await
@@ -1482,6 +1485,7 @@ mod tests {
                         .accept_target(transport_sdk::RelayTunnelAcceptRequest {
                             cluster_id,
                             target: transport_sdk::PeerIdentity::Node(target_node_id),
+                            session_kind: transport_sdk::RelayTunnelSessionKind::LegacyHttpTunnel,
                             wait_timeout_ms: Some(15_000),
                         })
                         .await

@@ -22,9 +22,9 @@ use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     ClientIdentityMaterial, ParsedRelayWireHttpResponse, PeerIdentity,
     RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES, RelayHttpHeader, RelayTicketRequest, RelayTunnelClient,
-    RelayTunnelEvent, RendezvousControlClient, build_signed_request_headers,
-    encode_relay_wire_http_request, parse_relay_wire_http_head_response,
-    parse_relay_wire_http_response,
+    RelayTunnelEvent, RelayTunnelSessionKind, RendezvousControlClient,
+    build_signed_request_headers, encode_relay_wire_http_request,
+    parse_relay_wire_http_head_response, parse_relay_wire_http_response,
 };
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
@@ -2280,6 +2280,7 @@ async fn execute_relay_tunnel_buffered_request(
             cluster_id: relay.rendezvous.config().cluster_id,
             source,
             target: PeerIdentity::Node(relay.target_node_id),
+            session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
             requested_expires_in_secs: Some(30),
         })
         .await

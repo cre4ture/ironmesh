@@ -68,11 +68,12 @@ use transport_sdk::{
     PeerTransportClient, PeerTransportClientConfig, PresenceRegistration,
     RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES, RelayHttpHeader, RelayHttpPollRequest, RelayHttpResponse,
     RelayMode, RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelEvent,
-    RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders, TransportCapability,
-    TransportPathKind, credential_fingerprint, encode_optional_body_base64,
-    encode_relay_wire_http_request, encode_relay_wire_http_response_head,
-    parse_relay_wire_http_head_response, parse_relay_wire_http_request,
-    parse_relay_wire_http_response, verify_signed_request_headers,
+    RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
+    SignedRequestHeaders, TransportCapability, TransportPathKind, credential_fingerprint,
+    encode_optional_body_base64, encode_relay_wire_http_request,
+    encode_relay_wire_http_response_head, parse_relay_wire_http_head_response,
+    parse_relay_wire_http_request, parse_relay_wire_http_response,
+    verify_signed_request_headers,
 };
 use uuid::Uuid;
 
@@ -4677,6 +4678,7 @@ async fn execute_relay_peer_request(
             cluster_id: state.cluster_id,
             source: PeerIdentity::Node(state.node_id),
             target: PeerIdentity::Node(node.node_id),
+            session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
             requested_expires_in_secs: Some(30),
         })
         .await
@@ -4778,6 +4780,7 @@ fn spawn_rendezvous_relay_tunnel_agent(state: ServerState, local_base_url: Strin
                         .accept_relay_tunnel(&RelayTunnelAcceptRequest {
                             cluster_id,
                             target: PeerIdentity::Node(node_id),
+                            session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
                             wait_timeout_ms: Some(15_000),
                         })
                         .await;
