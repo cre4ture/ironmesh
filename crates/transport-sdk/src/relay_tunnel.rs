@@ -12,8 +12,10 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
 use crate::relay::RelayTicket;
+use crate::ws_stream::WebSocketByteStream;
 use common::ClusterId;
 
 trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -106,6 +108,18 @@ impl RelayTunnelClient {
 
     pub fn session(&self) -> &RelayTunnelSession {
         &self.session
+    }
+
+    pub fn into_multiplexed_session(
+        self,
+        mode: MultiplexMode,
+        config: MultiplexConfig,
+    ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        let RelayTunnelClient { session, websocket } = self;
+        let transport = WebSocketByteStream::new(websocket);
+        let multiplexed = MultiplexedSession::spawn(transport, mode, config)
+            .context("failed creating multiplexed relay tunnel session")?;
+        Ok((session, multiplexed))
     }
 
     pub async fn send_data(&mut self, bytes: &[u8]) -> Result<()> {
@@ -345,4 +359,87 @@ fn parse_client_identity_pem(
     let key = PrivateKeyDer::from_pem_reader(&mut key_reader)
         .context("failed parsing relay tunnel client private key")?;
     Ok((cert_chain, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn relay_tunnel_client_can_host_a_multiplexed_session() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client_ws = WebSocketStream::from_raw_socket(
+            Box::new(client_io) as Box<dyn AsyncIo>,
+            Role::Client,
+            None,
+        )
+        .await;
+        let server_ws = WebSocketStream::from_raw_socket(
+            Box::new(server_io) as Box<dyn AsyncIo>,
+            Role::Server,
+            None,
+        )
+        .await;
+
+        let session = RelayTunnelSession {
+            cluster_id: Uuid::now_v7(),
+            session_id: "relay-session-test".to_string(),
+            source: PeerIdentity::Device(Uuid::now_v7()),
+            target: PeerIdentity::Node(Uuid::now_v7()),
+        };
+        let client = RelayTunnelClient {
+            session: session.clone(),
+            websocket: client_ws,
+        };
+
+        let (returned_session, client_mux) = client
+            .into_multiplexed_session(MultiplexMode::Client, MultiplexConfig::default())
+            .expect("client multiplexed session should build");
+        let mut server_mux = MultiplexedSession::spawn(
+            WebSocketByteStream::new(server_ws),
+            MultiplexMode::Server,
+            MultiplexConfig::default(),
+        )
+        .expect("server multiplexed session should build");
+
+        assert_eq!(returned_session, session);
+
+        let mut outbound = client_mux
+            .open_stream()
+            .await
+            .expect("outbound multiplexed stream should open");
+        outbound
+            .write_all(b"relay-mux")
+            .await
+            .expect("outbound stream write should succeed");
+        outbound
+            .close()
+            .await
+            .expect("outbound stream close should succeed");
+
+        let mut inbound = server_mux
+            .accept_stream()
+            .await
+            .expect("accepting multiplexed relay stream should succeed")
+            .expect("multiplexed relay stream should exist");
+        let mut payload = Vec::new();
+        inbound
+            .read_to_end(&mut payload)
+            .await
+            .expect("inbound multiplexed relay stream should read");
+
+        assert_eq!(payload, b"relay-mux");
+
+        client_mux
+            .close()
+            .await
+            .expect("client multiplexed relay session should close");
+        server_mux
+            .close()
+            .await
+            .expect("server multiplexed relay session should close");
+    }
 }

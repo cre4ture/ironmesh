@@ -11,12 +11,13 @@ use crate::bootstrap_claim::{
     ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
 };
 use crate::candidates::ConnectionCandidate;
+use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
 use crate::relay::{
     RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
     RelayTicketRequest,
 };
-use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelClient};
+use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSession};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -376,6 +377,26 @@ impl RendezvousControlClient {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("rendezvous client has no configured URLs")))
+    }
+
+    pub async fn connect_relay_multiplex_source(
+        &self,
+        ticket: &RelayTicket,
+        config: MultiplexConfig,
+    ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        self.connect_relay_tunnel_source(ticket)
+            .await?
+            .into_multiplexed_session(MultiplexMode::Client, config)
+    }
+
+    pub async fn accept_relay_multiplex_target(
+        &self,
+        request: &RelayTunnelAcceptRequest,
+        config: MultiplexConfig,
+    ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        self.accept_relay_tunnel(request)
+            .await?
+            .into_multiplexed_session(MultiplexMode::Server, config)
     }
 
     pub async fn poll_relay_http_request(

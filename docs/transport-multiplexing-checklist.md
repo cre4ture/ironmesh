@@ -46,6 +46,12 @@ Primary files:
 - [ ] Remove relay-HTTP request/response semantics from the transport design.
 - [ ] Add tests covering relay session reuse and reconnect behavior.
 
+Current slice landed:
+
+- [x] Bridge a paired relay tunnel WebSocket into `MultiplexedSession`.
+- [x] Add rendezvous client helpers for opening relay-backed multiplexed sessions.
+- [ ] Rewire server-node and client call paths to keep those sessions warm and reused.
+
 Primary files:
 
 - [ ] [crates/transport-sdk/src/rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous.rs)
@@ -161,6 +167,10 @@ Primary files:
 
 - [x] 2026-04-08: Create this checklist and commit the migration baseline in `443dc4e` (`docs: add transport multiplexing checklist`).
 - [x] 2026-04-08: Complete Milestone 1 transport foundation work in `transport-sdk`.
+  Verification:
+  - `cargo test -p transport-sdk`
+  - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
+- [x] 2026-04-08: Start Milestone 2 by bridging paired relay tunnel sockets into `MultiplexedSession` and exposing rendezvous client helpers for relay-backed multiplexed sessions.
   Verification:
   - `cargo test -p transport-sdk`
   - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
