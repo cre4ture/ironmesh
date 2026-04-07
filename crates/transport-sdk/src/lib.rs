@@ -3,6 +3,7 @@ pub mod bootstrap_claim;
 pub mod candidates;
 pub mod http_connector;
 pub mod identity;
+pub mod multiplex_transport;
 pub mod mux;
 pub mod peer;
 pub mod relay;
@@ -31,6 +32,12 @@ pub use candidates::{CandidateKind, ConnectionCandidate, rank_candidates};
 pub use http_connector::{HttpRouteKind, TransportHttpClientConfig, TransportHttpRequestTarget};
 pub use identity::{
     ClientEnrollmentRequest, ClientIdentityMaterial, IssuedClientIdentity, next_device_id,
+};
+pub use multiplex_transport::{
+    BufferedTransportRequest, BufferedTransportResponse, perform_transport_client_handshake,
+    perform_transport_server_handshake, read_buffered_transport_request,
+    read_buffered_transport_response, write_buffered_transport_request,
+    write_buffered_transport_response,
 };
 pub use mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};

@@ -16,15 +16,18 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
+use tokio::sync::Mutex;
 use transport_sdk::{
-    ClientIdentityMaterial, ParsedRelayWireHttpResponse, PeerIdentity,
-    RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES, RelayHttpHeader, RelayTicketRequest, RelayTunnelClient,
-    RelayTunnelEvent, RelayTunnelSessionKind, RendezvousControlClient,
-    build_signed_request_headers, encode_relay_wire_http_request,
-    parse_relay_wire_http_head_response, parse_relay_wire_http_response,
+    BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
+    ClientIdentityMaterial, MultiplexConfig, MultiplexedSession, PeerIdentity, RelayHttpHeader,
+    RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind, RendezvousControlClient,
+    TransportHeader, TransportSessionControlMessage,
+    TransportSessionRole, TransportStreamKind, TRANSPORT_PROTOCOL_VERSION,
+    build_signed_request_headers, perform_transport_client_handshake,
+    read_buffered_transport_response, write_buffered_transport_request,
 };
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
@@ -70,6 +73,12 @@ struct ClientRelayTransport {
     rendezvous: RendezvousControlClient,
     request_base_url: String,
     target_node_id: NodeId,
+    multiplex_session: Arc<Mutex<Option<ClientRelayMultiplexSession>>>,
+}
+
+struct ClientRelayMultiplexSession {
+    _relay_session: RelayTunnelSession,
+    session: Arc<MultiplexedSession>,
 }
 
 #[derive(Debug)]
@@ -438,6 +447,7 @@ impl IronMeshClient {
                 rendezvous,
                 request_base_url: request_base_url.into().trim_end_matches('/').to_string(),
                 target_node_id,
+                multiplex_session: Arc::new(Mutex::new(None)),
             }),
             auth: ClientRequestAuth::None,
         }
@@ -583,7 +593,7 @@ impl IronMeshClient {
             }
             ClientTransport::Relay(relay) => {
                 let source = self.relay_source_identity()?;
-                execute_relay_tunnel_buffered_request(
+                execute_relay_multiplex_buffered_request(
                     relay,
                     source,
                     &method,
@@ -2246,17 +2256,17 @@ async fn wait_for_download_cancellation(should_cancel: &dyn Fn() -> bool) {
     }
 }
 
-fn buffered_response_from_relay_wire(
-    response: ParsedRelayWireHttpResponse,
+fn buffered_response_from_multiplex(
+    response: MultiplexBufferedTransportResponse,
 ) -> Result<BufferedTransportResponse> {
     let status = StatusCode::from_u16(response.status)
-        .with_context(|| format!("invalid relayed tunnel HTTP status {}", response.status))?;
+        .with_context(|| format!("invalid multiplexed transport status {}", response.status))?;
     let mut headers = HeaderMap::new();
     for header in response.headers {
         let name = HeaderName::from_bytes(header.name.as_bytes())
-            .with_context(|| format!("invalid relayed tunnel header name {}", header.name))?;
+            .with_context(|| format!("invalid multiplexed header name {}", header.name))?;
         let value = HeaderValue::from_str(&header.value)
-            .with_context(|| format!("invalid relayed tunnel header value for {}", header.name))?;
+            .with_context(|| format!("invalid multiplexed header value for {}", header.name))?;
         headers.append(name, value);
     }
     Ok(BufferedTransportResponse {
@@ -2266,7 +2276,101 @@ fn buffered_response_from_relay_wire(
     })
 }
 
-async fn execute_relay_tunnel_buffered_request(
+fn transport_headers_from_relay_headers(headers: &[RelayHttpHeader]) -> Vec<TransportHeader> {
+    headers
+        .iter()
+        .map(|header| TransportHeader {
+            name: header.name.clone(),
+            value: header.value.clone(),
+        })
+        .collect()
+}
+
+fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole {
+    match source {
+        PeerIdentity::Node(_) => TransportSessionRole::Node,
+        PeerIdentity::Device(_) => TransportSessionRole::Client,
+    }
+}
+
+fn transport_stream_kind_for_path(path: &str) -> TransportStreamKind {
+    if path == "/health" || path.starts_with("/diagnostics/") {
+        TransportStreamKind::Diagnostics
+    } else {
+        TransportStreamKind::Rpc
+    }
+}
+
+impl ClientRelayTransport {
+    async fn invalidate_multiplex_session(&self) {
+        let mut guard = self.multiplex_session.lock().await;
+        *guard = None;
+    }
+
+    async fn ensure_multiplex_session(
+        &self,
+        source: PeerIdentity,
+    ) -> Result<Arc<MultiplexedSession>> {
+        let mut guard = self.multiplex_session.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Arc::clone(&existing.session));
+        }
+
+        let ticket = self
+            .rendezvous
+            .issue_relay_ticket(&RelayTicketRequest {
+                cluster_id: self.rendezvous.config().cluster_id,
+                source: source.clone(),
+                target: PeerIdentity::Node(self.target_node_id),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                requested_expires_in_secs: Some(300),
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed issuing multiplex relay ticket for client target node {}",
+                    self.target_node_id
+                )
+            })?;
+        let (relay_session, multiplexed) = self
+            .rendezvous
+            .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed opening multiplex relay session for client target node {}",
+                    self.target_node_id
+                )
+            })?;
+
+        perform_transport_client_handshake(
+            &multiplexed,
+            TransportSessionControlMessage::Hello {
+                protocol_version: TRANSPORT_PROTOCOL_VERSION,
+                cluster_id: self.rendezvous.config().cluster_id,
+                role: relay_session_role_for_source(&source),
+                peer: source,
+                target: Some(PeerIdentity::Node(self.target_node_id)),
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed performing multiplex relay transport handshake for target node {}",
+                self.target_node_id
+            )
+        })?;
+
+        let session = Arc::new(multiplexed);
+        *guard = Some(ClientRelayMultiplexSession {
+            _relay_session: relay_session,
+            session: Arc::clone(&session),
+        });
+        Ok(session)
+    }
+}
+
+async fn execute_relay_multiplex_buffered_request(
     relay: &ClientRelayTransport,
     source: PeerIdentity,
     method: &Method,
@@ -2274,77 +2378,63 @@ async fn execute_relay_tunnel_buffered_request(
     headers: &[RelayHttpHeader],
     body: &[u8],
 ) -> Result<BufferedTransportResponse> {
-    let ticket = relay
-        .rendezvous
-        .issue_relay_ticket(&RelayTicketRequest {
-            cluster_id: relay.rendezvous.config().cluster_id,
-            source,
-            target: PeerIdentity::Node(relay.target_node_id),
-            session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
-            requested_expires_in_secs: Some(30),
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "failed issuing relay ticket for client target node {}",
-                relay.target_node_id
-            )
-        })?;
-    let mut tunnel = relay
-        .rendezvous
-        .connect_relay_tunnel_source(&ticket)
-        .await
-        .with_context(|| {
-            format!(
-                "failed opening relay tunnel for client target node {}",
-                relay.target_node_id
-            )
-        })?;
+    let request_path = path_and_query(url);
+    let request_headers = transport_headers_from_relay_headers(headers);
 
-    let request_bytes = encode_relay_wire_http_request(
-        method.as_str(),
-        &path_and_query(url),
-        &host_header_value(url)?,
-        headers,
-        body,
-    )
-    .context("failed encoding relayed tunnel HTTP request")?;
-    send_relay_tunnel_bytes(&mut tunnel, &request_bytes).await?;
-    tunnel
-        .send_close_write()
-        .await
-        .context("failed finishing relayed tunnel HTTP request")?;
-
-    let response_bytes = collect_relay_tunnel_response_bytes(&mut tunnel).await?;
-    let _ = tunnel.close().await;
-    let response = if method == Method::HEAD {
-        parse_relay_wire_http_head_response(&response_bytes)
-    } else {
-        parse_relay_wire_http_response(&response_bytes)
-    }
-    .context("failed parsing relayed tunnel HTTP response")?;
-    buffered_response_from_relay_wire(response)
-}
-
-async fn send_relay_tunnel_bytes(tunnel: &mut RelayTunnelClient, bytes: &[u8]) -> Result<()> {
-    for chunk in bytes.chunks(RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
-        tunnel
-            .send_data(chunk)
+    for attempt in 0..2 {
+        let session = relay
+            .ensure_multiplex_session(source.clone())
             .await
-            .context("failed sending relayed tunnel bytes")?;
-    }
-    Ok(())
-}
+            .with_context(|| {
+                format!(
+                    "failed ensuring multiplex relay session for target node {}",
+                    relay.target_node_id
+                )
+            })?;
+        let request = BufferedTransportRequest::new(
+            transport_stream_kind_for_path(&request_path),
+            method.as_str(),
+            request_path.clone(),
+            request_headers.clone(),
+            body.to_vec(),
+        );
 
-async fn collect_relay_tunnel_response_bytes(tunnel: &mut RelayTunnelClient) -> Result<Vec<u8>> {
-    let mut response_bytes = Vec::new();
-    loop {
-        match tunnel.recv_event().await? {
-            RelayTunnelEvent::Data(bytes) => response_bytes.extend_from_slice(&bytes),
-            RelayTunnelEvent::CloseWrite | RelayTunnelEvent::Closed => break,
+        let result = async {
+            let mut stream = session
+                .open_stream()
+                .await
+                .context("failed opening multiplex relay request stream")?;
+            write_buffered_transport_request(&mut stream, &request)
+                .await
+                .context("failed writing multiplex relay request")?;
+            let response = read_buffered_transport_response(&mut stream)
+                .await
+                .context("failed reading multiplex relay response")?;
+            buffered_response_from_multiplex(response)
+        }
+        .await;
+
+        match result {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt == 0 => {
+                relay.invalidate_multiplex_session().await;
+                tracing::debug!(
+                    error = %err,
+                    target_node_id = %relay.target_node_id,
+                    "retrying multiplex relay request after resetting cached session"
+                );
+            }
+            Err(err) => {
+                relay.invalidate_multiplex_session().await;
+                return Err(err);
+            }
         }
     }
-    Ok(response_bytes)
+
+    bail!(
+        "multiplex relay request retried without producing a response for target node {}",
+        relay.target_node_id
+    )
 }
 
 fn json_content_type_header() -> RelayHttpHeader {
@@ -2679,21 +2769,6 @@ fn path_and_query(url: &Url) -> String {
     }
 }
 
-fn host_header_value(url: &Url) -> Result<String> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow!("request URL is missing a host: {url}"))?;
-    let port = url.port_or_known_default();
-    let include_port = port.is_some_and(|port| {
-        !(url.scheme() == "http" && port == 80 || url.scheme() == "https" && port == 443)
-    });
-    if let Some(port) = port.filter(|_| include_port) {
-        Ok(format!("{host}:{port}"))
-    } else {
-        Ok(host.to_string())
-    }
-}
-
 fn unix_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2742,13 +2817,24 @@ mod tests {
         http::{Response, header},
         routing::{get, post},
     };
-    use std::sync::{Arc, Barrier};
+    use futures_util::{Sink, Stream};
+    use std::pin::Pin;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll};
     use tokio::sync::Mutex;
     use transport_sdk::{
-        ParsedRelayWireHttpRequest, RelayHttpHeader, RelayTicket, RelayTicketRequest,
-        RelayTunnelControlMessage, RelayTunnelSession, RendezvousClientConfig,
-        RendezvousControlClient, encode_relay_wire_http_response_head,
-        parse_relay_wire_http_request,
+        BufferedTransportResponse as MultiplexBufferedTransportResponse, DecodedWebSocketMessage,
+        MultiplexConfig, MultiplexMode, MultiplexedSession, RelayHttpHeader, RelayTicket,
+        RelayTicketRequest, RelayTunnelControlMessage, RelayTunnelSession,
+        RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
+        TransportHeader, TransportSessionControlMessage, TransportSessionRole,
+        TRANSPORT_PROTOCOL_VERSION, WebSocketByteStream, WebSocketMessageCodec,
+        encode_relay_wire_http_response_head, parse_relay_wire_http_request,
+        perform_transport_server_handshake, read_buffered_transport_request,
+        write_buffered_transport_response,
     };
 
     #[test]
@@ -2932,10 +3018,20 @@ mod tests {
         handle.abort();
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RelayTestCapturedRequest {
+        method: String,
+        path_and_query: String,
+        headers: Vec<RelayHttpHeader>,
+        body: Vec<u8>,
+    }
+
     #[derive(Clone)]
     struct RelayTestState {
         public_url: String,
-        captured_request: Arc<Mutex<Option<ParsedRelayWireHttpRequest>>>,
+        captured_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
+        issued_ticket_count: Arc<AtomicUsize>,
+        paired_session_count: Arc<AtomicUsize>,
         response_status: u16,
         response_headers: Vec<RelayHttpHeader>,
         response_body: Vec<u8>,
@@ -2945,11 +3041,13 @@ mod tests {
         State(state): State<RelayTestState>,
         Json(request): Json<RelayTicketRequest>,
     ) -> Json<RelayTicket> {
+        state.issued_ticket_count.fetch_add(1, Ordering::SeqCst);
         Json(RelayTicket {
             cluster_id: request.cluster_id,
             session_id: format!("relay-session-{}", uuid::Uuid::now_v7()),
             source: request.source,
             target: request.target,
+            session_kind: request.session_kind,
             relay_urls: vec![state.public_url],
             issued_at_unix: 1,
             expires_at_unix: 61,
@@ -2963,6 +3061,103 @@ mod tests {
         websocket.on_upgrade(move |socket| async move {
             serve_relay_tunnel_test_socket(state, socket).await;
         })
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RelayTestWsMessage {
+        Binary(Vec<u8>),
+        Text(String),
+        Ping(Vec<u8>),
+        Pong(Vec<u8>),
+        Close,
+    }
+
+    impl WebSocketMessageCodec for RelayTestWsMessage {
+        fn decode(self) -> std::io::Result<DecodedWebSocketMessage> {
+            Ok(match self {
+                Self::Binary(bytes) => DecodedWebSocketMessage::Binary(bytes),
+                Self::Text(_) => DecodedWebSocketMessage::Ignore,
+                Self::Ping(payload) => DecodedWebSocketMessage::Ping(payload),
+                Self::Pong(_) => DecodedWebSocketMessage::Pong,
+                Self::Close => DecodedWebSocketMessage::Close,
+            })
+        }
+
+        fn binary(bytes: Vec<u8>) -> Self {
+            Self::Binary(bytes)
+        }
+
+        fn pong(bytes: Vec<u8>) -> Self {
+            Self::Pong(bytes)
+        }
+    }
+
+    struct RelayTestSocketAdapter {
+        socket: WebSocket,
+    }
+
+    impl Stream for RelayTestSocketAdapter {
+        type Item = Result<RelayTestWsMessage, axum::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            match Pin::new(&mut this.socket).poll_next(cx) {
+                Poll::Ready(Some(Ok(Message::Binary(bytes)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Binary(bytes.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(Message::Text(text)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Text(text.to_string()))))
+                }
+                Poll::Ready(Some(Ok(Message::Ping(payload)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Ping(payload.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(Message::Pong(payload)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Pong(payload.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(Message::Close(_)))) => {
+                    Poll::Ready(Some(Ok(RelayTestWsMessage::Close)))
+                }
+                Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl Sink<RelayTestWsMessage> for RelayTestSocketAdapter {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_ready(cx)
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: RelayTestWsMessage) -> Result<(), Self::Error> {
+            let message = match item {
+                RelayTestWsMessage::Binary(bytes) => Message::Binary(bytes.into()),
+                RelayTestWsMessage::Text(text) => Message::Text(text.into()),
+                RelayTestWsMessage::Ping(payload) => Message::Ping(payload.into()),
+                RelayTestWsMessage::Pong(payload) => Message::Pong(payload.into()),
+                RelayTestWsMessage::Close => Message::Close(None),
+            };
+            Pin::new(&mut self.get_mut().socket).start_send(message)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_flush(cx)
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_close(cx)
+        }
     }
 
     async fn serve_relay_tunnel_test_socket(state: RelayTestState, mut socket: WebSocket) {
@@ -2981,6 +3176,7 @@ mod tests {
             session_id: ticket.session_id.clone(),
             source: ticket.source.clone(),
             target: ticket.target.clone(),
+            session_kind: ticket.session_kind,
         };
         socket
             .send(Message::Text(
@@ -2990,6 +3186,13 @@ mod tests {
             ))
             .await
             .expect("paired response should send");
+
+        state.paired_session_count.fetch_add(1, Ordering::SeqCst);
+
+        if ticket.session_kind == RelayTunnelSessionKind::MultiplexTransport {
+            serve_relay_multiplex_test_socket(state, socket, ticket).await;
+            return;
+        }
 
         let mut request_bytes = Vec::new();
         loop {
@@ -3016,7 +3219,12 @@ mod tests {
 
         let parsed = parse_relay_wire_http_request(&request_bytes)
             .expect("relay tunnel request should parse");
-        *state.captured_request.lock().await = Some(parsed);
+        *state.captured_request.lock().await = Some(RelayTestCapturedRequest {
+            method: parsed.method,
+            path_and_query: parsed.path_and_query,
+            headers: parsed.headers,
+            body: parsed.body,
+        });
 
         let response_head =
             encode_relay_wire_http_response_head(state.response_status, &state.response_headers)
@@ -3041,6 +3249,80 @@ mod tests {
             .expect("close_write should send");
     }
 
+    async fn serve_relay_multiplex_test_socket(
+        state: RelayTestState,
+        socket: WebSocket,
+        ticket: RelayTicket,
+    ) {
+        let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
+        let mut session = MultiplexedSession::spawn(
+            transport,
+            MultiplexMode::Server,
+            MultiplexConfig::default(),
+        )
+        .expect("multiplexed relay test session should spawn");
+
+        let hello = perform_transport_server_handshake(
+            &mut session,
+            TransportSessionControlMessage::Ready {
+                protocol_version: TRANSPORT_PROTOCOL_VERSION,
+                session_id: ticket.session_id,
+                max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+            },
+        )
+        .await
+        .expect("multiplexed relay test handshake should succeed");
+        assert!(matches!(
+            hello,
+            TransportSessionControlMessage::Hello {
+                role: TransportSessionRole::Client,
+                ..
+            }
+        ));
+
+        while let Some(mut stream) = session
+            .accept_stream()
+            .await
+            .expect("multiplexed relay test stream accept should succeed")
+        {
+            let request = read_buffered_transport_request(&mut stream)
+                .await
+                .expect("multiplexed relay test request should decode");
+            *state.captured_request.lock().await = Some(RelayTestCapturedRequest {
+                method: request.method.clone(),
+                path_and_query: request.path.clone(),
+                headers: request
+                    .headers
+                    .iter()
+                    .map(|header| RelayHttpHeader {
+                        name: header.name.clone(),
+                        value: header.value.clone(),
+                    })
+                    .collect(),
+                body: request.body.clone(),
+            });
+
+            write_buffered_transport_response(
+                &mut stream,
+                &MultiplexBufferedTransportResponse {
+                    request_id: request.request_id,
+                    status: state.response_status,
+                    headers: state
+                        .response_headers
+                        .iter()
+                        .map(|header| TransportHeader {
+                            name: header.name.clone(),
+                            value: header.value.clone(),
+                        })
+                        .collect(),
+                    body: state.response_body.clone(),
+                },
+            )
+            .await
+            .expect("multiplexed relay test response should write");
+        }
+    }
+
     async fn spawn_relay_test_server(
         response_status: u16,
         response_headers: Vec<RelayHttpHeader>,
@@ -3053,6 +3335,8 @@ mod tests {
         let state = RelayTestState {
             public_url: format!("http://{addr}"),
             captured_request: Arc::new(Mutex::new(None)),
+            issued_ticket_count: Arc::new(AtomicUsize::new(0)),
+            paired_session_count: Arc::new(AtomicUsize::new(0)),
             response_status,
             response_headers,
             response_body,
@@ -3339,6 +3623,52 @@ mod tests {
             .expect("relay request should be captured");
         assert_eq!(captured.method, "HEAD");
         assert_eq!(captured.path_and_query, "/store/gallery%2Fcat.png");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_transport_reuses_multiplexed_session_for_multiple_requests() {
+        let (relay_state, server) = spawn_relay_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: br#"{"status":"ok"}"#.len().to_string(),
+                },
+            ],
+            br#"{"status":"ok"}"#.to_vec(),
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("relay-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let target_node_id = NodeId::new_v4();
+        let client = relay_test_client(&relay_state, identity, target_node_id);
+
+        let first = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("first multiplex relay request should succeed");
+        let second = client
+            .get_json_path("/cluster/status")
+            .await
+            .expect("second multiplex relay request should succeed");
+
+        assert_eq!(first["status"], "ok");
+        assert_eq!(second["status"], "ok");
+        assert_eq!(relay_state.issued_ticket_count.load(Ordering::SeqCst), 1);
+        assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 1);
 
         server.abort();
         let _ = server.await;

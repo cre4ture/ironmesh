@@ -58,22 +58,25 @@ use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
     BootstrapClaimBroker, BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial,
     BootstrapServerTlsFiles, BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots,
-    CLIENT_BOOTSTRAP_CLAIM_KIND, CLIENT_BOOTSTRAP_CLAIM_VERSION, CandidateKind,
-    ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
-    ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
+    BufferedTransportRequest, BufferedTransportResponse, CLIENT_BOOTSTRAP_CLAIM_KIND,
+    CLIENT_BOOTSTRAP_CLAIM_VERSION, CandidateKind, ClientBootstrap as TransportClientBootstrap,
+    ClientBootstrapClaim, ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
     ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ClientEnrollmentRequest,
-    ConnectionCandidate, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
-    NodeEnrollmentPackage, NodeJoinRequest, ParsedRelayWireHttpRequest, PeerIdentity,
-    PeerTransportClient, PeerTransportClientConfig, PresenceRegistration,
-    RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES, RelayHttpHeader, RelayHttpPollRequest, RelayHttpResponse,
-    RelayMode, RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelEvent,
+    ConnectionCandidate, MultiplexConfig, MultiplexedSession,
+    NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
+    NodeJoinRequest, ParsedRelayWireHttpRequest, PeerIdentity, PeerTransportClient,
+    PeerTransportClientConfig, PresenceRegistration, RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES,
+    RelayHttpHeader, RelayHttpPollRequest, RelayHttpResponse, RelayMode, RelayTicketRequest,
+    RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelEvent, RelayTunnelSession,
     RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
-    SignedRequestHeaders, TransportCapability, TransportPathKind, credential_fingerprint,
+    SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader,
+    TransportPathKind, TransportSessionControlMessage, credential_fingerprint,
     encode_optional_body_base64, encode_relay_wire_http_request,
     encode_relay_wire_http_response_head, parse_relay_wire_http_head_response,
     parse_relay_wire_http_request, parse_relay_wire_http_response,
-    verify_signed_request_headers,
+    perform_transport_server_handshake, read_buffered_transport_request,
+    verify_signed_request_headers, write_buffered_transport_response,
 };
 use uuid::Uuid;
 
@@ -3459,6 +3462,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             && let Some(self_base_url) = relay_self_base_url
         {
             spawn_rendezvous_relay_tunnel_agent(state.clone(), self_base_url.clone());
+            spawn_rendezvous_relay_multiplex_agent(state.clone(), self_base_url.clone());
             spawn_rendezvous_relay_http_agent(state.clone(), self_base_url);
         }
     }
@@ -4759,6 +4763,302 @@ fn normalize_peer_path_and_query(path_and_query: &str) -> Result<String> {
     } else {
         Ok(format!("/{trimmed}"))
     }
+}
+
+fn transport_headers_from_response(headers: &HeaderMap) -> Vec<TransportHeader> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| TransportHeader {
+                name: name.as_str().to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn buffered_transport_error_response(
+    request_id: impl Into<String>,
+    status: u16,
+    body: String,
+) -> BufferedTransportResponse {
+    let content_length = body.len();
+    BufferedTransportResponse {
+        request_id: request_id.into(),
+        status,
+        headers: vec![
+            TransportHeader {
+                name: "content-type".to_string(),
+                value: "text/plain; charset=utf-8".to_string(),
+            },
+            TransportHeader {
+                name: "content-length".to_string(),
+                value: content_length.to_string(),
+            },
+        ],
+        body: body.into_bytes(),
+    }
+}
+
+async fn execute_local_multiplex_transport_request(
+    local_http: &reqwest::Client,
+    local_base_url: &str,
+    request: &BufferedTransportRequest,
+) -> Result<BufferedTransportResponse> {
+    let url = join_peer_url(local_base_url, &request.path)?;
+    let method = reqwest::Method::from_bytes(request.method.as_bytes())
+        .with_context(|| format!("invalid multiplexed transport HTTP method {}", request.method))?;
+    let mut outbound = local_http.request(method, url);
+    for header in &request.headers {
+        if header.name.eq_ignore_ascii_case("host")
+            || header.name.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        outbound = outbound.header(&header.name, &header.value);
+    }
+    if !request.body.is_empty() {
+        outbound = outbound.body(request.body.clone());
+    }
+
+    let response = outbound
+        .send()
+        .await
+        .context("failed executing local multiplex transport request")?;
+    let status = response.status().as_u16();
+    let headers = transport_headers_from_response(response.headers());
+    let body = response
+        .bytes()
+        .await
+        .context("failed reading local multiplex transport response body")?
+        .to_vec();
+
+    Ok(BufferedTransportResponse {
+        request_id: request.request_id.clone(),
+        status,
+        headers,
+        body,
+    })
+}
+
+async fn handle_multiplexed_relay_stream<S>(
+    local_http: reqwest::Client,
+    local_base_url: String,
+    mut stream: S,
+) -> Result<()>
+where
+    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
+{
+    let request = read_buffered_transport_request(&mut stream)
+        .await
+        .context("failed decoding multiplexed relay request stream")?;
+    let response = match execute_local_multiplex_transport_request(
+        &local_http,
+        &local_base_url,
+        &request,
+    )
+    .await
+    {
+        Ok(response) => {
+            if response.body.len() >= LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES {
+                info!(
+                    request_id = %response.request_id,
+                    path = %request.path,
+                    relay_response_body_bytes = response.body.len(),
+                    "large multiplexed relay response"
+                );
+            }
+            response
+        }
+        Err(err) => buffered_transport_error_response(
+            request.request_id.clone(),
+            502,
+            format!("relay execution failed: {err:#}"),
+        ),
+    };
+
+    write_buffered_transport_response(&mut stream, &response)
+        .await
+        .context("failed writing multiplexed relay response")
+}
+
+async fn serve_relay_multiplex_session(
+    state: ServerState,
+    endpoint_url: String,
+    relay_session: RelayTunnelSession,
+    mut session: MultiplexedSession,
+    local_http: reqwest::Client,
+    local_base_url: String,
+) -> Result<()> {
+    let hello = perform_transport_server_handshake(
+        &mut session,
+        TransportSessionControlMessage::Ready {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            session_id: relay_session.session_id.clone(),
+            max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed completing multiplex relay handshake for session {} from {}",
+            relay_session.session_id, endpoint_url
+        )
+    })?;
+    let TransportSessionControlMessage::Hello {
+        cluster_id,
+        peer,
+        target,
+        ..
+    } = hello
+    else {
+        bail!("multiplex relay handshake did not return a hello control message");
+    };
+
+    if cluster_id != state.cluster_id {
+        bail!(
+            "multiplex relay handshake cluster_id {} did not match local cluster {}",
+            cluster_id,
+            state.cluster_id
+        );
+    }
+    if peer != relay_session.source {
+        bail!(
+            "multiplex relay handshake peer {} did not match relay source {}",
+            peer,
+            relay_session.source
+        );
+    }
+    if target.as_ref() != Some(&PeerIdentity::Node(state.node_id)) {
+        bail!(
+            "multiplex relay handshake target {:?} did not match local node {}",
+            target,
+            state.node_id
+        );
+    }
+
+    loop {
+        let next = session
+            .accept_stream()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed accepting multiplex relay stream for session {}",
+                    relay_session.session_id
+                )
+            })?;
+        let Some(stream) = next else {
+            return Ok(());
+        };
+
+        let local_http = local_http.clone();
+        let local_base_url = local_base_url.clone();
+        let session_id = relay_session.session_id.clone();
+        let endpoint_url = endpoint_url.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_multiplexed_relay_stream(local_http, local_base_url, stream).await
+            {
+                warn!(
+                    error = %err,
+                    rendezvous_url = %endpoint_url,
+                    session_id = %session_id,
+                    "multiplexed relay request stream failed"
+                );
+            }
+        });
+    }
+}
+
+fn spawn_rendezvous_relay_multiplex_agent(state: ServerState, local_base_url: String) {
+    tokio::spawn(async move {
+        loop {
+            let clients = current_rendezvous_endpoint_clients(&state).await;
+            if clients.is_empty() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            let cluster_id = state.cluster_id;
+            let node_id = state.node_id;
+            let mut accepts = tokio::task::JoinSet::new();
+            for endpoint in clients {
+                accepts.spawn(async move {
+                    let result = endpoint
+                        .control
+                        .accept_relay_multiplex_target(
+                            &RelayTunnelAcceptRequest {
+                                cluster_id,
+                                target: PeerIdentity::Node(node_id),
+                                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                                wait_timeout_ms: Some(15_000),
+                            },
+                            MultiplexConfig::default(),
+                        )
+                        .await;
+                    (endpoint, result)
+                });
+            }
+
+            let mut handled_session = false;
+            while let Some(result) = accepts.join_next().await {
+                let Ok((endpoint, result)) = result else {
+                    continue;
+                };
+                match result {
+                    Ok((relay_session, multiplexed)) => {
+                        handled_session = true;
+                        accepts.abort_all();
+
+                        let state = state.clone();
+                        let local_http = current_internal_http(&state).await;
+                        let endpoint_url = endpoint.url.clone();
+                        let local_base_url = local_base_url.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = serve_relay_multiplex_session(
+                                state,
+                                endpoint_url.clone(),
+                                relay_session.clone(),
+                                multiplexed,
+                                local_http,
+                                local_base_url,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    error = %err,
+                                    rendezvous_url = %endpoint_url,
+                                    session_id = %relay_session.session_id,
+                                    "multiplex relay session failed"
+                                );
+                            }
+                        });
+                        break;
+                    }
+                    Err(err) => {
+                        if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(
+                            &err.to_string(),
+                        ) {
+                            tracing::debug!(
+                                error = %err,
+                                rendezvous_url = %endpoint.url,
+                                "multiplex relay accept timed out without a source connection"
+                            );
+                        } else {
+                            warn!(
+                                error = %err,
+                                rendezvous_url = %endpoint.url,
+                                "multiplex relay accept failed"
+                            );
+                        }
+                    }
+                }
+            }
+
+            if !handled_session {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    });
 }
 
 fn spawn_rendezvous_relay_tunnel_agent(state: ServerState, local_base_url: String) {

@@ -51,7 +51,9 @@ Current slice landed:
 - [x] Bridge a paired relay tunnel WebSocket into `MultiplexedSession`.
 - [x] Add rendezvous client helpers for opening relay-backed multiplexed sessions.
 - [x] Separate legacy relay tunnels from multiplexed relay sessions with explicit `session_kind` routing keys.
-- [ ] Rewire server-node and client call paths to keep those sessions warm and reused.
+- [x] Add buffered multiplexed RPC framing and transport handshakes for Yamux streams.
+- [x] Rewire buffered relay requests in `client-sdk` and `server-node` to use a warm multiplexed relay session.
+- [ ] Rewire the remaining server-node and client relay call paths to keep all relay traffic warm and reused.
 
 Primary files:
 
@@ -178,4 +180,9 @@ Primary files:
 - [x] 2026-04-08: Isolate legacy relay HTTP/one-shot tunnel traffic from new multiplexed relay sessions by adding `session_kind` to relay tickets, relay accept requests, and rendezvous pairing keys.
   Verification:
   - `cargo test -p transport-sdk`
+  - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
+- [x] 2026-04-08: Route buffered relay client requests through a cached multiplexed Yamux session and add buffered transport framing/handshakes for the new relay path.
+  Verification:
+  - `cargo test -p transport-sdk`
+  - `cargo test -p client-sdk relay_transport`
   - `cargo check -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`

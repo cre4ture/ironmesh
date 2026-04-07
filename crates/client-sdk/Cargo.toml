@@ -23,6 +23,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["ws"] }
+futures-util = "0.3"
 
 [lints]
 workspace = true
