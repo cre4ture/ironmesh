@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -21,6 +22,14 @@ impl SqliteMetadataStore {
     pub(super) fn open(metadata_db_path: &Path) -> Result<Self> {
         let metadata = Connection::open(metadata_db_path)
             .with_context(|| format!("failed to open {}", metadata_db_path.display()))?;
+        metadata
+            .busy_timeout(Duration::from_secs(5))
+            .with_context(|| {
+                format!(
+                    "failed to configure sqlite busy timeout for {}",
+                    metadata_db_path.display()
+                )
+            })?;
         init_metadata_db(&metadata)
             .with_context(|| format!("failed to initialize {}", metadata_db_path.display()))?;
         Ok(Self {

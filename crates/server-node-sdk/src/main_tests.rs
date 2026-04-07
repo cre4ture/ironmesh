@@ -670,6 +670,7 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     backend: MainTestBackend,
 ) {
     let state = build_test_state(1, false, backend).await;
+    let device_id = Uuid::now_v7().to_string();
     let now = super::unix_ts();
     {
         let mut auth = state.client_credentials.lock().await;
@@ -690,7 +691,7 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
         Json(super::ClientDeviceEnrollRequest {
             cluster_id: state.cluster_id,
             pairing_token: "pair-secret".to_string(),
-            device_id: Some("device-a".to_string()),
+            device_id: Some(device_id.clone()),
             label: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
                 .to_string(),
@@ -703,18 +704,18 @@ async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     if status != StatusCode::CREATED {
         panic!(
-            "unexpected status {} issuing bootstrap claim: {}",
+            "unexpected status {} enrolling client device: {}",
             status,
             String::from_utf8_lossy(&body)
         );
     }
     let enrolled: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(enrolled["device_id"], "device-a");
+    assert_eq!(enrolled["device_id"], device_id);
     assert!(enrolled["credential_pem"].as_str().is_some());
 
     let auth = state.client_credentials.lock().await;
     assert_eq!(auth.credentials.len(), 1);
-    assert_eq!(auth.credentials[0].device_id, "device-a");
+    assert_eq!(auth.credentials[0].device_id, device_id);
     assert!(auth.pairing_authorizations[0].used_at_unix.is_some());
     cleanup_test_state(&state).await;
 }
@@ -728,6 +729,7 @@ run_on_main_metadata_backends!(
 #[tokio::test]
 async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let device_id = Uuid::now_v7().to_string();
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     state.cluster_ca_pem = Some(cluster_ca_pem);
     state.internal_ca_key_pem = Some(internal_ca_key_pem);
@@ -753,7 +755,7 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
         Json(super::ClientDeviceEnrollRequest {
             cluster_id: state.cluster_id,
             pairing_token: "pair-secret-2".to_string(),
-            device_id: Some("device-b".to_string()),
+            device_id: Some(device_id.clone()),
             label: Some("Laptop".to_string()),
             public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
                 .to_string(),
@@ -766,12 +768,13 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     if status != StatusCode::CREATED {
         panic!(
-            "unexpected status {} issuing bootstrap claim: {}",
+            "unexpected status {} enrolling client device: {}",
             status,
             String::from_utf8_lossy(&body)
         );
     }
     let enrolled: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(enrolled["device_id"], device_id);
     let rendezvous_identity_pem = enrolled["rendezvous_client_identity_pem"]
         .as_str()
         .expect("rendezvous client identity PEM should be present");
@@ -5664,27 +5667,21 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
             }),
         )
         .route(
-            "/relay/http/request",
-            post(
-                move |Json(request): Json<transport_sdk::RelayHttpRequest>| {
-                    let relay_paths = relay_paths.clone();
-                    async move {
-                        relay_paths
-                            .lock()
-                            .await
-                            .push(request.path_and_query.clone());
-                        Json(transport_sdk::RelayHttpResponse {
-                            cluster_id: request.ticket.cluster_id,
-                            session_id: request.ticket.session_id.clone(),
-                            request_id: request.request_id,
-                            responder: request.ticket.target,
-                            status: StatusCode::OK.as_u16(),
-                            headers: Vec::new(),
-                            body_base64: None,
-                        })
-                    }
-                },
-            ),
+            "/relay/tunnel/ws",
+            get(move |websocket: axum::extract::WebSocketUpgrade| {
+                let relay_paths = relay_paths.clone();
+                let expected_target = expected_target.clone();
+                async move {
+                    websocket.on_upgrade(move |socket| async move {
+                        serve_cleanup_relay_tunnel_socket(
+                            relay_paths,
+                            expected_target,
+                            socket,
+                        )
+                        .await;
+                    })
+                }
+            }),
         );
     let relay_listener = tokio::net::TcpListener::bind(relay_bind_addr)
         .await
@@ -5786,6 +5783,87 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     relay_handle.abort();
     let _ = relay_handle.await;
     cleanup_test_state(&state).await;
+}
+
+async fn serve_cleanup_relay_tunnel_socket(
+    relay_paths: Arc<Mutex<Vec<String>>>,
+    expected_target: transport_sdk::PeerIdentity,
+    mut socket: axum::extract::ws::WebSocket,
+) {
+    let initial = match socket.recv().await {
+        Some(Ok(axum::extract::ws::Message::Text(text))) => text,
+        _ => return,
+    };
+    let transport_sdk::RelayTunnelControlMessage::ConnectSource { ticket } =
+        serde_json::from_str(&initial).expect("relay cleanup tunnel control should parse")
+    else {
+        return;
+    };
+    assert_eq!(ticket.target, expected_target);
+
+    let session = transport_sdk::RelayTunnelSession {
+        cluster_id: ticket.cluster_id,
+        session_id: ticket.session_id.clone(),
+        source: ticket.source.clone(),
+        target: ticket.target.clone(),
+    };
+    socket
+        .send(axum::extract::ws::Message::Text(
+            serde_json::to_string(&transport_sdk::RelayTunnelControlMessage::Paired { session })
+                .expect("paired relay control should serialize")
+                .into(),
+        ))
+        .await
+        .expect("paired relay response should send");
+
+    let mut request_bytes = Vec::new();
+    loop {
+        match socket.recv().await {
+            Some(Ok(axum::extract::ws::Message::Binary(bytes))) => {
+                request_bytes.extend_from_slice(&bytes);
+            }
+            Some(Ok(axum::extract::ws::Message::Text(text))) => {
+                let control: transport_sdk::RelayTunnelControlMessage =
+                    serde_json::from_str(&text).expect("relay cleanup control should parse");
+                if matches!(control, transport_sdk::RelayTunnelControlMessage::CloseWrite) {
+                    break;
+                }
+            }
+            Some(Ok(axum::extract::ws::Message::Close(_))) | None => return,
+            Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
+                socket
+                    .send(axum::extract::ws::Message::Pong(payload))
+                    .await
+                    .expect("relay cleanup pong should send");
+            }
+            Some(Ok(axum::extract::ws::Message::Pong(_))) => {}
+            #[allow(unreachable_patterns)]
+            Some(Ok(_)) => {}
+            Some(Err(_)) => return,
+        }
+    }
+
+    let request = transport_sdk::parse_relay_wire_http_request(&request_bytes)
+        .expect("relay cleanup request should parse");
+    relay_paths.lock().await.push(request.path_and_query);
+
+    let response_head = transport_sdk::encode_relay_wire_http_response_head(
+        StatusCode::OK.as_u16(),
+        &[],
+    )
+    .expect("relay cleanup response head should encode");
+    socket
+        .send(axum::extract::ws::Message::Binary(response_head.into()))
+        .await
+        .expect("relay cleanup response head should send");
+    socket
+        .send(axum::extract::ws::Message::Text(
+            serde_json::to_string(&transport_sdk::RelayTunnelControlMessage::CloseWrite)
+                .expect("relay cleanup close_write should serialize")
+                .into(),
+        ))
+        .await
+        .expect("relay cleanup close_write should send");
 }
 
 #[tokio::test]

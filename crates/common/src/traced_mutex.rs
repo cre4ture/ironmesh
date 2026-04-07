@@ -69,6 +69,10 @@ impl<T> TracedMutex<T> {
     }
 
     pub async fn lock(&self, operation: &'static str) -> TracedMutexGuard<'_, T> {
+        if let Ok(guard) = self.inner.try_lock() {
+            return self.guard_from_lock(operation, 0, Instant::now(), guard);
+        }
+
         let wait_started_at = Instant::now();
         let mut wait_logged = false;
         let lock_future = self.inner.lock();
@@ -96,24 +100,7 @@ impl<T> TracedMutex<T> {
             self.log_wait(operation, waited_ms);
         }
 
-        let acquired_at = Instant::now();
-        {
-            let mut owner = self.owner.lock().unwrap();
-            *owner = Some(TracedMutexOwner {
-                operation,
-                acquired_at,
-            });
-        }
-
-        TracedMutexGuard {
-            mutex_name: self.name,
-            operation,
-            waited_ms,
-            acquired_at,
-            owner: &self.owner,
-            hold_log_after: self.config.hold_log_after,
-            guard,
-        }
+        self.guard_from_lock(operation, waited_ms, Instant::now(), guard)
     }
 
     fn log_wait(&self, operation: &'static str, waited_ms: u128) {
@@ -132,6 +119,32 @@ impl<T> TracedMutex<T> {
                 mutex = self.name,
                 operation, waited_ms, "slow mutex lock wait"
             );
+        }
+    }
+
+    fn guard_from_lock<'a>(
+        &'a self,
+        operation: &'static str,
+        waited_ms: u128,
+        acquired_at: Instant,
+        guard: MutexGuard<'a, T>,
+    ) -> TracedMutexGuard<'a, T> {
+        {
+            let mut owner = self.owner.lock().unwrap();
+            *owner = Some(TracedMutexOwner {
+                operation,
+                acquired_at,
+            });
+        }
+
+        TracedMutexGuard {
+            mutex_name: self.name,
+            operation,
+            waited_ms,
+            acquired_at,
+            owner: &self.owner,
+            hold_log_after: self.config.hold_log_after,
+            guard,
         }
     }
 }
