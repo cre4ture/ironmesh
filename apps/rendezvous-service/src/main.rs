@@ -1205,72 +1205,98 @@ mod tests {
             issue_device_cert(&ca, device_id).expect("device client cert should issue");
         let device_identity_pem = format!("{}\n{}", device_tls.0, device_tls.1);
         let captured_request = std::sync::Arc::new(tokio::sync::Mutex::new(
-            None::<transport_sdk::PendingRelayHttpRequest>,
+            None::<(
+                transport_sdk::PeerIdentity,
+                transport_sdk::ParsedRelayWireHttpRequest,
+            )>,
         ));
 
-        let captured_request_for_poller = captured_request.clone();
-        let rendezvous_public_url_for_poller = rendezvous_public_url.clone();
-        let ca_pem_for_poller = ca.ca_pem.clone();
-        let poller_handle = tokio::spawn(async move {
+        let captured_request_for_acceptor = captured_request.clone();
+        let rendezvous_public_url_for_acceptor = rendezvous_public_url.clone();
+        let ca_pem_for_acceptor = ca.ca_pem.clone();
+        let acceptor_handle = tokio::spawn(async move {
             let client = transport_sdk::RendezvousControlClient::new(
                 transport_sdk::RendezvousClientConfig {
                     cluster_id,
-                    rendezvous_urls: vec![rendezvous_public_url_for_poller],
+                    rendezvous_urls: vec![rendezvous_public_url_for_acceptor],
                     heartbeat_interval_secs: 15,
                 },
-                Some(&ca_pem_for_poller),
+                Some(&ca_pem_for_acceptor),
                 Some(target_identity_pem.as_bytes()),
             )
             .expect("target rendezvous client should build");
 
-            let request = loop {
-                let polled = client
-                    .poll_relay_http_request(&transport_sdk::RelayHttpPollRequest {
-                        cluster_id,
-                        target: transport_sdk::PeerIdentity::Node(target_node_id),
-                        wait_timeout_ms: Some(2_000),
-                    })
-                    .await
-                    .expect("relay poll should succeed");
-                if let Some(request) = polled.request {
-                    break request;
-                }
-            };
-            *captured_request_for_poller.lock().await = Some(request.clone());
-
-            client
-                .respond_relay_http_request(&transport_sdk::RelayHttpResponse {
+            let mut tunnel = client
+                .accept_relay_tunnel(&transport_sdk::RelayTunnelAcceptRequest {
                     cluster_id,
-                    session_id: request.session_id,
-                    request_id: request.request_id,
-                    responder: transport_sdk::PeerIdentity::Node(target_node_id),
-                    status: 200,
-                    headers: vec![transport_sdk::RelayHttpHeader {
-                        name: "content-type".to_string(),
-                        value: "application/json".to_string(),
-                    }],
-                    body_base64: transport_sdk::encode_optional_body_base64(
-                        serde_json::to_string(&client_sdk::StoreIndexResponse {
-                            prefix: String::new(),
-                            depth: 1,
-                            entry_count: 1,
-                            entries: vec![client_sdk::StoreIndexEntry {
-                                path: "readme.txt".to_string(),
-                                entry_type: "key".to_string(),
-                                version: Some("v1".to_string()),
-                                content_hash: Some("hash-1".to_string()),
-                                size_bytes: Some(7),
-                                modified_at_unix: None,
-                                content_fingerprint: None,
-                                media: None,
-                            }],
-                        })
-                        .expect("store index should serialize")
-                        .as_bytes(),
-                    ),
+                    target: transport_sdk::PeerIdentity::Node(target_node_id),
+                    wait_timeout_ms: Some(15_000),
                 })
                 .await
-                .expect("relay response should submit");
+                .expect("relay tunnel accept should succeed");
+            let mut request_bytes = Vec::new();
+            loop {
+                match tunnel.recv_event().await.expect("relay tunnel read should succeed") {
+                    transport_sdk::RelayTunnelEvent::Data(bytes) => {
+                        request_bytes.extend_from_slice(&bytes);
+                    }
+                    transport_sdk::RelayTunnelEvent::CloseWrite => break,
+                    transport_sdk::RelayTunnelEvent::Closed => {
+                        panic!("relay tunnel closed before request completed");
+                    }
+                }
+            }
+            let request = transport_sdk::parse_relay_wire_http_request(&request_bytes)
+                .expect("relay tunnel request should parse");
+            *captured_request_for_acceptor.lock().await =
+                Some((tunnel.session().source.clone(), request.clone()));
+
+            let response_body = serde_json::to_vec(&client_sdk::StoreIndexResponse {
+                prefix: String::new(),
+                depth: 1,
+                entry_count: 1,
+                entries: vec![client_sdk::StoreIndexEntry {
+                    path: "readme.txt".to_string(),
+                    entry_type: "key".to_string(),
+                    version: Some("v1".to_string()),
+                    content_hash: Some("hash-1".to_string()),
+                    size_bytes: Some(7),
+                    modified_at_unix: None,
+                    content_fingerprint: None,
+                    media: None,
+                }],
+            })
+            .expect("store index should serialize");
+            let response_head = transport_sdk::encode_relay_wire_http_response_head(
+                200,
+                &[
+                    transport_sdk::RelayHttpHeader {
+                        name: "content-type".to_string(),
+                        value: "application/json".to_string(),
+                    },
+                    transport_sdk::RelayHttpHeader {
+                        name: "content-length".to_string(),
+                        value: response_body.len().to_string(),
+                    },
+                ],
+            )
+            .expect("relay response head should encode");
+            for chunk in response_head.chunks(transport_sdk::RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
+                tunnel
+                    .send_data(chunk)
+                    .await
+                    .expect("relay response head should send");
+            }
+            for chunk in response_body.chunks(transport_sdk::RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
+                tunnel
+                    .send_data(chunk)
+                    .await
+                    .expect("relay response body should send");
+            }
+            tunnel
+                .send_close_write()
+                .await
+                .expect("relay response should finish");
         });
 
         let mut identity = ClientIdentityMaterial::generate(
@@ -1314,19 +1340,16 @@ mod tests {
         assert_eq!(response.entry_count, 1);
         assert_eq!(response.entries[0].path, "readme.txt");
 
-        let captured = captured_request
+        let (source, request) = captured_request
             .lock()
             .await
             .clone()
             .expect("relay request should be captured");
-        assert_eq!(
-            captured.source,
-            transport_sdk::PeerIdentity::Device(device_id)
-        );
-        assert_eq!(captured.path_and_query, "/store/index?depth=1");
+        assert_eq!(source, transport_sdk::PeerIdentity::Device(device_id));
+        assert_eq!(request.path_and_query, "/store/index?depth=1");
 
-        poller_handle.abort();
-        let _ = poller_handle.await;
+        acceptor_handle.abort();
+        let _ = acceptor_handle.await;
         rendezvous_handle.abort();
         let _ = rendezvous_handle.await;
         let _ = std::fs::remove_dir_all(&rendezvous_dir);
