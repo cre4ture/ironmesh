@@ -637,32 +637,54 @@ pub fn enroll_bootstrap_claim_blocking(
     let mut identity =
         ClientIdentityMaterial::generate(claim.cluster_id, device_id, label.clone())?;
     let rendezvous_ca_pem = claim_rendezvous_ca_pem(&claim.trust)?;
-    let redeem_url = Url::parse(&claim.rendezvous_url)
-        .with_context(|| format!("invalid claim rendezvous URL {}", claim.rendezvous_url))?
-        .join("bootstrap-claims/redeem")
-        .with_context(|| {
-            format!(
-                "failed to build bootstrap claim redeem URL from {}",
-                claim.rendezvous_url
-            )
-        })?;
-    let response =
-        build_blocking_reqwest_client_from_pem_for_url(Some(&rendezvous_ca_pem), &redeem_url)?
-            .post(redeem_url)
-            .json(&ClientBootstrapClaimRedeemRequest {
-                claim_token: claim.claim_token.clone(),
-                target_node_id: claim.target_node_id,
-                device_id: Some(identity.device_id.to_string()),
-                label,
-                public_key_pem: identity.public_key_pem.clone(),
-            })
-            .send()
-            .context("failed to call /bootstrap-claims/redeem")?;
-    let status = response.status();
-    let body = response
-        .text()
-        .unwrap_or_else(|_| "<failed to read response body>".to_string());
-    let redeemed = parse_bootstrap_claim_redeem_response(status, body)?;
+    let redeem_request = ClientBootstrapClaimRedeemRequest {
+        claim_token: claim.claim_token.clone(),
+        target_node_id: claim.target_node_id,
+        device_id: Some(identity.device_id.to_string()),
+        label,
+        public_key_pem: identity.public_key_pem.clone(),
+    };
+    let mut retryable_errors = Vec::new();
+    let mut redeemed = None;
+    for redeem_url in claim_redeem_urls(claim)? {
+        let response = match build_blocking_reqwest_client_from_pem_for_url(
+            Some(&rendezvous_ca_pem),
+            &redeem_url,
+        )?
+        .post(redeem_url.clone())
+        .json(&redeem_request)
+        .send()
+        {
+            Ok(response) => response,
+            Err(err) => {
+                retryable_errors.push(format!(
+                    "failed to call /bootstrap-claims/redeem via {redeem_url}: {err}"
+                ));
+                continue;
+            }
+        };
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "<failed to read response body>".to_string());
+        if status.is_success() {
+            redeemed = Some(parse_bootstrap_claim_redeem_response(status, body)?);
+            break;
+        }
+        if status.is_server_error() {
+            retryable_errors.push(format!(
+                "bootstrap claim redeem failed via {redeem_url} with HTTP {status}: {body}"
+            ));
+            continue;
+        }
+        bail!("bootstrap claim redeem failed via {redeem_url} with HTTP {status}: {body}");
+    }
+    let redeemed = redeemed.ok_or_else(|| {
+        anyhow!(
+            "bootstrap claim redeem failed across all rendezvous endpoints: {}",
+            retryable_errors.join(" | ")
+        )
+    })?;
     identity.apply_issued_identity(&redeemed.issued_identity()?)?;
 
     let bootstrap = connection_bootstrap_from_transport(&redeemed.bootstrap);
@@ -701,6 +723,21 @@ fn parse_bootstrap_claim_redeem_response(
         .context("failed to parse /bootstrap-claims/redeem response")?;
     redeemed.validate()?;
     Ok(redeemed)
+}
+
+fn claim_redeem_urls(claim: &ClientBootstrapClaim) -> Result<Vec<Url>> {
+    claim
+        .ordered_rendezvous_urls()?
+        .into_iter()
+        .map(|rendezvous_url| {
+            Url::parse(&rendezvous_url)
+                .with_context(|| format!("invalid claim rendezvous URL {rendezvous_url}"))?
+                .join("bootstrap-claims/redeem")
+                .with_context(|| {
+                    format!("failed to build bootstrap claim redeem URL from {rendezvous_url}")
+                })
+        })
+        .collect()
 }
 
 fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) -> Result<bool> {
@@ -836,6 +873,10 @@ impl From<&BootstrapEnrollmentResult> for DeviceEnrollmentResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport_sdk::{
+        CLIENT_BOOTSTRAP_CLAIM_KIND, CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim,
+        ClientBootstrapClaimTrust,
+    };
 
     fn sample_bootstrap() -> ConnectionBootstrap {
         ConnectionBootstrap {
@@ -869,6 +910,30 @@ mod tests {
             pairing_token: Some("pairing".to_string()),
             device_label: Some("desktop".to_string()),
             device_id: Some("019cf235-6922-7902-9221-0df1a3192c62".to_string()),
+        }
+    }
+
+    fn sample_claim() -> ClientBootstrapClaim {
+        ClientBootstrapClaim {
+            version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
+            kind: CLIENT_BOOTSTRAP_CLAIM_KIND.to_string(),
+            cluster_id: ClusterId::now_v7(),
+            target_node_id: NodeId::new_v4(),
+            rendezvous_url: "https://rendezvous-a.example:9443".to_string(),
+            rendezvous_urls: vec![
+                "https://rendezvous-a.example:9443/".to_string(),
+                "https://rendezvous-b.example:9443".to_string(),
+            ],
+            trust: ClientBootstrapClaimTrust {
+                mode: ClientBootstrapClaimTrustMode::RendezvousCaPem,
+                ca_der_b64u: None,
+                ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nclaim-test\n-----END CERTIFICATE-----\n"
+                        .to_string(),
+                ),
+            },
+            claim_token: "im-claim-test-token".to_string(),
+            expires_at_unix: 42,
         }
     }
 
@@ -925,6 +990,23 @@ mod tests {
             .expect_err("relay-required bootstrap without rendezvous should fail");
 
         assert!(error.to_string().contains("rendezvous_urls"));
+    }
+
+    #[test]
+    fn claim_redeem_urls_prefer_primary_and_deduplicate_variants() {
+        let claim = sample_claim();
+
+        let redeem_urls = claim_redeem_urls(&claim).expect("claim redeem URLs should build");
+
+        assert_eq!(redeem_urls.len(), 2);
+        assert_eq!(
+            redeem_urls[0].as_str(),
+            "https://rendezvous-a.example:9443/bootstrap-claims/redeem"
+        );
+        assert_eq!(
+            redeem_urls[1].as_str(),
+            "https://rendezvous-b.example:9443/bootstrap-claims/redeem"
+        );
     }
 
     #[test]

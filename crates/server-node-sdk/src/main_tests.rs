@@ -872,6 +872,7 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
         .expect("mock rendezvous should bind");
     let rendezvous_addr = listener.local_addr().expect("mock rendezvous addr");
     let rendezvous_url = format!("http://{rendezvous_addr}");
+    let canonical_rendezvous_url = format!("{rendezvous_url}/");
     *state.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
     let rendezvous_server = tokio::spawn(async move {
         axum::serve(
@@ -891,6 +892,15 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
         Duration::from_secs(5),
     )
     .await;
+    *state.rendezvous_registration_state.lock().await = HashMap::from([(
+        canonical_rendezvous_url.clone(),
+        super::RendezvousEndpointRegistrationRuntime {
+            last_attempt_unix: Some(10),
+            last_success_unix: Some(10),
+            consecutive_failures: 0,
+            last_error: None,
+        },
+    )]);
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -922,7 +932,11 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
     assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
     assert_eq!(
         issued.bootstrap_claim.rendezvous_url,
-        format!("{rendezvous_url}/"),
+        canonical_rendezvous_url,
+    );
+    assert_eq!(
+        issued.bootstrap_claim.rendezvous_urls,
+        vec![format!("{rendezvous_url}/")]
     );
     assert_eq!(
         issued.bootstrap_claim.kind,
@@ -979,6 +993,7 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
         .expect("mock rendezvous A should bind");
     let rendezvous_addr_a = listener_a.local_addr().expect("mock rendezvous A addr");
     let rendezvous_url_a = format!("http://{rendezvous_addr_a}");
+    let canonical_rendezvous_url_a = format!("{rendezvous_url_a}/");
     let rendezvous_server_a = tokio::spawn(async move {
         axum::serve(
             listener_a,
@@ -1003,6 +1018,7 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
         .expect("mock rendezvous B should bind");
     let rendezvous_addr_b = listener_b.local_addr().expect("mock rendezvous B addr");
     let rendezvous_url_b = format!("http://{rendezvous_addr_b}");
+    let canonical_rendezvous_url_b = format!("{rendezvous_url_b}/");
     let rendezvous_server_b = tokio::spawn(async move {
         axum::serve(
             listener_b,
@@ -1024,6 +1040,26 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
 
     *state.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
+    *state.rendezvous_registration_state.lock().await = HashMap::from([
+        (
+            canonical_rendezvous_url_a.clone(),
+            super::RendezvousEndpointRegistrationRuntime {
+                last_attempt_unix: Some(10),
+                last_success_unix: Some(10),
+                consecutive_failures: 0,
+                last_error: None,
+            },
+        ),
+        (
+            canonical_rendezvous_url_b.clone(),
+            super::RendezvousEndpointRegistrationRuntime {
+                last_attempt_unix: Some(11),
+                last_success_unix: Some(11),
+                consecutive_failures: 0,
+                last_error: None,
+            },
+        ),
+    ]);
 
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
@@ -1053,7 +1089,14 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
         serde_json::from_slice(&body).unwrap();
     assert_eq!(
         issued.bootstrap_claim.rendezvous_url,
-        format!("{rendezvous_url_b}/"),
+        canonical_rendezvous_url_b,
+    );
+    assert_eq!(
+        issued.bootstrap_claim.rendezvous_urls,
+        vec![
+            canonical_rendezvous_url_b.clone(),
+            canonical_rendezvous_url_a.clone(),
+        ]
     );
     assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
     let stored_claim = state
@@ -1088,6 +1131,7 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
         .expect("mock rendezvous A should bind");
     let rendezvous_addr_a = listener_a.local_addr().expect("mock rendezvous A addr");
     let rendezvous_url_a = format!("http://{rendezvous_addr_a}");
+    let canonical_rendezvous_url_a = format!("{rendezvous_url_a}/");
     let rendezvous_server_a = tokio::spawn(async move {
         axum::serve(
             listener_a,
@@ -1112,6 +1156,7 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
         .expect("mock rendezvous B should bind");
     let rendezvous_addr_b = listener_b.local_addr().expect("mock rendezvous B addr");
     let rendezvous_url_b = format!("http://{rendezvous_addr_b}");
+    let canonical_rendezvous_url_b = format!("{rendezvous_url_b}/");
     let rendezvous_server_b = tokio::spawn(async move {
         axum::serve(
             listener_b,
@@ -1133,6 +1178,26 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
 
     *state.rendezvous_urls.lock().unwrap() =
         vec![rendezvous_url_a.clone(), rendezvous_url_b.clone()];
+    *state.rendezvous_registration_state.lock().await = HashMap::from([
+        (
+            canonical_rendezvous_url_a.clone(),
+            super::RendezvousEndpointRegistrationRuntime {
+                last_attempt_unix: Some(10),
+                last_success_unix: Some(10),
+                consecutive_failures: 2,
+                last_error: Some("unavailable".to_string()),
+            },
+        ),
+        (
+            canonical_rendezvous_url_b.clone(),
+            super::RendezvousEndpointRegistrationRuntime {
+                last_attempt_unix: Some(11),
+                last_success_unix: Some(11),
+                consecutive_failures: 0,
+                last_error: None,
+            },
+        ),
+    ]);
     let mut headers = HeaderMap::new();
     headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
 
@@ -1161,7 +1226,11 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
         serde_json::from_slice(&body).unwrap();
     assert_eq!(
         issued.bootstrap_claim.rendezvous_url,
-        format!("{rendezvous_url_b}/"),
+        canonical_rendezvous_url_b,
+    );
+    assert_eq!(
+        issued.bootstrap_claim.rendezvous_urls,
+        vec![canonical_rendezvous_url_b.clone()]
     );
     assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
     let stored_claim = state

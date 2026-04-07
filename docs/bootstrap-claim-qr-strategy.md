@@ -42,7 +42,8 @@ Do not put the full bootstrap bundle in the QR.
 
 Instead, the QR should carry a small bootstrap-claim payload that contains:
 
-- a stable rendezvous/service URL,
+- a stable primary rendezvous/service URL,
+- an optional ordered list of fallback rendezvous/service URLs,
 - minimal trust bootstrap for that rendezvous endpoint,
 - a short-lived one-time claim token,
 - a small amount of display/verification metadata such as `cluster_id` and expiry.
@@ -111,6 +112,10 @@ Example QR payload:
   "cluster_id": "cluster-alpha",
   "target_node_id": "7a4f2a38-8e32-4b37-919d-9bb07a5a0a27",
   "rendezvous_url": "https://rendezvous.example:9443",
+  "rendezvous_urls": [
+    "https://rendezvous.example:9443",
+    "https://rendezvous-backup.example:9443"
+  ],
   "trust": {
     "mode": "rendezvous_ca_der_b64u",
     "ca_der_b64u": "MIIC..."
@@ -125,6 +130,7 @@ Notes:
 - this payload should stay small and stable,
 - it should not contain full direct endpoint lists or the final bootstrap bundle,
 - it should not contain anything that requires direct access to a specific server node,
+- `rendezvous_url` remains the primary redeem endpoint while `rendezvous_urls` can carry backup public rendezvous endpoints in priority order,
 - trust material should avoid PEM armor in the QR when possible,
 - the claim token is the bearer secret and must be treated accordingly.
 
@@ -136,14 +142,14 @@ Notes:
 2. Server node creates the full client bootstrap bundle as it does today.
 3. Server node creates a short-lived one-time claim record.
 4. Server node stores that claim locally on the issuing node.
-5. Server node returns the small claim payload to the admin UI.
+5. Server node returns the small claim payload to the admin UI, including the primary rendezvous URL and any additional currently healthy/registered rendezvous URLs.
 6. Admin UI renders the QR from that small claim payload.
 
 ### 7.2 Client side
 
 1. Android app scans the QR.
 2. App parses the small claim payload.
-3. App establishes HTTPS to `rendezvous_url`, using the trust bootstrap from the QR instead of the public system trust store.
+3. App establishes HTTPS to the ordered rendezvous URLs from the claim, using the trust bootstrap from the QR instead of the public system trust store.
 4. App redeems the claim with an explicit request such as:
    - `POST /bootstrap-claims/redeem`
 5. Rendezvous validates that the target node is currently present and then relays the redeem request over the authenticated relay tunnel to `target_node_id`.

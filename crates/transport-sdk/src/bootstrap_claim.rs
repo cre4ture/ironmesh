@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -34,6 +35,8 @@ pub struct ClientBootstrapClaim {
     pub cluster_id: ClusterId,
     pub target_node_id: NodeId,
     pub rendezvous_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendezvous_urls: Vec<String>,
     pub trust: ClientBootstrapClaimTrust,
     pub claim_token: String,
     pub expires_at_unix: u64,
@@ -151,12 +154,10 @@ impl ClientBootstrapClaim {
         if self.target_node_id.is_nil() {
             bail!("bootstrap claim must include a non-nil target_node_id");
         }
-        reqwest::Url::parse(self.rendezvous_url.trim()).with_context(|| {
-            format!(
-                "invalid bootstrap claim rendezvous_url {}",
-                self.rendezvous_url
-            )
-        })?;
+        normalize_claim_rendezvous_url(&self.rendezvous_url, "rendezvous_url")?;
+        for (index, rendezvous_url) in self.rendezvous_urls.iter().enumerate() {
+            normalize_claim_rendezvous_url(rendezvous_url, &format!("rendezvous_urls[{index}]"))?;
+        }
         self.trust.validate()?;
         if self.claim_token.trim().is_empty() {
             bail!("bootstrap claim must include a claim_token");
@@ -166,6 +167,26 @@ impl ClientBootstrapClaim {
         }
         Ok(())
     }
+
+    pub fn ordered_rendezvous_urls(&self) -> Result<Vec<String>> {
+        let mut urls = Vec::new();
+        let mut seen = HashSet::new();
+        for rendezvous_url in std::iter::once(self.rendezvous_url.as_str())
+            .chain(self.rendezvous_urls.iter().map(String::as_str))
+        {
+            let normalized = normalize_claim_rendezvous_url(rendezvous_url, "rendezvous_url")?;
+            if seen.insert(normalized.clone()) {
+                urls.push(normalized);
+            }
+        }
+        Ok(urls)
+    }
+}
+
+fn normalize_claim_rendezvous_url(value: &str, field_name: &str) -> Result<String> {
+    reqwest::Url::parse(value.trim())
+        .with_context(|| format!("invalid bootstrap claim {field_name} {value}"))
+        .map(|url| url.to_string())
 }
 
 impl ClientBootstrapClaimIssueResponse {

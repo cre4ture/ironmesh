@@ -1852,6 +1852,22 @@ fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
     }
 }
 
+async fn connected_rendezvous_registration_urls(
+    state: &ServerState,
+    candidate_urls: &[String],
+) -> Vec<String> {
+    let registration_state = state.rendezvous_registration_state.lock().await;
+    candidate_urls
+        .iter()
+        .filter(|url| {
+            registration_state.get(*url).is_some_and(|runtime| {
+                runtime.last_success_unix.is_some() && runtime.consecutive_failures == 0
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 fn current_bootstrap_trust_roots(state: &ServerState) -> Result<BootstrapTrustRoots> {
     // Enrollment packages are the supported production lifecycle source for trust roots.
     // Direct env/file CA wiring remains useful for development/testing or short-lived
@@ -9073,7 +9089,13 @@ async fn resolve_bootstrap_claim_rendezvous_candidates(
                 ),
             ));
         }
-        return Ok(vec![preferred_rendezvous_url]);
+        let mut ordered_urls = vec![preferred_rendezvous_url.clone()];
+        ordered_urls.extend(
+            configured_urls
+                .into_iter()
+                .filter(|url| url != &preferred_rendezvous_url),
+        );
+        return Ok(ordered_urls);
     }
 
     let rendezvous_urls =
@@ -9151,20 +9173,22 @@ fn map_bootstrap_claim_rendezvous_error(error: String) -> (StatusCode, String) {
     )
 }
 
-async fn select_bootstrap_claim_rendezvous_url(
+async fn select_bootstrap_claim_rendezvous_urls(
     state: &ServerState,
     bootstrap: &TransportClientBootstrap,
     preferred_rendezvous_url: Option<&str>,
-) -> std::result::Result<String, (StatusCode, String)> {
-    let rendezvous_urls =
+) -> std::result::Result<Vec<String>, (StatusCode, String)> {
+    let candidate_urls =
         resolve_bootstrap_claim_rendezvous_candidates(state, bootstrap, preferred_rendezvous_url)
             .await?;
+    let registered_urls = connected_rendezvous_registration_urls(state, &candidate_urls).await;
     let preferred_rendezvous_selected = preferred_rendezvous_url
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
+    let mut healthy_urls = Vec::new();
     let mut last_error = None;
 
-    for rendezvous_url in rendezvous_urls {
+    for rendezvous_url in candidate_urls {
         let rendezvous = build_bootstrap_claim_rendezvous_client(state, &rendezvous_url)?;
         let normalized_rendezvous_url = rendezvous_url.trim_end_matches('/');
         match rendezvous.probe_health_endpoints().await {
@@ -9174,7 +9198,8 @@ async fn select_bootstrap_claim_rendezvous_url(
                         && status.status
                             == transport_sdk::RendezvousEndpointConnectionState::Connected
                 }) {
-                    return Ok(rendezvous_url);
+                    healthy_urls.push(rendezvous_url);
+                    continue;
                 }
                 let message =
                     format!("rendezvous endpoint is not currently reachable: {rendezvous_url}");
@@ -9193,11 +9218,30 @@ async fn select_bootstrap_claim_rendezvous_url(
         }
     }
 
-    Err(map_bootstrap_claim_rendezvous_error(
-        last_error.unwrap_or_else(|| {
-            "bootstrap claim issuance requires a reachable rendezvous service".to_string()
-        }),
-    ))
+    if healthy_urls.is_empty() {
+        return Err(map_bootstrap_claim_rendezvous_error(
+            last_error.unwrap_or_else(|| {
+                "bootstrap claim issuance requires a reachable rendezvous service".to_string()
+            }),
+        ));
+    }
+
+    let primary_rendezvous_url = healthy_urls[0].clone();
+    let mut ordered_rendezvous_urls = vec![primary_rendezvous_url.clone()];
+    for rendezvous_url in registered_urls {
+        if rendezvous_url != primary_rendezvous_url && healthy_urls.contains(&rendezvous_url) {
+            ordered_rendezvous_urls.push(rendezvous_url);
+        }
+    }
+    if ordered_rendezvous_urls.len() == 1 {
+        for rendezvous_url in healthy_urls {
+            if rendezvous_url != primary_rendezvous_url {
+                ordered_rendezvous_urls.push(rendezvous_url);
+            }
+        }
+    }
+
+    Ok(ordered_rendezvous_urls)
 }
 
 async fn store_client_bootstrap_claim(
@@ -9206,8 +9250,14 @@ async fn store_client_bootstrap_claim(
     expires_at_unix: u64,
     preferred_rendezvous_url: Option<&str>,
 ) -> std::result::Result<ClientBootstrapClaim, (StatusCode, String)> {
-    let rendezvous_url =
-        select_bootstrap_claim_rendezvous_url(state, bootstrap, preferred_rendezvous_url).await?;
+    let claim_rendezvous_urls =
+        select_bootstrap_claim_rendezvous_urls(state, bootstrap, preferred_rendezvous_url).await?;
+    let rendezvous_url = claim_rendezvous_urls.first().cloned().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "bootstrap claim issuance did not resolve any rendezvous URLs".to_string(),
+        )
+    })?;
     let claim_token = generate_bootstrap_claim_token();
     let claim_trust = rendezvous_claim_trust_from_bootstrap(bootstrap).map_err(|status| {
         (
@@ -9239,6 +9289,7 @@ async fn store_client_bootstrap_claim(
         cluster_id: bootstrap.cluster_id,
         target_node_id: state.node_id,
         rendezvous_url,
+        rendezvous_urls: claim_rendezvous_urls,
         trust: claim_trust,
         claim_token,
         expires_at_unix,

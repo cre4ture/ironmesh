@@ -3310,6 +3310,14 @@ mod tests {
                 issued.bootstrap_claim.rendezvous_url,
                 format!("{dedicated_rendezvous_url}/")
             );
+            assert!(
+                issued
+                    .bootstrap_claim
+                    .rendezvous_urls
+                    .iter()
+                    .any(|value| value == &format!("{dedicated_rendezvous_url}/")),
+                "expected issued bootstrap claim to include the selected rendezvous URL in rendezvous_urls"
+            );
 
             let claim_path = client_dir.join("selected-rendezvous.claim.json");
             fs::write(&claim_path, issued.bootstrap_claim.to_json_pretty()?)
