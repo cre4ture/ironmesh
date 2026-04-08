@@ -132,7 +132,7 @@ async fn execute_fallback_local_http_request(
     })
 }
 
-fn parse_query<T>(path_and_query: &str) -> Result<T>
+pub(super) fn parse_query<T>(path_and_query: &str) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -142,7 +142,7 @@ where
     Ok(Query::<T>::try_from_uri(&uri)?.0)
 }
 
-fn decode_route_tail(path: &str, prefix: &str) -> Result<String> {
+pub(super) fn decode_route_tail(path: &str, prefix: &str) -> Result<String> {
     let tail = path
         .strip_prefix(prefix)
         .ok_or_else(|| anyhow::anyhow!("transport request path {path} did not start with {prefix}"))?;
@@ -152,7 +152,7 @@ fn decode_route_tail(path: &str, prefix: &str) -> Result<String> {
         .context("failed decoding percent-encoded transport path tail")
 }
 
-fn header_map_from_transport_headers(headers: &[TransportHeader]) -> Result<HeaderMap> {
+pub(super) fn header_map_from_transport_headers(headers: &[TransportHeader]) -> Result<HeaderMap> {
     let mut header_map = HeaderMap::new();
     for header in headers {
         let name = header.name.parse::<axum::http::HeaderName>().with_context(|| {

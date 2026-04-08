@@ -35,6 +35,7 @@ use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
 use common::{ClusterId, DeviceId, HealthStatus, NodeId};
+use futures_util::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -57,6 +58,7 @@ use tracing::{info, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use http_body_util::BodyExt;
 use transport_sdk::{
     BootstrapClaimBroker, BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial,
     BootstrapServerTlsFiles, BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots,
@@ -73,12 +75,13 @@ use transport_sdk::{
     RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelEvent, RelayTunnelSession,
     RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
     SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader,
-    TransportPathKind, TransportSessionControlMessage, credential_fingerprint,
-    encode_optional_body_base64, encode_relay_wire_http_request,
+    TransportPathKind, TransportRequestHead, TransportResponseHead,
+    TransportSessionControlMessage, TransportStreamKind, credential_fingerprint, encode_optional_body_base64, encode_relay_wire_http_request,
     encode_relay_wire_http_response_head, parse_relay_wire_http_head_response,
-    parse_relay_wire_http_request, parse_relay_wire_http_response,
-    perform_transport_server_handshake, read_buffered_transport_request,
+    parse_relay_wire_http_request, parse_relay_wire_http_response, perform_transport_server_handshake,
+    read_transport_request_head,
     verify_signed_request_headers, write_buffered_transport_response,
+    write_transport_response_head,
 };
 use uuid::Uuid;
 use futures_util::{Sink, Stream};
@@ -5055,9 +5058,15 @@ async fn handle_multiplexed_relay_stream<S>(
 where
     S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
 {
-    let request = read_buffered_transport_request(&mut stream)
+    let request_head = read_transport_request_head(&mut stream)
         .await
-        .context("failed decoding multiplexed relay request stream")?;
+        .context("failed decoding multiplexed relay request head")?;
+    if request_head.kind == TransportStreamKind::ObjectRead {
+        return handle_streamed_object_read_request(&state, request_head, &mut stream).await;
+    }
+    let request = read_buffered_transport_request_from_head(&mut stream, request_head)
+        .await
+        .context("failed decoding multiplexed relay request body")?;
     let response = match transport_service::execute_buffered_transport_request(
         &state,
         &local_http,
@@ -5087,6 +5096,164 @@ where
     write_buffered_transport_response(&mut stream, &response)
         .await
         .context("failed writing multiplexed relay response")
+}
+
+async fn read_buffered_transport_request_from_head<S>(
+    stream: &mut S,
+    request_head: TransportRequestHead,
+) -> Result<BufferedTransportRequest>
+where
+    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
+{
+    let mut body = Vec::new();
+    stream
+        .read_to_end(&mut body)
+        .await
+        .context("failed reading multiplexed relay request body")?;
+    let request = BufferedTransportRequest {
+        request_id: request_head.request_id,
+        kind: request_head.kind,
+        method: request_head.method,
+        path: request_head.path,
+        headers: request_head.headers,
+        body,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+async fn handle_streamed_object_read_request<S>(
+    state: &ServerState,
+    request_head: TransportRequestHead,
+    stream: &mut S,
+) -> Result<()>
+where
+    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
+{
+    if request_head.method != "GET" {
+        let response = buffered_transport_error_response(
+            request_head.request_id,
+            405,
+            format!(
+                "object read streams only support GET, received {}",
+                request_head.method
+            ),
+        );
+        return write_buffered_transport_response(stream, &response)
+            .await
+            .context("failed writing object read method error");
+    }
+
+    if !request_head.end_of_stream {
+        let mut ignored = Vec::new();
+        stream
+            .read_to_end(&mut ignored)
+            .await
+            .context("failed draining unexpected object read request body")?;
+        let response = buffered_transport_error_response(
+            request_head.request_id,
+            400,
+            "object read streams must not include request bodies".to_string(),
+        );
+        return write_buffered_transport_response(stream, &response)
+            .await
+            .context("failed writing object read body error");
+    }
+
+    let raw_path = request_head.path.trim();
+    let path_only = raw_path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(raw_path);
+    if !path_only.starts_with("/store/") {
+        let response = buffered_transport_error_response(
+            request_head.request_id,
+            400,
+            format!("object read streams only support /store/* paths, received {path_only}"),
+        );
+        return write_buffered_transport_response(stream, &response)
+            .await
+            .context("failed writing object read path error");
+    }
+
+    let headers = match transport_service::header_map_from_transport_headers(&request_head.headers) {
+        Ok(headers) => headers,
+        Err(err) => {
+            let response = buffered_transport_error_response(
+                request_head.request_id,
+                400,
+                format!("invalid object read headers: {err:#}"),
+            );
+            return write_buffered_transport_response(stream, &response)
+                .await
+                .context("failed writing object read header error");
+        }
+    };
+    let query = match transport_service::parse_query::<ObjectGetQuery>(raw_path) {
+        Ok(query) => query,
+        Err(err) => {
+            let response = buffered_transport_error_response(
+                request_head.request_id,
+                400,
+                format!("invalid object read query: {err:#}"),
+            );
+            return write_buffered_transport_response(stream, &response)
+                .await
+                .context("failed writing object read query error");
+        }
+    };
+    let key = match transport_service::decode_route_tail(path_only, "/store/") {
+        Ok(key) => key,
+        Err(err) => {
+            let response = buffered_transport_error_response(
+                request_head.request_id,
+                400,
+                format!("invalid object read path: {err:#}"),
+            );
+            return write_buffered_transport_response(stream, &response)
+                .await
+                .context("failed writing object read key error");
+        }
+    };
+
+    let response = get_object_response(state, &key, query, &headers, false).await;
+    write_transport_response_from_axum(stream, request_head.request_id, response).await
+}
+
+async fn write_transport_response_from_axum<S>(
+    stream: &mut S,
+    request_id: String,
+    response: Response,
+) -> Result<()>
+where
+    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
+{
+    let (parts, mut body) = response.into_parts();
+    write_transport_response_head(
+        stream,
+        &TransportResponseHead {
+            request_id,
+            status: parts.status.as_u16(),
+            headers: transport_headers_from_response(&parts.headers),
+        },
+    )
+    .await
+    .context("failed writing streamed transport response head")?;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.context("failed reading streamed transport response body frame")?;
+        if let Ok(data) = frame.into_data() {
+            stream
+                .write_all(data.as_ref())
+                .await
+                .context("failed writing streamed transport response body")?;
+        }
+    }
+
+    stream
+        .close()
+        .await
+        .context("failed closing streamed transport response")
 }
 
 async fn serve_relay_multiplex_session(

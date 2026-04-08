@@ -11,6 +11,7 @@ blake3.workspace = true
 base64 = "0.22"
 bytes.workspace = true
 common = { path = "../common" }
+futures-util = "0.3"
 reqwest.workspace = true
 rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }

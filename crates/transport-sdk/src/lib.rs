@@ -37,8 +37,10 @@ pub use identity::{
 pub use multiplex_transport::{
     BufferedTransportRequest, BufferedTransportResponse, perform_transport_client_handshake,
     perform_transport_server_handshake, read_buffered_transport_request,
-    read_buffered_transport_response, write_buffered_transport_request,
-    write_buffered_transport_response,
+    read_buffered_transport_response, read_transport_request_head, read_transport_response_head,
+    write_buffered_transport_request, write_buffered_transport_response,
+    write_transport_request_head, write_transport_response_head, TransportRequestHead,
+    TransportResponseHead,
 };
 pub use mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};

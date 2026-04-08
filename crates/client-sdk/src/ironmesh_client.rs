@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use common::{NodeId, StorageObjectMeta};
+use futures_util::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
 use reqwest::Client as HttpClient;
 use reqwest::Method;
 use reqwest::RequestBuilder;
@@ -22,9 +23,11 @@ use sync_core::{NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, PeerIdentity, RelayHttpHeader, RendezvousControlClient,
-    TransportHeader, TransportStreamKind, build_signed_request_headers,
-    read_buffered_transport_response, write_buffered_transport_request,
+    TransportHeader, TransportRequestHead, TransportStreamKind, build_signed_request_headers,
+    read_buffered_transport_response, read_transport_response_head,
+    write_buffered_transport_request, write_transport_request_head,
 };
+use uuid::Uuid;
 
 use crate::session_pool::{TransportSessionPool, TransportSessionPoolSnapshot};
 
@@ -32,6 +35,7 @@ const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 const DOWNLOAD_SEGMENT_SIZE_BYTES: usize = 1024 * 1024;
 const STAGED_DOWNLOAD_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
+const TRANSPORT_STREAM_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestedRange {
@@ -1193,45 +1197,84 @@ impl IronMeshClient {
         Ok(head_response)
     }
 
-    async fn get_object_range_response(
+    async fn stream_object_request_to_writer(
         &self,
         key: &str,
         snapshot: Option<&str>,
         version: Option<&str>,
-        start: u64,
-        end_inclusive: u64,
+        range: Option<(u64, u64)>,
         if_range: Option<&str>,
-    ) -> Result<BufferedTransportResponse> {
+        writer: &mut dyn Write,
+    ) -> Result<StreamedTransportResponseMeta> {
         let mut url = self.store_key_url(key)?;
         append_optional_query(&mut url, "snapshot", snapshot);
         append_optional_query(&mut url, "version", version);
 
-        let mut headers = vec![range_header(start, end_inclusive)];
+        let mut headers = Vec::new();
+        if let Some((start, end_inclusive)) = range {
+            headers.push(range_header(start, end_inclusive));
+        }
         if let Some(if_range) = if_range {
             headers.push(simple_header(IF_RANGE, if_range)?);
         }
+        let mut auth_headers = self.request_auth_headers(&Method::GET, &url)?;
+        auth_headers.append(&mut headers);
 
-        let response = self
-            .execute_buffered_request(Method::GET, url, headers, None)
-            .await
-            .with_context(|| {
-                format!("failed to GET object range key={key} start={start} end={end_inclusive}")
-            })?;
+        let response = match &self.transport {
+            ClientTransport::Direct {
+                http,
+                server_base_url,
+                session_pool,
+            } => {
+                if let ClientRequestAuth::SignedIdentity(identity) = &self.auth {
+                    execute_direct_multiplex_streaming_object_read_request(
+                        server_base_url,
+                        session_pool,
+                        identity,
+                        &url,
+                        &auth_headers,
+                        writer,
+                    )
+                    .await
+                    .with_context(|| format!("failed to execute streamed GET {}", url))?
+                } else {
+                    execute_direct_http_streaming_object_read_request(
+                        http,
+                        &url,
+                        &auth_headers,
+                        writer,
+                    )
+                    .await?
+                }
+            }
+            ClientTransport::Relay(relay) => {
+                let source = self.relay_source_identity()?;
+                execute_relay_multiplex_streaming_object_read_request(
+                    relay,
+                    source,
+                    &url,
+                    &auth_headers,
+                    writer,
+                )
+                .await
+                .with_context(|| format!("failed to relay streamed GET {}", url))?
+            }
+        };
 
         tracing::info!(
-            "client range-response: key={} snapshot={} version={} start={} end={} status={} content_length={} content_range={} object_size={} etag={} accept_ranges={} body_len={}",
+            "client streamed object-read: key={} snapshot={} version={} range_start={} range_end={} status={} content_length={} content_range={} object_size={} etag={} accept_ranges={} bytes_written={}",
             key,
             snapshot.unwrap_or("<none>"),
             version.unwrap_or("<none>"),
-            start,
-            end_inclusive,
+            range.map(|(start, _)| start.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            range.map(|(_, end)| end.to_string()).unwrap_or_else(|| "<none>".to_string()),
             response.status,
             header_value_for_log(&response.headers, CONTENT_LENGTH.as_str()),
             header_value_for_log(&response.headers, CONTENT_RANGE.as_str()),
             header_value_for_log(&response.headers, "x-ironmesh-object-size"),
             header_value_for_log(&response.headers, ETAG.as_str()),
             header_value_for_log(&response.headers, ACCEPT_RANGES.as_str()),
-            response.body.len()
+            response.bytes_written
         );
 
         Ok(response)
@@ -1253,13 +1296,15 @@ impl IronMeshClient {
         }
 
         if !head.accept_ranges {
-            let payload = self.get_with_selector(key, snapshot, version).await?;
-            writer
-                .write_all(payload.as_ref())
-                .with_context(|| format!("failed to write payload chunk for key={key}"))?;
-            writer
-                .flush()
-                .with_context(|| format!("failed to flush output for key={key}"))?;
+            let response = self
+                .stream_object_request_to_writer(key, snapshot, version, None, None, writer)
+                .await?;
+            if response.status != StatusCode::OK {
+                bail!(
+                    "server rejected object download for key={key}: {}",
+                    response.status
+                );
+            }
             return Ok(());
         }
 
@@ -1270,27 +1315,27 @@ impl IronMeshClient {
                 head.total_size_bytes - 1,
             );
             let response = self
-                .get_object_range_response(
+                .stream_object_request_to_writer(
                     key,
                     snapshot,
                     version,
-                    offset,
-                    end_inclusive,
+                    Some((offset, end_inclusive)),
                     head.etag.as_deref(),
+                    writer,
                 )
                 .await?;
 
             match response.status {
                 StatusCode::PARTIAL_CONTENT => {
                     let expected_len = (end_inclusive - offset + 1) as usize;
-                    if response.body.len() != expected_len {
+                    if response.bytes_written != expected_len as u64 {
                         tracing::info!(
                             "client range-response length mismatch: key={} range_start={} range_end={} expected_len={} actual_len={} status={} content_length={} content_range={} object_size={} etag={}",
                             key,
                             offset,
                             end_inclusive,
                             expected_len,
-                            response.body.len(),
+                            response.bytes_written,
                             response.status,
                             header_value_for_log(&response.headers, CONTENT_LENGTH.as_str()),
                             header_value_for_log(&response.headers, CONTENT_RANGE.as_str()),
@@ -1299,18 +1344,12 @@ impl IronMeshClient {
                         );
                         bail!(
                             "server returned unexpected range length for key={key}: expected={expected_len} actual={}",
-                            response.body.len()
+                            response.bytes_written
                         );
                     }
-                    writer
-                        .write_all(response.body.as_ref())
-                        .with_context(|| format!("failed to write payload chunk for key={key}"))?;
                     offset = end_inclusive + 1;
                 }
                 StatusCode::OK if offset == 0 => {
-                    writer
-                        .write_all(response.body.as_ref())
-                        .with_context(|| format!("failed to write payload chunk for key={key}"))?;
                     offset = head.total_size_bytes;
                 }
                 status => {
@@ -1381,20 +1420,17 @@ impl IronMeshClient {
                 bail!("download canceled for key={key}");
             }
 
-            let payload = await_download_with_cancellation(
-                self.get_with_selector(key, snapshot, version),
+            let response = await_download_with_cancellation(
+                self.stream_object_request_to_writer(key, snapshot, version, None, None, writer),
                 should_cancel,
                 format!("download canceled for key={key}"),
             )
             .await?;
-            writer
-                .write_all(payload.as_ref())
-                .with_context(|| format!("failed to write payload chunk for key={key}"))?;
-            writer
-                .flush()
-                .with_context(|| format!("failed to flush output for key={key}"))?;
+            if response.status != StatusCode::OK {
+                bail!("server rejected object download for key={key}: {}", response.status);
+            }
 
-            let bytes_downloaded = payload.len() as u64;
+            let bytes_downloaded = response.bytes_written;
             on_progress(DownloadProgress {
                 object_size_bytes: head.total_size_bytes,
                 range: RequestedRange {
@@ -1426,13 +1462,13 @@ impl IronMeshClient {
                 range_end_exclusive - 1,
             );
             let response = await_download_with_cancellation(
-                self.get_object_range_response(
+                self.stream_object_request_to_writer(
                     key,
                     snapshot,
                     version,
-                    offset,
-                    end_inclusive,
+                    Some((offset, end_inclusive)),
                     head.etag.as_deref(),
+                    writer,
                 ),
                 should_cancel,
                 format!("download canceled for key={key}"),
@@ -1442,16 +1478,13 @@ impl IronMeshClient {
             match response.status {
                 StatusCode::PARTIAL_CONTENT => {
                     let expected_len = (end_inclusive - offset + 1) as usize;
-                    if response.body.len() != expected_len {
+                    if response.bytes_written != expected_len as u64 {
                         bail!(
                             "server returned unexpected range length for key={key}: expected={expected_len} actual={}",
-                            response.body.len()
+                            response.bytes_written
                         );
                     }
-                    writer
-                        .write_all(response.body.as_ref())
-                        .with_context(|| format!("failed to write payload chunk for key={key}"))?;
-                    bytes_downloaded += response.body.len() as u64;
+                    bytes_downloaded += response.bytes_written;
                     offset = end_inclusive + 1;
                     on_progress(DownloadProgress {
                         object_size_bytes: head.total_size_bytes,
@@ -1463,10 +1496,7 @@ impl IronMeshClient {
                     });
                 }
                 StatusCode::OK if offset == 0 && range_length == head.total_size_bytes => {
-                    writer
-                        .write_all(response.body.as_ref())
-                        .with_context(|| format!("failed to write payload chunk for key={key}"))?;
-                    bytes_downloaded = response.body.len() as u64;
+                    bytes_downloaded = response.bytes_written;
                     offset = range_end_exclusive;
                     on_progress(DownloadProgress {
                         object_size_bytes: head.total_size_bytes,
@@ -1770,33 +1800,36 @@ impl IronMeshClient {
         }
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("failed to seek temp file {}", temp_path.display()))?;
+        if offset == 0 {
+            file.set_len(0)
+                .with_context(|| format!("failed to reset temp file {}", temp_path.display()))?;
+            file.seek(SeekFrom::Start(0))
+                .with_context(|| format!("failed to seek temp file {}", temp_path.display()))?;
+        }
 
         while offset < head.total_size_bytes {
             let end_inclusive = std::cmp::min(
                 offset + DOWNLOAD_SEGMENT_SIZE_BYTES as u64 - 1,
                 head.total_size_bytes - 1,
             );
-            let response = runtime.block_on(self.get_object_range_response(
+            let response = runtime.block_on(self.stream_object_request_to_writer(
                 key,
                 snapshot_owned.as_deref(),
                 version_owned.as_deref(),
-                offset,
-                end_inclusive,
+                Some((offset, end_inclusive)),
                 Some(current_etag.as_str()),
+                &mut file,
             ))?;
 
             match response.status {
                 StatusCode::PARTIAL_CONTENT => {
                     let expected_len = (end_inclusive - offset + 1) as usize;
-                    if response.body.len() != expected_len {
+                    if response.bytes_written != expected_len as u64 {
                         bail!(
                             "server returned unexpected range length for key={key}: expected={expected_len} actual={}",
-                            response.body.len()
+                            response.bytes_written
                         );
                     }
-                    file.write_all(response.body.as_ref()).with_context(|| {
-                        format!("failed to write temp download file {}", temp_path.display())
-                    })?;
                     file.sync_data().with_context(|| {
                         format!(
                             "failed to persist temp download file {}",
@@ -1806,22 +1839,13 @@ impl IronMeshClient {
                     offset = end_inclusive + 1;
                 }
                 StatusCode::OK if offset == 0 => {
-                    file.set_len(0).with_context(|| {
-                        format!("failed to reset temp download file {}", temp_path.display())
-                    })?;
-                    file.seek(SeekFrom::Start(0)).with_context(|| {
-                        format!("failed to seek temp download file {}", temp_path.display())
-                    })?;
-                    file.write_all(response.body.as_ref()).with_context(|| {
-                        format!("failed to write temp download file {}", temp_path.display())
-                    })?;
                     file.sync_data().with_context(|| {
                         format!(
                             "failed to persist temp download file {}",
                             temp_path.display()
                         )
                     })?;
-                    offset = response.body.len() as u64;
+                    offset = response.bytes_written;
                 }
                 status => {
                     bail!("server rejected resumable download for key={key}: {status}");
@@ -2322,12 +2346,222 @@ fn transport_headers_from_relay_headers(headers: &[RelayHttpHeader]) -> Vec<Tran
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct StreamedTransportResponseMeta {
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes_written: u64,
+}
+
+fn header_map_from_transport_headers(headers: &[TransportHeader]) -> Result<HeaderMap> {
+    let mut header_map = HeaderMap::new();
+    for header in headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .with_context(|| format!("invalid multiplexed header name {}", header.name))?;
+        let value = HeaderValue::from_str(&header.value)
+            .with_context(|| format!("invalid multiplexed header value for {}", header.name))?;
+        header_map.append(name, value);
+    }
+    Ok(header_map)
+}
+
+async fn read_streaming_transport_response_to_writer<S>(
+    stream: &mut S,
+    writer: &mut dyn Write,
+) -> Result<StreamedTransportResponseMeta>
+where
+    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
+{
+    let response_head = read_transport_response_head(stream)
+        .await
+        .context("failed reading streamed transport response head")?;
+    let status = StatusCode::from_u16(response_head.status)
+        .with_context(|| format!("invalid multiplexed transport status {}", response_head.status))?;
+    let headers = header_map_from_transport_headers(&response_head.headers)?;
+
+    let mut buffer = vec![0_u8; TRANSPORT_STREAM_COPY_BUFFER_SIZE_BYTES];
+    let mut bytes_written = 0_u64;
+    loop {
+        let bytes_read = stream
+            .read(&mut buffer)
+            .await
+            .context("failed reading streamed transport response body")?;
+        if bytes_read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..bytes_read])
+            .context("failed writing streamed transport response body")?;
+        bytes_written += bytes_read as u64;
+    }
+    writer
+        .flush()
+        .context("failed flushing streamed transport response body")?;
+
+    Ok(StreamedTransportResponseMeta {
+        status,
+        headers,
+        bytes_written,
+    })
+}
+
 fn transport_stream_kind_for_path(path: &str) -> TransportStreamKind {
     if path == "/health" || path.starts_with("/diagnostics/") {
         TransportStreamKind::Diagnostics
     } else {
         TransportStreamKind::Rpc
     }
+}
+
+async fn execute_multiplex_streaming_object_read_request(
+    session: &transport_sdk::MultiplexedSession,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    writer: &mut dyn Write,
+) -> Result<StreamedTransportResponseMeta> {
+    let request_path = path_and_query(url);
+    let mut stream = session
+        .open_stream()
+        .await
+        .context("failed opening streamed object-read transport stream")?;
+    write_transport_request_head(
+        &mut stream,
+        &TransportRequestHead {
+            request_id: Uuid::now_v7().to_string(),
+            kind: TransportStreamKind::ObjectRead,
+            method: Method::GET.as_str().to_string(),
+            path: request_path,
+            headers: transport_headers_from_relay_headers(headers),
+            end_of_stream: true,
+        },
+    )
+    .await
+    .context("failed writing streamed object-read request head")?;
+    stream
+        .close()
+        .await
+        .context("failed closing streamed object-read request body")?;
+    read_streaming_transport_response_to_writer(&mut stream, writer).await
+}
+
+async fn execute_direct_http_streaming_object_read_request(
+    http: &HttpClient,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    writer: &mut dyn Write,
+) -> Result<StreamedTransportResponseMeta> {
+    let mut request = http.request(Method::GET, url.clone());
+    for header in headers {
+        request = request.header(header.name.as_str(), header.value.as_str());
+    }
+    let mut response = request
+        .send()
+        .await
+        .with_context(|| format!("failed to execute streaming GET {}", url))?;
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let mut bytes_written = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed reading streaming response chunk for {}", url))?
+    {
+        writer
+            .write_all(chunk.as_ref())
+            .with_context(|| format!("failed writing streamed response body for {}", url))?;
+        bytes_written += chunk.len() as u64;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("failed flushing streamed response for {}", url))?;
+    Ok(StreamedTransportResponseMeta {
+        status,
+        headers: response_headers,
+        bytes_written,
+    })
+}
+
+async fn execute_direct_multiplex_streaming_object_read_request(
+    server_base_url: &str,
+    session_pool: &TransportSessionPool,
+    identity: &ClientIdentityMaterial,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    writer: &mut dyn Write,
+) -> Result<StreamedTransportResponseMeta> {
+    for attempt in 0..2 {
+        let session = session_pool
+            .ensure_direct_session(identity)
+            .await
+            .context("failed ensuring direct multiplex session")?;
+        let result =
+            execute_multiplex_streaming_object_read_request(session.as_ref(), url, headers, writer)
+                .await;
+        match result {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt == 0 => {
+                session_pool.invalidate().await;
+                tracing::debug!(
+                    error = %err,
+                    server_base_url,
+                    "retrying streamed direct object read after resetting cached session"
+                );
+            }
+            Err(err) => {
+                session_pool.invalidate().await;
+                return Err(err);
+            }
+        }
+    }
+
+    bail!(
+        "streamed direct object read retried without producing a response for {}",
+        server_base_url
+    )
+}
+
+async fn execute_relay_multiplex_streaming_object_read_request(
+    relay: &ClientRelayTransport,
+    source: PeerIdentity,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    writer: &mut dyn Write,
+) -> Result<StreamedTransportResponseMeta> {
+    for attempt in 0..2 {
+        let session = relay
+            .session_pool
+            .ensure_relay_session(source.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed ensuring multiplex relay session for target node {}",
+                    relay.target_node_id
+                )
+            })?;
+        let result =
+            execute_multiplex_streaming_object_read_request(session.as_ref(), url, headers, writer)
+                .await;
+        match result {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt == 0 => {
+                relay.session_pool.invalidate().await;
+                tracing::debug!(
+                    error = %err,
+                    target_node_id = %relay.target_node_id,
+                    "retrying streamed relay object read after resetting cached session"
+                );
+            }
+            Err(err) => {
+                relay.session_pool.invalidate().await;
+                return Err(err);
+            }
+        }
+    }
+
+    bail!(
+        "streamed relay object read retried without producing a response for target node {}",
+        relay.target_node_id
+    )
 }
 
 async fn execute_direct_multiplex_buffered_request(

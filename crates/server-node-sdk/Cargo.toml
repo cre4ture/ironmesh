@@ -26,6 +26,7 @@ fs2 = "0.4"
 git-version.workspace = true
 futures-core = "0.3"
 futures-util = "0.3"
+http-body-util = "0.1"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 percent-encoding = "2"
 pbkdf2 = "0.12"

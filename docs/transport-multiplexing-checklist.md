@@ -140,6 +140,12 @@ Primary files:
 - [ ] Preserve mixed-workload responsiveness under concurrent large and small transfers.
 - [ ] Add tests for cancellation and partial failures.
 
+Current slice landed:
+
+- [x] Split multiplexed transport request/response heads from buffered bodies so dedicated stream handlers can share the same Yamux substream protocol.
+- [x] Route multiplexed object reads through dedicated `object_read` substreams and rewire ranged download paths to stream bytes directly into their destination writers.
+- [ ] Move upload-session chunk writes onto dedicated `object_write` substreams and add explicit mixed-workload transport tests.
+
 Primary files:
 
 - [ ] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
@@ -235,3 +241,11 @@ Primary files:
   - `cargo test -p client-sdk latency_probe`
   - `cargo check -p cli-client -p web-ui-backend`
   - `pnpm --dir web --filter @ironmesh/api --filter @ironmesh/client-ui typecheck`
+- [x] 2026-04-08: Introduce dedicated object-read transport substreams and stream ranged downloads over multiplexed direct/relay sessions instead of buffering whole range bodies through RPC frames.
+  Verification:
+  - `cargo check -p transport-sdk -p server-node-sdk -p client-sdk`
+  - `cargo test -p transport-sdk`
+  - `cargo test -p client-sdk direct_transport`
+  - `cargo test -p client-sdk relay_transport`
+  - `cargo test -p client-sdk blocking_range_download_handles_concurrent_overlapping_requests`
+  - `cargo check -p cli-client -p web-ui-backend`

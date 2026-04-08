@@ -33,6 +33,26 @@ pub struct BufferedTransportResponse {
     pub body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportRequestHead {
+    pub request_id: String,
+    pub kind: TransportStreamKind,
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub headers: Vec<TransportHeader>,
+    #[serde(default)]
+    pub end_of_stream: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportResponseHead {
+    pub request_id: String,
+    pub status: u16,
+    #[serde(default)]
+    pub headers: Vec<TransportHeader>,
+}
+
 impl BufferedTransportRequest {
     pub fn new(
         kind: TransportStreamKind,
@@ -55,8 +75,8 @@ impl BufferedTransportRequest {
         self.request_head().validate()
     }
 
-    fn request_head(&self) -> TransportStreamControlMessage {
-        TransportStreamControlMessage::RequestHead {
+    fn request_head(&self) -> TransportRequestHead {
+        TransportRequestHead {
             request_id: self.request_id.clone(),
             kind: self.kind,
             method: self.method.clone(),
@@ -72,12 +92,85 @@ impl BufferedTransportResponse {
         self.response_head().validate()
     }
 
-    fn response_head(&self) -> TransportStreamControlMessage {
-        TransportStreamControlMessage::ResponseHead {
+    fn response_head(&self) -> TransportResponseHead {
+        TransportResponseHead {
             request_id: self.request_id.clone(),
             status: self.status,
             headers: self.headers.clone(),
         }
+    }
+}
+
+impl TransportRequestHead {
+    pub fn validate(&self) -> Result<()> {
+        self.clone().into_control_message().validate()
+    }
+
+    fn into_control_message(self) -> TransportStreamControlMessage {
+        TransportStreamControlMessage::RequestHead {
+            request_id: self.request_id,
+            kind: self.kind,
+            method: self.method,
+            path: self.path,
+            headers: self.headers,
+            end_of_stream: self.end_of_stream,
+        }
+    }
+
+    fn from_control_message(message: TransportStreamControlMessage) -> Result<Self> {
+        let TransportStreamControlMessage::RequestHead {
+            request_id,
+            kind,
+            method,
+            path,
+            headers,
+            end_of_stream,
+        } = message
+        else {
+            bail!("transport stream did not begin with a request head");
+        };
+        let head = Self {
+            request_id,
+            kind,
+            method,
+            path,
+            headers,
+            end_of_stream,
+        };
+        head.validate()?;
+        Ok(head)
+    }
+}
+
+impl TransportResponseHead {
+    pub fn validate(&self) -> Result<()> {
+        self.clone().into_control_message().validate()
+    }
+
+    fn into_control_message(self) -> TransportStreamControlMessage {
+        TransportStreamControlMessage::ResponseHead {
+            request_id: self.request_id,
+            status: self.status,
+            headers: self.headers,
+        }
+    }
+
+    fn from_control_message(message: TransportStreamControlMessage) -> Result<Self> {
+        let TransportStreamControlMessage::ResponseHead {
+            request_id,
+            status,
+            headers,
+        } = message
+        else {
+            bail!("transport stream did not begin with a response head");
+        };
+        let head = Self {
+            request_id,
+            status,
+            headers,
+        };
+        head.validate()?;
+        Ok(head)
     }
 }
 
@@ -176,8 +269,7 @@ pub async fn write_buffered_transport_request<W>(
 where
     W: AsyncRead + AsyncWrite + Unpin,
 {
-    request.validate()?;
-    write_json_frame(writer, &request.request_head())
+    write_transport_request_head(writer, &request.request_head())
         .await
         .context("failed writing buffered transport request head")?;
     if !request.body.is_empty() {
@@ -198,20 +290,9 @@ pub async fn read_buffered_transport_request<R>(
 where
     R: AsyncRead + AsyncWrite + Unpin,
 {
-    let head = read_json_frame::<_, TransportStreamControlMessage>(reader)
+    let head = read_transport_request_head(reader)
         .await
         .context("failed reading buffered transport request head")?;
-    let TransportStreamControlMessage::RequestHead {
-        request_id,
-        kind,
-        method,
-        path,
-        headers,
-        ..
-    } = head
-    else {
-        bail!("buffered transport request stream did not begin with a request head");
-    };
 
     let mut body = Vec::new();
     reader
@@ -219,11 +300,11 @@ where
         .await
         .context("failed reading buffered transport request body")?;
     let request = BufferedTransportRequest {
-        request_id,
-        kind,
-        method,
-        path,
-        headers,
+        request_id: head.request_id,
+        kind: head.kind,
+        method: head.method,
+        path: head.path,
+        headers: head.headers,
         body,
     };
     request.validate()?;
@@ -237,8 +318,7 @@ pub async fn write_buffered_transport_response<W>(
 where
     W: AsyncRead + AsyncWrite + Unpin,
 {
-    response.validate()?;
-    write_json_frame(writer, &response.response_head())
+    write_transport_response_head(writer, &response.response_head())
         .await
         .context("failed writing buffered transport response head")?;
     if !response.body.is_empty() {
@@ -259,17 +339,9 @@ pub async fn read_buffered_transport_response<R>(
 where
     R: AsyncRead + AsyncWrite + Unpin,
 {
-    let head = read_json_frame::<_, TransportStreamControlMessage>(reader)
+    let head = read_transport_response_head(reader)
         .await
         .context("failed reading buffered transport response head")?;
-    let TransportStreamControlMessage::ResponseHead {
-        request_id,
-        status,
-        headers,
-    } = head
-    else {
-        bail!("buffered transport response stream did not begin with a response head");
-    };
 
     let mut body = Vec::new();
     reader
@@ -277,13 +349,54 @@ where
         .await
         .context("failed reading buffered transport response body")?;
     let response = BufferedTransportResponse {
-        request_id,
-        status,
-        headers,
+        request_id: head.request_id,
+        status: head.status,
+        headers: head.headers,
         body,
     };
     response.validate()?;
     Ok(response)
+}
+
+pub async fn write_transport_request_head<W>(writer: &mut W, head: &TransportRequestHead) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    head.validate()?;
+    write_json_frame(writer, &head.clone().into_control_message())
+        .await
+}
+
+pub async fn read_transport_request_head<R>(reader: &mut R) -> Result<TransportRequestHead>
+where
+    R: AsyncRead + Unpin,
+{
+    let message = read_json_frame::<_, TransportStreamControlMessage>(reader)
+        .await
+        .context("failed reading transport request head")?;
+    TransportRequestHead::from_control_message(message)
+}
+
+pub async fn write_transport_response_head<W>(
+    writer: &mut W,
+    head: &TransportResponseHead,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    head.validate()?;
+    write_json_frame(writer, &head.clone().into_control_message())
+        .await
+}
+
+pub async fn read_transport_response_head<R>(reader: &mut R) -> Result<TransportResponseHead>
+where
+    R: AsyncRead + Unpin,
+{
+    let message = read_json_frame::<_, TransportStreamControlMessage>(reader)
+        .await
+        .context("failed reading transport response head")?;
+    TransportResponseHead::from_control_message(message)
 }
 
 async fn write_json_frame<W, T>(writer: &mut W, message: &T) -> Result<()>
