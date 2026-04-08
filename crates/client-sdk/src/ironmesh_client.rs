@@ -16,20 +16,17 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sync_core::{NamespaceEntry, SyncSnapshot};
-use tokio::sync::Mutex;
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
-    ClientIdentityMaterial, MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity,
-    RelayHttpHeader, RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind,
-    RendezvousControlClient, TransportHeader, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, TRANSPORT_PROTOCOL_VERSION,
-    WebSocketByteStream, build_signed_request_headers, connect_websocket,
-    perform_transport_client_handshake, websocket_url,
+    ClientIdentityMaterial, PeerIdentity, RelayHttpHeader, RendezvousControlClient,
+    TransportHeader, TransportStreamKind, build_signed_request_headers,
     read_buffered_transport_response, write_buffered_transport_request,
 };
+
+use crate::session_pool::{TransportSessionPool, TransportSessionPoolSnapshot};
 
 const LARGE_UPLOAD_THRESHOLD_BYTES: usize = 1024 * 1024;
 const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
@@ -65,14 +62,9 @@ enum ClientTransport {
     Direct {
         http: HttpClient,
         server_base_url: String,
-        server_ca_pem: Option<String>,
-        multiplex_session: Arc<Mutex<Option<DirectMultiplexSession>>>,
+        session_pool: TransportSessionPool,
     },
     Relay(ClientRelayTransport),
-}
-
-struct DirectMultiplexSession {
-    session: Arc<MultiplexedSession>,
 }
 
 #[derive(Clone)]
@@ -80,12 +72,7 @@ struct ClientRelayTransport {
     rendezvous: RendezvousControlClient,
     request_base_url: String,
     target_node_id: NodeId,
-    multiplex_session: Arc<Mutex<Option<ClientRelayMultiplexSession>>>,
-}
-
-struct ClientRelayMultiplexSession {
-    _relay_session: RelayTunnelSession,
-    session: Arc<MultiplexedSession>,
+    session_pool: TransportSessionPool,
 }
 
 #[derive(Debug)]
@@ -478,12 +465,15 @@ impl IronMeshClient {
         http: HttpClient,
         server_ca_pem: Option<String>,
     ) -> Self {
+        let server_base_url = server_base_url.into().trim_end_matches('/').to_string();
         Self {
             transport: ClientTransport::Direct {
                 http,
-                server_base_url: server_base_url.into().trim_end_matches('/').to_string(),
-                server_ca_pem,
-                multiplex_session: Arc::new(Mutex::new(None)),
+                session_pool: TransportSessionPool::new_direct(
+                    server_base_url.clone(),
+                    server_ca_pem,
+                ),
+                server_base_url,
             },
             auth: ClientRequestAuth::None,
         }
@@ -494,12 +484,14 @@ impl IronMeshClient {
         rendezvous: RendezvousControlClient,
         target_node_id: NodeId,
     ) -> Self {
+        let request_base_url = request_base_url.into().trim_end_matches('/').to_string();
+        let session_pool = TransportSessionPool::new_relay(rendezvous.clone(), target_node_id);
         Self {
             transport: ClientTransport::Relay(ClientRelayTransport {
                 rendezvous,
-                request_base_url: request_base_url.into().trim_end_matches('/').to_string(),
+                request_base_url,
                 target_node_id,
-                multiplex_session: Arc::new(Mutex::new(None)),
+                session_pool,
             }),
             auth: ClientRequestAuth::None,
         }
@@ -534,6 +526,13 @@ impl IronMeshClient {
         match &self.transport {
             ClientTransport::Direct { .. } => None,
             ClientTransport::Relay(relay) => Some(relay.rendezvous.clone()),
+        }
+    }
+
+    pub fn transport_session_pool_snapshot(&self) -> TransportSessionPoolSnapshot {
+        match &self.transport {
+            ClientTransport::Direct { session_pool, .. } => session_pool.snapshot(),
+            ClientTransport::Relay(relay) => relay.session_pool.snapshot(),
         }
     }
 
@@ -590,14 +589,12 @@ impl IronMeshClient {
             ClientTransport::Direct {
                 http,
                 server_base_url,
-                server_ca_pem,
-                multiplex_session,
+                session_pool,
             } => {
                 if let ClientRequestAuth::SignedIdentity(identity) = &self.auth {
                     return execute_direct_multiplex_buffered_request(
                         server_base_url,
-                        server_ca_pem.as_deref(),
-                        multiplex_session,
+                        session_pool,
                         identity,
                         &method,
                         &url,
@@ -2325,13 +2322,6 @@ fn transport_headers_from_relay_headers(headers: &[RelayHttpHeader]) -> Vec<Tran
         .collect()
 }
 
-fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole {
-    match source {
-        PeerIdentity::Node(_) => TransportSessionRole::Node,
-        PeerIdentity::Device(_) => TransportSessionRole::Client,
-    }
-}
-
 fn transport_stream_kind_for_path(path: &str) -> TransportStreamKind {
     if path == "/health" || path.starts_with("/diagnostics/") {
         TransportStreamKind::Diagnostics
@@ -2340,68 +2330,9 @@ fn transport_stream_kind_for_path(path: &str) -> TransportStreamKind {
     }
 }
 
-fn websocket_header_pairs(headers: &[RelayHttpHeader]) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .map(|header| (header.name.clone(), header.value.clone()))
-        .collect()
-}
-
-async fn invalidate_direct_multiplex_session(
-    multiplex_session: &Arc<Mutex<Option<DirectMultiplexSession>>>,
-) {
-    let mut guard = multiplex_session.lock().await;
-    *guard = None;
-}
-
-async fn ensure_direct_multiplex_session(
-    server_base_url: &str,
-    server_ca_pem: Option<&str>,
-    multiplex_session: &Arc<Mutex<Option<DirectMultiplexSession>>>,
-    identity: &ClientIdentityMaterial,
-) -> Result<Arc<MultiplexedSession>> {
-    let mut guard = multiplex_session.lock().await;
-    if let Some(existing) = guard.as_ref() {
-        return Ok(Arc::clone(&existing.session));
-    }
-
-    let ws_url = websocket_url(server_base_url, "transport/ws")
-        .with_context(|| format!("failed building direct transport websocket URL from {server_base_url}"))?;
-    let ws_headers = websocket_header_pairs(&build_identity_request_auth_headers(
-        identity,
-        "GET",
-        "/transport/ws",
-    )?);
-    let websocket = connect_websocket(&ws_url, server_ca_pem, None, &ws_headers)
-        .await
-        .with_context(|| format!("failed opening direct transport websocket {}", ws_url))?;
-    let transport = WebSocketByteStream::new(websocket);
-    let multiplexed = MultiplexedSession::spawn(transport, MultiplexMode::Client, MultiplexConfig::default())
-        .context("failed creating direct multiplexed transport session")?;
-    perform_transport_client_handshake(
-        &multiplexed,
-        TransportSessionControlMessage::Hello {
-            protocol_version: TRANSPORT_PROTOCOL_VERSION,
-            cluster_id: identity.cluster_id,
-            role: TransportSessionRole::Client,
-            peer: PeerIdentity::Device(identity.device_id),
-            target: None,
-        },
-    )
-    .await
-    .context("failed performing direct transport handshake")?;
-
-    let session = Arc::new(multiplexed);
-    *guard = Some(DirectMultiplexSession {
-        session: Arc::clone(&session),
-    });
-    Ok(session)
-}
-
 async fn execute_direct_multiplex_buffered_request(
     server_base_url: &str,
-    server_ca_pem: Option<&str>,
-    multiplex_session: &Arc<Mutex<Option<DirectMultiplexSession>>>,
+    session_pool: &TransportSessionPool,
     identity: &ClientIdentityMaterial,
     method: &Method,
     url: &Url,
@@ -2412,14 +2343,10 @@ async fn execute_direct_multiplex_buffered_request(
     let request_headers = transport_headers_from_relay_headers(headers);
 
     for attempt in 0..2 {
-        let session = ensure_direct_multiplex_session(
-            server_base_url,
-            server_ca_pem,
-            multiplex_session,
-            identity,
-        )
-        .await
-        .context("failed ensuring direct multiplex session")?;
+        let session = session_pool
+            .ensure_direct_session(identity)
+            .await
+            .context("failed ensuring direct multiplex session")?;
         let request = BufferedTransportRequest::new(
             transport_stream_kind_for_path(&request_path),
             method.as_str(),
@@ -2446,7 +2373,7 @@ async fn execute_direct_multiplex_buffered_request(
         match result {
             Ok(response) => return Ok(response),
             Err(err) if attempt == 0 => {
-                invalidate_direct_multiplex_session(multiplex_session).await;
+                session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
                     server_base_url,
@@ -2454,7 +2381,7 @@ async fn execute_direct_multiplex_buffered_request(
                 );
             }
             Err(err) => {
-                invalidate_direct_multiplex_session(multiplex_session).await;
+                session_pool.invalidate().await;
                 return Err(err);
             }
         }
@@ -2464,75 +2391,6 @@ async fn execute_direct_multiplex_buffered_request(
         "direct multiplex request retried without producing a response for {}",
         server_base_url
     )
-}
-
-impl ClientRelayTransport {
-    async fn invalidate_multiplex_session(&self) {
-        let mut guard = self.multiplex_session.lock().await;
-        *guard = None;
-    }
-
-    async fn ensure_multiplex_session(
-        &self,
-        source: PeerIdentity,
-    ) -> Result<Arc<MultiplexedSession>> {
-        let mut guard = self.multiplex_session.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            return Ok(Arc::clone(&existing.session));
-        }
-
-        let ticket = self
-            .rendezvous
-            .issue_relay_ticket(&RelayTicketRequest {
-                cluster_id: self.rendezvous.config().cluster_id,
-                source: source.clone(),
-                target: PeerIdentity::Node(self.target_node_id),
-                session_kind: RelayTunnelSessionKind::MultiplexTransport,
-                requested_expires_in_secs: Some(300),
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "failed issuing multiplex relay ticket for client target node {}",
-                    self.target_node_id
-                )
-            })?;
-        let (relay_session, multiplexed) = self
-            .rendezvous
-            .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed opening multiplex relay session for client target node {}",
-                    self.target_node_id
-                )
-            })?;
-
-        perform_transport_client_handshake(
-            &multiplexed,
-            TransportSessionControlMessage::Hello {
-                protocol_version: TRANSPORT_PROTOCOL_VERSION,
-                cluster_id: self.rendezvous.config().cluster_id,
-                role: relay_session_role_for_source(&source),
-                peer: source,
-                target: Some(PeerIdentity::Node(self.target_node_id)),
-            },
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed performing multiplex relay transport handshake for target node {}",
-                self.target_node_id
-            )
-        })?;
-
-        let session = Arc::new(multiplexed);
-        *guard = Some(ClientRelayMultiplexSession {
-            _relay_session: relay_session,
-            session: Arc::clone(&session),
-        });
-        Ok(session)
-    }
 }
 
 async fn execute_relay_multiplex_buffered_request(
@@ -2548,7 +2406,8 @@ async fn execute_relay_multiplex_buffered_request(
 
     for attempt in 0..2 {
         let session = relay
-            .ensure_multiplex_session(source.clone())
+            .session_pool
+            .ensure_relay_session(source.clone())
             .await
             .with_context(|| {
                 format!(
@@ -2582,7 +2441,7 @@ async fn execute_relay_multiplex_buffered_request(
         match result {
             Ok(response) => return Ok(response),
             Err(err) if attempt == 0 => {
-                relay.invalidate_multiplex_session().await;
+                relay.session_pool.invalidate().await;
                 tracing::debug!(
                     error = %err,
                     target_node_id = %relay.target_node_id,
@@ -2590,7 +2449,7 @@ async fn execute_relay_multiplex_buffered_request(
                 );
             }
             Err(err) => {
-                relay.invalidate_multiplex_session().await;
+                relay.session_pool.invalidate().await;
                 return Err(err);
             }
         }

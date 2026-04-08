@@ -104,6 +104,11 @@ Primary files:
 - [ ] Introduce a session pool for direct and relay paths.
 - [ ] Keep bootstrap/path-selection logic, but target sessions instead of bespoke request transports.
 
+Current slice landed:
+
+- [x] Move direct and relay warm-session ownership into a shared `session_pool` module instead of transport-specific cached session fields.
+- [x] Expose transport session-pool snapshots from `IronMeshClient` so later diagnostics can report connection reuse and resets without reworking the client surface again.
+
 Primary files:
 
 - [ ] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
@@ -210,3 +215,8 @@ Primary files:
   - `cargo test -p client-sdk relay_transport`
   - `cargo test -p client-sdk direct_transport`
   - `cargo check -p transport-sdk -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
+- [x] 2026-04-08: Consolidate direct and relay warm-session management into a shared client transport session pool and expose reusable session snapshots for diagnostics.
+  Verification:
+  - `cargo check -p client-sdk`
+  - `cargo test -p client-sdk direct_transport`
+  - `cargo test -p client-sdk relay_transport`

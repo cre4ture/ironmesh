@@ -6,6 +6,7 @@ pub mod device_auth;
 pub mod ironmesh_client;
 pub mod latency_probe;
 pub mod remote_sync;
+mod session_pool;
 
 pub use bootstrap::{
     BootstrapEnrollmentResult, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
@@ -42,6 +43,7 @@ pub use remote_sync::{
     RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
     RemoteSyncScheduler, RemoteSyncStrategy, changed_paths_between,
 };
+pub use session_pool::TransportSessionPoolSnapshot;
 pub use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientBootstrapClaim,
     ClientBootstrapClaimIssueResponse, ClientBootstrapClaimRedeemRequest,
