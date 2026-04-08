@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/common",
+    "crates/desktop-status",
     "crates/transport-sdk",
     "crates/rendezvous-server",
     "crates/client-sdk",

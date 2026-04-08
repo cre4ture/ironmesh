@@ -6,6 +6,7 @@ const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
 const LOCAL_STATE_SYNC_ROOTS_DIR: &str = "sync-roots";
 const LOCAL_STATE_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "connection-bootstrap.json";
 const LOCAL_STATE_CLIENT_IDENTITY_FILE_NAME: &str = "client-identity.json";
+const LOCAL_STATE_DESKTOP_STATUS_FILE_NAME: &str = "desktop-status.json";
 
 pub(crate) fn local_appdata_sync_root_state_dir(sync_root_path: &Path) -> PathBuf {
     local_appdata_root()
@@ -20,6 +21,10 @@ pub(crate) fn local_appdata_connection_bootstrap_path(sync_root_path: &Path) -> 
 
 pub(crate) fn local_appdata_client_identity_path(sync_root_path: &Path) -> PathBuf {
     local_appdata_sync_root_state_dir(sync_root_path).join(LOCAL_STATE_CLIENT_IDENTITY_FILE_NAME)
+}
+
+pub(crate) fn local_appdata_desktop_status_path(sync_root_path: &Path) -> PathBuf {
+    local_appdata_sync_root_state_dir(sync_root_path).join(LOCAL_STATE_DESKTOP_STATUS_FILE_NAME)
 }
 
 fn local_appdata_root() -> PathBuf {
@@ -63,7 +68,10 @@ fn sync_root_state_label(sync_root_path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_appdata_client_identity_path, local_appdata_connection_bootstrap_path};
+    use super::{
+        local_appdata_client_identity_path, local_appdata_connection_bootstrap_path,
+        local_appdata_desktop_status_path,
+    };
     use std::path::Path;
 
     #[test]
@@ -79,6 +87,12 @@ mod tests {
         assert_eq!(
             identity.file_name().and_then(|value| value.to_str()),
             Some("client-identity.json")
+        );
+        assert_eq!(
+            local_appdata_desktop_status_path(sync_root)
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some("desktop-status.json")
         );
         assert_eq!(bootstrap.parent(), identity.parent());
     }

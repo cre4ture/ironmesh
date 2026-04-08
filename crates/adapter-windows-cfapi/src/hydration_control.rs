@@ -100,6 +100,20 @@ pub fn has_hydration_cancel_request(sync_root_path: &Path, relative_path: &str) 
         .is_file()
 }
 
+pub fn active_hydration_marker_count(sync_root_path: &Path) -> Result<usize> {
+    let state_dir = local_appdata_sync_root_state_dir(sync_root_path).join(ACTIVE_HYDRATIONS_DIR);
+    match fs::read_dir(&state_dir) {
+        Ok(entries) => Ok(entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_file())
+            .count()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to enumerate {}", state_dir.display()))
+        }
+    }
+}
+
 fn write_marker_file(path: &Path, normalized_relative_path: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
