@@ -13,10 +13,7 @@ use crate::bootstrap_claim::{
 use crate::candidates::ConnectionCandidate;
 use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
-use crate::relay::{
-    RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
-    RelayTicketRequest,
-};
+use crate::relay::{RelayTicket, RelayTicketRequest};
 use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelSession};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -281,21 +278,6 @@ impl RendezvousControlClient {
             .await
     }
 
-    pub async fn submit_relay_http_request(
-        &self,
-        request: &RelayHttpRequest,
-    ) -> Result<RelayHttpResponse> {
-        request.validate()?;
-        if request.ticket.cluster_id != self.config.cluster_id {
-            bail!(
-                "relay HTTP request cluster_id {} does not match rendezvous client cluster_id {}",
-                request.ticket.cluster_id,
-                self.config.cluster_id
-            );
-        }
-        self.post_json("/relay/http/request", request).await
-    }
-
     pub async fn connect_relay_tunnel_source(
         &self,
         ticket: &RelayTicket,
@@ -401,27 +383,6 @@ impl RendezvousControlClient {
         self.accept_relay_tunnel(&multiplex_request)
             .await?
             .into_multiplexed_session(MultiplexMode::Server, config)
-    }
-
-    pub async fn poll_relay_http_request(
-        &self,
-        request: &RelayHttpPollRequest,
-    ) -> Result<RelayHttpPollResponse> {
-        request.validate()?;
-        if request.cluster_id != self.config.cluster_id {
-            bail!(
-                "relay HTTP poll request cluster_id {} does not match rendezvous client cluster_id {}",
-                request.cluster_id,
-                self.config.cluster_id
-            );
-        }
-        self.post_json("/relay/http/poll", request).await
-    }
-
-    pub async fn respond_relay_http_request(&self, response: &RelayHttpResponse) -> Result<()> {
-        response.validate()?;
-        let _: serde_json::Value = self.post_json("/relay/http/respond", response).await?;
-        Ok(())
     }
 
     async fn get_json<T>(&self, path: &str) -> Result<T>

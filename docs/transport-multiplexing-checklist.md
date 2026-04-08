@@ -182,7 +182,8 @@ Current slice landed:
 
 - [x] Stop spawning the legacy relay tunnel acceptor and relay HTTP polling agents inside `server-node` now that peer relay requests use multiplexed sessions.
 - [x] Remove the dead `/relay/http/*` broker routes and in-memory relay broker state from standalone rendezvous and embedded rendezvous, leaving the relay tunnel WebSocket endpoint as the only live relayed data-plane entrypoint.
-- [ ] Remove the remaining relay HTTP control-client methods and runtime types from `transport-sdk`.
+- [x] Remove the now-unused `/relay/http/*` control-client methods from `RendezvousControlClient`.
+- [ ] Remove the remaining relay HTTP runtime types and broker implementation from `transport-sdk`.
 - [ ] Remove the remaining legacy HTTP-over-tunnel codec helpers once those routes are gone.
 
 Primary files:
@@ -276,3 +277,6 @@ Primary files:
 - [x] 2026-04-08: Remove the dead `/relay/http/*` routes and relay broker state from standalone rendezvous and embedded rendezvous.
   Verification:
   - `cargo check -p rendezvous-service -p server-node-sdk`
+- [x] 2026-04-08: Remove the unused rendezvous control-client methods for `/relay/http/*` now that those routes no longer exist.
+  Verification:
+  - `cargo check -p transport-sdk -p rendezvous-service -p server-node-sdk`
