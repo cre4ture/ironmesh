@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use common::{ClusterId, NodeId};
+pub use rendezvous_server::{
+    RendezvousMtlsConfig, RendezvousServerConfig, RendezvousServerTlsIdentity,
+};
 
 use crate::failover::{
     DecryptedRendezvousFailoverPackage, load_rendezvous_failover_package, normalize_public_url,
@@ -18,24 +21,6 @@ const LONG_VERSION: &str = git_version::git_version!(
     prefix = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: "),
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
-
-#[derive(Debug, Clone)]
-pub enum RendezvousServerTlsIdentity {
-    Files {
-        cert_path: PathBuf,
-        key_path: PathBuf,
-    },
-    InlinePem {
-        cert_pem: String,
-        key_pem: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct RendezvousMtlsConfig {
-    pub client_ca_cert_path: PathBuf,
-    pub server_identity: RendezvousServerTlsIdentity,
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Parser)]
 #[command(name = "rendezvous-service")]
@@ -195,6 +180,15 @@ impl RendezvousServiceConfig {
         anyhow::bail!(
             "rendezvous-service refuses insecure HTTP startup without mTLS; configure IRONMESH_RENDEZVOUS_CLIENT_CA_CERT plus IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY, or use a failover package with IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE and IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE, or set IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true for local development/testing only"
         )
+    }
+
+    pub fn server_config(&self) -> RendezvousServerConfig {
+        RendezvousServerConfig {
+            bind_addr: self.bind_addr,
+            public_url: self.public_url.clone(),
+            relay_public_urls: self.relay_public_urls.clone(),
+            mtls: self.mtls.clone(),
+        }
     }
 }
 

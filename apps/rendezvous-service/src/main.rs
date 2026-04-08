@@ -1,74 +1,23 @@
-mod auth;
 mod config;
-mod control;
 mod failover;
-mod presence;
-mod relay;
-mod state;
 
-use anyhow::{Context, Result};
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
-use axum::http::StatusCode;
-use axum::http::header::CACHE_CONTROL;
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use serde::Serialize;
-use tracing::{info, warn};
-use transport_sdk::peer::PeerIdentity;
-use transport_sdk::relay::{RelayTicket, RelayTicketRequest};
-use transport_sdk::rendezvous::PresenceRegistration;
-use transport_sdk::{
-    BufferedTransportRequest, ClientBootstrapClaimRedeemRequest,
-    ClientBootstrapClaimRedeemResponse, MultiplexConfig, MultiplexMode, RelayTunnelControlMessage,
-    RelayTunnelFrame, TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, perform_transport_client_handshake,
-    read_buffered_transport_response, write_buffered_transport_request,
-};
-
-use crate::auth::{
-    MaybeAuthenticatedPeer, MtlsAuthenticatedPeerAcceptor, ensure_authenticated_peer_identity,
-    require_authenticated_node,
-};
 use crate::config::RendezvousServiceConfig;
-use crate::control::{PresenceListResponse, RegisterPresenceResponse};
-use crate::state::AppState;
-
-#[derive(Debug, Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    public_url: String,
-    registered_endpoints: usize,
-}
+use anyhow::Result;
+use rendezvous_server::{RendezvousAppState, serve as serve_rendezvous};
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     common::logging::init_compact_tracing(common::logging::env_filter_from_default_env("info"));
 
     let config = RendezvousServiceConfig::from_env()?;
-    let state = AppState::new(config);
-    run_with_state(state).await
+    run_with_config(config).await
 }
 
-fn build_router(state: AppState) -> Router {
-    let relay_router = Router::new().route("/relay/tunnel/ws", get(relay_tunnel_ws));
+async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
+    config.validate_startup_security()?;
 
-    Router::new()
-        .route("/health", get(health))
-        .route("/control/presence", get(list_presence))
-        .route("/control/presence/register", post(register_presence))
-        .route("/control/relay/ticket", post(issue_relay_ticket))
-        .route("/bootstrap-claims/redeem", post(redeem_bootstrap_claim))
-        .merge(relay_router)
-        .with_state(state)
-}
-
-async fn run_with_state(state: AppState) -> Result<()> {
-    state.config.validate_startup_security()?;
-    let bind_addr = state.config.bind_addr;
-    let app = build_router(state.clone());
-
-    if let Some(failover) = state.config.failover_package.as_ref() {
+    if let Some(failover) = config.failover_package.as_ref() {
         info!(
             failover_package = %failover.package_path.display(),
             cluster_id = %failover.cluster_id,
@@ -79,411 +28,13 @@ async fn run_with_state(state: AppState) -> Result<()> {
     }
 
     info!(
-        bind_addr = %bind_addr,
-        public_url = %state.config.public_url,
-        mtls_enabled = state.config.mtls.is_some(),
+        bind_addr = %config.bind_addr,
+        public_url = %config.public_url,
+        mtls_enabled = config.mtls.is_some(),
         "rendezvous service listening"
     );
 
-    if let Some(mtls) = state.config.mtls.as_ref() {
-        let tls_config = auth::build_mtls_rustls_config(mtls)?;
-        axum_server::bind(bind_addr)
-            .acceptor(MtlsAuthenticatedPeerAcceptor::new(tls_config))
-            .serve(app.into_make_service())
-            .await?;
-        Ok(())
-    } else {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(listener, app).await?;
-        Ok(())
-    }
-}
-
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        public_url: state.config.public_url,
-        registered_endpoints: state.presence.len(),
-    })
-}
-
-async fn register_presence(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(request): Json<PresenceRegistration>,
-) -> std::result::Result<Json<RegisterPresenceResponse>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        &request.identity,
-        "presence registration identity",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-
-    let entry = state.presence.register(request);
-    Ok(Json(RegisterPresenceResponse {
-        accepted: true,
-        updated_at_unix: entry.updated_at_unix,
-        entry,
-    }))
-}
-
-async fn list_presence(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-) -> std::result::Result<Json<PresenceListResponse>, (StatusCode, String)> {
-    require_authenticated_node(state.config.mtls.is_some(), &authenticated_peer)
-        .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let entries = state.presence.list();
-    Ok(Json(PresenceListResponse {
-        registered_endpoints: entries.len(),
-        entries,
-    }))
-}
-
-async fn issue_relay_ticket(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(request): Json<RelayTicketRequest>,
-) -> std::result::Result<Json<RelayTicket>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        &request.source,
-        "relay ticket source",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-
-    let ticket = relay::issue_relay_ticket(request, &state.config.relay_public_urls);
-    ticket
-        .validate()
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    Ok(Json(ticket))
-}
-
-async fn redeem_bootstrap_claim(
-    State(state): State<AppState>,
-    Json(request): Json<ClientBootstrapClaimRedeemRequest>,
-) -> std::result::Result<impl axum::response::IntoResponse, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-
-    let response = relay_bootstrap_claim_redeem_over_tunnel(&state, &request).await?;
-
-    Ok(([(CACHE_CONTROL, "no-store")], Json(response)))
-}
-
-fn bootstrap_claim_relay_source_identity(
-    request: &ClientBootstrapClaimRedeemRequest,
-) -> PeerIdentity {
-    request
-        .device_id
-        .as_deref()
-        .and_then(|value| value.trim().parse().ok())
-        .map(PeerIdentity::Device)
-        .unwrap_or(PeerIdentity::Node(request.target_node_id))
-}
-
-fn bootstrap_claim_transport_request(
-    request: &ClientBootstrapClaimRedeemRequest,
-) -> std::result::Result<BufferedTransportRequest, (StatusCode, String)> {
-    let body = serde_json::to_vec(request).map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed encoding bootstrap claim redeem request: {err}"),
-        )
-    })?;
-    Ok(BufferedTransportRequest::new(
-        TransportStreamKind::Rpc,
-        "POST",
-        "/auth/bootstrap-claims/redeem",
-        vec![TransportHeader {
-            name: "content-type".to_string(),
-            value: "application/json".to_string(),
-        }],
-        body,
-    ))
-}
-
-async fn relay_bootstrap_claim_redeem_over_tunnel(
-    state: &AppState,
-    request: &ClientBootstrapClaimRedeemRequest,
-) -> std::result::Result<ClientBootstrapClaimRedeemResponse, (StatusCode, String)> {
-    let target = PeerIdentity::Node(request.target_node_id);
-    let target_presence = state.presence.entry_for_identity(&target).ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "bootstrap claim target node {} is not currently connected to rendezvous",
-                request.target_node_id
-            ),
-        )
-    })?;
-
-    let ticket = relay::issue_relay_ticket(
-        RelayTicketRequest {
-            cluster_id: target_presence.registration.cluster_id,
-            source: bootstrap_claim_relay_source_identity(request),
-            target,
-            session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
-            requested_expires_in_secs: Some(30),
-        },
-        &state.config.relay_public_urls,
-    );
-    let source = bootstrap_claim_relay_source_identity(request);
-    let transport_request = bootstrap_claim_transport_request(request)?;
-    let (relay_session, session) = state
-        .relay_tunnel
-        .connect_source(ticket)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?
-        .into_multiplexed_session(MultiplexMode::Client, MultiplexConfig::default())
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    perform_transport_client_handshake(
-        &session,
-        TransportSessionControlMessage::Hello {
-            protocol_version: TRANSPORT_PROTOCOL_VERSION,
-            cluster_id: target_presence.registration.cluster_id,
-            role: TransportSessionRole::Client,
-            peer: source,
-            target: Some(PeerIdentity::Node(request.target_node_id)),
-        },
-    )
-    .await
-    .map_err(|err| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "failed completing bootstrap-claim relay handshake for session {}: {err}",
-                relay_session.session_id
-            ),
-        )
-    })?;
-
-    let response = async {
-        let mut stream = session
-            .open_stream()
-            .await
-            .map_err(|err| anyhow::anyhow!("failed opening bootstrap-claim relay stream: {err}"))?;
-        write_buffered_transport_request(&mut stream, &transport_request)
-            .await
-            .map_err(|err| {
-                anyhow::anyhow!("failed writing bootstrap-claim relay request: {err}")
-            })?;
-        read_buffered_transport_response(&mut stream)
-            .await
-            .map_err(|err| anyhow::anyhow!("failed reading bootstrap-claim relay response: {err}"))
-    }
-    .await
-    .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    let _ = session.close().await;
-
-    let response_status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    if response_status.is_server_error() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            String::from_utf8_lossy(&response.body).trim().to_string(),
-        ));
-    }
-    if !response_status.is_success() {
-        return Err((
-            response_status,
-            String::from_utf8_lossy(&response.body).trim().to_string(),
-        ));
-    }
-
-    let redeemed = serde_json::from_slice::<ClientBootstrapClaimRedeemResponse>(&response.body)
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    redeemed
-        .validate()
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    Ok(redeemed)
-}
-
-async fn relay_tunnel_ws(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    websocket: WebSocketUpgrade,
-) -> impl axum::response::IntoResponse {
-    websocket.on_upgrade(move |socket| async move {
-        serve_relay_tunnel_websocket(state, authenticated_peer, socket).await;
-    })
-}
-
-async fn serve_relay_tunnel_websocket(
-    state: AppState,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    mut socket: WebSocket,
-) {
-    if let Err(err) = run_relay_tunnel_websocket(&state, &authenticated_peer, &mut socket).await {
-        if transport_sdk::is_expected_idle_relay_tunnel_accept_timeout(&err.to_string()) {
-            tracing::debug!(
-                error = %err,
-                "relay tunnel websocket closed after idle target wait"
-            );
-        } else {
-            warn!(error = %err, "relay tunnel websocket failed");
-        }
-        let _ = send_relay_tunnel_control(
-            &mut socket,
-            &RelayTunnelControlMessage::Error {
-                message: err.to_string(),
-            },
-        )
-        .await;
-    }
-    let _ = socket.send(Message::Close(None)).await;
-}
-
-async fn run_relay_tunnel_websocket(
-    state: &AppState,
-    authenticated_peer: &MaybeAuthenticatedPeer,
-    socket: &mut WebSocket,
-) -> anyhow::Result<()> {
-    let initial = read_relay_tunnel_initial_message(socket).await?;
-    let mut endpoint = establish_relay_tunnel_endpoint(state, authenticated_peer, initial).await?;
-    send_relay_tunnel_control(
-        socket,
-        &RelayTunnelControlMessage::Paired {
-            session: endpoint.session().clone(),
-        },
-    )
-    .await?;
-
-    loop {
-        tokio::select! {
-            message = socket.recv() => {
-                match message {
-                    Some(Ok(Message::Binary(bytes))) => {
-                        endpoint.send(RelayTunnelFrame::Data(bytes.to_vec())).await?;
-                    }
-                    Some(Ok(Message::Text(text))) => match parse_relay_tunnel_control(&text)? {
-                        RelayTunnelControlMessage::CloseWrite => {
-                            endpoint.send(RelayTunnelFrame::CloseWrite).await?;
-                        }
-                        other => {
-                            anyhow::bail!(
-                                "unexpected relay tunnel control message after pairing: {}",
-                                serde_json::to_string(&other)
-                                    .unwrap_or_else(|_| "<unserializable>".to_string())
-                            );
-                        }
-                    },
-                    Some(Ok(Message::Ping(payload))) => {
-                        socket
-                            .send(Message::Pong(payload))
-                            .await
-                            .context("failed sending relay tunnel pong")?;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(err)) => {
-                        return Err(err).context("relay tunnel websocket read failed");
-                    }
-                }
-            }
-            frame = endpoint.recv() => {
-                match frame {
-                    Some(RelayTunnelFrame::Data(bytes)) => {
-                        socket
-                            .send(Message::Binary(bytes.into()))
-                            .await
-                            .context("failed sending relay tunnel data frame")?;
-                    }
-                    Some(RelayTunnelFrame::CloseWrite) => {
-                        send_relay_tunnel_control(socket, &RelayTunnelControlMessage::CloseWrite)
-                            .await?;
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn read_relay_tunnel_initial_message(
-    socket: &mut WebSocket,
-) -> anyhow::Result<RelayTunnelControlMessage> {
-    loop {
-        let message = socket
-            .recv()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("relay tunnel websocket closed before pairing"))?
-            .context("relay tunnel websocket read failed before pairing")?;
-        match message {
-            Message::Text(text) => return parse_relay_tunnel_control(&text),
-            Message::Ping(payload) => {
-                socket
-                    .send(Message::Pong(payload))
-                    .await
-                    .context("failed sending relay tunnel pong")?;
-            }
-            Message::Pong(_) => {}
-            Message::Close(_) => {
-                anyhow::bail!("relay tunnel websocket closed before pairing");
-            }
-            Message::Binary(_) => {
-                anyhow::bail!("relay tunnel websocket sent data before pairing");
-            }
-        }
-    }
-}
-
-async fn establish_relay_tunnel_endpoint(
-    state: &AppState,
-    authenticated_peer: &MaybeAuthenticatedPeer,
-    control: RelayTunnelControlMessage,
-) -> anyhow::Result<transport_sdk::RelayTunnelEndpoint> {
-    match control {
-        RelayTunnelControlMessage::ConnectSource { ticket } => {
-            ensure_authenticated_peer_identity(
-                state.config.mtls.is_some(),
-                authenticated_peer,
-                &ticket.source,
-                "relay tunnel source",
-            )?;
-            state.relay_tunnel.connect_source(ticket).await
-        }
-        RelayTunnelControlMessage::AcceptTarget { request } => {
-            ensure_authenticated_peer_identity(
-                state.config.mtls.is_some(),
-                authenticated_peer,
-                &request.target,
-                "relay tunnel target",
-            )?;
-            state.relay_tunnel.accept_target(request).await
-        }
-        RelayTunnelControlMessage::Paired { .. }
-        | RelayTunnelControlMessage::CloseWrite
-        | RelayTunnelControlMessage::Error { .. } => {
-            anyhow::bail!("unexpected relay tunnel control message before pairing");
-        }
-    }
-}
-
-fn parse_relay_tunnel_control(text: &str) -> anyhow::Result<RelayTunnelControlMessage> {
-    serde_json::from_str(text).context("failed parsing relay tunnel control message")
-}
-
-async fn send_relay_tunnel_control(
-    socket: &mut WebSocket,
-    control: &RelayTunnelControlMessage,
-) -> anyhow::Result<()> {
-    let payload =
-        serde_json::to_string(control).context("failed encoding relay tunnel control message")?;
-    socket
-        .send(Message::Text(payload.into()))
-        .await
-        .context("failed sending relay tunnel control message")
+    serve_rendezvous(RendezvousAppState::new(config.server_config())).await
 }
 
 #[cfg(test)]
@@ -502,24 +53,24 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use transport_sdk::RelayMode;
+    use transport_sdk::{PresenceListResponse, RelayMode};
     use uuid::Uuid;
 
     #[tokio::test]
     async fn relay_required_replication_flows_through_rendezvous() {
         let rendezvous_bind_addr = free_bind_addr();
         let rendezvous_public_url = format!("http://{rendezvous_bind_addr}");
-        let rendezvous_state = AppState::new(RendezvousServiceConfig {
+        let rendezvous_config = RendezvousServiceConfig {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
             mtls: None,
             allow_insecure_http: true,
             failover_package: None,
-        });
-        let rendezvous_state_for_server = rendezvous_state.clone();
+        };
+        let rendezvous_config_for_server = rendezvous_config.clone();
         let rendezvous_handle = tokio::spawn(async move {
-            run_with_state(rendezvous_state_for_server)
+            run_with_config(rendezvous_config_for_server)
                 .await
                 .expect("rendezvous service should run");
         });
@@ -737,7 +288,7 @@ mod tests {
             &issue_server_cert(&ca).expect("rendezvous server cert should issue"),
         )
         .expect("rendezvous TLS material should write");
-        let rendezvous_state = AppState::new(RendezvousServiceConfig {
+        let rendezvous_config = RendezvousServiceConfig {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
@@ -750,7 +301,7 @@ mod tests {
             }),
             allow_insecure_http: false,
             failover_package: None,
-        });
+        };
 
         let source_dir = fresh_test_dir("relay-required-source-mtls");
         let source_node_id = Uuid::now_v7();
@@ -765,7 +316,7 @@ mod tests {
                 .expect("rendezvous mTLS client should build");
 
         let rendezvous_handle = tokio::spawn(async move {
-            run_with_state(rendezvous_state)
+            run_with_config(rendezvous_config)
                 .await
                 .expect("mTLS rendezvous service should run");
         });
@@ -999,7 +550,7 @@ mod tests {
             &(rendezvous_cert_pem.clone(), rendezvous_key_pem.clone()),
         )
         .expect("rendezvous TLS material should write");
-        let rendezvous_state = AppState::new(RendezvousServiceConfig {
+        let rendezvous_config = RendezvousServiceConfig {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
@@ -1012,7 +563,7 @@ mod tests {
             }),
             allow_insecure_http: false,
             failover_package: None,
-        });
+        };
 
         let target_node_id = Uuid::now_v7();
         let target_tls =
@@ -1028,9 +579,10 @@ mod tests {
         )
         .expect("rendezvous mTLS health client should build");
 
+        let rendezvous_state = RendezvousAppState::new(rendezvous_config.server_config());
         let rendezvous_state_for_server = rendezvous_state.clone();
         let rendezvous_handle = tokio::spawn(async move {
-            run_with_state(rendezvous_state_for_server)
+            serve_rendezvous(rendezvous_state_for_server)
                 .await
                 .expect("mTLS rendezvous service should run");
         });
@@ -1219,7 +771,7 @@ mod tests {
             &(rendezvous_cert_pem.clone(), rendezvous_key_pem.clone()),
         )
         .expect("rendezvous TLS material should write");
-        let rendezvous_state = AppState::new(RendezvousServiceConfig {
+        let rendezvous_config = RendezvousServiceConfig {
             bind_addr: rendezvous_bind_addr,
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
@@ -1232,7 +784,7 @@ mod tests {
             }),
             allow_insecure_http: false,
             failover_package: None,
-        });
+        };
 
         let target_node_id = Uuid::now_v7();
         let target_tls =
@@ -1241,9 +793,10 @@ mod tests {
         let target_tls_paths = write_tls_material(&rendezvous_dir, &ca.ca_pem, &target_tls)
             .expect("target TLS material should write");
 
+        let rendezvous_state = RendezvousAppState::new(rendezvous_config.server_config());
         let rendezvous_state_for_server = rendezvous_state.clone();
         let rendezvous_handle = tokio::spawn(async move {
-            run_with_state(rendezvous_state_for_server)
+            serve_rendezvous(rendezvous_state_for_server)
                 .await
                 .expect("mTLS rendezvous service should run");
         });

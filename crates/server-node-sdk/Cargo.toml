@@ -33,6 +33,7 @@ pbkdf2 = "0.12"
 rand = "0.8"
 reqwest.workspace = true
 rcgen = { version = "0.14", features = ["crypto", "pem", "ring", "x509-parser"] }
+rendezvous-server = { path = "../rendezvous-server" }
 rusqlite.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use axum::extract::FromRequestParts;
-use common::{DeviceId, NodeId};
+use common::NodeId;
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -16,18 +16,18 @@ use transport_sdk::peer::PeerIdentity;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
-use crate::config::{RendezvousMtlsConfig, RendezvousServerTlsIdentity};
+use crate::{RendezvousMtlsConfig, RendezvousServerTlsIdentity};
 
 #[derive(Debug, Clone)]
-pub struct AuthenticatedPeer {
-    pub identity: PeerIdentity,
+pub(crate) struct AuthenticatedPeer {
+    pub(crate) identity: PeerIdentity,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct MaybeAuthenticatedPeer(pub Option<AuthenticatedPeer>);
+pub(crate) struct MaybeAuthenticatedPeer(pub(crate) Option<AuthenticatedPeer>);
 
 impl MaybeAuthenticatedPeer {
-    pub fn identity(&self) -> Option<&PeerIdentity> {
+    pub(crate) fn identity(&self) -> Option<&PeerIdentity> {
         self.0.as_ref().map(|peer| &peer.identity)
     }
 }
@@ -47,7 +47,7 @@ where
     }
 }
 
-pub fn require_authenticated_node(
+pub(crate) fn require_authenticated_node(
     mtls_enabled: bool,
     authenticated_peer: &MaybeAuthenticatedPeer,
 ) -> Result<Option<NodeId>> {
@@ -64,7 +64,7 @@ pub fn require_authenticated_node(
     }
 }
 
-pub fn ensure_authenticated_peer_identity(
+pub(crate) fn ensure_authenticated_peer_identity(
     mtls_enabled: bool,
     authenticated_peer: &MaybeAuthenticatedPeer,
     identity: &PeerIdentity,
@@ -73,6 +73,7 @@ pub fn ensure_authenticated_peer_identity(
     if !mtls_enabled {
         return Ok(());
     }
+
     let Some(authenticated_identity) = authenticated_peer.identity() else {
         bail!("rendezvous mTLS requires an authenticated peer certificate");
     };
@@ -87,13 +88,13 @@ pub fn ensure_authenticated_peer_identity(
 }
 
 #[derive(Clone)]
-pub struct WithAuthenticatedPeer<S> {
+pub(crate) struct WithAuthenticatedPeer<S> {
     inner: S,
     authenticated_peer: Option<AuthenticatedPeer>,
 }
 
 impl<S> WithAuthenticatedPeer<S> {
-    pub fn new(inner: S, authenticated_peer: Option<AuthenticatedPeer>) -> Self {
+    pub(crate) fn new(inner: S, authenticated_peer: Option<AuthenticatedPeer>) -> Self {
         Self {
             inner,
             authenticated_peer,
@@ -125,12 +126,12 @@ where
 }
 
 #[derive(Clone)]
-pub struct MtlsAuthenticatedPeerAcceptor {
+pub(crate) struct MtlsAuthenticatedPeerAcceptor {
     inner: axum_server::tls_rustls::RustlsAcceptor,
 }
 
 impl MtlsAuthenticatedPeerAcceptor {
-    pub fn new(config: axum_server::tls_rustls::RustlsConfig) -> Self {
+    pub(crate) fn new(config: axum_server::tls_rustls::RustlsConfig) -> Self {
         Self {
             inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
         }
@@ -177,7 +178,7 @@ where
     }
 }
 
-pub fn authenticated_peer_from_tls_stream<T>(
+fn authenticated_peer_from_tls_stream<T>(
     tls_stream: &TlsStream<T>,
 ) -> Result<Option<AuthenticatedPeer>> {
     let (_, conn) = tls_stream.get_ref();
@@ -189,7 +190,7 @@ pub fn authenticated_peer_from_tls_stream<T>(
     Ok(Some(AuthenticatedPeer { identity }))
 }
 
-pub fn build_mtls_rustls_config(
+pub(crate) fn build_mtls_rustls_config(
     mtls: &RendezvousMtlsConfig,
 ) -> Result<axum_server::tls_rustls::RustlsConfig> {
     use std::fs::File;
@@ -254,7 +255,6 @@ pub fn build_mtls_rustls_config(
         .with_client_cert_verifier(verifier)
         .with_single_cert(cert_chain, key)
         .context("failed creating rendezvous rustls server config")?;
-
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(axum_server::tls_rustls::RustlsConfig::from_config(
@@ -266,13 +266,10 @@ fn extract_peer_identity_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result
     let cert = certs
         .first()
         .context("missing end-entity peer certificate")?;
-
     let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
         .context("failed parsing peer certificate")?;
-
     for extension in parsed.extensions() {
-        let parsed_extension = extension.parsed_extension();
-        if let ParsedExtension::SubjectAlternativeName(san) = parsed_extension {
+        if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
             for name in &san.general_names {
                 if let x509_parser::extensions::GeneralName::URI(uri) = name
                     && let Some(identity) = parse_peer_identity_from_san_uri(uri)
@@ -283,19 +280,17 @@ fn extract_peer_identity_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result
         }
     }
 
-    bail!("missing urn:ironmesh:(node|device):<uuid> SAN URI in peer certificate")
+    bail!("peer certificate missing URI SAN for ironmesh identity")
 }
 
 fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
-    if let Some(rest) = uri.strip_prefix("urn:ironmesh:node:") {
-        return rest.trim().parse::<NodeId>().ok().map(PeerIdentity::Node);
+    let node_prefix = "spiffe://ironmesh/node/";
+    if let Some(rest) = uri.strip_prefix(node_prefix) {
+        return rest.parse().ok().map(PeerIdentity::Node);
     }
-    if let Some(rest) = uri.strip_prefix("urn:ironmesh:device:") {
-        return rest
-            .trim()
-            .parse::<DeviceId>()
-            .ok()
-            .map(PeerIdentity::Device);
-    }
-    None
+
+    let device_prefix = "spiffe://ironmesh/device/";
+    uri.strip_prefix(device_prefix)
+        .and_then(|rest| rest.parse().ok())
+        .map(PeerIdentity::Device)
 }

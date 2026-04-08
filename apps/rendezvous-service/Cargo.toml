@@ -17,6 +17,7 @@ clap.workspace = true
 common = { path = "../../crates/common" }
 git-version.workspace = true
 pbkdf2 = "0.12"
+rendezvous-server = { path = "../../crates/rendezvous-server" }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }
 serde.workspace = true
