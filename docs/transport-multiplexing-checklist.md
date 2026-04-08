@@ -178,6 +178,12 @@ Primary files:
 - [ ] Remove one-request tunnel execution paths.
 - [ ] Remove HTTP-over-tunnel request/response codecs that are no longer used.
 
+Current slice landed:
+
+- [x] Stop spawning the legacy relay tunnel acceptor and relay HTTP polling agents inside `server-node` now that peer relay requests use multiplexed sessions.
+- [ ] Remove the remaining relay HTTP broker routes, control-client methods, and runtime types from `transport-sdk`, `rendezvous-service`, and embedded rendezvous.
+- [ ] Remove the remaining legacy HTTP-over-tunnel codec helpers once those routes are gone.
+
 Primary files:
 
 - [ ] [crates/transport-sdk/src/relay.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay.rs)
@@ -261,4 +267,8 @@ Primary files:
 - [x] 2026-04-08: Migrate server-node peer replication and cleanup requests off the legacy relay tunnel wire format and onto multiplexed relay sessions.
   Verification:
   - `cargo check -p server-node-sdk -p transport-sdk`
+  - `cargo test -p server-node-sdk execute_replication_cleanup_routes_remote_drop_through_relay`
+- [x] 2026-04-08: Remove the live `server-node` runtime hooks for legacy relay HTTP polling and one-request relay tunnel execution, leaving only the multiplexed relay acceptor active.
+  Verification:
+  - `cargo check -p server-node-sdk`
   - `cargo test -p server-node-sdk execute_replication_cleanup_routes_remote_drop_through_relay`
