@@ -1249,8 +1249,10 @@ function LatencyPage() {
               hint={worstRelayTarget?.label ?? "Relay probe unavailable for this session."}
             />
           </SimpleGrid>
+        </Grid.Col>
 
-          <Card withBorder radius="md" padding="lg" mt="md">
+        <Grid.Col span={12}>
+          <Card withBorder radius="md" padding="lg">
             <Stack gap="sm">
               <Text fw={700}>Probe results</Text>
               <Text c="dimmed" size="sm">
