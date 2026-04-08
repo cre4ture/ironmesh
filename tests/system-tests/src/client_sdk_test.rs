@@ -869,12 +869,9 @@ mod tests {
     async fn ironmesh_client_latency_probe_reports_cold_connect_and_session_reuse_end_to_end()
     -> Result<()> {
         let bind = "127.0.0.1:19242";
-        let (mut server, enrolled) = start_authenticated_test_client(
-            bind,
-            "latency-probe-server",
-            "latency-probe-client",
-        )
-        .await?;
+        let (mut server, enrolled) =
+            start_authenticated_test_client(bind, "latency-probe-server", "latency-probe-client")
+                .await?;
 
         let sdk = enrolled.build_client_async().await?;
         let result = sdk

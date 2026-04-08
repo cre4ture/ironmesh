@@ -73,15 +73,17 @@ async fn open_websocket_io(
     match url.scheme() {
         "ws" => Ok(Box::new(tcp)),
         "wss" => {
-            let server_name =
-                ServerName::try_from(host.to_string()).context("failed building TLS server name")?;
+            let server_name = ServerName::try_from(host.to_string())
+                .context("failed building TLS server name")?;
             let tls_stream = TlsConnector::from(std::sync::Arc::new(build_tls_client_config(
                 server_ca_pem,
                 client_identity_pem,
             )?))
             .connect(server_name, tcp)
             .await
-            .with_context(|| format!("failed establishing TLS websocket stream to {host}:{port}"))?;
+            .with_context(|| {
+                format!("failed establishing TLS websocket stream to {host}:{port}")
+            })?;
             Ok(Box::new(tls_stream))
         }
         other => bail!("unsupported websocket URL scheme {other}"),

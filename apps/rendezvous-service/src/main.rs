@@ -20,11 +20,10 @@ use transport_sdk::relay::{RelayTicket, RelayTicketRequest};
 use transport_sdk::rendezvous::PresenceRegistration;
 use transport_sdk::{
     BufferedTransportRequest, ClientBootstrapClaimRedeemRequest,
-    ClientBootstrapClaimRedeemResponse, MultiplexConfig, MultiplexMode,
-    RelayTunnelControlMessage, RelayTunnelFrame, TransportHeader, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, TRANSPORT_PROTOCOL_VERSION,
-    perform_transport_client_handshake, read_buffered_transport_response,
-    write_buffered_transport_request,
+    ClientBootstrapClaimRedeemResponse, MultiplexConfig, MultiplexMode, RelayTunnelControlMessage,
+    RelayTunnelFrame, TRANSPORT_PROTOCOL_VERSION, TransportHeader, TransportSessionControlMessage,
+    TransportSessionRole, TransportStreamKind, perform_transport_client_handshake,
+    read_buffered_transport_response, write_buffered_transport_request,
 };
 
 use crate::auth::{
@@ -275,7 +274,9 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             .map_err(|err| anyhow::anyhow!("failed opening bootstrap-claim relay stream: {err}"))?;
         write_buffered_transport_request(&mut stream, &transport_request)
             .await
-            .map_err(|err| anyhow::anyhow!("failed writing bootstrap-claim relay request: {err}"))?;
+            .map_err(|err| {
+                anyhow::anyhow!("failed writing bootstrap-claim relay request: {err}")
+            })?;
         read_buffered_transport_response(&mut stream)
             .await
             .map_err(|err| anyhow::anyhow!("failed reading bootstrap-claim relay response: {err}"))
@@ -1070,12 +1071,15 @@ mod tests {
             .expect("target rendezvous client should build");
 
             let (relay_session, mut session) = client
-                .accept_relay_multiplex_target(&transport_sdk::RelayTunnelAcceptRequest {
-                    cluster_id,
-                    target: transport_sdk::PeerIdentity::Node(target_node_id),
-                    session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
-                    wait_timeout_ms: Some(15_000),
-                }, transport_sdk::MultiplexConfig::default())
+                .accept_relay_multiplex_target(
+                    &transport_sdk::RelayTunnelAcceptRequest {
+                        cluster_id,
+                        target: transport_sdk::PeerIdentity::Node(target_node_id),
+                        session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+                        wait_timeout_ms: Some(15_000),
+                    },
+                    transport_sdk::MultiplexConfig::default(),
+                )
                 .await
                 .expect("relay tunnel accept should succeed");
             transport_sdk::perform_transport_server_handshake(

@@ -31,9 +31,8 @@ use transport_sdk::{
     BufferedTransportRequest, ClientBootstrapClaimRedeemRequest,
     ClientBootstrapClaimRedeemResponse, MultiplexConfig, MultiplexMode, PresenceRegistry,
     RelayTicket, RelayTicketRequest, RelayTunnelBroker, RelayTunnelControlMessage,
-    RelayTunnelFrame,
-    RelayTunnelSessionKind, TransportHeader, TransportSessionControlMessage,
-    TransportSessionRole, TransportStreamKind, TRANSPORT_PROTOCOL_VERSION,
+    RelayTunnelFrame, RelayTunnelSessionKind, TRANSPORT_PROTOCOL_VERSION, TransportHeader,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind,
     issue_relay_ticket as issue_runtime_relay_ticket, perform_transport_client_handshake,
     read_buffered_transport_response, write_buffered_transport_request,
 };
@@ -273,7 +272,9 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             .map_err(|err| anyhow::anyhow!("failed opening bootstrap-claim relay stream: {err}"))?;
         write_buffered_transport_request(&mut stream, &transport_request)
             .await
-            .map_err(|err| anyhow::anyhow!("failed writing bootstrap-claim relay request: {err}"))?;
+            .map_err(|err| {
+                anyhow::anyhow!("failed writing bootstrap-claim relay request: {err}")
+            })?;
         read_buffered_transport_response(&mut stream)
             .await
             .map_err(|err| anyhow::anyhow!("failed reading bootstrap-claim relay response: {err}"))

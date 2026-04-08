@@ -284,9 +284,7 @@ where
         .context("failed closing buffered transport request stream")
 }
 
-pub async fn read_buffered_transport_request<R>(
-    reader: &mut R,
-) -> Result<BufferedTransportRequest>
+pub async fn read_buffered_transport_request<R>(reader: &mut R) -> Result<BufferedTransportRequest>
 where
     R: AsyncRead + AsyncWrite + Unpin,
 {
@@ -358,13 +356,15 @@ where
     Ok(response)
 }
 
-pub async fn write_transport_request_head<W>(writer: &mut W, head: &TransportRequestHead) -> Result<()>
+pub async fn write_transport_request_head<W>(
+    writer: &mut W,
+    head: &TransportRequestHead,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     head.validate()?;
-    write_json_frame(writer, &head.clone().into_control_message())
-        .await
+    write_json_frame(writer, &head.clone().into_control_message()).await
 }
 
 pub async fn read_transport_request_head<R>(reader: &mut R) -> Result<TransportRequestHead>
@@ -385,8 +385,7 @@ where
     W: AsyncWrite + Unpin,
 {
     head.validate()?;
-    write_json_frame(writer, &head.clone().into_control_message())
-        .await
+    write_json_frame(writer, &head.clone().into_control_message()).await
 }
 
 pub async fn read_transport_response_head<R>(reader: &mut R) -> Result<TransportResponseHead>
@@ -404,7 +403,8 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize + ?Sized,
 {
-    let payload = serde_json::to_vec(message).context("failed serializing framed transport JSON")?;
+    let payload =
+        serde_json::to_vec(message).context("failed serializing framed transport JSON")?;
     if payload.len() > MAX_CONTROL_MESSAGE_BYTES {
         bail!(
             "framed transport JSON message exceeded {} bytes",

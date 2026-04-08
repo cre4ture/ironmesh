@@ -5853,15 +5853,19 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
         )
         .await;
 
-    wait_for_condition("relay reconnect stub health", Duration::from_secs(5), || {
-        let relay_base_url = relay_base_url.clone();
-        async move {
-            match reqwest::get(format!("{relay_base_url}/health")).await {
-                Ok(response) => response.status() == StatusCode::OK,
-                Err(_) => false,
+    wait_for_condition(
+        "relay reconnect stub health",
+        Duration::from_secs(5),
+        || {
+            let relay_base_url = relay_base_url.clone();
+            async move {
+                match reqwest::get(format!("{relay_base_url}/health")).await {
+                    Ok(response) => response.status() == StatusCode::OK,
+                    Err(_) => false,
+                }
             }
-        }
-    })
+        },
+    )
     .await;
 
     for _ in 0..2 {
@@ -6071,10 +6075,7 @@ async fn serve_cleanup_relay_tunnel_socket(
     impl Stream for RelayCleanupSocketAdapter {
         type Item = Result<RelayCleanupWsMessage, axum::Error>;
 
-        fn poll_next(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             let this = self.get_mut();
             match Pin::new(&mut this.socket).poll_next(cx) {
                 Poll::Ready(Some(Ok(axum::extract::ws::Message::Binary(bytes)))) => {
@@ -6102,10 +6103,7 @@ async fn serve_cleanup_relay_tunnel_socket(
     impl Sink<RelayCleanupWsMessage> for RelayCleanupSocketAdapter {
         type Error = axum::Error;
 
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Pin::new(&mut self.get_mut().socket).poll_ready(cx)
         }
 
@@ -6117,9 +6115,7 @@ async fn serve_cleanup_relay_tunnel_socket(
                 RelayCleanupWsMessage::Binary(bytes) => {
                     axum::extract::ws::Message::Binary(bytes.into())
                 }
-                RelayCleanupWsMessage::Text(text) => {
-                    axum::extract::ws::Message::Text(text.into())
-                }
+                RelayCleanupWsMessage::Text(text) => axum::extract::ws::Message::Text(text.into()),
                 RelayCleanupWsMessage::Ping(payload) => {
                     axum::extract::ws::Message::Ping(payload.into())
                 }
@@ -6131,17 +6127,11 @@ async fn serve_cleanup_relay_tunnel_socket(
             Pin::new(&mut self.get_mut().socket).start_send(message)
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Pin::new(&mut self.get_mut().socket).poll_flush(cx)
         }
 
-        fn poll_close(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Pin::new(&mut self.get_mut().socket).poll_close(cx)
         }
     }
@@ -6258,20 +6248,23 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
         None,
     )
     .expect("endpoint B rendezvous client should build");
-    super::replace_outbound_clients(&state, super::OutboundClients {
-        internal_http: reqwest::Client::new(),
-        rendezvous_control: Some(shared_client),
-        rendezvous_controls: vec![
-            super::RendezvousEndpointClient {
-                url: rendezvous_url_a.clone(),
-                control: client_a,
-            },
-            super::RendezvousEndpointClient {
-                url: rendezvous_url_b.clone(),
-                control: client_b,
-            },
-        ],
-    })
+    super::replace_outbound_clients(
+        &state,
+        super::OutboundClients {
+            internal_http: reqwest::Client::new(),
+            rendezvous_control: Some(shared_client),
+            rendezvous_controls: vec![
+                super::RendezvousEndpointClient {
+                    url: rendezvous_url_a.clone(),
+                    control: client_a,
+                },
+                super::RendezvousEndpointClient {
+                    url: rendezvous_url_b.clone(),
+                    control: client_b,
+                },
+            ],
+        },
+    )
     .await;
 
     let registrations_a = Arc::new(Mutex::new(0u64));

@@ -3465,8 +3465,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_only_bootstrap_reuses_transport_session_across_multiple_requests()
-    -> Result<()> {
+    async fn relay_only_bootstrap_reuses_transport_session_across_multiple_requests() -> Result<()>
+    {
         let rendezvous_bind = "127.0.0.1:19166";
         let bind = "127.0.0.1:19167";
         let cluster_id = "11111111-1111-7111-8111-111111111116";

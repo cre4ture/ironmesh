@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use common::{NodeId, StorageObjectMeta};
-use futures_util::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
+use futures_util::io::{
+    AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
+};
 use reqwest::Client as HttpClient;
 use reqwest::Method;
 use reqwest::RequestBuilder;
@@ -606,13 +608,13 @@ impl IronMeshClient {
                         body.as_deref().unwrap_or_default(),
                     )
                     .await
-                    .with_context(|| {
-                        format!("failed to execute multiplexed {} {}", method, url)
-                    });
+                    .with_context(|| format!("failed to execute multiplexed {} {}", method, url));
                 }
 
-                let mut request =
-                    self.apply_headers_to_request(http.request(method.clone(), url.clone()), &auth_headers);
+                let mut request = self.apply_headers_to_request(
+                    http.request(method.clone(), url.clone()),
+                    &auth_headers,
+                );
                 if let Some(body) = body {
                     request = request.body(body);
                 }
@@ -1092,16 +1094,19 @@ impl IronMeshClient {
                     )
                     .await
                     .with_context(|| {
-                        format!(
-                            "failed to upload streamed chunk {index} for session={upload_id}"
-                        )
+                        format!("failed to upload streamed chunk {index} for session={upload_id}")
                     })?
                 } else {
-                    self.execute_buffered_request(Method::PUT, url.clone(), Vec::new(), Some(payload))
-                        .await
-                        .with_context(|| {
-                            format!("failed to upload chunk {index} for session={upload_id}")
-                        })?
+                    self.execute_buffered_request(
+                        Method::PUT,
+                        url.clone(),
+                        Vec::new(),
+                        Some(payload),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to upload chunk {index} for session={upload_id}")
+                    })?
                 }
             }
             ClientTransport::Relay(relay) => {
@@ -1310,8 +1315,12 @@ impl IronMeshClient {
             key,
             snapshot.unwrap_or("<none>"),
             version.unwrap_or("<none>"),
-            range.map(|(start, _)| start.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            range.map(|(_, end)| end.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            range
+                .map(|(start, _)| start.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            range
+                .map(|(_, end)| end.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
             response.status,
             header_value_for_log(&response.headers, CONTENT_LENGTH.as_str()),
             header_value_for_log(&response.headers, CONTENT_RANGE.as_str()),
@@ -1471,7 +1480,10 @@ impl IronMeshClient {
             )
             .await?;
             if response.status != StatusCode::OK {
-                bail!("server rejected object download for key={key}: {}", response.status);
+                bail!(
+                    "server rejected object download for key={key}: {}",
+                    response.status
+                );
             }
 
             let bytes_downloaded = response.bytes_written;
@@ -2419,8 +2431,12 @@ where
     let response_head = read_transport_response_head(stream)
         .await
         .context("failed reading streamed transport response head")?;
-    let status = StatusCode::from_u16(response_head.status)
-        .with_context(|| format!("invalid multiplexed transport status {}", response_head.status))?;
+    let status = StatusCode::from_u16(response_head.status).with_context(|| {
+        format!(
+            "invalid multiplexed transport status {}",
+            response_head.status
+        )
+    })?;
     let headers = header_map_from_transport_headers(&response_head.headers)?;
 
     let mut buffer = vec![0_u8; TRANSPORT_STREAM_COPY_BUFFER_SIZE_BYTES];
@@ -3267,11 +3283,10 @@ mod tests {
     use transport_sdk::{
         BufferedTransportResponse as MultiplexBufferedTransportResponse, DecodedWebSocketMessage,
         MultiplexConfig, MultiplexMode, MultiplexedSession, RelayHttpHeader, RelayTicket,
-        RelayTicketRequest, RelayTunnelControlMessage, RelayTunnelSession,
-        RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
-        TransportHeader, TransportSessionControlMessage, TransportSessionRole,
-        TransportResponseHead, TransportStreamKind,
-        TRANSPORT_PROTOCOL_VERSION, WebSocketByteStream, WebSocketMessageCodec,
+        RelayTicketRequest, RelayTunnelControlMessage, RelayTunnelSession, RelayTunnelSessionKind,
+        RendezvousClientConfig, RendezvousControlClient, TRANSPORT_PROTOCOL_VERSION,
+        TransportHeader, TransportResponseHead, TransportSessionControlMessage,
+        TransportSessionRole, TransportStreamKind, WebSocketByteStream, WebSocketMessageCodec,
         perform_transport_server_handshake, read_buffered_transport_request,
         write_buffered_transport_response, write_transport_response_head,
     };
@@ -3583,10 +3598,7 @@ mod tests {
     impl Sink<RelayTestWsMessage> for RelayTestSocketAdapter {
         type Error = axum::Error;
 
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Pin::new(&mut self.get_mut().socket).poll_ready(cx)
         }
 
@@ -3601,17 +3613,11 @@ mod tests {
             Pin::new(&mut self.get_mut().socket).start_send(message)
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Pin::new(&mut self.get_mut().socket).poll_flush(cx)
         }
 
-        fn poll_close(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Pin::new(&mut self.get_mut().socket).poll_close(cx)
         }
     }
@@ -3644,7 +3650,10 @@ mod tests {
             .expect("paired response should send");
 
         state.paired_session_count.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(ticket.session_kind, RelayTunnelSessionKind::MultiplexTransport);
+        assert_eq!(
+            ticket.session_kind,
+            RelayTunnelSessionKind::MultiplexTransport
+        );
         serve_relay_multiplex_test_socket(state, socket, ticket).await;
     }
 
@@ -3654,12 +3663,9 @@ mod tests {
         session_id: String,
     ) {
         let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
-        let mut session = MultiplexedSession::spawn(
-            transport,
-            MultiplexMode::Server,
-            MultiplexConfig::default(),
-        )
-        .expect("multiplexed relay test session should spawn");
+        let mut session =
+            MultiplexedSession::spawn(transport, MultiplexMode::Server, MultiplexConfig::default())
+                .expect("multiplexed relay test session should spawn");
 
         let hello = perform_transport_server_handshake(
             &mut session,
@@ -4039,7 +4045,8 @@ mod tests {
         state: &RelayTestState,
         identity: ClientIdentityMaterial,
     ) -> IronMeshClient {
-        IronMeshClient::from_direct_base_url(state.public_url.clone()).with_client_identity(identity)
+        IronMeshClient::from_direct_base_url(state.public_url.clone())
+            .with_client_identity(identity)
     }
 
     fn parse_range_header(range: &str, total_len: usize) -> (usize, usize) {
@@ -4465,7 +4472,10 @@ mod tests {
             .clone()
             .expect("relay request should be captured");
         assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
-        assert_eq!(captured.path_and_query, "/store/uploads/upload-retry/chunk/4");
+        assert_eq!(
+            captured.path_and_query,
+            "/store/uploads/upload-retry/chunk/4"
+        );
         assert_eq!(captured.body, b"retry-body".to_vec());
 
         server.abort();

@@ -35,7 +35,11 @@ use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
 use common::{ClusterId, DeviceId, HealthStatus, NodeId};
-use futures_util::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
+use futures_util::io::{
+    AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
+};
+use futures_util::{Sink, Stream};
+use http_body_util::BodyExt;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -58,7 +62,6 @@ use tracing::{info, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use http_body_util::BodyExt;
 use transport_sdk::{
     BootstrapClaimBroker, BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial,
     BootstrapServerTlsFiles, BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots,
@@ -70,20 +73,17 @@ use transport_sdk::{
     ConnectionCandidate, MultiplexConfig, MultiplexMode, MultiplexedSession,
     NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
     NodeJoinRequest, PeerIdentity, PeerTransportClient, PeerTransportClientConfig,
-    PresenceRegistration, RelayHttpHeader, RelayMode, RelayTicketRequest,
-    RelayTunnelAcceptRequest, RelayTunnelSession,
-    RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
+    PresenceRegistration, RelayHttpHeader, RelayMode, RelayTicketRequest, RelayTunnelAcceptRequest,
+    RelayTunnelSession, RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
     SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader,
     TransportPathKind, TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
     TransportSessionRole, TransportStreamKind, credential_fingerprint,
     perform_transport_client_handshake, perform_transport_server_handshake,
-    read_buffered_transport_response, read_transport_request_head,
-    verify_signed_request_headers, write_buffered_transport_response,
-    write_buffered_transport_request,
+    read_buffered_transport_response, read_transport_request_head, verify_signed_request_headers,
+    write_buffered_transport_request, write_buffered_transport_response,
     write_transport_response_head,
 };
 use uuid::Uuid;
-use futures_util::{Sink, Stream};
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_REVISION: &str =
@@ -1790,7 +1790,8 @@ async fn cached_peer_relay_session(
     state: &ServerState,
     node_id: NodeId,
 ) -> Option<CachedPeerRelaySession> {
-    state.peer_relay_sessions
+    state
+        .peer_relay_sessions
         .sessions
         .lock()
         .await
@@ -1799,7 +1800,12 @@ async fn cached_peer_relay_session(
 }
 
 async fn invalidate_peer_relay_session(state: &ServerState, node_id: NodeId) {
-    let removed = state.peer_relay_sessions.sessions.lock().await.remove(&node_id);
+    let removed = state
+        .peer_relay_sessions
+        .sessions
+        .lock()
+        .await
+        .remove(&node_id);
     if let Some(removed) = removed {
         tracing::debug!(
             peer_node_id = %node_id,
@@ -4737,7 +4743,12 @@ async fn open_relay_peer_session(
     let (relay_session, session) = rendezvous
         .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
         .await
-        .with_context(|| format!("failed opening multiplex relay session for node {}", node.node_id))?;
+        .with_context(|| {
+            format!(
+                "failed opening multiplex relay session for node {}",
+                node.node_id
+            )
+        })?;
     perform_transport_client_handshake(
         &session,
         TransportSessionControlMessage::Hello {
@@ -4821,16 +4832,12 @@ async fn execute_relay_peer_request(
         );
 
         let result = async {
-            let mut stream = cached
-                .session
-                .open_stream()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed opening multiplex relay peer stream for node {}",
-                        node.node_id
-                    )
-                })?;
+            let mut stream = cached.session.open_stream().await.with_context(|| {
+                format!(
+                    "failed opening multiplex relay peer stream for node {}",
+                    node.node_id
+                )
+            })?;
             write_buffered_transport_request(&mut stream, &request)
                 .await
                 .with_context(|| {
@@ -4968,10 +4975,7 @@ impl Sink<DirectTransportWsMessage> for DirectTransportSocketAdapter {
         Pin::new(&mut self.get_mut().socket).poll_ready(cx)
     }
 
-    fn start_send(
-        self: Pin<&mut Self>,
-        item: DirectTransportWsMessage,
-    ) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: DirectTransportWsMessage) -> Result<(), Self::Error> {
         let message = match item {
             DirectTransportWsMessage::Binary(bytes) => AxumWsMessage::Binary(bytes.into()),
             DirectTransportWsMessage::Text(text) => AxumWsMessage::Text(text.into()),
@@ -5064,16 +5068,17 @@ async fn client_transport_ws(
     websocket: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
-    let Some(device_id) = request_device_id(&headers).and_then(|value| DeviceId::parse_str(&value).ok()) else {
+    let Some(device_id) =
+        request_device_id(&headers).and_then(|value| DeviceId::parse_str(&value).ok())
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let peer = PeerIdentity::Device(device_id);
 
     websocket
         .on_upgrade(move |socket| async move {
-            let transport = transport_sdk::WebSocketByteStream::new(DirectTransportSocketAdapter {
-                socket,
-            });
+            let transport =
+                transport_sdk::WebSocketByteStream::new(DirectTransportSocketAdapter { socket });
             let session = match MultiplexedSession::spawn(
                 transport,
                 MultiplexMode::Server,
@@ -5176,30 +5181,26 @@ where
     let request = read_buffered_transport_request_from_head(&mut stream, request_head)
         .await
         .context("failed decoding multiplexed relay request body")?;
-    let response = match transport_service::execute_buffered_transport_request(
-        &state,
-        &scope,
-        &request,
-    )
-    .await
-    {
-        Ok(response) => {
-            if response.body.len() >= LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES {
-                info!(
-                    request_id = %response.request_id,
-                    path = %request.path,
-                    relay_response_body_bytes = response.body.len(),
-                    "large multiplexed relay response"
-                );
+    let response =
+        match transport_service::execute_buffered_transport_request(&state, &scope, &request).await
+        {
+            Ok(response) => {
+                if response.body.len() >= LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES {
+                    info!(
+                        request_id = %response.request_id,
+                        path = %request.path,
+                        relay_response_body_bytes = response.body.len(),
+                        "large multiplexed relay response"
+                    );
+                }
+                response
             }
-            response
-        }
-        Err(err) => buffered_transport_error_response(
-            request.request_id.clone(),
-            502,
-            format!("transport execution failed: {err:#}"),
-        ),
-    };
+            Err(err) => buffered_transport_error_response(
+                request.request_id.clone(),
+                502,
+                format!("transport execution failed: {err:#}"),
+            ),
+        };
 
     write_buffered_transport_response(&mut stream, &response)
         .await
@@ -5284,7 +5285,8 @@ where
             .context("failed writing object read path error");
     }
 
-    let headers = match transport_service::header_map_from_transport_headers(&request_head.headers) {
+    let headers = match transport_service::header_map_from_transport_headers(&request_head.headers)
+    {
         Ok(headers) => headers,
         Err(err) => {
             let response = buffered_transport_error_response(
@@ -5359,9 +5361,7 @@ where
         let response = buffered_transport_error_response(
             request_head.request_id,
             400,
-            format!(
-                "object write streams only support /store/uploads/*, received {path_only}"
-            ),
+            format!("object write streams only support /store/uploads/*, received {path_only}"),
         );
         return write_buffered_transport_response(stream, &response)
             .await
@@ -5371,9 +5371,7 @@ where
         let response = buffered_transport_error_response(
             request_head.request_id,
             400,
-            format!(
-                "object write streams only support upload chunk paths, received {path_only}"
-            ),
+            format!("object write streams only support upload chunk paths, received {path_only}"),
         );
         return write_buffered_transport_response(stream, &response)
             .await
@@ -5392,7 +5390,8 @@ where
                 .context("failed writing object write chunk-index error");
         }
     };
-    let headers = match transport_service::header_map_from_transport_headers(&request_head.headers) {
+    let headers = match transport_service::header_map_from_transport_headers(&request_head.headers)
+    {
         Ok(headers) => headers,
         Err(err) => {
             let response = buffered_transport_error_response(
@@ -5514,15 +5513,12 @@ async fn serve_relay_multiplex_session(
     };
 
     loop {
-        let next = session
-            .accept_stream()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed accepting multiplex relay stream for session {}",
-                    relay_session.session_id
-                )
-            })?;
+        let next = session.accept_stream().await.with_context(|| {
+            format!(
+                "failed accepting multiplex relay stream for session {}",
+                relay_session.session_id
+            )
+        })?;
         let Some(stream) = next else {
             return Ok(());
         };
@@ -5532,8 +5528,7 @@ async fn serve_relay_multiplex_session(
         let endpoint_url = endpoint_url.clone();
         let execution_scope = execution_scope.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_multiplexed_relay_stream(state, execution_scope, stream).await
+            if let Err(err) = handle_multiplexed_relay_stream(state, execution_scope, stream).await
             {
                 warn!(
                     error = %err,

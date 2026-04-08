@@ -390,7 +390,10 @@ impl AsyncWrite for RelayTunnelEndpointByteStream {
         }
 
         if self.pending_send.is_none() {
-            self.start_pending_send(RelayTunnelFrame::CloseWrite, PendingRelayTunnelSendKind::Close);
+            self.start_pending_send(
+                RelayTunnelFrame::CloseWrite,
+                PendingRelayTunnelSendKind::Close,
+            );
         }
 
         match self.poll_pending_send(cx) {
@@ -667,8 +670,7 @@ mod tests {
     use crate::multiplex_transport::{
         BufferedTransportRequest, BufferedTransportResponse, perform_transport_client_handshake,
         perform_transport_server_handshake, read_buffered_transport_request,
-        write_buffered_transport_request,
-        write_buffered_transport_response,
+        write_buffered_transport_request, write_buffered_transport_response,
     };
     use crate::transport_protocol::{
         TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
@@ -800,9 +802,10 @@ mod tests {
             write_buffered_transport_request(&mut stream, &request)
                 .await
                 .expect("source request should write");
-            let response = crate::multiplex_transport::read_buffered_transport_response(&mut stream)
-                .await
-                .expect("source response should read");
+            let response =
+                crate::multiplex_transport::read_buffered_transport_response(&mut stream)
+                    .await
+                    .expect("source response should read");
             assert_eq!(response.status, 200);
             assert_eq!(response.body, br#"{"ok":true}"#);
 
@@ -833,7 +836,10 @@ mod tests {
         .expect("target handshake should succeed");
         assert!(matches!(
             hello,
-            TransportSessionControlMessage::Hello { role: TransportSessionRole::Node, .. }
+            TransportSessionControlMessage::Hello {
+                role: TransportSessionRole::Node,
+                ..
+            }
         ));
 
         let mut stream = session

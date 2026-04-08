@@ -1,33 +1,31 @@
 use anyhow::{Context, Result};
+use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, Uri};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::Router;
 use percent_encoding::percent_decode_str;
 use tower::ServiceExt;
 
 use crate::{
     BufferedTransportRequest, BufferedTransportResponse, InternalCaller, ServerState,
-    StoreIndexQuery, TransportHeader, cluster_status, complete_upload_session_route,
-    commit_version, confirm_version, copy_object_path, delete_object, delete_object_by_query,
-    delete_upload_session, drop_replication_subject, enroll_client_device,
+    StoreIndexQuery, TransportHeader, cluster_status, commit_version,
+    complete_upload_session_route, confirm_version, copy_object_path, delete_object,
+    delete_object_by_query, delete_upload_session, drop_replication_subject, enroll_client_device,
     execute_replication_cleanup, export_metadata_bundle, export_provisional_versions,
     export_replication_bundle, get_media_thumbnail, get_media_thumbnail_response, get_object,
     get_object_response, get_replication_chunk, get_upload_session, head_object, health,
-    latency_diagnostic, list_nodes, list_snapshots, list_store_index,
-    list_tombstone_archives,
-    list_store_index_response, list_versions, list_versions_response, local_available_subjects,
-    local_metadata_subjects, placement_for_key, push_replication_chunk,
-    push_replication_manifest, put_object, redeem_client_bootstrap_claim, reconcile_from_node,
-    rename_object_path, replication, replication_plan, require_client_auth,
-    require_client_or_admin_auth, require_internal_caller, restore_snapshot_path,
-    run_cleanup, run_tombstone_archive_purge, run_tombstone_archive_restore,
-    run_tombstone_compaction, start_upload_session, storage_stats_current,
-    storage_stats_history, transport_headers_from_response, trigger_replication_audit,
-    upload_session_chunk, wait_for_store_index_change,
+    latency_diagnostic, list_nodes, list_snapshots, list_store_index, list_store_index_response,
+    list_tombstone_archives, list_versions, list_versions_response, local_available_subjects,
+    local_metadata_subjects, placement_for_key, push_replication_chunk, push_replication_manifest,
+    put_object, reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
+    replication, replication_plan, require_client_auth, require_client_or_admin_auth,
+    require_internal_caller, restore_snapshot_path, run_cleanup, run_tombstone_archive_purge,
+    run_tombstone_archive_restore, run_tombstone_compaction, start_upload_session,
+    storage_stats_current, storage_stats_history, transport_headers_from_response,
+    trigger_replication_audit, upload_session_chunk, wait_for_store_index_change,
 };
 
 #[derive(Clone)]
@@ -54,7 +52,10 @@ async fn try_execute_direct_transport_request(
 ) -> Result<Option<BufferedTransportResponse>> {
     let method = request.method.trim();
     let raw_path = request.path.trim();
-    let path_only = raw_path.split_once('?').map(|(path, _)| path).unwrap_or(raw_path);
+    let path_only = raw_path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(raw_path);
     let headers = header_map_from_transport_headers(&request.headers)?;
 
     let response = match (method, path_only) {
@@ -82,9 +83,8 @@ async fn try_execute_direct_transport_request(
             Some(get_media_thumbnail_response(state, query).await)
         }
         ("GET", path) if path.starts_with("/store/") => {
-            let query = parse_query::<crate::ObjectGetQuery>(raw_path).map_err(|err| {
-                anyhow::anyhow!("failed parsing object query {raw_path}: {err}")
-            })?;
+            let query = parse_query::<crate::ObjectGetQuery>(raw_path)
+                .map_err(|err| anyhow::anyhow!("failed parsing object query {raw_path}: {err}"))?;
             let key = decode_route_tail(path, "/store/")?;
             Some(get_object_response(state, &key, query, &headers, false).await)
         }
@@ -115,14 +115,20 @@ async fn execute_fallback_local_router_request(
     scope: &TransportExecutionScope,
     request: &BufferedTransportRequest,
 ) -> Result<BufferedTransportResponse> {
-    let method = request.method.parse::<axum::http::Method>().with_context(|| {
-        format!(
-            "invalid multiplexed transport fallback HTTP method {}",
-            request.method
-        )
-    })?;
+    let method = request
+        .method
+        .parse::<axum::http::Method>()
+        .with_context(|| {
+            format!(
+                "invalid multiplexed transport fallback HTTP method {}",
+                request.method
+            )
+        })?;
     let uri: Uri = request.path.parse().with_context(|| {
-        format!("invalid multiplexed transport fallback URI {}", request.path)
+        format!(
+            "invalid multiplexed transport fallback URI {}",
+            request.path
+        )
     })?;
     let mut builder = Request::builder().method(method).uri(uri);
     for header in &request.headers {
@@ -164,9 +170,9 @@ where
 }
 
 pub(super) fn decode_route_tail(path: &str, prefix: &str) -> Result<String> {
-    let tail = path
-        .strip_prefix(prefix)
-        .ok_or_else(|| anyhow::anyhow!("transport request path {path} did not start with {prefix}"))?;
+    let tail = path.strip_prefix(prefix).ok_or_else(|| {
+        anyhow::anyhow!("transport request path {path} did not start with {prefix}")
+    })?;
     percent_decode_str(tail)
         .decode_utf8()
         .map(|value| value.into_owned())
@@ -176,12 +182,12 @@ pub(super) fn decode_route_tail(path: &str, prefix: &str) -> Result<String> {
 pub(super) fn header_map_from_transport_headers(headers: &[TransportHeader]) -> Result<HeaderMap> {
     let mut header_map = HeaderMap::new();
     for header in headers {
-        let name = header.name.parse::<axum::http::HeaderName>().with_context(|| {
-            format!("invalid transport header name {}", header.name)
-        })?;
-        let value = HeaderValue::from_str(&header.value).with_context(|| {
-            format!("invalid transport header value for {}", header.name)
-        })?;
+        let name = header
+            .name
+            .parse::<axum::http::HeaderName>()
+            .with_context(|| format!("invalid transport header name {}", header.name))?;
+        let value = HeaderValue::from_str(&header.value)
+            .with_context(|| format!("invalid transport header value for {}", header.name))?;
         header_map.append(name, value);
     }
     Ok(header_map)
@@ -354,8 +360,14 @@ fn build_internal_transport_router(state: ServerState) -> Router {
             post(confirm_version),
         )
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
-        .route("/cluster/availability/subjects/local", get(local_available_subjects))
-        .route("/cluster/metadata/subjects/local", get(local_metadata_subjects))
+        .route(
+            "/cluster/availability/subjects/local",
+            get(local_available_subjects),
+        )
+        .route(
+            "/cluster/metadata/subjects/local",
+            get(local_metadata_subjects),
+        )
         .route(
             "/cluster/replication/export",
             get(export_replication_bundle),

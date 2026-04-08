@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use transport_sdk::{
     ClientIdentityMaterial, MultiplexConfig, MultiplexMode, MultiplexedSession, PeerIdentity,
     RelayTicketRequest, RelayTunnelSession, RelayTunnelSessionKind, RendezvousControlClient,
-    TransportSessionControlMessage, TransportSessionRole, TRANSPORT_PROTOCOL_VERSION,
+    TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
     WebSocketByteStream, build_signed_request_headers, connect_websocket,
     perform_transport_client_handshake, websocket_url,
 };
@@ -65,10 +65,7 @@ impl TransportSessionPool {
         }
     }
 
-    pub(crate) fn new_relay(
-        rendezvous: RendezvousControlClient,
-        target_node_id: NodeId,
-    ) -> Self {
+    pub(crate) fn new_relay(rendezvous: RendezvousControlClient, target_node_id: NodeId) -> Self {
         Self {
             target: SessionPoolTarget::Relay {
                 rendezvous,
@@ -120,12 +117,9 @@ impl TransportSessionPool {
             .await
             .with_context(|| format!("failed opening direct transport websocket {}", ws_url))?;
         let transport = WebSocketByteStream::new(websocket);
-        let multiplexed = MultiplexedSession::spawn(
-            transport,
-            MultiplexMode::Client,
-            MultiplexConfig::default(),
-        )
-        .context("failed creating direct multiplexed transport session")?;
+        let multiplexed =
+            MultiplexedSession::spawn(transport, MultiplexMode::Client, MultiplexConfig::default())
+                .context("failed creating direct multiplexed transport session")?;
         perform_transport_client_handshake(
             &multiplexed,
             TransportSessionControlMessage::Hello {
@@ -227,7 +221,8 @@ fn relay_session_role_for_source(source: &PeerIdentity) -> TransportSessionRole 
 }
 
 fn websocket_auth_headers(identity: &ClientIdentityMaterial) -> Result<Vec<(String, String)>> {
-    let signed_headers = build_signed_request_headers(identity, "GET", "/transport/ws", unix_ts(), None)?;
+    let signed_headers =
+        build_signed_request_headers(identity, "GET", "/transport/ws", unix_ts(), None)?;
     Ok(vec![
         (
             transport_sdk::HEADER_CLUSTER_ID.to_string(),
