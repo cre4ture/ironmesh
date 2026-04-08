@@ -3472,6 +3472,7 @@ mod tests {
         captured_request: Arc<Mutex<Option<RelayTestCapturedRequest>>>,
         issued_ticket_count: Arc<AtomicUsize>,
         paired_session_count: Arc<AtomicUsize>,
+        object_write_failures_remaining: Arc<AtomicUsize>,
         response_status: u16,
         response_headers: Vec<RelayHttpHeader>,
         response_body: Vec<u8>,
@@ -3701,6 +3702,17 @@ mod tests {
                 body: request.body.clone(),
             });
 
+            let fail_object_write = request.kind == TransportStreamKind::ObjectWrite
+                && state
+                    .object_write_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok();
+            if fail_object_write {
+                return;
+            }
+
             write_buffered_transport_response(
                 &mut stream,
                 &MultiplexBufferedTransportResponse {
@@ -3735,6 +3747,21 @@ mod tests {
         response_headers: Vec<RelayHttpHeader>,
         response_body: Vec<u8>,
     ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
+        spawn_relay_test_server_with_object_write_failures(
+            response_status,
+            response_headers,
+            response_body,
+            0,
+        )
+        .await
+    }
+
+    async fn spawn_relay_test_server_with_object_write_failures(
+        response_status: u16,
+        response_headers: Vec<RelayHttpHeader>,
+        response_body: Vec<u8>,
+        object_write_failures_remaining: usize,
+    ) -> (RelayTestState, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -3744,6 +3771,9 @@ mod tests {
             captured_request: Arc::new(Mutex::new(None)),
             issued_ticket_count: Arc::new(AtomicUsize::new(0)),
             paired_session_count: Arc::new(AtomicUsize::new(0)),
+            object_write_failures_remaining: Arc::new(AtomicUsize::new(
+                object_write_failures_remaining,
+            )),
             response_status,
             response_headers,
             response_body,
@@ -3774,6 +3804,7 @@ mod tests {
             captured_request: Arc::new(Mutex::new(None)),
             issued_ticket_count: Arc::new(AtomicUsize::new(0)),
             paired_session_count: Arc::new(AtomicUsize::new(0)),
+            object_write_failures_remaining: Arc::new(AtomicUsize::new(0)),
             response_status,
             response_headers,
             response_body,
@@ -4384,6 +4415,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_transport_retries_streamed_upload_chunk_after_partial_session_failure() {
+        let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
+            stored: true,
+            received_index: 4,
+        })
+        .expect("upload chunk response should serialize");
+        let (relay_state, server) = spawn_relay_test_server_with_object_write_failures(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: response_body.len().to_string(),
+                },
+            ],
+            response_body,
+            1,
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("relay-upload-retry-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let target_node_id = NodeId::new_v4();
+        let client = relay_test_client(&relay_state, identity, target_node_id);
+
+        let response = client
+            .upload_session_chunk_bytes("upload-retry", 4, b"retry-body".to_vec())
+            .await
+            .expect("relay upload chunk retry should succeed");
+
+        assert!(response.stored);
+        assert_eq!(response.received_index, 4);
+        assert_eq!(relay_state.issued_ticket_count.load(Ordering::SeqCst), 2);
+        assert_eq!(relay_state.paired_session_count.load(Ordering::SeqCst), 2);
+
+        let captured = relay_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("relay request should be captured");
+        assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
+        assert_eq!(captured.path_and_query, "/store/uploads/upload-retry/chunk/4");
+        assert_eq!(captured.body, b"retry-body".to_vec());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn direct_transport_executes_and_reuses_multiplexed_session() {
         let (direct_state, server) = spawn_direct_transport_test_server(
             200,
@@ -4562,6 +4651,55 @@ mod tests {
         let snapshot = client.transport_session_pool_snapshot();
         assert_eq!(snapshot.connect_count, 1);
         assert!(snapshot.reuse_count >= 2);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn direct_transport_cancels_streamed_download_promptly() {
+        let payload = Arc::new(vec![0x3C; 1024 * 1024]);
+        let payload_len = payload.len();
+        let (base_url, server) =
+            spawn_direct_mixed_workload_test_server(Arc::clone(&payload)).await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-cancel-download-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = IronMeshClient::from_direct_base_url(base_url).with_client_identity(identity);
+
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_for_task = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            cancel_for_task.store(true, Ordering::SeqCst);
+        });
+
+        let mut output = Vec::new();
+        let result = client
+            .download_range_to_writer_with_progress(
+                DownloadRangeRequest {
+                    key: "large.bin",
+                    snapshot: None,
+                    version: None,
+                    range: RequestedRange {
+                        offset: 0,
+                        length: payload_len as u64,
+                    },
+                },
+                &mut output,
+                &mut |_| {},
+                &|| cancel.load(Ordering::SeqCst),
+            )
+            .await;
+
+        let error = result.expect_err("streamed download should cancel");
+        assert!(error.to_string().contains("download canceled"));
+        assert!(output.len() < payload_len);
 
         server.abort();
         let _ = server.await;

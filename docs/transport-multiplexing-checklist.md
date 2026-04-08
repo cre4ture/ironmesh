@@ -140,9 +140,9 @@ Primary files:
 
 ### Milestone 7: Bulk transfer stream migration
 
-- [ ] Move uploads and downloads onto dedicated multiplexed streams.
-- [ ] Preserve mixed-workload responsiveness under concurrent large and small transfers.
-- [ ] Add tests for cancellation and partial failures.
+- [x] Move uploads and downloads onto dedicated multiplexed streams.
+- [x] Preserve mixed-workload responsiveness under concurrent large and small transfers.
+- [x] Add tests for cancellation and partial failures.
 
 Current slice landed:
 
@@ -150,12 +150,12 @@ Current slice landed:
 - [x] Route multiplexed object reads through dedicated `object_read` substreams and rewire ranged download paths to stream bytes directly into their destination writers.
 - [x] Move upload-session chunk writes onto dedicated `object_write` substreams for both direct and relay transport sessions.
 - [x] Add a direct mixed-workload transport test proving small RPCs stay responsive during a concurrent streamed download on the same warm session.
-- [ ] Add explicit cancellation and partial-failure coverage for dedicated bulk-transfer substreams.
+- [x] Add explicit cancellation and partial-failure coverage for dedicated bulk-transfer substreams.
 
 Primary files:
 
-- [ ] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
-- [ ] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
+- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
 
 ### Milestone 8: Diagnostics and UI wiring
 
@@ -298,3 +298,7 @@ Primary files:
   - `cargo test -p server-node-sdk execute_replication_cleanup_routes_remote_drop_through_relay`
   - `cargo test -p server-node-sdk execute_peer_request_reuses_warm_relay_session`
   - `cargo test -p server-node-sdk execute_peer_request_reconnects_after_relay_session_closes`
+- [x] 2026-04-08: Close the bulk-transfer hardening gap by adding regression coverage for streamed-download cancellation and retrying streamed upload chunks after a mid-session relay failure.
+  Verification:
+  - `cargo test -p client-sdk direct_transport_cancels_streamed_download_promptly`
+  - `cargo test -p client-sdk relay_transport_retries_streamed_upload_chunk_after_partial_session_failure`
