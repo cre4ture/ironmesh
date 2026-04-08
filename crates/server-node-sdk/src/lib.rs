@@ -5064,6 +5064,9 @@ where
     if request_head.kind == TransportStreamKind::ObjectRead {
         return handle_streamed_object_read_request(&state, request_head, &mut stream).await;
     }
+    if request_head.kind == TransportStreamKind::ObjectWrite {
+        return handle_streamed_object_write_request(&state, request_head, &mut stream).await;
+    }
     let request = read_buffered_transport_request_from_head(&mut stream, request_head)
         .await
         .context("failed decoding multiplexed relay request body")?;
@@ -5217,6 +5220,94 @@ where
     };
 
     let response = get_object_response(state, &key, query, &headers, false).await;
+    write_transport_response_from_axum(stream, request_head.request_id, response).await
+}
+
+async fn handle_streamed_object_write_request<S>(
+    state: &ServerState,
+    request_head: TransportRequestHead,
+    stream: &mut S,
+) -> Result<()>
+where
+    S: futures_util::io::AsyncRead + futures_util::io::AsyncWrite + Unpin,
+{
+    if request_head.method != "PUT" {
+        let response = buffered_transport_error_response(
+            request_head.request_id,
+            405,
+            format!(
+                "object write streams only support PUT, received {}",
+                request_head.method
+            ),
+        );
+        return write_buffered_transport_response(stream, &response)
+            .await
+            .context("failed writing object write method error");
+    }
+
+    let raw_path = request_head.path.trim();
+    let path_only = raw_path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(raw_path);
+    let Some(path_tail) = path_only.strip_prefix("/store/uploads/") else {
+        let response = buffered_transport_error_response(
+            request_head.request_id,
+            400,
+            format!(
+                "object write streams only support /store/uploads/*, received {path_only}"
+            ),
+        );
+        return write_buffered_transport_response(stream, &response)
+            .await
+            .context("failed writing object write path error");
+    };
+    let Some((upload_id, index_raw)) = path_tail.split_once("/chunk/") else {
+        let response = buffered_transport_error_response(
+            request_head.request_id,
+            400,
+            format!(
+                "object write streams only support upload chunk paths, received {path_only}"
+            ),
+        );
+        return write_buffered_transport_response(stream, &response)
+            .await
+            .context("failed writing object write chunk-path error");
+    };
+    let index = match index_raw.parse::<usize>() {
+        Ok(index) => index,
+        Err(err) => {
+            let response = buffered_transport_error_response(
+                request_head.request_id,
+                400,
+                format!("invalid upload chunk index {index_raw}: {err}"),
+            );
+            return write_buffered_transport_response(stream, &response)
+                .await
+                .context("failed writing object write chunk-index error");
+        }
+    };
+    let headers = match transport_service::header_map_from_transport_headers(&request_head.headers) {
+        Ok(headers) => headers,
+        Err(err) => {
+            let response = buffered_transport_error_response(
+                request_head.request_id,
+                400,
+                format!("invalid object write headers: {err:#}"),
+            );
+            return write_buffered_transport_response(stream, &response)
+                .await
+                .context("failed writing object write header error");
+        }
+    };
+    let mut body = Vec::new();
+    stream
+        .read_to_end(&mut body)
+        .await
+        .context("failed reading object write request body")?;
+
+    let response =
+        upload_session_chunk_response(state, &headers, upload_id, index, Bytes::from(body)).await;
     write_transport_response_from_axum(stream, request_head.request_id, response).await
 }
 
@@ -7407,14 +7498,24 @@ async fn upload_session_chunk(
     Path((upload_id, index)): Path<(String, usize)>,
     payload: Bytes,
 ) -> impl IntoResponse {
+    upload_session_chunk_response(&state, &headers, &upload_id, index, payload).await
+}
+
+async fn upload_session_chunk_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    upload_id: &str,
+    index: usize,
+    payload: Bytes,
+) -> Response {
     let request_started_at = Instant::now();
-    let requester_device_id = request_device_id(&headers);
+    let requester_device_id = request_device_id(headers);
     let (total_size_bytes, chunk_size_bytes, chunk_count) = {
         let now = unix_ts();
-        let mut sessions = write_upload_sessions(&state, "upload_sessions.chunk.preflight").await;
+        let mut sessions = write_upload_sessions(state, "upload_sessions.chunk.preflight").await;
         prune_expired_upload_sessions(&mut sessions, now);
 
-        let Some(session) = sessions.sessions.get(&upload_id) else {
+        let Some(session) = sessions.sessions.get(upload_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
         if let Some(owner_device_id) = session.owner_device_id.as_deref()
@@ -7473,10 +7574,10 @@ async fn upload_session_chunk(
     };
 
     let now = unix_ts();
-    let mut sessions = write_upload_sessions(&state, "upload_sessions.chunk.commit").await;
+    let mut sessions = write_upload_sessions(state, "upload_sessions.chunk.commit").await;
     prune_expired_upload_sessions(&mut sessions, now);
 
-    let Some(session) = sessions.sessions.get_mut(&upload_id) else {
+    let Some(session) = sessions.sessions.get_mut(upload_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if let Some(owner_device_id) = session.owner_device_id.as_deref()
@@ -7506,7 +7607,7 @@ async fn upload_session_chunk(
     };
 
     drop(sessions);
-    persist_upload_session_store_after_mutation(&state, "upload_session_chunk").await;
+    persist_upload_session_store_after_mutation(state, "upload_session_chunk").await;
     let total_ms = request_started_at.elapsed().as_millis();
     if total_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS
         || store_lock_wait_ms >= SLOW_UPLOAD_CHUNK_LOG_THRESHOLD_MS

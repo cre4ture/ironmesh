@@ -144,7 +144,9 @@ Current slice landed:
 
 - [x] Split multiplexed transport request/response heads from buffered bodies so dedicated stream handlers can share the same Yamux substream protocol.
 - [x] Route multiplexed object reads through dedicated `object_read` substreams and rewire ranged download paths to stream bytes directly into their destination writers.
-- [ ] Move upload-session chunk writes onto dedicated `object_write` substreams and add explicit mixed-workload transport tests.
+- [x] Move upload-session chunk writes onto dedicated `object_write` substreams for both direct and relay transport sessions.
+- [x] Add a direct mixed-workload transport test proving small RPCs stay responsive during a concurrent streamed download on the same warm session.
+- [ ] Add explicit cancellation and partial-failure coverage for dedicated bulk-transfer substreams.
 
 Primary files:
 
@@ -249,3 +251,9 @@ Primary files:
   - `cargo test -p client-sdk relay_transport`
   - `cargo test -p client-sdk blocking_range_download_handles_concurrent_overlapping_requests`
   - `cargo check -p cli-client -p web-ui-backend`
+- [x] 2026-04-08: Stream upload-session chunk writes over dedicated `object_write` substreams and add a mixed-workload transport test covering concurrent large downloads and small RPCs on one warm direct session.
+  Verification:
+  - `cargo test -p client-sdk direct_transport`
+  - `cargo test -p client-sdk relay_transport`
+  - `cargo test -p client-sdk blocking_range_download_handles_concurrent_overlapping_requests`
+  - `cargo check -p transport-sdk -p server-node-sdk -p client-sdk`

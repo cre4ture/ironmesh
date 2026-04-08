@@ -254,7 +254,7 @@ struct UploadSessionView {
     expires_at_unix: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct UploadSessionChunkResponse {
     #[allow(dead_code)]
     stored: bool,
@@ -1073,10 +1073,54 @@ impl IronMeshClient {
         payload: Vec<u8>,
     ) -> Result<UploadSessionChunkResponse> {
         let url = self.store_upload_session_chunk_url(upload_id, index)?;
-        let response = self
-            .execute_buffered_request(Method::PUT, url, Vec::new(), Some(payload))
-            .await
-            .with_context(|| format!("failed to upload chunk {index} for session={upload_id}"))?;
+        let response = match &self.transport {
+            ClientTransport::Direct {
+                http: _,
+                server_base_url,
+                session_pool,
+            } => {
+                if let ClientRequestAuth::SignedIdentity(identity) = &self.auth {
+                    let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+                    execute_direct_multiplex_streaming_object_write_request(
+                        server_base_url,
+                        session_pool,
+                        identity,
+                        &Method::PUT,
+                        &url,
+                        &auth_headers,
+                        &payload,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to upload streamed chunk {index} for session={upload_id}"
+                        )
+                    })?
+                } else {
+                    self.execute_buffered_request(Method::PUT, url.clone(), Vec::new(), Some(payload))
+                        .await
+                        .with_context(|| {
+                            format!("failed to upload chunk {index} for session={upload_id}")
+                        })?
+                }
+            }
+            ClientTransport::Relay(relay) => {
+                let auth_headers = self.request_auth_headers(&Method::PUT, &url)?;
+                let source = self.relay_source_identity()?;
+                execute_relay_multiplex_streaming_object_write_request(
+                    relay,
+                    source,
+                    &Method::PUT,
+                    &url,
+                    &auth_headers,
+                    &payload,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to upload streamed chunk {index} for session={upload_id}")
+                })?
+            }
+        };
         if !response.status.is_success() {
             bail!(
                 "upload session chunk rejected for session={upload_id} index={index}: {}",
@@ -2444,6 +2488,47 @@ async fn execute_multiplex_streaming_object_read_request(
     read_streaming_transport_response_to_writer(&mut stream, writer).await
 }
 
+async fn execute_multiplex_streaming_object_write_request(
+    session: &transport_sdk::MultiplexedSession,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body: &[u8],
+) -> Result<BufferedTransportResponse> {
+    let request_path = path_and_query(url);
+    let mut stream = session
+        .open_stream()
+        .await
+        .context("failed opening streamed object-write transport stream")?;
+    write_transport_request_head(
+        &mut stream,
+        &TransportRequestHead {
+            request_id: Uuid::now_v7().to_string(),
+            kind: TransportStreamKind::ObjectWrite,
+            method: method.as_str().to_string(),
+            path: request_path,
+            headers: transport_headers_from_relay_headers(headers),
+            end_of_stream: body.is_empty(),
+        },
+    )
+    .await
+    .context("failed writing streamed object-write request head")?;
+    if !body.is_empty() {
+        stream
+            .write_all(body)
+            .await
+            .context("failed writing streamed object-write request body")?;
+    }
+    stream
+        .close()
+        .await
+        .context("failed closing streamed object-write request body")?;
+    let response = read_buffered_transport_response(&mut stream)
+        .await
+        .context("failed reading streamed object-write response")?;
+    buffered_response_from_multiplex(response)
+}
+
 async fn execute_direct_http_streaming_object_read_request(
     http: &HttpClient,
     url: &Url,
@@ -2560,6 +2645,101 @@ async fn execute_relay_multiplex_streaming_object_read_request(
 
     bail!(
         "streamed relay object read retried without producing a response for target node {}",
+        relay.target_node_id
+    )
+}
+
+async fn execute_direct_multiplex_streaming_object_write_request(
+    server_base_url: &str,
+    session_pool: &TransportSessionPool,
+    identity: &ClientIdentityMaterial,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body: &[u8],
+) -> Result<BufferedTransportResponse> {
+    for attempt in 0..2 {
+        let session = session_pool
+            .ensure_direct_session(identity)
+            .await
+            .context("failed ensuring direct multiplex session")?;
+        let result = execute_multiplex_streaming_object_write_request(
+            session.as_ref(),
+            method,
+            url,
+            headers,
+            body,
+        )
+        .await;
+        match result {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt == 0 => {
+                session_pool.invalidate().await;
+                tracing::debug!(
+                    error = %err,
+                    server_base_url,
+                    "retrying streamed direct object write after resetting cached session"
+                );
+            }
+            Err(err) => {
+                session_pool.invalidate().await;
+                return Err(err);
+            }
+        }
+    }
+
+    bail!(
+        "streamed direct object write retried without producing a response for {}",
+        server_base_url
+    )
+}
+
+async fn execute_relay_multiplex_streaming_object_write_request(
+    relay: &ClientRelayTransport,
+    source: PeerIdentity,
+    method: &Method,
+    url: &Url,
+    headers: &[RelayHttpHeader],
+    body: &[u8],
+) -> Result<BufferedTransportResponse> {
+    for attempt in 0..2 {
+        let session = relay
+            .session_pool
+            .ensure_relay_session(source.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed ensuring multiplex relay session for target node {}",
+                    relay.target_node_id
+                )
+            })?;
+        let result = execute_multiplex_streaming_object_write_request(
+            session.as_ref(),
+            method,
+            url,
+            headers,
+            body,
+        )
+        .await;
+        match result {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt == 0 => {
+                relay.session_pool.invalidate().await;
+                tracing::debug!(
+                    error = %err,
+                    target_node_id = %relay.target_node_id,
+                    "retrying streamed relay object write after resetting cached session"
+                );
+            }
+            Err(err) => {
+                relay.session_pool.invalidate().await;
+                return Err(err);
+            }
+        }
+    }
+
+    bail!(
+        "streamed relay object write retried without producing a response for target node {}",
         relay.target_node_id
     )
 }
@@ -3073,6 +3253,7 @@ mod tests {
             ws::{Message, WebSocket, WebSocketUpgrade},
         },
         http::{Response, header},
+        response::IntoResponse,
         routing::{get, post},
     };
     use futures_util::{Sink, Stream};
@@ -3089,10 +3270,11 @@ mod tests {
         RelayTicketRequest, RelayTunnelControlMessage, RelayTunnelSession,
         RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
         TransportHeader, TransportSessionControlMessage, TransportSessionRole,
+        TransportResponseHead, TransportStreamKind,
         TRANSPORT_PROTOCOL_VERSION, WebSocketByteStream, WebSocketMessageCodec,
         encode_relay_wire_http_response_head, parse_relay_wire_http_request,
         perform_transport_server_handshake, read_buffered_transport_request,
-        write_buffered_transport_response,
+        write_buffered_transport_response, write_transport_response_head,
     };
 
     #[test]
@@ -3278,6 +3460,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RelayTestCapturedRequest {
+        kind: Option<TransportStreamKind>,
         method: String,
         path_and_query: String,
         headers: Vec<RelayHttpHeader>,
@@ -3493,6 +3676,7 @@ mod tests {
         let parsed = parse_relay_wire_http_request(&request_bytes)
             .expect("relay tunnel request should parse");
         *state.captured_request.lock().await = Some(RelayTestCapturedRequest {
+            kind: None,
             method: parsed.method,
             path_and_query: parsed.path_and_query,
             headers: parsed.headers,
@@ -3562,6 +3746,7 @@ mod tests {
                 .await
                 .expect("multiplexed relay test request should decode");
             *state.captured_request.lock().await = Some(RelayTestCapturedRequest {
+                kind: Some(request.kind),
                 method: request.method.clone(),
                 path_and_query: request.path.clone(),
                 headers: request
@@ -3663,6 +3848,202 @@ mod tests {
         (state, server)
     }
 
+    async fn direct_mixed_workload_ws(
+        websocket: WebSocketUpgrade,
+        State(payload): State<Arc<Vec<u8>>>,
+    ) -> impl IntoResponse {
+        websocket.on_upgrade(move |socket| async move {
+            let transport = WebSocketByteStream::new(RelayTestSocketAdapter { socket });
+            let mut session = MultiplexedSession::spawn(
+                transport,
+                MultiplexMode::Server,
+                MultiplexConfig::default(),
+            )
+            .expect("mixed workload session should spawn");
+            let hello = perform_transport_server_handshake(
+                &mut session,
+                TransportSessionControlMessage::Ready {
+                    protocol_version: TRANSPORT_PROTOCOL_VERSION,
+                    session_id: format!("mixed-session-{}", uuid::Uuid::now_v7()),
+                    max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+                },
+            )
+            .await
+            .expect("mixed workload handshake should succeed");
+            assert!(matches!(
+                hello,
+                TransportSessionControlMessage::Hello {
+                    role: TransportSessionRole::Client,
+                    ..
+                }
+            ));
+
+            while let Some(mut stream) = session
+                .accept_stream()
+                .await
+                .expect("mixed workload stream accept should succeed")
+            {
+                let payload = Arc::clone(&payload);
+                tokio::spawn(async move {
+                    let request = read_buffered_transport_request(&mut stream)
+                        .await
+                        .expect("mixed workload request should decode");
+
+                    match (request.kind, request.method.as_str(), request.path.as_str()) {
+                        (TransportStreamKind::Rpc, "HEAD", "/store/large.bin") => {
+                            write_buffered_transport_response(
+                                &mut stream,
+                                &MultiplexBufferedTransportResponse {
+                                    request_id: request.request_id,
+                                    status: StatusCode::OK.as_u16(),
+                                    headers: vec![
+                                        TransportHeader {
+                                            name: ACCEPT_RANGES.as_str().to_string(),
+                                            value: "bytes".to_string(),
+                                        },
+                                        TransportHeader {
+                                            name: CONTENT_LENGTH.as_str().to_string(),
+                                            value: payload.len().to_string(),
+                                        },
+                                        TransportHeader {
+                                            name: ETAG.as_str().to_string(),
+                                            value: "\"mixed-etag\"".to_string(),
+                                        },
+                                        TransportHeader {
+                                            name: "x-ironmesh-object-size".to_string(),
+                                            value: payload.len().to_string(),
+                                        },
+                                    ],
+                                    body: Vec::new(),
+                                },
+                            )
+                            .await
+                            .expect("mixed workload HEAD response should write");
+                        }
+                        (TransportStreamKind::ObjectRead, "GET", "/store/large.bin") => {
+                            let range = request
+                                .headers
+                                .iter()
+                                .find(|header| header.name.eq_ignore_ascii_case("range"))
+                                .map(|header| header.value.clone())
+                                .expect("range header should be present");
+                            let (start, end_inclusive) = parse_range_header(&range, payload.len());
+                            let selected = &payload[start..=end_inclusive];
+                            write_transport_response_head(
+                                &mut stream,
+                                &TransportResponseHead {
+                                    request_id: request.request_id,
+                                    status: StatusCode::PARTIAL_CONTENT.as_u16(),
+                                    headers: vec![
+                                        TransportHeader {
+                                            name: ACCEPT_RANGES.as_str().to_string(),
+                                            value: "bytes".to_string(),
+                                        },
+                                        TransportHeader {
+                                            name: CONTENT_LENGTH.as_str().to_string(),
+                                            value: selected.len().to_string(),
+                                        },
+                                        TransportHeader {
+                                            name: CONTENT_RANGE.as_str().to_string(),
+                                            value: format!(
+                                                "bytes {start}-{end_inclusive}/{}",
+                                                payload.len()
+                                            ),
+                                        },
+                                        TransportHeader {
+                                            name: ETAG.as_str().to_string(),
+                                            value: "\"mixed-etag\"".to_string(),
+                                        },
+                                        TransportHeader {
+                                            name: "x-ironmesh-object-size".to_string(),
+                                            value: payload.len().to_string(),
+                                        },
+                                    ],
+                                },
+                            )
+                            .await
+                            .expect("mixed workload object-read head should write");
+
+                            for chunk in selected.chunks(16 * 1024) {
+                                stream
+                                    .write_all(chunk)
+                                    .await
+                                    .expect("mixed workload object-read body should write");
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                            stream
+                                .close()
+                                .await
+                                .expect("mixed workload object-read stream should close");
+                        }
+                        (TransportStreamKind::Rpc, "GET", "/cluster/status") => {
+                            write_buffered_transport_response(
+                                &mut stream,
+                                &MultiplexBufferedTransportResponse {
+                                    request_id: request.request_id,
+                                    status: StatusCode::OK.as_u16(),
+                                    headers: vec![
+                                        TransportHeader {
+                                            name: "content-type".to_string(),
+                                            value: "application/json".to_string(),
+                                        },
+                                        TransportHeader {
+                                            name: "content-length".to_string(),
+                                            value: br#"{"status":"ok"}"#.len().to_string(),
+                                        },
+                                    ],
+                                    body: br#"{"status":"ok"}"#.to_vec(),
+                                },
+                            )
+                            .await
+                            .expect("mixed workload RPC response should write");
+                        }
+                        _ => {
+                            write_buffered_transport_response(
+                                &mut stream,
+                                &MultiplexBufferedTransportResponse {
+                                    request_id: request.request_id,
+                                    status: StatusCode::BAD_REQUEST.as_u16(),
+                                    headers: vec![
+                                        TransportHeader {
+                                            name: "content-type".to_string(),
+                                            value: "text/plain; charset=utf-8".to_string(),
+                                        },
+                                        TransportHeader {
+                                            name: "content-length".to_string(),
+                                            value: b"unsupported".len().to_string(),
+                                        },
+                                    ],
+                                    body: b"unsupported".to_vec(),
+                                },
+                            )
+                            .await
+                            .expect("mixed workload error response should write");
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    async fn spawn_direct_mixed_workload_test_server(
+        payload: Arc<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let router = Router::new()
+            .route("/transport/ws", get(direct_mixed_workload_ws))
+            .with_state(payload);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mixed workload server should run");
+        });
+        (format!("http://{addr}"), server)
+    }
+
     fn relay_test_client(
         state: &RelayTestState,
         identity: ClientIdentityMaterial,
@@ -3687,6 +4068,20 @@ mod tests {
         identity: ClientIdentityMaterial,
     ) -> IronMeshClient {
         IronMeshClient::from_direct_base_url(state.public_url.clone()).with_client_identity(identity)
+    }
+
+    fn parse_range_header(range: &str, total_len: usize) -> (usize, usize) {
+        let trimmed = range
+            .strip_prefix("bytes=")
+            .expect("range header should have bytes= prefix");
+        let (start, end) = trimmed
+            .split_once('-')
+            .expect("range header should contain dash");
+        let start = start.parse::<usize>().expect("range start should parse");
+        let end = end.parse::<usize>().expect("range end should parse");
+        assert!(start <= end, "range start must not exceed end");
+        assert!(end < total_len, "range end must stay within payload");
+        (start, end)
     }
 
     #[tokio::test]
@@ -3992,6 +4387,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_transport_streams_upload_session_chunks_over_object_write() {
+        let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
+            stored: true,
+            received_index: 2,
+        })
+        .expect("upload chunk response should serialize");
+        let (relay_state, server) = spawn_relay_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: response_body.len().to_string(),
+                },
+            ],
+            response_body,
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("relay-upload-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let target_node_id = NodeId::new_v4();
+        let client = relay_test_client(&relay_state, identity, target_node_id);
+
+        let response = client
+            .upload_session_chunk_bytes("upload-123", 2, b"chunk-body".to_vec())
+            .await
+            .expect("relay upload chunk should succeed");
+
+        assert!(response.stored);
+        assert_eq!(response.received_index, 2);
+
+        let captured = relay_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("relay request should be captured");
+        assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
+        assert_eq!(captured.method, "PUT");
+        assert_eq!(captured.path_and_query, "/store/uploads/upload-123/chunk/2");
+        assert_eq!(captured.body, b"chunk-body".to_vec());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn direct_transport_executes_and_reuses_multiplexed_session() {
         let (direct_state, server) = spawn_direct_transport_test_server(
             200,
@@ -4045,6 +4496,131 @@ mod tests {
                 .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID
                     && header.value == identity.device_id.to_string())
         );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn direct_transport_streams_upload_session_chunks_over_object_write() {
+        let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
+            stored: true,
+            received_index: 3,
+        })
+        .expect("upload chunk response should serialize");
+        let (direct_state, server) = spawn_direct_transport_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: response_body.len().to_string(),
+                },
+            ],
+            response_body,
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-upload-test-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = direct_transport_test_client(&direct_state, identity);
+
+        let response = client
+            .upload_session_chunk_bytes("upload-abc", 3, b"direct-chunk".to_vec())
+            .await
+            .expect("direct upload chunk should succeed");
+
+        assert!(response.stored);
+        assert_eq!(response.received_index, 3);
+
+        let captured = direct_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("direct request should be captured");
+        assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
+        assert_eq!(captured.method, "PUT");
+        assert_eq!(captured.path_and_query, "/store/uploads/upload-abc/chunk/3");
+        assert_eq!(captured.body, b"direct-chunk".to_vec());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn direct_transport_keeps_small_rpcs_responsive_during_streamed_downloads() {
+        let payload = Arc::new(vec![0x5A; 1024 * 1024]);
+        let payload_len = payload.len();
+        let (base_url, server) =
+            spawn_direct_mixed_workload_test_server(Arc::clone(&payload)).await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-mixed-workload-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = IronMeshClient::from_direct_base_url(base_url).with_client_identity(identity);
+
+        let download_client = client.clone();
+        let download_future = async move {
+            let mut output = Vec::new();
+            let mut progress = Vec::new();
+            let mut on_progress = |update: DownloadProgress| {
+                progress.push(update);
+            };
+            let result = download_client
+                .download_range_to_writer_with_progress(
+                    DownloadRangeRequest {
+                        key: "large.bin",
+                        snapshot: None,
+                        version: None,
+                        range: RequestedRange {
+                            offset: 0,
+                            length: payload_len as u64,
+                        },
+                    },
+                    &mut output,
+                    &mut on_progress,
+                    &|| false,
+                )
+                .await
+                .expect("streamed download should succeed");
+            (output, progress, result)
+        };
+        let rpc_future = async {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                client.get_json_path("/cluster/status"),
+            )
+            .await
+            .expect("small RPC should not be blocked behind streamed download")
+            .expect("small RPC should succeed")
+        };
+        let ((output, progress, result), rpc_response) = tokio::join!(download_future, rpc_future);
+
+        assert_eq!(rpc_response["status"], "ok");
+        assert_eq!(output.len(), payload_len);
+        assert_eq!(result.bytes_downloaded, payload_len as u64);
+        assert!(
+            progress
+                .last()
+                .is_some_and(|entry| entry.bytes_downloaded == payload_len as u64)
+        );
+        let snapshot = client.transport_session_pool_snapshot();
+        assert_eq!(snapshot.connect_count, 1);
+        assert!(snapshot.reuse_count >= 2);
 
         server.abort();
         let _ = server.await;
