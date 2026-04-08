@@ -714,16 +714,28 @@ fn print_latency_test_suite(suite: &LatencyTestSuiteResult) {
         if let Some(result) = target.result.as_ref() {
             let summary = &result.summary;
             println!(
-                "{} [{}] avg={} p95={} overhead={} assessment={:?}",
+                "{} [{}] avg={} p95={} cold={} overhead={} sessions={}/{}/{} assessment={:?}",
                 target.label,
                 target.transport_mode,
                 format_duration_ms(summary.avg_total_duration_ms),
                 format_duration_ms(summary.p95_total_duration_ms),
+                format_duration_ms(result.cold_connect_duration_ms),
                 format_duration_ms(summary.avg_transport_overhead_ms),
+                result.transport_session_pool.connect_count,
+                result.transport_session_pool.reuse_count,
+                result.transport_session_pool.reset_count,
                 summary.assessment
             );
             if let Some(target_description) = target.target.as_deref() {
                 println!("  target: {target_description}");
+            }
+            if result.transport_session_pool.connect_count > 0 {
+                println!(
+                    "  session reuse: {} connect(s), {} reuse(s), {} reset(s)",
+                    result.transport_session_pool.connect_count,
+                    result.transport_session_pool.reuse_count,
+                    result.transport_session_pool.reset_count
+                );
             }
             for observation in &summary.observations {
                 println!("  note: {observation}");

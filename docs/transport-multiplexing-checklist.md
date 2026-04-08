@@ -122,6 +122,11 @@ Primary files:
 - [ ] Cover JSON endpoints, relative-path fetches, store index, and object metadata paths.
 - [ ] Update latency diagnostics to distinguish cold session setup from warm stream reuse.
 
+Current slice landed:
+
+- [x] Extend latency probe results with cold-connect timing and transport-session connect/reuse/reset counters.
+- [x] Keep measured sample summaries focused on warm request behavior while still reporting when the probe had to establish or reset transport sessions.
+
 Primary files:
 
 - [ ] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
@@ -145,6 +150,11 @@ Primary files:
 - [ ] Expose transport session diagnostics to CLI and web UI.
 - [ ] Report warm-session reuse, reconnects, and per-relay health.
 - [ ] Extend latency tooling with cold-connect vs warm-stream metrics.
+
+Current slice landed:
+
+- [x] Show cold-connect and transport-session reuse/reset metrics in the CLI latency output.
+- [x] Show cold-connect and transport-session reuse/reset metrics in the web latency page and API typings.
 
 Primary files:
 
@@ -220,3 +230,8 @@ Primary files:
   - `cargo check -p client-sdk`
   - `cargo test -p client-sdk direct_transport`
   - `cargo test -p client-sdk relay_transport`
+- [x] 2026-04-08: Extend latency diagnostics to report cold session setup separately from measured warm requests and surface session reuse metrics in the CLI and web UI.
+  Verification:
+  - `cargo test -p client-sdk latency_probe`
+  - `cargo check -p cli-client -p web-ui-backend`
+  - `pnpm --dir web --filter @ironmesh/api --filter @ironmesh/client-ui typecheck`

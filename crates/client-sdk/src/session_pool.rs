@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use common::NodeId;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
@@ -35,7 +36,7 @@ struct CachedTransportSession {
     _relay_session: Option<RelayTunnelSession>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportSessionPoolSnapshot {
     pub connect_count: u64,
     pub reuse_count: u64,

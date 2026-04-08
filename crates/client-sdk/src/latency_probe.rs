@@ -3,7 +3,7 @@ use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::IronMeshClient;
+use crate::{IronMeshClient, TransportSessionPoolSnapshot};
 
 const LATENCY_PROBE_ROUTE: &str = "/diagnostics/latency";
 const LATENCY_PROBE_HEADER_NODE_ID: &str = "x-ironmesh-latency-node-id";
@@ -139,6 +139,10 @@ pub struct LatencyProbeResult {
     pub config: LatencyProbeConfig,
     pub route: String,
     pub generated_at_unix_ms: u64,
+    #[serde(default)]
+    pub cold_connect_duration_ms: Option<f64>,
+    #[serde(default)]
+    pub transport_session_pool: TransportSessionPoolSnapshot,
     pub samples: Vec<LatencyProbeSample>,
     pub summary: LatencyProbeSummary,
 }
@@ -168,6 +172,8 @@ impl IronMeshClient {
             config.response_bytes, config.server_delay_ms
         );
 
+        let session_pool_before = self.transport_session_pool_snapshot();
+        let mut cold_connect_duration_ms = None;
         let mut samples = Vec::with_capacity(config.sample_count);
         let total_requests = config.warmup_count + config.sample_count;
         for request_index in 0..total_requests {
@@ -235,16 +241,42 @@ impl IronMeshClient {
                 },
             };
 
+            if request_index == 0 {
+                let session_pool_after_first = self.transport_session_pool_snapshot();
+                if session_pool_after_first.connect_count > session_pool_before.connect_count {
+                    cold_connect_duration_ms = Some(sample.total_duration_ms);
+                }
+            }
+
             if request_index >= config.warmup_count {
                 samples.push(sample);
             }
         }
 
-        let summary = summarize_latency_probe(&samples, config.sample_count);
+        let session_pool_after = self.transport_session_pool_snapshot();
+        let session_pool_delta = TransportSessionPoolSnapshot {
+            connect_count: session_pool_after
+                .connect_count
+                .saturating_sub(session_pool_before.connect_count),
+            reuse_count: session_pool_after
+                .reuse_count
+                .saturating_sub(session_pool_before.reuse_count),
+            reset_count: session_pool_after
+                .reset_count
+                .saturating_sub(session_pool_before.reset_count),
+        };
+        let summary = summarize_latency_probe(
+            &samples,
+            config.sample_count,
+            cold_connect_duration_ms,
+            session_pool_delta,
+        );
         Ok(LatencyProbeResult {
             config,
             route: LATENCY_PROBE_ROUTE.to_string(),
             generated_at_unix_ms: unix_ts_ms(),
+            cold_connect_duration_ms,
+            transport_session_pool: session_pool_delta,
             samples,
             summary,
         })
@@ -323,6 +355,8 @@ pub fn compare_direct_and_relay_latency(
 fn summarize_latency_probe(
     samples: &[LatencyProbeSample],
     requested_samples: usize,
+    cold_connect_duration_ms: Option<f64>,
+    session_pool: TransportSessionPoolSnapshot,
 ) -> LatencyProbeSummary {
     let successful_samples = samples
         .iter()
@@ -419,6 +453,30 @@ fn summarize_latency_probe(
         observations.push(format!(
             "Latency jitter is high across samples ({:.1} ms spread between min and max).",
             max_ms - min_ms
+        ));
+    }
+
+    if session_pool.connect_count > 0 {
+        observations.push(format!(
+            "Probe opened {} transport session(s) and reused warm sessions {} time(s).",
+            session_pool.connect_count, session_pool.reuse_count
+        ));
+    }
+    if session_pool.reset_count > 0 {
+        if assessment == LatencyProbeAssessment::Healthy {
+            assessment = LatencyProbeAssessment::Warn;
+        }
+        observations.push(format!(
+            "Transport sessions reset {} time(s) during the probe.",
+            session_pool.reset_count
+        ));
+    }
+    if let (Some(cold_ms), Some(avg_ms)) = (cold_connect_duration_ms, avg_total_duration_ms)
+        && cold_ms >= avg_ms + 25.0
+    {
+        observations.push(format!(
+            "Cold session setup took {:.1} ms versus {:.1} ms average for measured warm requests.",
+            cold_ms, avg_ms
         ));
     }
 
@@ -573,6 +631,10 @@ mod tests {
         assert_eq!(result.summary.success_count, 3);
         assert_eq!(result.summary.failure_count, 0);
         assert!(result.summary.avg_total_duration_ms.is_some());
+        assert_eq!(result.transport_session_pool.connect_count, 0);
+        assert_eq!(result.transport_session_pool.reuse_count, 0);
+        assert_eq!(result.transport_session_pool.reset_count, 0);
+        assert!(result.cold_connect_duration_ms.is_none());
         assert!(
             result
                 .samples
@@ -590,6 +652,12 @@ mod tests {
             config: LatencyProbeConfig::default(),
             route: LATENCY_PROBE_ROUTE.to_string(),
             generated_at_unix_ms: 1,
+            cold_connect_duration_ms: Some(35.0),
+            transport_session_pool: TransportSessionPoolSnapshot {
+                connect_count: 1,
+                reuse_count: 3,
+                reset_count: 0,
+            },
             samples: Vec::new(),
             summary: LatencyProbeSummary {
                 requested_samples: 3,
@@ -612,6 +680,12 @@ mod tests {
             config: LatencyProbeConfig::default(),
             route: LATENCY_PROBE_ROUTE.to_string(),
             generated_at_unix_ms: 1,
+            cold_connect_duration_ms: Some(210.0),
+            transport_session_pool: TransportSessionPoolSnapshot {
+                connect_count: 1,
+                reuse_count: 3,
+                reset_count: 0,
+            },
             samples: Vec::new(),
             summary: LatencyProbeSummary {
                 requested_samples: 3,
@@ -636,5 +710,45 @@ mod tests {
         assert_eq!(comparison.assessment, LatencyProbeAssessment::Degraded);
         assert!(comparison.relay_avg_total_delta_ms.unwrap_or_default() >= 150.0);
         assert!(!comparison.observations.is_empty());
+    }
+
+    #[test]
+    fn latency_probe_summary_reports_session_reuse_and_cold_connect() {
+        let summary = summarize_latency_probe(
+            &[LatencyProbeSample {
+                index: 0,
+                started_unix_ms: 1,
+                successful: true,
+                status_code: Some(200),
+                total_duration_ms: 18.0,
+                server_duration_ms: Some(2.0),
+                transport_overhead_ms: Some(16.0),
+                response_bytes: 32,
+                throughput_bytes_per_sec: Some(1000.0),
+                node_id: Some("node-123".to_string()),
+                error: None,
+            }],
+            1,
+            Some(64.0),
+            TransportSessionPoolSnapshot {
+                connect_count: 1,
+                reuse_count: 4,
+                reset_count: 1,
+            },
+        );
+
+        assert!(
+            summary
+                .observations
+                .iter()
+                .any(|entry| entry.contains("reused warm sessions 4 time(s)"))
+        );
+        assert!(
+            summary
+                .observations
+                .iter()
+                .any(|entry| entry.contains("Cold session setup took 64.0 ms"))
+        );
+        assert_eq!(summary.assessment, LatencyProbeAssessment::Warn);
     }
 }

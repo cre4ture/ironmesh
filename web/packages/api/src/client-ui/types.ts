@@ -48,6 +48,12 @@ export type LatencyProbeSummary = {
   observations: string[];
 };
 
+export type TransportSessionPoolSnapshot = {
+  connect_count: number;
+  reuse_count: number;
+  reset_count: number;
+};
+
 export type LatencyProbeResult = {
   config: {
     sample_count: number;
@@ -58,6 +64,8 @@ export type LatencyProbeResult = {
   };
   route: string;
   generated_at_unix_ms: number;
+  cold_connect_duration_ms?: number | null;
+  transport_session_pool: TransportSessionPoolSnapshot;
   samples: LatencyProbeSample[];
   summary: LatencyProbeSummary;
 };

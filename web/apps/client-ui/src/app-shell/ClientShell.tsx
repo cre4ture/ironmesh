@@ -1265,7 +1265,9 @@ function LatencyPage() {
                       <Table.Th>Assessment</Table.Th>
                       <Table.Th>Average</Table.Th>
                       <Table.Th>P95</Table.Th>
+                      <Table.Th>Cold connect</Table.Th>
                       <Table.Th>Avg overhead</Table.Th>
+                      <Table.Th>Session reuse</Table.Th>
                       <Table.Th>Avg throughput</Table.Th>
                       <Table.Th>Notes</Table.Th>
                     </Table.Tr>
@@ -1298,7 +1300,9 @@ function LatencyPage() {
                         </Table.Td>
                         <Table.Td>{formatDurationValue(target.result?.summary.avg_total_duration_ms)}</Table.Td>
                         <Table.Td>{formatDurationValue(target.result?.summary.p95_total_duration_ms)}</Table.Td>
+                        <Table.Td>{formatDurationValue(target.result?.cold_connect_duration_ms)}</Table.Td>
                         <Table.Td>{formatDurationValue(target.result?.summary.avg_transport_overhead_ms)}</Table.Td>
+                        <Table.Td>{formatLatencySessionReuse(target)}</Table.Td>
                         <Table.Td>{formatBinaryTransferSpeed(target.result?.summary.avg_throughput_bytes_per_sec)}</Table.Td>
                         <Table.Td>
                           <Text size="xs" c={target.error ? "red" : "dimmed"}>
@@ -1882,6 +1886,17 @@ function formatLatencyAverage(target: ClientLatencyProbeTargetResult | null): st
     return "Failed";
   }
   return formatDurationValue(target.result?.summary.avg_total_duration_ms);
+}
+
+function formatLatencySessionReuse(target: ClientLatencyProbeTargetResult | null): string {
+  if (!target?.result) {
+    return target?.error ? "failed" : "n/a";
+  }
+  const stats = target.result.transport_session_pool;
+  if (stats.connect_count === 0 && stats.reuse_count === 0 && stats.reset_count === 0) {
+    return "n/a";
+  }
+  return `${stats.connect_count}c / ${stats.reuse_count}r / ${stats.reset_count}x`;
 }
 
 function selectLatencyTargetByAverage(
