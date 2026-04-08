@@ -105,9 +105,9 @@ Primary files:
 
 ### Milestone 5: Client session pool and path management
 
-- [ ] Replace per-request relay setup in `IronMeshClient` with warm transport sessions.
-- [ ] Introduce a session pool for direct and relay paths.
-- [ ] Keep bootstrap/path-selection logic, but target sessions instead of bespoke request transports.
+- [x] Replace per-request relay setup in `IronMeshClient` with warm transport sessions.
+- [x] Introduce a session pool for direct and relay paths.
+- [x] Keep bootstrap/path-selection logic, but target sessions instead of bespoke request transports.
 
 Current slice landed:
 
@@ -116,16 +116,16 @@ Current slice landed:
 
 Primary files:
 
-- [ ] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
-- [ ] [crates/client-sdk/src/bootstrap.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/bootstrap.rs)
-- [ ] [crates/client-sdk/src/connection.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/connection.rs)
-- [ ] [crates/client-sdk/src/session_pool.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/session_pool.rs)
+- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
+- [x] [crates/client-sdk/src/bootstrap.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/bootstrap.rs)
+- [x] [crates/client-sdk/src/connection.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/connection.rs)
+- [x] [crates/client-sdk/src/session_pool.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/session_pool.rs)
 
 ### Milestone 6: Small-request SDK migration
 
-- [ ] Move small buffered operations onto multiplexed streams.
-- [ ] Cover JSON endpoints, relative-path fetches, store index, and object metadata paths.
-- [ ] Update latency diagnostics to distinguish cold session setup from warm stream reuse.
+- [x] Move small buffered operations onto multiplexed streams.
+- [x] Cover JSON endpoints, relative-path fetches, store index, and object metadata paths.
+- [x] Update latency diagnostics to distinguish cold session setup from warm stream reuse.
 
 Current slice landed:
 
@@ -134,10 +134,10 @@ Current slice landed:
 
 Primary files:
 
-- [ ] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
-- [ ] [crates/client-sdk/src/latency_probe.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/latency_probe.rs)
-- [ ] [apps/cli-client/src/main.rs](/home/uli/rust-dev/ironmesh/apps/cli-client/src/main.rs)
-- [ ] [crates/web-ui-backend/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/web-ui-backend/src/lib.rs)
+- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
+- [x] [crates/client-sdk/src/latency_probe.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/latency_probe.rs)
+- [x] [apps/cli-client/src/main.rs](/home/uli/rust-dev/ironmesh/apps/cli-client/src/main.rs)
+- [x] [crates/web-ui-backend/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/web-ui-backend/src/lib.rs)
 
 ### Milestone 7: Bulk transfer stream migration
 
@@ -160,9 +160,9 @@ Primary files:
 
 ### Milestone 8: Diagnostics and UI wiring
 
-- [ ] Expose transport session diagnostics to CLI and web UI.
-- [ ] Report warm-session reuse, reconnects, and per-relay health.
-- [ ] Extend latency tooling with cold-connect vs warm-stream metrics.
+- [x] Expose transport session diagnostics to CLI and web UI.
+- [x] Report warm-session reuse, reconnects, and per-relay health.
+- [x] Extend latency tooling with cold-connect vs warm-stream metrics.
 
 Current slice landed:
 
@@ -171,10 +171,10 @@ Current slice landed:
 
 Primary files:
 
-- [ ] [apps/cli-client/src/main.rs](/home/uli/rust-dev/ironmesh/apps/cli-client/src/main.rs)
-- [ ] [crates/web-ui-backend/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/web-ui-backend/src/lib.rs)
-- [ ] [web/packages/api/src/client-ui/client.ts](/home/uli/rust-dev/ironmesh/web/packages/api/src/client-ui/client.ts)
-- [ ] [web/apps/client-ui/src/app-shell/ClientShell.tsx](/home/uli/rust-dev/ironmesh/web/apps/client-ui/src/app-shell/ClientShell.tsx)
+- [x] [apps/cli-client/src/main.rs](/home/uli/rust-dev/ironmesh/apps/cli-client/src/main.rs)
+- [x] [crates/web-ui-backend/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/web-ui-backend/src/lib.rs)
+- [x] [web/packages/api/src/client-ui/client.ts](/home/uli/rust-dev/ironmesh/web/packages/api/src/client-ui/client.ts)
+- [x] [web/apps/client-ui/src/app-shell/ClientShell.tsx](/home/uli/rust-dev/ironmesh/web/apps/client-ui/src/app-shell/ClientShell.tsx)
 
 ### Milestone 9: Legacy transport removal
 
@@ -307,3 +307,8 @@ Primary files:
   Verification:
   - `cargo test -p client-sdk direct_transport`
   - `cargo check -p client-sdk`
+- [x] 2026-04-08: Reconcile the remaining client-side migration milestones by validating that warm direct/relay session pooling, buffered multiplexed RPC routing, and transport-session diagnostics are all live in the SDK, CLI, and web UI.
+  Verification:
+  - `cargo test -p client-sdk relay_transport`
+  - `cargo test -p client-sdk latency_probe`
+  - `cargo check -p cli-client -p web-ui-backend`
