@@ -88,6 +88,11 @@ Primary files:
 - [ ] Make HTTP and multiplexed transport call the same internal async service functions.
 - [ ] Stop bouncing relayed requests through local HTTP.
 
+Current slice landed:
+
+- [x] Route current multiplexed health, cluster, diagnostics, store index, object read, thumbnail, and version-list requests through `transport_service`.
+- [x] Keep a bounded local-HTTP fallback only for buffered routes that have not been migrated into the shared service layer yet.
+
 Primary files:
 
 - [ ] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
@@ -198,4 +203,10 @@ Primary files:
   - `cargo test -p client-sdk direct_transport`
   - `cargo test -p client-sdk relay_transport`
   - `cargo test -p transport-sdk`
+  - `cargo check -p transport-sdk -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`
+- [x] 2026-04-08: Route the existing multiplexed buffered request surface through a shared server transport dispatcher instead of bouncing those requests through local HTTP.
+  Verification:
+  - `cargo check -p server-node-sdk`
+  - `cargo test -p client-sdk relay_transport`
+  - `cargo test -p client-sdk direct_transport`
   - `cargo check -p transport-sdk -p client-sdk -p server-node-sdk -p cli-client -p rendezvous-service`

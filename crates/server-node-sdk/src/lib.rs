@@ -97,6 +97,7 @@ mod embedded_rendezvous;
 mod replication;
 mod setup;
 mod storage;
+mod transport_service;
 mod ui;
 mod web_maps;
 
@@ -4954,8 +4955,10 @@ async fn serve_direct_transport_session(
 
         let local_http = local_http.clone();
         let local_base_url = local_base_url.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_multiplexed_relay_stream(local_http, local_base_url, stream).await
+            if let Err(err) =
+                handle_multiplexed_relay_stream(state, local_http, local_base_url, stream).await
             {
                 warn!(error = %err, "direct transport request stream failed");
             }
@@ -5043,48 +5046,8 @@ fn buffered_transport_error_response(
     }
 }
 
-async fn execute_local_multiplex_transport_request(
-    local_http: &reqwest::Client,
-    local_base_url: &str,
-    request: &BufferedTransportRequest,
-) -> Result<BufferedTransportResponse> {
-    let url = join_peer_url(local_base_url, &request.path)?;
-    let method = reqwest::Method::from_bytes(request.method.as_bytes())
-        .with_context(|| format!("invalid multiplexed transport HTTP method {}", request.method))?;
-    let mut outbound = local_http.request(method, url);
-    for header in &request.headers {
-        if header.name.eq_ignore_ascii_case("host")
-            || header.name.eq_ignore_ascii_case("content-length")
-        {
-            continue;
-        }
-        outbound = outbound.header(&header.name, &header.value);
-    }
-    if !request.body.is_empty() {
-        outbound = outbound.body(request.body.clone());
-    }
-
-    let response = outbound
-        .send()
-        .await
-        .context("failed executing local multiplex transport request")?;
-    let status = response.status().as_u16();
-    let headers = transport_headers_from_response(response.headers());
-    let body = response
-        .bytes()
-        .await
-        .context("failed reading local multiplex transport response body")?
-        .to_vec();
-
-    Ok(BufferedTransportResponse {
-        request_id: request.request_id.clone(),
-        status,
-        headers,
-        body,
-    })
-}
-
 async fn handle_multiplexed_relay_stream<S>(
+    state: ServerState,
     local_http: reqwest::Client,
     local_base_url: String,
     mut stream: S,
@@ -5095,7 +5058,8 @@ where
     let request = read_buffered_transport_request(&mut stream)
         .await
         .context("failed decoding multiplexed relay request stream")?;
-    let response = match execute_local_multiplex_transport_request(
+    let response = match transport_service::execute_buffered_transport_request(
+        &state,
         &local_http,
         &local_base_url,
         &request,
@@ -5116,7 +5080,7 @@ where
         Err(err) => buffered_transport_error_response(
             request.request_id.clone(),
             502,
-            format!("relay execution failed: {err:#}"),
+            format!("transport execution failed: {err:#}"),
         ),
     };
 
@@ -5196,10 +5160,12 @@ async fn serve_relay_multiplex_session(
 
         let local_http = local_http.clone();
         let local_base_url = local_base_url.clone();
+        let state = state.clone();
         let session_id = relay_session.session_id.clone();
         let endpoint_url = endpoint_url.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_multiplexed_relay_stream(local_http, local_base_url, stream).await
+            if let Err(err) =
+                handle_multiplexed_relay_stream(state, local_http, local_base_url, stream).await
             {
                 warn!(
                     error = %err,
