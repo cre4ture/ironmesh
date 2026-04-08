@@ -203,18 +203,25 @@ Primary files:
 
 ### Milestone 10: System-level hardening
 
-- [ ] Add end-to-end tests for:
-  - [ ] session reuse over relay
-  - [ ] concurrent small requests during large transfers
-  - [ ] relay reconnects
-  - [ ] failover across configured relays
-  - [ ] updated latency diagnostics
+- [x] Add end-to-end tests for:
+  - [x] session reuse over relay
+  - [x] concurrent small requests during large transfers
+  - [x] relay reconnects
+  - [x] failover across configured relays
+  - [x] updated latency diagnostics
+
+Current slice landed:
+
+- [x] Add a relay-only bootstrap system test that proves a live client reuses one warm relay transport session across multiple requests.
+- [x] Add an authenticated direct-client system test that keeps a small `/cluster/status` request responsive during a large streamed download.
+- [x] Add an end-to-end latency-probe system test that asserts cold-connect timing and warm transport-session reuse counters.
+- [x] Keep the existing relay reconnect and managed rendezvous failover system tests green as the final transport hardening guardrails.
 
 Primary files:
 
-- [ ] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
-- [ ] [crates/server-node-sdk/src/main_tests.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/main_tests.rs)
-- [ ] [tests/system-tests/src/framework.rs](/home/uli/rust-dev/ironmesh/tests/system-tests/src/framework.rs)
+- [x] [tests/system-tests/src/client_sdk_test.rs](/home/uli/rust-dev/ironmesh/tests/system-tests/src/client_sdk_test.rs)
+- [x] [tests/system-tests/src/cluster_test.rs](/home/uli/rust-dev/ironmesh/tests/system-tests/src/cluster_test.rs)
+- [x] [crates/server-node-sdk/src/main_tests.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/main_tests.rs)
 
 ## Progress log
 
@@ -317,3 +324,10 @@ Primary files:
   - `cargo check -p server-node-sdk`
   - `cargo test -p server-node-sdk execute_replication_cleanup_routes_remote_drop_through_relay`
   - `cargo test -p system-tests content_addressed_client_cache_persists_and_reuses_local_content`
+- [x] 2026-04-08: Finish the transport migration hardening pass with end-to-end tests for relay session reuse, mixed large+small direct traffic, live latency diagnostics, relay reconnects after rendezvous restarts, and managed rendezvous failover.
+  Verification:
+  - `cargo test -p system-tests relay_only_bootstrap_reuses_transport_session_across_multiple_requests`
+  - `cargo test -p system-tests ironmesh_client_keeps_small_requests_responsive_during_large_download_end_to_end`
+  - `cargo test -p system-tests ironmesh_client_latency_probe_reports_cold_connect_and_session_reuse_end_to_end`
+  - `cargo test -p system-tests relay_required_nodes_reconnect_after_rendezvous_restart_and_replicate`
+  - `cargo test -p system-tests zero_touch_managed_rendezvous_failover_promotes_second_node_and_keeps_relay_clients_working`

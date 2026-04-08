@@ -4,10 +4,13 @@ mod tests {
 
     use std::fs;
     use std::io::Cursor;
+    use std::time::Duration;
 
     use anyhow::{Context, Result};
     use bytes::Bytes;
-    use client_sdk::{ClientNode, ContentAddressedClientCache, IronMeshClient, UploadMode};
+    use client_sdk::{
+        ClientNode, ContentAddressedClientCache, IronMeshClient, LatencyProbeConfig, UploadMode,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -809,6 +812,92 @@ mod tests {
         .context("staged writer download task join failed")??;
 
         assert_eq!(downloaded, payload);
+
+        stop_server(&mut server).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ironmesh_client_keeps_small_requests_responsive_during_large_download_end_to_end()
+    -> Result<()> {
+        let bind = "127.0.0.1:19241";
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "mixed-download-request-server",
+            "mixed-download-request-client",
+        )
+        .await?;
+
+        let sdk = enrolled.build_client_async().await?;
+        let payload = vec![b'M'; CHUNK_UPLOAD_THRESHOLD_BYTES * 16];
+        sdk.put_large_aware("mixed/large.bin", Bytes::from(payload.clone()))
+            .await?;
+
+        let download_sdk = sdk.clone();
+        let download_handle = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let mut writer = Vec::new();
+            download_sdk.get_with_selector_writer("mixed/large.bin", None, None, &mut writer)?;
+            Ok(writer)
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !download_handle.is_finished(),
+            "expected large streamed download to still be active"
+        );
+
+        let status = sdk.get_json_path("/cluster/status").await?;
+        assert!(
+            status
+                .get("online_nodes")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+                >= 1,
+            "expected cluster/status to report at least one online node: {status}"
+        );
+
+        let downloaded = download_handle
+            .await
+            .context("mixed download task join failed")??;
+        assert_eq!(downloaded, payload);
+
+        stop_server(&mut server).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ironmesh_client_latency_probe_reports_cold_connect_and_session_reuse_end_to_end()
+    -> Result<()> {
+        let bind = "127.0.0.1:19242";
+        let (mut server, enrolled) = start_authenticated_test_client(
+            bind,
+            "latency-probe-server",
+            "latency-probe-client",
+        )
+        .await?;
+
+        let sdk = enrolled.build_client_async().await?;
+        let result = sdk
+            .run_latency_probe(LatencyProbeConfig {
+                sample_count: 4,
+                warmup_count: 1,
+                response_bytes: 512,
+                server_delay_ms: 0,
+                pause_between_samples_ms: 5,
+            })
+            .await?;
+
+        assert_eq!(result.summary.success_count, 4);
+        assert_eq!(result.summary.failure_count, 0);
+        assert!(
+            result.cold_connect_duration_ms.is_some(),
+            "expected a cold-connect measurement on the first probe sample"
+        );
+        assert_eq!(result.transport_session_pool.connect_count, 1);
+        assert!(
+            result.transport_session_pool.reuse_count >= 1,
+            "expected warm session reuse across probe samples"
+        );
 
         stop_server(&mut server).await;
         Ok(())

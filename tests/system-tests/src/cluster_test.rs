@@ -3465,6 +3465,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_only_bootstrap_reuses_transport_session_across_multiple_requests()
+    -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19166";
+        let bind = "127.0.0.1:19167";
+        let cluster_id = "11111111-1111-7111-8111-111111111116";
+        let node_id = "00000000-0000-0000-0000-0000000008d1";
+        let admin_token = "admin-secret";
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_url = format!("http://{bind}");
+        let data_dir = fresh_data_dir("relay-session-reuse-node");
+        let client_dir = fresh_data_dir("relay-session-reuse-client");
+
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut node = start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let enrolled = issue_bootstrap_bundle_and_enroll_client(
+                &http,
+                &base_url,
+                admin_token,
+                &client_dir,
+                "relay-session-reuse.bootstrap.json",
+                Some("relay-session-reuse"),
+                Some(3600),
+            )
+            .await?;
+
+            let mut relay_only_bootstrap = enrolled.bootstrap.clone();
+            for endpoint in &mut relay_only_bootstrap.direct_endpoints {
+                if endpoint.usage == Some(client_sdk::BootstrapEndpointUse::PublicApi) {
+                    endpoint.url = "http://127.0.0.1:9".to_string();
+                }
+            }
+            let identity = enrolled.identity.clone();
+            let client = tokio::task::spawn_blocking(move || {
+                relay_only_bootstrap.build_client_with_identity(&identity)
+            })
+            .await
+            .context("relay-only client construction task panicked")??;
+
+            assert!(client.uses_relay_transport());
+            let first = client.get_json_path("/cluster/status").await?;
+            let second = client.get_json_path("/cluster/status").await?;
+            for status in [&first, &second] {
+                assert!(
+                    status
+                        .get("online_nodes")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0)
+                        >= 1,
+                    "expected cluster/status to report at least one online node: {status}"
+                );
+            }
+
+            let snapshot = client.transport_session_pool_snapshot();
+            assert_eq!(snapshot.connect_count, 1);
+            assert!(
+                snapshot.reuse_count >= 1,
+                "expected relay transport session reuse after multiple requests"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut node).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
+
+        result
+    }
+
+    #[tokio::test]
     async fn bootstrap_client_prefers_direct_and_uses_relay_after_rendezvous_restart_and_forced_direct_failure()
     -> Result<()> {
         let rendezvous_bind = "127.0.0.1:19137";
