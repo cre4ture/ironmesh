@@ -13,6 +13,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{info, warn};
 use tracing_subscriber::filter::Directive;
 use web_ui_backend::{WebUiBootstrapPersistence, WebUiConfig};
 
@@ -133,6 +134,15 @@ enum Commands {
 async fn main() -> Result<()> {
     init_cli_tracing();
     let cli = Cli::parse();
+    info!(
+        command = command_name(&cli.command),
+        connection_source = connection_source(&cli),
+        server_url = cli.server_url.as_deref().unwrap_or("<none>"),
+        bootstrap_file = path_for_log(cli.bootstrap_file.as_deref()),
+        client_identity_file = path_for_log(configured_client_identity_path(&cli).as_deref()),
+        server_ca_pem_file = path_for_log(cli.server_ca_pem_file.as_deref()),
+        "cli command starting"
+    );
 
     match &cli.command {
         Commands::Enroll {
@@ -223,10 +233,20 @@ async fn main() -> Result<()> {
         }
         Commands::ServeWeb { bind } => {
             let bind_addr: SocketAddr = bind.parse()?;
+            info!(
+                bind_addr = %bind_addr,
+                connection_source = connection_source(&cli),
+                "starting cli web interface"
+            );
             let web_ui_config = if cli.server_url.is_some() || cli.bootstrap_file.is_some() {
                 let client = build_authenticated_sdk_from_cli(&cli).await?;
+                log_client_transport_ready("serve_web", &client);
                 let mut web_ui_config = WebUiConfig::from_client(client);
                 if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
+                    info!(
+                        bootstrap_file = %bootstrap_path.display(),
+                        "web interface will persist bootstrap updates back to disk"
+                    );
                     let server_ca_override = read_server_ca_override_from_cli(&cli)?;
                     let bootstrap =
                         load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
@@ -243,11 +263,16 @@ async fn main() -> Result<()> {
                 }
                 web_ui_config
             } else {
+                warn!(
+                    bind_addr = %bind_addr,
+                    "starting web interface without bootstrap or server URL; UI will begin disconnected"
+                );
                 WebUiConfig::new("http://127.0.0.1:9")
             }
             .with_service_name("cli-client-web");
             let app = web_ui_backend::router(web_ui_config);
 
+            info!(bind_addr = %bind_addr, "cli web interface listening");
             println!("web interface at http://{bind_addr}");
             let listener = tokio::net::TcpListener::bind(bind_addr).await?;
             axum::serve(listener, app).await?;
@@ -259,6 +284,18 @@ async fn main() -> Result<()> {
 fn init_cli_tracing() {
     let perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
     let mut env_filter = common::logging::env_filter_from_default_env("warn");
+    for directive in [
+        "cli_client=info",
+        "client_sdk=info",
+        "transport_sdk=info",
+        "web_ui_backend=info",
+    ] {
+        env_filter = env_filter.add_directive(
+            directive
+                .parse::<Directive>()
+                .expect("valid cli tracing directive"),
+        );
+    }
     if perf_logging_enabled {
         env_filter = env_filter.add_directive(
             "info"
@@ -267,6 +304,9 @@ fn init_cli_tracing() {
         );
     }
     common::logging::init_compact_tracing(env_filter);
+    if perf_logging_enabled {
+        info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
+    }
 }
 
 fn env_flag_is_truthy(name: &str) -> bool {
@@ -336,15 +376,31 @@ async fn enroll_from_bootstrap(
 }
 
 fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient> {
+    let client_identity_path = configured_client_identity_path(cli);
     let client_identity = read_client_identity_from_cli(cli)?;
     let server_ca_override = read_server_ca_override_from_cli(cli)?;
+    let authenticated = client_identity.is_some();
+    let client_device_id = client_identity
+        .as_ref()
+        .map(|identity| identity.device_id.to_string())
+        .unwrap_or_else(|| "<none>".to_string());
 
     if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
+        info!(
+            bootstrap_file = %bootstrap_path.display(),
+            client_identity_file = path_for_log(client_identity_path.as_deref()),
+            server_ca_pem_file = path_for_log(cli.server_ca_pem_file.as_deref()),
+            authenticated,
+            client_device_id,
+            "building authenticated client from bootstrap"
+        );
         let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
-        return match client_identity.as_ref() {
+        let client = match client_identity.as_ref() {
             Some(identity) => bootstrap.build_client_with_identity(identity),
             None => bootstrap.build_client(),
-        };
+        }?;
+        log_client_transport_ready("build_authenticated_sdk_from_cli_blocking", &client);
+        return Ok(client);
     }
 
     let server_url = cli
@@ -352,14 +408,24 @@ fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("set either --bootstrap-file or --server-url"))?;
     let base_url = normalize_server_base_url(server_url)?;
-    match client_identity.as_ref() {
+    info!(
+        server_url = %base_url,
+        client_identity_file = path_for_log(client_identity_path.as_deref()),
+        server_ca_pem_file = path_for_log(cli.server_ca_pem_file.as_deref()),
+        authenticated,
+        client_device_id,
+        "building authenticated client from direct server URL"
+    );
+    let client = match client_identity.as_ref() {
         Some(identity) => build_http_client_with_identity_from_pem(
             server_ca_override.as_deref(),
             base_url.as_str(),
             identity,
         ),
         None => build_http_client_from_pem(server_ca_override.as_deref(), base_url.as_str()),
-    }
+    }?;
+    log_client_transport_ready("build_authenticated_sdk_from_cli_blocking", &client);
+    Ok(client)
 }
 
 async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<IronMeshClient> {
@@ -387,8 +453,18 @@ async fn run_latency_test(
     config: LatencyProbeConfig,
 ) -> Result<LatencyTestSuiteResult> {
     config.validate()?;
+    info!(
+        path_selection = ?path_selection,
+        sample_count = config.sample_count,
+        warmup_count = config.warmup_count,
+        response_bytes = config.response_bytes,
+        pause_between_samples_ms = config.pause_between_samples_ms,
+        server_delay_ms = config.server_delay_ms,
+        "starting latency test suite"
+    );
 
     let current_client = build_authenticated_sdk_from_cli(cli).await?;
+    log_client_transport_ready("latency_test_current_client", &current_client);
     let bootstrap = load_bootstrap_from_cli(cli)?;
     let identity = read_client_identity_from_cli(cli)?;
     let diagnostic_targets = bootstrap
@@ -454,6 +530,12 @@ async fn run_latency_test(
     let comparison = select_direct_and_relay_results(&targets)
         .map(|(direct, relay)| compare_direct_and_relay_latency(Some(direct), Some(relay)))
         .flatten();
+
+    info!(
+        target_count = targets.len(),
+        comparison_assessment = ?comparison.as_ref().map(|value| value.assessment),
+        "latency test suite completed"
+    );
 
     Ok(LatencyTestSuiteResult {
         generated_at_unix_ms: unix_ts_ms(),
@@ -629,24 +711,50 @@ async fn probe_latency_client(
     config: &LatencyProbeConfig,
 ) -> LatencyTestPathResult {
     match client.run_latency_probe(config.clone()).await {
-        Ok(result) => LatencyTestPathResult {
-            path_id: path_id.to_string(),
-            label,
-            transport_mode,
-            uses_current_runtime,
-            target,
-            result: Some(result),
-            error: None,
-        },
-        Err(error) => LatencyTestPathResult {
-            path_id: path_id.to_string(),
-            label,
-            transport_mode,
-            uses_current_runtime,
-            target,
-            result: None,
-            error: Some(error.to_string()),
-        },
+        Ok(result) => {
+            info!(
+                path_id,
+                label = %label,
+                transport_mode = %transport_mode,
+                target = target.as_deref().unwrap_or("<none>"),
+                assessment = ?result.summary.assessment,
+                avg_total_ms = result.summary.avg_total_duration_ms,
+                p95_total_ms = result.summary.p95_total_duration_ms,
+                cold_connect_ms = result.cold_connect_duration_ms,
+                session_connect_count = result.transport_session_pool.connect_count,
+                session_reuse_count = result.transport_session_pool.reuse_count,
+                session_reset_count = result.transport_session_pool.reset_count,
+                "latency probe completed"
+            );
+            LatencyTestPathResult {
+                path_id: path_id.to_string(),
+                label,
+                transport_mode,
+                uses_current_runtime,
+                target,
+                result: Some(result),
+                error: None,
+            }
+        }
+        Err(error) => {
+            warn!(
+                path_id,
+                label = %label,
+                transport_mode = %transport_mode,
+                target = target.as_deref().unwrap_or("<none>"),
+                error = %error,
+                "latency probe failed"
+            );
+            LatencyTestPathResult {
+                path_id: path_id.to_string(),
+                label,
+                transport_mode,
+                uses_current_runtime,
+                target,
+                result: None,
+                error: Some(error.to_string()),
+            }
+        }
     }
 }
 
@@ -811,6 +919,65 @@ fn format_duration_ms(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
+fn command_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Enroll { .. } => "enroll",
+        Commands::Put { .. } => "put",
+        Commands::Get { .. } => "get",
+        Commands::List { .. } => "list",
+        Commands::Health => "health",
+        Commands::ClusterStatus => "cluster-status",
+        Commands::Nodes => "nodes",
+        Commands::ReplicationPlan => "replication-plan",
+        Commands::CacheList => "cache-list",
+        Commands::LatencyTest { .. } => "latency-test",
+        Commands::ServeWeb { .. } => "serve-web",
+    }
+}
+
+fn connection_source(cli: &Cli) -> &'static str {
+    if cli.bootstrap_file.is_some() {
+        "bootstrap"
+    } else if cli.server_url.is_some() {
+        "server_url"
+    } else {
+        "none"
+    }
+}
+
+fn path_for_log(path: Option<&Path>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn log_client_transport_ready(context: &str, client: &IronMeshClient) {
+    let session_pool = client.transport_session_pool_snapshot();
+    let target = describe_current_target(client).unwrap_or_else(|| "<unknown>".to_string());
+    if let Some(rendezvous) = client.rendezvous_client() {
+        info!(
+            context,
+            transport_mode = "relay",
+            target = %target,
+            rendezvous_urls = ?rendezvous.config().rendezvous_urls,
+            session_connect_count = session_pool.connect_count,
+            session_reuse_count = session_pool.reuse_count,
+            session_reset_count = session_pool.reset_count,
+            "client transport ready"
+        );
+        return;
+    }
+
+    info!(
+        context,
+        transport_mode = "direct",
+        target = %target,
+        session_connect_count = session_pool.connect_count,
+        session_reuse_count = session_pool.reuse_count,
+        session_reset_count = session_pool.reset_count,
+        "client transport ready"
+    );
+}
+
 fn read_optional_utf8_file(path: Option<&Path>) -> Result<Option<String>> {
     path.map(|path| {
         std::fs::read_to_string(path)
@@ -822,16 +989,24 @@ fn read_optional_utf8_file(path: Option<&Path>) -> Result<Option<String>> {
     .map(|value| value.filter(|value| !value.is_empty()))
 }
 
-fn read_client_identity_from_cli(cli: &Cli) -> Result<Option<ClientIdentityMaterial>> {
-    if let Some(path) = cli.client_identity_file.as_deref() {
-        return ClientIdentityMaterial::from_path(path).map(Some);
+fn configured_client_identity_path(cli: &Cli) -> Option<PathBuf> {
+    if let Some(path) = cli.client_identity_file.as_ref() {
+        return Some(path.clone());
     }
 
     if let Some(bootstrap_path) = cli.bootstrap_file.as_deref() {
         let default_path = default_client_identity_path(bootstrap_path);
         if default_path.exists() {
-            return ClientIdentityMaterial::from_path(&default_path).map(Some);
+            return Some(default_path);
         }
+    }
+
+    None
+}
+
+fn read_client_identity_from_cli(cli: &Cli) -> Result<Option<ClientIdentityMaterial>> {
+    if let Some(path) = configured_client_identity_path(cli) {
+        return ClientIdentityMaterial::from_path(&path).map(Some);
     }
 
     Ok(None)
