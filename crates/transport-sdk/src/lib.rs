@@ -7,7 +7,6 @@ pub mod multiplex_transport;
 pub mod mux;
 pub mod peer;
 pub mod relay;
-pub mod relay_http_wire;
 pub mod relay_tunnel;
 pub mod rendezvous;
 pub mod rendezvous_runtime;
@@ -44,17 +43,7 @@ pub use multiplex_transport::{
 };
 pub use mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 pub use peer::{PeerIdentity, PeerTransportClient, PeerTransportClientConfig};
-pub use relay::{
-    PendingRelayHttpRequest, RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayHttpHeader,
-    RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
-    RelayTicketRequest, RelayTunnelSessionKind, encode_optional_body_base64,
-};
-pub use relay_http_wire::{
-    ParsedRelayWireHttpRequest, ParsedRelayWireHttpResponse, RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES,
-    encode_relay_wire_http_request, encode_relay_wire_http_response_head,
-    parse_relay_wire_http_head_response, parse_relay_wire_http_request,
-    parse_relay_wire_http_response,
-};
+pub use relay::{RelayHttpHeader, RelayTicket, RelayTicketRequest, RelayTunnelSessionKind};
 pub use relay_tunnel::{
     RelayTunnelAcceptRequest, RelayTunnelClient, RelayTunnelControlMessage, RelayTunnelEvent,
     RelayTunnelSession, relay_tunnel_ws_url,
@@ -66,8 +55,8 @@ pub use rendezvous::{
     is_expected_idle_relay_tunnel_accept_timeout,
 };
 pub use rendezvous_runtime::{
-    BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayBroker, RelayBrokerStats,
-    RelayTunnelBroker, RelayTunnelEndpoint, RelayTunnelFrame, issue_relay_ticket,
+    BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayTunnelBroker,
+    RelayTunnelEndpoint, RelayTunnelFrame, issue_relay_ticket,
 };
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,

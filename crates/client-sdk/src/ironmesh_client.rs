@@ -3272,7 +3272,6 @@ mod tests {
         TransportHeader, TransportSessionControlMessage, TransportSessionRole,
         TransportResponseHead, TransportStreamKind,
         TRANSPORT_PROTOCOL_VERSION, WebSocketByteStream, WebSocketMessageCodec,
-        encode_relay_wire_http_response_head, parse_relay_wire_http_request,
         perform_transport_server_handshake, read_buffered_transport_request,
         write_buffered_transport_response, write_transport_response_head,
     };
@@ -3644,66 +3643,8 @@ mod tests {
             .expect("paired response should send");
 
         state.paired_session_count.fetch_add(1, Ordering::SeqCst);
-
-        if ticket.session_kind == RelayTunnelSessionKind::MultiplexTransport {
-            serve_relay_multiplex_test_socket(state, socket, ticket).await;
-            return;
-        }
-
-        let mut request_bytes = Vec::new();
-        loop {
-            match socket.recv().await {
-                Some(Ok(Message::Binary(bytes))) => request_bytes.extend_from_slice(&bytes),
-                Some(Ok(Message::Text(text))) => {
-                    let control: RelayTunnelControlMessage =
-                        serde_json::from_str(&text).expect("relay control should parse");
-                    if matches!(control, RelayTunnelControlMessage::CloseWrite) {
-                        break;
-                    }
-                }
-                Some(Ok(Message::Close(_))) | None => return,
-                Some(Ok(Message::Ping(payload))) => {
-                    socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .expect("pong should send");
-                }
-                Some(Ok(Message::Pong(_))) => {}
-                Some(Err(_)) => return,
-            }
-        }
-
-        let parsed = parse_relay_wire_http_request(&request_bytes)
-            .expect("relay tunnel request should parse");
-        *state.captured_request.lock().await = Some(RelayTestCapturedRequest {
-            kind: None,
-            method: parsed.method,
-            path_and_query: parsed.path_and_query,
-            headers: parsed.headers,
-            body: parsed.body,
-        });
-
-        let response_head =
-            encode_relay_wire_http_response_head(state.response_status, &state.response_headers)
-                .expect("response head should encode");
-        socket
-            .send(Message::Binary(response_head.into()))
-            .await
-            .expect("response head should send");
-        if !state.response_body.is_empty() {
-            socket
-                .send(Message::Binary(state.response_body.into()))
-                .await
-                .expect("response body should send");
-        }
-        socket
-            .send(Message::Text(
-                serde_json::to_string(&RelayTunnelControlMessage::CloseWrite)
-                    .expect("close_write should serialize")
-                    .into(),
-            ))
-            .await
-            .expect("close_write should send");
+        assert_eq!(ticket.session_kind, RelayTunnelSessionKind::MultiplexTransport);
+        serve_relay_multiplex_test_socket(state, socket, ticket).await;
     }
 
     async fn serve_test_multiplex_socket(

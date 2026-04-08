@@ -174,26 +174,28 @@ Primary files:
 
 ### Milestone 9: Legacy transport removal
 
-- [ ] Remove relay HTTP broker routes and types.
-- [ ] Remove one-request tunnel execution paths.
-- [ ] Remove HTTP-over-tunnel request/response codecs that are no longer used.
+- [x] Remove relay HTTP broker routes and types.
+- [x] Remove one-request tunnel execution paths.
+- [x] Remove HTTP-over-tunnel request/response codecs that are no longer used.
 
 Current slice landed:
 
 - [x] Stop spawning the legacy relay tunnel acceptor and relay HTTP polling agents inside `server-node` now that peer relay requests use multiplexed sessions.
 - [x] Remove the dead `/relay/http/*` broker routes and in-memory relay broker state from standalone rendezvous and embedded rendezvous, leaving the relay tunnel WebSocket endpoint as the only live relayed data-plane entrypoint.
 - [x] Remove the now-unused `/relay/http/*` control-client methods from `RendezvousControlClient`.
-- [ ] Remove the remaining relay HTTP runtime types and broker implementation from `transport-sdk`.
-- [ ] Remove the remaining legacy HTTP-over-tunnel codec helpers once those routes are gone.
+- [x] Migrate the remaining bootstrap-claim relay redemption path in standalone and embedded rendezvous onto buffered multiplexed transport streams.
+- [x] Remove the remaining relay HTTP runtime types and broker implementation from `transport-sdk`.
+- [x] Remove the remaining legacy HTTP-over-tunnel codec helpers once those routes are gone.
+- [x] Drop the last legacy tunnel-codec branch from the `client-sdk` relay test harness so transport coverage stays on the multiplexed path only.
 
 Primary files:
 
-- [ ] [crates/transport-sdk/src/relay.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay.rs)
-- [ ] [crates/transport-sdk/src/relay_http_wire.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay_http_wire.rs)
-- [ ] [crates/transport-sdk/src/rendezvous_runtime.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous_runtime.rs)
-- [ ] [apps/rendezvous-service/src/main.rs](/home/uli/rust-dev/ironmesh/apps/rendezvous-service/src/main.rs)
-- [ ] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
-- [ ] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
+- [x] [crates/transport-sdk/src/relay.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay.rs)
+- [x] [crates/transport-sdk/src/relay_http_wire.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay_http_wire.rs)
+- [x] [crates/transport-sdk/src/rendezvous_runtime.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous_runtime.rs)
+- [x] [apps/rendezvous-service/src/main.rs](/home/uli/rust-dev/ironmesh/apps/rendezvous-service/src/main.rs)
+- [x] [crates/server-node-sdk/src/embedded_rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/embedded_rendezvous.rs)
+- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
 
 ### Milestone 10: System-level hardening
 
@@ -280,3 +282,10 @@ Primary files:
 - [x] 2026-04-08: Remove the unused rendezvous control-client methods for `/relay/http/*` now that those routes no longer exist.
   Verification:
   - `cargo check -p transport-sdk -p rendezvous-service -p server-node-sdk`
+- [x] 2026-04-08: Finish the legacy relay cleanup by migrating bootstrap-claim relay redemption onto multiplexed transport streams, deleting the remaining relay HTTP runtime/types/codecs from `transport-sdk`, and removing the last legacy tunnel branch from the client relay test harness.
+  Verification:
+  - `cargo check -p transport-sdk -p rendezvous-service -p server-node-sdk -p client-sdk`
+  - `cargo test -p transport-sdk`
+  - `cargo test -p client-sdk relay_transport`
+  - `cargo test -p rendezvous-service relay_client_device_flows_through_mtls_authenticated_rendezvous`
+  - `cargo test -p rendezvous-service bootstrap_claim_redeem_flows_through_mtls_rendezvous_without_client_cert`

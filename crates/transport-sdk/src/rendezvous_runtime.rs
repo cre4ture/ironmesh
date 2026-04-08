@@ -1,21 +1,24 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use common::NodeId;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use futures_util::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::bootstrap::ClientBootstrap;
 use crate::bootstrap_claim::{
     ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
 };
+use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::peer::PeerIdentity;
-use crate::relay::{
-    PendingRelayHttpRequest, RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest,
-    RelayHttpResponse, RelayTicket, RelayTicketRequest, RelayTunnelSessionKind,
-};
+use crate::relay::{RelayTicket, RelayTicketRequest, RelayTunnelSessionKind};
 use crate::relay_tunnel::{RelayTunnelAcceptRequest, RelayTunnelSession};
 use crate::rendezvous::{PresenceEntry, PresenceRegistration};
 
@@ -171,236 +174,6 @@ pub fn issue_relay_ticket(
     }
 }
 
-#[derive(Clone, Default)]
-pub struct RelayBroker {
-    inner: Arc<RelayBrokerInner>,
-}
-
-#[derive(Default)]
-struct RelayBrokerInner {
-    state: Mutex<RelayBrokerState>,
-    notify: Notify,
-}
-
-#[derive(Default)]
-struct RelayBrokerState {
-    pending_by_target: HashMap<String, VecDeque<PendingRelayHttpRequest>>,
-    inflight: HashMap<String, InflightRelayRequest>,
-    stats: RelayBrokerStats,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RelayBrokerStats {
-    pub submitted_requests: u64,
-    pub delivered_requests: u64,
-    pub completed_responses: u64,
-}
-
-struct InflightRelayRequest {
-    response_tx: oneshot::Sender<RelayHttpResponse>,
-    cluster_id: uuid::Uuid,
-    session_id: String,
-    expected_responder: PeerIdentity,
-}
-
-struct SubmitAwaitCleanup {
-    inner: Arc<RelayBrokerInner>,
-    request_id: String,
-    active: bool,
-}
-
-impl SubmitAwaitCleanup {
-    fn new(inner: Arc<RelayBrokerInner>, request_id: String) -> Self {
-        Self {
-            inner,
-            request_id,
-            active: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for SubmitAwaitCleanup {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-
-        let inner = self.inner.clone();
-        let request_id = self.request_id.clone();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async move {
-            let mut state = inner.state.lock().await;
-            state.inflight.remove(&request_id);
-            remove_pending_request(&mut state.pending_by_target, &request_id);
-        });
-    }
-}
-
-impl RelayBroker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub async fn stats(&self) -> RelayBrokerStats {
-        let state = self.inner.state.lock().await;
-        state.stats
-    }
-
-    pub async fn submit_and_await(&self, request: RelayHttpRequest) -> Result<RelayHttpResponse> {
-        request.validate()?;
-        request.ticket.validate()?;
-        if request.ticket.expires_at_unix <= unix_ts() {
-            bail!("relay ticket has expired");
-        }
-
-        let target_key = relay_target_key(
-            request.ticket.cluster_id,
-            &request.ticket.target,
-            RelayTunnelSessionKind::LegacyHttpTunnel,
-        );
-        let request_id = request.request_id.clone();
-        let pending = PendingRelayHttpRequest {
-            cluster_id: request.ticket.cluster_id,
-            session_id: request.ticket.session_id.clone(),
-            request_id: request.request_id.clone(),
-            source: request.ticket.source.clone(),
-            target: request.ticket.target.clone(),
-            method: request.method,
-            path_and_query: request.path_and_query,
-            headers: request.headers,
-            body_base64: request.body_base64,
-        };
-        pending.validate()?;
-
-        let wait_timeout = request
-            .ticket
-            .expires_at_unix
-            .saturating_sub(unix_ts())
-            .clamp(5, 60);
-        let (tx, rx) = oneshot::channel();
-
-        {
-            let mut state = self.inner.state.lock().await;
-            state
-                .pending_by_target
-                .entry(target_key)
-                .or_default()
-                .push_back(pending);
-            state.inflight.insert(
-                request_id.clone(),
-                InflightRelayRequest {
-                    response_tx: tx,
-                    cluster_id: request.ticket.cluster_id,
-                    session_id: request.ticket.session_id.clone(),
-                    expected_responder: request.ticket.target.clone(),
-                },
-            );
-            state.stats.submitted_requests = state.stats.submitted_requests.saturating_add(1);
-        }
-        self.inner.notify.notify_waiters();
-        let mut cleanup = SubmitAwaitCleanup::new(self.inner.clone(), request_id.clone());
-
-        match tokio::time::timeout(Duration::from_secs(wait_timeout), rx).await {
-            Ok(Ok(response)) => {
-                cleanup.disarm();
-                response.validate()?;
-                Ok(response)
-            }
-            Ok(Err(_)) => {
-                let mut state = self.inner.state.lock().await;
-                state.inflight.remove(&request_id);
-                remove_pending_request(&mut state.pending_by_target, &request_id);
-                cleanup.disarm();
-                Err(anyhow!("relay response channel closed before completion"))
-            }
-            Err(_) => {
-                let mut state = self.inner.state.lock().await;
-                state.inflight.remove(&request_id);
-                remove_pending_request(&mut state.pending_by_target, &request_id);
-                cleanup.disarm();
-                bail!("timed out waiting for relayed HTTP response")
-            }
-        }
-    }
-
-    pub async fn poll(&self, request: RelayHttpPollRequest) -> Result<RelayHttpPollResponse> {
-        request.validate()?;
-        let target_key = relay_target_key(
-            request.cluster_id,
-            &request.target,
-            RelayTunnelSessionKind::LegacyHttpTunnel,
-        );
-        let timeout =
-            Duration::from_millis(request.wait_timeout_ms.unwrap_or(15_000).clamp(100, 30_000));
-
-        if let Some(pending) = self.try_pop_pending(&target_key).await? {
-            return Ok(RelayHttpPollResponse {
-                request: Some(pending),
-            });
-        }
-
-        let notified = self.inner.notify.notified();
-        let _ = tokio::time::timeout(timeout, notified).await;
-
-        Ok(RelayHttpPollResponse {
-            request: self.try_pop_pending(&target_key).await?,
-        })
-    }
-
-    pub async fn respond(&self, response: RelayHttpResponse) -> Result<bool> {
-        response.validate()?;
-        let inflight = {
-            let mut state = self.inner.state.lock().await;
-            state.inflight.remove(&response.request_id)
-        };
-        match inflight {
-            Some(inflight) => {
-                if inflight.cluster_id != response.cluster_id {
-                    bail!("relay response cluster_id does not match the in-flight request");
-                }
-                if inflight.session_id != response.session_id {
-                    bail!("relay response session_id does not match the in-flight request");
-                }
-                if inflight.expected_responder != response.responder {
-                    bail!("relay response responder does not match the in-flight request target");
-                }
-                let _ = inflight.response_tx.send(response);
-                let mut state = self.inner.state.lock().await;
-                state.stats.completed_responses = state.stats.completed_responses.saturating_add(1);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn try_pop_pending(&self, target_key: &str) -> Result<Option<PendingRelayHttpRequest>> {
-        let mut state = self.inner.state.lock().await;
-        let pending = state
-            .pending_by_target
-            .get_mut(target_key)
-            .and_then(|queue| queue.pop_front());
-        if state
-            .pending_by_target
-            .get(target_key)
-            .map(|queue| queue.is_empty())
-            .unwrap_or(false)
-        {
-            state.pending_by_target.remove(target_key);
-        }
-        if let Some(pending) = pending.as_ref() {
-            state.stats.delivered_requests = state.stats.delivered_requests.saturating_add(1);
-            pending.validate()?;
-        }
-        Ok(pending)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayTunnelFrame {
     Data(Vec<u8>),
@@ -418,6 +191,25 @@ impl RelayTunnelEndpoint {
         &self.session
     }
 
+    pub fn into_multiplexed_session(
+        self,
+        mode: MultiplexMode,
+        config: MultiplexConfig,
+    ) -> Result<(RelayTunnelSession, MultiplexedSession)> {
+        let RelayTunnelEndpoint {
+            session,
+            inbound,
+            outbound,
+        } = self;
+        let multiplexed = MultiplexedSession::spawn(
+            RelayTunnelEndpointByteStream::new(inbound, outbound),
+            mode,
+            config,
+        )
+        .map_err(|err| anyhow!("failed creating multiplexed relay endpoint session: {err:#}"))?;
+        Ok((session, multiplexed))
+    }
+
     pub async fn send(&self, frame: RelayTunnelFrame) -> Result<()> {
         self.outbound
             .send(frame)
@@ -427,6 +219,189 @@ impl RelayTunnelEndpoint {
 
     pub async fn recv(&mut self) -> Option<RelayTunnelFrame> {
         self.inbound.recv().await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PendingRelayTunnelSendKind {
+    Data(usize),
+    Close,
+}
+
+struct PendingRelayTunnelSend {
+    future: Pin<
+        Box<
+            dyn Future<Output = std::result::Result<(), mpsc::error::SendError<RelayTunnelFrame>>>
+                + Send,
+        >,
+    >,
+    kind: PendingRelayTunnelSendKind,
+}
+
+struct RelayTunnelEndpointByteStream {
+    inbound: mpsc::Receiver<RelayTunnelFrame>,
+    outbound: mpsc::Sender<RelayTunnelFrame>,
+    read_buffer: Vec<u8>,
+    read_offset: usize,
+    read_closed: bool,
+    write_closed: bool,
+    pending_send: Option<PendingRelayTunnelSend>,
+}
+
+impl RelayTunnelEndpointByteStream {
+    fn new(
+        inbound: mpsc::Receiver<RelayTunnelFrame>,
+        outbound: mpsc::Sender<RelayTunnelFrame>,
+    ) -> Self {
+        Self {
+            inbound,
+            outbound,
+            read_buffer: Vec::new(),
+            read_offset: 0,
+            read_closed: false,
+            write_closed: false,
+            pending_send: None,
+        }
+    }
+
+    fn start_pending_send(&mut self, frame: RelayTunnelFrame, kind: PendingRelayTunnelSendKind) {
+        let outbound = self.outbound.clone();
+        self.pending_send = Some(PendingRelayTunnelSend {
+            future: Box::pin(async move { outbound.send(frame).await }),
+            kind,
+        });
+    }
+
+    fn poll_pending_send(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<PendingRelayTunnelSendKind>>> {
+        let Some(pending) = self.pending_send.as_mut() else {
+            return Poll::Ready(Ok(None));
+        };
+
+        match pending.future.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                let kind = self
+                    .pending_send
+                    .take()
+                    .expect("pending relay tunnel send should exist")
+                    .kind;
+                Poll::Ready(Ok(Some(kind)))
+            }
+            Poll::Ready(Err(_)) => {
+                self.pending_send = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "relay tunnel peer disconnected before frame delivery",
+                )))
+            }
+        }
+    }
+}
+
+impl AsyncRead for RelayTunnelEndpointByteStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            if self.read_offset < self.read_buffer.len() {
+                let available = self.read_buffer.len() - self.read_offset;
+                let to_copy = available.min(buf.len());
+                buf[..to_copy].copy_from_slice(
+                    &self.read_buffer[self.read_offset..self.read_offset + to_copy],
+                );
+                self.read_offset += to_copy;
+                if self.read_offset >= self.read_buffer.len() {
+                    self.read_buffer.clear();
+                    self.read_offset = 0;
+                }
+                return Poll::Ready(Ok(to_copy));
+            }
+
+            if self.read_closed {
+                return Poll::Ready(Ok(0));
+            }
+
+            match self.inbound.poll_recv(cx) {
+                Poll::Ready(Some(RelayTunnelFrame::Data(bytes))) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    self.read_buffer = bytes;
+                    self.read_offset = 0;
+                }
+                Poll::Ready(Some(RelayTunnelFrame::CloseWrite)) | Poll::Ready(None) => {
+                    self.read_closed = true;
+                    return Poll::Ready(Ok(0));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for RelayTunnelEndpointByteStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if self.write_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "relay tunnel write side is already closed",
+            )));
+        }
+
+        if self.pending_send.is_none() {
+            self.start_pending_send(
+                RelayTunnelFrame::Data(buf.to_vec()),
+                PendingRelayTunnelSendKind::Data(buf.len()),
+            );
+        }
+
+        match self.poll_pending_send(cx) {
+            Poll::Ready(Ok(Some(PendingRelayTunnelSendKind::Data(len)))) => Poll::Ready(Ok(len)),
+            Poll::Ready(Ok(Some(PendingRelayTunnelSendKind::Close))) => Poll::Ready(Ok(0)),
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(0)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.poll_pending_send(cx) {
+            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_closed {
+            return self.poll_flush(cx);
+        }
+
+        if self.pending_send.is_none() {
+            self.start_pending_send(RelayTunnelFrame::CloseWrite, PendingRelayTunnelSendKind::Close);
+        }
+
+        match self.poll_pending_send(cx) {
+            Poll::Ready(Ok(Some(PendingRelayTunnelSendKind::Close))) | Poll::Ready(Ok(None)) => {
+                self.write_closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(Some(PendingRelayTunnelSendKind::Data(_)))) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -662,21 +637,6 @@ fn pop_waiting_target(
     }
 }
 
-fn remove_pending_request(
-    pending_by_target: &mut HashMap<String, VecDeque<PendingRelayHttpRequest>>,
-    request_id: &str,
-) {
-    let keys = pending_by_target.keys().cloned().collect::<Vec<_>>();
-    for key in keys {
-        if let Some(queue) = pending_by_target.get_mut(&key) {
-            queue.retain(|request| request.request_id != request_id);
-            if queue.is_empty() {
-                pending_by_target.remove(&key);
-            }
-        }
-    }
-}
-
 fn relay_target_key(
     cluster_id: uuid::Uuid,
     target: &PeerIdentity,
@@ -704,183 +664,16 @@ fn unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::encode_optional_body_base64;
-
-    #[tokio::test]
-    async fn relay_broker_round_trips_http_request() {
-        let broker = RelayBroker::new();
-        let cluster_id = uuid::Uuid::now_v7();
-        let source = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let ticket = issue_relay_ticket(
-            RelayTicketRequest {
-                cluster_id,
-                source: source.clone(),
-                target: target.clone(),
-                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
-                requested_expires_in_secs: Some(60),
-            },
-            &["https://relay.example".to_string()],
-        );
-
-        let broker_for_submit = broker.clone();
-        let submit = tokio::spawn(async move {
-            broker_for_submit
-                .submit_and_await(RelayHttpRequest {
-                    ticket,
-                    request_id: "req-1".to_string(),
-                    method: "GET".to_string(),
-                    path_and_query: "/health".to_string(),
-                    headers: Vec::new(),
-                    body_base64: None,
-                })
-                .await
-                .expect("relay request should complete")
-        });
-
-        let pending = broker
-            .poll(RelayHttpPollRequest {
-                cluster_id,
-                target,
-                wait_timeout_ms: Some(100),
-            })
-            .await
-            .expect("relay poll should succeed")
-            .request
-            .expect("poll should return a pending request");
-        assert_eq!(pending.request_id, "req-1");
-        assert_eq!(pending.path_and_query, "/health");
-
-        let accepted = broker
-            .respond(RelayHttpResponse {
-                cluster_id,
-                session_id: pending.session_id.clone(),
-                request_id: pending.request_id.clone(),
-                responder: pending.target.clone(),
-                status: 200,
-                headers: Vec::new(),
-                body_base64: encode_optional_body_base64(br#"{"ok":true}"#),
-            })
-            .await
-            .expect("relay response should be accepted");
-        assert!(accepted);
-
-        let response = submit.await.expect("submit task should join");
-        assert_eq!(response.status, 200);
-        assert_eq!(
-            response.body_bytes().expect("body should decode"),
-            br#"{"ok":true}"#
-        );
-    }
-
-    #[tokio::test]
-    async fn relay_broker_rejects_response_from_wrong_responder() {
-        let broker = RelayBroker::new();
-        let cluster_id = uuid::Uuid::now_v7();
-        let source = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let wrong_target = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let ticket = issue_relay_ticket(
-            RelayTicketRequest {
-                cluster_id,
-                source,
-                target: target.clone(),
-                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
-                requested_expires_in_secs: Some(60),
-            },
-            &["https://relay.example".to_string()],
-        );
-
-        let broker_for_submit = broker.clone();
-        let submit = tokio::spawn(async move {
-            broker_for_submit
-                .submit_and_await(RelayHttpRequest {
-                    ticket,
-                    request_id: "req-2".to_string(),
-                    method: "GET".to_string(),
-                    path_and_query: "/health".to_string(),
-                    headers: Vec::new(),
-                    body_base64: None,
-                })
-                .await
-        });
-
-        let pending = broker
-            .poll(RelayHttpPollRequest {
-                cluster_id,
-                target,
-                wait_timeout_ms: Some(100),
-            })
-            .await
-            .expect("relay poll should succeed")
-            .request
-            .expect("poll should return a pending request");
-
-        let error = broker
-            .respond(RelayHttpResponse {
-                cluster_id,
-                session_id: pending.session_id,
-                request_id: pending.request_id,
-                responder: wrong_target,
-                status: 200,
-                headers: Vec::new(),
-                body_base64: None,
-            })
-            .await
-            .expect_err("wrong responder should be rejected");
-        assert!(error.to_string().contains("does not match"));
-
-        submit.abort();
-        let _ = submit.await;
-    }
-
-    #[tokio::test]
-    async fn relay_broker_removes_pending_request_when_submitter_is_dropped() {
-        let broker = RelayBroker::new();
-        let cluster_id = uuid::Uuid::now_v7();
-        let source = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
-        let ticket = issue_relay_ticket(
-            RelayTicketRequest {
-                cluster_id,
-                source,
-                target: target.clone(),
-                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
-                requested_expires_in_secs: Some(60),
-            },
-            &["https://relay.example".to_string()],
-        );
-
-        let broker_for_submit = broker.clone();
-        let submit = tokio::spawn(async move {
-            broker_for_submit
-                .submit_and_await(RelayHttpRequest {
-                    ticket,
-                    request_id: "req-drop".to_string(),
-                    method: "GET".to_string(),
-                    path_and_query: "/health".to_string(),
-                    headers: Vec::new(),
-                    body_base64: None,
-                })
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        submit.abort();
-        let _ = submit.await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let pending = broker
-            .poll(RelayHttpPollRequest {
-                cluster_id,
-                target,
-                wait_timeout_ms: Some(50),
-            })
-            .await
-            .expect("relay poll should succeed")
-            .request;
-        assert!(pending.is_none(), "abandoned request should be removed");
-    }
+    use crate::multiplex_transport::{
+        BufferedTransportRequest, BufferedTransportResponse, perform_transport_client_handshake,
+        perform_transport_server_handshake, read_buffered_transport_request,
+        write_buffered_transport_request,
+        write_buffered_transport_response,
+    };
+    use crate::transport_protocol::{
+        TRANSPORT_PROTOCOL_VERSION, TransportSessionControlMessage, TransportSessionRole,
+        TransportStreamKind,
+    };
 
     #[tokio::test]
     async fn relay_tunnel_broker_pairs_source_and_target_and_relays_frames() {
@@ -893,7 +686,7 @@ mod tests {
                 cluster_id,
                 source: source.clone(),
                 target: target.clone(),
-                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
                 requested_expires_in_secs: Some(60),
             },
             &["https://relay.example".to_string()],
@@ -925,7 +718,7 @@ mod tests {
             .accept_target(RelayTunnelAcceptRequest {
                 cluster_id,
                 target,
-                session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
                 wait_timeout_ms: Some(500),
             })
             .await
@@ -949,6 +742,122 @@ mod tests {
             .await
             .expect("target close_write should send");
 
+        source_task.await.expect("source task should join");
+    }
+
+    #[tokio::test]
+    async fn relay_tunnel_endpoint_supports_multiplexed_sessions() {
+        let broker = RelayTunnelBroker::new();
+        let cluster_id = uuid::Uuid::now_v7();
+        let source = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let target = PeerIdentity::Node(uuid::Uuid::now_v7());
+        let ticket = issue_relay_ticket(
+            RelayTicketRequest {
+                cluster_id,
+                source: source.clone(),
+                target: target.clone(),
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                requested_expires_in_secs: Some(60),
+            },
+            &["https://relay.example".to_string()],
+        );
+
+        let broker_for_source = broker.clone();
+        let source_for_task = source.clone();
+        let source_task = tokio::spawn(async move {
+            let (relay_session, session) = broker_for_source
+                .connect_source(ticket)
+                .await
+                .expect("source should pair")
+                .into_multiplexed_session(MultiplexMode::Client, MultiplexConfig::default())
+                .expect("source multiplex session should spawn");
+            assert_eq!(relay_session.source, source_for_task);
+
+            perform_transport_client_handshake(
+                &session,
+                TransportSessionControlMessage::Hello {
+                    protocol_version: TRANSPORT_PROTOCOL_VERSION,
+                    cluster_id,
+                    role: TransportSessionRole::Node,
+                    peer: relay_session.source.clone(),
+                    target: Some(relay_session.target.clone()),
+                },
+            )
+            .await
+            .expect("source transport handshake should succeed");
+
+            let request = BufferedTransportRequest::new(
+                TransportStreamKind::Diagnostics,
+                "GET",
+                "/diagnostics/latency",
+                Vec::new(),
+                Vec::new(),
+            );
+            let mut stream = session
+                .open_stream()
+                .await
+                .expect("source stream should open");
+            write_buffered_transport_request(&mut stream, &request)
+                .await
+                .expect("source request should write");
+            let response = crate::multiplex_transport::read_buffered_transport_response(&mut stream)
+                .await
+                .expect("source response should read");
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, br#"{"ok":true}"#);
+
+            session.close().await.expect("source session should close");
+        });
+
+        let (relay_session, mut session) = broker
+            .accept_target(RelayTunnelAcceptRequest {
+                cluster_id,
+                target,
+                session_kind: RelayTunnelSessionKind::MultiplexTransport,
+                wait_timeout_ms: Some(500),
+            })
+            .await
+            .expect("target should pair")
+            .into_multiplexed_session(MultiplexMode::Server, MultiplexConfig::default())
+            .expect("target multiplex session should spawn");
+        assert_eq!(relay_session.source, source);
+        let hello = perform_transport_server_handshake(
+            &mut session,
+            TransportSessionControlMessage::Ready {
+                protocol_version: TRANSPORT_PROTOCOL_VERSION,
+                session_id: relay_session.session_id.clone(),
+                max_concurrent_streams: MultiplexConfig::default().max_num_streams,
+            },
+        )
+        .await
+        .expect("target handshake should succeed");
+        assert!(matches!(
+            hello,
+            TransportSessionControlMessage::Hello { role: TransportSessionRole::Node, .. }
+        ));
+
+        let mut stream = session
+            .accept_stream()
+            .await
+            .expect("target stream accept should succeed")
+            .expect("target stream should exist");
+        let request = read_buffered_transport_request(&mut stream)
+            .await
+            .expect("target request should decode");
+        assert_eq!(request.path, "/diagnostics/latency");
+        write_buffered_transport_response(
+            &mut stream,
+            &BufferedTransportResponse {
+                request_id: request.request_id,
+                status: 200,
+                headers: Vec::new(),
+                body: br#"{"ok":true}"#.to_vec(),
+            },
+        )
+        .await
+        .expect("target response should write");
+
+        session.close().await.expect("target session should close");
         source_task.await.expect("source task should join");
     }
 }

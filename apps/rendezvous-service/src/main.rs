@@ -13,15 +13,18 @@ use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use common::NodeId;
 use serde::Serialize;
 use tracing::{info, warn};
 use transport_sdk::peer::PeerIdentity;
 use transport_sdk::relay::{RelayTicket, RelayTicketRequest};
 use transport_sdk::rendezvous::PresenceRegistration;
 use transport_sdk::{
-    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, RelayTunnelControlMessage, RelayTunnelEndpoint,
-    RelayTunnelFrame, encode_relay_wire_http_request, parse_relay_wire_http_response,
+    BufferedTransportRequest, ClientBootstrapClaimRedeemRequest,
+    ClientBootstrapClaimRedeemResponse, MultiplexConfig, MultiplexMode,
+    RelayTunnelControlMessage, RelayTunnelFrame, TransportHeader, TransportSessionControlMessage,
+    TransportSessionRole, TransportStreamKind, TRANSPORT_PROTOCOL_VERSION,
+    perform_transport_client_handshake, read_buffered_transport_response,
+    write_buffered_transport_request,
 };
 
 use crate::auth::{
@@ -189,31 +192,25 @@ fn bootstrap_claim_relay_source_identity(
         .unwrap_or(PeerIdentity::Node(request.target_node_id))
 }
 
-fn bootstrap_claim_relay_request_host(target_node_id: NodeId) -> String {
-    format!("bootstrap-claim-node-{target_node_id}")
-}
-
-async fn send_relay_tunnel_bytes(
-    endpoint: &RelayTunnelEndpoint,
-    bytes: &[u8],
-) -> anyhow::Result<()> {
-    for chunk in bytes.chunks(transport_sdk::RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
-        endpoint
-            .send(RelayTunnelFrame::Data(chunk.to_vec()))
-            .await?;
-    }
-    Ok(())
-}
-
-async fn collect_relay_tunnel_bytes(endpoint: &mut RelayTunnelEndpoint) -> anyhow::Result<Vec<u8>> {
-    let mut collected = Vec::new();
-    loop {
-        match endpoint.recv().await {
-            Some(RelayTunnelFrame::Data(bytes)) => collected.extend_from_slice(&bytes),
-            Some(RelayTunnelFrame::CloseWrite) => return Ok(collected),
-            None => anyhow::bail!("relay tunnel closed before response completed"),
-        }
-    }
+fn bootstrap_claim_transport_request(
+    request: &ClientBootstrapClaimRedeemRequest,
+) -> std::result::Result<BufferedTransportRequest, (StatusCode, String)> {
+    let body = serde_json::to_vec(request).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed encoding bootstrap claim redeem request: {err}"),
+        )
+    })?;
+    Ok(BufferedTransportRequest::new(
+        TransportStreamKind::Rpc,
+        "POST",
+        "/auth/bootstrap-claims/redeem",
+        vec![TransportHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        body,
+    ))
 }
 
 async fn relay_bootstrap_claim_redeem_over_tunnel(
@@ -236,45 +233,57 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             cluster_id: target_presence.registration.cluster_id,
             source: bootstrap_claim_relay_source_identity(request),
             target,
-            session_kind: transport_sdk::RelayTunnelSessionKind::LegacyHttpTunnel,
+            session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
             requested_expires_in_secs: Some(30),
         },
         &state.config.relay_public_urls,
     );
-    let mut tunnel = state
+    let source = bootstrap_claim_relay_source_identity(request);
+    let transport_request = bootstrap_claim_transport_request(request)?;
+    let (relay_session, session) = state
         .relay_tunnel
         .connect_source(ticket)
         .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?
+        .into_multiplexed_session(MultiplexMode::Client, MultiplexConfig::default())
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    let request_bytes = encode_relay_wire_http_request(
-        "POST",
-        "/auth/bootstrap-claims/redeem",
-        &bootstrap_claim_relay_request_host(request.target_node_id),
-        &[transport_sdk::RelayHttpHeader {
-            name: "content-type".to_string(),
-            value: "application/json".to_string(),
-        }],
-        &serde_json::to_vec(request).map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed encoding bootstrap claim redeem request: {err}"),
-            )
-        })?,
+    perform_transport_client_handshake(
+        &session,
+        TransportSessionControlMessage::Hello {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            cluster_id: target_presence.registration.cluster_id,
+            role: TransportSessionRole::Client,
+            peer: source,
+            target: Some(PeerIdentity::Node(request.target_node_id)),
+        },
     )
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    send_relay_tunnel_bytes(&tunnel, &request_bytes)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    tunnel
-        .send(RelayTunnelFrame::CloseWrite)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    .await
+    .map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "failed completing bootstrap-claim relay handshake for session {}: {err}",
+                relay_session.session_id
+            ),
+        )
+    })?;
 
-    let response_bytes = collect_relay_tunnel_bytes(&mut tunnel)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    let response = parse_relay_wire_http_response(&response_bytes)
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let response = async {
+        let mut stream = session
+            .open_stream()
+            .await
+            .map_err(|err| anyhow::anyhow!("failed opening bootstrap-claim relay stream: {err}"))?;
+        write_buffered_transport_request(&mut stream, &transport_request)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed writing bootstrap-claim relay request: {err}"))?;
+        read_buffered_transport_response(&mut stream)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed reading bootstrap-claim relay response: {err}"))
+    }
+    .await
+    .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let _ = session.close().await;
+
     let response_status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
     if response_status.is_server_error() {
         return Err((
@@ -480,8 +489,6 @@ async fn send_relay_tunnel_control(
 mod tests {
     use super::*;
     use anyhow::Context;
-    use axum::body::Body;
-    use axum::http::Request;
     use axum::http::StatusCode;
     use client_sdk::{
         BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
@@ -494,7 +501,6 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tower::ServiceExt;
     use transport_sdk::RelayMode;
     use uuid::Uuid;
 
@@ -1044,7 +1050,7 @@ mod tests {
         let captured_request = std::sync::Arc::new(tokio::sync::Mutex::new(
             None::<(
                 transport_sdk::PeerIdentity,
-                transport_sdk::ParsedRelayWireHttpRequest,
+                transport_sdk::BufferedTransportRequest,
             )>,
         ));
 
@@ -1063,31 +1069,36 @@ mod tests {
             )
             .expect("target rendezvous client should build");
 
-            let mut tunnel = client
-                .accept_relay_tunnel(&transport_sdk::RelayTunnelAcceptRequest {
+            let (relay_session, mut session) = client
+                .accept_relay_multiplex_target(&transport_sdk::RelayTunnelAcceptRequest {
                     cluster_id,
                     target: transport_sdk::PeerIdentity::Node(target_node_id),
-                    session_kind: transport_sdk::RelayTunnelSessionKind::LegacyHttpTunnel,
+                    session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
                     wait_timeout_ms: Some(15_000),
-                })
+                }, transport_sdk::MultiplexConfig::default())
                 .await
                 .expect("relay tunnel accept should succeed");
-            let mut request_bytes = Vec::new();
-            loop {
-                match tunnel.recv_event().await.expect("relay tunnel read should succeed") {
-                    transport_sdk::RelayTunnelEvent::Data(bytes) => {
-                        request_bytes.extend_from_slice(&bytes);
-                    }
-                    transport_sdk::RelayTunnelEvent::CloseWrite => break,
-                    transport_sdk::RelayTunnelEvent::Closed => {
-                        panic!("relay tunnel closed before request completed");
-                    }
-                }
-            }
-            let request = transport_sdk::parse_relay_wire_http_request(&request_bytes)
-                .expect("relay tunnel request should parse");
+            transport_sdk::perform_transport_server_handshake(
+                &mut session,
+                transport_sdk::TransportSessionControlMessage::Ready {
+                    protocol_version: transport_sdk::TRANSPORT_PROTOCOL_VERSION,
+                    session_id: relay_session.session_id.clone(),
+                    max_concurrent_streams: transport_sdk::MultiplexConfig::default()
+                        .max_num_streams,
+                },
+            )
+            .await
+            .expect("relay transport handshake should succeed");
+            let mut stream = session
+                .accept_stream()
+                .await
+                .expect("relay transport accept should succeed")
+                .expect("relay transport request stream should exist");
+            let request = transport_sdk::read_buffered_transport_request(&mut stream)
+                .await
+                .expect("relay transport request should parse");
             *captured_request_for_acceptor.lock().await =
-                Some((tunnel.session().source.clone(), request.clone()));
+                Some((relay_session.source.clone(), request.clone()));
 
             let response_body = serde_json::to_vec(&client_sdk::StoreIndexResponse {
                 prefix: String::new(),
@@ -1105,36 +1116,30 @@ mod tests {
                 }],
             })
             .expect("store index should serialize");
-            let response_head = transport_sdk::encode_relay_wire_http_response_head(
-                200,
-                &[
-                    transport_sdk::RelayHttpHeader {
-                        name: "content-type".to_string(),
-                        value: "application/json".to_string(),
-                    },
-                    transport_sdk::RelayHttpHeader {
-                        name: "content-length".to_string(),
-                        value: response_body.len().to_string(),
-                    },
-                ],
+            transport_sdk::write_buffered_transport_response(
+                &mut stream,
+                &transport_sdk::BufferedTransportResponse {
+                    request_id: request.request_id,
+                    status: 200,
+                    headers: vec![
+                        transport_sdk::TransportHeader {
+                            name: "content-type".to_string(),
+                            value: "application/json".to_string(),
+                        },
+                        transport_sdk::TransportHeader {
+                            name: "content-length".to_string(),
+                            value: response_body.len().to_string(),
+                        },
+                    ],
+                    body: response_body,
+                },
             )
-            .expect("relay response head should encode");
-            for chunk in response_head.chunks(transport_sdk::RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
-                tunnel
-                    .send_data(chunk)
-                    .await
-                    .expect("relay response head should send");
-            }
-            for chunk in response_body.chunks(transport_sdk::RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
-                tunnel
-                    .send_data(chunk)
-                    .await
-                    .expect("relay response body should send");
-            }
-            tunnel
-                .send_close_write()
+            .await
+            .expect("relay transport response should write");
+            session
+                .close()
                 .await
-                .expect("relay response should finish");
+                .expect("relay transport session should close");
         });
 
         let mut identity = ClientIdentityMaterial::generate(
@@ -1184,7 +1189,8 @@ mod tests {
             .clone()
             .expect("relay request should be captured");
         assert_eq!(source, transport_sdk::PeerIdentity::Device(device_id));
-        assert_eq!(request.path_and_query, "/store/index?depth=1");
+        assert_eq!(request.kind, transport_sdk::TransportStreamKind::Rpc);
+        assert_eq!(request.path, "/store/index?depth=1");
 
         acceptor_handle.abort();
         let _ = acceptor_handle.await;
@@ -1308,22 +1314,41 @@ mod tests {
             let published_bootstrap = published_bootstrap.clone();
             async move {
                 for redeem_attempt in 0..2 {
-                    let mut tunnel = rendezvous_state
+                    let (relay_session, mut session) = rendezvous_state
                         .relay_tunnel
                         .accept_target(transport_sdk::RelayTunnelAcceptRequest {
                             cluster_id,
                             target: transport_sdk::PeerIdentity::Node(target_node_id),
-                            session_kind: transport_sdk::RelayTunnelSessionKind::LegacyHttpTunnel,
+                            session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
                             wait_timeout_ms: Some(15_000),
                         })
                         .await
-                        .expect("relay tunnel should pair with target node");
-                    let request_bytes = collect_relay_tunnel_bytes(&mut tunnel)
+                        .expect("relay tunnel should pair with target node")
+                        .into_multiplexed_session(
+                            transport_sdk::MultiplexMode::Server,
+                            transport_sdk::MultiplexConfig::default(),
+                        )
+                        .expect("relay multiplex session should spawn");
+                    transport_sdk::perform_transport_server_handshake(
+                        &mut session,
+                        transport_sdk::TransportSessionControlMessage::Ready {
+                            protocol_version: transport_sdk::TRANSPORT_PROTOCOL_VERSION,
+                            session_id: relay_session.session_id.clone(),
+                            max_concurrent_streams: transport_sdk::MultiplexConfig::default()
+                                .max_num_streams,
+                        },
+                    )
+                    .await
+                    .expect("relay transport handshake should succeed");
+                    let mut stream = session
+                        .accept_stream()
                         .await
-                        .expect("relay tunnel request bytes should collect");
-                    let request = transport_sdk::parse_relay_wire_http_request(&request_bytes)
-                        .expect("relay tunnel request should parse");
-                    assert_eq!(request.path_and_query, "/auth/bootstrap-claims/redeem");
+                        .expect("relay transport accept should succeed")
+                        .expect("relay transport request stream should exist");
+                    let request = transport_sdk::read_buffered_transport_request(&mut stream)
+                        .await
+                        .expect("relay transport request should parse");
+                    assert_eq!(request.path, "/auth/bootstrap-claims/redeem");
                     let redeem_request: transport_sdk::ClientBootstrapClaimRedeemRequest =
                         serde_json::from_slice(&request.body)
                             .expect("relay tunnel redeem request should parse");
@@ -1357,53 +1382,52 @@ mod tests {
                             },
                         )
                         .expect("redeem response should serialize");
-                        let response_head = transport_sdk::encode_relay_wire_http_response_head(
-                            200,
-                            &[
-                                transport_sdk::RelayHttpHeader {
-                                    name: "content-type".to_string(),
-                                    value: "application/json".to_string(),
-                                },
-                                transport_sdk::RelayHttpHeader {
-                                    name: "content-length".to_string(),
-                                    value: response_body.len().to_string(),
-                                },
-                            ],
+                        transport_sdk::write_buffered_transport_response(
+                            &mut stream,
+                            &transport_sdk::BufferedTransportResponse {
+                                request_id: request.request_id,
+                                status: 200,
+                                headers: vec![
+                                    transport_sdk::TransportHeader {
+                                        name: "content-type".to_string(),
+                                        value: "application/json".to_string(),
+                                    },
+                                    transport_sdk::TransportHeader {
+                                        name: "content-length".to_string(),
+                                        value: response_body.len().to_string(),
+                                    },
+                                ],
+                                body: response_body,
+                            },
                         )
-                        .expect("redeem response head should encode");
-                        send_relay_tunnel_bytes(&tunnel, &response_head)
-                            .await
-                            .expect("relay response head should send");
-                        send_relay_tunnel_bytes(&tunnel, &response_body)
-                            .await
-                            .expect("relay response body should send");
-                    } else {
-                        let response_head = transport_sdk::encode_relay_wire_http_response_head(
-                            404,
-                            &[
-                                transport_sdk::RelayHttpHeader {
-                                    name: "content-type".to_string(),
-                                    value: "text/plain; charset=utf-8".to_string(),
-                                },
-                                transport_sdk::RelayHttpHeader {
-                                    name: "content-length".to_string(),
-                                    value: "30".to_string(),
-                                },
-                            ],
-                        )
-                        .expect("not found head should encode");
-                        send_relay_tunnel_bytes(&tunnel, &response_head)
-                            .await
-                            .expect("not found head should send");
-                        send_relay_tunnel_bytes(&tunnel, b"bootstrap claim is unavailable")
-                            .await
-                            .expect("not found body should send");
-                    }
-
-                    tunnel
-                        .send(transport_sdk::RelayTunnelFrame::CloseWrite)
                         .await
-                        .expect("relay tunnel response should finish");
+                        .expect("relay response should write");
+                    } else {
+                        transport_sdk::write_buffered_transport_response(
+                            &mut stream,
+                            &transport_sdk::BufferedTransportResponse {
+                                request_id: request.request_id,
+                                status: 404,
+                                headers: vec![
+                                    transport_sdk::TransportHeader {
+                                        name: "content-type".to_string(),
+                                        value: "text/plain; charset=utf-8".to_string(),
+                                    },
+                                    transport_sdk::TransportHeader {
+                                        name: "content-length".to_string(),
+                                        value: "30".to_string(),
+                                    },
+                                ],
+                                body: b"bootstrap claim is unavailable".to_vec(),
+                            },
+                        )
+                        .await
+                        .expect("not found response should write");
+                    }
+                    session
+                        .close()
+                        .await
+                        .expect("relay transport session should finish");
                 }
             }
         });

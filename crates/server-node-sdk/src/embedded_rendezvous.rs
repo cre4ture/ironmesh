@@ -28,11 +28,14 @@ use transport_sdk::rendezvous::{
     PresenceListResponse, PresenceRegistration, RegisterPresenceResponse,
 };
 use transport_sdk::{
-    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, PresenceRegistry,
-    RelayTicket, RelayTicketRequest, RelayTunnelBroker,
-    RelayTunnelControlMessage, RelayTunnelEndpoint, RelayTunnelFrame, RelayTunnelSessionKind,
-    encode_relay_wire_http_request, issue_relay_ticket as issue_runtime_relay_ticket,
-    parse_relay_wire_http_response,
+    BufferedTransportRequest, ClientBootstrapClaimRedeemRequest,
+    ClientBootstrapClaimRedeemResponse, MultiplexConfig, MultiplexMode, PresenceRegistry,
+    RelayTicket, RelayTicketRequest, RelayTunnelBroker, RelayTunnelControlMessage,
+    RelayTunnelFrame,
+    RelayTunnelSessionKind, TransportHeader, TransportSessionControlMessage,
+    TransportSessionRole, TransportStreamKind, TRANSPORT_PROTOCOL_VERSION,
+    issue_relay_ticket as issue_runtime_relay_ticket, perform_transport_client_handshake,
+    read_buffered_transport_response, write_buffered_transport_request,
 };
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
@@ -187,31 +190,25 @@ fn bootstrap_claim_relay_source_identity(
         .unwrap_or(PeerIdentity::Node(request.target_node_id))
 }
 
-fn bootstrap_claim_relay_request_host(target_node_id: NodeId) -> String {
-    format!("bootstrap-claim-node-{target_node_id}")
-}
-
-async fn send_relay_tunnel_bytes(
-    endpoint: &RelayTunnelEndpoint,
-    bytes: &[u8],
-) -> anyhow::Result<()> {
-    for chunk in bytes.chunks(transport_sdk::RELAY_HTTP_TUNNEL_CHUNK_SIZE_BYTES) {
-        endpoint
-            .send(RelayTunnelFrame::Data(chunk.to_vec()))
-            .await?;
-    }
-    Ok(())
-}
-
-async fn collect_relay_tunnel_bytes(endpoint: &mut RelayTunnelEndpoint) -> anyhow::Result<Vec<u8>> {
-    let mut collected = Vec::new();
-    loop {
-        match endpoint.recv().await {
-            Some(RelayTunnelFrame::Data(bytes)) => collected.extend_from_slice(&bytes),
-            Some(RelayTunnelFrame::CloseWrite) => return Ok(collected),
-            None => anyhow::bail!("relay tunnel closed before response completed"),
-        }
-    }
+fn bootstrap_claim_transport_request(
+    request: &ClientBootstrapClaimRedeemRequest,
+) -> std::result::Result<BufferedTransportRequest, (StatusCode, String)> {
+    let body = serde_json::to_vec(request).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed encoding bootstrap claim redeem request: {err}"),
+        )
+    })?;
+    Ok(BufferedTransportRequest::new(
+        TransportStreamKind::Rpc,
+        "POST",
+        "/auth/bootstrap-claims/redeem",
+        vec![TransportHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        body,
+    ))
 }
 
 async fn relay_bootstrap_claim_redeem_over_tunnel(
@@ -234,45 +231,57 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
             cluster_id: target_presence.registration.cluster_id,
             source: bootstrap_claim_relay_source_identity(request),
             target,
-            session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
             requested_expires_in_secs: Some(30),
         },
         std::slice::from_ref(&state.config.public_url),
     );
-    let mut tunnel = state
+    let source = bootstrap_claim_relay_source_identity(request);
+    let transport_request = bootstrap_claim_transport_request(request)?;
+    let (relay_session, session) = state
         .relay_tunnel
         .connect_source(ticket)
         .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?
+        .into_multiplexed_session(MultiplexMode::Client, MultiplexConfig::default())
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    let request_bytes = encode_relay_wire_http_request(
-        "POST",
-        "/auth/bootstrap-claims/redeem",
-        &bootstrap_claim_relay_request_host(request.target_node_id),
-        &[transport_sdk::RelayHttpHeader {
-            name: "content-type".to_string(),
-            value: "application/json".to_string(),
-        }],
-        &serde_json::to_vec(request).map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed encoding bootstrap claim redeem request: {err}"),
-            )
-        })?,
+    perform_transport_client_handshake(
+        &session,
+        TransportSessionControlMessage::Hello {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            cluster_id: target_presence.registration.cluster_id,
+            role: TransportSessionRole::Client,
+            peer: source,
+            target: Some(PeerIdentity::Node(request.target_node_id)),
+        },
     )
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    send_relay_tunnel_bytes(&tunnel, &request_bytes)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    tunnel
-        .send(RelayTunnelFrame::CloseWrite)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    .await
+    .map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "failed completing bootstrap-claim relay handshake for session {}: {err}",
+                relay_session.session_id
+            ),
+        )
+    })?;
 
-    let response_bytes = collect_relay_tunnel_bytes(&mut tunnel)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    let response = parse_relay_wire_http_response(&response_bytes)
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let response = async {
+        let mut stream = session
+            .open_stream()
+            .await
+            .map_err(|err| anyhow::anyhow!("failed opening bootstrap-claim relay stream: {err}"))?;
+        write_buffered_transport_request(&mut stream, &transport_request)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed writing bootstrap-claim relay request: {err}"))?;
+        read_buffered_transport_response(&mut stream)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed reading bootstrap-claim relay response: {err}"))
+    }
+    .await
+    .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
+    let _ = session.close().await;
+
     let response_status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
     if response_status.is_server_error() {
         return Err((
