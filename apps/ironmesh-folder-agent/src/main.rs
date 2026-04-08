@@ -296,6 +296,7 @@ fn run_agent(args: &Args) -> Result<()> {
         read_optional_client_identity_json(args.client_identity_file.as_deref())?;
     let runtime_options = FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
+        state_root_dir: None,
         local_tree_uri: None,
         server_base_url: target.server_base_url.clone(),
         client_bootstrap_json: target.client_bootstrap_json.clone(),

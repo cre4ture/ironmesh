@@ -31,6 +31,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct FolderAgentRuntimeOptions {
     pub root_dir: PathBuf,
+    pub state_root_dir: Option<PathBuf>,
     pub local_tree_uri: Option<String>,
     pub server_base_url: Option<String>,
     pub client_bootstrap_json: Option<String>,
@@ -114,7 +115,15 @@ fn run_folder_agent_inner(
         options.server_base_url.as_deref(),
         options.client_bootstrap_json.as_deref(),
     )?;
-    let state_store = StartupStateStore::new(&options.root_dir, &scope, &connection_target);
+    let state_store = match options.state_root_dir.as_deref() {
+        Some(state_root_dir) => StartupStateStore::new_with_state_root(
+            &options.root_dir,
+            &scope,
+            &connection_target,
+            state_root_dir,
+        ),
+        None => StartupStateStore::new(&options.root_dir, &scope, &connection_target),
+    };
 
     fs::create_dir_all(&options.root_dir).with_context(|| {
         format!(

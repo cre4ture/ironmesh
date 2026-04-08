@@ -82,13 +82,22 @@ pub const BASELINE_SCHEMA_VERSION_CURRENT: i64 = 2;
 
 impl StartupStateStore {
     pub fn new(root_dir: &Path, scope: &PathScope, server_base_url: &str) -> Self {
+        Self::new_with_state_root(root_dir, scope, server_base_url, &std::env::temp_dir())
+    }
+
+    pub fn new_with_state_root(
+        root_dir: &Path,
+        scope: &PathScope,
+        server_base_url: &str,
+        state_root_dir: &Path,
+    ) -> Self {
         let mut hasher = DefaultHasher::new();
         root_dir.to_string_lossy().hash(&mut hasher);
         scope.remote_prefix().unwrap_or_default().hash(&mut hasher);
         server_base_url.hash(&mut hasher);
         let fingerprint = hasher.finish();
 
-        let mut path = std::env::temp_dir();
+        let mut path = state_root_dir.to_path_buf();
         path.push("ironmesh-folder-agent");
         path.push(format!("baseline-{fingerprint:016x}.sqlite"));
         Self {
@@ -1029,6 +1038,37 @@ mod tests {
         assert!(error.contains("unsupported sqlite baseline schema version"));
 
         remove_sqlite_sidecars(&store.path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_state_store_uses_explicit_state_root() {
+        let root = test_root();
+        let state_root = root.join("state-root");
+        let scope = PathScope::new(Some("photos/camera".to_string()));
+        let store = StartupStateStore::new_with_state_root(
+            &root,
+            &scope,
+            "http://127.0.0.1:8080",
+            &state_root,
+        );
+
+        assert!(store.path.starts_with(&state_root));
+        assert_eq!(
+            store.path.parent().unwrap().file_name().unwrap(),
+            "ironmesh-folder-agent"
+        );
+        let file_name = store
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            file_name,
+            format!("baseline-{}.sqlite", store.scope_fingerprint)
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

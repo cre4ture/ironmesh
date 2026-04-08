@@ -1030,8 +1030,16 @@ pub(crate) fn run_saf_folder_agent_with_control(
         options.client_bootstrap_json.as_deref(),
     )
     .context("SAF runtime requires server_base_url or client_bootstrap_json")?;
-    let state_store =
-        StartupStateStore::new(&state_identity_root(tree_uri), &scope, &connection_target);
+    let state_identity_root = state_identity_root(tree_uri);
+    let state_store = match options.state_root_dir.as_deref() {
+        Some(state_root_dir) => StartupStateStore::new_with_state_root(
+            &state_identity_root,
+            &scope,
+            &connection_target,
+            state_root_dir,
+        ),
+        None => StartupStateStore::new(&state_identity_root, &scope, &connection_target),
+    };
     let client = configured_client(options)?;
     let snapshot_scope = RemoteSnapshotScope::new(
         scope.remote_prefix().map(ToString::to_string),

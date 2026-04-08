@@ -151,6 +151,10 @@ fn android_download_stage_root(category: &str, scope: &str) -> Result<PathBuf> {
         .join(scope_hash))
 }
 
+fn android_folder_sync_state_root() -> Result<PathBuf> {
+    Ok(android_cache_dir()?.join("ironmesh-folder-sync-state"))
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AndroidFolderSyncServiceStatus {
@@ -1142,6 +1146,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
 
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
+            state_root_dir: Some(android_folder_sync_state_root()?),
             local_tree_uri,
             server_base_url,
             client_bootstrap_json,
@@ -1203,6 +1208,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
 
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
+            state_root_dir: Some(android_folder_sync_state_root()?),
             local_tree_uri,
             server_base_url,
             client_bootstrap_json,
