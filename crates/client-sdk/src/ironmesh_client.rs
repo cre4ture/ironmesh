@@ -4532,6 +4532,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_transport_executes_store_index_request_with_signed_device_identity() {
+        let (direct_state, server) = spawn_direct_transport_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: serde_json::to_vec(&StoreIndexResponse {
+                        prefix: String::new(),
+                        depth: 1,
+                        entry_count: 1,
+                        entries: vec![StoreIndexEntry {
+                            path: "docs/readme.txt".to_string(),
+                            entry_type: "key".to_string(),
+                            version: Some("v1".to_string()),
+                            content_hash: Some("hash-1".to_string()),
+                            size_bytes: Some(42),
+                            modified_at_unix: None,
+                            content_fingerprint: None,
+                            media: None,
+                        }],
+                    })
+                    .expect("store index response should serialize")
+                    .len()
+                    .to_string(),
+                },
+            ],
+            serde_json::to_vec(&StoreIndexResponse {
+                prefix: String::new(),
+                depth: 1,
+                entry_count: 1,
+                entries: vec![StoreIndexEntry {
+                    path: "docs/readme.txt".to_string(),
+                    entry_type: "key".to_string(),
+                    version: Some("v1".to_string()),
+                    content_hash: Some("hash-1".to_string()),
+                    size_bytes: Some(42),
+                    modified_at_unix: None,
+                    content_fingerprint: None,
+                    media: None,
+                }],
+            })
+            .expect("store index response should serialize"),
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-store-index-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = direct_transport_test_client(&direct_state, identity.clone());
+
+        let response = client
+            .store_index(None, 1, None)
+            .await
+            .expect("store index over direct transport should succeed");
+
+        assert_eq!(response.entry_count, 2);
+        assert_eq!(response.entries[0].path, "docs/");
+        assert_eq!(response.entries[1].path, "docs/readme.txt");
+
+        let captured = direct_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("direct request should be captured");
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path_and_query, "/store/index?depth=1");
+        assert!(
+            captured
+                .headers
+                .iter()
+                .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID
+                    && header.value == identity.device_id.to_string())
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn direct_transport_executes_relative_path_get_request() {
+        let (direct_state, server) = spawn_direct_transport_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "image/jpeg".to_string(),
+                },
+                RelayHttpHeader {
+                    name: "content-length".to_string(),
+                    value: b"thumb-jpeg-bytes".len().to_string(),
+                },
+            ],
+            b"thumb-jpeg-bytes".to_vec(),
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-relative-path-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = direct_transport_test_client(&direct_state, identity.clone());
+
+        let response = client
+            .get_relative_path("/media/thumbnail?key=gallery%2Fcat.png")
+            .await
+            .expect("relative GET over direct transport should succeed");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body.as_ref(), b"thumb-jpeg-bytes");
+
+        let captured = direct_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("direct request should be captured");
+        assert_eq!(
+            captured.path_and_query,
+            "/media/thumbnail?key=gallery%2Fcat.png"
+        );
+        assert!(
+            captured
+                .headers
+                .iter()
+                .any(|header| header.name == transport_sdk::HEADER_DEVICE_ID
+                    && header.value == identity.device_id.to_string())
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn direct_transport_preserves_head_response_headers() {
+        let payload = b"head-only-payload";
+        let (direct_state, server) = spawn_direct_transport_test_server(
+            200,
+            vec![
+                RelayHttpHeader {
+                    name: ACCEPT_RANGES.as_str().to_string(),
+                    value: "bytes".to_string(),
+                },
+                RelayHttpHeader {
+                    name: CONTENT_LENGTH.as_str().to_string(),
+                    value: payload.len().to_string(),
+                },
+                RelayHttpHeader {
+                    name: ETAG.as_str().to_string(),
+                    value: "\"direct-head-etag\"".to_string(),
+                },
+            ],
+            Vec::new(),
+        )
+        .await;
+
+        let mut identity = ClientIdentityMaterial::generate(
+            uuid::Uuid::now_v7(),
+            None,
+            Some("direct-head-device".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let client = direct_transport_test_client(&direct_state, identity);
+
+        let response = client
+            .head_object("gallery/cat.png", None, None)
+            .await
+            .expect("HEAD over direct transport should succeed");
+
+        assert_eq!(response.total_size_bytes, payload.len() as u64);
+        assert!(response.accept_ranges);
+        assert_eq!(response.etag.as_deref(), Some("\"direct-head-etag\""));
+
+        let captured = direct_state
+            .captured_request
+            .lock()
+            .await
+            .clone()
+            .expect("direct request should be captured");
+        assert_eq!(captured.method, "HEAD");
+        assert_eq!(captured.path_and_query, "/store/gallery%2Fcat.png");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn direct_transport_streams_upload_session_chunks_over_object_write() {
         let response_body = serde_json::to_vec(&UploadSessionChunkResponse {
             stored: true,

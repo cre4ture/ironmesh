@@ -69,22 +69,23 @@ Primary files:
 
 ### Milestone 3: Direct multiplexed server transport
 
-- [ ] Add a direct WebSocket transport endpoint on `server-node`.
-- [ ] Authenticate once per transport session.
-- [ ] Run the same Yamux/session protocol for direct and relay paths.
-- [ ] Add tests covering direct multiplexed requests.
+- [x] Add a direct WebSocket transport endpoint on `server-node`.
+- [x] Authenticate once per transport session.
+- [x] Run the same Yamux/session protocol for direct and relay paths.
+- [x] Add tests covering direct multiplexed requests.
 
 Current slice landed:
 
 - [x] Add a direct `/transport/ws` endpoint on `server-node` for authenticated client sessions.
 - [x] Reuse the shared buffered multiplex transport framing and handshake over direct WebSocket sessions.
 - [x] Route buffered authenticated direct client requests through a cached multiplexed session.
-- [ ] Expand direct coverage beyond the current buffered request slice.
+- [x] Expand direct coverage beyond the current buffered request slice with direct store-index, relative-path, HEAD, object-read, object-write, cancellation, and mixed-workload regression tests.
 
 Primary files:
 
-- [ ] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
-- [ ] [crates/server-node-sdk/src/server_transport.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/server_transport.rs)
+- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/client-sdk/src/connection.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/connection.rs)
+- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
 
 ### Milestone 4: Shared server transport service layer
 
@@ -302,3 +303,7 @@ Primary files:
   Verification:
   - `cargo test -p client-sdk direct_transport_cancels_streamed_download_promptly`
   - `cargo test -p client-sdk relay_transport_retries_streamed_upload_chunk_after_partial_session_failure`
+- [x] 2026-04-08: Expand direct multiplexed transport coverage so `/transport/ws` exercises store-index, relative-path, HEAD, upload, download-cancel, and mixed-workload request shapes instead of only a generic JSON probe.
+  Verification:
+  - `cargo test -p client-sdk direct_transport`
+  - `cargo check -p client-sdk`
