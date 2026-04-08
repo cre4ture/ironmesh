@@ -8,7 +8,7 @@ mod state;
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{DefaultBodyLimit, State, WebSocketUpgrade};
+use axum::extract::{State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::routing::{get, post};
@@ -17,14 +17,10 @@ use common::NodeId;
 use serde::Serialize;
 use tracing::{info, warn};
 use transport_sdk::peer::PeerIdentity;
-use transport_sdk::relay::{
-    RelayHttpPollRequest, RelayHttpPollResponse, RelayHttpRequest, RelayHttpResponse, RelayTicket,
-    RelayTicketRequest,
-};
+use transport_sdk::relay::{RelayTicket, RelayTicketRequest};
 use transport_sdk::rendezvous::PresenceRegistration;
 use transport_sdk::{
-    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
-    RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayTunnelControlMessage, RelayTunnelEndpoint,
+    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, RelayTunnelControlMessage, RelayTunnelEndpoint,
     RelayTunnelFrame, encode_relay_wire_http_request, parse_relay_wire_http_response,
 };
 
@@ -53,12 +49,7 @@ async fn main() -> Result<()> {
 }
 
 fn build_router(state: AppState) -> Router {
-    let relay_router = Router::new()
-        .route("/relay/http/request", post(submit_relay_http_request))
-        .route("/relay/http/poll", post(poll_relay_http_request))
-        .route("/relay/http/respond", post(complete_relay_http_request))
-        .route("/relay/tunnel/ws", get(relay_tunnel_ws))
-        .layer(DefaultBodyLimit::max(RELAY_HTTP_JSON_BODY_LIMIT_BYTES));
+    let relay_router = Router::new().route("/relay/tunnel/ws", get(relay_tunnel_ws));
 
     Router::new()
         .route("/health", get(health))
@@ -304,82 +295,6 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
         .validate()
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
     Ok(redeemed)
-}
-
-async fn submit_relay_http_request(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(request): Json<RelayHttpRequest>,
-) -> std::result::Result<Json<RelayHttpResponse>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        &request.ticket.source,
-        "relay HTTP request source",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-
-    let response = state
-        .relay
-        .submit_and_await(request)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    Ok(Json(response))
-}
-
-async fn poll_relay_http_request(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(request): Json<RelayHttpPollRequest>,
-) -> std::result::Result<Json<RelayHttpPollResponse>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        &request.target,
-        "relay HTTP poll target",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let response = state
-        .relay
-        .poll(request)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    Ok(Json(response))
-}
-
-async fn complete_relay_http_request(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(response): Json<RelayHttpResponse>,
-) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    response
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        state.config.mtls.is_some(),
-        &authenticated_peer,
-        &response.responder,
-        "relay HTTP response responder",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let completed = state
-        .relay
-        .respond(response)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    if !completed {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "relay request is no longer waiting".to_string(),
-        ));
-    }
-    Ok(Json(serde_json::json!({ "accepted": true })))
 }
 
 async fn relay_tunnel_ws(
@@ -800,93 +715,6 @@ mod tests {
         let _ = rendezvous_handle.await;
         let _ = std::fs::remove_dir_all(&source_dir);
         let _ = std::fs::remove_dir_all(&target_dir);
-    }
-
-    #[tokio::test]
-    async fn relay_http_respond_route_accepts_large_json_bodies() {
-        let bind_addr = free_bind_addr();
-        let public_url = format!("http://{bind_addr}");
-        let state = AppState::new(RendezvousServiceConfig {
-            bind_addr,
-            public_url: public_url.clone(),
-            relay_public_urls: vec![public_url],
-            mtls: None,
-            allow_insecure_http: true,
-            failover_package: None,
-        });
-        let cluster_id = Uuid::now_v7();
-        let source = transport_sdk::PeerIdentity::Node(Uuid::now_v7());
-        let target = transport_sdk::PeerIdentity::Node(Uuid::now_v7());
-        let ticket = crate::relay::issue_relay_ticket(
-            transport_sdk::RelayTicketRequest {
-                cluster_id,
-                source,
-                target: target.clone(),
-                session_kind: transport_sdk::RelayTunnelSessionKind::LegacyHttpTunnel,
-                requested_expires_in_secs: Some(60),
-            },
-            std::slice::from_ref(&state.config.public_url),
-        );
-
-        let relay = state.relay.clone();
-        let submit = tokio::spawn(async move {
-            relay
-                .submit_and_await(transport_sdk::RelayHttpRequest {
-                    ticket,
-                    request_id: "large-relay-response".to_string(),
-                    method: "GET".to_string(),
-                    path_and_query: "/store/list".to_string(),
-                    headers: Vec::new(),
-                    body_base64: None,
-                })
-                .await
-        });
-
-        let pending = state
-            .relay
-            .poll(transport_sdk::RelayHttpPollRequest {
-                cluster_id,
-                target: target.clone(),
-                wait_timeout_ms: Some(100),
-            })
-            .await
-            .expect("relay poll should succeed")
-            .request
-            .expect("relay request should be pending");
-
-        let large_body = vec![b'x'; 2 * 1024 * 1024];
-        let payload = serde_json::to_vec(&transport_sdk::RelayHttpResponse {
-            cluster_id,
-            session_id: pending.session_id,
-            request_id: pending.request_id,
-            responder: target,
-            status: 200,
-            headers: vec![transport_sdk::RelayHttpHeader {
-                name: "content-type".to_string(),
-                value: "application/octet-stream".to_string(),
-            }],
-            body_base64: transport_sdk::encode_optional_body_base64(&large_body),
-        })
-        .expect("relay response should serialize");
-
-        let response = build_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/relay/http/respond")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let relayed = submit.await.expect("submit task should join").unwrap();
-        assert_eq!(
-            relayed.body_bytes().expect("relayed body should decode"),
-            large_body
-        );
     }
 
     #[tokio::test]

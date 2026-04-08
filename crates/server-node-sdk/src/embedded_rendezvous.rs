@@ -6,7 +6,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use axum::extract::DefaultBodyLimit;
 use axum::extract::FromRequestParts;
 use axum::extract::State;
 use axum::extract::WebSocketUpgrade;
@@ -30,8 +29,7 @@ use transport_sdk::rendezvous::{
 };
 use transport_sdk::{
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse, PresenceRegistry,
-    RELAY_HTTP_JSON_BODY_LIMIT_BYTES, RelayBroker, RelayHttpPollRequest, RelayHttpPollResponse,
-    RelayHttpRequest, RelayHttpResponse, RelayTicket, RelayTicketRequest, RelayTunnelBroker,
+    RelayTicket, RelayTicketRequest, RelayTunnelBroker,
     RelayTunnelControlMessage, RelayTunnelEndpoint, RelayTunnelFrame, RelayTunnelSessionKind,
     encode_relay_wire_http_request, issue_relay_ticket as issue_runtime_relay_ticket,
     parse_relay_wire_http_response,
@@ -52,7 +50,6 @@ pub(crate) struct EmbeddedRendezvousConfig {
 struct AppState {
     config: EmbeddedRendezvousConfig,
     presence: PresenceRegistry,
-    relay: RelayBroker,
     relay_tunnel: RelayTunnelBroker,
 }
 
@@ -61,7 +58,6 @@ impl AppState {
         Self {
             config,
             presence: PresenceRegistry::new(),
-            relay: RelayBroker::new(),
             relay_tunnel: RelayTunnelBroker::new(),
         }
     }
@@ -76,12 +72,7 @@ struct HealthResponse {
 
 pub(crate) async fn run_listener(config: EmbeddedRendezvousConfig) -> Result<()> {
     let state = AppState::new(config.clone());
-    let relay_router = Router::new()
-        .route("/relay/http/request", post(submit_relay_http_request))
-        .route("/relay/http/poll", post(poll_relay_http_request))
-        .route("/relay/http/respond", post(complete_relay_http_request))
-        .route("/relay/tunnel/ws", get(relay_tunnel_ws))
-        .layer(DefaultBodyLimit::max(RELAY_HTTP_JSON_BODY_LIMIT_BYTES));
+    let relay_router = Router::new().route("/relay/tunnel/ws", get(relay_tunnel_ws));
     let app = Router::new()
         .route("/health", get(health))
         .route("/control/presence", get(list_presence))
@@ -302,79 +293,6 @@ async fn relay_bootstrap_claim_redeem_over_tunnel(
         .validate()
         .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
     Ok(redeemed)
-}
-
-async fn submit_relay_http_request(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(request): Json<RelayHttpRequest>,
-) -> std::result::Result<Json<RelayHttpResponse>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        &authenticated_peer,
-        &request.ticket.source,
-        "relay HTTP request source",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-
-    let response = state
-        .relay
-        .submit_and_await(request)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    Ok(Json(response))
-}
-
-async fn poll_relay_http_request(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(request): Json<RelayHttpPollRequest>,
-) -> std::result::Result<Json<RelayHttpPollResponse>, (StatusCode, String)> {
-    request
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        &authenticated_peer,
-        &request.target,
-        "relay HTTP poll target",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let response = state
-        .relay
-        .poll(request)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    Ok(Json(response))
-}
-
-async fn complete_relay_http_request(
-    State(state): State<AppState>,
-    authenticated_peer: MaybeAuthenticatedPeer,
-    Json(response): Json<RelayHttpResponse>,
-) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    response
-        .validate()
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    ensure_authenticated_peer_identity(
-        &authenticated_peer,
-        &response.responder,
-        "relay HTTP response responder",
-    )
-    .map_err(|err| (StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let completed = state
-        .relay
-        .respond(response)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?;
-    if !completed {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "relay request is no longer waiting".to_string(),
-        ));
-    }
-    Ok(Json(serde_json::json!({ "accepted": true })))
 }
 
 async fn relay_tunnel_ws(
