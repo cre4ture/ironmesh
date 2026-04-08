@@ -20,6 +20,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
@@ -2872,7 +2873,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     }
     {
         let outbound_clients = super::build_outbound_clients(&state).unwrap();
-        *state.outbound_clients.write().await = outbound_clients;
+        super::replace_outbound_clients(&state, outbound_clients).await;
     }
 
     let internal_http = super::current_internal_http(&state).await;
@@ -5133,6 +5134,7 @@ async fn build_test_state(
             rendezvous_control: None,
             rendezvous_controls: Vec::new(),
         })),
+        peer_relay_sessions: super::PeerRelaySessionPool::default(),
         metadata_commit_mode: MetadataCommitMode::Local,
         autonomous_replication_on_put_enabled: false,
         inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -5620,80 +5622,16 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     let relay_bind_addr = free_bind_addr();
     let relay_base_url = format!("http://{relay_bind_addr}");
     *state.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
-
-    let rendezvous_client = transport_sdk::RendezvousControlClient::new(
-        transport_sdk::RendezvousClientConfig {
-            cluster_id: state.cluster_id,
-            rendezvous_urls: vec![relay_base_url.clone()],
-            heartbeat_interval_secs: 15,
-        },
-        None,
-        None,
-    )
-    .expect("rendezvous client should build");
-    *state.outbound_clients.write().await = super::OutboundClients {
-        internal_http: reqwest::Client::new(),
-        rendezvous_control: Some(rendezvous_client.clone()),
-        rendezvous_controls: vec![super::RendezvousEndpointClient {
-            url: relay_base_url.clone(),
-            control: rendezvous_client,
-        }],
-    };
-
-    let observed_paths = Arc::new(Mutex::new(Vec::<String>::new()));
-    let relay_paths = observed_paths.clone();
     let expected_target = transport_sdk::PeerIdentity::Node(remote_node.node_id);
-    let relay_app = Router::new()
-        .route("/health", get(|| async { StatusCode::OK }))
-        .route(
-            "/control/relay/ticket",
-            post({
-                let relay_base_url = relay_base_url.clone();
-                let expected_target = expected_target.clone();
-                move |Json(request): Json<transport_sdk::RelayTicketRequest>| {
-                    let relay_base_url = relay_base_url.clone();
-                    let expected_target = expected_target.clone();
-                    async move {
-                        assert_eq!(request.target, expected_target);
-                        Json(transport_sdk::RelayTicket {
-                            cluster_id: request.cluster_id,
-                            session_id: "cleanup-relay-session".to_string(),
-                            source: request.source,
-                            target: request.target,
-                            session_kind: request.session_kind,
-                            relay_urls: vec![relay_base_url],
-                            issued_at_unix: 1,
-                            expires_at_unix: 301,
-                        })
-                    }
-                }
-            }),
+    configure_test_relay_outbound_clients(&state, &relay_base_url).await;
+    let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
+        spawn_cleanup_relay_stub(
+            relay_bind_addr,
+            relay_base_url.clone(),
+            expected_target,
+            None,
         )
-        .route(
-            "/relay/tunnel/ws",
-            get(move |websocket: axum::extract::WebSocketUpgrade| {
-                let relay_paths = relay_paths.clone();
-                let expected_target = expected_target.clone();
-                async move {
-                    websocket.on_upgrade(move |socket| async move {
-                        serve_cleanup_relay_tunnel_socket(
-                            relay_paths,
-                            expected_target,
-                            socket,
-                        )
-                        .await;
-                    })
-                }
-            }),
-        );
-    let relay_listener = tokio::net::TcpListener::bind(relay_bind_addr)
-        .await
-        .expect("relay stub listener should bind");
-    let relay_handle = tokio::spawn(async move {
-        axum::serve(relay_listener, relay_app)
-            .await
-            .expect("relay stub should serve");
-    });
+        .await;
 
     wait_for_condition("relay stub health", Duration::from_secs(5), || {
         let relay_base_url = relay_base_url.clone();
@@ -5773,6 +5711,8 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
         observed_paths[0],
         super::build_replication_drop_path(key, &version_id)
     );
+    assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 1);
+    assert_eq!(paired_session_count.load(Ordering::SeqCst), 1);
 
     let replicas = {
         let cluster = state.cluster.lock().await;
@@ -5788,9 +5728,283 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     cleanup_test_state(&state).await;
 }
 
+#[tokio::test]
+async fn execute_peer_request_reuses_warm_relay_session() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.relay_mode = super::RelayMode::Required;
+
+    let remote_node = {
+        let mut cluster = state.cluster.lock().await;
+        let node = cluster::NodeDescriptor {
+            node_id: NodeId::new_v4(),
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("https://relay-reuse-remote.example".to_string()),
+                peer_api_url: Some("https://relay-reuse-remote-internal.example".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 800_000,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        };
+        cluster.register_node(node.clone());
+        node
+    };
+
+    let relay_bind_addr = free_bind_addr();
+    let relay_base_url = format!("http://{relay_bind_addr}");
+    *state.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
+    configure_test_relay_outbound_clients(&state, &relay_base_url).await;
+
+    let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
+        spawn_cleanup_relay_stub(
+            relay_bind_addr,
+            relay_base_url.clone(),
+            transport_sdk::PeerIdentity::Node(remote_node.node_id),
+            None,
+        )
+        .await;
+
+    wait_for_condition("relay reuse stub health", Duration::from_secs(5), || {
+        let relay_base_url = relay_base_url.clone();
+        async move {
+            match reqwest::get(format!("{relay_base_url}/health")).await {
+                Ok(response) => response.status() == StatusCode::OK,
+                Err(_) => false,
+            }
+        }
+    })
+    .await;
+
+    for _ in 0..2 {
+        let response = super::execute_peer_request(
+            &state,
+            &remote_node,
+            reqwest::Method::GET,
+            "/cluster/status",
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("relay peer request should succeed");
+        assert!(response.is_success());
+    }
+
+    assert_eq!(
+        observed_paths.lock().await.as_slice(),
+        ["/cluster/status", "/cluster/status"]
+    );
+    assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 1);
+    assert_eq!(paired_session_count.load(Ordering::SeqCst), 1);
+
+    relay_handle.abort();
+    let _ = relay_handle.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn execute_peer_request_reconnects_after_relay_session_closes() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.relay_mode = super::RelayMode::Required;
+
+    let remote_node = {
+        let mut cluster = state.cluster.lock().await;
+        let node = cluster::NodeDescriptor {
+            node_id: NodeId::new_v4(),
+            reachability: cluster::NodeReachability {
+                public_api_url: Some("https://relay-reconnect-remote.example".to_string()),
+                peer_api_url: Some("https://relay-reconnect-remote-internal.example".to_string()),
+                relay_required: false,
+            },
+            capabilities: cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: true,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 800_000,
+            storage_stats: None,
+            last_heartbeat_unix: 0,
+            status: cluster::NodeStatus::Online,
+        };
+        cluster.register_node(node.clone());
+        node
+    };
+
+    let relay_bind_addr = free_bind_addr();
+    let relay_base_url = format!("http://{relay_bind_addr}");
+    *state.rendezvous_urls.lock().unwrap() = vec![relay_base_url.clone()];
+    configure_test_relay_outbound_clients(&state, &relay_base_url).await;
+
+    let (observed_paths, issued_ticket_count, paired_session_count, relay_handle) =
+        spawn_cleanup_relay_stub(
+            relay_bind_addr,
+            relay_base_url.clone(),
+            transport_sdk::PeerIdentity::Node(remote_node.node_id),
+            Some(1),
+        )
+        .await;
+
+    wait_for_condition("relay reconnect stub health", Duration::from_secs(5), || {
+        let relay_base_url = relay_base_url.clone();
+        async move {
+            match reqwest::get(format!("{relay_base_url}/health")).await {
+                Ok(response) => response.status() == StatusCode::OK,
+                Err(_) => false,
+            }
+        }
+    })
+    .await;
+
+    for _ in 0..2 {
+        let response = super::execute_peer_request(
+            &state,
+            &remote_node,
+            reqwest::Method::GET,
+            "/cluster/status",
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("relay peer request should succeed after reconnect");
+        assert!(response.is_success());
+    }
+
+    assert_eq!(
+        observed_paths.lock().await.as_slice(),
+        ["/cluster/status", "/cluster/status"]
+    );
+    assert_eq!(issued_ticket_count.load(Ordering::SeqCst), 2);
+    assert_eq!(paired_session_count.load(Ordering::SeqCst), 2);
+
+    relay_handle.abort();
+    let _ = relay_handle.await;
+    cleanup_test_state(&state).await;
+}
+
+async fn configure_test_relay_outbound_clients(state: &ServerState, relay_base_url: &str) {
+    let rendezvous_client = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id: state.cluster_id,
+            rendezvous_urls: vec![relay_base_url.to_string()],
+            heartbeat_interval_secs: 15,
+        },
+        None,
+        None,
+    )
+    .expect("rendezvous client should build");
+    super::replace_outbound_clients(
+        state,
+        super::OutboundClients {
+            internal_http: reqwest::Client::new(),
+            rendezvous_control: Some(rendezvous_client.clone()),
+            rendezvous_controls: vec![super::RendezvousEndpointClient {
+                url: relay_base_url.to_string(),
+                control: rendezvous_client,
+            }],
+        },
+    )
+    .await;
+}
+
+async fn spawn_cleanup_relay_stub(
+    relay_bind_addr: SocketAddr,
+    relay_base_url: String,
+    expected_target: transport_sdk::PeerIdentity,
+    max_requests_per_session: Option<usize>,
+) -> (
+    Arc<Mutex<Vec<String>>>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let observed_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+    let issued_ticket_count = Arc::new(AtomicUsize::new(0));
+    let paired_session_count = Arc::new(AtomicUsize::new(0));
+
+    let relay_app = Router::new()
+        .route("/health", get(|| async { StatusCode::OK }))
+        .route(
+            "/control/relay/ticket",
+            post({
+                let relay_base_url = relay_base_url.clone();
+                let expected_target = expected_target.clone();
+                let issued_ticket_count = issued_ticket_count.clone();
+                move |Json(request): Json<transport_sdk::RelayTicketRequest>| {
+                    let relay_base_url = relay_base_url.clone();
+                    let expected_target = expected_target.clone();
+                    let issued_ticket_count = issued_ticket_count.clone();
+                    async move {
+                        issued_ticket_count.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(request.target, expected_target);
+                        Json(transport_sdk::RelayTicket {
+                            cluster_id: request.cluster_id,
+                            session_id: format!("cleanup-relay-session-{}", Uuid::now_v7()),
+                            source: request.source,
+                            target: request.target,
+                            session_kind: request.session_kind,
+                            relay_urls: vec![relay_base_url],
+                            issued_at_unix: 1,
+                            expires_at_unix: 301,
+                        })
+                    }
+                }
+            }),
+        )
+        .route(
+            "/relay/tunnel/ws",
+            get({
+                let observed_paths_for_ws = observed_paths.clone();
+                let paired_session_count_for_ws = paired_session_count.clone();
+                move |websocket: axum::extract::WebSocketUpgrade| {
+                    let relay_paths = observed_paths_for_ws.clone();
+                    let expected_target = expected_target.clone();
+                    let paired_session_count = paired_session_count_for_ws.clone();
+                    async move {
+                        websocket.on_upgrade(move |socket| async move {
+                            serve_cleanup_relay_tunnel_socket(
+                                relay_paths,
+                                expected_target,
+                                paired_session_count,
+                                max_requests_per_session,
+                                socket,
+                            )
+                            .await;
+                        })
+                    }
+                }
+            }),
+        );
+    let relay_listener = tokio::net::TcpListener::bind(relay_bind_addr)
+        .await
+        .expect("relay stub listener should bind");
+    let relay_handle = tokio::spawn(async move {
+        axum::serve(relay_listener, relay_app)
+            .await
+            .expect("relay stub should serve");
+    });
+
+    (
+        observed_paths,
+        issued_ticket_count,
+        paired_session_count,
+        relay_handle,
+    )
+}
+
 async fn serve_cleanup_relay_tunnel_socket(
     relay_paths: Arc<Mutex<Vec<String>>>,
     expected_target: transport_sdk::PeerIdentity,
+    paired_session_count: Arc<AtomicUsize>,
+    max_requests_per_session: Option<usize>,
     mut socket: axum::extract::ws::WebSocket,
 ) {
     let initial = match socket.recv().await {
@@ -5803,6 +6017,7 @@ async fn serve_cleanup_relay_tunnel_socket(
         return;
     };
     assert_eq!(ticket.target, expected_target);
+    paired_session_count.fetch_add(1, Ordering::SeqCst);
 
     let session = transport_sdk::RelayTunnelSession {
         cluster_id: ticket.cluster_id,
@@ -5956,26 +6171,35 @@ async fn serve_cleanup_relay_tunnel_socket(
         }
     ));
 
-    let mut stream = session
+    let mut served_requests = 0usize;
+    while let Some(mut stream) = session
         .accept_stream()
         .await
         .expect("relay cleanup stream accept should succeed")
-        .expect("relay cleanup stream should exist");
-    let request = transport_sdk::read_buffered_transport_request(&mut stream)
+    {
+        let request = transport_sdk::read_buffered_transport_request(&mut stream)
+            .await
+            .expect("relay cleanup request should decode");
+        relay_paths.lock().await.push(request.path.clone());
+        transport_sdk::write_buffered_transport_response(
+            &mut stream,
+            &transport_sdk::BufferedTransportResponse {
+                request_id: request.request_id,
+                status: StatusCode::OK.as_u16(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        )
         .await
-        .expect("relay cleanup request should decode");
-    relay_paths.lock().await.push(request.path.clone());
-    transport_sdk::write_buffered_transport_response(
-        &mut stream,
-        &transport_sdk::BufferedTransportResponse {
-            request_id: request.request_id,
-            status: StatusCode::OK.as_u16(),
-            headers: Vec::new(),
-            body: Vec::new(),
-        },
-    )
-    .await
-    .expect("relay cleanup response should write");
+        .expect("relay cleanup response should write");
+
+        served_requests += 1;
+        if max_requests_per_session.is_some_and(|limit| served_requests >= limit) {
+            break;
+        }
+    }
+
+    let _ = session.close().await;
 }
 
 #[tokio::test]
@@ -6034,7 +6258,7 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
         None,
     )
     .expect("endpoint B rendezvous client should build");
-    *state.outbound_clients.write().await = super::OutboundClients {
+    super::replace_outbound_clients(&state, super::OutboundClients {
         internal_http: reqwest::Client::new(),
         rendezvous_control: Some(shared_client),
         rendezvous_controls: vec![
@@ -6047,7 +6271,8 @@ async fn rendezvous_presence_heartbeat_retries_all_endpoints_until_all_connected
                 control: client_b,
             },
         ],
-    };
+    })
+    .await;
 
     let registrations_a = Arc::new(Mutex::new(0u64));
     let registrations_a_state = registrations_a.clone();

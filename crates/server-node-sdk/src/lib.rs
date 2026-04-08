@@ -188,6 +188,7 @@ struct ServerState {
     node_enrollment_auto_renew_check_secs: u64,
     node_enrollment_auto_renew_state: Arc<Mutex<NodeEnrollmentAutoRenewState>>,
     outbound_clients: Arc<RwLock<OutboundClients>>,
+    peer_relay_sessions: PeerRelaySessionPool,
     metadata_commit_mode: MetadataCommitMode,
     autonomous_replication_on_put_enabled: bool,
     inflight_requests: Arc<AtomicUsize>,
@@ -358,6 +359,22 @@ struct OutboundClients {
     internal_http: reqwest::Client,
     rendezvous_control: Option<RendezvousControlClient>,
     rendezvous_controls: Vec<RendezvousEndpointClient>,
+}
+
+#[derive(Clone, Default)]
+struct PeerRelaySessionPool {
+    sessions: Arc<Mutex<HashMap<NodeId, CachedPeerRelaySession>>>,
+}
+
+#[derive(Clone)]
+struct CachedPeerRelaySession {
+    session: Arc<MultiplexedSession>,
+    relay_session: RelayTunnelSession,
+}
+
+struct EstablishedPeerRelaySession {
+    session: MultiplexedSession,
+    relay_session: RelayTunnelSession,
 }
 
 #[derive(Clone)]
@@ -1769,6 +1786,49 @@ async fn current_rendezvous_control(state: &ServerState) -> Option<RendezvousCon
         .clone()
 }
 
+async fn cached_peer_relay_session(
+    state: &ServerState,
+    node_id: NodeId,
+) -> Option<CachedPeerRelaySession> {
+    state.peer_relay_sessions
+        .sessions
+        .lock()
+        .await
+        .get(&node_id)
+        .cloned()
+}
+
+async fn invalidate_peer_relay_session(state: &ServerState, node_id: NodeId) {
+    let removed = state.peer_relay_sessions.sessions.lock().await.remove(&node_id);
+    if let Some(removed) = removed {
+        tracing::debug!(
+            peer_node_id = %node_id,
+            session_id = %removed.relay_session.session_id,
+            "invalidated cached relay peer session"
+        );
+    }
+}
+
+async fn clear_peer_relay_sessions(state: &ServerState) {
+    let cleared = {
+        let mut sessions = state.peer_relay_sessions.sessions.lock().await;
+        let cleared = sessions.len();
+        sessions.clear();
+        cleared
+    };
+    if cleared > 0 {
+        tracing::debug!(
+            cleared_sessions = cleared,
+            "cleared cached relay peer sessions after outbound client update"
+        );
+    }
+}
+
+async fn replace_outbound_clients(state: &ServerState, outbound_clients: OutboundClients) {
+    *state.outbound_clients.write().await = outbound_clients;
+    clear_peer_relay_sessions(state).await;
+}
+
 async fn current_rendezvous_endpoint_clients(state: &ServerState) -> Vec<RendezvousEndpointClient> {
     state
         .outbound_clients
@@ -2047,7 +2107,7 @@ fn build_outbound_clients(state: &ServerState) -> Result<OutboundClients> {
 
 async fn reload_live_outbound_clients(state: &ServerState) -> Result<()> {
     let outbound_clients = build_outbound_clients(state)?;
-    *state.outbound_clients.write().await = outbound_clients;
+    replace_outbound_clients(state, outbound_clients).await;
     Ok(())
 }
 
@@ -3369,6 +3429,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             rendezvous_control,
             rendezvous_controls,
         })),
+        peer_relay_sessions: PeerRelaySessionPool::default(),
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
         inflight_requests: Arc::new(AtomicUsize::new(0)),
@@ -4671,28 +4732,21 @@ async fn execute_direct_peer_request(
     })
 }
 
-async fn execute_relay_peer_request(
+async fn open_relay_peer_session(
     state: &ServerState,
+    rendezvous: &RendezvousControlClient,
     node: &NodeDescriptor,
-    method: reqwest::Method,
-    path_and_query: &str,
-    headers: Vec<RelayHttpHeader>,
-    body: Vec<u8>,
-) -> Result<PeerHttpResponse> {
-    let rendezvous = current_rendezvous_control(state)
-        .await
-        .context("relay peer transport requires rendezvous control client")?;
+) -> Result<EstablishedPeerRelaySession> {
     let ticket = rendezvous
         .issue_relay_ticket(&RelayTicketRequest {
             cluster_id: state.cluster_id,
             source: PeerIdentity::Node(state.node_id),
             target: PeerIdentity::Node(node.node_id),
             session_kind: RelayTunnelSessionKind::MultiplexTransport,
-            requested_expires_in_secs: Some(30),
+            requested_expires_in_secs: Some(300),
         })
         .await
         .with_context(|| format!("failed issuing relay ticket for node {}", node.node_id))?;
-    let normalized_path = normalize_peer_path_and_query(path_and_query)?;
     let (relay_session, session) = rendezvous
         .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
         .await
@@ -4715,54 +4769,123 @@ async fn execute_relay_peer_request(
         )
     })?;
 
-    let request = BufferedTransportRequest::new(
-        TransportStreamKind::Rpc,
-        method.as_str(),
-        normalized_path,
-        transport_headers_from_relay_headers(&headers),
-        body,
-    );
-    let result = async {
-        let mut stream = session
-            .open_stream()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed opening multiplex relay peer stream for node {}",
-                    node.node_id
-                )
-            })?;
-        write_buffered_transport_request(&mut stream, &request)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed writing multiplex relay peer request for node {}",
-                    node.node_id
-                )
-            })?;
-        let response = read_buffered_transport_response(&mut stream)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed reading multiplex relay peer response for node {}",
-                    node.node_id
-                )
-            })?;
-        Ok::<PeerHttpResponse, anyhow::Error>(peer_http_response_from_multiplex(response))
+    Ok(EstablishedPeerRelaySession {
+        session,
+        relay_session,
+    })
+}
+
+async fn ensure_relay_peer_session(
+    state: &ServerState,
+    node: &NodeDescriptor,
+) -> Result<CachedPeerRelaySession> {
+    if let Some(existing) = cached_peer_relay_session(state, node.node_id).await {
+        return Ok(existing);
     }
-    .await;
-    if let Err(err) = session
-        .close()
+
+    let rendezvous = current_rendezvous_control(state)
         .await
-    {
-        tracing::debug!(
-            error = %err,
-            peer_node_id = %node.node_id,
-            session_id = %relay_session.session_id,
-            "failed closing multiplex relay peer session"
-        );
+        .context("relay peer transport requires rendezvous control client")?;
+    let established = open_relay_peer_session(state, &rendezvous, node).await?;
+    let cached = CachedPeerRelaySession {
+        session: Arc::new(established.session),
+        relay_session: established.relay_session,
+    };
+
+    let mut sessions = state.peer_relay_sessions.sessions.lock().await;
+    if let Some(existing) = sessions.get(&node.node_id).cloned() {
+        drop(sessions);
+        if let Ok(unused_session) = Arc::try_unwrap(cached.session) {
+            if let Err(err) = unused_session.close().await {
+                tracing::debug!(
+                    error = %err,
+                    peer_node_id = %node.node_id,
+                    session_id = %cached.relay_session.session_id,
+                    "failed closing redundant relay peer session"
+                );
+            }
+        }
+        return Ok(existing);
     }
-    result
+
+    sessions.insert(node.node_id, cached.clone());
+    Ok(cached)
+}
+
+async fn execute_relay_peer_request(
+    state: &ServerState,
+    node: &NodeDescriptor,
+    method: reqwest::Method,
+    path_and_query: &str,
+    headers: Vec<RelayHttpHeader>,
+    body: Vec<u8>,
+) -> Result<PeerHttpResponse> {
+    let normalized_path = normalize_peer_path_and_query(path_and_query)?;
+    let request_headers = transport_headers_from_relay_headers(&headers);
+
+    for attempt in 0..2 {
+        let cached = ensure_relay_peer_session(state, node).await?;
+        let request = BufferedTransportRequest::new(
+            TransportStreamKind::Rpc,
+            method.as_str(),
+            normalized_path.clone(),
+            request_headers.clone(),
+            body.clone(),
+        );
+
+        let result = async {
+            let mut stream = cached
+                .session
+                .open_stream()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed opening multiplex relay peer stream for node {}",
+                        node.node_id
+                    )
+                })?;
+            write_buffered_transport_request(&mut stream, &request)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed writing multiplex relay peer request for node {}",
+                        node.node_id
+                    )
+                })?;
+            let response = read_buffered_transport_response(&mut stream)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed reading multiplex relay peer response for node {}",
+                        node.node_id
+                    )
+                })?;
+            Ok::<PeerHttpResponse, anyhow::Error>(peer_http_response_from_multiplex(response))
+        }
+        .await;
+
+        match result {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt == 0 => {
+                invalidate_peer_relay_session(state, node.node_id).await;
+                tracing::debug!(
+                    error = %err,
+                    peer_node_id = %node.node_id,
+                    session_id = %cached.relay_session.session_id,
+                    "retrying relay peer request after resetting cached session"
+                );
+            }
+            Err(err) => {
+                invalidate_peer_relay_session(state, node.node_id).await;
+                return Err(err);
+            }
+        }
+    }
+
+    bail!(
+        "relay peer request retried without producing a response for node {}",
+        node.node_id
+    )
 }
 
 fn join_peer_url(base_url: &str, path_and_query: &str) -> Result<reqwest::Url> {
@@ -12440,7 +12563,7 @@ async fn update_rendezvous_config(
     };
 
     replace_rendezvous_urls(&state, effective_urls);
-    *state.outbound_clients.write().await = outbound_clients;
+    replace_outbound_clients(&state, outbound_clients).await;
     sync_rendezvous_registration_state(&state).await;
     let view = build_rendezvous_config_view(&state, persisted).await;
 

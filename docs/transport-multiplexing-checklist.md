@@ -41,10 +41,10 @@ Primary files:
 
 ### Milestone 2: Persistent relay sessions
 
-- [ ] Replace one-request relay tunnel semantics with long-lived paired relay sessions.
-- [ ] Keep relay tickets and pairing, but pair once per session instead of once per request.
-- [ ] Remove relay-HTTP request/response semantics from the transport design.
-- [ ] Add tests covering relay session reuse and reconnect behavior.
+- [x] Replace one-request relay tunnel semantics with long-lived paired relay sessions.
+- [x] Keep relay tickets and pairing, but pair once per session instead of once per request.
+- [x] Remove relay-HTTP request/response semantics from the transport design.
+- [x] Add tests covering relay session reuse and reconnect behavior.
 
 Current slice landed:
 
@@ -54,15 +54,18 @@ Current slice landed:
 - [x] Add buffered multiplexed RPC framing and transport handshakes for Yamux streams.
 - [x] Rewire buffered relay requests in `client-sdk` and `server-node` to use a warm multiplexed relay session.
 - [x] Rewire server-node peer replication and cleanup requests to use multiplexed relay sessions instead of the legacy HTTP-over-tunnel wire format.
-- [ ] Keep the remaining server-node relay traffic warm and reused instead of reconnecting a fresh multiplexed relay session per peer request.
+- [x] Keep the remaining server-node relay traffic warm and reused instead of reconnecting a fresh multiplexed relay session per peer request.
+- [x] Add server-node coverage proving relay peer requests reuse a warm session and reconnect cleanly after that cached session closes.
 
 Primary files:
 
-- [ ] [crates/transport-sdk/src/rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous.rs)
-- [ ] [crates/transport-sdk/src/rendezvous_runtime.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous_runtime.rs)
-- [ ] [crates/transport-sdk/src/relay_tunnel.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay_tunnel.rs)
-- [ ] [apps/rendezvous-service/src/main.rs](/home/uli/rust-dev/ironmesh/apps/rendezvous-service/src/main.rs)
-- [ ] [crates/server-node-sdk/src/embedded_rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/embedded_rendezvous.rs)
+- [x] [crates/transport-sdk/src/rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous.rs)
+- [x] [crates/transport-sdk/src/rendezvous_runtime.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous_runtime.rs)
+- [x] [crates/transport-sdk/src/relay_tunnel.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay_tunnel.rs)
+- [x] [apps/rendezvous-service/src/main.rs](/home/uli/rust-dev/ironmesh/apps/rendezvous-service/src/main.rs)
+- [x] [crates/server-node-sdk/src/embedded_rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/embedded_rendezvous.rs)
+- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/server-node-sdk/src/main_tests.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/main_tests.rs)
 
 ### Milestone 3: Direct multiplexed server transport
 
@@ -289,3 +292,9 @@ Primary files:
   - `cargo test -p client-sdk relay_transport`
   - `cargo test -p rendezvous-service relay_client_device_flows_through_mtls_authenticated_rendezvous`
   - `cargo test -p rendezvous-service bootstrap_claim_redeem_flows_through_mtls_rendezvous_without_client_cert`
+- [x] 2026-04-08: Keep server-node peer relay traffic on warm cached multiplexed sessions and add regression coverage for both reuse and reconnect-after-close behavior.
+  Verification:
+  - `cargo check -p server-node-sdk`
+  - `cargo test -p server-node-sdk execute_replication_cleanup_routes_remote_drop_through_relay`
+  - `cargo test -p server-node-sdk execute_peer_request_reuses_warm_relay_session`
+  - `cargo test -p server-node-sdk execute_peer_request_reconnects_after_relay_session_closes`
