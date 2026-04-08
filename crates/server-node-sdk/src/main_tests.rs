@@ -33,10 +33,12 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use bytes::Bytes;
+use futures_util::{Sink, Stream};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::task::{Context, Poll};
 use tokio::time::{Duration, Instant};
 use tower::{Service, ServiceExt};
 use uuid::Uuid;
@@ -5658,6 +5660,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
                             session_id: "cleanup-relay-session".to_string(),
                             source: request.source,
                             target: request.target,
+                            session_kind: request.session_kind,
                             relay_urls: vec![relay_base_url],
                             issued_at_unix: 1,
                             expires_at_unix: 301,
@@ -5806,6 +5809,7 @@ async fn serve_cleanup_relay_tunnel_socket(
         session_id: ticket.session_id.clone(),
         source: ticket.source.clone(),
         target: ticket.target.clone(),
+        session_kind: ticket.session_kind,
     };
     socket
         .send(axum::extract::ws::Message::Text(
@@ -5816,54 +5820,162 @@ async fn serve_cleanup_relay_tunnel_socket(
         .await
         .expect("paired relay response should send");
 
-    let mut request_bytes = Vec::new();
-    loop {
-        match socket.recv().await {
-            Some(Ok(axum::extract::ws::Message::Binary(bytes))) => {
-                request_bytes.extend_from_slice(&bytes);
-            }
-            Some(Ok(axum::extract::ws::Message::Text(text))) => {
-                let control: transport_sdk::RelayTunnelControlMessage =
-                    serde_json::from_str(&text).expect("relay cleanup control should parse");
-                if matches!(control, transport_sdk::RelayTunnelControlMessage::CloseWrite) {
-                    break;
-                }
-            }
-            Some(Ok(axum::extract::ws::Message::Close(_))) | None => return,
-            Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
-                socket
-                    .send(axum::extract::ws::Message::Pong(payload))
-                    .await
-                    .expect("relay cleanup pong should send");
-            }
-            Some(Ok(axum::extract::ws::Message::Pong(_))) => {}
-            #[allow(unreachable_patterns)]
-            Some(Ok(_)) => {}
-            Some(Err(_)) => return,
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RelayCleanupWsMessage {
+        Binary(Vec<u8>),
+        Text(String),
+        Ping(Vec<u8>),
+        Pong(Vec<u8>),
+        Close,
+    }
+
+    impl transport_sdk::WebSocketMessageCodec for RelayCleanupWsMessage {
+        fn decode(self) -> std::io::Result<transport_sdk::DecodedWebSocketMessage> {
+            Ok(match self {
+                Self::Binary(bytes) => transport_sdk::DecodedWebSocketMessage::Binary(bytes),
+                Self::Text(_) => transport_sdk::DecodedWebSocketMessage::Ignore,
+                Self::Ping(payload) => transport_sdk::DecodedWebSocketMessage::Ping(payload),
+                Self::Pong(_) => transport_sdk::DecodedWebSocketMessage::Pong,
+                Self::Close => transport_sdk::DecodedWebSocketMessage::Close,
+            })
+        }
+
+        fn binary(bytes: Vec<u8>) -> Self {
+            Self::Binary(bytes)
+        }
+
+        fn pong(bytes: Vec<u8>) -> Self {
+            Self::Pong(bytes)
         }
     }
 
-    let request = transport_sdk::parse_relay_wire_http_request(&request_bytes)
-        .expect("relay cleanup request should parse");
-    relay_paths.lock().await.push(request.path_and_query);
+    struct RelayCleanupSocketAdapter {
+        socket: axum::extract::ws::WebSocket,
+    }
 
-    let response_head = transport_sdk::encode_relay_wire_http_response_head(
-        StatusCode::OK.as_u16(),
-        &[],
+    impl Stream for RelayCleanupSocketAdapter {
+        type Item = Result<RelayCleanupWsMessage, axum::Error>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            match Pin::new(&mut this.socket).poll_next(cx) {
+                Poll::Ready(Some(Ok(axum::extract::ws::Message::Binary(bytes)))) => {
+                    Poll::Ready(Some(Ok(RelayCleanupWsMessage::Binary(bytes.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(axum::extract::ws::Message::Text(text)))) => {
+                    Poll::Ready(Some(Ok(RelayCleanupWsMessage::Text(text.to_string()))))
+                }
+                Poll::Ready(Some(Ok(axum::extract::ws::Message::Ping(payload)))) => {
+                    Poll::Ready(Some(Ok(RelayCleanupWsMessage::Ping(payload.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(axum::extract::ws::Message::Pong(payload)))) => {
+                    Poll::Ready(Some(Ok(RelayCleanupWsMessage::Pong(payload.to_vec()))))
+                }
+                Poll::Ready(Some(Ok(axum::extract::ws::Message::Close(_)))) => {
+                    Poll::Ready(Some(Ok(RelayCleanupWsMessage::Close)))
+                }
+                Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl Sink<RelayCleanupWsMessage> for RelayCleanupSocketAdapter {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_ready(cx)
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            item: RelayCleanupWsMessage,
+        ) -> Result<(), Self::Error> {
+            let message = match item {
+                RelayCleanupWsMessage::Binary(bytes) => {
+                    axum::extract::ws::Message::Binary(bytes.into())
+                }
+                RelayCleanupWsMessage::Text(text) => {
+                    axum::extract::ws::Message::Text(text.into())
+                }
+                RelayCleanupWsMessage::Ping(payload) => {
+                    axum::extract::ws::Message::Ping(payload.into())
+                }
+                RelayCleanupWsMessage::Pong(payload) => {
+                    axum::extract::ws::Message::Pong(payload.into())
+                }
+                RelayCleanupWsMessage::Close => axum::extract::ws::Message::Close(None),
+            };
+            Pin::new(&mut self.get_mut().socket).start_send(message)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_flush(cx)
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().socket).poll_close(cx)
+        }
+    }
+
+    let transport = transport_sdk::WebSocketByteStream::new(RelayCleanupSocketAdapter { socket });
+    let mut session = transport_sdk::MultiplexedSession::spawn(
+        transport,
+        transport_sdk::MultiplexMode::Server,
+        transport_sdk::MultiplexConfig::default(),
     )
-    .expect("relay cleanup response head should encode");
-    socket
-        .send(axum::extract::ws::Message::Binary(response_head.into()))
+    .expect("relay cleanup multiplexed session should spawn");
+    let hello = transport_sdk::perform_transport_server_handshake(
+        &mut session,
+        transport_sdk::TransportSessionControlMessage::Ready {
+            protocol_version: transport_sdk::TRANSPORT_PROTOCOL_VERSION,
+            session_id: "cleanup-relay-session".to_string(),
+            max_concurrent_streams: transport_sdk::MultiplexConfig::default().max_num_streams,
+        },
+    )
+    .await
+    .expect("relay cleanup transport handshake should succeed");
+    assert!(matches!(
+        hello,
+        transport_sdk::TransportSessionControlMessage::Hello {
+            role: transport_sdk::TransportSessionRole::Node,
+            ..
+        }
+    ));
+
+    let mut stream = session
+        .accept_stream()
         .await
-        .expect("relay cleanup response head should send");
-    socket
-        .send(axum::extract::ws::Message::Text(
-            serde_json::to_string(&transport_sdk::RelayTunnelControlMessage::CloseWrite)
-                .expect("relay cleanup close_write should serialize")
-                .into(),
-        ))
+        .expect("relay cleanup stream accept should succeed")
+        .expect("relay cleanup stream should exist");
+    let request = transport_sdk::read_buffered_transport_request(&mut stream)
         .await
-        .expect("relay cleanup close_write should send");
+        .expect("relay cleanup request should decode");
+    relay_paths.lock().await.push(request.path.clone());
+    transport_sdk::write_buffered_transport_response(
+        &mut stream,
+        &transport_sdk::BufferedTransportResponse {
+            request_id: request.request_id,
+            status: StatusCode::OK.as_u16(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        },
+    )
+    .await
+    .expect("relay cleanup response should write");
 }
 
 #[tokio::test]

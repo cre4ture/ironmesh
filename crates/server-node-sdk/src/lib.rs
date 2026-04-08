@@ -76,11 +76,12 @@ use transport_sdk::{
     RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
     SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader,
     TransportPathKind, TransportRequestHead, TransportResponseHead,
-    TransportSessionControlMessage, TransportStreamKind, credential_fingerprint, encode_optional_body_base64, encode_relay_wire_http_request,
-    encode_relay_wire_http_response_head, parse_relay_wire_http_head_response,
-    parse_relay_wire_http_request, parse_relay_wire_http_response, perform_transport_server_handshake,
-    read_transport_request_head,
+    TransportSessionControlMessage, TransportSessionRole, TransportStreamKind, credential_fingerprint, encode_optional_body_base64,
+    encode_relay_wire_http_response_head, parse_relay_wire_http_request,
+    perform_transport_client_handshake, perform_transport_server_handshake,
+    read_buffered_transport_response, read_transport_request_head,
     verify_signed_request_headers, write_buffered_transport_response,
+    write_buffered_transport_request,
     write_transport_response_head,
 };
 use uuid::Uuid;
@@ -4690,47 +4691,82 @@ async fn execute_relay_peer_request(
             cluster_id: state.cluster_id,
             source: PeerIdentity::Node(state.node_id),
             target: PeerIdentity::Node(node.node_id),
-            session_kind: RelayTunnelSessionKind::LegacyHttpTunnel,
+            session_kind: RelayTunnelSessionKind::MultiplexTransport,
             requested_expires_in_secs: Some(30),
         })
         .await
         .with_context(|| format!("failed issuing relay ticket for node {}", node.node_id))?;
-    let mut tunnel = rendezvous
-        .connect_relay_tunnel_source(&ticket)
+    let normalized_path = normalize_peer_path_and_query(path_and_query)?;
+    let (relay_session, session) = rendezvous
+        .connect_relay_multiplex_source(&ticket, MultiplexConfig::default())
         .await
-        .with_context(|| format!("failed opening relay tunnel for node {}", node.node_id))?;
-    let request_bytes = encode_relay_wire_http_request(
-        method.as_str(),
-        &normalize_peer_path_and_query(path_and_query)?,
-        &relay_tunnel_request_host(node.node_id),
-        &headers,
-        &body,
+        .with_context(|| format!("failed opening multiplex relay session for node {}", node.node_id))?;
+    perform_transport_client_handshake(
+        &session,
+        TransportSessionControlMessage::Hello {
+            protocol_version: TRANSPORT_PROTOCOL_VERSION,
+            cluster_id: state.cluster_id,
+            role: TransportSessionRole::Node,
+            peer: PeerIdentity::Node(state.node_id),
+            target: Some(PeerIdentity::Node(node.node_id)),
+        },
     )
-    .context("failed encoding relayed peer HTTP request")?;
-    send_relay_tunnel_bytes(&mut tunnel, &request_bytes).await?;
-    tunnel
-        .send_close_write()
-        .await
-        .context("failed finishing relayed peer HTTP request")?;
+    .await
+    .with_context(|| {
+        format!(
+            "failed completing multiplex relay handshake for session {} to node {}",
+            relay_session.session_id, node.node_id
+        )
+    })?;
 
-    let response_bytes = collect_relay_tunnel_bytes(&mut tunnel).await?;
-    let _ = tunnel.close().await;
-    let response = if method == reqwest::Method::HEAD {
-        parse_relay_wire_http_head_response(&response_bytes)
-    } else {
-        parse_relay_wire_http_response(&response_bytes)
+    let request = BufferedTransportRequest::new(
+        TransportStreamKind::Rpc,
+        method.as_str(),
+        normalized_path,
+        transport_headers_from_relay_headers(&headers),
+        body,
+    );
+    let result = async {
+        let mut stream = session
+            .open_stream()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed opening multiplex relay peer stream for node {}",
+                    node.node_id
+                )
+            })?;
+        write_buffered_transport_request(&mut stream, &request)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed writing multiplex relay peer request for node {}",
+                    node.node_id
+                )
+            })?;
+        let response = read_buffered_transport_response(&mut stream)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed reading multiplex relay peer response for node {}",
+                    node.node_id
+                )
+            })?;
+        Ok::<PeerHttpResponse, anyhow::Error>(peer_http_response_from_multiplex(response))
     }
-    .context("failed parsing relayed peer HTTP response")?;
-
-    Ok(PeerHttpResponse {
-        status: response.status,
-        headers: response.headers,
-        body: Bytes::from(response.body),
-    })
-}
-
-fn relay_tunnel_request_host(node_id: NodeId) -> String {
-    format!("peer-{node_id}")
+    .await;
+    if let Err(err) = session
+        .close()
+        .await
+    {
+        tracing::debug!(
+            error = %err,
+            peer_node_id = %node.node_id,
+            session_id = %relay_session.session_id,
+            "failed closing multiplex relay peer session"
+        );
+    }
+    result
 }
 
 async fn send_relay_tunnel_bytes(tunnel: &mut RelayTunnelClient, bytes: &[u8]) -> Result<()> {
@@ -5024,6 +5060,34 @@ fn transport_headers_from_response(headers: &HeaderMap) -> Vec<TransportHeader> 
             })
         })
         .collect()
+}
+
+fn transport_headers_from_relay_headers(headers: &[RelayHttpHeader]) -> Vec<TransportHeader> {
+    headers
+        .iter()
+        .map(|header| TransportHeader {
+            name: header.name.clone(),
+            value: header.value.clone(),
+        })
+        .collect()
+}
+
+fn relay_headers_from_transport_headers(headers: &[TransportHeader]) -> Vec<RelayHttpHeader> {
+    headers
+        .iter()
+        .map(|header| RelayHttpHeader {
+            name: header.name.clone(),
+            value: header.value.clone(),
+        })
+        .collect()
+}
+
+fn peer_http_response_from_multiplex(response: BufferedTransportResponse) -> PeerHttpResponse {
+    PeerHttpResponse {
+        status: response.status,
+        headers: relay_headers_from_transport_headers(&response.headers),
+        body: Bytes::from(response.body),
+    }
 }
 
 fn buffered_transport_error_response(

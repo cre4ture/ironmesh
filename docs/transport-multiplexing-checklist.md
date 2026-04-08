@@ -53,7 +53,8 @@ Current slice landed:
 - [x] Separate legacy relay tunnels from multiplexed relay sessions with explicit `session_kind` routing keys.
 - [x] Add buffered multiplexed RPC framing and transport handshakes for Yamux streams.
 - [x] Rewire buffered relay requests in `client-sdk` and `server-node` to use a warm multiplexed relay session.
-- [ ] Rewire the remaining server-node and client relay call paths to keep all relay traffic warm and reused.
+- [x] Rewire server-node peer replication and cleanup requests to use multiplexed relay sessions instead of the legacy HTTP-over-tunnel wire format.
+- [ ] Keep the remaining server-node relay traffic warm and reused instead of reconnecting a fresh multiplexed relay session per peer request.
 
 Primary files:
 
@@ -257,3 +258,7 @@ Primary files:
   - `cargo test -p client-sdk relay_transport`
   - `cargo test -p client-sdk blocking_range_download_handles_concurrent_overlapping_requests`
   - `cargo check -p transport-sdk -p server-node-sdk -p client-sdk`
+- [x] 2026-04-08: Migrate server-node peer replication and cleanup requests off the legacy relay tunnel wire format and onto multiplexed relay sessions.
+  Verification:
+  - `cargo check -p server-node-sdk -p transport-sdk`
+  - `cargo test -p server-node-sdk execute_replication_cleanup_routes_remote_drop_through_relay`
