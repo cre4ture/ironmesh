@@ -89,19 +89,19 @@ Primary files:
 
 ### Milestone 4: Shared server transport service layer
 
-- [ ] Extract store/media/cluster/diagnostic operations from HTTP-only handlers.
-- [ ] Make HTTP and multiplexed transport call the same internal async service functions.
-- [ ] Stop bouncing relayed requests through local HTTP.
+- [x] Extract store/media/cluster/diagnostic operations from HTTP-only handlers.
+- [x] Make HTTP and multiplexed transport call the same internal async service functions.
+- [x] Stop bouncing relayed requests through local HTTP.
 
 Current slice landed:
 
 - [x] Route current multiplexed health, cluster, diagnostics, store index, object read, thumbnail, and version-list requests through `transport_service`.
-- [x] Keep a bounded local-HTTP fallback only for buffered routes that have not been migrated into the shared service layer yet.
+- [x] Replace the remaining buffered-route loopback `reqwest` fallback with in-process Axum dispatch that reuses the same public and internal route handlers without a local HTTP hop.
 
 Primary files:
 
-- [ ] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
-- [ ] [crates/server-node-sdk/src/transport_service.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/transport_service.rs)
+- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/server-node-sdk/src/transport_service.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/transport_service.rs)
 
 ### Milestone 5: Client session pool and path management
 
@@ -312,3 +312,8 @@ Primary files:
   - `cargo test -p client-sdk relay_transport`
   - `cargo test -p client-sdk latency_probe`
   - `cargo check -p cli-client -p web-ui-backend`
+- [x] 2026-04-08: Remove the remaining local loopback HTTP hop from buffered transport execution by dispatching fallback routes in-process against the existing public and internal Axum route graphs.
+  Verification:
+  - `cargo check -p server-node-sdk`
+  - `cargo test -p server-node-sdk execute_replication_cleanup_routes_remote_drop_through_relay`
+  - `cargo test -p system-tests content_addressed_client_cache_persists_and_reuses_local_content`

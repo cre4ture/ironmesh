@@ -1,28 +1,51 @@
 use anyhow::{Context, Result};
-use axum::body::to_bytes;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, HeaderValue, Uri};
+use axum::http::{HeaderMap, HeaderValue, Request, Uri};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::Router;
 use percent_encoding::percent_decode_str;
+use tower::ServiceExt;
 
 use crate::{
-    BufferedTransportRequest, BufferedTransportResponse, ServerState, StoreIndexQuery,
-    TransportHeader, cluster_status, get_media_thumbnail_response, get_object_response, health,
-    join_peer_url, latency_diagnostic, list_nodes, list_store_index_response,
-    list_versions_response, transport_headers_from_response,
+    BufferedTransportRequest, BufferedTransportResponse, InternalCaller, ServerState,
+    StoreIndexQuery, TransportHeader, cluster_status, complete_upload_session_route,
+    commit_version, confirm_version, copy_object_path, delete_object, delete_object_by_query,
+    delete_upload_session, drop_replication_subject, enroll_client_device,
+    execute_replication_cleanup, export_metadata_bundle, export_provisional_versions,
+    export_replication_bundle, get_media_thumbnail, get_media_thumbnail_response, get_object,
+    get_object_response, get_replication_chunk, get_upload_session, head_object, health,
+    latency_diagnostic, list_nodes, list_snapshots, list_store_index,
+    list_tombstone_archives,
+    list_store_index_response, list_versions, list_versions_response, local_available_subjects,
+    local_metadata_subjects, placement_for_key, push_replication_chunk,
+    push_replication_manifest, put_object, redeem_client_bootstrap_claim, reconcile_from_node,
+    rename_object_path, replication, replication_plan, require_client_auth,
+    require_client_or_admin_auth, require_internal_caller, restore_snapshot_path,
+    run_cleanup, run_tombstone_archive_purge, run_tombstone_archive_restore,
+    run_tombstone_compaction, start_upload_session, storage_stats_current,
+    storage_stats_history, transport_headers_from_response, trigger_replication_audit,
+    upload_session_chunk, wait_for_store_index_change,
 };
+
+#[derive(Clone)]
+pub(super) enum TransportExecutionScope {
+    Public,
+    Internal(InternalCaller),
+}
 
 pub(super) async fn execute_buffered_transport_request(
     state: &ServerState,
-    local_http: &reqwest::Client,
-    local_base_url: &str,
+    scope: &TransportExecutionScope,
     request: &BufferedTransportRequest,
 ) -> Result<BufferedTransportResponse> {
     if let Some(response) = try_execute_direct_transport_request(state, request).await? {
         return Ok(response);
     }
 
-    execute_fallback_local_http_request(local_http, local_base_url, request).await
+    execute_fallback_local_router_request(state, scope, request).await
 }
 
 async fn try_execute_direct_transport_request(
@@ -87,49 +110,47 @@ async fn try_execute_direct_transport_request(
     ))
 }
 
-async fn execute_fallback_local_http_request(
-    local_http: &reqwest::Client,
-    local_base_url: &str,
+async fn execute_fallback_local_router_request(
+    state: &ServerState,
+    scope: &TransportExecutionScope,
     request: &BufferedTransportRequest,
 ) -> Result<BufferedTransportResponse> {
-    let url = join_peer_url(local_base_url, &request.path)?;
-    let method = reqwest::Method::from_bytes(request.method.as_bytes()).with_context(|| {
+    let method = request.method.parse::<axum::http::Method>().with_context(|| {
         format!(
             "invalid multiplexed transport fallback HTTP method {}",
             request.method
         )
     })?;
-    let mut outbound = local_http.request(method, url);
+    let uri: Uri = request.path.parse().with_context(|| {
+        format!("invalid multiplexed transport fallback URI {}", request.path)
+    })?;
+    let mut builder = Request::builder().method(method).uri(uri);
     for header in &request.headers {
         if header.name.eq_ignore_ascii_case("host")
             || header.name.eq_ignore_ascii_case("content-length")
         {
             continue;
         }
-        outbound = outbound.header(&header.name, &header.value);
+        builder = builder.header(&header.name, &header.value);
     }
-    if !request.body.is_empty() {
-        outbound = outbound.body(request.body.clone());
+    let mut outbound = builder
+        .body(Body::from(request.body.clone()))
+        .context("failed building fallback local multiplex transport request")?;
+    if let TransportExecutionScope::Internal(caller) = scope {
+        outbound.extensions_mut().insert(caller.clone());
     }
 
-    let response = outbound
-        .send()
-        .await
-        .context("failed executing fallback local multiplex transport request")?;
-    let status = response.status().as_u16();
-    let headers = transport_headers_from_response(response.headers());
-    let body = response
-        .bytes()
-        .await
-        .context("failed reading fallback local multiplex transport response body")?
-        .to_vec();
-
-    Ok(BufferedTransportResponse {
-        request_id: request.request_id.clone(),
-        status,
-        headers,
-        body,
-    })
+    let response = match scope {
+        TransportExecutionScope::Public => build_public_transport_router(state.clone())
+            .oneshot(outbound)
+            .await
+            .context("failed executing public fallback local multiplex transport request")?,
+        TransportExecutionScope::Internal(_) => build_internal_transport_router(state.clone())
+            .oneshot(outbound)
+            .await
+            .context("failed executing internal fallback local multiplex transport request")?,
+    };
+    buffered_response_from_axum_response(request.request_id.clone(), response).await
 }
 
 pub(super) fn parse_query<T>(path_and_query: &str) -> Result<T>
@@ -180,4 +201,186 @@ async fn buffered_response_from_axum_response(
         headers: transport_headers_from_response(&parts.headers),
         body: body.to_vec(),
     })
+}
+
+fn build_public_transport_router(state: ServerState) -> Router {
+    let public_client_api = Router::new()
+        .route("/diagnostics/latency", get(latency_diagnostic))
+        .route("/snapshots", get(list_snapshots))
+        .route("/store/index", get(list_store_index))
+        .route(
+            "/store/index/changes/wait",
+            get(wait_for_store_index_change),
+        )
+        .route("/store/uploads/start", post(start_upload_session))
+        .route(
+            "/store/uploads/{upload_id}",
+            get(get_upload_session).delete(delete_upload_session),
+        )
+        .route(
+            "/store/uploads/{upload_id}/chunk/{index}",
+            put(upload_session_chunk),
+        )
+        .route(
+            "/store/uploads/{upload_id}/complete",
+            post(complete_upload_session_route),
+        )
+        .route("/media/thumbnail", get(get_media_thumbnail))
+        .route("/store/delete", post(delete_object_by_query))
+        .route("/store/rename", post(rename_object_path))
+        .route("/store/copy", post(copy_object_path))
+        .route("/store/restore", post(restore_snapshot_path))
+        .route(
+            "/store/{key}",
+            put(put_object)
+                .get(get_object)
+                .head(head_object)
+                .delete(delete_object),
+        )
+        .route("/versions/{key}", get(list_versions))
+        .route(
+            "/versions/{key}/confirm/{version_id}",
+            post(confirm_version),
+        )
+        .route("/versions/{key}/commit/{version_id}", post(commit_version))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_auth,
+        ));
+
+    let public_cluster_info_api = Router::new()
+        .route("/cluster/status", get(cluster_status))
+        .route("/cluster/nodes", get(list_nodes))
+        .route("/cluster/replication/plan", get(replication_plan))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_or_admin_auth,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .route(
+            "/auth/bootstrap-claims/redeem",
+            post(redeem_client_bootstrap_claim),
+        )
+        .route("/auth/device/enroll", post(enroll_client_device))
+        .route("/storage/stats/current", get(storage_stats_current))
+        .route("/storage/stats/history", get(storage_stats_history))
+        .route("/cluster/placement/{key}", get(placement_for_key))
+        .route(
+            "/cluster/replication/audit",
+            post(trigger_replication_audit),
+        )
+        .route(
+            "/cluster/replication/repair",
+            post(replication::execute_replication_repair),
+        )
+        .route(
+            "/cluster/replication/cleanup",
+            post(execute_replication_cleanup),
+        )
+        .route("/cluster/reconcile/{node_id}", post(reconcile_from_node))
+        .route("/maintenance/cleanup", post(run_cleanup))
+        .route(
+            "/maintenance/tombstones/compact",
+            post(run_tombstone_compaction),
+        )
+        .route(
+            "/maintenance/tombstones/archive",
+            get(list_tombstone_archives),
+        )
+        .route(
+            "/maintenance/tombstones/archive/restore",
+            post(run_tombstone_archive_restore),
+        )
+        .route(
+            "/maintenance/tombstones/archive/purge",
+            post(run_tombstone_archive_purge),
+        )
+        .merge(public_cluster_info_api)
+        .merge(public_client_api)
+        .with_state(state)
+}
+
+fn build_internal_transport_router(state: ServerState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/diagnostics/latency", get(latency_diagnostic))
+        .route(
+            "/auth/bootstrap-claims/redeem",
+            post(redeem_client_bootstrap_claim),
+        )
+        .route("/auth/device/enroll", post(enroll_client_device))
+        .route("/cluster/status", get(cluster_status))
+        .route("/cluster/nodes", get(list_nodes))
+        .route("/storage/stats/current", get(storage_stats_current))
+        .route("/storage/stats/history", get(storage_stats_history))
+        .route("/cluster/placement/{key}", get(placement_for_key))
+        .route("/cluster/replication/plan", get(replication_plan))
+        .route("/snapshots", get(list_snapshots))
+        .route("/store/index", get(list_store_index))
+        .route(
+            "/store/index/changes/wait",
+            get(wait_for_store_index_change),
+        )
+        .route("/store/uploads/start", post(start_upload_session))
+        .route(
+            "/store/uploads/{upload_id}",
+            get(get_upload_session).delete(delete_upload_session),
+        )
+        .route(
+            "/store/uploads/{upload_id}/chunk/{index}",
+            put(upload_session_chunk),
+        )
+        .route(
+            "/store/uploads/{upload_id}/complete",
+            post(complete_upload_session_route),
+        )
+        .route("/media/thumbnail", get(get_media_thumbnail))
+        .route("/store/delete", post(delete_object_by_query))
+        .route("/store/rename", post(rename_object_path))
+        .route("/store/copy", post(copy_object_path))
+        .route("/store/restore", post(restore_snapshot_path))
+        .route(
+            "/store/{key}",
+            put(put_object)
+                .get(get_object)
+                .head(head_object)
+                .delete(delete_object),
+        )
+        .route("/versions/{key}", get(list_versions))
+        .route(
+            "/versions/{key}/confirm/{version_id}",
+            post(confirm_version),
+        )
+        .route("/versions/{key}/commit/{version_id}", post(commit_version))
+        .route("/cluster/availability/subjects/local", get(local_available_subjects))
+        .route("/cluster/metadata/subjects/local", get(local_metadata_subjects))
+        .route(
+            "/cluster/replication/export",
+            get(export_replication_bundle),
+        )
+        .route("/cluster/metadata/export", get(export_metadata_bundle))
+        .route(
+            "/cluster/replication/chunk/{hash}",
+            get(get_replication_chunk),
+        )
+        .route(
+            "/cluster/replication/push/chunk/{hash}",
+            post(push_replication_chunk),
+        )
+        .route(
+            "/cluster/replication/push/manifest",
+            post(push_replication_manifest),
+        )
+        .route("/cluster/replication/drop", post(drop_replication_subject))
+        .route(
+            "/cluster/reconcile/export/provisional",
+            get(export_provisional_versions),
+        )
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state,
+            require_internal_caller,
+        ))
 }

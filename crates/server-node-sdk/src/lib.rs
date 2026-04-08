@@ -3514,21 +3514,8 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             config.peer_heartbeat_interval_secs,
         );
 
-        let relay_self_base_url = config
-            .internal_tls
-            .as_ref()
-            .and_then(|tls| tls.internal_url.clone())
-            .or_else(|| {
-                if config.public_peer_api_enabled {
-                    Some(public_url.clone())
-                } else {
-                    None
-                }
-            });
-        if state.relay_mode != RelayMode::Disabled
-            && let Some(self_base_url) = relay_self_base_url
-        {
-            spawn_rendezvous_relay_multiplex_agent(state.clone(), self_base_url.clone());
+        if state.relay_mode != RelayMode::Disabled {
+            spawn_rendezvous_relay_multiplex_agent(state.clone());
         }
     }
 
@@ -5010,43 +4997,10 @@ impl Sink<DirectTransportWsMessage> for DirectTransportSocketAdapter {
     }
 }
 
-fn direct_transport_base_url(state: &ServerState, headers: &HeaderMap) -> Result<String> {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("direct transport websocket request is missing a host header"))?;
-    let scheme = if state.public_tls_runtime.is_some() {
-        "https"
-    } else {
-        "http"
-    };
-    Ok(format!("{scheme}://{host}/"))
-}
-
-fn direct_transport_http_client(state: &ServerState) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
-    if let Some(ca_pem) = state
-        .public_ca_pem
-        .as_deref()
-        .or(state.cluster_ca_pem.as_deref())
-    {
-        let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
-            .context("failed parsing direct transport public CA certificate")?;
-        builder = builder.add_root_certificate(certificate);
-    }
-    builder
-        .build()
-        .context("failed building direct transport local HTTP client")
-}
-
 async fn serve_direct_transport_session(
     state: ServerState,
     peer: PeerIdentity,
     mut session: MultiplexedSession,
-    local_http: reqwest::Client,
-    local_base_url: String,
 ) -> Result<()> {
     let hello = perform_transport_server_handshake(
         &mut session,
@@ -5090,12 +5044,14 @@ async fn serve_direct_transport_session(
             return Ok(());
         };
 
-        let local_http = local_http.clone();
-        let local_base_url = local_base_url.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_multiplexed_relay_stream(state, local_http, local_base_url, stream).await
+            if let Err(err) = handle_multiplexed_relay_stream(
+                state,
+                transport_service::TransportExecutionScope::Public,
+                stream,
+            )
+            .await
             {
                 warn!(error = %err, "direct transport request stream failed");
             }
@@ -5110,14 +5066,6 @@ async fn client_transport_ws(
 ) -> Response {
     let Some(device_id) = request_device_id(&headers).and_then(|value| DeviceId::parse_str(&value).ok()) else {
         return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let local_base_url = match direct_transport_base_url(&state, &headers) {
-        Ok(url) => url,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let local_http = match direct_transport_http_client(&state) {
-        Ok(client) => client,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     };
     let peer = PeerIdentity::Device(device_id);
 
@@ -5138,10 +5086,7 @@ async fn client_transport_ws(
                 }
             };
 
-            if let Err(err) =
-                serve_direct_transport_session(state, peer, session, local_http, local_base_url)
-                    .await
-            {
+            if let Err(err) = serve_direct_transport_session(state, peer, session).await {
                 warn!(error = %err, "direct transport session failed");
             }
         })
@@ -5213,8 +5158,7 @@ fn buffered_transport_error_response(
 
 async fn handle_multiplexed_relay_stream<S>(
     state: ServerState,
-    local_http: reqwest::Client,
-    local_base_url: String,
+    scope: transport_service::TransportExecutionScope,
     mut stream: S,
 ) -> Result<()>
 where
@@ -5234,8 +5178,7 @@ where
         .context("failed decoding multiplexed relay request body")?;
     let response = match transport_service::execute_buffered_transport_request(
         &state,
-        &local_http,
-        &local_base_url,
+        &scope,
         &request,
     )
     .await
@@ -5514,8 +5457,6 @@ async fn serve_relay_multiplex_session(
     endpoint_url: String,
     relay_session: RelayTunnelSession,
     mut session: MultiplexedSession,
-    local_http: reqwest::Client,
-    local_base_url: String,
 ) -> Result<()> {
     let hello = perform_transport_server_handshake(
         &mut session,
@@ -5563,6 +5504,14 @@ async fn serve_relay_multiplex_session(
             state.node_id
         );
     }
+    let execution_scope = match &peer {
+        PeerIdentity::Device(_) => transport_service::TransportExecutionScope::Public,
+        PeerIdentity::Node(node_id) => {
+            transport_service::TransportExecutionScope::Internal(InternalCaller {
+                node_id: *node_id,
+            })
+        }
+    };
 
     loop {
         let next = session
@@ -5578,14 +5527,13 @@ async fn serve_relay_multiplex_session(
             return Ok(());
         };
 
-        let local_http = local_http.clone();
-        let local_base_url = local_base_url.clone();
         let state = state.clone();
         let session_id = relay_session.session_id.clone();
         let endpoint_url = endpoint_url.clone();
+        let execution_scope = execution_scope.clone();
         tokio::spawn(async move {
             if let Err(err) =
-                handle_multiplexed_relay_stream(state, local_http, local_base_url, stream).await
+                handle_multiplexed_relay_stream(state, execution_scope, stream).await
             {
                 warn!(
                     error = %err,
@@ -5598,7 +5546,7 @@ async fn serve_relay_multiplex_session(
     }
 }
 
-fn spawn_rendezvous_relay_multiplex_agent(state: ServerState, local_base_url: String) {
+fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
     tokio::spawn(async move {
         loop {
             let clients = current_rendezvous_endpoint_clients(&state).await;
@@ -5639,17 +5587,13 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState, local_base_url: St
                         accepts.abort_all();
 
                         let state = state.clone();
-                        let local_http = current_internal_http(&state).await;
                         let endpoint_url = endpoint.url.clone();
-                        let local_base_url = local_base_url.clone();
                         tokio::spawn(async move {
                             if let Err(err) = serve_relay_multiplex_session(
                                 state,
                                 endpoint_url.clone(),
                                 relay_session.clone(),
                                 multiplexed,
-                                local_http,
-                                local_base_url,
                             )
                             .await
                             {
