@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use common::NodeId;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use tracing::warn;
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
@@ -216,9 +217,26 @@ impl MetadataStore for SqliteMetadataStore {
             )
             .optional()?;
         match payload {
-            Some(payload) => serde_json::from_slice::<CachedMediaMetadata>(&payload)
-                .map(Some)
-                .context("invalid media metadata in sqlite"),
+            Some(payload) => match serde_json::from_slice::<CachedMediaMetadata>(&payload) {
+                Ok(metadata) => Ok(Some(metadata)),
+                Err(err) => {
+                    db.execute(
+                        "DELETE FROM media_cache WHERE content_fingerprint = ?1",
+                        params![content_fingerprint],
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to delete invalid media metadata row for {content_fingerprint}"
+                        )
+                    })?;
+                    warn!(
+                        content_fingerprint = %content_fingerprint,
+                        error = %err,
+                        "deleted invalid cached media metadata row from sqlite"
+                    );
+                    Ok(None)
+                }
+            },
             None => Ok(None),
         }
     }

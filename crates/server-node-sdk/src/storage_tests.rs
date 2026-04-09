@@ -309,6 +309,83 @@ async fn load_admin_audit_event_from_metadata_db(
     }
 }
 
+async fn persist_raw_media_cache_record(
+    backend: StorageTestBackend,
+    metadata_db_path: &Path,
+    content_fingerprint: &str,
+    payload: &[u8],
+) {
+    match backend {
+        StorageTestBackend::Sqlite => {
+            let db = rusqlite::Connection::open(metadata_db_path).unwrap();
+            db.execute(
+                "INSERT INTO media_cache (content_fingerprint, metadata_json)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(content_fingerprint) DO UPDATE SET metadata_json = excluded.metadata_json",
+                rusqlite::params![content_fingerprint, payload],
+            )
+            .unwrap();
+        }
+        #[cfg(feature = "turso-metadata")]
+        StorageTestBackend::Turso => {
+            let db = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO media_cache (content_fingerprint, metadata_json)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(content_fingerprint) DO UPDATE SET metadata_json = excluded.metadata_json",
+                (content_fingerprint, payload.to_vec()),
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+async fn media_cache_record_exists(
+    backend: StorageTestBackend,
+    metadata_db_path: &Path,
+    content_fingerprint: &str,
+) -> bool {
+    match backend {
+        StorageTestBackend::Sqlite => {
+            let db = rusqlite::Connection::open(metadata_db_path).unwrap();
+            db.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM media_cache WHERE content_fingerprint = ?1
+                 )",
+                rusqlite::params![content_fingerprint],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                != 0
+        }
+        #[cfg(feature = "turso-metadata")]
+        StorageTestBackend::Turso => {
+            let db = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM media_cache WHERE content_fingerprint = ?1",
+                    (content_fingerprint,),
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().expect("expected count row");
+            match row.get_value(0).unwrap() {
+                turso::Value::Integer(value) => value != 0,
+                other => panic!("unexpected count type: {other:?}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn preferred_head_prioritizes_confirmed_over_newer_provisional() {
     let mut index = empty_version_index("k");
@@ -331,6 +408,17 @@ fn preferred_head_prioritizes_confirmed_over_newer_provisional() {
 
     let preferred = choose_preferred_head(&index);
     assert_eq!(preferred.as_deref(), Some("v-old-confirmed"));
+}
+
+#[test]
+fn exif_gps_coordinate_rejects_non_finite_rationals() {
+    let value = exif::Value::Rational(vec![
+        exif::Rational { num: 0, denom: 0 },
+        exif::Rational { num: 1, denom: 1 },
+        exif::Rational { num: 1, denom: 1 },
+    ]);
+
+    assert_eq!(exif_gps_coordinate(&value), None);
 }
 
 #[test]
@@ -2131,6 +2219,95 @@ run_on_all_metadata_backends!(
     ensure_media_cache_rebuilds_stale_schema_records_impl,
     ensure_media_cache_rebuilds_stale_schema_records,
     ensure_media_cache_rebuilds_stale_schema_records_turso
+);
+
+async fn lookup_media_cache_deletes_invalid_metadata_records_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-invalid-row-cleanup").await;
+
+    let put = store
+        .put_object_versioned(
+            "photos/portrait.jpg",
+            Bytes::from(sample_oriented_jpeg_bytes(6)),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let invalid_payload = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": MEDIA_CACHE_SCHEMA_VERSION,
+        "content_fingerprint": metadata.content_fingerprint,
+        "source_manifest_hash": metadata.source_manifest_hash,
+        "status": "ready",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "width": metadata.width,
+        "height": metadata.height,
+        "orientation": metadata.orientation,
+        "taken_at_unix": metadata.taken_at_unix,
+        "gps": {
+            "latitude": serde_json::Value::Null,
+            "longitude": serde_json::Value::Null,
+        },
+        "thumbnail": serde_json::Value::Null,
+        "source_size_bytes": metadata.source_size_bytes,
+        "generated_at_unix": metadata.generated_at_unix,
+        "error": metadata.error,
+    }))
+    .unwrap();
+    persist_raw_media_cache_record(
+        backend,
+        &store.metadata_db_path,
+        &metadata.content_fingerprint,
+        &invalid_payload,
+    )
+    .await;
+
+    let lookup = store
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lookup.metadata.is_none());
+    assert!(
+        !media_cache_record_exists(
+            backend,
+            &store.metadata_db_path,
+            &metadata.content_fingerprint,
+        )
+        .await
+    );
+
+    let rebuilt = store
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebuilt.content_fingerprint, metadata.content_fingerprint);
+    assert!(rebuilt.gps.is_none());
+
+    let lookup = store
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lookup.metadata.is_some());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    lookup_media_cache_deletes_invalid_metadata_records_impl,
+    lookup_media_cache_deletes_invalid_metadata_records,
+    lookup_media_cache_deletes_invalid_metadata_records_turso
 );
 
 async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes_impl(

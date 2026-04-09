@@ -5822,7 +5822,11 @@ fn exif_gps_coordinate(value: &Value) -> Option<f64> {
             let degrees = values[0].to_f64();
             let minutes = values[1].to_f64();
             let seconds = values[2].to_f64();
-            Some(degrees + (minutes / 60.0) + (seconds / 3600.0))
+            if !degrees.is_finite() || !minutes.is_finite() || !seconds.is_finite() {
+                return None;
+            }
+            let total = degrees + (minutes / 60.0) + (seconds / 3600.0);
+            total.is_finite().then_some(total)
         }
         _ => None,
     }

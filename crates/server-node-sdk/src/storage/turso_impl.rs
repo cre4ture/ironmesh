@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use common::NodeId;
+use tracing::warn;
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
@@ -269,8 +270,28 @@ impl MetadataStore for TursoMetadataStore {
         };
 
         let payload = row_blob(&row, 0, "media_cache.metadata_json")?;
-        let metadata = self.decode_json::<CachedMediaMetadata>(payload, "media metadata")?;
-        Ok(Some(metadata))
+        match self.decode_json::<CachedMediaMetadata>(payload, "media metadata") {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(err) => {
+                self.connection
+                    .execute(
+                        "DELETE FROM media_cache WHERE content_fingerprint = ?1",
+                        (content_fingerprint,),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to delete invalid media metadata row for {content_fingerprint}"
+                        )
+                    })?;
+                warn!(
+                    content_fingerprint = %content_fingerprint,
+                    error = %err,
+                    "deleted invalid cached media metadata row from Turso"
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn persist_media_cache_record(&self, metadata: &CachedMediaMetadata) -> Result<()> {
