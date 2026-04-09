@@ -5,41 +5,25 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use common::{ClusterId, NodeId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{ClientBootstrap, IssuedClientIdentity, PeerIdentity};
 
 pub const CLIENT_BOOTSTRAP_CLAIM_VERSION: u32 = 1;
-pub const CLIENT_BOOTSTRAP_CLAIM_KIND: &str = "client_bootstrap_claim";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientBootstrapClaimTrustMode {
-    RendezvousCaDerB64u,
-    RendezvousCaPem,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientBootstrapClaimTrust {
-    pub mode: ClientBootstrapClaimTrustMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca_der_b64u: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca_pem: Option<String>,
+    pub ca_der_b64u: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientBootstrapClaim {
     pub version: u32,
-    pub kind: String,
     pub cluster_id: ClusterId,
     pub target_node_id: NodeId,
-    pub rendezvous_url: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rendezvous_urls: Vec<String>,
     pub trust: ClientBootstrapClaimTrust,
     pub claim_token: String,
-    pub expires_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,30 +78,13 @@ pub struct ClientBootstrapClaimRedeemResponse {
 
 impl ClientBootstrapClaimTrust {
     pub fn validate(&self) -> Result<()> {
-        match self.mode {
-            ClientBootstrapClaimTrustMode::RendezvousCaDerB64u => {
-                let value = self
-                    .ca_der_b64u
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("claim trust requires ca_der_b64u"))?;
-                let _ = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(value)
-                    .context("failed to decode claim rendezvous CA DER base64url")?;
-            }
-            ClientBootstrapClaimTrustMode::RendezvousCaPem => {
-                let value = self
-                    .ca_pem
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("claim trust requires ca_pem"))?;
-                if !value.contains("BEGIN CERTIFICATE") {
-                    bail!("claim rendezvous CA PEM must include a certificate block");
-                }
-            }
+        let value = self.ca_der_b64u.trim();
+        if value.is_empty() {
+            bail!("claim trust requires ca_der_b64u");
         }
+        let _ = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value)
+            .context("failed to decode claim rendezvous CA DER base64url")?;
         Ok(())
     }
 }
@@ -145,16 +112,15 @@ impl ClientBootstrapClaim {
         if self.version != CLIENT_BOOTSTRAP_CLAIM_VERSION {
             bail!("unsupported bootstrap claim version {}", self.version);
         }
-        if self.kind.trim() != CLIENT_BOOTSTRAP_CLAIM_KIND {
-            bail!("unsupported bootstrap claim kind {}", self.kind);
-        }
         if self.cluster_id.is_nil() {
             bail!("bootstrap claim must include a non-nil cluster_id");
         }
         if self.target_node_id.is_nil() {
             bail!("bootstrap claim must include a non-nil target_node_id");
         }
-        normalize_claim_rendezvous_url(&self.rendezvous_url, "rendezvous_url")?;
+        if self.rendezvous_urls.is_empty() {
+            bail!("bootstrap claim must include at least one rendezvous URL");
+        }
         for (index, rendezvous_url) in self.rendezvous_urls.iter().enumerate() {
             normalize_claim_rendezvous_url(rendezvous_url, &format!("rendezvous_urls[{index}]"))?;
         }
@@ -162,18 +128,13 @@ impl ClientBootstrapClaim {
         if self.claim_token.trim().is_empty() {
             bail!("bootstrap claim must include a claim_token");
         }
-        if self.expires_at_unix == 0 {
-            bail!("bootstrap claim must include a non-zero expires_at_unix");
-        }
         Ok(())
     }
 
     pub fn ordered_rendezvous_urls(&self) -> Result<Vec<String>> {
         let mut urls = Vec::new();
         let mut seen = HashSet::new();
-        for rendezvous_url in std::iter::once(self.rendezvous_url.as_str())
-            .chain(self.rendezvous_urls.iter().map(String::as_str))
-        {
+        for rendezvous_url in self.rendezvous_urls.iter().map(String::as_str) {
             let normalized = normalize_claim_rendezvous_url(rendezvous_url, "rendezvous_url")?;
             if seen.insert(normalized.clone()) {
                 urls.push(normalized);
@@ -187,6 +148,159 @@ fn normalize_claim_rendezvous_url(value: &str, field_name: &str) -> Result<Strin
     reqwest::Url::parse(value.trim())
         .with_context(|| format!("invalid bootstrap claim {field_name} {value}"))
         .map(|url| url.to_string())
+}
+
+#[derive(Serialize)]
+struct ClientBootstrapClaimWire<'a> {
+    #[serde(rename = "v")]
+    version: u32,
+    #[serde(rename = "c")]
+    cluster_id: &'a ClusterId,
+    #[serde(rename = "n")]
+    target_node_id: &'a NodeId,
+    #[serde(rename = "r")]
+    rendezvous_urls: &'a [String],
+    #[serde(rename = "t")]
+    ca_der_b64u: &'a str,
+    #[serde(rename = "k")]
+    claim_token: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ClientBootstrapClaimWireOwned {
+    #[serde(rename = "v", alias = "version")]
+    version: u32,
+    #[serde(rename = "c", alias = "cluster_id")]
+    cluster_id: ClusterId,
+    #[serde(rename = "n", alias = "target_node_id")]
+    target_node_id: NodeId,
+    #[serde(rename = "r", alias = "rendezvous_urls", default)]
+    rendezvous_urls: Vec<String>,
+    #[serde(rename = "u", alias = "rendezvous_url", default)]
+    rendezvous_url: Option<String>,
+    #[serde(rename = "t", alias = "trust")]
+    trust: ClientBootstrapClaimWireTrust,
+    #[serde(rename = "k", alias = "claim_token")]
+    claim_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ClientBootstrapClaimWireTrust {
+    Compact(String),
+    Legacy(ClientBootstrapClaimLegacyTrust),
+}
+
+#[derive(Deserialize)]
+struct ClientBootstrapClaimLegacyTrust {
+    #[serde(default)]
+    ca_der_b64u: Option<String>,
+    #[serde(default)]
+    ca_pem: Option<String>,
+}
+
+impl Serialize for ClientBootstrapClaim {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = ClientBootstrapClaimWire {
+            version: self.version,
+            cluster_id: &self.cluster_id,
+            target_node_id: &self.target_node_id,
+            rendezvous_urls: &self.rendezvous_urls,
+            ca_der_b64u: self.trust.ca_der_b64u.as_str(),
+            claim_token: self.claim_token.as_str(),
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientBootstrapClaim {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ClientBootstrapClaimWireOwned::deserialize(deserializer)?;
+        ClientBootstrapClaim::try_from(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<ClientBootstrapClaimWireOwned> for ClientBootstrapClaim {
+    type Error = anyhow::Error;
+
+    fn try_from(wire: ClientBootstrapClaimWireOwned) -> Result<Self> {
+        let mut rendezvous_urls = wire.rendezvous_urls;
+        if let Some(primary_rendezvous_url) = wire
+            .rendezvous_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            && !rendezvous_urls
+                .iter()
+                .any(|candidate| candidate.trim() == primary_rendezvous_url)
+        {
+            rendezvous_urls.insert(0, primary_rendezvous_url);
+        }
+        Ok(Self {
+            version: wire.version,
+            cluster_id: wire.cluster_id,
+            target_node_id: wire.target_node_id,
+            rendezvous_urls,
+            trust: match wire.trust {
+                ClientBootstrapClaimWireTrust::Compact(ca_der_b64u) => {
+                    ClientBootstrapClaimTrust { ca_der_b64u }
+                }
+                ClientBootstrapClaimWireTrust::Legacy(legacy) => {
+                    ClientBootstrapClaimTrust::try_from(legacy)?
+                }
+            },
+            claim_token: wire.claim_token,
+        })
+    }
+}
+
+impl TryFrom<ClientBootstrapClaimLegacyTrust> for ClientBootstrapClaimTrust {
+    type Error = anyhow::Error;
+
+    fn try_from(legacy: ClientBootstrapClaimLegacyTrust) -> Result<Self> {
+        if let Some(ca_der_b64u) = legacy
+            .ca_der_b64u
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+        {
+            return Ok(Self { ca_der_b64u });
+        }
+
+        let ca_pem = legacy
+            .ca_pem
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("claim trust requires ca_der_b64u"))?;
+        let der = der_from_pem_certificate(ca_pem)?;
+        Ok(Self {
+            ca_der_b64u: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(der),
+        })
+    }
+}
+
+fn der_from_pem_certificate(pem: &str) -> Result<Vec<u8>> {
+    let body = pem
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("-----BEGIN ") && !line.starts_with("-----END "))
+        .collect::<String>();
+    if body.is_empty() {
+        bail!("claim rendezvous CA PEM must include a certificate block");
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .context("failed to decode claim rendezvous CA PEM")
 }
 
 impl ClientBootstrapClaimIssueResponse {
@@ -295,5 +409,92 @@ impl ClientBootstrapClaimRedeemResponse {
         };
         issued.validate()?;
         Ok(issued)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_claim() -> ClientBootstrapClaim {
+        ClientBootstrapClaim {
+            version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
+            cluster_id: "019d02eb-ab39-7220-911a-c0eafcb38249".parse().unwrap(),
+            target_node_id: "9f068697-bd16-431a-8311-8ae985025bcf".parse().unwrap(),
+            rendezvous_urls: vec![
+                "https://rendezvous-a.example:9443".to_string(),
+                "https://rendezvous-b.example:9443/".to_string(),
+            ],
+            trust: ClientBootstrapClaimTrust {
+                ca_der_b64u: "Y2xhaW0tdGVzdA".to_string(),
+            },
+            claim_token: "im-claim-test-token".to_string(),
+        }
+    }
+
+    #[test]
+    fn bootstrap_claim_serializes_to_compact_shape() {
+        let json = serde_json::to_value(sample_claim()).expect("claim should serialize");
+        let object = json
+            .as_object()
+            .expect("bootstrap claim should serialize as an object");
+
+        assert_eq!(object.get("v").and_then(serde_json::Value::as_u64), Some(1));
+        assert_eq!(
+            object.get("c").and_then(serde_json::Value::as_str),
+            Some("019d02eb-ab39-7220-911a-c0eafcb38249")
+        );
+        assert_eq!(
+            object.get("n").and_then(serde_json::Value::as_str),
+            Some("9f068697-bd16-431a-8311-8ae985025bcf")
+        );
+        assert_eq!(
+            object
+                .get("r")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            object.get("t").and_then(serde_json::Value::as_str),
+            Some("Y2xhaW0tdGVzdA")
+        );
+        assert_eq!(
+            object.get("k").and_then(serde_json::Value::as_str),
+            Some("im-claim-test-token")
+        );
+        assert!(!object.contains_key("kind"));
+        assert!(!object.contains_key("rendezvous_url"));
+        assert!(!object.contains_key("expires_at_unix"));
+    }
+
+    #[test]
+    fn bootstrap_claim_deserializes_legacy_shape() {
+        let claim = ClientBootstrapClaim::from_json_str(
+            r#"{
+                "version": 1,
+                "kind": "client_bootstrap_claim",
+                "cluster_id": "019d02eb-ab39-7220-911a-c0eafcb38249",
+                "target_node_id": "9f068697-bd16-431a-8311-8ae985025bcf",
+                "rendezvous_url": "https://rendezvous-a.example:9443",
+                "rendezvous_urls": ["https://rendezvous-b.example:9443/"],
+                "trust": {
+                    "mode": "rendezvous_ca_pem",
+                    "ca_pem": "-----BEGIN CERTIFICATE-----\nY2xhaW0tdGVzdA==\n-----END CERTIFICATE-----\n"
+                },
+                "claim_token": "im-claim-test-token",
+                "expires_at_unix": 42
+            }"#,
+        )
+        .expect("legacy claim should deserialize");
+
+        assert_eq!(
+            claim.rendezvous_urls,
+            vec![
+                "https://rendezvous-a.example:9443".to_string(),
+                "https://rendezvous-b.example:9443/".to_string(),
+            ]
+        );
+        assert_eq!(claim.trust.ca_der_b64u, "Y2xhaW0tdGVzdA");
     }
 }

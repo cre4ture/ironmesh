@@ -932,27 +932,53 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
             String::from_utf8_lossy(&body)
         );
     }
+    let issued_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let bootstrap_claim_json = issued_json
+        .get("bootstrap_claim")
+        .and_then(serde_json::Value::as_object)
+        .expect("bootstrap_claim should serialize as an object");
+    assert_eq!(
+        bootstrap_claim_json
+            .get("v")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        bootstrap_claim_json
+            .get("r")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        bootstrap_claim_json
+            .get("k")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.starts_with("im-claim-")),
+        Some(true)
+    );
+    assert!(
+        bootstrap_claim_json
+            .get("t")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    );
+    assert!(!bootstrap_claim_json.contains_key("kind"));
+    assert!(!bootstrap_claim_json.contains_key("rendezvous_url"));
+    assert!(!bootstrap_claim_json.contains_key("expires_at_unix"));
     let issued: transport_sdk::ClientBootstrapClaimIssueResponse =
         serde_json::from_slice(&body).unwrap();
     assert_eq!(issued.bootstrap_bundle.cluster_id, state.cluster_id);
     assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
     assert_eq!(
-        issued.bootstrap_claim.rendezvous_url,
-        canonical_rendezvous_url,
-    );
-    assert_eq!(
         issued.bootstrap_claim.rendezvous_urls,
         vec![format!("{rendezvous_url}/")]
     );
     assert_eq!(
-        issued.bootstrap_claim.kind,
-        transport_sdk::CLIENT_BOOTSTRAP_CLAIM_KIND
+        issued.bootstrap_claim.rendezvous_urls[0],
+        canonical_rendezvous_url
     );
-    assert_eq!(
-        issued.bootstrap_claim.trust.mode,
-        transport_sdk::ClientBootstrapClaimTrustMode::RendezvousCaDerB64u
-    );
-    assert!(issued.bootstrap_claim.trust.ca_der_b64u.is_some());
+    assert!(!issued.bootstrap_claim.trust.ca_der_b64u.is_empty());
     assert!(issued.bootstrap_claim.claim_token.starts_with("im-claim-"));
     assert!(issued.bootstrap_bundle.pairing_token.is_some());
 
@@ -1094,10 +1120,6 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
     let issued: transport_sdk::ClientBootstrapClaimIssueResponse =
         serde_json::from_slice(&body).unwrap();
     assert_eq!(
-        issued.bootstrap_claim.rendezvous_url,
-        canonical_rendezvous_url_b,
-    );
-    assert_eq!(
         issued.bootstrap_claim.rendezvous_urls,
         vec![
             canonical_rendezvous_url_b.clone(),
@@ -1231,8 +1253,8 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
     let issued: transport_sdk::ClientBootstrapClaimIssueResponse =
         serde_json::from_slice(&body).unwrap();
     assert_eq!(
-        issued.bootstrap_claim.rendezvous_url,
-        canonical_rendezvous_url_b,
+        issued.bootstrap_claim.rendezvous_urls[0],
+        canonical_rendezvous_url_b
     );
     assert_eq!(
         issued.bootstrap_claim.rendezvous_urls,

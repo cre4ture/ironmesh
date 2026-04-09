@@ -159,16 +159,24 @@ export type BootstrapBundle = Record<string, unknown> & {
 };
 
 export type BootstrapClaimTrust = {
-  mode: "rendezvous_ca_der_b64u" | "rendezvous_ca_pem";
   ca_der_b64u?: string | null;
   ca_pem?: string | null;
+  mode?: "rendezvous_ca_der_b64u" | "rendezvous_ca_pem";
 };
 
 export type BootstrapClaim = Record<string, unknown> & {
+  v?: number;
+  c?: string;
+  n?: string;
+  r?: string[];
+  t?: string;
+  k?: string;
   version?: number;
   kind?: string;
   cluster_id?: string;
+  target_node_id?: string;
   rendezvous_url?: string;
+  rendezvous_urls?: string[];
   trust?: BootstrapClaimTrust;
   claim_token?: string;
   expires_at_unix?: number;

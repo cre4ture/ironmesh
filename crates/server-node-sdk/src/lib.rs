@@ -65,18 +65,18 @@ use tracing_subscriber::util::SubscriberInitExt;
 use transport_sdk::{
     BootstrapClaimBroker, BootstrapEndpoint, BootstrapEndpointUse, BootstrapMutualTlsMaterial,
     BootstrapServerTlsFiles, BootstrapTlsFiles, BootstrapTlsMaterialMetadata, BootstrapTrustRoots,
-    BufferedTransportRequest, BufferedTransportResponse, CLIENT_BOOTSTRAP_CLAIM_KIND,
-    CLIENT_BOOTSTRAP_CLAIM_VERSION, CandidateKind, ClientBootstrap as TransportClientBootstrap,
-    ClientBootstrapClaim, ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
+    BufferedTransportRequest, BufferedTransportResponse, CLIENT_BOOTSTRAP_CLAIM_VERSION,
+    CandidateKind, ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
+    ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
-    ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ClientEnrollmentRequest,
-    ConnectionCandidate, MultiplexConfig, MultiplexMode, MultiplexedSession,
-    NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode, NodeEnrollmentPackage,
-    NodeJoinRequest, PeerIdentity, PeerTransportClient, PeerTransportClientConfig,
-    PresenceRegistration, RelayHttpHeader, RelayMode, RelayTicketRequest, RelayTunnelAcceptRequest,
-    RelayTunnelSession, RelayTunnelSessionKind, RendezvousClientConfig, RendezvousControlClient,
-    SignedRequestHeaders, TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader,
-    TransportPathKind, TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
+    ClientBootstrapClaimTrust, ClientEnrollmentRequest, ConnectionCandidate, MultiplexConfig,
+    MultiplexMode, MultiplexedSession, NodeBootstrap as TransportNodeBootstrap, NodeBootstrapMode,
+    NodeEnrollmentPackage, NodeJoinRequest, PeerIdentity, PeerTransportClient,
+    PeerTransportClientConfig, PresenceRegistration, RelayHttpHeader, RelayMode,
+    RelayTicketRequest, RelayTunnelAcceptRequest, RelayTunnelSession, RelayTunnelSessionKind,
+    RendezvousClientConfig, RendezvousControlClient, SignedRequestHeaders,
+    TRANSPORT_PROTOCOL_VERSION, TransportCapability, TransportHeader, TransportPathKind,
+    TransportRequestHead, TransportResponseHead, TransportSessionControlMessage,
     TransportSessionRole, TransportStreamKind, credential_fingerprint,
     perform_transport_client_handshake, perform_transport_server_handshake,
     read_buffered_transport_response, read_transport_request_head, verify_signed_request_headers,
@@ -9616,9 +9616,7 @@ fn rendezvous_claim_trust_from_bootstrap(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(ClientBootstrapClaimTrust {
-        mode: ClientBootstrapClaimTrustMode::RendezvousCaDerB64u,
-        ca_der_b64u: Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cert.as_ref())),
-        ca_pem: None,
+        ca_der_b64u: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cert.as_ref()),
     })
 }
 
@@ -9824,12 +9822,6 @@ async fn store_client_bootstrap_claim(
 ) -> std::result::Result<ClientBootstrapClaim, (StatusCode, String)> {
     let claim_rendezvous_urls =
         select_bootstrap_claim_rendezvous_urls(state, bootstrap, preferred_rendezvous_url).await?;
-    let rendezvous_url = claim_rendezvous_urls.first().cloned().ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "bootstrap claim issuance did not resolve any rendezvous URLs".to_string(),
-        )
-    })?;
     let claim_token = generate_bootstrap_claim_token();
     let claim_trust = rendezvous_claim_trust_from_bootstrap(bootstrap).map_err(|status| {
         (
@@ -9857,14 +9849,11 @@ async fn store_client_bootstrap_claim(
         })?;
     let claim = ClientBootstrapClaim {
         version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
-        kind: CLIENT_BOOTSTRAP_CLAIM_KIND.to_string(),
         cluster_id: bootstrap.cluster_id,
         target_node_id: state.node_id,
-        rendezvous_url,
         rendezvous_urls: claim_rendezvous_urls,
         trust: claim_trust,
         claim_token,
-        expires_at_unix,
     };
     claim.validate().map_err(|err| {
         (
@@ -10321,7 +10310,7 @@ async fn issue_bootstrap_claim(
         json!({
             "label": request_label,
             "endpoint_count": response.bootstrap_bundle.direct_endpoints.len(),
-            "expires_at_unix": response.bootstrap_claim.expires_at_unix,
+            "expires_at_unix": expires_at_unix,
         }),
     )
     .await;

@@ -23,10 +23,10 @@ pub use bootstrap::{
     RelayMode,
 };
 pub use bootstrap_claim::{
-    CLIENT_BOOTSTRAP_CLAIM_KIND, CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim,
-    ClientBootstrapClaimIssueResponse, ClientBootstrapClaimPublishRequest,
-    ClientBootstrapClaimPublishResponse, ClientBootstrapClaimRedeemRequest,
-    ClientBootstrapClaimRedeemResponse, ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode,
+    CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim, ClientBootstrapClaimIssueResponse,
+    ClientBootstrapClaimPublishRequest, ClientBootstrapClaimPublishResponse,
+    ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
+    ClientBootstrapClaimTrust,
 };
 pub use candidates::{CandidateKind, ConnectionCandidate, rank_candidates};
 pub use http_connector::{HttpRouteKind, TransportHttpClientConfig, TransportHttpRequestTarget};

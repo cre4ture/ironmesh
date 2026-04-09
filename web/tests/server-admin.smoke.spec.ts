@@ -150,7 +150,8 @@ test("server-admin provisioning can target a selected rendezvous service", async
   await page.getByLabel("Primary rendezvous service").selectOption("https://rendezvous-a.local:9443/");
   await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
 
-  await expect(page.locator("pre").filter({ hasText: '"rendezvous_url": "https://rendezvous-a.local:9443/"' })).toBeVisible();
+  await expect(page.locator("pre").filter({ hasText: '"r": [' })).toBeVisible();
+  await expect(page.locator("pre").filter({ hasText: '"https://rendezvous-a.local:9443/"' })).toBeVisible();
   await expect(page.getByText("Request failed", { exact: true })).toHaveCount(0);
 });
 
@@ -820,19 +821,16 @@ async function installServerAdminMocks(
       return json(route, {
         bootstrap_bundle: bootstrapBundle,
         bootstrap_claim: {
-          version: 1,
-          kind: "client_bootstrap_claim",
-          cluster_id: "cluster-alpha",
-          rendezvous_url:
+          v: 1,
+          c: "cluster-alpha",
+          n: "node-alpha",
+          r: [
             typeof body.preferred_rendezvous_url === "string" && body.preferred_rendezvous_url.trim().length > 0
               ? new URL(body.preferred_rendezvous_url).toString()
-              : "https://node-alpha.local/rendezvous",
-          claim_token: "im-claim-example",
-          expires_at_unix: 1_900_003_600,
-          trust: {
-            mode: "rendezvous_ca_der_b64u",
-            ca_der_b64u: "TUlJQy4uLg"
-          }
+              : "https://node-alpha.local/rendezvous"
+          ],
+          t: "TUlJQy4uLg",
+          k: "im-claim-example"
         }
       });
     }

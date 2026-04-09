@@ -11,8 +11,7 @@ use transport_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots,
     ClientBootstrap as TransportClientBootstrap, ClientBootstrapClaim,
     ClientBootstrapClaimRedeemRequest, ClientBootstrapClaimRedeemResponse,
-    ClientBootstrapClaimTrust, ClientBootstrapClaimTrustMode, ClientIdentityMaterial, RelayMode,
-    TransportPathKind,
+    ClientBootstrapClaimTrust, ClientIdentityMaterial, RelayMode, TransportPathKind,
 };
 
 use crate::connection::{
@@ -870,27 +869,14 @@ fn preferred_direct_server_base_url(bootstrap: &ConnectionBootstrap) -> Result<O
 
 fn claim_rendezvous_ca_pem(trust: &ClientBootstrapClaimTrust) -> Result<String> {
     trust.validate()?;
-    match trust.mode {
-        ClientBootstrapClaimTrustMode::RendezvousCaPem => trust
-            .ca_pem
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .ok_or_else(|| anyhow!("bootstrap claim trust is missing ca_pem")),
-        ClientBootstrapClaimTrustMode::RendezvousCaDerB64u => {
-            let encoded = trust
-                .ca_der_b64u
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow!("bootstrap claim trust is missing ca_der_b64u"))?;
-            let der = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(encoded)
-                .context("failed to decode bootstrap claim rendezvous CA DER")?;
-            Ok(pem_from_der_certificate(&der))
-        }
+    let encoded = trust.ca_der_b64u.trim();
+    if encoded.is_empty() {
+        bail!("bootstrap claim trust is missing ca_der_b64u");
     }
+    let der = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("failed to decode bootstrap claim rendezvous CA DER")?;
+    Ok(pem_from_der_certificate(&der))
 }
 
 fn pem_from_der_certificate(der: &[u8]) -> String {
@@ -930,8 +916,7 @@ impl From<&BootstrapEnrollmentResult> for DeviceEnrollmentResponse {
 mod tests {
     use super::*;
     use transport_sdk::{
-        CLIENT_BOOTSTRAP_CLAIM_KIND, CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim,
-        ClientBootstrapClaimTrust,
+        CLIENT_BOOTSTRAP_CLAIM_VERSION, ClientBootstrapClaim, ClientBootstrapClaimTrust,
     };
 
     fn sample_bootstrap() -> ConnectionBootstrap {
@@ -972,24 +957,16 @@ mod tests {
     fn sample_claim() -> ClientBootstrapClaim {
         ClientBootstrapClaim {
             version: CLIENT_BOOTSTRAP_CLAIM_VERSION,
-            kind: CLIENT_BOOTSTRAP_CLAIM_KIND.to_string(),
             cluster_id: ClusterId::now_v7(),
             target_node_id: NodeId::new_v4(),
-            rendezvous_url: "https://rendezvous-a.example:9443".to_string(),
             rendezvous_urls: vec![
                 "https://rendezvous-a.example:9443/".to_string(),
                 "https://rendezvous-b.example:9443".to_string(),
             ],
             trust: ClientBootstrapClaimTrust {
-                mode: ClientBootstrapClaimTrustMode::RendezvousCaPem,
-                ca_der_b64u: None,
-                ca_pem: Some(
-                    "-----BEGIN CERTIFICATE-----\nclaim-test\n-----END CERTIFICATE-----\n"
-                        .to_string(),
-                ),
+                ca_der_b64u: "Y2xhaW0tdGVzdA".to_string(),
             },
             claim_token: "im-claim-test-token".to_string(),
-            expires_at_unix: 42,
         }
     }
 

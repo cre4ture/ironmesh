@@ -15,6 +15,10 @@ import QRCode from "qrcode";
 import { useEffect, useMemo, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 
+const BOOTSTRAP_QR_WIDTH = 1024;
+const BOOTSTRAP_QR_MARGIN = 12;
+const BOOTSTRAP_QR_FRAME_PADDING = 24;
+
 function shouldFallbackToFullBootstrapQr(message: string): boolean {
   return (
     message.startsWith("HTTP 404:") ||
@@ -149,8 +153,12 @@ export function BootstrapBundlesPage() {
     void QRCode.toString(bootstrapQrPayload, {
       errorCorrectionLevel: "H",
       type: "svg",
-      margin: 4,
-      width: 512
+      margin: BOOTSTRAP_QR_MARGIN,
+      width: BOOTSTRAP_QR_WIDTH,
+      color: {
+        dark: "#000000",
+        light: "#FFFFFF"
+      }
     })
       .then((svg: string) => {
         if (!cancelled) {
@@ -312,11 +320,22 @@ export function BootstrapBundlesPage() {
                 <Stack gap="xs">
                   <Text fw={600}>Scan the compact claim with the ironmesh Android app</Text>
                   {bootstrapBundleQrDataUrl ? (
-                    <img
-                      src={bootstrapBundleQrDataUrl}
-                      alt="Client bootstrap QR code"
-                      style={{ width: 512, maxWidth: "100%", display: "block" }}
-                    />
+                    <div
+                      style={{
+                        background: "#FFFFFF",
+                        padding: BOOTSTRAP_QR_FRAME_PADDING,
+                        borderRadius: 16,
+                        width: "100%",
+                        maxWidth: BOOTSTRAP_QR_WIDTH + BOOTSTRAP_QR_FRAME_PADDING * 2,
+                        boxSizing: "border-box"
+                      }}
+                    >
+                      <img
+                        src={bootstrapBundleQrDataUrl}
+                        alt="Client bootstrap QR code"
+                        style={{ width: "100%", display: "block" }}
+                      />
+                    </div>
                   ) : (
                     <Text size="sm" c={bootstrapBundleQrError ? "red" : "dimmed"}>
                       {bootstrapBundleQrError ? `Failed to generate QR code: ${bootstrapBundleQrError}` : "Generating QR code..."}
@@ -327,11 +346,22 @@ export function BootstrapBundlesPage() {
                 <Stack gap="xs">
                   <Text fw={600}>Scan the full bootstrap bundle with the ironmesh Android app</Text>
                   {bootstrapBundleQrDataUrl ? (
-                    <img
-                      src={bootstrapBundleQrDataUrl}
-                      alt="Client bootstrap QR code"
-                      style={{ width: 512, maxWidth: "100%", display: "block" }}
-                    />
+                    <div
+                      style={{
+                        background: "#FFFFFF",
+                        padding: BOOTSTRAP_QR_FRAME_PADDING,
+                        borderRadius: 16,
+                        width: "100%",
+                        maxWidth: BOOTSTRAP_QR_WIDTH + BOOTSTRAP_QR_FRAME_PADDING * 2,
+                        boxSizing: "border-box"
+                      }}
+                    >
+                      <img
+                        src={bootstrapBundleQrDataUrl}
+                        alt="Client bootstrap QR code"
+                        style={{ width: "100%", display: "block" }}
+                      />
+                    </div>
                   ) : (
                     <Text size="sm" c={bootstrapBundleQrError ? "red" : "dimmed"}>
                       {bootstrapBundleQrError ? `Failed to generate QR code: ${bootstrapBundleQrError}` : "Generating QR code..."}
