@@ -3659,6 +3659,102 @@ run_on_main_metadata_backends!(
     store_index_change_wait_times_out_without_mutation_turso
 );
 
+async fn multiplex_transport_wait_for_store_index_change_routes_to_handler_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+
+    let request = transport_sdk::BufferedTransportRequest::new(
+        transport_sdk::TransportStreamKind::Rpc,
+        "GET",
+        "/store/index/changes/wait?since=0&timeout_ms=250",
+        Vec::new(),
+        Vec::new(),
+    );
+    let response = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &super::transport_service::TransportExecutionScope::Public,
+        &request,
+    )
+    .await
+    .expect("transport wait request should execute");
+
+    assert_eq!(response.status, StatusCode::OK.as_u16());
+    let payload = serde_json::from_slice::<super::StoreIndexChangeWaitResponse>(&response.body)
+        .expect("transport wait response should parse");
+    assert!(!payload.changed);
+    assert_eq!(payload.sequence, 0);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    multiplex_transport_wait_for_store_index_change_routes_to_handler_impl,
+    multiplex_transport_wait_for_store_index_change_routes_to_handler,
+    multiplex_transport_wait_for_store_index_change_routes_to_handler_turso
+);
+
+async fn multiplex_transport_get_upload_session_routes_to_handler_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let upload_id = "transport-upload-session-route".to_string();
+    let now = super::unix_ts();
+
+    {
+        let mut sessions = super::write_upload_sessions(&state, "tests.upload_sessions.seed").await;
+        sessions.sessions.insert(
+            upload_id.clone(),
+            super::UploadSessionRecord {
+                upload_id: upload_id.clone(),
+                owner_device_id: None,
+                key: "uploads/test.bin".to_string(),
+                total_size_bytes: 1024,
+                chunk_size_bytes: 1024,
+                chunk_count: 1,
+                state: VersionConsistencyState::Confirmed,
+                parent_version_ids: Vec::new(),
+                explicit_version_id: None,
+                received_chunks: vec![None],
+                created_at_unix: now,
+                updated_at_unix: now,
+                expires_at_unix: now + 300,
+                finalizing: false,
+                completed: false,
+                completed_result: None,
+            },
+        );
+    }
+
+    let request = transport_sdk::BufferedTransportRequest::new(
+        transport_sdk::TransportStreamKind::Rpc,
+        "GET",
+        format!("/store/uploads/{upload_id}"),
+        Vec::new(),
+        Vec::new(),
+    );
+    let response = super::transport_service::execute_buffered_transport_request(
+        &state,
+        &super::transport_service::TransportExecutionScope::Public,
+        &request,
+    )
+    .await
+    .expect("transport upload-session request should execute");
+
+    assert_eq!(response.status, StatusCode::OK.as_u16());
+    let payload = serde_json::from_slice::<super::UploadSessionView>(&response.body)
+        .expect("transport upload-session response should parse");
+    assert_eq!(payload.upload_id, upload_id);
+    assert_eq!(payload.key, "uploads/test.bin");
+    assert_eq!(payload.total_size_bytes, 1024);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    multiplex_transport_get_upload_session_routes_to_handler_impl,
+    multiplex_transport_get_upload_session_routes_to_handler,
+    multiplex_transport_get_upload_session_routes_to_handler_turso
+);
+
 #[test]
 fn store_index_depth_groups_prefixes() {
     let keys = vec![

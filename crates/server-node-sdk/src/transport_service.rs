@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, Uri};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -11,7 +11,7 @@ use tower::ServiceExt;
 
 use crate::{
     BufferedTransportRequest, BufferedTransportResponse, InternalCaller, ServerState,
-    StoreIndexQuery, TransportHeader, cluster_status, commit_version,
+    StoreIndexChangeWaitQuery, StoreIndexQuery, TransportHeader, cluster_status, commit_version,
     complete_upload_session_route, confirm_version, copy_object_path, delete_object,
     delete_object_by_query, delete_upload_session, drop_replication_subject, enroll_client_device,
     execute_replication_cleanup, export_metadata_bundle, export_provisional_versions,
@@ -76,11 +76,29 @@ async fn try_execute_direct_transport_request(
             })?;
             Some(list_store_index_response(state, query, "/media/thumbnail").await)
         }
+        ("GET", "/store/index/changes/wait") => {
+            let query = parse_query::<StoreIndexChangeWaitQuery>(raw_path).map_err(|err| {
+                anyhow::anyhow!("failed parsing store index change wait query {raw_path}: {err}")
+            })?;
+            Some(
+                wait_for_store_index_change(State(state.clone()), Query(query))
+                    .await
+                    .into_response(),
+            )
+        }
         ("GET", "/media/thumbnail") => {
             let query = parse_query::<crate::MediaThumbnailQuery>(raw_path).map_err(|err| {
                 anyhow::anyhow!("failed parsing media thumbnail query {raw_path}: {err}")
             })?;
             Some(get_media_thumbnail_response(state, query).await)
+        }
+        ("GET", path) if path.starts_with("/store/uploads/") => {
+            let upload_id = decode_route_tail(path, "/store/uploads/")?;
+            Some(
+                get_upload_session(State(state.clone()), headers.clone(), Path(upload_id))
+                    .await
+                    .into_response(),
+            )
         }
         ("GET", path) if path.starts_with("/store/") => {
             let query = parse_query::<crate::ObjectGetQuery>(raw_path)
