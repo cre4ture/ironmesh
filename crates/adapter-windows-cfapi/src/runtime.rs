@@ -961,13 +961,37 @@ pub fn apply_action_plan(
 ) -> Result<()> {
     std::fs::create_dir_all(root_path)?;
 
+    // Pre-compute directories that are ancestors of planned file placeholders.
+    // EnsureDirectory actions for other paths are skipped to avoid resurrecting
+    // locally-renamed directories when a stale snapshot still contains directory
+    // markers that haven't been removed from the remote yet.
+    let mut dirs_with_planned_content: BTreeSet<String> = BTreeSet::new();
+    for action in &plan.actions {
+        let file_path = match action {
+            CfapiAction::EnsurePlaceholder { path, .. }
+            | CfapiAction::HydrateOnDemand { path, .. } => path,
+            _ => continue,
+        };
+        let normalized = normalize_path(file_path);
+        let parts: Vec<&str> = normalized
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        for i in 1..parts.len() {
+            dirs_with_planned_content.insert(parts[..i].join("/"));
+        }
+    }
+
     let mut placeholders: BTreeMap<String, (String, String, Option<u64>, Option<String>)> =
         BTreeMap::new();
     let mut created_placeholder_paths = BTreeSet::new();
     for action in &plan.actions {
         match action {
             CfapiAction::EnsureDirectory { path } => {
-                std::fs::create_dir_all(root_path.join(path.replace('/', "\\")))?;
+                let normalized = normalize_path(path);
+                if dirs_with_planned_content.contains(&normalized) {
+                    std::fs::create_dir_all(root_path.join(path.replace('/', "\\")))?;
+                }
             }
             CfapiAction::EnsurePlaceholder {
                 path,
