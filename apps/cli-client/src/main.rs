@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use tracing_subscriber::filter::Directive;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use web_ui_backend::{WebUiBootstrapPersistence, WebUiConfig};
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -303,7 +305,18 @@ fn init_cli_tracing() {
                 .expect("valid info tracing directive"),
         );
     }
-    common::logging::init_compact_tracing(env_filter);
+    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+    TRACING_INIT.call_once(move || {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_timer(tracing_subscriber::fmt::time::SystemTime)
+            .with_target(false)
+            .compact();
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .try_init();
+    });
     if perf_logging_enabled {
         info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
     }

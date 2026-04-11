@@ -9659,13 +9659,7 @@ async fn resolve_bootstrap_claim_rendezvous_candidates(
                 ),
             ));
         }
-        let mut ordered_urls = vec![preferred_rendezvous_url.clone()];
-        ordered_urls.extend(
-            configured_urls
-                .into_iter()
-                .filter(|url| url != &preferred_rendezvous_url),
-        );
-        return Ok(ordered_urls);
+        return Ok(vec![preferred_rendezvous_url]);
     }
 
     let rendezvous_urls =

@@ -284,13 +284,11 @@ fn extract_peer_identity_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result
 }
 
 fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
-    let node_prefix = "spiffe://ironmesh/node/";
-    if let Some(rest) = uri.strip_prefix(node_prefix) {
+    if let Some(rest) = uri.strip_prefix("urn:ironmesh:node:") {
         return rest.parse().ok().map(PeerIdentity::Node);
     }
 
-    let device_prefix = "spiffe://ironmesh/device/";
-    uri.strip_prefix(device_prefix)
+    uri.strip_prefix("urn:ironmesh:device:")
         .and_then(|rest| rest.parse().ok())
         .map(PeerIdentity::Device)
 }

@@ -3307,8 +3307,8 @@ mod tests {
             .await?;
             issued.validate()?;
             assert_eq!(
-                issued.bootstrap_claim.rendezvous_url,
-                format!("{dedicated_rendezvous_url}/")
+                issued.bootstrap_claim.rendezvous_urls,
+                vec![format!("{dedicated_rendezvous_url}/")]
             );
             assert!(
                 issued
