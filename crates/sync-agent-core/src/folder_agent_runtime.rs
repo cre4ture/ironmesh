@@ -53,12 +53,143 @@ pub fn run_folder_agent(options: &FolderAgentRuntimeOptions) -> Result<()> {
 
 pub type FolderAgentStatusCallback = Arc<dyn Fn(FolderAgentRuntimeStatus) + Send + Sync + 'static>;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderAgentRuntimeMetrics {
+    pub local_entry_count: u64,
+    pub local_file_count: u64,
+    pub local_directory_count: u64,
+    pub remote_entry_count: u64,
+    pub remote_file_count: u64,
+    pub remote_directory_count: u64,
+    pub changed_path_count: u64,
+    pub uploaded_file_count: u64,
+    pub downloaded_file_count: u64,
+    pub deleted_remote_file_count: u64,
+    pub removed_local_path_count: u64,
+    pub ensured_directory_count: u64,
+    pub preserved_local_file_count: u64,
+    pub startup_conflict_count: u64,
+}
+
+impl FolderAgentRuntimeMetrics {
+    pub fn from_states(
+        local_state: Option<&LocalTreeState>,
+        remote_index: Option<&RemoteTreeIndex>,
+    ) -> Self {
+        let mut metrics = Self::default();
+        if let Some(local_state) = local_state {
+            metrics.apply_local_state(local_state);
+        }
+        if let Some(remote_index) = remote_index {
+            metrics.apply_remote_index(remote_index);
+        }
+        metrics
+    }
+
+    pub fn apply_local_state(&mut self, local_state: &LocalTreeState) {
+        self.local_entry_count = usize_to_u64(local_state.len());
+        self.local_file_count = usize_to_u64(
+            local_state
+                .values()
+                .filter(|entry| entry.kind == LocalEntryKind::File)
+                .count(),
+        );
+        self.local_directory_count = self.local_entry_count.saturating_sub(self.local_file_count);
+    }
+
+    pub fn apply_remote_index(&mut self, remote_index: &RemoteTreeIndex) {
+        self.remote_directory_count = usize_to_u64(remote_index.directories.len());
+        self.remote_file_count = usize_to_u64(remote_index.files.len());
+        self.remote_entry_count = self
+            .remote_directory_count
+            .saturating_add(self.remote_file_count);
+    }
+
+    pub fn apply_snapshot(&mut self, snapshot: &SyncSnapshot, scope: &PathScope) {
+        let mut remote_directory_count = 0usize;
+        let mut remote_file_count = 0usize;
+
+        for entry in &snapshot.remote {
+            let remote_path = crate::normalize_relative_path(&entry.path);
+            let Some(local_path) = scope.remote_to_local(&remote_path) else {
+                continue;
+            };
+            if local_path.is_empty() {
+                continue;
+            }
+
+            match entry.kind {
+                EntryKind::Directory => remote_directory_count += 1,
+                EntryKind::File => remote_file_count += 1,
+            }
+        }
+
+        self.remote_directory_count = usize_to_u64(remote_directory_count);
+        self.remote_file_count = usize_to_u64(remote_file_count);
+        self.remote_entry_count = self
+            .remote_directory_count
+            .saturating_add(self.remote_file_count);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderAgentRuntimeStatus {
     pub state: String,
     pub message: String,
     pub updated_unix_ms: u64,
+    pub phase: String,
+    pub activity: String,
+    pub scope_label: String,
+    pub root_dir: String,
+    pub local_tree_uri: Option<String>,
+    pub connection_target: Option<String>,
+    pub storage_mode: String,
+    pub watch_mode: String,
+    pub run_mode: String,
+    pub last_success_unix_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub metrics: FolderAgentRuntimeMetrics,
+}
+
+impl FolderAgentRuntimeStatus {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        options: &FolderAgentRuntimeOptions,
+        connection_target: Option<&str>,
+        storage_mode: &str,
+        watch_mode: &str,
+        state: impl Into<String>,
+        phase: impl Into<String>,
+        activity: impl Into<String>,
+        message: impl Into<String>,
+        metrics: FolderAgentRuntimeMetrics,
+        last_success_unix_ms: Option<u64>,
+        last_error: Option<String>,
+    ) -> Self {
+        Self {
+            state: state.into(),
+            message: message.into(),
+            updated_unix_ms: now_unix_ms(),
+            phase: phase.into(),
+            activity: activity.into(),
+            scope_label: options.prefix.as_deref().unwrap_or("<root>").to_string(),
+            root_dir: options.root_dir.display().to_string(),
+            local_tree_uri: options.local_tree_uri.clone(),
+            connection_target: connection_target.map(ToOwned::to_owned),
+            storage_mode: storage_mode.to_string(),
+            watch_mode: watch_mode.to_string(),
+            run_mode: if options.run_once {
+                "once".to_string()
+            } else {
+                "continuous".to_string()
+            },
+            last_success_unix_ms,
+            last_error,
+            metrics,
+        }
+    }
 }
 
 pub fn run_folder_agent_with_control(
@@ -71,11 +202,20 @@ pub fn run_folder_agent_with_control(
     let prefix_label = options.prefix.as_deref().unwrap_or("<root>");
     emit_status(
         status_callback.as_ref(),
+        options,
+        None,
+        "filesystem",
+        watch_mode_label(options),
         "starting",
+        "startup",
+        "initializing",
         format!(
             "Starting folder sync runtime for prefix={prefix_label} root={}",
             options.root_dir.display()
         ),
+        FolderAgentRuntimeMetrics::default(),
+        None,
+        None,
     );
     let result = run_folder_agent_inner(
         options,
@@ -84,24 +224,57 @@ pub fn run_folder_agent_with_control(
         status_callback.clone(),
     );
 
-    match &result {
-        Ok(()) => emit_status(
+    if let Err(error) = &result {
+        emit_status(
             status_callback.as_ref(),
-            "stopped",
-            if options.run_once {
-                "Folder sync run completed"
-            } else {
-                "Folder sync runtime stopped"
-            },
-        ),
-        Err(error) => emit_status(
-            status_callback.as_ref(),
+            options,
+            None,
+            "filesystem",
+            watch_mode_label(options),
             "error",
+            "error",
+            "failed",
             format!("Folder sync runtime failed: {error:#}"),
-        ),
+            FolderAgentRuntimeMetrics::default(),
+            None,
+            Some(format!("{error:#}")),
+        );
     }
 
     result
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalSyncOutcome {
+    changed_path_count: usize,
+    ensured_directory_count: usize,
+    uploaded_file_count: usize,
+    deleted_remote_file_count: usize,
+}
+
+impl LocalSyncOutcome {
+    fn is_empty(self) -> bool {
+        self.ensured_directory_count == 0
+            && self.uploaded_file_count == 0
+            && self.deleted_remote_file_count == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RemoteApplyOutcome {
+    changed_path_count: usize,
+    ensured_directory_count: usize,
+    downloaded_file_count: usize,
+    removed_local_path_count: usize,
+}
+
+impl RemoteApplyOutcome {
+    fn accumulate(&mut self, other: Self) {
+        self.changed_path_count += other.changed_path_count;
+        self.ensured_directory_count += other.ensured_directory_count;
+        self.downloaded_file_count += other.downloaded_file_count;
+        self.removed_local_path_count += other.removed_local_path_count;
+    }
 }
 
 fn run_folder_agent_inner(
@@ -111,10 +284,12 @@ fn run_folder_agent_inner(
     status_callback: Option<FolderAgentStatusCallback>,
 ) -> Result<()> {
     let scope = PathScope::new(options.prefix.clone());
+    let watch_mode = watch_mode_label(options);
     let connection_target = describe_connection_target(
         options.server_base_url.as_deref(),
         options.client_bootstrap_json.as_deref(),
     )?;
+    let mut last_success_unix_ms = None;
     let state_store = match options.state_root_dir.as_deref() {
         Some(state_root_dir) => StartupStateStore::new_with_state_root(
             &options.root_dir,
@@ -164,21 +339,41 @@ fn run_folder_agent_inner(
 
     emit_status(
         status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "filesystem",
+        watch_mode,
         "starting",
-        "Fetching initial remote snapshot",
+        "startup",
+        "scanning-local-tree",
+        "Scanning local files before initial reconciliation",
+        FolderAgentRuntimeMetrics::default(),
+        last_success_unix_ms,
+        None,
     );
     let local_state_before_remote_sync = scan_local_tree(&options.root_dir)
         .context("failed to scan local state before initial remote sync")?;
     let local_scan_sample = sample_local_paths(&local_state_before_remote_sync, 5);
+    let local_scan_metrics =
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state_before_remote_sync), None);
     emit_status(
         status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "filesystem",
+        watch_mode,
         "starting",
+        "startup",
+        "scanning-local-tree",
         format!(
             "Initial local scan found {} path(s) under root={} sample=[{}]",
             local_state_before_remote_sync.len(),
             options.root_dir.display(),
             local_scan_sample
         ),
+        local_scan_metrics.clone(),
+        last_success_unix_ms,
+        None,
     );
 
     let baseline_before_remote_sync =
@@ -209,6 +404,20 @@ fn run_folder_agent_inner(
         None,
     );
 
+    emit_status(
+        status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "filesystem",
+        watch_mode,
+        "starting",
+        "startup",
+        "fetching-remote-snapshot",
+        "Fetching initial remote snapshot",
+        local_scan_metrics,
+        last_success_unix_ms,
+        None,
+    );
     let initial_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope.clone());
     let initial_snapshot = initial_fetcher
         .fetch_snapshot_blocking()
@@ -252,9 +461,36 @@ fn run_folder_agent_inner(
         tracing::warn!("startup-state: failed to materialize conflict copies: {error}");
     }
 
+    let mut startup_metrics =
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state_before_remote_sync), None);
+    startup_metrics.apply_snapshot(&initial_snapshot, &scope);
+    startup_metrics.preserved_local_file_count = usize_to_u64(preserve_local_files.len());
+    startup_metrics.startup_conflict_count = usize_to_u64(startup_conflicts.len());
+    startup_metrics.removed_local_path_count = usize_to_u64(remote_delete_wins_paths.len());
+    emit_status(
+        status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "filesystem",
+        watch_mode,
+        "starting",
+        "startup",
+        "reconciling-startup",
+        format!(
+            "Reconciling startup state: {} remote entrie(s), {} preserved local file(s), {} startup conflict(s), {} remote-delete winner(s)",
+            startup_metrics.remote_entry_count,
+            startup_metrics.preserved_local_file_count,
+            startup_metrics.startup_conflict_count,
+            startup_metrics.removed_local_path_count,
+        ),
+        startup_metrics,
+        last_success_unix_ms,
+        None,
+    );
+
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
-    apply_remote_snapshot(
+    let mut initial_remote_outcome = apply_remote_snapshot(
         &options.root_dir,
         &client,
         &initial_snapshot,
@@ -269,6 +505,7 @@ fn run_folder_agent_inner(
         remove_local_path(&options.root_dir, path)?;
         suppressed_uploads.remove(path);
     }
+    initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
 
     let mut local_state = scan_local_tree(&options.root_dir)
         .context("failed to scan local state after initial remote sync")?;
@@ -281,7 +518,37 @@ fn run_folder_agent_inner(
         .persist_local_baseline(&local_state)
         .context("failed to persist sqlite baseline after remote apply during startup")?;
 
-    sync_local_changes(
+    let mut initial_remote_metrics =
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+    initial_remote_metrics.changed_path_count =
+        usize_to_u64(initial_remote_outcome.changed_path_count);
+    initial_remote_metrics.downloaded_file_count =
+        usize_to_u64(initial_remote_outcome.downloaded_file_count);
+    initial_remote_metrics.ensured_directory_count =
+        usize_to_u64(initial_remote_outcome.ensured_directory_count);
+    initial_remote_metrics.removed_local_path_count =
+        usize_to_u64(initial_remote_outcome.removed_local_path_count);
+    initial_remote_metrics.preserved_local_file_count = usize_to_u64(preserve_local_files.len());
+    initial_remote_metrics.startup_conflict_count = usize_to_u64(startup_conflicts.len());
+    emit_status(
+        status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "filesystem",
+        watch_mode,
+        "syncing",
+        "startup",
+        "applying-remote-snapshot",
+        format!(
+            "Applied startup remote snapshot: {}",
+            format_remote_apply_summary(initial_remote_outcome)
+        ),
+        initial_remote_metrics,
+        last_success_unix_ms,
+        None,
+    );
+
+    let initial_local_sync_outcome = sync_local_changes(
         &options.root_dir,
         &client,
         &mut local_state,
@@ -298,7 +565,47 @@ fn run_folder_agent_inner(
         .persist_startup_conflicts(&startup_conflicts)
         .context("failed to persist startup conflicts")?;
 
+    last_success_unix_ms = Some(now_unix_ms());
+    let mut initial_runtime_metrics =
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+    initial_runtime_metrics.changed_path_count = usize_to_u64(
+        initial_remote_outcome.changed_path_count + initial_local_sync_outcome.changed_path_count,
+    );
+    initial_runtime_metrics.uploaded_file_count =
+        usize_to_u64(initial_local_sync_outcome.uploaded_file_count);
+    initial_runtime_metrics.downloaded_file_count =
+        usize_to_u64(initial_remote_outcome.downloaded_file_count);
+    initial_runtime_metrics.deleted_remote_file_count =
+        usize_to_u64(initial_local_sync_outcome.deleted_remote_file_count);
+    initial_runtime_metrics.removed_local_path_count =
+        usize_to_u64(initial_remote_outcome.removed_local_path_count);
+    initial_runtime_metrics.ensured_directory_count = usize_to_u64(
+        initial_remote_outcome.ensured_directory_count
+            + initial_local_sync_outcome.ensured_directory_count,
+    );
+    initial_runtime_metrics.preserved_local_file_count = usize_to_u64(preserve_local_files.len());
+    initial_runtime_metrics.startup_conflict_count = usize_to_u64(startup_conflicts.len());
+    let initial_sync_message = format!(
+        "Initial sync complete: {} and {}",
+        format_remote_apply_summary(initial_remote_outcome),
+        format_local_sync_summary(initial_local_sync_outcome)
+    );
+
     if options.run_once {
+        emit_status(
+            status_callback.as_ref(),
+            options,
+            Some(&connection_target),
+            "filesystem",
+            watch_mode,
+            "stopped",
+            "shutdown",
+            "completed-one-shot",
+            initial_sync_message,
+            initial_runtime_metrics,
+            last_success_unix_ms,
+            None,
+        );
         return Ok(());
     }
 
@@ -307,8 +614,17 @@ fn run_folder_agent_inner(
     }
     emit_status(
         status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "filesystem",
+        watch_mode,
         "running",
-        "Initial sync complete; watching for changes",
+        "steady-state",
+        "watching-for-changes",
+        initial_sync_message,
+        initial_runtime_metrics,
+        last_success_unix_ms,
+        None,
     );
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
@@ -346,13 +662,26 @@ fn run_folder_agent_inner(
     while running.load(Ordering::SeqCst) {
         let mut baseline_dirty = false;
         let mut remote_updates_applied = false;
+        let mut combined_remote_outcome = RemoteApplyOutcome::default();
         while let Ok(update) = remote_rx.try_recv() {
+            let mut remote_pending_metrics =
+                FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+            remote_pending_metrics.changed_path_count = usize_to_u64(update.changed_paths.len());
             emit_status(
                 status_callback.as_ref(),
+                options,
+                Some(&connection_target),
+                "filesystem",
+                watch_mode,
                 "syncing",
+                "steady-state",
+                "applying-remote-snapshot",
                 format!("Applying {} remote change(s)", update.changed_paths.len()),
+                remote_pending_metrics,
+                last_success_unix_ms,
+                None,
             );
-            apply_remote_snapshot(
+            combined_remote_outcome.accumulate(apply_remote_snapshot(
                 &options.root_dir,
                 &client,
                 &update.snapshot,
@@ -362,7 +691,7 @@ fn run_folder_agent_inner(
                 &scope,
                 &mut suppressed_uploads,
                 &mut remote_index,
-            )?;
+            )?);
             remote_updates_applied = true;
         }
 
@@ -370,6 +699,34 @@ fn run_folder_agent_inner(
             local_state = scan_local_tree(&options.root_dir)
                 .context("failed to rescan local state after remote update")?;
             baseline_dirty = true;
+            last_success_unix_ms = Some(now_unix_ms());
+            let mut remote_runtime_metrics =
+                FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+            remote_runtime_metrics.changed_path_count =
+                usize_to_u64(combined_remote_outcome.changed_path_count);
+            remote_runtime_metrics.downloaded_file_count =
+                usize_to_u64(combined_remote_outcome.downloaded_file_count);
+            remote_runtime_metrics.ensured_directory_count =
+                usize_to_u64(combined_remote_outcome.ensured_directory_count);
+            remote_runtime_metrics.removed_local_path_count =
+                usize_to_u64(combined_remote_outcome.removed_local_path_count);
+            emit_status(
+                status_callback.as_ref(),
+                options,
+                Some(&connection_target),
+                "filesystem",
+                watch_mode,
+                "running",
+                "steady-state",
+                "watching-for-changes",
+                format!(
+                    "Applied remote changes: {}",
+                    format_remote_apply_summary(combined_remote_outcome)
+                ),
+                remote_runtime_metrics,
+                last_success_unix_ms,
+                None,
+            );
         }
 
         let mut local_scan_requested = false;
@@ -379,12 +736,26 @@ fn run_folder_agent_inner(
 
         if local_scan_requested || Instant::now() >= next_local_scan {
             let previous_local_state = local_state.clone();
+            let local_scan_message = if local_scan_requested {
+                "Local change detected; scanning local files"
+            } else {
+                "Polling local files for changes"
+            };
             emit_status(
                 status_callback.as_ref(),
+                options,
+                Some(&connection_target),
+                "filesystem",
+                watch_mode,
                 "syncing",
-                "Scanning local files for changes",
+                "steady-state",
+                "scanning-local-tree",
+                local_scan_message,
+                FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+                last_success_unix_ms,
+                None,
             );
-            sync_local_changes(
+            let local_sync_outcome = sync_local_changes(
                 &options.root_dir,
                 &client,
                 &mut local_state,
@@ -397,7 +768,38 @@ fn run_folder_agent_inner(
                 baseline_dirty = true;
             }
             next_local_scan = Instant::now() + local_scan_interval;
-            emit_status(status_callback.as_ref(), "running", "Watching for changes");
+            last_success_unix_ms = Some(now_unix_ms());
+            let mut local_runtime_metrics =
+                FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+            local_runtime_metrics.changed_path_count =
+                usize_to_u64(local_sync_outcome.changed_path_count);
+            local_runtime_metrics.uploaded_file_count =
+                usize_to_u64(local_sync_outcome.uploaded_file_count);
+            local_runtime_metrics.deleted_remote_file_count =
+                usize_to_u64(local_sync_outcome.deleted_remote_file_count);
+            local_runtime_metrics.ensured_directory_count =
+                usize_to_u64(local_sync_outcome.ensured_directory_count);
+            emit_status(
+                status_callback.as_ref(),
+                options,
+                Some(&connection_target),
+                "filesystem",
+                watch_mode,
+                "running",
+                "steady-state",
+                "watching-for-changes",
+                if local_sync_outcome.is_empty() {
+                    "Watching for changes; local and remote state are aligned".to_string()
+                } else {
+                    format!(
+                        "Watching for changes after local sync: {}",
+                        format_local_sync_summary(local_sync_outcome)
+                    )
+                },
+                local_runtime_metrics,
+                last_success_unix_ms,
+                None,
+            );
         }
 
         if baseline_dirty {
@@ -411,22 +813,53 @@ fn run_folder_agent_inner(
 
     running.store(false, Ordering::SeqCst);
     let _ = remote_thread.join();
+    emit_status(
+        status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "filesystem",
+        watch_mode,
+        "stopped",
+        "shutdown",
+        "stopped",
+        "Folder sync runtime stopped",
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+        last_success_unix_ms,
+        None,
+    );
     Ok(())
 }
 
 fn emit_status(
     callback: Option<&FolderAgentStatusCallback>,
+    options: &FolderAgentRuntimeOptions,
+    connection_target: Option<&str>,
+    storage_mode: &str,
+    watch_mode: &str,
     state: impl Into<String>,
+    phase: impl Into<String>,
+    activity: impl Into<String>,
     message: impl Into<String>,
+    metrics: FolderAgentRuntimeMetrics,
+    last_success_unix_ms: Option<u64>,
+    last_error: Option<String>,
 ) {
     let Some(callback) = callback else {
         return;
     };
-    callback(FolderAgentRuntimeStatus {
-        state: state.into(),
-        message: message.into(),
-        updated_unix_ms: now_unix_ms(),
-    });
+    callback(FolderAgentRuntimeStatus::new(
+        options,
+        connection_target,
+        storage_mode,
+        watch_mode,
+        state,
+        phase,
+        activity,
+        message,
+        metrics,
+        last_success_unix_ms,
+        last_error,
+    ));
 }
 
 fn now_unix_ms() -> u64 {
@@ -500,9 +933,15 @@ fn sync_local_changes(
     scope: &PathScope,
     remote_index: &mut RemoteTreeIndex,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
-) -> Result<()> {
+) -> Result<LocalSyncOutcome> {
     let current = scan_local_tree(root_dir).context("failed to scan local root")?;
     let diff = diff_local_trees(local_state, &current);
+    let mut outcome = LocalSyncOutcome {
+        changed_path_count: diff.created_directories.len()
+            + diff.created_or_modified_files.len()
+            + diff.deleted_paths.len(),
+        ..LocalSyncOutcome::default()
+    };
 
     for path in &diff.created_directories {
         if remote_index.directories.contains(path) {
@@ -510,6 +949,7 @@ fn sync_local_changes(
         }
 
         ensure_remote_directory_marker(client, scope, path)?;
+        outcome.ensured_directory_count += 1;
         remote_index.directories.insert(path.clone());
         if let Some(store) = state_store
             && let Some(entry_state) = current.get(path)
@@ -537,6 +977,7 @@ fn sync_local_changes(
 
         let content_hash =
             upload_local_file(root_dir, client, scope, path, entry_state.size_bytes)?;
+        outcome.uploaded_file_count += 1;
         remote_index.files.insert(path.clone());
         for parent in parent_directories(path) {
             remote_index.directories.insert(parent);
@@ -576,6 +1017,7 @@ fn sync_local_changes(
             }
 
             delete_remote_file(client, scope, &path)?;
+            outcome.deleted_remote_file_count += 1;
             suppressed_uploads.remove(&path);
             remote_index.files.remove(&path);
             if let Some(store) = state_store {
@@ -588,7 +1030,7 @@ fn sync_local_changes(
     }
 
     *local_state = current;
-    Ok(())
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -602,7 +1044,8 @@ fn apply_remote_snapshot(
     scope: &PathScope,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
     remote_index: &mut RemoteTreeIndex,
-) -> Result<()> {
+) -> Result<RemoteApplyOutcome> {
+    let mut outcome = RemoteApplyOutcome::default();
     let mut next_index = RemoteTreeIndex::default();
     let mut entry_kinds: BTreeMap<String, (EntryKind, String)> = BTreeMap::new();
     let mut entry_hashes: BTreeMap<String, String> = BTreeMap::new();
@@ -650,6 +1093,8 @@ fn apply_remote_snapshot(
 
                 match entry_kinds.get(path) {
                     Some((EntryKind::Directory, _)) => {
+                        outcome.changed_path_count += 1;
+                        outcome.ensured_directory_count += 1;
                         let directory = absolute_path(root_dir, path);
                         fs::create_dir_all(&directory).with_context(|| {
                             format!(
@@ -668,6 +1113,8 @@ fn apply_remote_snapshot(
                         }
                     }
                     Some((EntryKind::File, remote_key)) => {
+                        outcome.changed_path_count += 1;
+                        outcome.downloaded_file_count += 1;
                         let content_hash = entry_hashes.get(path).map(|hash| hash.as_str());
                         download_remote_file(
                             root_dir,
@@ -682,6 +1129,8 @@ fn apply_remote_snapshot(
                         }
                     }
                     None => {
+                        outcome.changed_path_count += 1;
+                        outcome.removed_local_path_count += 1;
                         remove_local_path(root_dir, path)?;
                         suppressed_uploads.remove(path);
                         if let Some(store) = state_store {
@@ -696,6 +1145,8 @@ fn apply_remote_snapshot(
         }
         None => {
             for directory in &next_index.directories {
+                outcome.changed_path_count += 1;
+                outcome.ensured_directory_count += 1;
                 let absolute = absolute_path(root_dir, directory);
                 fs::create_dir_all(&absolute).with_context(|| {
                     format!(
@@ -727,6 +1178,8 @@ fn apply_remote_snapshot(
                 {
                     continue;
                 }
+                outcome.changed_path_count += 1;
+                outcome.downloaded_file_count += 1;
                 let content_hash = entry_hashes.get(file).map(|hash| hash.as_str());
                 download_remote_file(
                     root_dir,
@@ -745,7 +1198,71 @@ fn apply_remote_snapshot(
         }
     }
 
-    Ok(())
+    Ok(outcome)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
+}
+
+fn watch_mode_label(options: &FolderAgentRuntimeOptions) -> &'static str {
+    if options.run_once {
+        "not-watching"
+    } else if options.no_watch_local {
+        "polling-only"
+    } else {
+        "fs-notify+polling"
+    }
+}
+
+fn format_local_sync_summary(outcome: LocalSyncOutcome) -> String {
+    let mut parts = Vec::new();
+    if outcome.uploaded_file_count > 0 {
+        parts.push(format!("{} upload(s)", outcome.uploaded_file_count));
+    }
+    if outcome.deleted_remote_file_count > 0 {
+        parts.push(format!(
+            "{} remote delete(s)",
+            outcome.deleted_remote_file_count
+        ));
+    }
+    if outcome.ensured_directory_count > 0 {
+        parts.push(format!(
+            "{} directory marker upload(s)",
+            outcome.ensured_directory_count
+        ));
+    }
+
+    if parts.is_empty() {
+        "no local uploads or deletes were needed".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn format_remote_apply_summary(outcome: RemoteApplyOutcome) -> String {
+    let mut parts = Vec::new();
+    if outcome.downloaded_file_count > 0 {
+        parts.push(format!("{} download(s)", outcome.downloaded_file_count));
+    }
+    if outcome.ensured_directory_count > 0 {
+        parts.push(format!(
+            "{} directory materialization(s)",
+            outcome.ensured_directory_count
+        ));
+    }
+    if outcome.removed_local_path_count > 0 {
+        parts.push(format!(
+            "{} local removal(s)",
+            outcome.removed_local_path_count
+        ));
+    }
+
+    if parts.is_empty() {
+        "no remote materialization was needed".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 fn download_remote_file(

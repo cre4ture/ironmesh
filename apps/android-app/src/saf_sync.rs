@@ -18,12 +18,13 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_agent_core::{
-    FolderAgentRuntimeOptions, FolderAgentRuntimeStatus, FolderAgentStatusCallback, LocalEntryKind,
-    LocalEntryState, LocalTreeState, PathScope, RemoteTreeIndex, StartupStateStore,
-    build_configured_client, delete_remote_file, describe_connection_target, diff_local_trees,
-    load_local_baseline_hashes_with_retries, load_local_baseline_with_retries, parent_directories,
-    remote_file_hashes_by_local_path, remote_file_paths_by_local_path,
-    startup_add_delete_conflicts, startup_baseline_state_from_remote_index,
+    FolderAgentRuntimeMetrics, FolderAgentRuntimeOptions, FolderAgentRuntimeStatus,
+    FolderAgentStatusCallback, LocalEntryKind, LocalEntryState, LocalTreeState, PathScope,
+    RemoteTreeIndex, StartupStateStore, build_configured_client, delete_remote_file,
+    describe_connection_target, diff_local_trees, load_local_baseline_hashes_with_retries,
+    load_local_baseline_with_retries, parent_directories, remote_file_hashes_by_local_path,
+    remote_file_paths_by_local_path, startup_add_delete_conflicts,
+    startup_baseline_state_from_remote_index,
 };
 use sync_core::{EntryKind, SyncSnapshot};
 
@@ -102,17 +103,32 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClie
 
 fn emit_status(
     callback: Option<&FolderAgentStatusCallback>,
+    options: &FolderAgentRuntimeOptions,
+    connection_target: Option<&str>,
     state: impl Into<String>,
+    phase: impl Into<String>,
+    activity: impl Into<String>,
     message: impl Into<String>,
+    metrics: FolderAgentRuntimeMetrics,
+    last_success_unix_ms: Option<u64>,
+    last_error: Option<String>,
 ) {
     let Some(callback) = callback else {
         return;
     };
-    callback(FolderAgentRuntimeStatus {
-        state: state.into(),
-        message: message.into(),
-        updated_unix_ms: now_unix_ms(),
-    });
+    callback(FolderAgentRuntimeStatus::new(
+        options,
+        connection_target,
+        "android-saf",
+        watch_mode_label(options),
+        state,
+        phase,
+        activity,
+        message,
+        metrics,
+        last_success_unix_ms,
+        last_error,
+    ));
 }
 
 fn log_android_info(message: &str) {
@@ -160,6 +176,39 @@ fn sample_local_paths(local_state: &LocalTreeState, limit: usize) -> String {
         sample.push_str("<none>");
     }
     sample
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalSyncOutcome {
+    changed_path_count: usize,
+    ensured_directory_count: usize,
+    uploaded_file_count: usize,
+    deleted_remote_file_count: usize,
+}
+
+impl LocalSyncOutcome {
+    fn is_empty(self) -> bool {
+        self.ensured_directory_count == 0
+            && self.uploaded_file_count == 0
+            && self.deleted_remote_file_count == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RemoteApplyOutcome {
+    changed_path_count: usize,
+    ensured_directory_count: usize,
+    downloaded_file_count: usize,
+    removed_local_path_count: usize,
+}
+
+impl RemoteApplyOutcome {
+    fn accumulate(&mut self, other: Self) {
+        self.changed_path_count += other.changed_path_count;
+        self.ensured_directory_count += other.ensured_directory_count;
+        self.downloaded_file_count += other.downloaded_file_count;
+        self.removed_local_path_count += other.removed_local_path_count;
+    }
 }
 
 fn state_identity_root(tree_uri: &str) -> PathBuf {
@@ -817,7 +866,8 @@ fn apply_remote_snapshot_saf(
     scope: &PathScope,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
     remote_index: &mut RemoteTreeIndex,
-) -> Result<LocalTreeState> {
+) -> Result<(LocalTreeState, RemoteApplyOutcome)> {
+    let mut outcome = RemoteApplyOutcome::default();
     let mut next_index = RemoteTreeIndex::default();
     let mut entry_kinds: BTreeMap<String, (EntryKind, String)> = BTreeMap::new();
 
@@ -857,12 +907,18 @@ fn apply_remote_snapshot_saf(
             for path in &changed_local_paths {
                 match entry_kinds.get(path.as_str()) {
                     Some((EntryKind::Directory, _)) => {
+                        outcome.changed_path_count += 1;
+                        outcome.ensured_directory_count += 1;
                         ensure_tree_directory(tree_uri, path)?;
                     }
                     Some((EntryKind::File, remote_key)) => {
+                        outcome.changed_path_count += 1;
+                        outcome.downloaded_file_count += 1;
                         download_remote_file_to_saf(tree_uri, client, path, remote_key)?;
                     }
                     None => {
+                        outcome.changed_path_count += 1;
+                        outcome.removed_local_path_count += 1;
                         delete_tree_path(tree_uri, path)?;
                         suppressed_uploads.remove(path);
                     }
@@ -878,10 +934,12 @@ fn apply_remote_snapshot_saf(
                     suppressed_uploads.insert(path, entry_state.clone());
                 }
             }
-            Ok(scanned)
+            Ok((scanned, outcome))
         }
         None => {
             for directory in &next_index.directories {
+                outcome.changed_path_count += 1;
+                outcome.ensured_directory_count += 1;
                 ensure_tree_directory(tree_uri, directory)?;
             }
 
@@ -896,6 +954,8 @@ fn apply_remote_snapshot_saf(
                 {
                     continue;
                 }
+                outcome.changed_path_count += 1;
+                outcome.downloaded_file_count += 1;
                 download_remote_file_to_saf(tree_uri, client, file, remote_key)?;
             }
 
@@ -909,7 +969,7 @@ fn apply_remote_snapshot_saf(
                     suppressed_uploads.insert(file.clone(), entry_state.clone());
                 }
             }
-            Ok(scanned)
+            Ok((scanned, outcome))
         }
     }
 }
@@ -923,10 +983,15 @@ fn sync_local_changes_saf(
     scope: &PathScope,
     remote_index: &mut RemoteTreeIndex,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
-    status_callback: Option<&FolderAgentStatusCallback>,
-) -> Result<()> {
+) -> Result<LocalSyncOutcome> {
     let current = scan_saf_tree(tree_uri).context("failed to scan SAF tree")?;
     let diff = diff_local_trees(local_state, &current);
+    let mut outcome = LocalSyncOutcome {
+        changed_path_count: diff.created_directories.len()
+            + diff.created_or_modified_files.len()
+            + diff.deleted_paths.len(),
+        ..LocalSyncOutcome::default()
+    };
 
     for path in &diff.created_directories {
         if remote_index.directories.contains(path) {
@@ -934,6 +999,7 @@ fn sync_local_changes_saf(
         }
 
         ensure_remote_directory_marker(client, scope, path)?;
+        outcome.ensured_directory_count += 1;
         remote_index.directories.insert(path.clone());
         if let Some(store) = state_store
             && let Some(entry_state) = current.get(path)
@@ -962,8 +1028,8 @@ fn sync_local_changes_saf(
             anyhow::anyhow!("refusing to upload local root without concrete scoped path")
         })?;
         let content_hash = upload_saf_file(tree_uri, client, scope, path, entry_state.size_bytes)?;
+        outcome.uploaded_file_count += 1;
         let upload_message = format!("Uploaded SAF file {path} to {remote_key}");
-        emit_status(status_callback, "syncing", upload_message.as_str());
         log_android_info(upload_message.as_str());
         remote_index.files.insert(path.clone());
         for parent in parent_directories(path) {
@@ -1003,6 +1069,7 @@ fn sync_local_changes_saf(
             }
 
             delete_remote_file(client, scope, &path)?;
+            outcome.deleted_remote_file_count += 1;
             suppressed_uploads.remove(&path);
             remote_index.files.remove(&path);
             if let Some(store) = state_store {
@@ -1014,7 +1081,7 @@ fn sync_local_changes_saf(
     }
 
     *local_state = current;
-    Ok(())
+    Ok(outcome)
 }
 
 pub(crate) fn run_saf_folder_agent_with_control(
@@ -1030,6 +1097,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
         options.client_bootstrap_json.as_deref(),
     )
     .context("SAF runtime requires server_base_url or client_bootstrap_json")?;
+    let mut last_success_unix_ms = None;
     let state_identity_root = state_identity_root(tree_uri);
     let state_store = match options.state_root_dir.as_deref() {
         Some(state_root_dir) => StartupStateStore::new_with_state_root(
@@ -1050,29 +1118,52 @@ pub(crate) fn run_saf_folder_agent_with_control(
     let prefix_label = options.prefix.as_deref().unwrap_or("<root>");
     emit_status(
         status_callback.as_ref(),
+        options,
+        Some(&connection_target),
         "starting",
+        "startup",
+        "initializing",
         format!(
             "Starting SAF folder sync runtime for prefix={prefix_label} root={} treeUri={tree_uri}",
             options.root_dir.display()
         ),
+        FolderAgentRuntimeMetrics::default(),
+        last_success_unix_ms,
+        None,
     );
     emit_status(
         status_callback.as_ref(),
+        options,
+        Some(&connection_target),
         "starting",
-        "Fetching initial remote snapshot",
+        "startup",
+        "scanning-local-tree",
+        "Scanning SAF tree before initial reconciliation",
+        FolderAgentRuntimeMetrics::default(),
+        last_success_unix_ms,
+        None,
     );
 
     let local_state_before_remote_sync =
         scan_saf_tree(tree_uri).context("failed to scan SAF tree before initial remote sync")?;
+    let local_scan_metrics =
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state_before_remote_sync), None);
     emit_status(
         status_callback.as_ref(),
+        options,
+        Some(&connection_target),
         "starting",
+        "startup",
+        "scanning-local-tree",
         format!(
             "Initial local SAF scan found {} path(s) under root={} sample=[{}]",
             local_state_before_remote_sync.len(),
             options.root_dir.display(),
             sample_local_paths(&local_state_before_remote_sync, 5)
         ),
+        local_scan_metrics.clone(),
+        last_success_unix_ms,
+        None,
     );
 
     let baseline_before_remote_sync =
@@ -1097,6 +1188,18 @@ pub(crate) fn run_saf_folder_agent_with_control(
     };
 
     let initial_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope.clone());
+    emit_status(
+        status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "starting",
+        "startup",
+        "fetching-remote-snapshot",
+        "Fetching initial remote snapshot",
+        local_scan_metrics,
+        last_success_unix_ms,
+        None,
+    );
     let initial_snapshot = initial_fetcher
         .fetch_snapshot_blocking()
         .context("failed to fetch initial remote snapshot")?;
@@ -1134,9 +1237,34 @@ pub(crate) fn run_saf_folder_agent_with_control(
         &preserve_local_files,
     ));
 
+    let mut startup_metrics =
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state_before_remote_sync), None);
+    startup_metrics.apply_snapshot(&initial_snapshot, &scope);
+    startup_metrics.preserved_local_file_count = usize_to_u64(preserve_local_files.len());
+    startup_metrics.startup_conflict_count = usize_to_u64(startup_conflicts.len());
+    startup_metrics.removed_local_path_count = usize_to_u64(remote_delete_wins_paths.len());
+    emit_status(
+        status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "starting",
+        "startup",
+        "reconciling-startup",
+        format!(
+            "Reconciling SAF startup state: {} remote entrie(s), {} preserved local file(s), {} startup conflict(s), {} remote-delete winner(s)",
+            startup_metrics.remote_entry_count,
+            startup_metrics.preserved_local_file_count,
+            startup_metrics.startup_conflict_count,
+            startup_metrics.removed_local_path_count,
+        ),
+        startup_metrics,
+        last_success_unix_ms,
+        None,
+    );
+
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
-    let mut local_state = apply_remote_snapshot_saf(
+    let (mut local_state, mut initial_remote_outcome) = apply_remote_snapshot_saf(
         tree_uri,
         &local_state_before_remote_sync,
         &client,
@@ -1151,6 +1279,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
         delete_tree_path(tree_uri, path)?;
         suppressed_uploads.remove(path);
     }
+    initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
     if !remote_delete_wins_paths.is_empty() {
         local_state = scan_saf_tree(tree_uri)
             .context("failed to rescan SAF tree after remote delete wins")?;
@@ -1165,7 +1294,35 @@ pub(crate) fn run_saf_folder_agent_with_control(
         .persist_local_baseline(&local_state)
         .context("failed to persist sqlite baseline after remote apply during startup")?;
 
-    sync_local_changes_saf(
+    let mut initial_remote_metrics =
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+    initial_remote_metrics.changed_path_count =
+        usize_to_u64(initial_remote_outcome.changed_path_count);
+    initial_remote_metrics.downloaded_file_count =
+        usize_to_u64(initial_remote_outcome.downloaded_file_count);
+    initial_remote_metrics.ensured_directory_count =
+        usize_to_u64(initial_remote_outcome.ensured_directory_count);
+    initial_remote_metrics.removed_local_path_count =
+        usize_to_u64(initial_remote_outcome.removed_local_path_count);
+    initial_remote_metrics.preserved_local_file_count = usize_to_u64(preserve_local_files.len());
+    initial_remote_metrics.startup_conflict_count = usize_to_u64(startup_conflicts.len());
+    emit_status(
+        status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "syncing",
+        "startup",
+        "applying-remote-snapshot",
+        format!(
+            "Applied startup SAF snapshot: {}",
+            format_remote_apply_summary(initial_remote_outcome)
+        ),
+        initial_remote_metrics,
+        last_success_unix_ms,
+        None,
+    );
+
+    let initial_local_sync_outcome = sync_local_changes_saf(
         tree_uri,
         &client,
         &mut local_state,
@@ -1173,7 +1330,6 @@ pub(crate) fn run_saf_folder_agent_with_control(
         &scope,
         &mut remote_index,
         &mut suppressed_uploads,
-        status_callback.as_ref(),
     )?;
 
     state_store
@@ -1183,19 +1339,59 @@ pub(crate) fn run_saf_folder_agent_with_control(
         .persist_startup_conflicts(&startup_conflicts)
         .context("failed to persist startup conflicts")?;
 
+    last_success_unix_ms = Some(now_unix_ms());
+    let mut initial_runtime_metrics =
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+    initial_runtime_metrics.changed_path_count = usize_to_u64(
+        initial_remote_outcome.changed_path_count + initial_local_sync_outcome.changed_path_count,
+    );
+    initial_runtime_metrics.uploaded_file_count =
+        usize_to_u64(initial_local_sync_outcome.uploaded_file_count);
+    initial_runtime_metrics.downloaded_file_count =
+        usize_to_u64(initial_remote_outcome.downloaded_file_count);
+    initial_runtime_metrics.deleted_remote_file_count =
+        usize_to_u64(initial_local_sync_outcome.deleted_remote_file_count);
+    initial_runtime_metrics.removed_local_path_count =
+        usize_to_u64(initial_remote_outcome.removed_local_path_count);
+    initial_runtime_metrics.ensured_directory_count = usize_to_u64(
+        initial_remote_outcome.ensured_directory_count
+            + initial_local_sync_outcome.ensured_directory_count,
+    );
+    initial_runtime_metrics.preserved_local_file_count = usize_to_u64(preserve_local_files.len());
+    initial_runtime_metrics.startup_conflict_count = usize_to_u64(startup_conflicts.len());
+    let initial_sync_message = format!(
+        "Initial SAF sync complete: {} and {}",
+        format_remote_apply_summary(initial_remote_outcome),
+        format_local_sync_summary(initial_local_sync_outcome),
+    );
+
     if options.run_once {
         emit_status(
             status_callback.as_ref(),
+            options,
+            Some(&connection_target),
             "stopped",
-            "Folder sync run completed",
+            "shutdown",
+            "completed-one-shot",
+            initial_sync_message,
+            initial_runtime_metrics,
+            last_success_unix_ms,
+            None,
         );
         return Ok(());
     }
 
     emit_status(
         status_callback.as_ref(),
+        options,
+        Some(&connection_target),
         "running",
-        "Initial sync complete; watching SAF tree for changes",
+        "steady-state",
+        "watching-for-changes",
+        initial_sync_message,
+        initial_runtime_metrics,
+        last_success_unix_ms,
+        None,
     );
 
     let refresh_interval = Duration::from_millis(options.remote_refresh_interval_ms.max(250));
@@ -1222,13 +1418,24 @@ pub(crate) fn run_saf_folder_agent_with_control(
 
     while running.load(Ordering::SeqCst) {
         let mut baseline_dirty = false;
+        let mut combined_remote_outcome = RemoteApplyOutcome::default();
         while let Ok(update) = remote_rx.try_recv() {
+            let mut remote_pending_metrics =
+                FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+            remote_pending_metrics.changed_path_count = usize_to_u64(update.changed_paths.len());
             emit_status(
                 status_callback.as_ref(),
+                options,
+                Some(&connection_target),
                 "syncing",
+                "steady-state",
+                "applying-remote-snapshot",
                 format!("Applying {} remote change(s)", update.changed_paths.len()),
+                remote_pending_metrics,
+                last_success_unix_ms,
+                None,
             );
-            local_state = apply_remote_snapshot_saf(
+            let (next_local_state, remote_outcome) = apply_remote_snapshot_saf(
                 tree_uri,
                 &local_state,
                 &client,
@@ -1239,7 +1446,38 @@ pub(crate) fn run_saf_folder_agent_with_control(
                 &mut suppressed_uploads,
                 &mut remote_index,
             )?;
+            local_state = next_local_state;
+            combined_remote_outcome.accumulate(remote_outcome);
             baseline_dirty = true;
+        }
+
+        if combined_remote_outcome.changed_path_count > 0 {
+            last_success_unix_ms = Some(now_unix_ms());
+            let mut remote_runtime_metrics =
+                FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+            remote_runtime_metrics.changed_path_count =
+                usize_to_u64(combined_remote_outcome.changed_path_count);
+            remote_runtime_metrics.downloaded_file_count =
+                usize_to_u64(combined_remote_outcome.downloaded_file_count);
+            remote_runtime_metrics.ensured_directory_count =
+                usize_to_u64(combined_remote_outcome.ensured_directory_count);
+            remote_runtime_metrics.removed_local_path_count =
+                usize_to_u64(combined_remote_outcome.removed_local_path_count);
+            emit_status(
+                status_callback.as_ref(),
+                options,
+                Some(&connection_target),
+                "running",
+                "steady-state",
+                "watching-for-changes",
+                format!(
+                    "Applied SAF remote changes: {}",
+                    format_remote_apply_summary(combined_remote_outcome)
+                ),
+                remote_runtime_metrics,
+                last_success_unix_ms,
+                None,
+            );
         }
 
         let current_tree_change_version =
@@ -1250,14 +1488,21 @@ pub(crate) fn run_saf_folder_agent_with_control(
             let previous_local_state = local_state.clone();
             emit_status(
                 status_callback.as_ref(),
+                options,
+                Some(&connection_target),
                 "syncing",
+                "steady-state",
+                "scanning-local-tree",
                 if observer_hint_triggered {
                     "SAF change hint received; scanning local tree"
                 } else {
                     "Scanning SAF tree for changes"
                 },
+                FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+                last_success_unix_ms,
+                None,
             );
-            sync_local_changes_saf(
+            let local_sync_outcome = sync_local_changes_saf(
                 tree_uri,
                 &client,
                 &mut local_state,
@@ -1265,7 +1510,6 @@ pub(crate) fn run_saf_folder_agent_with_control(
                 &scope,
                 &mut remote_index,
                 &mut suppressed_uploads,
-                status_callback.as_ref(),
             )?;
             if local_state != previous_local_state {
                 baseline_dirty = true;
@@ -1273,10 +1517,36 @@ pub(crate) fn run_saf_folder_agent_with_control(
             last_observed_tree_change_version =
                 tree_change_version(tree_uri).unwrap_or(current_tree_change_version);
             next_local_scan = Instant::now() + local_scan_interval;
+            last_success_unix_ms = Some(now_unix_ms());
+            let mut local_runtime_metrics =
+                FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
+            local_runtime_metrics.changed_path_count =
+                usize_to_u64(local_sync_outcome.changed_path_count);
+            local_runtime_metrics.uploaded_file_count =
+                usize_to_u64(local_sync_outcome.uploaded_file_count);
+            local_runtime_metrics.deleted_remote_file_count =
+                usize_to_u64(local_sync_outcome.deleted_remote_file_count);
+            local_runtime_metrics.ensured_directory_count =
+                usize_to_u64(local_sync_outcome.ensured_directory_count);
             emit_status(
                 status_callback.as_ref(),
+                options,
+                Some(&connection_target),
                 "running",
-                "Watching SAF tree for changes",
+                "steady-state",
+                "watching-for-changes",
+                if local_sync_outcome.is_empty() {
+                    "Watching SAF tree for changes; local and remote state are aligned"
+                        .to_string()
+                } else {
+                    format!(
+                        "Watching SAF tree for changes after local sync: {}",
+                        format_local_sync_summary(local_sync_outcome)
+                    )
+                },
+                local_runtime_metrics,
+                last_success_unix_ms,
+                None,
             );
         }
 
@@ -1293,8 +1563,77 @@ pub(crate) fn run_saf_folder_agent_with_control(
     let _ = remote_thread.join();
     emit_status(
         status_callback.as_ref(),
+        options,
+        Some(&connection_target),
+        "stopped",
+        "shutdown",
         "stopped",
         "Folder sync runtime stopped",
+        FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+        last_success_unix_ms,
+        None,
     );
     Ok(())
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
+}
+
+fn watch_mode_label(options: &FolderAgentRuntimeOptions) -> &'static str {
+    if options.run_once {
+        "not-watching"
+    } else {
+        "saf-observer+polling"
+    }
+}
+
+fn format_local_sync_summary(outcome: LocalSyncOutcome) -> String {
+    let mut parts = Vec::new();
+    if outcome.uploaded_file_count > 0 {
+        parts.push(format!("{} upload(s)", outcome.uploaded_file_count));
+    }
+    if outcome.deleted_remote_file_count > 0 {
+        parts.push(format!(
+            "{} remote delete(s)",
+            outcome.deleted_remote_file_count
+        ));
+    }
+    if outcome.ensured_directory_count > 0 {
+        parts.push(format!(
+            "{} directory marker upload(s)",
+            outcome.ensured_directory_count
+        ));
+    }
+
+    if parts.is_empty() {
+        "no local uploads or deletes were needed".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn format_remote_apply_summary(outcome: RemoteApplyOutcome) -> String {
+    let mut parts = Vec::new();
+    if outcome.downloaded_file_count > 0 {
+        parts.push(format!("{} download(s)", outcome.downloaded_file_count));
+    }
+    if outcome.ensured_directory_count > 0 {
+        parts.push(format!(
+            "{} directory materialization(s)",
+            outcome.ensured_directory_count
+        ));
+    }
+    if outcome.removed_local_path_count > 0 {
+        parts.push(format!(
+            "{} local removal(s)",
+            outcome.removed_local_path_count
+        ));
+    }
+
+    if parts.is_empty() {
+        "no remote materialization was needed".to_string()
+    } else {
+        parts.join(", ")
+    }
 }

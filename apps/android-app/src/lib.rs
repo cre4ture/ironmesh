@@ -2,6 +2,84 @@ mod saf_sync;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_profile(
+        profile_id: &str,
+        label: &str,
+        state: &str,
+        message: &str,
+        last_success_unix_ms: Option<u64>,
+    ) -> AndroidFolderSyncProfileStatus {
+        AndroidFolderSyncProfileStatus {
+            profile_id: profile_id.to_string(),
+            label: label.to_string(),
+            state: state.to_string(),
+            message: message.to_string(),
+            last_success_unix_ms,
+            ..AndroidFolderSyncProfileStatus::default()
+        }
+    }
+
+    #[test]
+    fn rebuild_service_summary_reports_stopped_when_no_profiles_are_active() {
+        let mut status = AndroidFolderSyncServiceStatus::default();
+
+        rebuild_service_summary(&mut status);
+
+        assert_eq!(status.service_state, "stopped");
+        assert_eq!(status.service_message, "Continuous sync is stopped");
+        assert_eq!(status.active_profile_count, 0);
+        assert!(status.current_activity.is_empty());
+        assert!(status.active_summary.is_empty());
+        assert_eq!(status.last_success_unix_ms, None);
+    }
+
+    #[test]
+    fn rebuild_service_summary_prioritizes_errors_and_tracks_latest_success() {
+        let mut status = AndroidFolderSyncServiceStatus {
+            profiles: vec![
+                sample_profile(
+                    "profile-a",
+                    "Photos",
+                    "running",
+                    "Watching for changes",
+                    Some(100),
+                ),
+                sample_profile(
+                    "profile-b",
+                    "Docs",
+                    "error",
+                    "Folder sync runtime failed: boom",
+                    Some(250),
+                ),
+                sample_profile(
+                    "profile-c",
+                    "Media",
+                    "syncing",
+                    "Applying 4 remote change(s)",
+                    Some(200),
+                ),
+            ],
+            ..AndroidFolderSyncServiceStatus::default()
+        };
+
+        rebuild_service_summary(&mut status);
+
+        assert_eq!(status.service_state, "error");
+        assert_eq!(status.active_profile_count, 3);
+        assert_eq!(status.error_profile_count, 1);
+        assert_eq!(status.syncing_profile_count, 1);
+        assert_eq!(status.running_profile_count, 1);
+        assert_eq!(status.last_success_unix_ms, Some(250));
+        assert_eq!(status.current_activity, "Docs: Folder sync runtime failed: boom");
+        assert!(status.service_message.contains("1 with errors"));
+        assert!(status.active_summary.contains("Photos: running"));
+    }
+}
 use client_sdk::{
     BootstrapEnrollmentResult, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
     IronMeshClient, enroll_connection_input_blocking,
@@ -18,8 +96,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use sync_agent_core::{
-    FolderAgentRuntimeOptions, FolderAgentRuntimeStatus, FolderAgentStatusCallback,
-    build_configured_client, run_folder_agent, run_folder_agent_with_control,
+    FolderAgentRuntimeMetrics, FolderAgentRuntimeOptions, FolderAgentRuntimeStatus,
+    FolderAgentStatusCallback, build_configured_client, describe_connection_target,
+    run_folder_agent, run_folder_agent_with_control,
 };
 use tokio::task::JoinHandle;
 
@@ -162,6 +241,15 @@ struct AndroidFolderSyncServiceStatus {
     service_message: String,
     profiles: Vec<AndroidFolderSyncProfileStatus>,
     updated_unix_ms: u64,
+    profile_count: u64,
+    active_profile_count: u64,
+    syncing_profile_count: u64,
+    error_profile_count: u64,
+    starting_profile_count: u64,
+    running_profile_count: u64,
+    current_activity: String,
+    active_summary: String,
+    last_success_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -172,6 +260,104 @@ struct AndroidFolderSyncProfileStatus {
     state: String,
     message: String,
     updated_unix_ms: u64,
+    phase: String,
+    activity: String,
+    scope_label: String,
+    root_dir: String,
+    local_tree_uri: Option<String>,
+    connection_target: Option<String>,
+    storage_mode: String,
+    watch_mode: String,
+    run_mode: String,
+    last_success_unix_ms: Option<u64>,
+    last_error: Option<String>,
+    metrics: FolderAgentRuntimeMetrics,
+}
+
+fn android_storage_mode_label(options: &FolderAgentRuntimeOptions) -> &'static str {
+    if options
+        .local_tree_uri
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        "android-saf"
+    } else {
+        "filesystem"
+    }
+}
+
+fn android_watch_mode_label(options: &FolderAgentRuntimeOptions) -> &'static str {
+    if options.run_once {
+        "not-watching"
+    } else if options
+        .local_tree_uri
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        "saf-observer+polling"
+    } else if options.no_watch_local {
+        "polling-only"
+    } else {
+        "fs-notify+polling"
+    }
+}
+
+fn profile_status_from_runtime(
+    profile_id: impl Into<String>,
+    label: impl Into<String>,
+    status: FolderAgentRuntimeStatus,
+) -> AndroidFolderSyncProfileStatus {
+    AndroidFolderSyncProfileStatus {
+        profile_id: profile_id.into(),
+        label: label.into(),
+        state: status.state,
+        message: status.message,
+        updated_unix_ms: status.updated_unix_ms,
+        phase: status.phase,
+        activity: status.activity,
+        scope_label: status.scope_label,
+        root_dir: status.root_dir,
+        local_tree_uri: status.local_tree_uri,
+        connection_target: status.connection_target,
+        storage_mode: status.storage_mode,
+        watch_mode: status.watch_mode,
+        run_mode: status.run_mode,
+        last_success_unix_ms: status.last_success_unix_ms,
+        last_error: status.last_error,
+        metrics: status.metrics,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_profile_status(
+    profile_id: impl Into<String>,
+    label: impl Into<String>,
+    options: &FolderAgentRuntimeOptions,
+    connection_target: Option<&str>,
+    state: &str,
+    phase: &str,
+    activity: &str,
+    message: impl Into<String>,
+    last_success_unix_ms: Option<u64>,
+    last_error: Option<String>,
+) -> AndroidFolderSyncProfileStatus {
+    profile_status_from_runtime(
+        profile_id,
+        label,
+        FolderAgentRuntimeStatus::new(
+            options,
+            connection_target,
+            android_storage_mode_label(options),
+            android_watch_mode_label(options),
+            state,
+            phase,
+            activity,
+            message,
+            FolderAgentRuntimeMetrics::default(),
+            last_success_unix_ms,
+            last_error,
+        ),
+    )
 }
 
 struct AndroidFolderSyncRun {
@@ -191,8 +377,8 @@ impl AndroidFolderSyncManager {
             status: Arc::new(Mutex::new(AndroidFolderSyncServiceStatus {
                 service_state: "stopped".to_string(),
                 service_message: "Continuous sync is stopped".to_string(),
-                profiles: Vec::new(),
                 updated_unix_ms: now_unix_ms(),
+                ..AndroidFolderSyncServiceStatus::default()
             })),
         }
     }
@@ -208,15 +394,26 @@ impl AndroidFolderSyncManager {
             stop_folder_sync_run(previous);
         }
 
+        let connection_target = describe_connection_target(
+            options.server_base_url.as_deref(),
+            options.client_bootstrap_json.as_deref(),
+        )
+        .ok();
+
         update_profile_status(
             &self.status,
-            AndroidFolderSyncProfileStatus {
-                profile_id: profile_id.clone(),
-                label: label.clone(),
-                state: "starting".to_string(),
-                message: "Starting continuous sync".to_string(),
-                updated_unix_ms: now_unix_ms(),
-            },
+            build_profile_status(
+                profile_id.clone(),
+                label.clone(),
+                &options,
+                connection_target.as_deref(),
+                "starting",
+                "startup",
+                "initializing",
+                "Starting continuous sync",
+                None,
+                None,
+            ),
         );
         refresh_service_summary(&self.status);
 
@@ -228,19 +425,18 @@ impl AndroidFolderSyncManager {
             Arc::new(move |status: FolderAgentRuntimeStatus| {
                 update_profile_status(
                     &status_store,
-                    AndroidFolderSyncProfileStatus {
-                        profile_id: callback_profile_id.clone(),
-                        label: callback_label.clone(),
-                        state: status.state,
-                        message: status.message,
-                        updated_unix_ms: status.updated_unix_ms,
-                    },
+                    profile_status_from_runtime(
+                        callback_profile_id.clone(),
+                        callback_label.clone(),
+                        status,
+                    ),
                 );
                 refresh_service_summary(&status_store);
             });
 
         let thread_profile_id = profile_id.clone();
         let thread_label = label.clone();
+        let thread_connection_target = connection_target.clone();
         let thread_running = running.clone();
         let status_store = self.status.clone();
         let thread = thread::Builder::new()
@@ -261,16 +457,34 @@ impl AndroidFolderSyncManager {
                     )
                 };
                 if let Err(error) = result {
-                    update_profile_status(
-                        &status_store,
-                        AndroidFolderSyncProfileStatus {
-                            profile_id: thread_profile_id,
-                            label: thread_label,
-                            state: "error".to_string(),
-                            message: format!("{error:#}"),
-                            updated_unix_ms: now_unix_ms(),
-                        },
-                    );
+                    let needs_fallback_error = status_store
+                        .lock()
+                        .ok()
+                        .and_then(|status| {
+                            status
+                                .profiles
+                                .iter()
+                                .find(|profile| profile.profile_id == thread_profile_id)
+                                .cloned()
+                        })
+                        .is_none_or(|profile| profile.state != "error");
+                    if needs_fallback_error {
+                        update_profile_status(
+                            &status_store,
+                            build_profile_status(
+                                thread_profile_id,
+                                thread_label,
+                                &options,
+                                thread_connection_target.as_deref(),
+                                "error",
+                                "error",
+                                "failed",
+                                format!("{error:#}"),
+                                None,
+                                Some(format!("{error:#}")),
+                            ),
+                        );
+                    }
                     refresh_service_summary(&status_store);
                 }
             })
@@ -302,10 +516,12 @@ impl AndroidFolderSyncManager {
             stop_folder_sync_run(run);
         }
         if let Ok(mut status) = self.status.lock() {
-            status.profiles.clear();
-            status.service_state = "stopped".to_string();
-            status.service_message = "Continuous sync is stopped".to_string();
-            status.updated_unix_ms = now_unix_ms();
+            *status = AndroidFolderSyncServiceStatus {
+                service_state: "stopped".to_string(),
+                service_message: "Continuous sync is stopped".to_string(),
+                updated_unix_ms: now_unix_ms(),
+                ..AndroidFolderSyncServiceStatus::default()
+            };
         }
     }
 }
@@ -345,40 +561,116 @@ fn update_profile_status(
 
 fn refresh_service_summary(status_store: &Arc<Mutex<AndroidFolderSyncServiceStatus>>) {
     if let Ok(mut status) = status_store.lock() {
-        let active_profiles = status
-            .profiles
-            .iter()
-            .filter(|profile| profile.state != "stopped")
-            .count();
-        let has_error = status
-            .profiles
-            .iter()
-            .any(|profile| profile.state == "error");
-        let has_syncing = status
-            .profiles
-            .iter()
-            .any(|profile| profile.state == "syncing");
-
-        status.service_state = if active_profiles == 0 {
-            "stopped".to_string()
-        } else if has_error {
-            "error".to_string()
-        } else if has_syncing {
-            "syncing".to_string()
-        } else {
-            "running".to_string()
-        };
-        status.service_message = if active_profiles == 0 {
-            "Continuous sync is stopped".to_string()
-        } else if has_error {
-            format!("Continuous sync has errors across {active_profiles} profile(s)")
-        } else if has_syncing {
-            format!("Continuous sync is active for {active_profiles} profile(s)")
-        } else {
-            format!("Watching {active_profiles} profile(s)")
-        };
-        status.updated_unix_ms = now_unix_ms();
+        rebuild_service_summary(&mut status);
     }
+}
+
+fn rebuild_service_summary(status: &mut AndroidFolderSyncServiceStatus) {
+    let active_profiles = status
+        .profiles
+        .iter()
+        .filter(|profile| profile.state != "stopped")
+        .collect::<Vec<_>>();
+    let syncing_profiles = active_profiles
+        .iter()
+        .filter(|profile| profile.state == "syncing")
+        .count();
+    let error_profiles = active_profiles
+        .iter()
+        .filter(|profile| profile.state == "error")
+        .count();
+    let starting_profiles = active_profiles
+        .iter()
+        .filter(|profile| profile.state == "starting")
+        .count();
+    let running_profiles = active_profiles
+        .iter()
+        .filter(|profile| profile.state == "running")
+        .count();
+
+    status.profile_count = usize_to_u64(status.profiles.len());
+    status.active_profile_count = usize_to_u64(active_profiles.len());
+    status.syncing_profile_count = usize_to_u64(syncing_profiles);
+    status.error_profile_count = usize_to_u64(error_profiles);
+    status.starting_profile_count = usize_to_u64(starting_profiles);
+    status.running_profile_count = usize_to_u64(running_profiles);
+    status.last_success_unix_ms = active_profiles
+        .iter()
+        .filter_map(|profile| profile.last_success_unix_ms)
+        .max();
+
+    let primary_profile = active_profiles.iter().copied().min_by_key(|profile| {
+        match profile.state.as_str() {
+            "error" => 0,
+            "syncing" => 1,
+            "starting" => 2,
+            "running" => 3,
+            _ => 4,
+        }
+    });
+
+    status.current_activity = primary_profile
+        .map(|profile| {
+            let detail = if !profile.message.trim().is_empty() {
+                profile.message.as_str()
+            } else if !profile.activity.trim().is_empty() {
+                profile.activity.as_str()
+            } else {
+                profile.state.as_str()
+            };
+            format!("{}: {detail}", profile.label)
+        })
+        .unwrap_or_default();
+
+    let mut summary_parts = active_profiles
+        .iter()
+        .take(3)
+        .map(|profile| format!("{}: {}", profile.label, profile.state))
+        .collect::<Vec<_>>();
+    if active_profiles.len() > 3 {
+        summary_parts.push(format!("+{} more", active_profiles.len() - 3));
+    }
+    status.active_summary = summary_parts.join(" | ");
+
+    status.service_state = if active_profiles.is_empty() {
+        "stopped".to_string()
+    } else if error_profiles > 0 {
+        "error".to_string()
+    } else if syncing_profiles > 0 {
+        "syncing".to_string()
+    } else {
+        "running".to_string()
+    };
+
+    status.service_message = if active_profiles.is_empty() {
+        "Continuous sync is stopped".to_string()
+    } else if error_profiles > 0 {
+        format!(
+            "{} active profile(s), {} with errors",
+            active_profiles.len(),
+            error_profiles
+        )
+    } else if syncing_profiles > 0 {
+        format!(
+            "Syncing {} of {} active profile(s)",
+            syncing_profiles,
+            active_profiles.len()
+        )
+    } else if starting_profiles > 0 {
+        format!(
+            "Starting {} profile(s); {} already watching",
+            starting_profiles,
+            running_profiles
+        )
+    } else {
+        format!("Watching {} profile(s)", running_profiles)
+    };
+
+    status.updated_unix_ms = now_unix_ms();
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
 }
 
 fn current_folder_sync_status_json() -> Result<String> {

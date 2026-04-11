@@ -137,19 +137,26 @@ class FolderSyncForegroundService : Service() {
                 val contentText = status?.serviceMessage ?: "Continuous sync is starting"
                 val title = when (status?.serviceState) {
                     "error" -> "Ironmesh sync issue"
-                    "syncing" -> "Ironmesh syncing"
+                    "syncing" -> "Ironmesh syncing ${status.syncingProfileCount}/${status.activeProfileCount}"
                     "running" -> "Ironmesh sync active"
                     else -> "Ironmesh sync idle"
                 }
-                val detail = status?.profiles
-                    ?.takeIf { it.isNotEmpty() }
-                    ?.joinToString(" | ") { profile -> "${profile.label}: ${profile.state}" }
+                val detail = status?.currentActivity
+                    ?.takeIf { it.isNotBlank() }
+                    ?: status?.activeSummary
+                        ?.takeIf { it.isNotBlank() }
                     ?: contentText
                 val logLine = status?.profiles
                     ?.joinToString(" | ") { profile ->
-                        "${profile.label}:${profile.state}:${profile.message}"
+                        listOf(
+                            profile.label,
+                            profile.state,
+                            profile.phase.takeIf { it.isNotBlank() },
+                            profile.activity.takeIf { it.isNotBlank() },
+                            profile.message.takeIf { it.isNotBlank() },
+                        ).joinToString(":")
                     }
-                    ?: contentText
+                    ?: detail
                 if (logLine != lastLoggedStatusLine) {
                     Log.i(TAG, "continuous sync status: $logLine")
                     lastLoggedStatusLine = logLine

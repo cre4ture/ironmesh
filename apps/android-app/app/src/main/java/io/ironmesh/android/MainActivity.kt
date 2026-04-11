@@ -94,6 +94,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import io.ironmesh.android.data.FolderSyncProfileStatus
+import io.ironmesh.android.data.FolderSyncRuntimeMetrics
 import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.data.RustPreferencesBridge
 import io.ironmesh.android.ui.GalleryViewMode
@@ -576,6 +578,7 @@ private fun ServerControls(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FolderSyncControls(
     state: MainUiState,
@@ -598,10 +601,51 @@ private fun FolderSyncControls(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Engine: ${state.folderSyncStatus.serviceState}")
+            Text(
+                "Engine: ${displayStatusToken(state.folderSyncStatus.serviceState)}",
+                style = MaterialTheme.typography.titleSmall,
+            )
             Text(state.folderSyncStatus.serviceMessage)
+            state.folderSyncStatus.currentActivity
+                .takeIf { it.isNotBlank() }
+                ?.let { activity ->
+                    Text(
+                        "Current: $activity",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FolderSyncBadge("Configured ${state.syncProfiles.size}")
+                FolderSyncBadge("Active ${state.folderSyncStatus.activeProfileCount}")
+                if (state.folderSyncStatus.syncingProfileCount > 0L) {
+                    FolderSyncBadge("Syncing ${state.folderSyncStatus.syncingProfileCount}")
+                }
+                if (state.folderSyncStatus.runningProfileCount > 0L) {
+                    FolderSyncBadge("Watching ${state.folderSyncStatus.runningProfileCount}")
+                }
+                if (state.folderSyncStatus.startingProfileCount > 0L) {
+                    FolderSyncBadge("Starting ${state.folderSyncStatus.startingProfileCount}")
+                }
+                if (state.folderSyncStatus.errorProfileCount > 0L) {
+                    FolderSyncBadge("Errors ${state.folderSyncStatus.errorProfileCount}")
+                }
+            }
+            state.folderSyncStatus.activeSummary
+                .takeIf { it.isNotBlank() }
+                ?.let { summary ->
+                    Text(summary, style = MaterialTheme.typography.bodySmall)
+                }
+            state.folderSyncStatus.lastSuccessUnixMs?.let { lastSuccess ->
+                Text(
+                    "Last success ${formatTimestamp(lastSuccess)}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             if (state.folderSyncStatus.updatedUnixMs > 0L) {
                 Text(
                     "Updated ${formatTimestamp(state.folderSyncStatus.updatedUnixMs)}",
@@ -666,26 +710,113 @@ private fun FolderSyncControls(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 Text(profile.label, style = MaterialTheme.typography.titleSmall)
-                Text(
-                    "Prefix: ${
-                        if (profile.prefix.isBlank()) "<root>" else profile.prefix
-                    }",
-                )
-                Text("Local: ${profile.localFolder}")
-                if (profileStatus != null) {
-                    Text("Sync State: ${profileStatus.state}")
-                    if (profileStatus.message.isNotBlank()) {
-                        Text(
-                            profileStatus.message,
-                            style = MaterialTheme.typography.bodySmall,
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        FolderSyncBadge(
+                            if (profile.enabled) {
+                                displayStatusToken(profileStatus?.state ?: "waiting")
+                            } else {
+                                "Disabled"
+                            },
+                        )
+                        profileStatus?.phase
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { phase ->
+                                FolderSyncBadge(displayStatusToken(phase))
+                            }
+                        profileStatus?.storageMode
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { storageMode ->
+                                FolderSyncBadge(displayStatusToken(storageMode))
+                            }
+                        profileStatus?.watchMode
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { watchMode ->
+                                FolderSyncBadge(displayStatusToken(watchMode))
+                            }
+                        FolderSyncBadge(
+                            "Scope ${profileStatus?.scopeLabel ?: profile.prefix.ifBlank { "<root>" }}",
                         )
                     }
-                } else {
                     Text(
-                        if (profile.enabled) "Sync State: waiting to start" else "Sync State: disabled",
+                        profileStatus?.message ?: if (profile.enabled) {
+                            "Waiting for continuous sync to start"
+                        } else {
+                            "This profile is disabled"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                     )
-                }
+                    profileStatus?.activity
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { activity ->
+                            Text(
+                                "Activity: ${displayStatusToken(activity)}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    Text(
+                        "Local root: ${profileStatus?.rootDir?.ifBlank { profile.localFolder } ?: profile.localFolder}",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    profileStatus?.connectionTarget
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { connectionTarget ->
+                            Text(
+                                "Connection: $connectionTarget",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    profileStatus?.localTreeUri
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { treeUri ->
+                            Text(
+                                "Tree URI: $treeUri",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    profileStatus?.let { status ->
+                        Text(
+                            profileInventorySummary(status),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        recentWorkSummary(status.metrics)
+                            ?.let { summary ->
+                                Text(
+                                    "Recent: $summary",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        startupDetailSummary(status.metrics)
+                            ?.let { summary ->
+                                Text(
+                                    "Startup: $summary",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        status.lastSuccessUnixMs?.let { lastSuccess ->
+                            Text(
+                                "Last success ${formatTimestamp(lastSuccess)}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        if (status.updatedUnixMs > 0L) {
+                            Text(
+                                "Updated ${formatTimestamp(status.updatedUnixMs)}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        status.lastError
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { lastError ->
+                                Text(
+                                    "Last error: $lastError",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                    }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Switch(
                         checked = profile.enabled,
@@ -701,6 +832,21 @@ private fun FolderSyncControls(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FolderSyncBadge(text: String) {
+    Surface(
+        tonalElevation = 1.dp,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(999.dp),
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+        )
     }
 }
 
@@ -1242,6 +1388,66 @@ private fun galleryMetaText(item: GalleryImageItem): String? {
         parts += item.thumbnailStatus
     }
     return parts.takeIf { it.isNotEmpty() }?.joinToString(" - ")
+}
+
+private fun displayStatusToken(value: String): String {
+    if (value.isBlank()) {
+        return "Unknown"
+    }
+    return value
+        .replace('-', ' ')
+        .replace('_', ' ')
+        .split(' ')
+        .filter { it.isNotBlank() }
+        .joinToString(" ") { part ->
+            part.lowercase().replaceFirstChar { ch ->
+                if (ch.isLowerCase()) ch.titlecase() else ch.toString()
+            }
+        }
+}
+
+private fun profileInventorySummary(status: FolderSyncProfileStatus): String {
+    val metrics = status.metrics
+    return buildString {
+        append("Local ${metrics.localEntryCount} entries")
+        append(" (${metrics.localFileCount} files, ${metrics.localDirectoryCount} folders)")
+        append(" | Remote ${metrics.remoteEntryCount} entries")
+        append(" (${metrics.remoteFileCount} files, ${metrics.remoteDirectoryCount} folders)")
+    }
+}
+
+private fun recentWorkSummary(metrics: FolderSyncRuntimeMetrics): String? {
+    val parts = mutableListOf<String>()
+    if (metrics.changedPathCount > 0L) {
+        parts += "${metrics.changedPathCount} path(s)"
+    }
+    if (metrics.uploadedFileCount > 0L) {
+        parts += "${metrics.uploadedFileCount} upload(s)"
+    }
+    if (metrics.downloadedFileCount > 0L) {
+        parts += "${metrics.downloadedFileCount} download(s)"
+    }
+    if (metrics.deletedRemoteFileCount > 0L) {
+        parts += "${metrics.deletedRemoteFileCount} remote delete(s)"
+    }
+    if (metrics.removedLocalPathCount > 0L) {
+        parts += "${metrics.removedLocalPathCount} local removal(s)"
+    }
+    if (metrics.ensuredDirectoryCount > 0L) {
+        parts += "${metrics.ensuredDirectoryCount} directory update(s)"
+    }
+    return parts.takeIf { it.isNotEmpty() }?.joinToString(", ")
+}
+
+private fun startupDetailSummary(metrics: FolderSyncRuntimeMetrics): String? {
+    val parts = mutableListOf<String>()
+    if (metrics.preservedLocalFileCount > 0L) {
+        parts += "${metrics.preservedLocalFileCount} preserved local file(s)"
+    }
+    if (metrics.startupConflictCount > 0L) {
+        parts += "${metrics.startupConflictCount} startup conflict(s)"
+    }
+    return parts.takeIf { it.isNotEmpty() }?.joinToString(", ")
 }
 
 private fun formatTimestamp(value: Long): String {
