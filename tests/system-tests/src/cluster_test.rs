@@ -4172,15 +4172,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_claim_enrollment_fails_when_node_disconnects_from_rendezvous()
+    async fn bootstrap_claim_enrollment_fails_when_node_not_registered_at_rendezvous()
     -> Result<()> {
+        // PresenceRegistry has no TTL — entries are never evicted when a node disconnects.
+        // Instead of stopping the node and waiting for deregistration (which never happens),
+        // we redirect the claim's rendezvous URL to a fresh rendezvous that has no nodes,
+        // which reliably produces the "not currently connected to rendezvous" error.
         let rendezvous_bind = "127.0.0.1:19222";
+        let empty_rendezvous_bind = "127.0.0.1:19224";
         let bind = "127.0.0.1:19223";
         let cluster_id = "11111111-1111-7111-8111-111111111121";
         let node_id = "00000000-0000-0000-0000-000000000921";
         let admin_token = "claim-offline-secret";
 
         let rendezvous_url = format!("http://{rendezvous_bind}");
+        let empty_rendezvous_url = format!("http://{empty_rendezvous_bind}");
         let base_url = format!("http://{bind}");
         let data_dir = fresh_data_dir("bootstrap-claim-offline-node");
         let client_dir = fresh_data_dir("bootstrap-claim-offline-client");
@@ -4195,6 +4201,7 @@ mod tests {
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut empty_rendezvous = start_rendezvous_service(empty_rendezvous_bind).await?;
         let mut node =
             start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
         let http = reqwest::Client::new();
@@ -4213,16 +4220,23 @@ mod tests {
             .await?;
             issued.validate()?;
 
-            let claim_path = client_dir.join("claim-offline.claim.json");
-            fs::write(&claim_path, issued.bootstrap_claim.to_json_pretty()?)
-                .context("failed writing bootstrap claim json")?;
-            let claim_arg = claim_path.to_string_lossy().into_owned();
+            // Redirect the claim's rendezvous URL to the empty rendezvous, which has no
+            // nodes registered. The claim JSON uses the short wire key "r" for rendezvous_urls.
+            let mut claim_json: serde_json::Value =
+                serde_json::from_str(&issued.bootstrap_claim.to_json_pretty()?)
+                    .context("failed to parse claim json for tampering")?;
+            claim_json["r"] = serde_json::json!([format!("{empty_rendezvous_url}/")]);
+            let tampered_claim_path = client_dir.join("claim-offline.claim.json");
+            fs::write(
+                &tampered_claim_path,
+                serde_json::to_string_pretty(&claim_json)
+                    .context("failed to re-serialize tampered claim")?,
+            )
+            .context("failed writing tampered claim json")?;
+            let claim_arg = tampered_claim_path.to_string_lossy().into_owned();
 
             let client_identity_path = client_dir.join("claim-offline.identity.json");
             let client_identity_arg = client_identity_path.to_string_lossy().into_owned();
-
-            stop_server(&mut node).await;
-            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 0, 120).await?;
 
             let enroll_result = run_cli(&[
                 "--bootstrap-file",
@@ -4249,6 +4263,7 @@ mod tests {
         .await;
 
         stop_server(&mut rendezvous).await;
+        stop_server(&mut empty_rendezvous).await;
         stop_server(&mut node).await;
         let _ = fs::remove_dir_all(&data_dir);
         let _ = fs::remove_dir_all(&client_dir);
