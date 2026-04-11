@@ -127,10 +127,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("gallery/clip.mp4", { exact: true })).toBeVisible();
   await expect(page.getByText("3 items")).toBeVisible();
   await expect(page.getByText("1 movie")).toBeVisible();
-  const thumbnailsPerRowInput = page.getByRole("textbox", { name: "Thumbnails per row" });
-  await thumbnailsPerRowInput.click();
-  await page.getByRole("option", { name: "4 per row" }).click();
-  await expect(thumbnailsPerRowInput).toHaveValue("4 per row");
+  const thumbnailsPerRowInput = page.getByLabel("Thumbnails per row");
+  await thumbnailsPerRowInput.fill("8");
+  await thumbnailsPerRowInput.blur();
+  await expect(thumbnailsPerRowInput).toHaveValue("8");
   await page.getByText("clip.mp4", { exact: true }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.locator("video")).toBeVisible();
@@ -138,10 +138,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await page.getByText("Cluster", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Cluster" })).toBeVisible();
   await page.getByText("Gallery", { exact: true }).click();
-  await expect(page.getByRole("textbox", { name: "Thumbnails per row" })).toHaveValue("4 per row");
+  await expect(page.getByLabel("Thumbnails per row")).toHaveValue("8");
   await page.reload();
   await page.getByText("Gallery", { exact: true }).click();
-  await expect(page.getByRole("textbox", { name: "Thumbnails per row" })).toHaveValue("4 per row");
+  await expect(page.getByLabel("Thumbnails per row")).toHaveValue("8");
   await page.getByRole("button", { name: "Map" }).click();
   await expect(
     page.getByText("Using MapTiler Satellite 2017-11-02 Planet from your self-hosted basemap dataset.")
@@ -197,6 +197,81 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Under replicated")).toBeVisible();
   await expect(page.locator("pre").filter({ hasText: '"node_id": "node-alpha"' })).toBeVisible();
   await expect(page.getByText('"under_replicated": 1')).toBeVisible();
+});
+
+test("client-ui gallery grid keeps multiple columns on narrow viewports", async ({ page }) => {
+  test.setTimeout(45_000);
+
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  const thumbnailsPerRowInput = page.getByLabel("Thumbnails per row");
+  await thumbnailsPerRowInput.fill("8");
+  await thumbnailsPerRowInput.blur();
+  await expect(thumbnailsPerRowInput).toHaveValue("8");
+
+  const galleryGrid = page.locator('[data-gallery-grid="true"]');
+  await expect(galleryGrid).toBeVisible();
+  await expect
+    .poll(async () =>
+      page.locator('[data-gallery-card="true"]').evaluateAll((nodes) => {
+        if (nodes.length === 0) {
+          return 0;
+        }
+
+        const firstRowTop = Math.round(nodes[0]!.getBoundingClientRect().top);
+        return nodes.filter(
+          (node) => Math.abs(Math.round(node.getBoundingClientRect().top) - firstRowTop) <= 1
+        ).length;
+      })
+    )
+    .toBeGreaterThanOrEqual(2);
+
+  const gap = await galleryGrid.evaluate((node) => Number.parseFloat(getComputedStyle(node).gap));
+  expect(gap).toBeLessThanOrEqual(10);
+
+  const metadataToggle = page.getByLabel("Show metadata");
+  await expect(metadataToggle).toBeChecked();
+  await page.locator("label").filter({ hasText: "Show metadata" }).click();
+  await expect(metadataToggle).not.toBeChecked();
+  await expect(page.locator('[data-gallery-card-metadata="true"]')).toHaveCount(0);
+
+  const collapsedGap = await galleryGrid.evaluate((node) =>
+    Number.parseFloat(getComputedStyle(node).gap)
+  );
+  expect(collapsedGap).toBe(0);
+
+  const previewHeightDelta = await page
+    .locator('[data-gallery-card="true"]')
+    .first()
+    .evaluate((card) => {
+      const aspectRatio = card.querySelector(".mantine-AspectRatio-root");
+      if (!aspectRatio) {
+        return null;
+      }
+
+      return Math.abs(
+        card.getBoundingClientRect().height - aspectRatio.getBoundingClientRect().height
+      );
+    });
+  expect(previewHeightDelta).not.toBeNull();
+  expect(previewHeightDelta ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(1);
+
+  const borderWidth = await page
+    .locator('[data-gallery-card="true"]')
+    .first()
+    .evaluate((node) => Number.parseFloat(getComputedStyle(node).borderTopWidth));
+  expect(borderWidth).toBe(0);
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.reload();
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByLabel("Show metadata")).not.toBeChecked();
+  await expect(page.locator('[data-gallery-card-metadata="true"]')).toHaveCount(0);
 });
 
 async function installClientUiMocks(page: Page) {
