@@ -4089,4 +4089,170 @@ mod tests {
         let _ = fs::remove_dir_all(&fixture.client_dir);
         result
     }
+
+    #[tokio::test]
+    async fn bootstrap_claim_enrollment_succeeds_via_relay_with_auth_required_node() -> Result<()>
+    {
+        let rendezvous_bind = "127.0.0.1:19220";
+        let bind = "127.0.0.1:19221";
+        let cluster_id = "11111111-1111-7111-8111-111111111120";
+        let node_id = "00000000-0000-0000-0000-000000000920";
+        let admin_token = "claim-relay-secret";
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_url = format!("http://{bind}");
+        let data_dir = fresh_data_dir("bootstrap-claim-relay-auth-node");
+        let client_dir = fresh_data_dir("bootstrap-claim-relay-auth-client");
+
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut node =
+            start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let issued = issue_bootstrap_claim(
+                &http,
+                &base_url,
+                admin_token,
+                Some("claim-relay-cli"),
+                Some(3600),
+                None,
+            )
+            .await?;
+            issued.validate()?;
+
+            let claim_path = client_dir.join("claim-relay.claim.json");
+            fs::write(&claim_path, issued.bootstrap_claim.to_json_pretty()?)
+                .context("failed writing bootstrap claim json")?;
+            let claim_arg = claim_path.to_string_lossy().into_owned();
+
+            let client_identity_path = client_dir.join("claim-relay.identity.json");
+            let client_identity_arg = client_identity_path.to_string_lossy().into_owned();
+
+            let enroll_output = run_cli(&[
+                "--bootstrap-file",
+                claim_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "enroll",
+                "--label",
+                "claim-relay-cli",
+            ])
+            .await?;
+            assert!(
+                enroll_output.contains("enrolled device"),
+                "unexpected enroll output: {enroll_output}"
+            );
+            assert!(
+                client_identity_path.exists(),
+                "expected client identity file to be written after claim enrollment"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut node).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn bootstrap_claim_enrollment_fails_when_node_disconnects_from_rendezvous()
+    -> Result<()> {
+        let rendezvous_bind = "127.0.0.1:19222";
+        let bind = "127.0.0.1:19223";
+        let cluster_id = "11111111-1111-7111-8111-111111111121";
+        let node_id = "00000000-0000-0000-0000-000000000921";
+        let admin_token = "claim-offline-secret";
+
+        let rendezvous_url = format!("http://{rendezvous_bind}");
+        let base_url = format!("http://{bind}");
+        let data_dir = fresh_data_dir("bootstrap-claim-offline-node");
+        let client_dir = fresh_data_dir("bootstrap-claim-offline-client");
+
+        let node_env = [
+            ("IRONMESH_CLUSTER_ID", cluster_id),
+            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("IRONMESH_RELAY_MODE", "fallback"),
+            ("IRONMESH_ADMIN_TOKEN", admin_token),
+            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+        ];
+
+        let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
+        let mut node =
+            start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let http = reqwest::Client::new();
+
+        let result = async {
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 1, 120).await?;
+
+            let issued = issue_bootstrap_claim(
+                &http,
+                &base_url,
+                admin_token,
+                Some("claim-offline-cli"),
+                Some(3600),
+                None,
+            )
+            .await?;
+            issued.validate()?;
+
+            let claim_path = client_dir.join("claim-offline.claim.json");
+            fs::write(&claim_path, issued.bootstrap_claim.to_json_pretty()?)
+                .context("failed writing bootstrap claim json")?;
+            let claim_arg = claim_path.to_string_lossy().into_owned();
+
+            let client_identity_path = client_dir.join("claim-offline.identity.json");
+            let client_identity_arg = client_identity_path.to_string_lossy().into_owned();
+
+            stop_server(&mut node).await;
+            wait_for_rendezvous_registered_endpoints(&rendezvous_url, 0, 120).await?;
+
+            let enroll_result = run_cli(&[
+                "--bootstrap-file",
+                claim_arg.as_str(),
+                "--client-identity-file",
+                client_identity_arg.as_str(),
+                "enroll",
+                "--label",
+                "claim-offline-cli",
+            ])
+            .await;
+
+            let err = enroll_result
+                .err()
+                .context("expected enrollment to fail but it succeeded")?
+                .to_string();
+            assert!(
+                err.contains("not currently connected to rendezvous"),
+                "expected 'not currently connected to rendezvous' error, got: {err}"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut rendezvous).await;
+        stop_server(&mut node).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&client_dir);
+
+        result
+    }
 }
