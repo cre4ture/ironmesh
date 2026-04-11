@@ -1,9 +1,12 @@
 package io.ironmesh.android
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.ContentResolver
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Point
 import android.net.Uri
@@ -87,6 +90,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.browser.customtabs.CustomTabsIntent
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -317,9 +321,28 @@ private fun SettingsView(
     onOpenFiles: () -> Unit,
 ) {
     val context = LocalContext.current
+    var existingProfilePermissionRequestAttempted by rememberSaveable { mutableStateOf(false) }
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         if (result.contents != null) {
             vm.updateBootstrapInput(result.contents)
+        }
+    }
+    val photoAccessPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        val denied = grants
+            .filterValues { granted -> !granted }
+            .keys
+            .toList()
+        if (denied.isEmpty()) {
+            Log.i("MainActivity", "Granted photo original-byte permissions for folder sync")
+            vm.setStatus("Photo metadata access granted for folder sync")
+        } else {
+            Log.i(
+                "MainActivity",
+                "Photo original-byte permissions denied: ${denied.joinToString(", ")}",
+            )
+            vm.setStatus("Photo GPS EXIF may be stripped until photo permissions are granted")
         }
     }
     val folderPickerLauncher = rememberLauncherForActivityResult(
@@ -331,9 +354,18 @@ private fun SettingsView(
             onResolvedSelection = { path, treeUri ->
                 vm.updateNewSyncLocalFolderSelection(path, treeUri)
                 vm.setStatus("Selected sync folder: $path")
+                requestOriginalPhotoAccessIfNeeded(context, photoAccessPermissionLauncher)
             },
             onError = vm::setStatus,
         )
+    }
+    LaunchedEffect(state.syncProfiles) {
+        if (existingProfilePermissionRequestAttempted || state.syncProfiles.isEmpty()) {
+            return@LaunchedEffect
+        }
+
+        existingProfilePermissionRequestAttempted = true
+        requestOriginalPhotoAccessIfNeeded(context, photoAccessPermissionLauncher)
     }
     val onScanQr: () -> Unit = {
         scanLauncher.launch(
@@ -1235,6 +1267,37 @@ private fun launchFolderPicker(
         launcher.launch(intent)
     } catch (_: ActivityNotFoundException) {
         onError("No compatible folder picker found on this device")
+    }
+}
+
+private fun missingOriginalPhotoAccessPermissions(context: Context): Array<String> {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        return emptyArray()
+    }
+
+    val required = buildList {
+        add(Manifest.permission.ACCESS_MEDIA_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.READ_MEDIA_IMAGES)
+        } else {
+            add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+    }
+
+    return required
+        .filter { permission ->
+            ContextCompat.checkSelfPermission(context, permission) != PackageManager.PERMISSION_GRANTED
+        }
+        .toTypedArray()
+}
+
+private fun requestOriginalPhotoAccessIfNeeded(
+    context: Context,
+    launcher: ManagedActivityResultLauncher<Array<String>, Map<String, Boolean>>,
+) {
+    val missing = missingOriginalPhotoAccessPermissions(context)
+    if (missing.isNotEmpty()) {
+        launcher.launch(missing)
     }
 }
 
