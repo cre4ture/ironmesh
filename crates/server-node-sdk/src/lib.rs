@@ -4793,15 +4793,15 @@ async fn ensure_relay_peer_session(
     let mut sessions = state.peer_relay_sessions.sessions.lock().await;
     if let Some(existing) = sessions.get(&node.node_id).cloned() {
         drop(sessions);
-        if let Ok(unused_session) = Arc::try_unwrap(cached.session) {
-            if let Err(err) = unused_session.close().await {
-                tracing::debug!(
-                    error = %err,
-                    peer_node_id = %node.node_id,
-                    session_id = %cached.relay_session.session_id,
-                    "failed closing redundant relay peer session"
-                );
-            }
+        if let Ok(unused_session) = Arc::try_unwrap(cached.session)
+            && let Err(err) = unused_session.close().await
+        {
+            tracing::debug!(
+                error = %err,
+                peer_node_id = %node.node_id,
+                session_id = %cached.relay_session.session_id,
+                "failed closing redundant relay peer session"
+            );
         }
         return Ok(existing);
     }
@@ -11996,7 +11996,7 @@ async fn enroll_client_device_impl(
         credential_expires_at_unix,
     );
     let rendezvous_client_identity_pem = match issue_client_rendezvous_identity_pem(
-        &state,
+        state,
         device_id.as_str(),
         credential_expires_at_unix,
     ) {

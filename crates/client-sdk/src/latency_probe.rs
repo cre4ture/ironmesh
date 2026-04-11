@@ -326,13 +326,13 @@ pub fn compare_direct_and_relay_latency(
         }
     }
 
-    if let (Some(delta_ms), Some(ratio)) = (relay_avg_total_delta_ms, relay_avg_total_ratio) {
-        if delta_ms >= 75.0 || ratio >= 2.0 {
-            observations.push(format!(
-                "Relay average latency is {:.1} ms higher than direct ({:.2}x slower).",
-                delta_ms, ratio
-            ));
-        }
+    if let (Some(delta_ms), Some(ratio)) = (relay_avg_total_delta_ms, relay_avg_total_ratio)
+        && (delta_ms >= 75.0 || ratio >= 2.0)
+    {
+        observations.push(format!(
+            "Relay average latency is {:.1} ms higher than direct ({:.2}x slower).",
+            delta_ms, ratio
+        ));
     }
 
     if let Some(delta_ms) = relay_avg_transport_overhead_delta_ms

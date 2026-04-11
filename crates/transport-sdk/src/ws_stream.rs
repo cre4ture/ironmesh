@@ -229,11 +229,11 @@ impl WebSocketMessageCodec for Message {
     }
 
     fn binary(bytes: Vec<u8>) -> Self {
-        Message::Binary(bytes.into())
+        Message::Binary(bytes)
     }
 
     fn pong(bytes: Vec<u8>) -> Self {
-        Message::Pong(bytes.into())
+        Message::Pong(bytes)
     }
 }
 

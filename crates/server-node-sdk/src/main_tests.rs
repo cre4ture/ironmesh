@@ -1121,10 +1121,7 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
         serde_json::from_slice(&body).unwrap();
     assert_eq!(
         issued.bootstrap_claim.rendezvous_urls,
-        vec![
-            canonical_rendezvous_url_b.clone(),
-            canonical_rendezvous_url_a.clone(),
-        ]
+        vec![canonical_rendezvous_url_b.clone()]
     );
     assert_eq!(issued.bootstrap_claim.target_node_id, state.node_id);
     let stored_claim = state

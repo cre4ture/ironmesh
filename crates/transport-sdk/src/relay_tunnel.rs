@@ -128,7 +128,7 @@ impl RelayTunnelClient {
 
     pub async fn send_data(&mut self, bytes: &[u8]) -> Result<()> {
         self.websocket
-            .send(Message::Binary(bytes.to_vec().into()))
+            .send(Message::Binary(bytes.to_vec()))
             .await
             .context("failed sending relay tunnel data frame")
     }
@@ -269,7 +269,7 @@ async fn send_control_message(
 ) -> Result<()> {
     let payload = serde_json::to_string(control).context("failed encoding relay tunnel control")?;
     websocket
-        .send(Message::Text(payload.into()))
+        .send(Message::Text(payload))
         .await
         .context("failed sending relay tunnel control")
 }

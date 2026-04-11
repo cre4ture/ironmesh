@@ -541,8 +541,7 @@ async fn run_latency_test(
     dedup_latency_targets(&mut targets);
 
     let comparison = select_direct_and_relay_results(&targets)
-        .map(|(direct, relay)| compare_direct_and_relay_latency(Some(direct), Some(relay)))
-        .flatten();
+        .and_then(|(direct, relay)| compare_direct_and_relay_latency(Some(direct), Some(relay)));
 
     info!(
         target_count = targets.len(),
@@ -788,13 +787,11 @@ fn select_direct_and_relay_results(
 ) -> Option<(&LatencyProbeResult, &LatencyProbeResult)> {
     let direct = targets.iter().find_map(|target| {
         (target.path_id == "direct" || target.transport_mode == "direct")
-            .then(|| target.result.as_ref())
-            .flatten()
+            .then_some(target.result.as_ref())?
     })?;
     let relay = targets.iter().find_map(|target| {
         (target.path_id == "relay" || target.transport_mode == "relay")
-            .then(|| target.result.as_ref())
-            .flatten()
+            .then_some(target.result.as_ref())?
     })?;
     Some((direct, relay))
 }
