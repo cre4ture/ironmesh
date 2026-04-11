@@ -793,6 +793,7 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     state.admin_control.admin_token = Some("admin-secret".to_string());
     state.public_ca_pem = Some("public-ca".to_string());
     state.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.internal_ca_key_pem = Some("cluster-key".to_string());
     state.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
     *state.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.rendezvous_registration_enabled = true;
@@ -864,11 +865,12 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
 async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_node() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
-    let (cluster_ca_pem, _) = generate_test_internal_ca();
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, _) = generate_test_internal_ca();
     let (rendezvous_ca_pem, _) = generate_test_internal_ca();
     state.public_ca_pem = Some(public_ca_pem.clone());
     state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
     state.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
@@ -1011,11 +1013,12 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
 async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
-    let (cluster_ca_pem, _) = generate_test_internal_ca();
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, _) = generate_test_internal_ca();
     let (rendezvous_ca_pem, _) = generate_test_internal_ca();
     state.public_ca_pem = Some(public_ca_pem.clone());
     state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
     state.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
@@ -1142,11 +1145,12 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
 async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healthy() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
-    let (cluster_ca_pem, _) = generate_test_internal_ca();
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, _) = generate_test_internal_ca();
     let (rendezvous_ca_pem, _) = generate_test_internal_ca();
     state.public_ca_pem = Some(public_ca_pem.clone());
     state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
     state.rendezvous_ca_pem = Some(rendezvous_ca_pem.clone());
     state.rendezvous_registration_enabled = true;
     state.rendezvous_mtls_required = true;
@@ -1304,6 +1308,263 @@ async fn issue_bootstrap_claim_returns_json_error_when_rendezvous_is_unavailable
         Some("bootstrap claim issuance requires rendezvous to be configured on this node")
     );
 
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn issue_pairing_token_returns_json_error_when_rendezvous_mtls_signing_is_unavailable() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.rendezvous_mtls_required = true;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_pairing_token(
+        State(state.clone()),
+        headers,
+        Json(super::PairingTokenIssueRequest {
+            label: Some("tablet".to_string()),
+            expires_in_secs: Some(600),
+            preferred_rendezvous_url: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload.get("error").and_then(|value| value.as_str()),
+        Some(
+            "client enrollment issuance is unavailable on this node: rendezvous mTLS client identity issuance requires internal_ca_key_pem"
+        )
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn issue_bootstrap_claim_returns_json_error_when_rendezvous_mtls_signing_is_unavailable() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    state.cluster_ca_pem = Some("cluster-ca".to_string());
+    state.rendezvous_mtls_required = true;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::issue_bootstrap_claim(
+        State(state.clone()),
+        headers,
+        Json(super::PairingTokenIssueRequest {
+            label: Some("tablet".to_string()),
+            expires_in_secs: Some(600),
+            preferred_rendezvous_url: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload.get("error").and_then(|value| value.as_str()),
+        Some(
+            "client enrollment issuance is unavailable on this node: rendezvous mTLS client identity issuance requires internal_ca_key_pem"
+        )
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.rendezvous_registration_enabled = true;
+    let now = super::unix_ts();
+    let claim_token = "claim-secret";
+    let pairing_token = "pair-secret";
+    let rendezvous_bind_addr = free_bind_addr();
+    let rendezvous_url = format!("http://{rendezvous_bind_addr}");
+    let canonical_rendezvous_url = format!("{rendezvous_url}/");
+
+    {
+        let mut auth = state.client_credentials.lock().await;
+        auth.pairing_authorizations
+            .push(super::PairingAuthorizationRecord {
+                token_id: "pair-claim-1".to_string(),
+                pairing_secret_hash: super::hash_token(pairing_token),
+                label: Some("Tablet".to_string()),
+                created_at_unix: now,
+                expires_at_unix: now + 300,
+                used_at_unix: None,
+                consumed_by_device_id: None,
+            });
+    }
+
+    state
+        .bootstrap_claims
+        .publish(transport_sdk::ClientBootstrapClaimPublishRequest {
+            cluster_id: state.cluster_id,
+            issuer: transport_sdk::PeerIdentity::Node(state.node_id),
+            target_node_id: state.node_id,
+            claim_secret_hash: super::hash_token(claim_token),
+            expires_at_unix: now + 300,
+            bootstrap: transport_sdk::ClientBootstrap {
+                version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+                cluster_id: state.cluster_id,
+                rendezvous_urls: vec![canonical_rendezvous_url.clone()],
+                rendezvous_mtls_required: false,
+                direct_endpoints: Vec::new(),
+                relay_mode: transport_sdk::RelayMode::Fallback,
+                trust_roots: transport_sdk::BootstrapTrustRoots {
+                    cluster_ca_pem: None,
+                    public_api_ca_pem: None,
+                    rendezvous_ca_pem: None,
+                },
+                pairing_token: Some(pairing_token.to_string()),
+                device_id: None,
+                device_label: Some("Tablet".to_string()),
+            },
+        })
+        .await
+        .expect("bootstrap claim should publish");
+
+    let rendezvous_state = rendezvous_server::RendezvousAppState::new(
+        rendezvous_server::RendezvousServerConfig {
+            bind_addr: rendezvous_bind_addr,
+            public_url: canonical_rendezvous_url.clone(),
+            relay_public_urls: vec![canonical_rendezvous_url.clone()],
+            mtls: None,
+        },
+    );
+    let rendezvous_listener = tokio::net::TcpListener::bind(rendezvous_bind_addr)
+        .await
+        .expect("rendezvous listener should bind");
+    let rendezvous_server_state = rendezvous_state.clone();
+    let rendezvous_handle = tokio::spawn(async move {
+        axum::serve(
+            rendezvous_listener,
+            rendezvous_server::build_router(rendezvous_server_state),
+        )
+        .await
+        .expect("rendezvous server should serve");
+    });
+
+    wait_for_http_status(
+        &reqwest::Client::new(),
+        &format!("{rendezvous_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    *state.rendezvous_urls.lock().unwrap() = vec![rendezvous_url.clone()];
+    configure_test_relay_outbound_clients(&state, &rendezvous_url).await;
+
+    let local_descriptor = {
+        let cluster = state.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == state.node_id)
+    };
+    let registration = build_rendezvous_presence_registration(
+        &state,
+        Some("http://127.0.0.1:39080"),
+        Some("https://127.0.0.1:49080"),
+        true,
+        local_descriptor.as_ref(),
+    );
+    rendezvous_state.presence.register(registration);
+
+    let endpoint = super::current_rendezvous_endpoint_clients(&state)
+        .await
+        .into_iter()
+        .next()
+        .expect("rendezvous endpoint client should exist");
+    let relay_state = state.clone();
+    let relay_accept_task = tokio::spawn(async move {
+        let (relay_session, multiplexed) = endpoint
+            .control
+            .accept_relay_multiplex_target(
+                &transport_sdk::RelayTunnelAcceptRequest {
+                    cluster_id: relay_state.cluster_id,
+                    target: transport_sdk::PeerIdentity::Node(relay_state.node_id),
+                    session_kind: transport_sdk::RelayTunnelSessionKind::MultiplexTransport,
+                    wait_timeout_ms: Some(5_000),
+                },
+                transport_sdk::MultiplexConfig::default(),
+            )
+            .await
+            .expect("relay target accept should succeed");
+        let endpoint_url = endpoint.url;
+        let mut multiplexed = multiplexed;
+        let execution_scope = super::complete_relay_multiplex_handshake(
+            &relay_state,
+            &endpoint_url,
+            &relay_session,
+            &mut multiplexed,
+        )
+        .await
+        .expect("relay handshake should succeed");
+        super::serve_relay_multiplex_streams(
+            relay_state,
+            endpoint_url,
+            relay_session,
+            multiplexed,
+            execution_scope,
+        )
+        .await
+        .expect("relay multiplex session should serve");
+    });
+
+    let redeem_request = transport_sdk::ClientBootstrapClaimRedeemRequest {
+        claim_token: claim_token.to_string(),
+        target_node_id: state.node_id,
+        device_id: Some(Uuid::now_v7().to_string()),
+        label: Some("Tablet".to_string()),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
+            .to_string(),
+    };
+    let response = reqwest::Client::new()
+        .post(format!("{rendezvous_url}/bootstrap-claims/redeem"))
+        .json(&redeem_request)
+        .send()
+        .await
+        .expect("bootstrap claim redeem request should complete");
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .expect("bootstrap claim redeem response body should read");
+    if status != StatusCode::OK {
+        panic!(
+            "unexpected status {} redeeming bootstrap claim over relay: {}",
+            status, body
+        );
+    }
+    let redeemed: transport_sdk::ClientBootstrapClaimRedeemResponse =
+        serde_json::from_str(&body).expect("bootstrap claim redeem response should decode");
+    redeemed
+        .validate()
+        .expect("bootstrap claim redeem response should validate");
+    assert_eq!(redeemed.cluster_id, state.cluster_id);
+    assert_eq!(redeemed.device_id, redeem_request.device_id.unwrap());
+    assert_eq!(redeemed.label.as_deref(), Some("Tablet"));
+    assert_eq!(redeemed.bootstrap.pairing_token, None);
+
+    tokio::time::timeout(Duration::from_secs(5), relay_accept_task)
+        .await
+        .expect("relay accept task should finish")
+        .expect("relay accept task should join");
+
+    rendezvous_handle.abort();
+    let _ = rendezvous_handle.await;
     cleanup_test_state(&state).await;
 }
 

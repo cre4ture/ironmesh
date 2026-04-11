@@ -948,6 +948,30 @@ fn text_fingerprint(value: &str) -> String {
     blake3::hash(value.trim().as_bytes()).to_hex().to_string()
 }
 
+fn validate_rendezvous_client_identity_issuance(state: &ServerState) -> Result<()> {
+    if !state.rendezvous_mtls_required {
+        return Ok(());
+    }
+    if state.cluster_ca_pem.as_deref().is_none() {
+        bail!("rendezvous mTLS client identity issuance requires cluster_ca_pem");
+    }
+    if state.internal_ca_key_pem.as_deref().is_none() {
+        bail!("rendezvous mTLS client identity issuance requires internal_ca_key_pem");
+    }
+    Ok(())
+}
+
+fn ensure_client_enrollment_issuance_available(
+    state: &ServerState,
+) -> std::result::Result<(), (StatusCode, String)> {
+    validate_rendezvous_client_identity_issuance(state).map_err(|err| {
+        (
+            StatusCode::PRECONDITION_FAILED,
+            format!("client enrollment issuance is unavailable on this node: {err}"),
+        )
+    })
+}
+
 fn issue_client_rendezvous_identity_pem(
     state: &ServerState,
     device_id: &str,
@@ -956,6 +980,8 @@ fn issue_client_rendezvous_identity_pem(
     if !state.rendezvous_mtls_required {
         return Ok(None);
     }
+
+    validate_rendezvous_client_identity_issuance(state)?;
 
     let ca_cert_pem = state.cluster_ca_pem.as_deref().ok_or_else(|| {
         anyhow!("rendezvous mTLS client identity issuance requires cluster_ca_pem")
@@ -5451,14 +5477,14 @@ where
         .context("failed closing streamed transport response")
 }
 
-async fn serve_relay_multiplex_session(
-    state: ServerState,
-    endpoint_url: String,
-    relay_session: RelayTunnelSession,
-    mut session: MultiplexedSession,
-) -> Result<()> {
+async fn complete_relay_multiplex_handshake(
+    state: &ServerState,
+    endpoint_url: &str,
+    relay_session: &RelayTunnelSession,
+    session: &mut MultiplexedSession,
+) -> Result<transport_service::TransportExecutionScope> {
     let hello = perform_transport_server_handshake(
-        &mut session,
+        session,
         TransportSessionControlMessage::Ready {
             protocol_version: TRANSPORT_PROTOCOL_VERSION,
             session_id: relay_session.session_id.clone(),
@@ -5503,15 +5529,24 @@ async fn serve_relay_multiplex_session(
             state.node_id
         );
     }
-    let execution_scope = match &peer {
+
+    Ok(match &peer {
         PeerIdentity::Device(_) => transport_service::TransportExecutionScope::Public,
         PeerIdentity::Node(node_id) => {
             transport_service::TransportExecutionScope::Internal(InternalCaller {
                 node_id: *node_id,
             })
         }
-    };
+    })
+}
 
+async fn serve_relay_multiplex_streams(
+    state: ServerState,
+    endpoint_url: String,
+    relay_session: RelayTunnelSession,
+    mut session: MultiplexedSession,
+    execution_scope: transport_service::TransportExecutionScope,
+) -> Result<()> {
     loop {
         let next = session.accept_stream().await.with_context(|| {
             format!(
@@ -5584,20 +5619,54 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
                         let state = state.clone();
                         let endpoint_url = endpoint.url.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = serve_relay_multiplex_session(
-                                state,
-                                endpoint_url.clone(),
-                                relay_session.clone(),
-                                multiplexed,
+                            let mut multiplexed = multiplexed;
+                            match complete_relay_multiplex_handshake(
+                                &state,
+                                &endpoint_url,
+                                &relay_session,
+                                &mut multiplexed,
                             )
                             .await
                             {
-                                warn!(
-                                    error = %err,
-                                    rendezvous_url = %endpoint_url,
-                                    session_id = %relay_session.session_id,
-                                    "multiplex relay session failed"
-                                );
+                                Ok(execution_scope) => {
+                                    let _ = record_rendezvous_registration_success(
+                                        &state,
+                                        &endpoint_url,
+                                    )
+                                    .await;
+                                    if let Err(err) = serve_relay_multiplex_streams(
+                                        state,
+                                        endpoint_url.clone(),
+                                        relay_session.clone(),
+                                        multiplexed,
+                                        execution_scope,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            error = %err,
+                                            rendezvous_url = %endpoint_url,
+                                            session_id = %relay_session.session_id,
+                                            "multiplex relay session failed"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    let error_text = err.to_string();
+                                    let failures = record_rendezvous_registration_failure(
+                                        &state,
+                                        &endpoint_url,
+                                        &error_text,
+                                    )
+                                    .await;
+                                    warn!(
+                                        error = %err,
+                                        rendezvous_url = %endpoint_url,
+                                        session_id = %relay_session.session_id,
+                                        consecutive_failures = failures,
+                                        "multiplex relay session failed before handshake"
+                                    );
+                                }
                             }
                         });
                         break;
@@ -5612,9 +5681,17 @@ fn spawn_rendezvous_relay_multiplex_agent(state: ServerState) {
                                 "multiplex relay accept timed out without a source connection"
                             );
                         } else {
+                            let error_text = err.to_string();
+                            let failures = record_rendezvous_registration_failure(
+                                &state,
+                                &endpoint.url,
+                                &error_text,
+                            )
+                            .await;
                             warn!(
                                 error = %err,
                                 rendezvous_url = %endpoint.url,
+                                consecutive_failures = failures,
                                 "multiplex relay accept failed"
                             );
                         }
@@ -9504,7 +9581,20 @@ async fn issue_pairing_token(
 
     let response = match issue_pairing_token_impl(&state, request).await {
         Ok(response) => response,
-        Err(status) => return status.into_response(),
+        Err((status, error)) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": error }),
+            )
+            .await;
+            return (status, Json(json!({ "error": error }))).into_response();
+        }
     };
 
     append_admin_audit(
@@ -9555,8 +9645,13 @@ fn bootstrap_rendezvous_urls(state: &ServerState) -> std::result::Result<Vec<Str
 async fn issue_client_bootstrap_impl(
     state: &ServerState,
     request: PairingTokenIssueRequest,
-) -> std::result::Result<(TransportClientBootstrap, u64), StatusCode> {
-    let rendezvous_urls = bootstrap_rendezvous_urls(state)?;
+) -> std::result::Result<(TransportClientBootstrap, u64), (StatusCode, String)> {
+    let rendezvous_urls = bootstrap_rendezvous_urls(state).map_err(|status| {
+        (
+            status,
+            "failed to resolve bootstrap rendezvous URLs on this node".to_string(),
+        )
+    })?;
     let pairing_response = issue_pairing_token_impl(state, request).await?;
 
     let endpoints = {
@@ -9589,7 +9684,12 @@ async fn issue_client_bootstrap_impl(
         rendezvous_mtls_required: state.rendezvous_mtls_required,
         direct_endpoints: endpoints,
         relay_mode: state.relay_mode,
-        trust_roots: bootstrap_trust_roots(state)?,
+        trust_roots: bootstrap_trust_roots(state).map_err(|status| {
+            (
+                status,
+                "failed to resolve bootstrap trust roots on this node".to_string(),
+            )
+        })?,
         pairing_token: Some(pairing_response.pairing_token),
         device_label: pairing_response.label,
         device_id: None,
@@ -10198,7 +10298,20 @@ async fn issue_bootstrap_bundle(
     let request_label = request.label.clone();
     let (bootstrap, expires_at_unix) = match issue_client_bootstrap_impl(&state, request).await {
         Ok(response) => response,
-        Err(status) => return status.into_response(),
+        Err((status, error)) => {
+            append_admin_audit(
+                &state,
+                action,
+                &authz,
+                true,
+                true,
+                true,
+                "error",
+                json!({ "error": error }),
+            )
+            .await;
+            return (status, Json(json!({ "error": error }))).into_response();
+        }
     };
 
     append_admin_audit(
@@ -10248,8 +10361,7 @@ async fn issue_bootstrap_claim(
     let (bootstrap_bundle, expires_at_unix) =
         match issue_client_bootstrap_impl(&state, request).await {
             Ok(response) => response,
-            Err(status) => {
-                let error = "failed to issue bootstrap bundle backing the bootstrap claim";
+            Err((status, error)) => {
                 append_admin_audit(
                     &state,
                     action,
@@ -11918,7 +12030,9 @@ async fn renew_node_enrollment(
 async fn issue_pairing_token_impl(
     state: &ServerState,
     request: PairingTokenIssueRequest,
-) -> std::result::Result<PairingTokenIssueResponse, StatusCode> {
+) -> std::result::Result<PairingTokenIssueResponse, (StatusCode, String)> {
+    ensure_client_enrollment_issuance_available(state)?;
+
     let now = unix_ts();
     let expires_in_secs = request
         .expires_in_secs
@@ -11948,7 +12062,10 @@ async fn issue_pairing_token_impl(
             error = %err,
             "failed to persist client credential state after pairing token issue"
         );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to persist client credential state after pairing token issue".to_string(),
+        ));
     }
 
     Ok(PairingTokenIssueResponse {

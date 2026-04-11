@@ -376,11 +376,25 @@ async fn run_relay_tunnel_websocket(
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Binary(bytes))) => {
-                        endpoint.send(RelayTunnelFrame::Data(bytes.to_vec())).await?;
+                        if let Err(err) = endpoint.send(RelayTunnelFrame::Data(bytes.to_vec())).await {
+                            tracing::debug!(
+                                error = %err,
+                                session_id = %endpoint.session().session_id,
+                                "relay tunnel endpoint closed after pairing"
+                            );
+                            break;
+                        }
                     }
                     Some(Ok(Message::Text(text))) => match parse_relay_tunnel_control(&text)? {
                         RelayTunnelControlMessage::CloseWrite => {
-                            endpoint.send(RelayTunnelFrame::CloseWrite).await?;
+                            if let Err(err) = endpoint.send(RelayTunnelFrame::CloseWrite).await {
+                                tracing::debug!(
+                                    error = %err,
+                                    session_id = %endpoint.session().session_id,
+                                    "relay tunnel endpoint closed after pairing"
+                                );
+                                break;
+                            }
                         }
                         other => {
                             anyhow::bail!(
@@ -391,29 +405,53 @@ async fn run_relay_tunnel_websocket(
                         }
                     },
                     Some(Ok(Message::Ping(payload))) => {
-                        socket
-                            .send(Message::Pong(payload))
-                            .await
-                            .context("failed sending relay tunnel pong")?;
+                        if let Err(err) = socket.send(Message::Pong(payload)).await {
+                            tracing::debug!(
+                                error = %err,
+                                session_id = %endpoint.session().session_id,
+                                "relay tunnel websocket closed after pairing"
+                            );
+                            break;
+                        }
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(err)) => {
-                        return Err(err).context("relay tunnel websocket read failed");
+                        tracing::debug!(
+                            error = %err,
+                            session_id = %endpoint.session().session_id,
+                            "relay tunnel websocket closed after pairing"
+                        );
+                        break;
                     }
                 }
             }
             frame = endpoint.recv() => {
                 match frame {
                     Some(RelayTunnelFrame::Data(bytes)) => {
-                        socket
-                            .send(Message::Binary(bytes.into()))
-                            .await
-                            .context("failed sending relay tunnel data frame")?;
+                        if let Err(err) = socket.send(Message::Binary(bytes.into())).await {
+                            tracing::debug!(
+                                error = %err,
+                                session_id = %endpoint.session().session_id,
+                                "relay tunnel websocket closed after pairing"
+                            );
+                            break;
+                        }
                     }
                     Some(RelayTunnelFrame::CloseWrite) => {
-                        send_relay_tunnel_control(socket, &RelayTunnelControlMessage::CloseWrite)
-                            .await?;
+                        if let Err(err) = send_relay_tunnel_control(
+                            socket,
+                            &RelayTunnelControlMessage::CloseWrite,
+                        )
+                        .await
+                        {
+                            tracing::debug!(
+                                error = %err,
+                                session_id = %endpoint.session().session_id,
+                                "relay tunnel websocket closed after pairing"
+                            );
+                            break;
+                        }
                     }
                     None => break,
                 }
