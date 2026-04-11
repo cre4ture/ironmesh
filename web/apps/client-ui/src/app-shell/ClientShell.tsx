@@ -1,8 +1,6 @@
 import {
   Alert,
-  AppShell,
   Badge,
-  Burger,
   Button,
   Card,
   Code,
@@ -10,7 +8,6 @@ import {
   FileInput,
   Grid,
   Group,
-  NavLink,
   NumberInput,
   Progress,
   Select,
@@ -22,7 +19,6 @@ import {
   Textarea,
   UnstyledButton
 } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
 import {
   IconFiles,
   IconActivity,
@@ -34,8 +30,8 @@ import {
 } from "@tabler/icons-react";
 import {
   ColorSchemeControl,
-  IronmeshBrand,
   JsonBlock,
+  NavigationShell,
   PageHeader,
   StatCard
 } from "@ironmesh/ui";
@@ -181,7 +177,6 @@ const pages = [
 ];
 
 export function ClientShell() {
-  const [opened, { toggle, close }] = useDisclosure();
   const [activePageId, setActivePageId] = useState<PageId>("overview");
   const [ping, setPing] = useState<ClientUiPingResponse | null>(null);
   const [health, setHealth] = useState<JsonObject | null>(null);
@@ -217,105 +212,71 @@ export function ClientShell() {
   }
 
   return (
-    <>
-      <AppShell
-        className="shell-root"
-        header={{ height: 68 }}
-        navbar={{ width: 280, breakpoint: "sm", collapsed: { mobile: !opened } }}
-        padding={{ base: "xs", sm: "md", lg: "lg" }}
-      >
-        <AppShell.Header className="shell-header">
-          <Group className="shell-header-bar" h="100%" px="md" justify="space-between">
-            <Group gap="sm">
-              <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-              <IronmeshBrand surfaceLabel="Client UI" />
-            </Group>
-            <Group gap="sm">
-              {binaryUpload.summary.totalFiles > 0 ? (
-                <Button
-                  variant="light"
-                  color={binaryUploadHeaderColor(binaryUpload.summary, binaryUpload.running)}
-                  size="xs"
-                  leftSection={<IconFiles size={14} />}
-                  onClick={() => setActivePageId("store")}
-                >
-                  {binaryUploadHeaderLabel(binaryUpload.summary, binaryUpload.running)}
-                </Button>
-              ) : null}
-              <ColorSchemeControl />
-              {ping ? <Badge variant="light">{ping.service}</Badge> : null}
-              <Badge color="teal" variant="filled">
-                Transport-aware
-              </Badge>
-            </Group>
-          </Group>
-        </AppShell.Header>
+    <NavigationShell
+      surfaceLabel="Client UI"
+      navigationItems={pages}
+      activeItemId={activePageId}
+      onNavigate={setActivePageId}
+      contentGap="lg"
+      headerActions={
+        <>
+          {binaryUpload.summary.totalFiles > 0 ? (
+            <Button
+              variant="light"
+              color={binaryUploadHeaderColor(binaryUpload.summary, binaryUpload.running)}
+              size="xs"
+              leftSection={<IconFiles size={14} />}
+              onClick={() => setActivePageId("store")}
+            >
+              {binaryUploadHeaderLabel(binaryUpload.summary, binaryUpload.running)}
+            </Button>
+          ) : null}
+          <ColorSchemeControl />
+          {ping ? <Badge variant="light">{ping.service}</Badge> : null}
+          <Badge color="teal" variant="filled">
+            Transport-aware
+          </Badge>
+        </>
+      }
+    >
+      {activePageId === "overview" ? (
+        <OverviewPage
+          ping={ping}
+          health={health}
+          clusterStatus={clusterStatus}
+          connectionStatus={connectionStatus}
+          loading={overviewLoading}
+          error={overviewError}
+          onRefresh={refreshOverview}
+        />
+      ) : null}
 
-        <AppShell.Navbar className="shell-navbar" p="sm">
-          <Stack gap="xs">
-            {pages.map((page) => {
-              const Icon = page.icon;
-              return (
-                <NavLink
-                  key={page.id}
-                  active={page.id === activePageId}
-                  label={page.label}
-                  description={page.description}
-                  leftSection={<Icon size={16} />}
-                  onClick={() => {
-                    setActivePageId(page.id);
-                    close();
-                  }}
-                />
-              );
-            })}
-          </Stack>
-        </AppShell.Navbar>
+      {activePageId === "rendezvous" ? <RendezvousPage /> : null}
 
-        <AppShell.Main className="shell-main">
-          <Stack className="shell-content" gap="lg">
-            {activePageId === "overview" ? (
-              <OverviewPage
-                ping={ping}
-                health={health}
-                clusterStatus={clusterStatus}
-                connectionStatus={connectionStatus}
-                loading={overviewLoading}
-                error={overviewError}
-                onRefresh={refreshOverview}
-              />
-            ) : null}
+      {activePageId === "latency" ? <LatencyPage /> : null}
 
-            {activePageId === "rendezvous" ? <RendezvousPage /> : null}
+      {activePageId === "store" ? <StorePage binaryUpload={binaryUpload} /> : null}
 
-            {activePageId === "latency" ? <LatencyPage /> : null}
+      {activePageId === "explorer" ? (
+        <ClientExplorerPage
+          queueFilesToPrefix={(files, targetPrefix) =>
+            binaryUpload.enqueueFiles(files, targetPrefix)
+          }
+          onOpenStore={() => setActivePageId("store")}
+        />
+      ) : null}
 
-            {activePageId === "store" ? <StorePage binaryUpload={binaryUpload} /> : null}
+      {activePageId === "gallery" ? <GalleryPage /> : null}
 
-            {activePageId === "explorer" ? (
-              <ClientExplorerPage
-                queueFilesToPrefix={(files, targetPrefix) =>
-                  binaryUpload.enqueueFiles(files, targetPrefix)
-                }
-                onOpenStore={() => setActivePageId("store")}
-              />
-            ) : null}
-
-            {activePageId === "gallery" ? <GalleryPage /> : null}
-
-            {activePageId === "cluster" ? (
-              <ClusterPage
-                health={health}
-                clusterStatus={clusterStatus}
-                overviewLoading={overviewLoading}
-                onRefreshOverview={refreshOverview}
-              />
-            ) : null}
-          </Stack>
-        </AppShell.Main>
-      </AppShell>
-      {opened ? <div className="shell-backdrop" onClick={close} /> : null}
-    </>
+      {activePageId === "cluster" ? (
+        <ClusterPage
+          health={health}
+          clusterStatus={clusterStatus}
+          overviewLoading={overviewLoading}
+          onRefreshOverview={refreshOverview}
+        />
+      ) : null}
+    </NavigationShell>
   );
 }
 

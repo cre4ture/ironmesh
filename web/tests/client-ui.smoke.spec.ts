@@ -274,6 +274,45 @@ test("client-ui gallery grid keeps multiple columns on narrow viewports", async 
   await expect(page.locator('[data-gallery-card-metadata="true"]')).toHaveCount(0);
 });
 
+test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {
+  test.setTimeout(45_000);
+
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+
+  const desktopSidebarToggle = page.getByRole("button", { name: "Toggle navigation sidebar" });
+  const primaryNavigation = page.getByLabel("Primary navigation");
+  await expect(desktopSidebarToggle).toBeVisible();
+  await expect(primaryNavigation).toBeVisible();
+
+  await page.setViewportSize({ width: 1280, height: 320 });
+  const navbarScrollViewport = page.locator(".shell-navbar .mantine-ScrollArea-viewport");
+  await expect(navbarScrollViewport).toBeVisible();
+  const navbarScrollTop = await navbarScrollViewport.evaluate((node) => {
+    node.scrollTop = 999;
+    return node.scrollTop;
+  });
+  expect(navbarScrollTop).toBeGreaterThan(0);
+  const navbarRightBeforeCollapse = await primaryNavigation.evaluate(
+    (node) => node.getBoundingClientRect().right
+  );
+  expect(navbarRightBeforeCollapse).toBeGreaterThan(0);
+
+  await desktopSidebarToggle.click();
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeLessThanOrEqual(0);
+  await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+
+  await desktopSidebarToggle.click();
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeGreaterThan(0);
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+});
+
 async function installClientUiMocks(page: Page) {
   const imageBody = tinyPngBuffer();
   const movieBody = Buffer.from("mock-movie-payload");

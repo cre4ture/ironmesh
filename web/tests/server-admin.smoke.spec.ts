@@ -8,6 +8,27 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  const desktopSidebarToggle = page.getByRole("button", { name: "Toggle navigation sidebar" });
+  const primaryNavigation = page.getByLabel("Primary navigation");
+  await expect(desktopSidebarToggle).toBeVisible();
+  await expect(primaryNavigation).toBeVisible();
+  await page.setViewportSize({ width: 1280, height: 320 });
+  const navbarScrollViewport = page.locator(".shell-navbar .mantine-ScrollArea-viewport");
+  await expect(navbarScrollViewport).toBeVisible();
+  const navbarScrollTop = await navbarScrollViewport.evaluate((node) => {
+    node.scrollTop = 999;
+    return node.scrollTop;
+  });
+  expect(navbarScrollTop).toBeGreaterThan(0);
+  await desktopSidebarToggle.click();
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeLessThanOrEqual(0);
+  await desktopSidebarToggle.click();
+  await expect
+    .poll(async () => primaryNavigation.evaluate((node) => node.getBoundingClientRect().right))
+    .toBeGreaterThan(0);
+  await page.setViewportSize({ width: 1280, height: 800 });
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
   await expect(page.getByText(/UI build:\s*0\.1\.0 \(/)).toBeVisible();
   await expect(page.getByText("Backend build: 0.1.0 (v0.1.0-5-gmocked)")).toBeVisible();

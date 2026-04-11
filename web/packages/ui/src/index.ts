@@ -7,3 +7,4 @@ export * from "./components/ExplorerSurface/ExplorerSurface";
 export * from "./components/GallerySurface/GallerySurface";
 export * from "./components/IronmeshBrand/IronmeshBrand";
 export * from "./components/ColorSchemeControl/ColorSchemeControl";
+export * from "./components/NavigationShell/NavigationShell";

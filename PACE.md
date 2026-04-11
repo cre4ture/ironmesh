@@ -52,6 +52,7 @@ Use this pattern for future commits:
 
 - SOLID Principles
 - DRY (Don’t Repeat Yourself)
+  - when you notice significant exisitng code duplication during work, clean it up or at least point it out.
 - Clean code principles
 - Keep functions small, focused, and readable.
 - If a function grows too large or takes on multiple responsibilities, split it into smaller helper functions or modules.
