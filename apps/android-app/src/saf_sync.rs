@@ -13,8 +13,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_agent_core::{
@@ -209,6 +209,19 @@ impl RemoteApplyOutcome {
         self.downloaded_file_count += other.downloaded_file_count;
         self.removed_local_path_count += other.removed_local_path_count;
     }
+}
+
+#[derive(Debug, Clone)]
+struct BlockingStatusProgress {
+    options: FolderAgentRuntimeOptions,
+    connection_target: Option<String>,
+    state: String,
+    phase: String,
+    activity: String,
+    base_message: String,
+    metrics: FolderAgentRuntimeMetrics,
+    last_success_unix_ms: Option<u64>,
+    last_error: Option<String>,
 }
 
 fn state_identity_root(tree_uri: &str) -> PathBuf {
@@ -1098,6 +1111,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
     )
     .context("SAF runtime requires server_base_url or client_bootstrap_json")?;
     let mut last_success_unix_ms = None;
+    let last_success_shared = Arc::new(AtomicU64::new(0));
     let state_identity_root = state_identity_root(tree_uri);
     let state_store = match options.state_root_dir.as_deref() {
         Some(state_root_dir) => StartupStateStore::new_with_state_root(
@@ -1144,8 +1158,21 @@ pub(crate) fn run_saf_folder_agent_with_control(
         None,
     );
 
-    let local_state_before_remote_sync =
-        scan_saf_tree(tree_uri).context("failed to scan SAF tree before initial remote sync")?;
+    let local_state_before_remote_sync = run_with_status_heartbeat(
+        status_callback.clone(),
+        BlockingStatusProgress {
+            options: options.clone(),
+            connection_target: Some(connection_target.clone()),
+            state: "starting".to_string(),
+            phase: "startup".to_string(),
+            activity: "scanning-local-tree".to_string(),
+            base_message: "Scanning SAF tree before initial reconciliation".to_string(),
+            metrics: FolderAgentRuntimeMetrics::default(),
+            last_success_unix_ms,
+            last_error: None,
+        },
+        || scan_saf_tree(tree_uri).context("failed to scan SAF tree before initial remote sync"),
+    )?;
     let local_scan_metrics =
         FolderAgentRuntimeMetrics::from_states(Some(&local_state_before_remote_sync), None);
     emit_status(
@@ -1196,13 +1223,29 @@ pub(crate) fn run_saf_folder_agent_with_control(
         "startup",
         "fetching-remote-snapshot",
         "Fetching initial remote snapshot",
-        local_scan_metrics,
+        local_scan_metrics.clone(),
         last_success_unix_ms,
         None,
     );
-    let initial_snapshot = initial_fetcher
-        .fetch_snapshot_blocking()
-        .context("failed to fetch initial remote snapshot")?;
+    let initial_snapshot = run_with_status_heartbeat(
+        status_callback.clone(),
+        BlockingStatusProgress {
+            options: options.clone(),
+            connection_target: Some(connection_target.clone()),
+            state: "starting".to_string(),
+            phase: "startup".to_string(),
+            activity: "fetching-remote-snapshot".to_string(),
+            base_message: "Fetching initial remote snapshot".to_string(),
+            metrics: local_scan_metrics.clone(),
+            last_success_unix_ms,
+            last_error: None,
+        },
+        || {
+            initial_fetcher
+                .fetch_snapshot_blocking()
+                .context("failed to fetch initial remote snapshot")
+        },
+    )?;
     let remote_files_before_remote_sync =
         remote_file_paths_by_local_path(&initial_snapshot, &scope);
     let remote_hashes_before_remote_sync =
@@ -1281,8 +1324,21 @@ pub(crate) fn run_saf_folder_agent_with_control(
     }
     initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
     if !remote_delete_wins_paths.is_empty() {
-        local_state = scan_saf_tree(tree_uri)
-            .context("failed to rescan SAF tree after remote delete wins")?;
+        local_state = run_with_status_heartbeat(
+            status_callback.clone(),
+            BlockingStatusProgress {
+                options: options.clone(),
+                connection_target: Some(connection_target.clone()),
+                state: "syncing".to_string(),
+                phase: "startup".to_string(),
+                activity: "scanning-local-tree".to_string(),
+                base_message: "Rescanning SAF tree after remote-delete reconciliation".to_string(),
+                metrics: FolderAgentRuntimeMetrics::from_states(None, Some(&remote_index)),
+                last_success_unix_ms,
+                last_error: None,
+            },
+            || scan_saf_tree(tree_uri).context("failed to rescan SAF tree after remote delete wins"),
+        )?;
     }
 
     local_state = startup_baseline_state_from_remote_index(
@@ -1322,14 +1378,30 @@ pub(crate) fn run_saf_folder_agent_with_control(
         None,
     );
 
-    let initial_local_sync_outcome = sync_local_changes_saf(
-        tree_uri,
-        &client,
-        &mut local_state,
-        Some(&state_store),
-        &scope,
-        &mut remote_index,
-        &mut suppressed_uploads,
+    let initial_local_sync_outcome = run_with_status_heartbeat(
+        status_callback.clone(),
+        BlockingStatusProgress {
+            options: options.clone(),
+            connection_target: Some(connection_target.clone()),
+            state: "syncing".to_string(),
+            phase: "startup".to_string(),
+            activity: "scanning-local-tree".to_string(),
+            base_message: "Scanning SAF tree and reconciling startup local changes".to_string(),
+            metrics: FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+            last_success_unix_ms,
+            last_error: None,
+        },
+        || {
+            sync_local_changes_saf(
+                tree_uri,
+                &client,
+                &mut local_state,
+                Some(&state_store),
+                &scope,
+                &mut remote_index,
+                &mut suppressed_uploads,
+            )
+        },
     )?;
 
     state_store
@@ -1389,7 +1461,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
         "steady-state",
         "watching-for-changes",
         initial_sync_message,
-        initial_runtime_metrics,
+        initial_runtime_metrics.clone(),
         last_success_unix_ms,
         None,
     );
@@ -1399,13 +1471,37 @@ pub(crate) fn run_saf_folder_agent_with_control(
 
     let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
+    let latest_metrics = Arc::new(Mutex::new(initial_runtime_metrics.clone()));
+    store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
     let (remote_tx, remote_rx) = mpsc::channel();
     let remote_running = running.clone();
     let remote_stop_signal = running.clone();
-    let remote_thread = refresh_poller.spawn_fetcher_loop(
+    let remote_status_callback = status_callback.clone();
+    let remote_options = options.clone();
+    let remote_connection_target = connection_target.clone();
+    let remote_latest_metrics = latest_metrics.clone();
+    let remote_last_success = last_success_shared.clone();
+    let remote_thread = refresh_poller.spawn_changed_paths_loop(
         remote_running,
         Some(initial_snapshot),
-        refresh_fetcher,
+        move || {
+            let progress_metrics = latest_metrics_value(&remote_latest_metrics);
+            run_with_status_heartbeat(
+                remote_status_callback.clone(),
+                BlockingStatusProgress {
+                    options: remote_options.clone(),
+                    connection_target: Some(remote_connection_target.clone()),
+                    state: "syncing".to_string(),
+                    phase: "steady-state".to_string(),
+                    activity: "fetching-remote-snapshot".to_string(),
+                    base_message: "Refreshing remote snapshot from server".to_string(),
+                    metrics: progress_metrics,
+                    last_success_unix_ms: load_optional_unix_ms(&remote_last_success),
+                    last_error: None,
+                },
+                || refresh_fetcher.fetch_snapshot_blocking(),
+            )
+        },
         move |update| {
             if remote_tx.send(update).is_err() {
                 remote_stop_signal.store(false, Ordering::SeqCst);
@@ -1453,6 +1549,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
 
         if combined_remote_outcome.changed_path_count > 0 {
             last_success_unix_ms = Some(now_unix_ms());
+            store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
             let mut remote_runtime_metrics =
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
             remote_runtime_metrics.changed_path_count =
@@ -1474,10 +1571,11 @@ pub(crate) fn run_saf_folder_agent_with_control(
                     "Applied SAF remote changes: {}",
                     format_remote_apply_summary(combined_remote_outcome)
                 ),
-                remote_runtime_metrics,
+                remote_runtime_metrics.clone(),
                 last_success_unix_ms,
                 None,
             );
+            set_latest_metrics(&latest_metrics, &remote_runtime_metrics);
         }
 
         let current_tree_change_version =
@@ -1502,14 +1600,35 @@ pub(crate) fn run_saf_folder_agent_with_control(
                 last_success_unix_ms,
                 None,
             );
-            let local_sync_outcome = sync_local_changes_saf(
-                tree_uri,
-                &client,
-                &mut local_state,
-                Some(&state_store),
-                &scope,
-                &mut remote_index,
-                &mut suppressed_uploads,
+            let local_sync_outcome = run_with_status_heartbeat(
+                status_callback.clone(),
+                BlockingStatusProgress {
+                    options: options.clone(),
+                    connection_target: Some(connection_target.clone()),
+                    state: "syncing".to_string(),
+                    phase: "steady-state".to_string(),
+                    activity: "scanning-local-tree".to_string(),
+                    base_message: if observer_hint_triggered {
+                        "Scanning SAF tree and reconciling observer-triggered local changes"
+                            .to_string()
+                    } else {
+                        "Scanning SAF tree and reconciling scheduled local changes".to_string()
+                    },
+                    metrics: FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+                    last_success_unix_ms,
+                    last_error: None,
+                },
+                || {
+                    sync_local_changes_saf(
+                        tree_uri,
+                        &client,
+                        &mut local_state,
+                        Some(&state_store),
+                        &scope,
+                        &mut remote_index,
+                        &mut suppressed_uploads,
+                    )
+                },
             )?;
             if local_state != previous_local_state {
                 baseline_dirty = true;
@@ -1518,6 +1637,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
                 tree_change_version(tree_uri).unwrap_or(current_tree_change_version);
             next_local_scan = Instant::now() + local_scan_interval;
             last_success_unix_ms = Some(now_unix_ms());
+            store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
             let mut local_runtime_metrics =
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
             local_runtime_metrics.changed_path_count =
@@ -1544,10 +1664,11 @@ pub(crate) fn run_saf_folder_agent_with_control(
                         format_local_sync_summary(local_sync_outcome)
                     )
                 },
-                local_runtime_metrics,
+                local_runtime_metrics.clone(),
                 last_success_unix_ms,
                 None,
             );
+            set_latest_metrics(&latest_metrics, &local_runtime_metrics);
         }
 
         if baseline_dirty {
@@ -1561,6 +1682,10 @@ pub(crate) fn run_saf_folder_agent_with_control(
 
     running.store(false, Ordering::SeqCst);
     let _ = remote_thread.join();
+    set_latest_metrics(
+        &latest_metrics,
+        &FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+    );
     emit_status(
         status_callback.as_ref(),
         options,
@@ -1585,6 +1710,106 @@ fn watch_mode_label(options: &FolderAgentRuntimeOptions) -> &'static str {
         "not-watching"
     } else {
         "saf-observer+polling"
+    }
+}
+
+const BLOCKING_STATUS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+fn run_with_status_heartbeat<T, F>(
+    callback: Option<FolderAgentStatusCallback>,
+    progress: BlockingStatusProgress,
+    operation: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let progress_thread = callback.map(|callback| {
+        let progress = progress.clone();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let handle = thread::Builder::new()
+            .name("ironmesh-saf-status-heartbeat".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                loop {
+                    match done_rx.recv_timeout(BLOCKING_STATUS_HEARTBEAT_INTERVAL) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            callback(FolderAgentRuntimeStatus::new(
+                                &progress.options,
+                                progress.connection_target.as_deref(),
+                                "android-saf",
+                                watch_mode_label(&progress.options),
+                                progress.state.clone(),
+                                progress.phase.clone(),
+                                progress.activity.clone(),
+                                blocking_progress_message(
+                                    &progress.base_message,
+                                    started.elapsed(),
+                                ),
+                                progress.metrics.clone(),
+                                progress.last_success_unix_ms,
+                                progress.last_error.clone(),
+                            ));
+                        }
+                    }
+                }
+            });
+        (done_tx, handle)
+    });
+
+    let result = operation();
+
+    if let Some((done_tx, progress_thread)) = progress_thread {
+        let _ = done_tx.send(());
+        if let Ok(handle) = progress_thread {
+            let _ = handle.join();
+        }
+    }
+
+    result
+}
+
+fn blocking_progress_message(base_message: &str, elapsed: Duration) -> String {
+    format!(
+        "{base_message} (still working, {} elapsed)",
+        format_elapsed_duration(elapsed)
+    )
+}
+
+fn format_elapsed_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        let minutes = seconds / 60;
+        let remaining_seconds = seconds % 60;
+        format!("{minutes}m {remaining_seconds}s")
+    }
+}
+
+fn set_latest_metrics(
+    latest_metrics: &Arc<Mutex<FolderAgentRuntimeMetrics>>,
+    metrics: &FolderAgentRuntimeMetrics,
+) {
+    if let Ok(mut current) = latest_metrics.lock() {
+        *current = metrics.clone();
+    }
+}
+
+fn latest_metrics_value(
+    latest_metrics: &Arc<Mutex<FolderAgentRuntimeMetrics>>,
+) -> FolderAgentRuntimeMetrics {
+    latest_metrics.lock().map(|metrics| metrics.clone()).unwrap_or_default()
+}
+
+fn store_optional_unix_ms(target: &AtomicU64, value: Option<u64>) {
+    target.store(value.unwrap_or(0), Ordering::SeqCst);
+}
+
+fn load_optional_unix_ms(target: &AtomicU64) -> Option<u64> {
+    match target.load(Ordering::SeqCst) {
+        0 => None,
+        value => Some(value),
     }
 }
 

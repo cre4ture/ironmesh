@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_core::{EntryKind, SyncSnapshot};
@@ -277,6 +277,21 @@ impl RemoteApplyOutcome {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BlockingStatusProgress {
+    options: FolderAgentRuntimeOptions,
+    connection_target: Option<String>,
+    storage_mode: String,
+    watch_mode: String,
+    state: String,
+    phase: String,
+    activity: String,
+    base_message: String,
+    metrics: FolderAgentRuntimeMetrics,
+    last_success_unix_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
 fn run_folder_agent_inner(
     options: &FolderAgentRuntimeOptions,
     running: Arc<AtomicBool>,
@@ -290,6 +305,7 @@ fn run_folder_agent_inner(
         options.client_bootstrap_json.as_deref(),
     )?;
     let mut last_success_unix_ms = None;
+    let last_success_shared = Arc::new(AtomicU64::new(0));
     let state_store = match options.state_root_dir.as_deref() {
         Some(state_root_dir) => StartupStateStore::new_with_state_root(
             &options.root_dir,
@@ -351,8 +367,26 @@ fn run_folder_agent_inner(
         last_success_unix_ms,
         None,
     );
-    let local_state_before_remote_sync = scan_local_tree(&options.root_dir)
-        .context("failed to scan local state before initial remote sync")?;
+    let local_state_before_remote_sync = run_with_status_heartbeat(
+        status_callback.clone(),
+        BlockingStatusProgress {
+            options: options.clone(),
+            connection_target: Some(connection_target.clone()),
+            storage_mode: "filesystem".to_string(),
+            watch_mode: watch_mode.to_string(),
+            state: "starting".to_string(),
+            phase: "startup".to_string(),
+            activity: "scanning-local-tree".to_string(),
+            base_message: "Scanning local files before initial reconciliation".to_string(),
+            metrics: FolderAgentRuntimeMetrics::default(),
+            last_success_unix_ms,
+            last_error: None,
+        },
+        || {
+            scan_local_tree(&options.root_dir)
+                .context("failed to scan local state before initial remote sync")
+        },
+    )?;
     let local_scan_sample = sample_local_paths(&local_state_before_remote_sync, 5);
     let local_scan_metrics =
         FolderAgentRuntimeMetrics::from_states(Some(&local_state_before_remote_sync), None);
@@ -414,14 +448,32 @@ fn run_folder_agent_inner(
         "startup",
         "fetching-remote-snapshot",
         "Fetching initial remote snapshot",
-        local_scan_metrics,
+        local_scan_metrics.clone(),
         last_success_unix_ms,
         None,
     );
     let initial_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope.clone());
-    let initial_snapshot = initial_fetcher
-        .fetch_snapshot_blocking()
-        .context("failed to fetch initial remote snapshot")?;
+    let initial_snapshot = run_with_status_heartbeat(
+        status_callback.clone(),
+        BlockingStatusProgress {
+            options: options.clone(),
+            connection_target: Some(connection_target.clone()),
+            storage_mode: "filesystem".to_string(),
+            watch_mode: watch_mode.to_string(),
+            state: "starting".to_string(),
+            phase: "startup".to_string(),
+            activity: "fetching-remote-snapshot".to_string(),
+            base_message: "Fetching initial remote snapshot".to_string(),
+            metrics: local_scan_metrics.clone(),
+            last_success_unix_ms,
+            last_error: None,
+        },
+        || {
+            initial_fetcher
+                .fetch_snapshot_blocking()
+                .context("failed to fetch initial remote snapshot")
+        },
+    )?;
     let remote_files_before_remote_sync =
         remote_file_paths_by_local_path(&initial_snapshot, &scope);
     let remote_hashes_before_remote_sync =
@@ -507,8 +559,26 @@ fn run_folder_agent_inner(
     }
     initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
 
-    let mut local_state = scan_local_tree(&options.root_dir)
-        .context("failed to scan local state after initial remote sync")?;
+    let mut local_state = run_with_status_heartbeat(
+        status_callback.clone(),
+        BlockingStatusProgress {
+            options: options.clone(),
+            connection_target: Some(connection_target.clone()),
+            storage_mode: "filesystem".to_string(),
+            watch_mode: watch_mode.to_string(),
+            state: "syncing".to_string(),
+            phase: "startup".to_string(),
+            activity: "scanning-local-tree".to_string(),
+            base_message: "Rescanning local files after applying startup remote changes".to_string(),
+            metrics: FolderAgentRuntimeMetrics::from_states(None, Some(&remote_index)),
+            last_success_unix_ms,
+            last_error: None,
+        },
+        || {
+            scan_local_tree(&options.root_dir)
+                .context("failed to scan local state after initial remote sync")
+        },
+    )?;
     local_state = startup_baseline_state_from_remote_index(
         &local_state,
         &remote_index,
@@ -548,14 +618,33 @@ fn run_folder_agent_inner(
         None,
     );
 
-    let initial_local_sync_outcome = sync_local_changes(
-        &options.root_dir,
-        &client,
-        &mut local_state,
-        Some(&state_store),
-        &scope,
-        &mut remote_index,
-        &mut suppressed_uploads,
+    let initial_local_sync_outcome = run_with_status_heartbeat(
+        status_callback.clone(),
+        BlockingStatusProgress {
+            options: options.clone(),
+            connection_target: Some(connection_target.clone()),
+            storage_mode: "filesystem".to_string(),
+            watch_mode: watch_mode.to_string(),
+            state: "syncing".to_string(),
+            phase: "startup".to_string(),
+            activity: "scanning-local-tree".to_string(),
+            base_message: "Scanning local files and reconciling startup local changes"
+                .to_string(),
+            metrics: FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+            last_success_unix_ms,
+            last_error: None,
+        },
+        || {
+            sync_local_changes(
+                &options.root_dir,
+                &client,
+                &mut local_state,
+                Some(&state_store),
+                &scope,
+                &mut remote_index,
+                &mut suppressed_uploads,
+            )
+        },
     )?;
 
     state_store
@@ -622,7 +711,7 @@ fn run_folder_agent_inner(
         "steady-state",
         "watching-for-changes",
         initial_sync_message,
-        initial_runtime_metrics,
+        initial_runtime_metrics.clone(),
         last_success_unix_ms,
         None,
     );
@@ -632,14 +721,41 @@ fn run_folder_agent_inner(
 
     let refresh_poller = RemoteSnapshotPoller::polling(refresh_interval);
     let refresh_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope);
+    let latest_metrics = Arc::new(Mutex::new(initial_runtime_metrics.clone()));
+    store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
 
     let (remote_tx, remote_rx) = mpsc::channel::<RemoteSnapshotUpdate>();
     let remote_running = running.clone();
     let remote_stop_signal = running.clone();
-    let remote_thread = refresh_poller.spawn_fetcher_loop(
+    let remote_status_callback = status_callback.clone();
+    let remote_options = options.clone();
+    let remote_connection_target = connection_target.clone();
+    let remote_watch_mode = watch_mode.to_string();
+    let remote_latest_metrics = latest_metrics.clone();
+    let remote_last_success = last_success_shared.clone();
+    let remote_thread = refresh_poller.spawn_changed_paths_loop(
         remote_running,
         Some(initial_snapshot),
-        refresh_fetcher,
+        move || {
+            let progress_metrics = latest_metrics_value(&remote_latest_metrics);
+            run_with_status_heartbeat(
+                remote_status_callback.clone(),
+                BlockingStatusProgress {
+                    options: remote_options.clone(),
+                    connection_target: Some(remote_connection_target.clone()),
+                    storage_mode: "filesystem".to_string(),
+                    watch_mode: remote_watch_mode.clone(),
+                    state: "syncing".to_string(),
+                    phase: "steady-state".to_string(),
+                    activity: "fetching-remote-snapshot".to_string(),
+                    base_message: "Refreshing remote snapshot from server".to_string(),
+                    metrics: progress_metrics,
+                    last_success_unix_ms: load_optional_unix_ms(&remote_last_success),
+                    last_error: None,
+                },
+                || refresh_fetcher.fetch_snapshot_blocking(),
+            )
+        },
         move |update| {
             if remote_tx.send(update).is_err() {
                 remote_stop_signal.store(false, Ordering::SeqCst);
@@ -696,10 +812,29 @@ fn run_folder_agent_inner(
         }
 
         if remote_updates_applied {
-            local_state = scan_local_tree(&options.root_dir)
-                .context("failed to rescan local state after remote update")?;
+            local_state = run_with_status_heartbeat(
+                status_callback.clone(),
+                BlockingStatusProgress {
+                    options: options.clone(),
+                    connection_target: Some(connection_target.clone()),
+                    storage_mode: "filesystem".to_string(),
+                    watch_mode: watch_mode.to_string(),
+                    state: "syncing".to_string(),
+                    phase: "steady-state".to_string(),
+                    activity: "scanning-local-tree".to_string(),
+                    base_message: "Rescanning local files after applying remote changes".to_string(),
+                    metrics: FolderAgentRuntimeMetrics::from_states(None, Some(&remote_index)),
+                    last_success_unix_ms,
+                    last_error: None,
+                },
+                || {
+                    scan_local_tree(&options.root_dir)
+                        .context("failed to rescan local state after remote update")
+                },
+            )?;
             baseline_dirty = true;
             last_success_unix_ms = Some(now_unix_ms());
+            store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
             let mut remote_runtime_metrics =
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
             remote_runtime_metrics.changed_path_count =
@@ -723,10 +858,11 @@ fn run_folder_agent_inner(
                     "Applied remote changes: {}",
                     format_remote_apply_summary(combined_remote_outcome)
                 ),
-                remote_runtime_metrics,
+                remote_runtime_metrics.clone(),
                 last_success_unix_ms,
                 None,
             );
+            set_latest_metrics(&latest_metrics, &remote_runtime_metrics);
         }
 
         let mut local_scan_requested = false;
@@ -755,20 +891,45 @@ fn run_folder_agent_inner(
                 last_success_unix_ms,
                 None,
             );
-            let local_sync_outcome = sync_local_changes(
-                &options.root_dir,
-                &client,
-                &mut local_state,
-                Some(&state_store),
-                &scope,
-                &mut remote_index,
-                &mut suppressed_uploads,
+            let local_sync_outcome = run_with_status_heartbeat(
+                status_callback.clone(),
+                BlockingStatusProgress {
+                    options: options.clone(),
+                    connection_target: Some(connection_target.clone()),
+                    storage_mode: "filesystem".to_string(),
+                    watch_mode: watch_mode.to_string(),
+                    state: "syncing".to_string(),
+                    phase: "steady-state".to_string(),
+                    activity: "scanning-local-tree".to_string(),
+                    base_message: if local_scan_requested {
+                        "Scanning local files and reconciling event-driven local changes"
+                            .to_string()
+                    } else {
+                        "Scanning local files and reconciling scheduled local changes"
+                            .to_string()
+                    },
+                    metrics: FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+                    last_success_unix_ms,
+                    last_error: None,
+                },
+                || {
+                    sync_local_changes(
+                        &options.root_dir,
+                        &client,
+                        &mut local_state,
+                        Some(&state_store),
+                        &scope,
+                        &mut remote_index,
+                        &mut suppressed_uploads,
+                    )
+                },
             )?;
             if local_state != previous_local_state {
                 baseline_dirty = true;
             }
             next_local_scan = Instant::now() + local_scan_interval;
             last_success_unix_ms = Some(now_unix_ms());
+            store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
             let mut local_runtime_metrics =
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index));
             local_runtime_metrics.changed_path_count =
@@ -796,10 +957,11 @@ fn run_folder_agent_inner(
                         format_local_sync_summary(local_sync_outcome)
                     )
                 },
-                local_runtime_metrics,
+                local_runtime_metrics.clone(),
                 last_success_unix_ms,
                 None,
             );
+            set_latest_metrics(&latest_metrics, &local_runtime_metrics);
         }
 
         if baseline_dirty {
@@ -813,6 +975,10 @@ fn run_folder_agent_inner(
 
     running.store(false, Ordering::SeqCst);
     let _ = remote_thread.join();
+    set_latest_metrics(
+        &latest_metrics,
+        &FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+    );
     emit_status(
         status_callback.as_ref(),
         options,
@@ -1212,6 +1378,106 @@ fn watch_mode_label(options: &FolderAgentRuntimeOptions) -> &'static str {
         "polling-only"
     } else {
         "fs-notify+polling"
+    }
+}
+
+const BLOCKING_STATUS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+fn run_with_status_heartbeat<T, F>(
+    callback: Option<FolderAgentStatusCallback>,
+    progress: BlockingStatusProgress,
+    operation: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let progress_thread = callback.map(|callback| {
+        let progress = progress.clone();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let handle = thread::Builder::new()
+            .name("ironmesh-folder-status-heartbeat".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                loop {
+                    match done_rx.recv_timeout(BLOCKING_STATUS_HEARTBEAT_INTERVAL) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            callback(FolderAgentRuntimeStatus::new(
+                                &progress.options,
+                                progress.connection_target.as_deref(),
+                                &progress.storage_mode,
+                                &progress.watch_mode,
+                                progress.state.clone(),
+                                progress.phase.clone(),
+                                progress.activity.clone(),
+                                blocking_progress_message(
+                                    &progress.base_message,
+                                    started.elapsed(),
+                                ),
+                                progress.metrics.clone(),
+                                progress.last_success_unix_ms,
+                                progress.last_error.clone(),
+                            ));
+                        }
+                    }
+                }
+            });
+        (done_tx, handle)
+    });
+
+    let result = operation();
+
+    if let Some((done_tx, progress_thread)) = progress_thread {
+        let _ = done_tx.send(());
+        if let Ok(handle) = progress_thread {
+            let _ = handle.join();
+        }
+    }
+
+    result
+}
+
+fn blocking_progress_message(base_message: &str, elapsed: Duration) -> String {
+    format!(
+        "{base_message} (still working, {} elapsed)",
+        format_elapsed_duration(elapsed)
+    )
+}
+
+fn format_elapsed_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        let minutes = seconds / 60;
+        let remaining_seconds = seconds % 60;
+        format!("{minutes}m {remaining_seconds}s")
+    }
+}
+
+fn set_latest_metrics(
+    latest_metrics: &Arc<Mutex<FolderAgentRuntimeMetrics>>,
+    metrics: &FolderAgentRuntimeMetrics,
+) {
+    if let Ok(mut current) = latest_metrics.lock() {
+        *current = metrics.clone();
+    }
+}
+
+fn latest_metrics_value(
+    latest_metrics: &Arc<Mutex<FolderAgentRuntimeMetrics>>,
+) -> FolderAgentRuntimeMetrics {
+    latest_metrics.lock().map(|metrics| metrics.clone()).unwrap_or_default()
+}
+
+fn store_optional_unix_ms(target: &AtomicU64, value: Option<u64>) {
+    target.store(value.unwrap_or(0), Ordering::SeqCst);
+}
+
+fn load_optional_unix_ms(target: &AtomicU64) -> Option<u64> {
+    match target.load(Ordering::SeqCst) {
+        0 => None,
+        value => Some(value),
     }
 }
 
