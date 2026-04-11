@@ -973,10 +973,7 @@ pub fn apply_action_plan(
             _ => continue,
         };
         let normalized = normalize_path(file_path);
-        let parts: Vec<&str> = normalized
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
         for i in 1..parts.len() {
             dirs_with_planned_content.insert(parts[..i].join("/"));
         }
