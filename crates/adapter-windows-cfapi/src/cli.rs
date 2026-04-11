@@ -380,6 +380,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                 &registration.root_path,
                 &action_plan,
                 sync_root_identity.provider_instance_id,
+                true,
             )?;
             let _ = runtime.sync_from_action_plan(&action_plan);
             let sync_state_stats = reconcile_sync_states(&registration.root_path, &action_plan);
@@ -460,6 +461,7 @@ pub fn cli_main() -> anyhow::Result<()> {
                             &refresh_registration.root_path,
                             &plan,
                             refresh_provider_instance_id,
+                            false,
                         ) {
                             tracing::info!("remote-refresh: apply_action_plan error: {err}");
                             return;
