@@ -136,15 +136,42 @@ pub struct RemoteTreeIndex {
     pub files: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LocalTreeScanProgress {
+    pub scanned_entry_count: u64,
+    pub scanned_directory_count: u64,
+    pub pending_directory_count: u64,
+    pub current_path: Option<String>,
+}
+
 pub fn scan_local_tree(root: &Path) -> Result<LocalTreeState> {
+    scan_local_tree_with_progress(root, |_| {})
+}
+
+pub fn scan_local_tree_with_progress<F>(root: &Path, mut on_progress: F) -> Result<LocalTreeState>
+where
+    F: FnMut(&LocalTreeScanProgress),
+{
     if !root.exists() {
+        on_progress(&LocalTreeScanProgress::default());
         return Ok(LocalTreeState::new());
     }
 
     let mut state = LocalTreeState::new();
     let mut pending = vec![root.to_path_buf()];
+    let mut progress = LocalTreeScanProgress {
+        pending_directory_count: 1,
+        current_path: Some("<root>".to_string()),
+        ..LocalTreeScanProgress::default()
+    };
+    on_progress(&progress);
 
     while let Some(directory) = pending.pop() {
+        progress.scanned_directory_count = progress.scanned_directory_count.saturating_add(1);
+        progress.pending_directory_count = (pending.len() + 1).try_into().unwrap_or(u64::MAX);
+        progress.current_path = relative_path(root, &directory).or(Some("<root>".to_string()));
+        on_progress(&progress);
+
         let entries = fs::read_dir(&directory)
             .with_context(|| format!("failed to read local directory {}", directory.display()))?;
 
@@ -165,17 +192,27 @@ pub fn scan_local_tree(root: &Path) -> Result<LocalTreeState> {
                 .metadata()
                 .with_context(|| format!("failed to read metadata for {}", path.display()))?;
 
-            if is_ironmesh_internal_relative_path(&relative) {
-                continue;
-            }
+            progress.scanned_entry_count = progress.scanned_entry_count.saturating_add(1);
+            progress.current_path = Some(relative.clone());
 
             if metadata.is_dir() {
                 pending.push(path.clone());
             }
 
+            progress.pending_directory_count = pending.len().try_into().unwrap_or(u64::MAX);
+            on_progress(&progress);
+
+            if is_ironmesh_internal_relative_path(&relative) {
+                continue;
+            }
+
             state.insert(relative, LocalEntryState::from_metadata(&metadata));
         }
     }
+
+    progress.pending_directory_count = 0;
+    progress.current_path = None;
+    on_progress(&progress);
 
     Ok(state)
 }
@@ -438,6 +475,35 @@ mod tests {
             !state
                 .keys()
                 .any(|path| path.starts_with(".ironmesh-conflicts"))
+        );
+
+        fs::remove_dir_all(root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn scan_local_tree_with_progress_reports_entries_and_completion() {
+        let root = test_root();
+        fs::create_dir_all(root.join("nested/inner")).expect("directory should be created");
+        fs::write(root.join("nested/file.txt"), b"hello").expect("file should be written");
+
+        let mut progress_updates = Vec::new();
+        let state = scan_local_tree_with_progress(&root, |progress| {
+            progress_updates.push(progress.clone());
+        })
+        .expect("scan should succeed");
+
+        assert!(state.contains_key("nested"));
+        assert!(state.contains_key("nested/inner"));
+        assert!(state.contains_key("nested/file.txt"));
+        assert!(!progress_updates.is_empty());
+        assert!(progress_updates.iter().any(|progress| progress.scanned_entry_count >= 3));
+        assert_eq!(
+            progress_updates.last().map(|progress| progress.pending_directory_count),
+            Some(0)
+        );
+        assert_eq!(
+            progress_updates.last().and_then(|progress| progress.current_path.clone()),
+            None
         );
 
         fs::remove_dir_all(root).expect("temp root should be removed");

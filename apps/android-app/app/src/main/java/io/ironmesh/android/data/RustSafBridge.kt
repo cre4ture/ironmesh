@@ -27,7 +27,9 @@ object RustSafBridge {
     @Volatile
     private var appContext: Context? = null
     private val observerLock = Any()
+    private val scanProgressLock = Any()
     private val treeObservers = mutableMapOf<String, TreeObserverState>()
+    private val treeScanProgress = mutableMapOf<String, TreeScanProgressState>()
 
     @JvmStatic
     fun initialize(context: Context) {
@@ -41,17 +43,30 @@ object RustSafBridge {
         val rootDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
         val entries = JSONArray()
         val observedChildrenUris = linkedSetOf<Uri>()
-        collectEntries(
-            resolver = resolver,
-            treeUri = treeUri,
-            parentDocumentId = rootDocumentId,
-            prefix = "",
-            visitedDocumentIds = mutableSetOf(),
-            observedChildrenUris = observedChildrenUris,
-            output = entries,
-        )
+        beginTreeScanProgress(treeUriString)
+        try {
+            collectEntries(
+                resolver = resolver,
+                treeUriString = treeUriString,
+                treeUri = treeUri,
+                parentDocumentId = rootDocumentId,
+                prefix = "",
+                visitedDocumentIds = mutableSetOf(),
+                observedChildrenUris = observedChildrenUris,
+                output = entries,
+            )
+        } finally {
+            finishTreeScanProgress(treeUriString)
+        }
         updateObservedChildrenUris(treeUriString, observedChildrenUris)
         return entries.toString()
+    }
+
+    @JvmStatic
+    fun getTreeScanProgress(treeUriString: String): String? {
+        synchronized(scanProgressLock) {
+            return treeScanProgress[treeUriString]?.toJson()?.toString()
+        }
     }
 
     @JvmStatic
@@ -347,6 +362,7 @@ object RustSafBridge {
 
     private fun collectEntries(
         resolver: ContentResolver,
+        treeUriString: String,
         treeUri: Uri,
         parentDocumentId: String,
         prefix: String,
@@ -357,6 +373,11 @@ object RustSafBridge {
         if (!visitedDocumentIds.add(parentDocumentId)) {
             return
         }
+
+        enterTreeScanDirectory(
+            treeUriString = treeUriString,
+            currentPath = if (prefix.isBlank()) "<root>" else prefix,
+        )
 
         observedChildrenUris += DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
 
@@ -370,6 +391,12 @@ object RustSafBridge {
                 continue
             }
 
+             recordTreeScanEntry(
+                treeUriString = treeUriString,
+                currentPath = relativePath,
+                discoveredDirectory = child.isDirectory,
+            )
+
             output.put(
                 JSONObject()
                     .put("path", relativePath)
@@ -381,6 +408,7 @@ object RustSafBridge {
             if (child.isDirectory) {
                 collectEntries(
                     resolver = resolver,
+                    treeUriString = treeUriString,
                     treeUri = treeUri,
                     parentDocumentId = child.documentId,
                     prefix = relativePath,
@@ -389,6 +417,56 @@ object RustSafBridge {
                     output = output,
                 )
             }
+        }
+
+        completeTreeScanDirectory(treeUriString)
+    }
+
+    private fun beginTreeScanProgress(treeUriString: String) {
+        synchronized(scanProgressLock) {
+            treeScanProgress[treeUriString] = TreeScanProgressState(
+                pendingDirectoryCount = 1L,
+                currentPath = "<root>",
+            )
+        }
+    }
+
+    private fun enterTreeScanDirectory(
+        treeUriString: String,
+        currentPath: String,
+    ) {
+        synchronized(scanProgressLock) {
+            val state = treeScanProgress[treeUriString] ?: return
+            state.scannedDirectoryCount += 1L
+            state.currentPath = currentPath
+        }
+    }
+
+    private fun recordTreeScanEntry(
+        treeUriString: String,
+        currentPath: String,
+        discoveredDirectory: Boolean,
+    ) {
+        synchronized(scanProgressLock) {
+            val state = treeScanProgress[treeUriString] ?: return
+            state.scannedEntryCount += 1L
+            state.currentPath = currentPath
+            if (discoveredDirectory) {
+                state.pendingDirectoryCount += 1L
+            }
+        }
+    }
+
+    private fun completeTreeScanDirectory(treeUriString: String) {
+        synchronized(scanProgressLock) {
+            val state = treeScanProgress[treeUriString] ?: return
+            state.pendingDirectoryCount = (state.pendingDirectoryCount - 1L).coerceAtLeast(0L)
+        }
+    }
+
+    private fun finishTreeScanProgress(treeUriString: String) {
+        synchronized(scanProgressLock) {
+            treeScanProgress.remove(treeUriString)
         }
     }
 
@@ -544,6 +622,21 @@ object RustSafBridge {
     ) {
         val isDirectory: Boolean
             get() = mimeType == DocumentsContract.Document.MIME_TYPE_DIR
+    }
+
+    private data class TreeScanProgressState(
+        var scannedEntryCount: Long = 0L,
+        var scannedDirectoryCount: Long = 0L,
+        var pendingDirectoryCount: Long = 0L,
+        var currentPath: String? = null,
+    ) {
+        fun toJson(): JSONObject {
+            return JSONObject()
+                .put("scannedEntryCount", scannedEntryCount)
+                .put("scannedDirectoryCount", scannedDirectoryCount)
+                .put("pendingDirectoryCount", pendingDirectoryCount)
+                .put("currentPath", currentPath)
+        }
     }
 
     private class TreeObserverState(

@@ -3,6 +3,7 @@ use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
     RemoteSnapshotUpdate,
 };
+use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,16 +17,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_core::{EntryKind, SyncSnapshot};
 
 use crate::{
-    FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeState, PathScope,
-    RemoteTreeIndex, StartupStateStore, absolute_path, build_configured_client,
+    FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeScanProgress, LocalTreeState,
+    PathScope, RemoteTreeIndex, StartupStateStore, absolute_path, build_configured_client,
     cleanup_ironmesh_part_files, delete_remote_file, describe_connection_target, diff_local_trees,
     download_transfer_state_path, download_transfer_temp_path,
     load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
     local_entry_state_for_path, local_paths_to_preserve_on_startup,
     materialize_remote_conflict_copies, parent_directories, remote_file_hashes_by_local_path,
-    remote_file_paths_by_local_path, remove_local_path, scan_local_tree, spawn_ui_server,
-    startup_add_delete_conflicts, startup_baseline_state_from_remote_index,
-    startup_dual_modify_conflicts, startup_remote_delete_wins_paths, upload_local_file,
+    remote_file_paths_by_local_path, remove_local_path, scan_local_tree,
+    scan_local_tree_with_progress, spawn_ui_server, startup_add_delete_conflicts,
+    startup_baseline_state_from_remote_index, startup_dual_modify_conflicts,
+    startup_remote_delete_wins_paths, upload_local_file,
 };
 
 #[derive(Debug, Clone)]
@@ -292,6 +294,17 @@ struct BlockingStatusProgress {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct LocalScanStatusContext {
+    options: FolderAgentRuntimeOptions,
+    connection_target: String,
+    watch_mode: String,
+    state: String,
+    phase: String,
+    base_message: String,
+    last_success_unix_ms: Option<u64>,
+}
+
 fn run_folder_agent_inner(
     options: &FolderAgentRuntimeOptions,
     running: Arc<AtomicBool>,
@@ -367,26 +380,19 @@ fn run_folder_agent_inner(
         last_success_unix_ms,
         None,
     );
-    let local_state_before_remote_sync = run_with_status_heartbeat(
-        status_callback.clone(),
-        BlockingStatusProgress {
-            options: options.clone(),
-            connection_target: Some(connection_target.clone()),
-            storage_mode: "filesystem".to_string(),
-            watch_mode: watch_mode.to_string(),
-            state: "starting".to_string(),
-            phase: "startup".to_string(),
-            activity: "scanning-local-tree".to_string(),
-            base_message: "Scanning local files before initial reconciliation".to_string(),
-            metrics: FolderAgentRuntimeMetrics::default(),
-            last_success_unix_ms,
-            last_error: None,
-        },
-        || {
-            scan_local_tree(&options.root_dir)
-                .context("failed to scan local state before initial remote sync")
-        },
-    )?;
+    let local_state_before_remote_sync = scan_local_tree_with_status_progress(
+        options,
+        &connection_target,
+        watch_mode,
+        status_callback.as_ref(),
+        "starting",
+        "startup",
+        "Scanning local files before initial reconciliation",
+        &options.root_dir,
+        None,
+        last_success_unix_ms,
+    )
+    .context("failed to scan local state before initial remote sync")?;
     let local_scan_sample = sample_local_paths(&local_state_before_remote_sync, 5);
     let local_scan_metrics =
         FolderAgentRuntimeMetrics::from_states(Some(&local_state_before_remote_sync), None);
@@ -453,27 +459,22 @@ fn run_folder_agent_inner(
         None,
     );
     let initial_fetcher = RemoteSnapshotFetcher::new(client.clone(), snapshot_scope.clone());
-    let initial_snapshot = run_with_status_heartbeat(
-        status_callback.clone(),
-        BlockingStatusProgress {
-            options: options.clone(),
-            connection_target: Some(connection_target.clone()),
-            storage_mode: "filesystem".to_string(),
-            watch_mode: watch_mode.to_string(),
-            state: "starting".to_string(),
-            phase: "startup".to_string(),
-            activity: "fetching-remote-snapshot".to_string(),
-            base_message: "Fetching initial remote snapshot".to_string(),
-            metrics: local_scan_metrics.clone(),
-            last_success_unix_ms,
-            last_error: None,
-        },
-        || {
-            initial_fetcher
-                .fetch_snapshot_blocking()
-                .context("failed to fetch initial remote snapshot")
-        },
-    )?;
+    let initial_snapshot = fetch_remote_snapshot_with_status_progress(
+        options,
+        &connection_target,
+        "filesystem",
+        watch_mode,
+        status_callback.as_ref(),
+        "starting",
+        "startup",
+        "fetching-remote-snapshot",
+        "Fetching initial remote snapshot",
+        &initial_fetcher,
+        local_scan_metrics.clone(),
+        last_success_unix_ms,
+        None,
+    )
+    .context("failed to fetch initial remote snapshot")?;
     let remote_files_before_remote_sync =
         remote_file_paths_by_local_path(&initial_snapshot, &scope);
     let remote_hashes_before_remote_sync =
@@ -559,26 +560,19 @@ fn run_folder_agent_inner(
     }
     initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
 
-    let mut local_state = run_with_status_heartbeat(
-        status_callback.clone(),
-        BlockingStatusProgress {
-            options: options.clone(),
-            connection_target: Some(connection_target.clone()),
-            storage_mode: "filesystem".to_string(),
-            watch_mode: watch_mode.to_string(),
-            state: "syncing".to_string(),
-            phase: "startup".to_string(),
-            activity: "scanning-local-tree".to_string(),
-            base_message: "Rescanning local files after applying startup remote changes".to_string(),
-            metrics: FolderAgentRuntimeMetrics::from_states(None, Some(&remote_index)),
-            last_success_unix_ms,
-            last_error: None,
-        },
-        || {
-            scan_local_tree(&options.root_dir)
-                .context("failed to scan local state after initial remote sync")
-        },
-    )?;
+    let mut local_state = scan_local_tree_with_status_progress(
+        options,
+        &connection_target,
+        watch_mode,
+        status_callback.as_ref(),
+        "syncing",
+        "startup",
+        "Rescanning local files after applying startup remote changes",
+        &options.root_dir,
+        Some(&remote_index),
+        last_success_unix_ms,
+    )
+    .context("failed to scan local state after initial remote sync")?;
     local_state = startup_baseline_state_from_remote_index(
         &local_state,
         &remote_index,
@@ -643,6 +637,17 @@ fn run_folder_agent_inner(
                 &scope,
                 &mut remote_index,
                 &mut suppressed_uploads,
+                status_callback.as_ref(),
+                Some(&LocalScanStatusContext {
+                    options: options.clone(),
+                    connection_target: connection_target.clone(),
+                    watch_mode: watch_mode.to_string(),
+                    state: "syncing".to_string(),
+                    phase: "startup".to_string(),
+                    base_message:
+                        "Scanning local files and reconciling startup local changes".to_string(),
+                    last_success_unix_ms,
+                }),
             )
         },
     )?;
@@ -737,23 +742,20 @@ fn run_folder_agent_inner(
         remote_running,
         Some(initial_snapshot),
         move || {
-            let progress_metrics = latest_metrics_value(&remote_latest_metrics);
-            run_with_status_heartbeat(
-                remote_status_callback.clone(),
-                BlockingStatusProgress {
-                    options: remote_options.clone(),
-                    connection_target: Some(remote_connection_target.clone()),
-                    storage_mode: "filesystem".to_string(),
-                    watch_mode: remote_watch_mode.clone(),
-                    state: "syncing".to_string(),
-                    phase: "steady-state".to_string(),
-                    activity: "fetching-remote-snapshot".to_string(),
-                    base_message: "Refreshing remote snapshot from server".to_string(),
-                    metrics: progress_metrics,
-                    last_success_unix_ms: load_optional_unix_ms(&remote_last_success),
-                    last_error: None,
-                },
-                || refresh_fetcher.fetch_snapshot_blocking(),
+            fetch_remote_snapshot_with_status_progress(
+                &remote_options,
+                &remote_connection_target,
+                "filesystem",
+                &remote_watch_mode,
+                remote_status_callback.as_ref(),
+                "running",
+                "steady-state",
+                "checking-remote-snapshot",
+                "Checking remote snapshot for changes",
+                &refresh_fetcher,
+                latest_metrics_value(&remote_latest_metrics),
+                load_optional_unix_ms(&remote_last_success),
+                Some("Watching for changes; local and remote state are aligned"),
             )
         },
         move |update| {
@@ -812,26 +814,19 @@ fn run_folder_agent_inner(
         }
 
         if remote_updates_applied {
-            local_state = run_with_status_heartbeat(
-                status_callback.clone(),
-                BlockingStatusProgress {
-                    options: options.clone(),
-                    connection_target: Some(connection_target.clone()),
-                    storage_mode: "filesystem".to_string(),
-                    watch_mode: watch_mode.to_string(),
-                    state: "syncing".to_string(),
-                    phase: "steady-state".to_string(),
-                    activity: "scanning-local-tree".to_string(),
-                    base_message: "Rescanning local files after applying remote changes".to_string(),
-                    metrics: FolderAgentRuntimeMetrics::from_states(None, Some(&remote_index)),
-                    last_success_unix_ms,
-                    last_error: None,
-                },
-                || {
-                    scan_local_tree(&options.root_dir)
-                        .context("failed to rescan local state after remote update")
-                },
-            )?;
+            local_state = scan_local_tree_with_status_progress(
+                options,
+                &connection_target,
+                watch_mode,
+                status_callback.as_ref(),
+                "syncing",
+                "steady-state",
+                "Rescanning local files after applying remote changes",
+                &options.root_dir,
+                Some(&remote_index),
+                last_success_unix_ms,
+            )
+            .context("failed to rescan local state after remote update")?;
             baseline_dirty = true;
             last_success_unix_ms = Some(now_unix_ms());
             store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
@@ -872,10 +867,20 @@ fn run_folder_agent_inner(
 
         if local_scan_requested || Instant::now() >= next_local_scan {
             let previous_local_state = local_state.clone();
+            let local_scan_state = if local_scan_requested {
+                "syncing"
+            } else {
+                "running"
+            };
             let local_scan_message = if local_scan_requested {
                 "Local change detected; scanning local files"
             } else {
-                "Polling local files for changes"
+                "Checking local files for changes"
+            };
+            let local_scan_base_message = if local_scan_requested {
+                "Scanning local files and reconciling event-driven local changes"
+            } else {
+                "Checking local files for changes"
             };
             emit_status(
                 status_callback.as_ref(),
@@ -883,7 +888,7 @@ fn run_folder_agent_inner(
                 Some(&connection_target),
                 "filesystem",
                 watch_mode,
-                "syncing",
+                local_scan_state,
                 "steady-state",
                 "scanning-local-tree",
                 local_scan_message,
@@ -898,16 +903,10 @@ fn run_folder_agent_inner(
                     connection_target: Some(connection_target.clone()),
                     storage_mode: "filesystem".to_string(),
                     watch_mode: watch_mode.to_string(),
-                    state: "syncing".to_string(),
+                    state: local_scan_state.to_string(),
                     phase: "steady-state".to_string(),
                     activity: "scanning-local-tree".to_string(),
-                    base_message: if local_scan_requested {
-                        "Scanning local files and reconciling event-driven local changes"
-                            .to_string()
-                    } else {
-                        "Scanning local files and reconciling scheduled local changes"
-                            .to_string()
-                    },
+                    base_message: local_scan_base_message.to_string(),
                     metrics: FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
                     last_success_unix_ms,
                     last_error: None,
@@ -921,6 +920,16 @@ fn run_folder_agent_inner(
                         &scope,
                         &mut remote_index,
                         &mut suppressed_uploads,
+                        status_callback.as_ref(),
+                        Some(&LocalScanStatusContext {
+                            options: options.clone(),
+                            connection_target: connection_target.clone(),
+                            watch_mode: watch_mode.to_string(),
+                            state: local_scan_state.to_string(),
+                            phase: "steady-state".to_string(),
+                            base_message: local_scan_base_message.to_string(),
+                            last_success_unix_ms,
+                        }),
                     )
                 },
             )?;
@@ -1099,8 +1108,25 @@ fn sync_local_changes(
     scope: &PathScope,
     remote_index: &mut RemoteTreeIndex,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
+    status_callback: Option<&FolderAgentStatusCallback>,
+    local_scan_status: Option<&LocalScanStatusContext>,
 ) -> Result<LocalSyncOutcome> {
-    let current = scan_local_tree(root_dir).context("failed to scan local root")?;
+    let current = match local_scan_status {
+        Some(progress) => scan_local_tree_with_status_progress(
+            &progress.options,
+            &progress.connection_target,
+            &progress.watch_mode,
+            status_callback,
+            &progress.state,
+            &progress.phase,
+            &progress.base_message,
+            root_dir,
+            Some(remote_index),
+            progress.last_success_unix_ms,
+        )
+        .context("failed to scan local root")?,
+        None => scan_local_tree(root_dir).context("failed to scan local root")?,
+    };
     let diff = diff_local_trees(local_state, &current);
     let mut outcome = LocalSyncOutcome {
         changed_path_count: diff.created_directories.len()
@@ -1382,6 +1408,10 @@ fn watch_mode_label(options: &FolderAgentRuntimeOptions) -> &'static str {
 }
 
 const BLOCKING_STATUS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const LOCAL_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
+const LOCAL_SCAN_PROGRESS_ENTRY_STRIDE: u64 = 256;
+const REMOTE_FETCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
+const REMOTE_FETCH_PROGRESS_ENTRY_STRIDE: u64 = 512;
 
 fn run_with_status_heartbeat<T, F>(
     callback: Option<FolderAgentStatusCallback>,
@@ -1435,6 +1465,244 @@ where
     }
 
     result
+}
+
+fn scan_local_tree_with_status_progress(
+    options: &FolderAgentRuntimeOptions,
+    connection_target: &str,
+    watch_mode: &str,
+    status_callback: Option<&FolderAgentStatusCallback>,
+    state: &str,
+    phase: &str,
+    base_message: &str,
+    root: &Path,
+    remote_index: Option<&RemoteTreeIndex>,
+    last_success_unix_ms: Option<u64>,
+) -> Result<LocalTreeState> {
+    let Some(callback) = status_callback.cloned() else {
+        return scan_local_tree(root);
+    };
+
+    let last_reported_at = Arc::new(Mutex::new(Instant::now() - LOCAL_SCAN_PROGRESS_INTERVAL));
+    let last_reported_entry_count = Arc::new(AtomicU64::new(0));
+
+    scan_local_tree_with_progress(root, {
+        let callback = callback.clone();
+        let options = options.clone();
+        let connection_target = connection_target.to_string();
+        let watch_mode = watch_mode.to_string();
+        let remote_metrics = FolderAgentRuntimeMetrics::from_states(None, remote_index);
+        let last_reported_at = last_reported_at.clone();
+        let last_reported_entry_count = last_reported_entry_count.clone();
+
+        move |progress| {
+            let should_report = {
+                let previous_entry_count = last_reported_entry_count.load(Ordering::SeqCst);
+                let enough_entries = progress.scanned_entry_count
+                    >= previous_entry_count.saturating_add(LOCAL_SCAN_PROGRESS_ENTRY_STRIDE);
+                let enough_time = last_reported_at
+                    .lock()
+                    .map(|instant| instant.elapsed() >= LOCAL_SCAN_PROGRESS_INTERVAL)
+                    .unwrap_or(true);
+                enough_entries || enough_time || progress.pending_directory_count == 0
+            };
+
+            if !should_report {
+                return;
+            }
+
+            last_reported_entry_count.store(progress.scanned_entry_count, Ordering::SeqCst);
+            if let Ok(mut instant) = last_reported_at.lock() {
+                *instant = Instant::now();
+            }
+
+            let mut metrics = remote_metrics.clone();
+            apply_local_scan_progress_metrics(&mut metrics, progress);
+            callback(FolderAgentRuntimeStatus::new(
+                &options,
+                Some(&connection_target),
+                "filesystem",
+                &watch_mode,
+                state.to_string(),
+                phase.to_string(),
+                "scanning-local-tree".to_string(),
+                format_local_scan_progress_message(base_message, progress),
+                metrics,
+                last_success_unix_ms,
+                None,
+            ));
+        }
+    })
+}
+
+fn apply_local_scan_progress_metrics(
+    metrics: &mut FolderAgentRuntimeMetrics,
+    progress: &LocalTreeScanProgress,
+) {
+    metrics.local_entry_count = progress.scanned_entry_count;
+    metrics.local_directory_count = progress.scanned_directory_count;
+    metrics.local_file_count = progress
+        .scanned_entry_count
+        .saturating_sub(progress.scanned_directory_count);
+}
+
+fn format_local_scan_progress_message(
+    base_message: &str,
+    progress: &LocalTreeScanProgress,
+) -> String {
+    let current_path = progress.current_path.as_deref().unwrap_or("<complete>");
+    format!(
+        "{base_message}: {} entrie(s) examined, {} directorie(s) visited, {} directorie(s) pending, current={current_path}",
+        progress.scanned_entry_count,
+        progress.scanned_directory_count,
+        progress.pending_directory_count,
+    )
+}
+
+fn fetch_remote_snapshot_with_status_progress(
+    options: &FolderAgentRuntimeOptions,
+    connection_target: &str,
+    storage_mode: &str,
+    watch_mode: &str,
+    status_callback: Option<&FolderAgentStatusCallback>,
+    state: &str,
+    phase: &str,
+    activity: &str,
+    base_message: &str,
+    fetcher: &RemoteSnapshotFetcher,
+    base_metrics: FolderAgentRuntimeMetrics,
+    last_success_unix_ms: Option<u64>,
+    restore_idle_message: Option<&str>,
+) -> Result<SyncSnapshot> {
+    let Some(callback) = status_callback.cloned() else {
+        return fetcher.fetch_snapshot_blocking();
+    };
+
+    let mut last_reported_at = Instant::now() - REMOTE_FETCH_PROGRESS_INTERVAL;
+    let mut last_reported_processed = 0u64;
+    let detailed_progress = restore_idle_message.is_none();
+
+    let snapshot = run_with_status_heartbeat(
+        Some(callback.clone()),
+        BlockingStatusProgress {
+            options: options.clone(),
+            connection_target: Some(connection_target.to_string()),
+            storage_mode: storage_mode.to_string(),
+            watch_mode: watch_mode.to_string(),
+            state: state.to_string(),
+            phase: phase.to_string(),
+            activity: activity.to_string(),
+            base_message: base_message.to_string(),
+            metrics: base_metrics.clone(),
+            last_success_unix_ms,
+            last_error: None,
+        },
+        || {
+            fetcher.fetch_snapshot_blocking_with_progress(|progress| {
+                let should_report = progress.phase != "building-snapshot"
+                    || progress.processed_entry_count == progress.entry_count
+                    || progress.processed_entry_count
+                        >= last_reported_processed
+                            .saturating_add(REMOTE_FETCH_PROGRESS_ENTRY_STRIDE)
+                    || last_reported_at.elapsed() >= REMOTE_FETCH_PROGRESS_INTERVAL;
+
+                if !should_report {
+                    return;
+                }
+
+                last_reported_at = Instant::now();
+                last_reported_processed = progress.processed_entry_count;
+
+                let mut metrics = base_metrics.clone();
+                if detailed_progress {
+                    apply_remote_fetch_progress_metrics(&mut metrics, &progress);
+                }
+                callback(FolderAgentRuntimeStatus::new(
+                    options,
+                    Some(connection_target),
+                    storage_mode,
+                    watch_mode,
+                    state.to_string(),
+                    phase.to_string(),
+                    activity.to_string(),
+                    format_remote_fetch_progress_message(base_message, &progress, detailed_progress),
+                    metrics,
+                    last_success_unix_ms,
+                    None,
+                ));
+            })
+        },
+    )?;
+
+    if let Some(idle_message) = restore_idle_message {
+        callback(FolderAgentRuntimeStatus::new(
+            options,
+            Some(connection_target),
+            storage_mode,
+            watch_mode,
+            "running",
+            phase,
+            "watching-for-changes",
+            idle_message,
+            base_metrics,
+            last_success_unix_ms,
+            None,
+        ));
+    }
+
+    Ok(snapshot)
+}
+
+fn apply_remote_fetch_progress_metrics(
+    metrics: &mut FolderAgentRuntimeMetrics,
+    progress: &RemoteSnapshotFetchProgress,
+) {
+    metrics.remote_entry_count = progress.entry_count;
+    metrics.remote_file_count = progress.file_count;
+    metrics.remote_directory_count = progress.directory_count;
+}
+
+fn format_remote_fetch_progress_message(
+    base_message: &str,
+    progress: &RemoteSnapshotFetchProgress,
+    detailed_progress: bool,
+) -> String {
+    if !detailed_progress {
+        return match progress.phase.as_str() {
+            "requesting-store-index" => base_message.to_string(),
+            "received-store-index" => {
+                format!("{base_message}: received remote snapshot header")
+            }
+            "building-snapshot" => {
+                format!("{base_message}: rebuilding remote comparison view")
+            }
+            "completed" => format!("{base_message}: remote snapshot check complete"),
+            _ => base_message.to_string(),
+        };
+    }
+
+    match progress.phase.as_str() {
+        "requesting-store-index" => format!("{base_message}: requesting store index from server"),
+        "received-store-index" => format!(
+            "{base_message}: received store index metadata for {} entrie(s)",
+            progress.entry_count
+        ),
+        "building-snapshot" => format!(
+            "{base_message}: normalized {} / {} entrie(s) ({} file(s), {} directorie(s)); current={}",
+            progress.processed_entry_count,
+            progress.entry_count,
+            progress.file_count,
+            progress.directory_count,
+            progress.current_path.as_deref().unwrap_or("<none>"),
+        ),
+        "completed" => format!(
+            "{base_message}: snapshot ready with {} entrie(s) ({} file(s), {} directorie(s))",
+            progress.entry_count,
+            progress.file_count,
+            progress.directory_count,
+        ),
+        _ => base_message.to_string(),
+    }
 }
 
 fn blocking_progress_message(base_message: &str, elapsed: Duration) -> String {

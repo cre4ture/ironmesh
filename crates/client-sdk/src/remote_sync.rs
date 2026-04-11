@@ -7,8 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use sync_core::{EntryKind, SyncSnapshot};
+use sync_core::{EntryKind, NamespaceEntry, SyncSnapshot};
 use transport_sdk::ClientIdentityMaterial;
+
+const SNAPSHOT_BUILD_PROGRESS_STRIDE: u64 = 512;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteSyncStrategy {
@@ -104,6 +106,16 @@ pub struct RemoteSnapshotScope {
     pub snapshot: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteSnapshotFetchProgress {
+    pub phase: String,
+    pub entry_count: u64,
+    pub processed_entry_count: u64,
+    pub file_count: u64,
+    pub directory_count: u64,
+    pub current_path: Option<String>,
+}
+
 impl RemoteSnapshotScope {
     pub fn new(prefix: Option<String>, depth: usize, snapshot: Option<String>) -> Self {
         Self {
@@ -154,6 +166,107 @@ impl RemoteSnapshotFetcher {
             self.scope.depth,
             self.scope.snapshot.as_deref(),
         )
+    }
+
+    pub fn fetch_snapshot_blocking_with_progress<F>(&self, mut on_progress: F) -> Result<SyncSnapshot>
+    where
+        F: FnMut(RemoteSnapshotFetchProgress),
+    {
+        on_progress(RemoteSnapshotFetchProgress {
+            phase: "requesting-store-index".to_string(),
+            ..RemoteSnapshotFetchProgress::default()
+        });
+
+        let response = self.client.store_index_blocking(
+            self.scope.prefix.as_deref(),
+            self.scope.depth,
+            self.scope.snapshot.as_deref(),
+        )?;
+
+        let total_entries = response.entry_count.max(response.entries.len()) as u64;
+        on_progress(RemoteSnapshotFetchProgress {
+            phase: "received-store-index".to_string(),
+            entry_count: total_entries,
+            ..RemoteSnapshotFetchProgress::default()
+        });
+
+        let snapshot = snapshot_from_store_index_entries_with_progress(response.entries, |progress| {
+            on_progress(progress);
+        });
+
+        let file_count = snapshot
+            .remote
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::File)
+            .count() as u64;
+        let directory_count = snapshot.remote.len() as u64 - file_count;
+        on_progress(RemoteSnapshotFetchProgress {
+            phase: "completed".to_string(),
+            entry_count: snapshot.remote.len() as u64,
+            processed_entry_count: total_entries,
+            file_count,
+            directory_count,
+            current_path: None,
+        });
+
+        Ok(snapshot)
+    }
+}
+
+fn snapshot_from_store_index_entries_with_progress<F>(
+    entries: Vec<crate::ironmesh_client::StoreIndexEntry>,
+    mut on_progress: F,
+) -> SyncSnapshot
+where
+    F: FnMut(RemoteSnapshotFetchProgress),
+{
+    let total_entries = entries.len() as u64;
+    let mut remote = Vec::with_capacity(entries.len());
+    let mut file_count = 0u64;
+    let mut directory_count = 0u64;
+
+    for (index, entry) in entries.into_iter().enumerate() {
+        if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
+            let directory_path = entry.path.trim_end_matches('/').to_string();
+            if !directory_path.is_empty() {
+                directory_count += 1;
+                remote.push(NamespaceEntry::directory(directory_path));
+            }
+        } else {
+            let version = entry.version.unwrap_or_else(|| "server-head".to_string());
+            let content_hash = entry
+                .content_hash
+                .unwrap_or_else(|| format!("server-head:{}", entry.path));
+            let mut remote_entry = NamespaceEntry::file_sized(
+                entry.path.clone(),
+                version,
+                content_hash,
+                entry.size_bytes,
+            );
+            remote_entry.content_fingerprint = entry.content_fingerprint;
+            file_count += 1;
+            remote.push(remote_entry);
+        }
+
+        let processed_entry_count = (index + 1) as u64;
+        if processed_entry_count == 1
+            || processed_entry_count == total_entries
+            || processed_entry_count % SNAPSHOT_BUILD_PROGRESS_STRIDE == 0
+        {
+            on_progress(RemoteSnapshotFetchProgress {
+                phase: "building-snapshot".to_string(),
+                entry_count: total_entries,
+                processed_entry_count,
+                file_count,
+                directory_count,
+                current_path: remote.last().map(|entry| entry.path.clone()),
+            });
+        }
+    }
+
+    SyncSnapshot {
+        local: Vec::new(),
+        remote,
     }
 }
 
