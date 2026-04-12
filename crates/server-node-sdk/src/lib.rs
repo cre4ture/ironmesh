@@ -45,10 +45,12 @@ use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     SanType,
 };
-use rustls::RootCertStore;
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::WebPkiClientVerifier;
+use rustls::{OtherError, RootCertStore, SignatureScheme};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -445,6 +447,12 @@ pub(crate) fn publish_namespace_change(state: &ServerState) {
 #[derive(Debug, Clone)]
 struct InternalCaller {
     node_id: NodeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerCertificateIdentity {
+    node_id: NodeId,
+    cluster_id: Option<ClusterId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1118,29 +1126,170 @@ fn extract_node_id_from_peer_certs(certs: &[CertificateDer<'_>]) -> Result<NodeI
         .first()
         .context("missing end-entity peer certificate")?;
 
+    Ok(parse_peer_certificate_identity(cert)?.node_id)
+}
+
+fn parse_peer_certificate_identity(cert: &CertificateDer<'_>) -> Result<PeerCertificateIdentity> {
     let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
         .context("failed parsing peer certificate")?;
+
+    let mut node_id = None;
+    let mut cluster_id = None;
 
     for extension in parsed.extensions() {
         let parsed_extension = extension.parsed_extension();
         if let ParsedExtension::SubjectAlternativeName(san) = parsed_extension {
             for name in &san.general_names {
-                if let x509_parser::extensions::GeneralName::URI(uri) = name
-                    && let Some(node_id) = parse_node_id_from_san_uri(uri)
-                {
-                    return Ok(node_id);
+                if let x509_parser::extensions::GeneralName::URI(uri) = name {
+                    if node_id.is_none() {
+                        node_id = parse_node_id_from_san_uri(uri);
+                    }
+                    if cluster_id.is_none() {
+                        cluster_id = parse_cluster_id_from_san_uri(uri);
+                    }
                 }
             }
         }
     }
 
-    anyhow::bail!("missing urn:ironmesh:node:<uuid> SAN URI in peer certificate");
+    let node_id = node_id.context("missing urn:ironmesh:node:<uuid> SAN URI in peer certificate")?;
+
+    Ok(PeerCertificateIdentity {
+        node_id,
+        cluster_id,
+    })
+}
+
+fn validate_expected_peer_certificate_identity(
+    cert: &CertificateDer<'_>,
+    expected_node_id: NodeId,
+    expected_cluster_id: ClusterId,
+) -> Result<()> {
+    let identity = parse_peer_certificate_identity(cert)?;
+    if identity.node_id != expected_node_id {
+        bail!(
+            "peer certificate presented node_id {} but expected {}",
+            identity.node_id,
+            expected_node_id
+        );
+    }
+
+    let presented_cluster_id = identity
+        .cluster_id
+        .context("missing urn:ironmesh:cluster:<uuid> SAN URI in peer certificate")?;
+    if presented_cluster_id != expected_cluster_id {
+        bail!(
+            "peer certificate presented cluster_id {} but expected {}",
+            presented_cluster_id,
+            expected_cluster_id
+        );
+    }
+
+    Ok(())
 }
 
 fn parse_node_id_from_san_uri(uri: &str) -> Option<NodeId> {
     let prefix = "urn:ironmesh:node:";
     uri.strip_prefix(prefix)
         .and_then(|rest| rest.trim().parse::<NodeId>().ok())
+}
+
+fn parse_cluster_id_from_san_uri(uri: &str) -> Option<ClusterId> {
+    let prefix = "urn:ironmesh:cluster:";
+    uri.strip_prefix(prefix)
+        .and_then(|rest| rest.trim().parse::<ClusterId>().ok())
+}
+
+fn peer_certificate_verifier_error(message: impl Into<String>) -> rustls::Error {
+    rustls::Error::InvalidCertificate(rustls::CertificateError::Other(OtherError(Arc::new(
+        io::Error::other(message.into()),
+    ))))
+}
+
+#[derive(Debug)]
+struct ExpectedPeerServerCertVerifier {
+    roots: Arc<RootCertStore>,
+    inner: Arc<WebPkiServerVerifier>,
+    expected_node_id: NodeId,
+    expected_cluster_id: ClusterId,
+}
+
+impl ExpectedPeerServerCertVerifier {
+    fn new(
+        roots: Arc<RootCertStore>,
+        expected_node_id: NodeId,
+        expected_cluster_id: ClusterId,
+    ) -> Result<Self> {
+        let inner = WebPkiServerVerifier::builder(roots.clone())
+            .build()
+            .context("failed building expected peer certificate verifier")?;
+
+        Ok(Self {
+            roots,
+            inner,
+            expected_node_id,
+            expected_cluster_id,
+        })
+    }
+}
+
+impl ServerCertVerifier for ExpectedPeerServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        let cert = webpki::EndEntityCert::try_from(end_entity).map_err(|err| {
+            peer_certificate_verifier_error(format!("failed parsing peer certificate: {err}"))
+        })?;
+        cert.verify_for_usage(
+            webpki::ALL_VERIFICATION_ALGS,
+            self.roots.roots.as_slice(),
+            intermediates,
+            now,
+            webpki::KeyUsage::server_auth(),
+            None,
+            None,
+        )
+        .map_err(|err| {
+            peer_certificate_verifier_error(format!(
+                "peer certificate chain validation failed: {err}"
+            ))
+        })?;
+        validate_expected_peer_certificate_identity(
+            end_entity,
+            self.expected_node_id,
+            self.expected_cluster_id,
+        )
+        .map_err(|err| peer_certificate_verifier_error(err.to_string()))?;
+
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
 }
 
 struct LogBuffer {
@@ -3690,43 +3839,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
-    let public_peer_api = Router::new()
-        .route(
-            "/cluster/nodes/{node_id}/heartbeat",
-            post(node_heartbeat_public),
-        )
-        .route(
-            "/cluster/availability/subjects/local",
-            get(local_available_subjects),
-        )
-        .route(
-            "/cluster/metadata/subjects/local",
-            get(local_metadata_subjects),
-        )
-        .route(
-            "/cluster/replication/export",
-            get(export_replication_bundle),
-        )
-        .route("/cluster/metadata/export", get(export_metadata_bundle))
-        .route(
-            "/cluster/replication/chunk/{hash}",
-            get(get_replication_chunk),
-        )
-        .route(
-            "/cluster/replication/push/chunk/{hash}",
-            post(push_replication_chunk),
-        )
-        .route(
-            "/cluster/replication/push/manifest",
-            post(push_replication_manifest),
-        )
-        .route("/cluster/replication/drop", post(drop_replication_subject))
-        .route(
-            "/cluster/reconcile/export/provisional",
-            get(export_provisional_versions),
-        );
-
-    let mut public_app = Router::new()
+    let public_app = Router::new()
         .route("/", get(ui::index))
         .route("/ironmesh-favicon.svg", get(ui::favicon))
         .route("/assets/{*path}", get(ui::static_asset))
@@ -3797,10 +3910,6 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .merge(public_admin_api)
         .merge(public_cluster_info_api)
         .merge(public_client_api);
-
-    if config.public_peer_api_enabled {
-        public_app = public_app.merge(public_peer_api);
-    }
 
     let public_app = public_app
         .with_state(state.clone())
@@ -4291,19 +4400,14 @@ fn build_rendezvous_presence_registration(
     state: &ServerState,
     public_url: Option<&str>,
     internal_peer_url: Option<&str>,
-    public_peer_api_enabled: bool,
+    _public_peer_api_enabled: bool,
     local_descriptor: Option<&NodeDescriptor>,
 ) -> PresenceRegistration {
     let mut direct_candidates = Vec::new();
     let mut seen_endpoints = BTreeSet::new();
-    let public_api_url = public_peer_api_enabled
-        .then(|| normalize_optional_url(public_url))
-        .flatten();
-    let peer_api_url = normalize_optional_url(internal_peer_url).or_else(|| public_api_url.clone());
+    let public_api_url = normalize_optional_url(public_url);
+    let peer_api_url = normalize_optional_url(internal_peer_url);
 
-    if public_peer_api_enabled {
-        push_rendezvous_direct_candidate(&mut direct_candidates, &mut seen_endpoints, public_url);
-    }
     push_rendezvous_direct_candidate(
         &mut direct_candidates,
         &mut seen_endpoints,
@@ -4514,12 +4618,6 @@ fn peer_connection_candidates(
             normalize_optional_url(node.peer_api_url()),
             Some(1),
         );
-        push_ranked_peer_candidate(
-            &mut candidates,
-            &mut seen_endpoints,
-            normalize_optional_url(node.public_api_url()),
-            Some(100),
-        );
     }
     if state.relay_mode != RelayMode::Disabled && node.relay_capable() {
         for relay_url in current_rendezvous_urls(state) {
@@ -4592,6 +4690,23 @@ pub(crate) fn resolve_peer_base_url(state: &ServerState, node: &NodeDescriptor) 
             "node {} requires relay peer transport instead of a direct base URL",
             node.node_id
         ),
+    }
+}
+
+fn build_direct_peer_http_client(
+    state: &ServerState,
+    node: &NodeDescriptor,
+) -> Result<reqwest::Client> {
+    if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
+        build_internal_mtls_http_client_for_expected_peer(
+            &internal_tls.ca_cert_path,
+            &internal_tls.cert_path,
+            &internal_tls.key_path,
+            node.node_id,
+            state.cluster_id,
+        )
+    } else {
+        Ok(reqwest::Client::new())
     }
 }
 
@@ -4679,7 +4794,7 @@ async fn execute_peer_request(
                 .as_ref()
                 .map(|candidate| candidate.endpoint.trim_end_matches('/').to_string())
                 .context("peer transport plan did not include a selected candidate")?;
-            let internal_http = current_internal_http(state).await;
+            let internal_http = build_direct_peer_http_client(state, node)?;
             let response = execute_direct_peer_request(
                 &internal_http,
                 &base_url,
@@ -9970,7 +10085,7 @@ async fn store_client_bootstrap_claim(
 fn build_bootstrap_direct_endpoints(
     public_url: Option<&str>,
     internal_url: Option<&str>,
-    public_peer_api_enabled: bool,
+    _public_peer_api_enabled: bool,
     node_id: NodeId,
 ) -> Vec<BootstrapEndpoint> {
     let mut endpoints = Vec::new();
@@ -9983,12 +10098,7 @@ fn build_bootstrap_direct_endpoints(
         });
     }
 
-    let peer_url = if public_peer_api_enabled {
-        internal_url.or(public_url)
-    } else {
-        internal_url
-    };
-    if let Some(peer_url) = peer_url {
+    if let Some(peer_url) = internal_url {
         endpoints.push(BootstrapEndpoint {
             url: peer_url.to_string(),
             usage: Some(BootstrapEndpointUse::PeerApi),
@@ -10050,7 +10160,8 @@ fn build_issued_node_bootstrap(
     let internal_url = request
         .internal_url
         .or_else(|| internal_bind_addr.as_deref().map(default_internal_url));
-    let public_peer_api_enabled = request.public_peer_api_enabled.unwrap_or(false);
+    let _compat_public_peer_api_enabled = request.public_peer_api_enabled.unwrap_or(false);
+
     let bootstrap = TransportNodeBootstrap {
         version: 1,
         cluster_id: state.cluster_id,
@@ -10064,7 +10175,7 @@ fn build_issued_node_bootstrap(
         labels: request.labels.unwrap_or_default(),
         public_tls: request.public_tls,
         public_ca_cert_path: request.public_ca_cert_path,
-        public_peer_api_enabled,
+        public_peer_api_enabled: false,
         internal_bind_addr: internal_bind_addr.clone(),
         internal_url: internal_url.clone(),
         internal_tls: request.internal_tls,
@@ -10073,7 +10184,7 @@ fn build_issued_node_bootstrap(
         direct_endpoints: build_bootstrap_direct_endpoints(
             public_url.as_deref(),
             internal_url.as_deref(),
-            public_peer_api_enabled,
+            false,
             node_id,
         ),
         relay_mode: state.relay_mode,
@@ -10088,42 +10199,18 @@ fn build_issued_node_bootstrap(
 fn build_internal_node_subject_alt_names(
     bootstrap: &TransportNodeBootstrap,
 ) -> Result<Vec<SanType>> {
-    let mut subject_alt_names = Vec::new();
-    let mut seen_dns = HashSet::new();
-    let mut seen_ips = HashSet::new();
-
-    subject_alt_names.push(SanType::URI(
-        format!("urn:ironmesh:node:{}", bootstrap.node_id)
-            .try_into()
-            .context("invalid node identity URI SAN")?,
-    ));
-
-    if let Some(internal_url) = bootstrap.internal_url.as_deref() {
-        let parsed =
-            reqwest::Url::parse(internal_url).with_context(|| format!("invalid {internal_url}"))?;
-        if let Some(host) = parsed.host_str() {
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                if seen_ips.insert(ip) {
-                    subject_alt_names.push(SanType::IpAddress(ip));
-                }
-            } else if seen_dns.insert(host.to_string()) {
-                subject_alt_names.push(SanType::DnsName(
-                    host.try_into().context("invalid internal DNS SAN")?,
-                ));
-            }
-        }
-    }
-
-    if let Some(bind_addr) = bootstrap.internal_bind_addr.as_deref()
-        && let Ok(socket_addr) = bind_addr.parse::<SocketAddr>()
-    {
-        let ip = socket_addr.ip();
-        if !ip.is_unspecified() && seen_ips.insert(ip) {
-            subject_alt_names.push(SanType::IpAddress(ip));
-        }
-    }
-
-    Ok(subject_alt_names)
+    Ok(vec![
+        SanType::URI(
+            format!("urn:ironmesh:node:{}", bootstrap.node_id)
+                .try_into()
+                .context("invalid node identity URI SAN")?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:cluster:{}", bootstrap.cluster_id)
+                .try_into()
+                .context("invalid cluster identity URI SAN")?,
+        ),
+    ])
 }
 
 fn build_public_node_subject_alt_names(bootstrap: &TransportNodeBootstrap) -> Result<Vec<SanType>> {
@@ -12960,19 +13047,6 @@ async fn node_heartbeat(
     apply_node_heartbeat(&state, node_id, request).await
 }
 
-async fn node_heartbeat_public(
-    State(state): State<ServerState>,
-    Path(node_id): Path<String>,
-    Json(request): Json<NodeHeartbeatRequest>,
-) -> impl IntoResponse {
-    let node_id = match node_id.parse::<NodeId>() {
-        Ok(id) => id,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
-
-    apply_node_heartbeat(&state, node_id, request).await
-}
-
 async fn placement_for_key(
     State(state): State<ServerState>,
     Path(key): Path<String>,
@@ -13564,24 +13638,89 @@ fn build_identity_pem_from_paths(cert_path: &PathBuf, key_path: &PathBuf) -> Res
     Ok(identity_pem)
 }
 
+fn parse_client_identity_pem(
+    identity_pem: &[u8],
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let mut cert_reader = std::io::Cursor::new(identity_pem);
+    let cert_chain = CertificateDer::pem_reader_iter(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed parsing internal node certificate chain")?;
+    if cert_chain.is_empty() {
+        bail!("internal node identity PEM is missing a certificate chain");
+    }
+
+    let mut key_reader = std::io::Cursor::new(identity_pem);
+    let key = PrivateKeyDer::from_pem_reader(&mut key_reader)
+        .context("failed parsing internal node private key")?;
+    Ok((cert_chain, key))
+}
+
+fn load_root_cert_store_from_pem_path(ca_path: &PathBuf) -> Result<RootCertStore> {
+    let ca_pem =
+        std::fs::read(ca_path).with_context(|| format!("failed reading {}", ca_path.display()))?;
+    let mut reader = std::io::Cursor::new(ca_pem);
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_reader_iter(&mut reader) {
+        let cert = cert.context("failed parsing internal CA PEM")?;
+        roots
+            .add(cert)
+            .context("failed adding internal CA certificate to trust store")?;
+    }
+
+    Ok(roots)
+}
+
 fn build_internal_mtls_http_client(
     ca_path: &PathBuf,
     cert_path: &PathBuf,
     key_path: &PathBuf,
 ) -> Result<reqwest::Client> {
-    let ca_pem =
-        std::fs::read(ca_path).with_context(|| format!("failed reading {}", ca_path.display()))?;
-    let ca_cert =
-        reqwest::Certificate::from_pem(&ca_pem).context("failed parsing internal CA PEM")?;
+    build_internal_mtls_http_client_with_expected_peer(ca_path, cert_path, key_path, None)
+}
 
+fn build_internal_mtls_http_client_for_expected_peer(
+    ca_path: &PathBuf,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+    expected_node_id: NodeId,
+    expected_cluster_id: ClusterId,
+) -> Result<reqwest::Client> {
+    build_internal_mtls_http_client_with_expected_peer(
+        ca_path,
+        cert_path,
+        key_path,
+        Some((expected_node_id, expected_cluster_id)),
+    )
+}
+
+fn build_internal_mtls_http_client_with_expected_peer(
+    ca_path: &PathBuf,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+    expected_peer: Option<(NodeId, ClusterId)>,
+) -> Result<reqwest::Client> {
+    let roots = load_root_cert_store_from_pem_path(ca_path)?;
     let identity_pem = build_identity_pem_from_paths(cert_path, key_path)?;
+    let (cert_chain, key) = parse_client_identity_pem(&identity_pem)?;
 
-    let identity = reqwest::Identity::from_pem(&identity_pem)
-        .context("failed parsing internal node identity PEM")?;
+    let tls_config = match expected_peer {
+        Some((expected_node_id, expected_cluster_id)) => rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ExpectedPeerServerCertVerifier::new(
+                Arc::new(roots.clone()),
+                expected_node_id,
+                expected_cluster_id,
+            )?))
+            .with_client_auth_cert(cert_chain, key)
+            .context("failed building internal peer TLS client identity")?,
+        None => rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(cert_chain, key)
+            .context("failed building internal peer TLS client identity")?,
+    };
 
     reqwest::Client::builder()
-        .add_root_certificate(ca_cert)
-        .identity(identity)
+        .use_preconfigured_tls(tls_config)
         .build()
         .context("failed building internal mTLS http client")
 }

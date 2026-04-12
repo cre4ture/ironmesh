@@ -37,6 +37,7 @@ rendezvous-server = { path = "../rendezvous-server" }
 rusqlite.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }
+webpki = { package = "rustls-webpki", version = "0.103.9", features = ["ring", "std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

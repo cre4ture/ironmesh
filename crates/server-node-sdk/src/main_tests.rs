@@ -9,7 +9,7 @@ use super::{
 };
 use axum::Extension;
 use axum_server::accept::Accept;
-use common::NodeId;
+use common::{ClusterId, NodeId};
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -43,6 +43,7 @@ use std::task::{Context, Poll};
 use tokio::time::{Duration, Instant};
 use tower::{Service, ServiceExt};
 use uuid::Uuid;
+use x509_parser::prelude::FromDer;
 
 #[derive(Clone, Copy)]
 enum MainTestBackend {
@@ -360,10 +361,23 @@ async fn observe_peer_certificate_fingerprint(
     addr: SocketAddr,
     ca_cert_path: &std::path::Path,
     client_identity: Option<(&std::path::Path, &std::path::Path)>,
+    expected_peer: Option<(NodeId, ClusterId)>,
 ) -> String {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let roots = load_root_store_from_pem_file(ca_cert_path);
-    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let builder = match expected_peer {
+        Some((expected_node_id, expected_cluster_id)) => rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                super::ExpectedPeerServerCertVerifier::new(
+                    Arc::new(roots.clone()),
+                    expected_node_id,
+                    expected_cluster_id,
+                )
+                .unwrap(),
+            )),
+        None => rustls::ClientConfig::builder().with_root_certificates(roots),
+    };
     let config = match client_identity {
         Some((cert_path, key_path)) => {
             let (cert_chain, key) = load_client_identity_from_pem_files(cert_path, key_path);
@@ -1749,6 +1763,7 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
         bootstrap.internal_url.as_deref(),
         Some("https://10.0.0.12:38080")
     );
+    assert!(!bootstrap.public_peer_api_enabled);
     assert_eq!(
         bootstrap.enrollment_issuer_url.as_deref(),
         Some("http://127.0.0.1:39080")
@@ -1774,6 +1789,97 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
         bootstrap.direct_endpoints[1].node_id,
         Some(requested_node_id)
     );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn internal_node_tls_material_uses_identity_only_sans() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem);
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+
+    let bootstrap = transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: state.cluster_id,
+        node_id: NodeId::new_v4(),
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: "./data/node-b".to_string(),
+        bind_addr: "127.0.0.1:28080".to_string(),
+        public_url: Some("https://node-b.example".to_string()),
+        labels: HashMap::new(),
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_peer_api_enabled: false,
+        internal_bind_addr: Some("127.0.0.1:38080".to_string()),
+        internal_url: Some("https://10.0.0.12:38080".to_string()),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/cluster-ca.pem".to_string(),
+            cert_path: "tls/internal.pem".to_string(),
+            key_path: "tls/internal.key".to_string(),
+        }),
+        rendezvous_urls: Vec::new(),
+        rendezvous_mtls_required: false,
+        direct_endpoints: Vec::new(),
+        relay_mode: transport_sdk::RelayMode::Disabled,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: None,
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: None,
+        },
+        enrollment_issuer_url: None,
+    };
+
+    let policy = super::build_tls_issue_policy(Some(24 * 60 * 60), Some(600))
+        .expect("TLS issue policy should build");
+    let material = super::issue_internal_node_tls_material(&state, &bootstrap, policy)
+        .expect("internal TLS material should be issued");
+
+    let mut reader = std::io::Cursor::new(material.cert_pem.as_bytes());
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("certificate PEM should parse");
+    let cert = certs
+        .first()
+        .expect("issued internal TLS material should include a certificate");
+
+    super::validate_expected_peer_certificate_identity(cert, bootstrap.node_id, state.cluster_id)
+        .expect("issued internal cert should validate against the expected node and cluster IDs");
+    assert!(
+        super::validate_expected_peer_certificate_identity(cert, bootstrap.node_id, Uuid::now_v7())
+            .is_err(),
+        "cluster ID validation should reject mismatched clusters"
+    );
+
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
+        .expect("issued internal certificate DER should parse");
+    let mut saw_node_uri = false;
+    let mut saw_cluster_uri = false;
+
+    for extension in parsed.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+            extension.parsed_extension()
+        {
+            for name in &san.general_names {
+                match name {
+                    x509_parser::extensions::GeneralName::URI(uri) => {
+                        saw_node_uri |= *uri == format!("urn:ironmesh:node:{}", bootstrap.node_id);
+                        saw_cluster_uri |=
+                            *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
+                    }
+                    x509_parser::extensions::GeneralName::DNSName(_)
+                    | x509_parser::extensions::GeneralName::IPAddress(_) => {
+                        panic!("internal peer certificate should not include address SANs")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    assert!(saw_node_uri, "expected internal certificate node identity SAN");
+    assert!(saw_cluster_uri, "expected internal certificate cluster identity SAN");
 
     cleanup_test_state(&state).await;
 }
@@ -2347,10 +2453,12 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
 
     let config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
     let internal_tls = config.internal_tls.clone().unwrap();
-    let internal_http = super::build_internal_mtls_http_client(
+    let internal_http = super::build_internal_mtls_http_client_for_expected_peer(
         &internal_tls.ca_cert_path,
         &internal_tls.cert_path,
         &internal_tls.key_path,
+        config.node_id,
+        config.cluster_id,
     )
     .unwrap();
     let public_http = super::build_http_client_from_optional_pem(Some(&public_ca_pem)).unwrap();
@@ -2828,9 +2936,10 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     config.node_enrollment_renewal_admin_token = Some("admin-secret".to_string());
     let public_ca_cert_path = config.public_ca_cert_path.clone().unwrap();
     let internal_tls = config.internal_tls.clone().unwrap();
+    let expected_internal_node_id = config.node_id;
+    let expected_internal_cluster_id = config.cluster_id;
     let public_health_url = format!("https://{bind_addr}/health");
     let internal_health_url = format!("https://{internal_bind_addr}/health");
-    let node_handle = tokio::spawn(async move { super::run(config).await });
 
     let public_http = reqwest::Client::builder()
         .add_root_certificate(
@@ -2838,12 +2947,15 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
         )
         .build()
         .unwrap();
-    let internal_http = super::build_internal_mtls_http_client(
+    let internal_http = super::build_internal_mtls_http_client_for_expected_peer(
         &internal_tls.ca_cert_path,
         &internal_tls.cert_path,
         &internal_tls.key_path,
+        expected_internal_node_id,
+        expected_internal_cluster_id,
     )
     .unwrap();
+    let node_handle = tokio::spawn(async move { super::run(config).await });
 
     wait_for_http_status(
         &public_http,
@@ -2861,11 +2973,12 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     .await;
 
     let initial_public_fingerprint =
-        observe_peer_certificate_fingerprint(bind_addr, &public_ca_cert_path, None).await;
+        observe_peer_certificate_fingerprint(bind_addr, &public_ca_cert_path, None, None).await;
     let initial_internal_fingerprint = observe_peer_certificate_fingerprint(
         internal_bind_addr,
         &internal_tls.ca_cert_path,
         Some((&internal_tls.cert_path, &internal_tls.key_path)),
+        Some((expected_internal_node_id, expected_internal_cluster_id)),
     )
     .await;
     assert_eq!(
@@ -2908,12 +3021,18 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
                 }
 
                 let observed_public =
-                    observe_peer_certificate_fingerprint(bind_addr, &public_ca_cert_path, None)
+                    observe_peer_certificate_fingerprint(
+                        bind_addr,
+                        &public_ca_cert_path,
+                        None,
+                        None,
+                    )
                         .await;
                 let observed_internal = observe_peer_certificate_fingerprint(
                     internal_bind_addr,
                     &internal_ca_cert_path,
                     Some((&internal_cert_path, &internal_key_path)),
+                    Some((expected_internal_node_id, expected_internal_cluster_id)),
                 )
                 .await;
                 observed_public == expected_public && observed_internal == expected_internal
@@ -2924,11 +3043,12 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
 
     let renewed_package = transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap();
     let served_public_fingerprint =
-        observe_peer_certificate_fingerprint(bind_addr, &public_ca_cert_path, None).await;
+        observe_peer_certificate_fingerprint(bind_addr, &public_ca_cert_path, None, None).await;
     let served_internal_fingerprint = observe_peer_certificate_fingerprint(
         internal_bind_addr,
         &internal_tls.ca_cert_path,
         Some((&internal_tls.cert_path, &internal_tls.key_path)),
+        Some((expected_internal_node_id, expected_internal_cluster_id)),
     )
     .await;
     assert_ne!(served_public_fingerprint, initial_public_fingerprint);
@@ -3097,31 +3217,49 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     };
     let capture_material =
         super::issue_internal_node_tls_material(&state, &capture_bootstrap, issue_policy).unwrap();
+    let mut capture_server_bootstrap = capture_bootstrap.clone();
+    capture_server_bootstrap.public_url = Some(format!("https://{capture_bind_addr}"));
+    capture_server_bootstrap.public_tls = Some(transport_sdk::BootstrapServerTlsFiles {
+        cert_path: "tls/capture-public.pem".to_string(),
+        key_path: "tls/capture-public.key".to_string(),
+    });
+    let capture_server_material = super::issue_public_node_tls_material(
+        &state,
+        &capture_server_bootstrap,
+        issue_policy,
+    )
+    .unwrap()
+    .unwrap();
     let capture_ca_path = capture_dir.join("capture-ca.pem");
-    let capture_cert_path = capture_dir.join("capture-internal.pem");
-    let capture_key_path = capture_dir.join("capture-internal.key");
+    let capture_client_cert_path = capture_dir.join("capture-internal.pem");
+    let capture_client_key_path = capture_dir.join("capture-internal.key");
+    let capture_server_cert_path = capture_dir.join("capture-public.pem");
+    let capture_server_key_path = capture_dir.join("capture-public.key");
     std::fs::write(&capture_ca_path, &capture_material.ca_cert_pem).unwrap();
-    std::fs::write(&capture_cert_path, &capture_material.cert_pem).unwrap();
-    std::fs::write(&capture_key_path, &capture_material.key_pem).unwrap();
+    std::fs::write(&capture_client_cert_path, &capture_material.cert_pem).unwrap();
+    std::fs::write(&capture_client_key_path, &capture_material.key_pem).unwrap();
+    std::fs::write(&capture_server_cert_path, &capture_server_material.cert_pem).unwrap();
+    std::fs::write(&capture_server_key_path, &capture_server_material.key_pem).unwrap();
 
     let captured_fingerprint = Arc::new(Mutex::new(None));
     let capture_handle = spawn_mtls_client_fingerprint_capture_server(
         capture_bind_addr,
         &capture_ca_path,
-        &capture_cert_path,
-        &capture_key_path,
+        &capture_server_cert_path,
+        &capture_server_key_path,
         captured_fingerprint.clone(),
     );
     wait_for_condition("capture server ready", Duration::from_secs(5), || {
         let capture_ca_path = capture_ca_path.clone();
-        let capture_cert_path = capture_cert_path.clone();
-        let capture_key_path = capture_key_path.clone();
+        let capture_client_cert_path = capture_client_cert_path.clone();
+        let capture_client_key_path = capture_client_key_path.clone();
         async move {
             let result = tokio::spawn(async move {
                 observe_peer_certificate_fingerprint(
                     capture_bind_addr,
                     &capture_ca_path,
-                    Some((&capture_cert_path, &capture_key_path)),
+                    Some((&capture_client_cert_path, &capture_client_key_path)),
+                    None,
                 )
                 .await
             })
@@ -3302,7 +3440,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
             let ca1_path = ca1_path.clone();
             async move {
                 tokio::spawn(async move {
-                    observe_peer_certificate_fingerprint(bind_addr, &ca1_path, None).await
+                    observe_peer_certificate_fingerprint(bind_addr, &ca1_path, None, None).await
                 })
                 .await
                 .is_ok()
@@ -3358,7 +3496,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
             let ca2_path = ca2_path.clone();
             async move {
                 tokio::spawn(async move {
-                    observe_peer_certificate_fingerprint(bind_addr, &ca2_path, None).await
+                    observe_peer_certificate_fingerprint(bind_addr, &ca2_path, None, None).await
                 })
                 .await
                 .is_ok()
@@ -5669,7 +5807,7 @@ async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
 }
 
 #[tokio::test]
-async fn rendezvous_presence_registration_omits_public_candidate_when_peer_api_disabled() {
+async fn rendezvous_presence_registration_keeps_public_api_but_excludes_public_direct_candidate() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
 
     let registration = build_rendezvous_presence_registration(
@@ -5680,7 +5818,7 @@ async fn rendezvous_presence_registration_omits_public_candidate_when_peer_api_d
         None,
     );
 
-    assert_eq!(registration.public_api_url, None);
+    assert_eq!(registration.public_api_url.as_deref(), Some("https://public.example"));
     assert_eq!(
         registration.peer_api_url.as_deref(),
         Some("https://internal.example")
@@ -5877,6 +6015,41 @@ async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
 
     let error = resolve_peer_base_url(&state, &node)
         .expect_err("peer transport should fail without direct candidates");
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not expose any usable peer transport candidates")
+    );
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn resolve_peer_base_url_rejects_public_api_only_candidate() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.relay_mode = super::RelayMode::Disabled;
+    let node = cluster::NodeDescriptor {
+        node_id: NodeId::new_v4(),
+        reachability: cluster::NodeReachability {
+            public_api_url: Some("https://public.example".to_string()),
+            peer_api_url: None,
+            relay_required: false,
+        },
+        capabilities: cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: false,
+            relay_tunnel: false,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 0,
+        free_bytes: 0,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: cluster::NodeStatus::Online,
+    };
+
+    let error = resolve_peer_base_url(&state, &node)
+        .expect_err("peer transport should ignore public API endpoints as direct peer candidates");
 
     assert!(
         error
