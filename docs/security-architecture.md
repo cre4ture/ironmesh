@@ -73,6 +73,11 @@ Certificate rotation:
   the Node CA and still contains `urn:ironmesh:node:<same uuid>`.
 - Revocation is handled by CA/CRL/short-lived certs (preferred) rather than by changing `node_id`.
 
+Follow-up design note:
+- `docs/peer-identity-reachability-proposal.md` proposes making direct-peer reachability fully address-agnostic at the certificate layer.
+- Under that proposal, mutable NAT or public addresses are published through bootstrap or rendezvous metadata, while direct-peer authentication validates the expected `node_id` SAN instead of treating the dialed address as the primary identity claim.
+- This is not the current implementation yet; current direct HTTPS still relies on ordinary TLS address validation in addition to the logical `node_id` SAN.
+
 ### 4.2 Transport Authentication
 - Require TLS for all HTTP traffic.
 - Prefer mTLS for:

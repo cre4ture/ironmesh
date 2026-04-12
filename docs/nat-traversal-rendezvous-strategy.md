@@ -150,6 +150,11 @@ Responsibilities:
 
 Keep and extend the current internal mTLS model already described in `docs/security-architecture.md`.
 
+Follow-up design note:
+
+- `docs/peer-identity-reachability-proposal.md` describes a proposed simplification where stable node identity stays in certificate SAN URIs, while mutable public or NAT-forwarded peer addresses are published dynamically through bootstrap or rendezvous metadata instead of being treated as certificate identity.
+- That proposal is not implemented yet; the current runtime still models direct peer reachability partly through `public_url` plus the optional public peer API path.
+
 - each node has a Node-CA-signed certificate,
 - SAN contains `urn:ironmesh:node:<uuid>`,
 - optionally also `urn:ironmesh:cluster:<uuid>`,
