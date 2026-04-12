@@ -10,7 +10,31 @@ pub(crate) struct ReplicationRepairReport {
     pub(crate) skipped_items: usize,
     pub(crate) skipped_backoff: usize,
     pub(crate) skipped_max_retries: usize,
+    #[serde(default)]
+    pub(crate) skipped_details: Vec<ReplicationRepairSkippedItem>,
     pub(crate) last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReplicationRepairSkipReason {
+    InvalidSubject,
+    SourceNodeUnavailable,
+    BundleUnavailable,
+    BackoffActive,
+    MaxRetriesExhausted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReplicationRepairSkippedItem {
+    pub(crate) report_node_id: NodeId,
+    pub(crate) subject: String,
+    pub(crate) key: Option<String>,
+    pub(crate) version_id: Option<String>,
+    pub(crate) source_node_id: Option<NodeId>,
+    pub(crate) target_node_id: Option<NodeId>,
+    pub(crate) reason: ReplicationRepairSkipReason,
+    pub(crate) detail: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -30,6 +54,7 @@ pub(crate) struct ClusterReplicationRepairNodeReport {
     pub(crate) skipped_items: usize,
     pub(crate) skipped_backoff: usize,
     pub(crate) skipped_max_retries: usize,
+    pub(crate) skipped_details: Vec<ReplicationRepairSkippedItem>,
     pub(crate) last_error: Option<String>,
     pub(crate) request_error: Option<String>,
 }
@@ -89,6 +114,7 @@ pub(crate) async fn execute_replication_repair_inner(
     let mut skipped_items = 0usize;
     let mut skipped_backoff = 0usize;
     let mut skipped_max_retries = 0usize;
+    let mut skipped_details = Vec::new();
     let mut last_error = None;
     let mut replicas_state_dirty = false;
     let mut repair_state_dirty = false;
@@ -118,8 +144,22 @@ pub(crate) async fn execute_replication_repair_inner(
 
         let Some((key, version_id)) = parse_replication_subject(&item.key) else {
             skipped_items += 1;
+            push_repair_skipped_detail(
+                &mut skipped_details,
+                state.node_id,
+                item.key.clone(),
+                None,
+                None,
+                None,
+                None,
+                ReplicationRepairSkipReason::InvalidSubject,
+                "replication subject could not be parsed into key and version components",
+            );
             continue;
         };
+
+        let local_missing = item.missing_nodes.contains(&state.node_id);
+        let mut repair_source_node_id = None;
 
         let mut bundle = {
             let store = read_store(state, "replication_repair.export_bundle").await;
@@ -133,7 +173,7 @@ pub(crate) async fn execute_replication_repair_inner(
             }
         };
 
-        if bundle.is_none() && item.missing_nodes.contains(&state.node_id) {
+        if bundle.is_none() && local_missing {
             let Some(source_node) = item
                 .current_nodes
                 .iter()
@@ -141,8 +181,21 @@ pub(crate) async fn execute_replication_repair_inner(
                 .find_map(|node_id| node_by_id.get(node_id))
             else {
                 skipped_items += 1;
+                push_repair_skipped_detail(
+                    &mut skipped_details,
+                    state.node_id,
+                    item.key.clone(),
+                    Some(key.clone()),
+                    version_id.clone(),
+                    None,
+                    Some(state.node_id),
+                    ReplicationRepairSkipReason::SourceNodeUnavailable,
+                    "local node is missing the subject and no online source node was available",
+                );
                 continue;
             };
+
+            repair_source_node_id = Some(source_node.node_id);
 
             let transfer_key = format!("{}|{}", item.key, state.node_id);
 
@@ -151,6 +204,20 @@ pub(crate) async fn execute_replication_repair_inner(
                 if let Some(previous) = repair_state.attempts.get(&transfer_key) {
                     if previous.attempts > max_attempts {
                         skipped_max_retries += 1;
+                        push_repair_skipped_detail(
+                            &mut skipped_details,
+                            state.node_id,
+                            item.key.clone(),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(source_node.node_id),
+                            Some(state.node_id),
+                            ReplicationRepairSkipReason::MaxRetriesExhausted,
+                            format!(
+                                "transfer skipped after {} failed attempts (max_retries={max_attempts})",
+                                previous.attempts
+                            ),
+                        );
                         continue;
                     }
 
@@ -159,6 +226,21 @@ pub(crate) async fn execute_replication_repair_inner(
                         jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
                     if elapsed < required_backoff {
                         skipped_backoff += 1;
+                        push_repair_skipped_detail(
+                            &mut skipped_details,
+                            state.node_id,
+                            item.key.clone(),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(source_node.node_id),
+                            Some(state.node_id),
+                            ReplicationRepairSkipReason::BackoffActive,
+                            format!(
+                                "retry backoff active for another {}s after {} failed attempts",
+                                required_backoff.saturating_sub(elapsed),
+                                previous.attempts
+                            ),
+                        );
                         continue;
                     }
                 }
@@ -219,6 +301,21 @@ pub(crate) async fn execute_replication_repair_inner(
 
         let Some(bundle) = bundle else {
             skipped_items += 1;
+            push_repair_skipped_detail(
+                &mut skipped_details,
+                state.node_id,
+                item.key.clone(),
+                Some(key.clone()),
+                version_id.clone(),
+                repair_source_node_id,
+                local_missing.then_some(state.node_id),
+                ReplicationRepairSkipReason::BundleUnavailable,
+                if local_missing {
+                    "replication bundle remained unavailable after attempting local repair import"
+                } else {
+                    "replication bundle was not available on the reporting node"
+                },
+            );
             continue;
         };
 
@@ -243,6 +340,20 @@ pub(crate) async fn execute_replication_repair_inner(
                 if let Some(previous) = repair_state.attempts.get(&transfer_key) {
                     if previous.attempts > max_attempts {
                         skipped_max_retries += 1;
+                        push_repair_skipped_detail(
+                            &mut skipped_details,
+                            state.node_id,
+                            item.key.clone(),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(state.node_id),
+                            Some(target),
+                            ReplicationRepairSkipReason::MaxRetriesExhausted,
+                            format!(
+                                "transfer skipped after {} failed attempts (max_retries={max_attempts})",
+                                previous.attempts
+                            ),
+                        );
                         continue;
                     }
 
@@ -251,6 +362,21 @@ pub(crate) async fn execute_replication_repair_inner(
                         jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
                     if elapsed < required_backoff {
                         skipped_backoff += 1;
+                        push_repair_skipped_detail(
+                            &mut skipped_details,
+                            state.node_id,
+                            item.key.clone(),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            Some(state.node_id),
+                            Some(target),
+                            ReplicationRepairSkipReason::BackoffActive,
+                            format!(
+                                "retry backoff active for another {}s after {} failed attempts",
+                                required_backoff.saturating_sub(elapsed),
+                                previous.attempts
+                            ),
+                        );
                         continue;
                     }
                 }
@@ -321,6 +447,7 @@ pub(crate) async fn execute_replication_repair_inner(
         skipped_items,
         skipped_backoff,
         skipped_max_retries,
+        skipped_details,
         last_error,
     }
 }
@@ -337,6 +464,7 @@ async fn execute_cluster_replication_repair_inner(
         skipped_items: 0,
         skipped_backoff: 0,
         skipped_max_retries: 0,
+        skipped_details: Vec::new(),
         last_error: None,
     };
     let mut failed_nodes = 0usize;
@@ -351,6 +479,7 @@ async fn execute_cluster_replication_repair_inner(
         skipped_items: local_report.skipped_items,
         skipped_backoff: local_report.skipped_backoff,
         skipped_max_retries: local_report.skipped_max_retries,
+        skipped_details: local_report.skipped_details.clone(),
         last_error: local_report.last_error.clone(),
         request_error: None,
     });
@@ -392,6 +521,7 @@ async fn execute_cluster_replication_repair_inner(
                             skipped_items: report.skipped_items,
                             skipped_backoff: report.skipped_backoff,
                             skipped_max_retries: report.skipped_max_retries,
+                            skipped_details: report.skipped_details.clone(),
                             last_error: report.last_error.clone(),
                             request_error: None,
                         });
@@ -408,6 +538,7 @@ async fn execute_cluster_replication_repair_inner(
                             skipped_items: 0,
                             skipped_backoff: 0,
                             skipped_max_retries: 0,
+                            skipped_details: Vec::new(),
                             last_error: None,
                             request_error: Some(error),
                         });
@@ -426,6 +557,7 @@ async fn execute_cluster_replication_repair_inner(
                     skipped_items: 0,
                     skipped_backoff: 0,
                     skipped_max_retries: 0,
+                    skipped_details: Vec::new(),
                     last_error: None,
                     request_error: Some(error),
                 });
@@ -442,6 +574,7 @@ async fn execute_cluster_replication_repair_inner(
                     skipped_items: 0,
                     skipped_backoff: 0,
                     skipped_max_retries: 0,
+                    skipped_details: Vec::new(),
                     last_error: None,
                     request_error: Some(error),
                 });
@@ -478,9 +611,35 @@ fn accumulate_repair_report(
     totals.skipped_max_retries = totals
         .skipped_max_retries
         .saturating_add(report.skipped_max_retries);
+    totals
+        .skipped_details
+        .extend(report.skipped_details.iter().cloned());
     if report.last_error.is_some() {
         totals.last_error = report.last_error.clone();
     }
+}
+
+fn push_repair_skipped_detail(
+    skipped_details: &mut Vec<ReplicationRepairSkippedItem>,
+    report_node_id: NodeId,
+    subject: String,
+    key: Option<String>,
+    version_id: Option<String>,
+    source_node_id: Option<NodeId>,
+    target_node_id: Option<NodeId>,
+    reason: ReplicationRepairSkipReason,
+    detail: impl Into<String>,
+) {
+    skipped_details.push(ReplicationRepairSkippedItem {
+        report_node_id,
+        subject,
+        key,
+        version_id,
+        source_node_id,
+        target_node_id,
+        reason,
+        detail: detail.into(),
+    });
 }
 
 fn build_replication_repair_path(

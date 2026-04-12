@@ -1448,14 +1448,13 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
         .await
         .expect("bootstrap claim should publish");
 
-    let rendezvous_state = rendezvous_server::RendezvousAppState::new(
-        rendezvous_server::RendezvousServerConfig {
+    let rendezvous_state =
+        rendezvous_server::RendezvousAppState::new(rendezvous_server::RendezvousServerConfig {
             bind_addr: rendezvous_bind_addr,
             public_url: canonical_rendezvous_url.clone(),
             relay_public_urls: vec![canonical_rendezvous_url.clone()],
             mtls: None,
-        },
-    );
+        });
     let rendezvous_listener = tokio::net::TcpListener::bind(rendezvous_bind_addr)
         .await
         .expect("rendezvous listener should bind");
@@ -1542,8 +1541,7 @@ async fn bootstrap_claim_redeem_succeeds_over_rendezvous_relay() {
         target_node_id: state.node_id,
         device_id: Some(Uuid::now_v7().to_string()),
         label: Some("Tablet".to_string()),
-        public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
-            .to_string(),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----".to_string(),
     };
     let response = reqwest::Client::new()
         .post(format!("{rendezvous_url}/bootstrap-claims/redeem"))
@@ -1878,8 +1876,14 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
         }
     }
 
-    assert!(saw_node_uri, "expected internal certificate node identity SAN");
-    assert!(saw_cluster_uri, "expected internal certificate cluster identity SAN");
+    assert!(
+        saw_node_uri,
+        "expected internal certificate node identity SAN"
+    );
+    assert!(
+        saw_cluster_uri,
+        "expected internal certificate cluster identity SAN"
+    );
 
     cleanup_test_state(&state).await;
 }
@@ -3020,14 +3024,13 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
                     return false;
                 }
 
-                let observed_public =
-                    observe_peer_certificate_fingerprint(
-                        bind_addr,
-                        &public_ca_cert_path,
-                        None,
-                        None,
-                    )
-                        .await;
+                let observed_public = observe_peer_certificate_fingerprint(
+                    bind_addr,
+                    &public_ca_cert_path,
+                    None,
+                    None,
+                )
+                .await;
                 let observed_internal = observe_peer_certificate_fingerprint(
                     internal_bind_addr,
                     &internal_ca_cert_path,
@@ -3223,13 +3226,10 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
         cert_path: "tls/capture-public.pem".to_string(),
         key_path: "tls/capture-public.key".to_string(),
     });
-    let capture_server_material = super::issue_public_node_tls_material(
-        &state,
-        &capture_server_bootstrap,
-        issue_policy,
-    )
-    .unwrap()
-    .unwrap();
+    let capture_server_material =
+        super::issue_public_node_tls_material(&state, &capture_server_bootstrap, issue_policy)
+            .unwrap()
+            .unwrap();
     let capture_ca_path = capture_dir.join("capture-ca.pem");
     let capture_client_cert_path = capture_dir.join("capture-internal.pem");
     let capture_client_key_path = capture_dir.join("capture-internal.key");
@@ -4387,6 +4387,72 @@ run_on_main_metadata_backends!(
     startup_repair_runs_when_gaps_exist_impl,
     startup_repair_runs_when_gaps_exist,
     startup_repair_runs_when_gaps_exist_turso
+);
+
+async fn replication_repair_records_max_retry_skip_details_impl(backend: MainTestBackend) {
+    let state = build_test_state(2, true, backend).await;
+
+    let keys = super::planning_replication_subjects(&state).await;
+    let plan = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        cluster.replication_plan(&keys)
+    };
+    let expected_skips = plan
+        .items
+        .iter()
+        .flat_map(|item| {
+            item.missing_nodes
+                .iter()
+                .copied()
+                .filter(|node_id| *node_id != state.node_id)
+                .map(|node_id| (item.key.clone(), node_id))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !expected_skips.is_empty(),
+        "expected at least one missing replica in the seeded test state"
+    );
+
+    {
+        let mut repair_state = state.repair_state.lock().await;
+        for (subject, target_node_id) in &expected_skips {
+            repair_state.attempts.insert(
+                format!("{subject}|{target_node_id}"),
+                super::RepairAttemptEntry {
+                    attempts: state.repair_config.max_retries.saturating_add(1),
+                    last_failure_unix: super::unix_ts(),
+                },
+            );
+        }
+    }
+
+    let report = super::replication::execute_replication_repair_inner(&state, None).await;
+
+    assert_eq!(report.attempted_transfers, 0);
+    assert_eq!(report.failed_transfers, 0);
+    assert_eq!(report.skipped_max_retries, expected_skips.len());
+    assert_eq!(report.skipped_details.len(), expected_skips.len());
+
+    for (subject, target_node_id) in expected_skips {
+        assert!(
+            report.skipped_details.iter().any(|detail| {
+                detail.subject == subject
+                    && detail.target_node_id == Some(target_node_id)
+                    && detail.reason
+                        == super::replication::ReplicationRepairSkipReason::MaxRetriesExhausted
+            }),
+            "expected max-retries skip detail for subject={subject} target={target_node_id}"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    replication_repair_records_max_retry_skip_details_impl,
+    replication_repair_records_max_retry_skip_details,
+    replication_repair_records_max_retry_skip_details_turso
 );
 
 async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
@@ -5818,7 +5884,10 @@ async fn rendezvous_presence_registration_keeps_public_api_but_excludes_public_d
         None,
     );
 
-    assert_eq!(registration.public_api_url.as_deref(), Some("https://public.example"));
+    assert_eq!(
+        registration.public_api_url.as_deref(),
+        Some("https://public.example")
+    );
     assert_eq!(
         registration.peer_api_url.as_deref(),
         Some("https://internal.example")
@@ -6078,6 +6147,136 @@ async fn internal_peer_api_routes_replication_repair_locally() {
     assert_eq!(response.status(), StatusCode::OK);
     cleanup_test_state(&state).await;
 }
+
+async fn cluster_replication_repair_report_includes_skipped_details_impl(backend: MainTestBackend) {
+    let state = build_test_state(2, true, backend).await;
+
+    let keys = super::planning_replication_subjects(&state).await;
+    let plan = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        cluster.replication_plan(&keys)
+    };
+    let expected_skips = plan
+        .items
+        .iter()
+        .flat_map(|item| {
+            item.missing_nodes
+                .iter()
+                .copied()
+                .filter(|node_id| *node_id != state.node_id)
+                .map(|node_id| (item.key.clone(), node_id))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !expected_skips.is_empty(),
+        "expected at least one missing replica in the seeded test state"
+    );
+
+    {
+        let mut repair_state = state.repair_state.lock().await;
+        for (subject, target_node_id) in &expected_skips {
+            repair_state.attempts.insert(
+                format!("{subject}|{target_node_id}"),
+                super::RepairAttemptEntry {
+                    attempts: state.repair_config.max_retries.saturating_add(1),
+                    last_failure_unix: super::unix_ts(),
+                },
+            );
+        }
+    }
+
+    let response = super::build_internal_peer_api()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/replication/repair?scope=cluster")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("cluster repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("cluster repair response body should be readable");
+    let repair_report: serde_json::Value =
+        serde_json::from_slice(&body).expect("cluster repair response should be valid json");
+
+    assert_eq!(
+        repair_report
+            .get("skipped_max_retries")
+            .and_then(|value| value.as_u64()),
+        Some(expected_skips.len() as u64)
+    );
+
+    let skipped_details = repair_report
+        .get("skipped_details")
+        .and_then(|value| value.as_array())
+        .expect("cluster repair response should include skipped_details");
+    for (subject, target_node_id) in &expected_skips {
+        assert!(
+            skipped_details.iter().any(|detail| {
+                detail.get("reason").and_then(|value| value.as_str())
+                    == Some("max_retries_exhausted")
+                    && detail.get("subject").and_then(|value| value.as_str())
+                        == Some(subject.as_str())
+                    && detail
+                        .get("target_node_id")
+                        .and_then(|value| value.as_str())
+                        == Some(&target_node_id.to_string())
+                    && detail
+                        .get("report_node_id")
+                        .and_then(|value| value.as_str())
+                        == Some(&state.node_id.to_string())
+            }),
+            "expected max-retries skip detail in cluster report for subject={subject} target={target_node_id}: {repair_report:?}"
+        );
+    }
+
+    let local_report = repair_report
+        .get("node_reports")
+        .and_then(|value| value.as_array())
+        .and_then(|reports| {
+            reports.iter().find(|report| {
+                report.get("node_id").and_then(|value| value.as_str())
+                    == Some(&state.node_id.to_string())
+            })
+        })
+        .expect("cluster repair response should include the local node report");
+
+    let local_skipped_details = local_report
+        .get("skipped_details")
+        .and_then(|value| value.as_array())
+        .expect("local node report should include skipped_details");
+    assert_eq!(local_skipped_details.len(), expected_skips.len());
+    for (subject, target_node_id) in expected_skips {
+        assert!(
+            local_skipped_details.iter().any(|detail| {
+                detail.get("reason").and_then(|value| value.as_str())
+                    == Some("max_retries_exhausted")
+                    && detail.get("subject").and_then(|value| value.as_str())
+                        == Some(subject.as_str())
+                    && detail
+                        .get("target_node_id")
+                        .and_then(|value| value.as_str())
+                        == Some(&target_node_id.to_string())
+            }),
+            "expected max-retries skip detail in local node report for subject={subject} target={target_node_id}: {repair_report:?}"
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    cluster_replication_repair_report_includes_skipped_details_impl,
+    cluster_replication_repair_report_includes_skipped_details,
+    cluster_replication_repair_report_includes_skipped_details_turso
+);
 
 #[tokio::test]
 async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() {

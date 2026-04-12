@@ -1152,7 +1152,8 @@ fn parse_peer_certificate_identity(cert: &CertificateDer<'_>) -> Result<PeerCert
         }
     }
 
-    let node_id = node_id.context("missing urn:ironmesh:node:<uuid> SAN URI in peer certificate")?;
+    let node_id =
+        node_id.context("missing urn:ironmesh:node:<uuid> SAN URI in peer certificate")?;
 
     Ok(PeerCertificateIdentity {
         node_id,
