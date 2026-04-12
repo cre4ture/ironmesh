@@ -20,7 +20,7 @@ use crate::connection_config::{
     persist_connection_config, persist_local_appdata_connection_config, resolve_connection_config,
 };
 use crate::helpers::{normalize_path, path_to_relative};
-use crate::hydration_control::request_hydration_cancel;
+use crate::hydration_control::{is_active_hydration_marked, request_hydration_cancel};
 use crate::live::ServerNodeHydrator;
 use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
@@ -649,7 +649,9 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
 }
 
 fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::{CF_PIN_STATE_PINNED, CF_SET_PIN_FLAG_NONE};
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_SET_PIN_FLAG_NONE,
+    };
 
     let root_path = PathBuf::from(&args.root_path);
     let target_path = if PathBuf::from(&args.path).is_absolute() {
@@ -669,28 +671,39 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    cf_hydrate_placeholder(&file)?;
-    tracing::info!("requested local hydration for {}", target_path.display());
-
     let timeout = Duration::from_millis(args.timeout_ms.max(1));
     let poll_interval = Duration::from_millis(args.poll_interval_ms.max(50));
     let started = std::time::Instant::now();
     let total_size = file.metadata()?.len() as i64;
+    let normalized_relative_path = resolve_cli_relative_path(&root_path, &args.path);
+    let mut previous_snapshot = None;
+    let mut last_hydrate_error = None;
 
     loop {
         // Reopen the file for each poll so CFAPI progress reflects the latest placeholder state.
         let poll_file = OpenOptions::new().read(true).open(&target_path)?;
         let info = cf_get_placeholder_standard_info(&poll_file)?;
+        let snapshot = PinHydrationSnapshot {
+            on_disk_data_size: info.OnDiskDataSize,
+            validated_data_size: info.ValidatedDataSize,
+            modified_data_size: info.ModifiedDataSize,
+            in_sync_state: info.InSyncState,
+            pin_state: info.PinState,
+            provider_hydration_active: !normalized_relative_path.is_empty()
+                && is_active_hydration_marked(&root_path, &normalized_relative_path),
+        };
         tracing::info!(
-            "pin progress: on_disk={} validated={} modified={} total={} pin_state={}",
-            info.OnDiskDataSize,
-            info.ValidatedDataSize,
-            info.ModifiedDataSize,
+            "pin progress: on_disk={} validated={} modified={} total={} pin_state={} in_sync={} provider_hydration_active={}",
+            snapshot.on_disk_data_size,
+            snapshot.validated_data_size,
+            snapshot.modified_data_size,
             total_size,
-            info.PinState
+            snapshot.pin_state,
+            snapshot.in_sync_state,
+            snapshot.provider_hydration_active,
         );
 
-        if info.OnDiskDataSize >= total_size && info.ModifiedDataSize == 0 {
+        if snapshot.on_disk_data_size >= total_size && snapshot.modified_data_size == 0 {
             match load_registered_sync_root_context(&root_path) {
                 Ok(Some(context)) => {
                     if let Err(err) = record_in_sync_remote_file_state(
@@ -721,17 +734,112 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
             return Ok(());
         }
 
+        let can_still_hydrate = snapshot.pin_state == CF_PIN_STATE_PINNED
+            && snapshot.in_sync_state == CF_IN_SYNC_STATE_IN_SYNC
+            && snapshot.modified_data_size == 0;
+        let should_retry_explicit_hydrate = should_request_pin_hydration(
+            previous_snapshot,
+            snapshot,
+            total_size,
+            last_hydrate_error.is_some(),
+        );
+        if should_retry_explicit_hydrate && can_still_hydrate {
+            let hydrate_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&target_path)?;
+            match cf_hydrate_placeholder(&hydrate_file) {
+                Ok(()) => {
+                    tracing::info!(
+                        "requested local hydration for {} snapshot={} ",
+                        target_path.display(),
+                        snapshot.to_log_string()
+                    );
+                    last_hydrate_error = None;
+                }
+                Err(err) => {
+                    tracing::info!(
+                        "pin hydration request for {} failed: {:#} snapshot={}",
+                        target_path.display(),
+                        err,
+                        snapshot.to_log_string()
+                    );
+                    last_hydrate_error = Some(err);
+                }
+            }
+        }
+
+        previous_snapshot = Some(snapshot);
+
         if started.elapsed() >= timeout {
+            let last_hydrate_error = last_hydrate_error
+                .as_ref()
+                .map(|err| format!(" last_hydrate_error={err:#}"))
+                .unwrap_or_default();
             anyhow::bail!(
-                "timed out waiting for local pin hydration at {} (on_disk={} total={})",
+                "timed out waiting for local pin hydration at {} ({}) total={}{}",
                 target_path.display(),
-                info.OnDiskDataSize,
-                total_size
+                snapshot.to_log_string(),
+                total_size,
+                last_hydrate_error
             );
         }
 
         thread::sleep(poll_interval);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PinHydrationSnapshot {
+    on_disk_data_size: i64,
+    validated_data_size: i64,
+    modified_data_size: i64,
+    in_sync_state: i32,
+    pin_state: i32,
+    provider_hydration_active: bool,
+}
+
+impl PinHydrationSnapshot {
+    fn to_log_string(self) -> String {
+        format!(
+            "on_disk={} validated={} modified={} in_sync={} pin={} provider_hydration_active={}",
+            self.on_disk_data_size,
+            self.validated_data_size,
+            self.modified_data_size,
+            self.in_sync_state,
+            self.pin_state,
+            self.provider_hydration_active
+        )
+    }
+}
+
+fn should_request_pin_hydration(
+    previous_snapshot: Option<PinHydrationSnapshot>,
+    current_snapshot: PinHydrationSnapshot,
+    total_size: i64,
+    last_request_failed: bool,
+) -> bool {
+    if current_snapshot.provider_hydration_active
+        || current_snapshot.modified_data_size != 0
+        || current_snapshot.on_disk_data_size >= total_size
+    {
+        return false;
+    }
+
+    let Some(previous_snapshot) = previous_snapshot else {
+        return true;
+    };
+
+    if last_request_failed {
+        return true;
+    }
+
+    previous_snapshot.provider_hydration_active
+        || previous_snapshot.on_disk_data_size != current_snapshot.on_disk_data_size
+        || previous_snapshot.validated_data_size != current_snapshot.validated_data_size
+        || previous_snapshot.modified_data_size != current_snapshot.modified_data_size
+        || previous_snapshot.in_sync_state != current_snapshot.in_sync_state
+        || previous_snapshot.pin_state != current_snapshot.pin_state
 }
 
 fn cancel_placeholder_hydration(args: CancelHydrationArgs) -> anyhow::Result<()> {
@@ -767,4 +875,93 @@ fn resolve_cli_relative_path(root_path: &std::path::Path, requested_path: &str) 
         return path_to_relative(root_path, requested_path);
     }
     normalize_path(requested_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PinHydrationSnapshot, should_request_pin_hydration};
+
+    #[test]
+    fn pin_hydration_requests_initial_explicit_hydrate() {
+        let snapshot = PinHydrationSnapshot {
+            on_disk_data_size: 0,
+            validated_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: 1,
+            pin_state: 1,
+            provider_hydration_active: false,
+        };
+
+        assert!(should_request_pin_hydration(None, snapshot, 4096, false));
+    }
+
+    #[test]
+    fn pin_hydration_defers_while_provider_hydration_is_active() {
+        let snapshot = PinHydrationSnapshot {
+            on_disk_data_size: 0,
+            validated_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: 1,
+            pin_state: 1,
+            provider_hydration_active: true,
+        };
+
+        assert!(!should_request_pin_hydration(None, snapshot, 4096, false));
+    }
+
+    #[test]
+    fn pin_hydration_retries_after_provider_hydration_clears() {
+        let previous = PinHydrationSnapshot {
+            on_disk_data_size: 1024,
+            validated_data_size: 1024,
+            modified_data_size: 0,
+            in_sync_state: 1,
+            pin_state: 1,
+            provider_hydration_active: true,
+        };
+        let current = PinHydrationSnapshot {
+            provider_hydration_active: false,
+            ..previous
+        };
+
+        assert!(should_request_pin_hydration(Some(previous), current, 4096, false));
+    }
+
+    #[test]
+    fn pin_hydration_retries_after_progress_changes() {
+        let previous = PinHydrationSnapshot {
+            on_disk_data_size: 0,
+            validated_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: 1,
+            pin_state: 1,
+            provider_hydration_active: false,
+        };
+        let current = PinHydrationSnapshot {
+            on_disk_data_size: 2048,
+            validated_data_size: 2048,
+            ..previous
+        };
+
+        assert!(should_request_pin_hydration(Some(previous), current, 4096, false));
+    }
+
+    #[test]
+    fn pin_hydration_retries_after_request_failure() {
+        let snapshot = PinHydrationSnapshot {
+            on_disk_data_size: 0,
+            validated_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: 1,
+            pin_state: 1,
+            provider_hydration_active: false,
+        };
+
+        assert!(should_request_pin_hydration(
+            Some(snapshot),
+            snapshot,
+            4096,
+            true
+        ));
+    }
 }

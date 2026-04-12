@@ -7,13 +7,14 @@ use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_dehydrate_placeholder_with_oplock, cf_get_placeholder_standard_info,
-    cf_get_placeholder_standard_info_with_identity, cf_hydrate_placeholder_with_oplock,
-    cf_set_in_sync, describe_path_state, open_sync_path, path_is_placeholder,
-    path_placeholder_state, try_convert_materialized_file,
+    cf_get_placeholder_standard_info_with_identity, cf_hydrate_placeholder, cf_set_in_sync,
+    describe_path_state, open_sync_path, path_is_placeholder, path_placeholder_state,
+    try_convert_materialized_file,
 };
 use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{decode_path_from_file_identity, path_to_relative};
+use crate::hydration_control::is_active_hydration_marked;
 use crate::placeholder_metadata::{
     record_in_sync_content_fingerprint, record_in_sync_local_file_state,
     record_in_sync_remote_file_state,
@@ -51,6 +52,7 @@ struct SeenEntry {
     local_file_identity: Option<LocalFileIdentity>,
     placeholder_identity_path: Option<String>,
     placeholder_state: Option<PlaceholderSnapshot>,
+    provider_hydration_active: bool,
 }
 
 impl SeenEntry {
@@ -81,14 +83,15 @@ impl SeenEntry {
             .clone()
             .unwrap_or_else(|| String::from("none"));
         format!(
-            "dir={} attrs=0x{:08x} pinned_attr={} unpinned_attr={} file_id={} placeholder_identity={} placeholder_probe={}",
+            "dir={} attrs=0x{:08x} pinned_attr={} unpinned_attr={} file_id={} placeholder_identity={} placeholder_probe={} hydration_active={}",
             self.is_dir,
             self.file_attributes,
             self.has_pinned_attribute(),
             self.has_unpinned_attribute(),
             local_file_identity,
             placeholder_identity_path,
-            placeholder_state
+            placeholder_state,
+            self.provider_hydration_active,
         )
     }
 }
@@ -189,16 +192,33 @@ fn should_schedule_placeholder_hydration(
     entry: &SeenEntry,
     placeholder_state: PlaceholderSnapshot,
 ) -> bool {
-    if !entry.has_pinned_attribute() || !placeholder_state.should_hydrate() {
+    if !entry.has_pinned_attribute()
+        || !placeholder_state.should_hydrate()
+        || entry.provider_hydration_active
+    {
+        return false;
+    }
+
+    let Some(previous_entry) = previous_entry else {
+        return true;
+    };
+
+    if previous_entry == entry {
         return false;
     }
 
     let previous_was_hydrate_eligible = previous_entry
-        .filter(|previous| previous.has_pinned_attribute())
-        .and_then(|previous| previous.placeholder_state)
-        .is_some_and(PlaceholderSnapshot::should_hydrate);
+        .has_pinned_attribute()
+        && previous_entry
+            .placeholder_state
+            .is_some_and(PlaceholderSnapshot::should_hydrate);
 
-    previous_entry != Some(entry) && !previous_was_hydrate_eligible
+    !previous_was_hydrate_eligible
+        || previous_entry.provider_hydration_active
+        || previous_entry
+            .placeholder_state
+            .filter(|previous| previous.should_hydrate())
+            .is_some_and(|previous| previous != placeholder_state)
 }
 
 pub struct SyncRootMonitor {
@@ -496,7 +516,10 @@ impl SyncRootMonitor {
                 continue;
             }
 
-            current.insert(rel_path, snapshot_entry(path, entry.file_type().is_dir()));
+            current.insert(
+                rel_path.clone(),
+                snapshot_entry(&self.sync_root, &rel_path, path, entry.file_type().is_dir()),
+            );
         }
 
         current
@@ -526,7 +549,12 @@ impl SyncRootMonitor {
         };
         seeded.insert(
             normalized,
-            snapshot_entry(&full_path, metadata.is_dir() || is_dir_hint),
+            snapshot_entry(
+                &self.sync_root,
+                rel_path,
+                &full_path,
+                metadata.is_dir() || is_dir_hint,
+            ),
         );
     }
 
@@ -823,6 +851,19 @@ impl SyncRootMonitor {
             return;
         }
 
+        if entry.provider_hydration_active {
+            if previous_entry != Some(entry) {
+                tracing::info!(
+                    "{}: hydrate candidate deferred path={} snapshot={} reason=provider-hydration-active raw_state={}",
+                    self.name,
+                    rel_path,
+                    placeholder_state.to_log_string(),
+                    describe_path_state(path)
+                );
+            }
+            return;
+        }
+
         if !should_schedule_placeholder_hydration(previous_entry, entry, placeholder_state) {
             return;
         }
@@ -858,6 +899,7 @@ impl SyncRootMonitor {
 
         let rel_path = rel_path.to_string();
         let full_path = path.to_path_buf();
+        let sync_root = self.sync_root.clone();
         let monitor_name = self.name.clone();
         let in_flight = self.hydrations_in_flight.clone();
         std::thread::spawn(move || {
@@ -869,25 +911,37 @@ impl SyncRootMonitor {
                 placeholder_state.to_log_string()
             );
 
-            let result = cf_hydrate_placeholder_with_oplock(&full_path);
+            if is_active_hydration_marked(&sync_root, &rel_path) {
+                tracing::info!(
+                    "{}: deferring pinned placeholder hydrate {} because provider hydration is active state_before={} snapshot={}",
+                    monitor_name,
+                    rel_path,
+                    describe_path_state(&full_path),
+                    placeholder_state.to_log_string()
+                );
+            } else {
+                let result = open_sync_path(&full_path, true)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|file| cf_hydrate_placeholder(&file));
 
-            match result {
-                Ok(()) => {
-                    tracing::info!(
-                        "{}: hydrated pinned placeholder {} state_after={}",
-                        monitor_name,
-                        rel_path,
-                        describe_path_state(&full_path)
-                    );
-                }
-                Err(err) => {
-                    tracing::info!(
-                        "{}: failed to hydrate pinned placeholder {}: {:#} state_after={}",
-                        monitor_name,
-                        rel_path,
-                        err,
-                        describe_path_state(&full_path)
-                    );
+                match result {
+                    Ok(()) => {
+                        tracing::info!(
+                            "{}: hydrated pinned placeholder {} state_after={}",
+                            monitor_name,
+                            rel_path,
+                            describe_path_state(&full_path)
+                        );
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            "{}: failed to hydrate pinned placeholder {}: {:#} state_after={}",
+                            monitor_name,
+                            rel_path,
+                            err,
+                            describe_path_state(&full_path)
+                        );
+                    }
                 }
             }
 
@@ -1152,7 +1206,12 @@ fn detect_local_file_renames(
     pairs
 }
 
-fn snapshot_entry(path: &std::path::Path, is_dir: bool) -> SeenEntry {
+fn snapshot_entry(
+    sync_root: &std::path::Path,
+    rel_path: &str,
+    path: &std::path::Path,
+    is_dir: bool,
+) -> SeenEntry {
     let metadata = std::fs::metadata(path).ok();
     let file_attributes = metadata
         .as_ref()
@@ -1176,6 +1235,7 @@ fn snapshot_entry(path: &std::path::Path, is_dir: bool) -> SeenEntry {
                 path_placeholder_state(path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
             PlaceholderSnapshot::from_path(path, placeholder_state_bits)
         },
+        provider_hydration_active: should_probe && is_active_hydration_marked(sync_root, rel_path),
     }
 }
 
@@ -1481,6 +1541,7 @@ mod tests {
             local_file_identity: None,
             placeholder_identity_path: Some("movies/example.mp4".to_string()),
             placeholder_state: Some(pinned_partial),
+            provider_hydration_active: false,
         };
 
         assert!(
@@ -1504,6 +1565,7 @@ mod tests {
             local_file_identity: None,
             placeholder_identity_path: Some("movies/example.mp4".to_string()),
             placeholder_state: None,
+            provider_hydration_active: false,
         };
         let current = SeenEntry {
             is_dir: false,
@@ -1511,6 +1573,7 @@ mod tests {
             local_file_identity: None,
             placeholder_identity_path: Some("movies/example.mp4".to_string()),
             placeholder_state: Some(pinned_partial),
+            provider_hydration_active: false,
         };
 
         assert!(
@@ -1520,6 +1583,90 @@ mod tests {
         assert!(
             !should_schedule_placeholder_hydration(Some(&current), &current, pinned_partial),
             "already-eligible placeholders should not reschedule hydration on every walk",
+        );
+    }
+
+    #[test]
+    fn monitor_defers_hydration_while_provider_hydration_is_active() {
+        let pinned_partial = PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: CF_PIN_STATE_PINNED,
+            is_partial: true,
+        };
+        let entry = SeenEntry {
+            is_dir: false,
+            file_attributes: FILE_ATTRIBUTE_PINNED,
+            local_file_identity: None,
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: Some(pinned_partial),
+            provider_hydration_active: true,
+        };
+
+        assert!(
+            !should_schedule_placeholder_hydration(None, &entry, pinned_partial),
+            "provider-owned hydration should suppress overlapping explicit hydrates",
+        );
+    }
+
+    #[test]
+    fn monitor_retries_hydration_after_provider_hydration_clears() {
+        let pinned_partial = PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: CF_PIN_STATE_PINNED,
+            is_partial: true,
+        };
+        let previous = SeenEntry {
+            is_dir: false,
+            file_attributes: FILE_ATTRIBUTE_PINNED,
+            local_file_identity: None,
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: Some(pinned_partial),
+            provider_hydration_active: true,
+        };
+        let current = SeenEntry {
+            provider_hydration_active: false,
+            ..previous.clone()
+        };
+
+        assert!(
+            should_schedule_placeholder_hydration(Some(&previous), &current, pinned_partial),
+            "a stuck partial placeholder should retry once provider-owned hydration clears",
+        );
+    }
+
+    #[test]
+    fn monitor_retries_hydration_after_partial_progress_changes() {
+        let previous_partial = PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: CF_PIN_STATE_PINNED,
+            is_partial: true,
+        };
+        let current_partial = PlaceholderSnapshot {
+            on_disk_data_size: 3_883_008,
+            ..previous_partial
+        };
+        let previous = SeenEntry {
+            is_dir: false,
+            file_attributes: FILE_ATTRIBUTE_PINNED,
+            local_file_identity: None,
+            placeholder_identity_path: Some("movies/example.mp4".to_string()),
+            placeholder_state: Some(previous_partial),
+            provider_hydration_active: false,
+        };
+        let current = SeenEntry {
+            placeholder_state: Some(current_partial),
+            ..previous.clone()
+        };
+
+        assert!(
+            should_schedule_placeholder_hydration(Some(&previous), &current, current_partial),
+            "partial hydration progress should allow one more explicit hydrate pass",
         );
     }
 }
