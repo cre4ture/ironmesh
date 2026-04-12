@@ -3860,37 +3860,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             post(confirm_version),
         )
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
-        .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
-        .route(
-            "/cluster/availability/subjects/local",
-            get(local_available_subjects),
-        )
-        .route(
-            "/cluster/metadata/subjects/local",
-            get(local_metadata_subjects),
-        )
-        .route(
-            "/cluster/replication/export",
-            get(export_replication_bundle),
-        )
-        .route("/cluster/metadata/export", get(export_metadata_bundle))
-        .route(
-            "/cluster/replication/chunk/{hash}",
-            get(get_replication_chunk),
-        )
-        .route(
-            "/cluster/replication/push/chunk/{hash}",
-            post(push_replication_chunk),
-        )
-        .route(
-            "/cluster/replication/push/manifest",
-            post(push_replication_manifest),
-        )
-        .route("/cluster/replication/drop", post(drop_replication_subject))
-        .route(
-            "/cluster/reconcile/export/provisional",
-            get(export_provisional_versions),
-        )
+        .merge(build_internal_peer_api())
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -4623,6 +4593,45 @@ pub(crate) fn resolve_peer_base_url(state: &ServerState, node: &NodeDescriptor) 
             node.node_id
         ),
     }
+}
+
+pub(crate) fn build_internal_peer_api() -> Router<ServerState> {
+    Router::new()
+        .route("/cluster/nodes/{node_id}/heartbeat", post(node_heartbeat))
+        .route(
+            "/cluster/availability/subjects/local",
+            get(local_available_subjects),
+        )
+        .route(
+            "/cluster/metadata/subjects/local",
+            get(local_metadata_subjects),
+        )
+        .route(
+            "/cluster/replication/export",
+            get(export_replication_bundle),
+        )
+        .route("/cluster/metadata/export", get(export_metadata_bundle))
+        .route(
+            "/cluster/replication/chunk/{hash}",
+            get(get_replication_chunk),
+        )
+        .route(
+            "/cluster/replication/push/chunk/{hash}",
+            post(push_replication_chunk),
+        )
+        .route(
+            "/cluster/replication/push/manifest",
+            post(push_replication_manifest),
+        )
+        .route("/cluster/replication/drop", post(drop_replication_subject))
+        .route(
+            "/cluster/replication/repair",
+            post(replication::execute_replication_repair),
+        )
+        .route(
+            "/cluster/reconcile/export/provisional",
+            get(export_provisional_versions),
+        )
 }
 
 #[derive(Debug, Clone)]

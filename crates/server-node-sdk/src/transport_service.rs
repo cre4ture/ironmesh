@@ -11,18 +11,17 @@ use tower::ServiceExt;
 
 use crate::{
     BufferedTransportRequest, BufferedTransportResponse, InternalCaller, ServerState,
-    StoreIndexChangeWaitQuery, StoreIndexQuery, TransportHeader, cluster_status, commit_version,
-    complete_upload_session_route, confirm_version, copy_object_path, delete_object,
-    delete_object_by_query, delete_upload_session, drop_replication_subject, enroll_client_device,
-    execute_replication_cleanup, export_metadata_bundle, export_provisional_versions,
-    export_replication_bundle, get_media_thumbnail, get_media_thumbnail_response, get_object,
-    get_object_response, get_replication_chunk, get_upload_session, head_object, health,
-    latency_diagnostic, list_nodes, list_snapshots, list_store_index, list_store_index_response,
-    list_tombstone_archives, list_versions, list_versions_response, local_available_subjects,
-    local_metadata_subjects, placement_for_key, push_replication_chunk, push_replication_manifest,
-    put_object, reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
-    replication, replication_plan, require_client_auth, require_client_or_admin_auth,
-    require_internal_caller, restore_snapshot_path, run_cleanup, run_tombstone_archive_purge,
+    StoreIndexChangeWaitQuery, StoreIndexQuery, TransportHeader, build_internal_peer_api,
+    cluster_status, commit_version, complete_upload_session_route, confirm_version,
+    copy_object_path, delete_object, delete_object_by_query, delete_upload_session,
+    enroll_client_device, execute_replication_cleanup, get_media_thumbnail,
+    get_media_thumbnail_response, get_object, get_object_response, get_upload_session,
+    head_object, health, latency_diagnostic, list_nodes, list_snapshots, list_store_index,
+    list_store_index_response, list_tombstone_archives, list_versions,
+    list_versions_response, placement_for_key, put_object, reconcile_from_node,
+    redeem_client_bootstrap_claim, rename_object_path, replication, replication_plan,
+    require_client_auth, require_client_or_admin_auth, require_internal_caller,
+    restore_snapshot_path, run_cleanup, run_tombstone_archive_purge,
     run_tombstone_archive_restore, run_tombstone_compaction, start_upload_session,
     storage_stats_current, storage_stats_history, transport_headers_from_response,
     trigger_replication_audit, upload_session_chunk, wait_for_store_index_change,
@@ -378,36 +377,7 @@ fn build_internal_transport_router(state: ServerState) -> Router {
             post(confirm_version),
         )
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
-        .route(
-            "/cluster/availability/subjects/local",
-            get(local_available_subjects),
-        )
-        .route(
-            "/cluster/metadata/subjects/local",
-            get(local_metadata_subjects),
-        )
-        .route(
-            "/cluster/replication/export",
-            get(export_replication_bundle),
-        )
-        .route("/cluster/metadata/export", get(export_metadata_bundle))
-        .route(
-            "/cluster/replication/chunk/{hash}",
-            get(get_replication_chunk),
-        )
-        .route(
-            "/cluster/replication/push/chunk/{hash}",
-            post(push_replication_chunk),
-        )
-        .route(
-            "/cluster/replication/push/manifest",
-            post(push_replication_manifest),
-        )
-        .route("/cluster/replication/drop", post(drop_replication_subject))
-        .route(
-            "/cluster/reconcile/export/provisional",
-            get(export_provisional_versions),
-        )
+        .merge(build_internal_peer_api())
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state,

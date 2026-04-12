@@ -5887,6 +5887,26 @@ async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
 }
 
 #[tokio::test]
+async fn internal_peer_api_routes_replication_repair_locally() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    let response = super::build_internal_peer_api()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/replication/repair?scope=local")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("internal peer repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let node = cluster::NodeDescriptor {
