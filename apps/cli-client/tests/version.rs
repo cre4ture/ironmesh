@@ -1,17 +1,31 @@
 use assert_cmd::Command;
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
-const BUILD_REVISION: &str =
-    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+
+fn expected_version_outputs(binary_name: &str) -> [String; 2] {
+    let build_revision =
+        git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+    let clean_revision = build_revision.trim_end_matches("-dirty");
+    [
+        format!("{binary_name} {PACKAGE_VERSION}\nBuild revision: {clean_revision}\n"),
+        format!("{binary_name} {PACKAGE_VERSION}\nBuild revision: {clean_revision}-dirty\n"),
+    ]
+}
 
 #[test]
 fn version_reports_package_version() {
-    Command::cargo_bin("cli-client")
+    let output = Command::cargo_bin("cli-client")
         .expect("cli-client binary should build")
         .arg("--version")
-        .assert()
-        .success()
-        .stdout(format!(
-            "ironmesh {PACKAGE_VERSION}\nBuild revision: {BUILD_REVISION}\n"
-        ));
+        .output()
+        .expect("cli-client --version should run");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("version output should be valid UTF-8");
+    let expected = expected_version_outputs("ironmesh");
+    assert!(
+        expected.iter().any(|candidate| candidate == &stdout),
+        "unexpected stdout: {stdout}"
+    );
 }

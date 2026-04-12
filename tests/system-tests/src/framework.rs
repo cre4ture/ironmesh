@@ -96,6 +96,7 @@ struct TestCa {
 }
 
 static TEST_CA: OnceLock<TestCa> = OnceLock::new();
+const DEFAULT_TEST_CLUSTER_ID: &str = "11111111-1111-7111-8111-111111110000";
 
 fn test_ca() -> Result<&'static TestCa> {
     if let Some(ca) = TEST_CA.get() {
@@ -127,7 +128,7 @@ fn test_ca() -> Result<&'static TestCa> {
         .expect("TEST_CA was just initialized but is missing"))
 }
 
-fn issue_node_cert(node_id: &str) -> Result<(String, String)> {
+fn issue_node_cert(node_id: &str, cluster_id: &str) -> Result<(String, String)> {
     let ca = test_ca()?;
 
     let node_key = rcgen::KeyPair::generate().context("failed generating node key")?;
@@ -138,6 +139,7 @@ fn issue_node_cert(node_id: &str) -> Result<(String, String)> {
     );
 
     let uri = format!("urn:ironmesh:node:{node_id}");
+    let cluster_uri = format!("urn:ironmesh:cluster:{cluster_id}");
     params
         .subject_alt_names
         .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(
@@ -145,6 +147,10 @@ fn issue_node_cert(node_id: &str) -> Result<(String, String)> {
         ))));
     params.subject_alt_names.push(rcgen::SanType::URI(
         rcgen::string::Ia5String::try_from(uri.as_str()).context("invalid SAN URI")?,
+    ));
+    params.subject_alt_names.push(rcgen::SanType::URI(
+        rcgen::string::Ia5String::try_from(cluster_uri.as_str())
+            .context("invalid cluster SAN URI")?,
     ));
 
     params.extended_key_usages = vec![
@@ -159,6 +165,14 @@ fn issue_node_cert(node_id: &str) -> Result<(String, String)> {
     let key_pem = node_key.serialize_pem();
 
     Ok((cert_pem, key_pem))
+}
+
+fn cluster_id_for_test_node(extra_env: &[(&str, &str)]) -> String {
+    extra_env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (*key == "IRONMESH_CLUSTER_ID").then_some((*value).to_string()))
+        .unwrap_or_else(|| DEFAULT_TEST_CLUSTER_ID.to_string())
 }
 
 fn internal_bind_from_public_bind(public_bind: &str) -> Result<String> {
@@ -240,7 +254,7 @@ pub fn mtls_client_for_node_id(node_id: &str) -> Result<reqwest::Client> {
     let ca_cert =
         reqwest::Certificate::from_pem(ca.ca_pem.as_bytes()).context("failed parsing CA pem")?;
 
-    let (cert_pem, key_pem) = issue_node_cert(node_id)?;
+    let (cert_pem, key_pem) = issue_node_cert(node_id, DEFAULT_TEST_CLUSTER_ID)?;
     let mut identity_pem = Vec::new();
     identity_pem.extend_from_slice(cert_pem.as_bytes());
     identity_pem.extend_from_slice(b"\n");
@@ -682,6 +696,7 @@ async fn start_server_with_env_options_inner(
     let public_url = format!("{public_scheme}://{bind}");
     let internal_bind = internal_bind_from_public_bind(bind)?;
     let internal_url = format!("https://{internal_bind}");
+    let cluster_id = cluster_id_for_test_node(extra_env);
     let resource_guards =
         lock_test_resources([tcp_resource_key(bind), tcp_resource_key(&internal_bind)]).await;
 
@@ -689,7 +704,7 @@ async fn start_server_with_env_options_inner(
     fs::create_dir_all(&tls_dir).context("failed creating tls dir")?;
 
     let ca_pem = test_ca()?.ca_pem.as_bytes().to_vec();
-    let (node_cert_pem, node_key_pem) = issue_node_cert(&node_id)?;
+    let (node_cert_pem, node_key_pem) = issue_node_cert(&node_id, &cluster_id)?;
 
     let ca_path = tls_dir.join("ca.pem");
     let cert_path = tls_dir.join("node.pem");
@@ -709,6 +724,7 @@ async fn start_server_with_env_options_inner(
         .env("IRONMESH_SERVER_BIND", bind)
         .env("IRONMESH_PUBLIC_URL", public_url)
         .env("IRONMESH_DATA_DIR", data_dir)
+        .env("IRONMESH_CLUSTER_ID", &cluster_id)
         .env("IRONMESH_NODE_ID", &node_id)
         .env("IRONMESH_INTERNAL_BIND", internal_bind)
         .env("IRONMESH_INTERNAL_URL", internal_url)

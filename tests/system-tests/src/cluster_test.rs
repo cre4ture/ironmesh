@@ -1574,6 +1574,28 @@ mod tests {
         let base_c = format!("http://{bind_c}");
         let base_d = format!("http://{bind_d}");
         let base_e = format!("http://{bind_e}");
+        let internal_nodes = vec![
+            (
+                internal_base_url_from_public_bind(bind_a)?,
+                mtls_client_from_data_dir(&data_a)?,
+            ),
+            (
+                internal_base_url_from_public_bind(bind_b)?,
+                mtls_client_from_data_dir(&data_b)?,
+            ),
+            (
+                internal_base_url_from_public_bind(bind_c)?,
+                mtls_client_from_data_dir(&data_c)?,
+            ),
+            (
+                internal_base_url_from_public_bind(bind_d)?,
+                mtls_client_from_data_dir(&data_d)?,
+            ),
+            (
+                internal_base_url_from_public_bind(bind_e)?,
+                mtls_client_from_data_dir(&data_e)?,
+            ),
+        ];
         let client = reqwest::Client::new();
 
         let result = async {
@@ -1614,10 +1636,10 @@ mod tests {
             }
 
             let mut missing_before_reads = Vec::new();
-            for (base_url, _, _, _) in &nodes {
-                let subjects = local_available_subjects(&client, base_url).await?;
+            for (index, (internal_base_url, internal_client)) in internal_nodes.iter().enumerate() {
+                let subjects = local_available_subjects(internal_client, internal_base_url).await?;
                 if !subjects.contains(key) {
-                    missing_before_reads.push((*base_url).to_string());
+                    missing_before_reads.push(index);
                 }
             }
 
@@ -1630,8 +1652,10 @@ mod tests {
                 wait_for_store_object_bytes(&client, base_url, key, &payload, 160).await?;
             }
 
-            for base_url in &missing_before_reads {
-                wait_for_local_available_subject(&client, base_url, key, true, 160).await?;
+            for index in &missing_before_reads {
+                let (internal_base_url, internal_client) = &internal_nodes[*index];
+                wait_for_local_available_subject(internal_client, internal_base_url, key, true, 160)
+                    .await?;
             }
 
             Ok::<(), anyhow::Error>(())
