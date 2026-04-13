@@ -16,5 +16,4 @@ web/test-results
 !.vscode/extensions.json
 ironmesh-client-*.json
 map/
-start_node.sh
 windows/thumbnail-provider/out/
