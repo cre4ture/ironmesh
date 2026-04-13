@@ -18,6 +18,8 @@ import type {
   NodeCertificateStatusResponse,
   NodeDescriptor,
   NodeEnrollmentPackage,
+  RepairActivityStatusResponse,
+  RepairHistoryResponse,
   RendezvousConfigView,
   ReplicationPlan,
   ServerHealthResponse,
@@ -235,11 +237,40 @@ export async function getReplicationPlan(
   });
 }
 
-export async function triggerReplicationRepair(): Promise<Record<string, unknown>> {
-  return fetchJson<Record<string, unknown>>("/cluster/replication/repair?scope=cluster", {
+export async function getRepairActivityStatus(
+  adminTokenOverride?: string
+): Promise<RepairActivityStatusResponse> {
+  return fetchAdminJson<RepairActivityStatusResponse>("/auth/repair/activity", {
+    adminTokenOverride
+  });
+}
+
+export async function getRepairHistory(
+  options?: {
+    limit?: number;
+    sinceUnix?: number;
+  },
+  adminTokenOverride?: string
+): Promise<RepairHistoryResponse> {
+  const query = new URLSearchParams();
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.trunc(options.limit))));
+  }
+  if (typeof options?.sinceUnix === "number" && Number.isFinite(options.sinceUnix)) {
+    query.set("since_unix", String(Math.max(0, Math.trunc(options.sinceUnix))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return fetchAdminJson<RepairHistoryResponse>(`/auth/repair/history${suffix}`, {
+    adminTokenOverride
+  });
+}
+
+export async function triggerReplicationRepair(
+  adminTokenOverride?: string
+): Promise<Record<string, unknown>> {
+  return fetchAdminJson<Record<string, unknown>>("/cluster/replication/repair?scope=cluster", {
     method: "POST",
-    credentials: "same-origin",
-    cache: "no-store"
+    adminTokenOverride
   });
 }
 

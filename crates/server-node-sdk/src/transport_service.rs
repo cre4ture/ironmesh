@@ -296,7 +296,7 @@ fn build_public_transport_router(state: ServerState) -> Router {
         )
         .route(
             "/cluster/replication/repair",
-            post(replication::execute_replication_repair),
+            post(replication::execute_replication_repair_public),
         )
         .route(
             "/cluster/replication/cleanup",

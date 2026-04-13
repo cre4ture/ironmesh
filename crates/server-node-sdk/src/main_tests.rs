@@ -4,7 +4,7 @@ use super::{
     build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
     jittered_backoff_secs, lock_store, new_store_rwlock, node_descriptor_from_presence_entry,
     plan_peer_transport, replication::build_internal_replication_put_url, resolve_peer_base_url,
-    run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
+    read_store, run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
     token_matches,
 };
 use axum::Extension;
@@ -5667,6 +5667,7 @@ async fn build_test_state(
         cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
         storage_stats_history_retention_secs: super::STORAGE_STATS_HISTORY_RETENTION_SECS,
+        repair_run_history_retention_secs: super::REPAIR_RUN_HISTORY_RETENTION_SECS,
         map_perf_logging_enabled: false,
         map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
         mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<
@@ -5736,6 +5737,7 @@ async fn build_test_state(
         log_buffer: Arc::new(super::LogBuffer::new(64)),
         startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+        repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
         local_availability_refresh_lock: Arc::new(Mutex::new(())),
         local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),
         storage_stats_runtime: Arc::new(Mutex::new(super::StorageStatsRuntime::default())),
@@ -6145,8 +6147,65 @@ async fn internal_peer_api_routes_replication_repair_locally() {
         .expect("internal peer repair route should respond");
 
     assert_eq!(response.status(), StatusCode::OK);
+
+    let repair_runs = {
+        let store = read_store(&state, "tests.repair_run_history.peer_route").await;
+        store.list_repair_run_history(Some(4), None).await.unwrap()
+    };
+    assert_eq!(repair_runs.len(), 1);
+    assert_eq!(
+        repair_runs[0].trigger,
+        super::RepairRunTrigger::PeerClusterRequest
+    );
+    assert_eq!(
+        repair_runs[0].scope,
+        super::replication::ReplicationRepairScope::Local
+    );
+    assert_eq!(repair_runs[0].status, super::RepairRunStatus::Completed);
+
     cleanup_test_state(&state).await;
 }
+
+async fn tracked_local_replication_repair_persists_history_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+
+    let report = super::execute_tracked_local_replication_repair(
+        &state,
+        None,
+        super::RepairRunTrigger::ManualRequest,
+        None,
+    )
+    .await;
+
+    let repair_runs = {
+        let store = read_store(&state, "tests.repair_run_history.manual_trigger").await;
+        store.list_repair_run_history(Some(4), None).await.unwrap()
+    };
+    assert_eq!(repair_runs.len(), 1);
+    assert_eq!(repair_runs[0].trigger, super::RepairRunTrigger::ManualRequest);
+    assert_eq!(
+        repair_runs[0].scope,
+        super::replication::ReplicationRepairScope::Local
+    );
+    assert_eq!(repair_runs[0].status, super::RepairRunStatus::Completed);
+    assert_eq!(
+        repair_runs[0]
+            .summary
+            .as_ref()
+            .map(|summary| summary.attempted_transfers),
+        Some(report.attempted_transfers)
+    );
+    assert!(repair_runs[0].report.is_some());
+    assert!(state.repair_activity.lock().await.active_runs.is_empty());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    tracked_local_replication_repair_persists_history_impl,
+    tracked_local_replication_repair_persists_history,
+    tracked_local_replication_repair_persists_history_turso
+);
 
 async fn cluster_replication_repair_report_includes_skipped_details_impl(backend: MainTestBackend) {
     let state = build_test_state(2, true, backend).await;

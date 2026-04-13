@@ -79,6 +79,81 @@ export type ReplicationPlan = {
   }>;
 };
 
+export type ReplicationRepairScope = "local" | "cluster";
+
+export type RepairRunTrigger =
+  | "manual_request"
+  | "startup_repair"
+  | "background_audit"
+  | "autonomous_post_write"
+  | "peer_cluster_request";
+
+export type RepairRunStatus = "completed" | "skipped_no_gaps";
+
+export type RepairActivityState = "idle" | "scheduled" | "running";
+
+export type StartupRepairStatus =
+  | "disabled"
+  | "scheduled"
+  | "running"
+  | "skipped_no_gaps"
+  | "completed";
+
+export type RepairPlanSummary = {
+  generated_at_unix: number;
+  under_replicated: number;
+  over_replicated: number;
+  cleanup_deferred_items: number;
+  cleanup_deferred_extra_nodes: number;
+  item_count: number;
+};
+
+export type RepairRunSummary = {
+  attempted_transfers: number;
+  successful_transfers: number;
+  failed_transfers: number;
+  skipped_items: number;
+  skipped_backoff: number;
+  skipped_max_retries: number;
+  skipped_detail_count: number;
+  last_error?: string | null;
+  nodes_contacted?: number | null;
+  failed_nodes?: number | null;
+};
+
+export type RepairRunRecord = {
+  run_id: string;
+  reporting_node_id: string;
+  scope: ReplicationRepairScope;
+  trigger: RepairRunTrigger;
+  status: RepairRunStatus;
+  started_at_unix: number;
+  finished_at_unix: number;
+  duration_ms: number;
+  plan_summary: RepairPlanSummary;
+  summary?: RepairRunSummary | null;
+  report?: Record<string, unknown> | null;
+};
+
+export type RepairActiveRun = {
+  run_id: string;
+  scope: ReplicationRepairScope;
+  trigger: RepairRunTrigger;
+  started_at_unix: number;
+};
+
+export type RepairHistoryResponse = {
+  retention_secs: number;
+  runs: RepairRunRecord[];
+};
+
+export type RepairActivityStatusResponse = {
+  state: RepairActivityState;
+  startup_status: StartupRepairStatus;
+  active_runs: RepairActiveRun[];
+  latest_run?: RepairRunRecord | null;
+};
+
 export type LogsResponse = {
   entries: string[];
 };

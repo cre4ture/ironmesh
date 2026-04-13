@@ -1,5 +1,6 @@
-import { IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconFolder, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
+import { IconActivity, IconArrowsTransferUp, IconCertificate, IconDashboard, IconFileText, IconFolder, IconKey, IconPhoto, IconPlugConnected, IconServerCog } from "@tabler/icons-react";
 import { DashboardPage } from "../pages/DashboardPage";
+import { RepairPage } from "../pages/RepairPage";
 import { SetupPage } from "../pages/SetupPage";
 import { BootstrapBundlesPage } from "../pages/BootstrapBundlesPage";
 import { ClientCredentialsPage } from "../pages/ClientCredentialsPage";
@@ -16,6 +17,13 @@ export const serverAdminRoutes = [
     description: "Cluster health, replication state, and recent server activity.",
     icon: IconDashboard,
     element: <DashboardPage />
+  },
+  {
+    id: "repair",
+    label: "Repair",
+    description: "Monitor live repair activity, inspect retained repair runs, and trigger cluster repair passes without crowding the dashboard.",
+    icon: IconActivity,
+    element: <RepairPage />
   },
   {
     id: "setup",

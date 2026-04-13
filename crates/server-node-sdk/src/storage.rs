@@ -30,6 +30,7 @@ mod turso_impl;
 use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]
 use self::turso_impl::TursoMetadataStore;
+use super::RepairRunRecord;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
@@ -695,6 +696,13 @@ trait MetadataStore: Send + Sync {
         &self,
         attempts: &HashMap<String, RepairAttemptRecord>,
     ) -> Result<()>;
+    async fn list_repair_run_history(
+        &self,
+        limit: Option<usize>,
+        finished_since_unix: Option<u64>,
+    ) -> Result<Vec<RepairRunRecord>>;
+    async fn persist_repair_run_record(&self, record: &RepairRunRecord) -> Result<()>;
+    async fn prune_repair_run_history_before(&self, finished_before_unix: u64) -> Result<()>;
     async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>>;
     async fn persist_cluster_replicas(&self, replicas: &HashMap<String, Vec<NodeId>>)
     -> Result<()>;
@@ -1806,6 +1814,29 @@ impl PersistentStore {
         self.metadata_store.persist_repair_attempts(attempts).await
     }
 
+    pub async fn list_repair_run_history(
+        &self,
+        limit: Option<usize>,
+        finished_since_unix: Option<u64>,
+    ) -> Result<Vec<RepairRunRecord>> {
+        self.metadata_store
+            .list_repair_run_history(limit, finished_since_unix)
+            .await
+    }
+
+    pub async fn persist_repair_run_record(&self, record: &RepairRunRecord) -> Result<()> {
+        self.metadata_store.persist_repair_run_record(record).await
+    }
+
+    pub async fn prune_repair_run_history_before(
+        &self,
+        finished_before_unix: u64,
+    ) -> Result<()> {
+        self.metadata_store
+            .prune_repair_run_history_before(finished_before_unix)
+            .await
+    }
+
     pub async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
         self.metadata_store.load_cluster_replicas().await
     }
@@ -2432,7 +2463,11 @@ impl PersistentStore {
         read_mode: ObjectReadMode,
     ) -> Result<Option<ReplicationExportBundle>> {
         let object_id = if version_id.is_some() {
-            self.resolve_object_id_for_key_history(key).await?
+            self.resolve_object_id_for_key_version(
+                key,
+                version_id.expect("version_id.is_some() checked above"),
+            )
+            .await?
         } else {
             self.object_id_for_key(key)
         };
@@ -2557,7 +2592,11 @@ impl PersistentStore {
         read_mode: ObjectReadMode,
     ) -> Result<Option<MetadataExportBundle>> {
         let object_id = if version_id.is_some() {
-            self.resolve_object_id_for_key_history(key).await?
+            self.resolve_object_id_for_key_version(
+                key,
+                version_id.expect("version_id.is_some() checked above"),
+            )
+            .await?
         } else {
             self.object_id_for_key(key)
                 .or(self.resolve_object_id_for_key_history(key).await?)
@@ -4122,12 +4161,30 @@ impl PersistentStore {
     }
 
     #[cfg(test)]
+    pub async fn persist_repair_run_record_for_test(
+        &self,
+        record: &RepairRunRecord,
+    ) -> Result<()> {
+        self.metadata_store.persist_repair_run_record(record).await
+    }
+
+    #[cfg(test)]
     pub async fn prune_storage_stats_history_before(
         &self,
         collected_before_unix: u64,
     ) -> Result<()> {
         self.storage_stats_collector()
             .prune_storage_stats_history_before(collected_before_unix)
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn prune_repair_run_history_before_for_test(
+        &self,
+        finished_before_unix: u64,
+    ) -> Result<()> {
+        self.metadata_store
+            .prune_repair_run_history_before(finished_before_unix)
             .await
     }
 
@@ -4919,6 +4976,33 @@ impl PersistentStore {
 
         for index in self.load_all_version_indexes().await? {
             if self.resolve_key_for_version_index(&index).await?.as_deref() == Some(key) {
+                return Ok(Some(index.object_id));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_object_id_for_key_version(
+        &self,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Option<String>> {
+        if let Some(object_id) = self.object_id_for_key(key)
+            && let Some(index) = self.load_version_index_by_object_id(&object_id).await?
+            && index.versions.contains_key(version_id)
+        {
+            return Ok(Some(object_id));
+        }
+
+        for index in self.load_all_version_indexes().await? {
+            let Some(record) = index.versions.get(version_id) else {
+                continue;
+            };
+
+            if record.logical_path.as_deref() == Some(key)
+                || self.resolve_key_for_version_index(&index).await?.as_deref() == Some(key)
+            {
                 return Ok(Some(index.object_id));
             }
         }

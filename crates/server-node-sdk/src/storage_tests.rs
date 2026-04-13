@@ -1447,6 +1447,141 @@ run_on_all_metadata_backends!(
     rename_replication_subjects_include_source_path_deletion_event_turso
 );
 
+async fn versioned_exports_preserve_historical_rename_tombstone_after_key_reuse_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("versioned-export-historical-rename-tombstone")
+        .await;
+
+    store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"before-rename"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let mutation = store
+        .rename_object_path("docs/a.txt", "docs/b.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    let tombstone_subject = store
+        .list_metadata_subjects()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|subject| subject.starts_with("docs/a.txt@rename-tomb-"))
+        .expect("expected rename tombstone subject for original path");
+    let (_, tombstone_version_id) = tombstone_subject
+        .split_once('@')
+        .expect("rename tombstone subject should include version id");
+    let tombstone_version_id = tombstone_version_id.to_string();
+
+    let tombstone_metadata_before_reuse = store
+        .export_metadata_bundle(
+            "docs/a.txt",
+            Some(&tombstone_version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected metadata export bundle before key reuse");
+    let tombstone_object_id = tombstone_metadata_before_reuse
+        .object_id
+        .clone()
+        .expect("historical tombstone export should include object id");
+
+    let tombstone_replication_before_reuse = store
+        .export_replication_bundle(
+            "docs/a.txt",
+            Some(&tombstone_version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected replication export bundle before key reuse");
+    assert_eq!(
+        tombstone_replication_before_reuse.version_id.as_deref(),
+        Some(tombstone_version_id.as_str())
+    );
+    assert_eq!(
+        tombstone_replication_before_reuse.manifest_hash,
+        TOMBSTONE_MANIFEST_HASH
+    );
+
+    store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"after-recreate"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let current_versions = store
+        .list_versions("docs/a.txt")
+        .await
+        .unwrap()
+        .expect("recreated key should have versions");
+    assert_ne!(current_versions.object_id, tombstone_object_id);
+
+    let metadata_subjects = store.list_metadata_subjects().await.unwrap();
+    assert!(
+        metadata_subjects.contains(&tombstone_subject),
+        "expected historical rename tombstone to stay advertised after key reuse, subjects={metadata_subjects:?}"
+    );
+
+    let tombstone_metadata_after_reuse = store
+        .export_metadata_bundle(
+            "docs/a.txt",
+            Some(&tombstone_version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected metadata export bundle for advertised historical rename tombstone");
+    assert_eq!(
+        tombstone_metadata_after_reuse.object_id.as_deref(),
+        Some(tombstone_object_id.as_str())
+    );
+    assert_eq!(tombstone_metadata_after_reuse.versions.len(), 1);
+    assert_eq!(
+        tombstone_metadata_after_reuse.versions[0].version_id,
+        tombstone_version_id
+    );
+
+    let tombstone_replication_after_reuse = store
+        .export_replication_bundle(
+            "docs/a.txt",
+            Some(&tombstone_version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("expected replication export bundle for advertised historical rename tombstone");
+    assert_eq!(
+        tombstone_replication_after_reuse.version_id.as_deref(),
+        Some(tombstone_version_id.as_str())
+    );
+    assert_eq!(
+        tombstone_replication_after_reuse.manifest_hash,
+        TOMBSTONE_MANIFEST_HASH
+    );
+    assert!(tombstone_replication_after_reuse.manifest.chunks.is_empty());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    versioned_exports_preserve_historical_rename_tombstone_after_key_reuse_impl,
+    versioned_exports_preserve_historical_rename_tombstone_after_key_reuse,
+    versioned_exports_preserve_historical_rename_tombstone_after_key_reuse_turso
+);
+
 async fn copy_creates_new_object_id_with_provenance_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("copy-provenance-object-id").await;
 
@@ -2896,4 +3031,104 @@ run_on_all_metadata_backends!(
     storage_stats_history_since_filters_samples_impl,
     storage_stats_history_since_filters_samples,
     storage_stats_history_since_filters_samples_turso
+);
+
+async fn repair_run_history_roundtrip_and_prune_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("repair-run-history-roundtrip").await;
+
+    let older = super::super::RepairRunRecord {
+        run_id: "repair-run-older".to_string(),
+        reporting_node_id: NodeId::nil(),
+        scope: super::super::replication::ReplicationRepairScope::Local,
+        trigger: super::super::RepairRunTrigger::ManualRequest,
+        status: super::super::RepairRunStatus::Completed,
+        started_at_unix: 900,
+        finished_at_unix: 1_000,
+        duration_ms: 100,
+        plan_summary: super::super::RepairPlanSummary {
+            generated_at_unix: 900,
+            under_replicated: 1,
+            over_replicated: 0,
+            cleanup_deferred_items: 0,
+            cleanup_deferred_extra_nodes: 0,
+            item_count: 1,
+        },
+        summary: Some(super::super::RepairRunSummary {
+            attempted_transfers: 1,
+            successful_transfers: 1,
+            failed_transfers: 0,
+            skipped_items: 0,
+            skipped_backoff: 0,
+            skipped_max_retries: 0,
+            skipped_detail_count: 0,
+            last_error: None,
+            nodes_contacted: None,
+            failed_nodes: None,
+        }),
+        report: Some(serde_json::json!({ "status": "older" })),
+    };
+    let newer = super::super::RepairRunRecord {
+        run_id: "repair-run-newer".to_string(),
+        reporting_node_id: NodeId::nil(),
+        scope: super::super::replication::ReplicationRepairScope::Cluster,
+        trigger: super::super::RepairRunTrigger::BackgroundAudit,
+        status: super::super::RepairRunStatus::Completed,
+        started_at_unix: 1_900,
+        finished_at_unix: 2_000,
+        duration_ms: 200,
+        plan_summary: super::super::RepairPlanSummary {
+            generated_at_unix: 1_900,
+            under_replicated: 2,
+            over_replicated: 1,
+            cleanup_deferred_items: 1,
+            cleanup_deferred_extra_nodes: 2,
+            item_count: 3,
+        },
+        summary: Some(super::super::RepairRunSummary {
+            attempted_transfers: 3,
+            successful_transfers: 2,
+            failed_transfers: 1,
+            skipped_items: 4,
+            skipped_backoff: 1,
+            skipped_max_retries: 1,
+            skipped_detail_count: 4,
+            last_error: Some("latest error".to_string()),
+            nodes_contacted: Some(2),
+            failed_nodes: Some(1),
+        }),
+        report: Some(serde_json::json!({ "status": "newer" })),
+    };
+
+    store.persist_repair_run_record_for_test(&older).await.unwrap();
+    store.persist_repair_run_record_for_test(&newer).await.unwrap();
+
+    let history = store.list_repair_run_history(Some(8), None).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].run_id, newer.run_id);
+    assert_eq!(history[1].run_id, older.run_id);
+
+    let filtered = store
+        .list_repair_run_history(None, Some(1_500))
+        .await
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].run_id, newer.run_id);
+
+    store
+        .prune_repair_run_history_before_for_test(1_500)
+        .await
+        .unwrap();
+
+    let remaining = store.list_repair_run_history(Some(8), None).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].run_id, newer.run_id);
+    assert_eq!(remaining[0].summary.as_ref().and_then(|summary| summary.failed_nodes), Some(1));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    repair_run_history_roundtrip_and_prune_impl,
+    repair_run_history_roundtrip_and_prune,
+    repair_run_history_roundtrip_and_prune_turso
 );

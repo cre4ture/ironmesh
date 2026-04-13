@@ -75,21 +75,67 @@ pub(crate) struct ReplicationRepairQuery {
     scope: Option<ReplicationRepairScope>,
 }
 
-pub(crate) async fn execute_replication_repair(
+async fn execute_replication_repair_with_trigger(
     State(state): State<ServerState>,
     Query(query): Query<ReplicationRepairQuery>,
+    trigger: RepairRunTrigger,
+    force_local_scope: bool,
 ) -> impl IntoResponse {
     let batch_override = query.batch_size.filter(|v| *v > 0);
-    match query.scope.unwrap_or_default() {
+    let scope = if force_local_scope {
+        ReplicationRepairScope::Local
+    } else {
+        query.scope.unwrap_or_default()
+    };
+
+    match scope {
         ReplicationRepairScope::Local => {
-            let report = execute_replication_repair_inner(&state, batch_override).await;
+            let report = execute_tracked_local_replication_repair(
+                &state,
+                batch_override,
+                trigger,
+                None,
+            )
+            .await;
             (StatusCode::OK, Json(report)).into_response()
         }
         ReplicationRepairScope::Cluster => {
-            let report = execute_cluster_replication_repair_inner(&state, batch_override).await;
+            let report = execute_tracked_cluster_replication_repair(
+                &state,
+                batch_override,
+                trigger,
+                None,
+            )
+            .await;
             (StatusCode::OK, Json(report)).into_response()
         }
     }
+}
+
+pub(crate) async fn execute_replication_repair_public(
+    state: State<ServerState>,
+    query: Query<ReplicationRepairQuery>,
+) -> impl IntoResponse {
+    execute_replication_repair_with_trigger(
+        state,
+        query,
+        RepairRunTrigger::ManualRequest,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn execute_replication_repair_peer(
+    state: State<ServerState>,
+    query: Query<ReplicationRepairQuery>,
+) -> impl IntoResponse {
+    execute_replication_repair_with_trigger(
+        state,
+        query,
+        RepairRunTrigger::PeerClusterRequest,
+        false,
+    )
+    .await
 }
 
 pub(crate) async fn execute_replication_repair_inner(
@@ -452,7 +498,7 @@ pub(crate) async fn execute_replication_repair_inner(
     }
 }
 
-async fn execute_cluster_replication_repair_inner(
+pub(crate) async fn execute_cluster_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ClusterReplicationRepairReport {
