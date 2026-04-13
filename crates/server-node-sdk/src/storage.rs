@@ -1567,12 +1567,11 @@ impl ReplicationSubjectInspector {
                 continue;
             }
 
-            let Some(key) = self.resolve_key_for_version_index(&index).await? else {
-                continue;
-            };
-
             for head_version_id in &index.head_version_ids {
                 let Some(record) = index.versions.get(head_version_id) else {
+                    continue;
+                };
+                let Some(key) = self.resolve_key_for_version_record(&index, record).await? else {
                     continue;
                 };
                 if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
@@ -1675,6 +1674,24 @@ impl ReplicationSubjectInspector {
         }
 
         Ok(None)
+    }
+
+    async fn resolve_key_for_version_record(
+        &self,
+        index: &FileVersionIndex,
+        record: &FileVersionRecord,
+    ) -> Result<Option<String>> {
+        if let Some(logical_path) = record.logical_path.clone() {
+            return Ok(Some(logical_path));
+        }
+
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH
+            && let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await?
+        {
+            return Ok(Some(manifest.key));
+        }
+
+        self.resolve_key_for_version_index(index).await
     }
 }
 
@@ -1996,17 +2013,14 @@ impl PersistentStore {
                 continue;
             }
 
-            let Some(key) = self.resolve_key_for_version_index(&index).await? else {
-                continue;
-            };
-
             for head_version_id in &index.head_version_ids {
-                if index
-                    .versions
-                    .get(head_version_id)
-                    .map(|record| record.manifest_hash == TOMBSTONE_MANIFEST_HASH)
-                    .unwrap_or(false)
-                {
+                let Some(record) = index.versions.get(head_version_id) else {
+                    continue;
+                };
+                let Some(key) = self.resolve_key_for_version_record(&index, record).await? else {
+                    continue;
+                };
+                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
                     subjects.insert(format!("{key}@{head_version_id}"));
                 }
             }
@@ -2049,12 +2063,11 @@ impl PersistentStore {
                 continue;
             }
 
-            let Some(key) = self.resolve_key_for_version_index(&index).await? else {
-                continue;
-            };
-
             for head_version_id in &index.head_version_ids {
                 let Some(record) = index.versions.get(head_version_id) else {
+                    continue;
+                };
+                let Some(key) = self.resolve_key_for_version_record(&index, record).await? else {
                     continue;
                 };
                 if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
@@ -5001,7 +5014,11 @@ impl PersistentStore {
             };
 
             if record.logical_path.as_deref() == Some(key)
-                || self.resolve_key_for_version_index(&index).await?.as_deref() == Some(key)
+                || self
+                    .resolve_key_for_version_record(&index, record)
+                    .await?
+                    .as_deref()
+                    == Some(key)
             {
                 return Ok(Some(index.object_id));
             }
@@ -5042,6 +5059,24 @@ impl PersistentStore {
         }
 
         Ok(None)
+    }
+
+    async fn resolve_key_for_version_record(
+        &self,
+        index: &FileVersionIndex,
+        record: &FileVersionRecord,
+    ) -> Result<Option<String>> {
+        if let Some(logical_path) = record.logical_path.clone() {
+            return Ok(Some(logical_path));
+        }
+
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH
+            && let Some(manifest) = self.load_manifest_by_hash(&record.manifest_hash).await?
+        {
+            return Ok(Some(manifest.key));
+        }
+
+        self.resolve_key_for_version_index(index).await
     }
 
     async fn create_snapshot(&self) -> Result<String> {

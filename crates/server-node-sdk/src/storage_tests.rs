@@ -1447,6 +1447,126 @@ run_on_all_metadata_backends!(
     rename_replication_subjects_include_source_path_deletion_event_turso
 );
 
+async fn rename_replication_subjects_use_each_heads_own_logical_path_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("rename-replication-subjects-own-head-path")
+        .await;
+
+    store
+        .put_object_versioned(
+            "docs/a.txt",
+            Bytes::from_static(b"hello"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let mutation = store
+        .rename_object_path("docs/a.txt", "docs/b.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(mutation, PathMutationResult::Applied);
+
+    let renamed_object_id = store
+        .current_state
+        .object_ids
+        .get("docs/b.txt")
+        .cloned()
+        .expect("renamed destination path should remain current");
+    let renamed_index = store
+        .load_version_index_by_object_id(&renamed_object_id)
+        .await
+        .unwrap()
+        .expect("renamed destination should have a version index");
+    let renamed_record = renamed_index
+        .versions
+        .values()
+        .find(|record| record.version_id.starts_with("ren-"))
+        .cloned()
+        .expect("expected renamed head version record");
+
+    let tombstone_subject = store
+        .list_metadata_subjects()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|subject| subject.starts_with("docs/a.txt@rename-tomb-"))
+        .expect("expected rename tombstone subject on source path");
+    let (_, tombstone_version_id) = tombstone_subject
+        .split_once('@')
+        .expect("rename tombstone subject should include version id");
+    let tombstone_object_id = store
+        .resolve_object_id_for_key_version("docs/a.txt", tombstone_version_id)
+        .await
+        .unwrap()
+        .expect("expected object id for rename tombstone");
+    let mut tombstone_index = store
+        .load_version_index_by_object_id(&tombstone_object_id)
+        .await
+        .unwrap()
+        .expect("expected version index for rename tombstone");
+
+    let mut divergent_renamed_record = renamed_record.clone();
+    divergent_renamed_record.object_id = tombstone_object_id.clone();
+    tombstone_index
+        .versions
+        .insert(divergent_renamed_record.version_id.clone(), divergent_renamed_record.clone());
+    tombstone_index.head_version_ids = vec![
+        tombstone_version_id.to_string(),
+        divergent_renamed_record.version_id.clone(),
+    ];
+    tombstone_index.preferred_head_version_id = Some(tombstone_version_id.to_string());
+    store
+        .persist_version_index_by_object_id(&tombstone_object_id, &tombstone_index)
+        .await
+        .unwrap();
+
+    let subjects = store.list_replication_subjects().await.unwrap();
+    assert!(
+        subjects.contains(&format!("docs/b.txt@{}", divergent_renamed_record.version_id)),
+        "renamed head should remain advertised on its destination path, subjects={subjects:?}"
+    );
+    assert!(
+        !subjects.contains(&format!("docs/a.txt@{}", divergent_renamed_record.version_id)),
+        "renamed head must not be advertised under the old path, subjects={subjects:?}"
+    );
+
+    let wrong_export = store
+        .export_replication_bundle(
+            "docs/a.txt",
+            Some(&divergent_renamed_record.version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrong_export.is_none(),
+        "source path should not resolve to renamed destination version"
+    );
+
+    let right_export = store
+        .export_replication_bundle(
+            "docs/b.txt",
+            Some(&divergent_renamed_record.version_id),
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .expect("destination path should resolve the renamed version");
+    assert_eq!(right_export.key, "docs/b.txt");
+    assert_eq!(right_export.manifest.key, "docs/b.txt");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    rename_replication_subjects_use_each_heads_own_logical_path_impl,
+    rename_replication_subjects_use_each_heads_own_logical_path,
+    rename_replication_subjects_use_each_heads_own_logical_path_turso
+);
+
 async fn versioned_exports_preserve_historical_rename_tombstone_after_key_reuse_impl(
     backend: StorageTestBackend,
 ) {
