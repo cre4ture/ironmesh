@@ -496,13 +496,21 @@ mod tests {
         assert!(state.contains_key("nested/inner"));
         assert!(state.contains_key("nested/file.txt"));
         assert!(!progress_updates.is_empty());
-        assert!(progress_updates.iter().any(|progress| progress.scanned_entry_count >= 3));
+        assert!(
+            progress_updates
+                .iter()
+                .any(|progress| progress.scanned_entry_count >= 3)
+        );
         assert_eq!(
-            progress_updates.last().map(|progress| progress.pending_directory_count),
+            progress_updates
+                .last()
+                .map(|progress| progress.pending_directory_count),
             Some(0)
         );
         assert_eq!(
-            progress_updates.last().and_then(|progress| progress.current_path.clone()),
+            progress_updates
+                .last()
+                .and_then(|progress| progress.current_path.clone()),
             None
         );
 

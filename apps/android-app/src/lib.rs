@@ -75,7 +75,10 @@ mod tests {
         assert_eq!(status.syncing_profile_count, 1);
         assert_eq!(status.running_profile_count, 1);
         assert_eq!(status.last_success_unix_ms, Some(250));
-        assert_eq!(status.current_activity, "Docs: Folder sync runtime failed: boom");
+        assert_eq!(
+            status.current_activity,
+            "Docs: Folder sync runtime failed: boom"
+        );
         assert!(status.service_message.contains("1 with errors"));
         assert!(status.active_summary.contains("Photos: running"));
     }
@@ -599,15 +602,17 @@ fn rebuild_service_summary(status: &mut AndroidFolderSyncServiceStatus) {
         .filter_map(|profile| profile.last_success_unix_ms)
         .max();
 
-    let primary_profile = active_profiles.iter().copied().min_by_key(|profile| {
-        match profile.state.as_str() {
-            "error" => 0,
-            "syncing" => 1,
-            "starting" => 2,
-            "running" => 3,
-            _ => 4,
-        }
-    });
+    let primary_profile =
+        active_profiles
+            .iter()
+            .copied()
+            .min_by_key(|profile| match profile.state.as_str() {
+                "error" => 0,
+                "syncing" => 1,
+                "starting" => 2,
+                "running" => 3,
+                _ => 4,
+            });
 
     status.current_activity = primary_profile
         .map(|profile| {
@@ -659,8 +664,7 @@ fn rebuild_service_summary(status: &mut AndroidFolderSyncServiceStatus) {
     } else if starting_profiles > 0 {
         format!(
             "Starting {} profile(s); {} already watching",
-            starting_profiles,
-            running_profiles
+            starting_profiles, running_profiles
         )
     } else {
         format!("Watching {} profile(s)", running_profiles)

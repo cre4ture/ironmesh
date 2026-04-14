@@ -4115,8 +4115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_claim_enrollment_succeeds_via_relay_with_auth_required_node() -> Result<()>
-    {
+    async fn bootstrap_claim_enrollment_succeeds_via_relay_with_auth_required_node() -> Result<()> {
         let rendezvous_bind = "127.0.0.1:19220";
         let bind = "127.0.0.1:19221";
         let cluster_id = "11111111-1111-7111-8111-111111111120";
@@ -4138,8 +4137,7 @@ mod tests {
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
-        let mut node =
-            start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let mut node = start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
         let http = reqwest::Client::new();
 
         let result = async {
@@ -4196,8 +4194,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_claim_enrollment_fails_when_node_not_registered_at_rendezvous()
-    -> Result<()> {
+    async fn bootstrap_claim_enrollment_fails_when_node_not_registered_at_rendezvous() -> Result<()>
+    {
         // PresenceRegistry has no TTL — entries are never evicted when a node disconnects.
         // Instead of stopping the node and waiting for deregistration (which never happens),
         // we redirect the claim's rendezvous URL to a fresh rendezvous that has no nodes,
@@ -4226,8 +4224,7 @@ mod tests {
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
         let mut empty_rendezvous = start_rendezvous_service(empty_rendezvous_bind).await?;
-        let mut node =
-            start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
+        let mut node = start_open_server_with_env(bind, &data_dir, node_id, 1, &node_env).await?;
         let http = reqwest::Client::new();
 
         let result = async {

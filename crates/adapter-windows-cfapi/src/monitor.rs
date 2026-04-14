@@ -207,8 +207,7 @@ fn should_schedule_placeholder_hydration(
         return false;
     }
 
-    let previous_was_hydrate_eligible = previous_entry
-        .has_pinned_attribute()
+    let previous_was_hydrate_eligible = previous_entry.has_pinned_attribute()
         && previous_entry
             .placeholder_state
             .is_some_and(PlaceholderSnapshot::should_hydrate);

@@ -924,7 +924,12 @@ mod tests {
             ..previous
         };
 
-        assert!(should_request_pin_hydration(Some(previous), current, 4096, false));
+        assert!(should_request_pin_hydration(
+            Some(previous),
+            current,
+            4096,
+            false
+        ));
     }
 
     #[test]
@@ -943,7 +948,12 @@ mod tests {
             ..previous
         };
 
-        assert!(should_request_pin_hydration(Some(previous), current, 4096, false));
+        assert!(should_request_pin_hydration(
+            Some(previous),
+            current,
+            4096,
+            false
+        ));
     }
 
     #[test]

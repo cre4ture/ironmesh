@@ -116,6 +116,9 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'?');
 const RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS: u64 = 1;
 const RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 5;
+const DIRECT_PEER_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS: u64 = 300;
+const REPAIR_LOCAL_AVAILABILITY_SYNC_TIMEOUT_SECS: u64 = 30;
 const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
 const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
 const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
@@ -4997,6 +5000,14 @@ async fn execute_direct_peer_request(
     body: Vec<u8>,
 ) -> Result<PeerHttpResponse> {
     let url = join_peer_url(base_url, path_and_query)?;
+    let request_url = url.to_string();
+    let request_method = method.as_str().to_string();
+    let request_timeout_secs = if path_and_query.starts_with("/cluster/replication/repair") {
+        DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS
+    } else {
+        DIRECT_PEER_REQUEST_TIMEOUT_SECS
+    };
+    let request_timeout = Duration::from_secs(request_timeout_secs);
     let mut request = http.request(method, url);
     for header in headers {
         request = request.header(header.name, header.value);
@@ -5005,10 +5016,18 @@ async fn execute_direct_peer_request(
         request = request.body(body);
     }
 
-    let response = request
-        .send()
+    let response = tokio::time::timeout(request_timeout, request.send())
         .await
-        .context("failed sending direct peer request")?;
+        .with_context(|| {
+            format!(
+                "timed out after {request_timeout_secs}s sending direct peer request {request_method} {request_url}"
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "failed sending direct peer request {request_method} {request_url}"
+            )
+        })?;
     let status = response.status().as_u16();
     let headers = response
         .headers()
@@ -5020,10 +5039,18 @@ async fn execute_direct_peer_request(
             })
         })
         .collect::<Vec<_>>();
-    let body = response
-        .bytes()
+    let body = tokio::time::timeout(request_timeout, response.bytes())
         .await
-        .context("failed reading direct peer response body")?;
+        .with_context(|| {
+            format!(
+                "timed out after {request_timeout_secs}s reading direct peer response body {request_method} {request_url}"
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "failed reading direct peer response body {request_method} {request_url}"
+            )
+        })?;
 
     Ok(PeerHttpResponse {
         status,
@@ -6054,12 +6081,36 @@ struct LocalMetadataSubjectsResponse {
 pub(crate) async fn sync_availability_views_once(state: &ServerState) {
     let started = Instant::now();
     let local_started = Instant::now();
-    refresh_local_availability_view_once(state).await;
+    let local_refresh_timed_out = match tokio::time::timeout(
+        Duration::from_secs(REPAIR_LOCAL_AVAILABILITY_SYNC_TIMEOUT_SECS),
+        refresh_local_availability_view_once(state),
+    )
+    .await
+    {
+        Ok(subject_count) => {
+            info!(
+                subject_count,
+                elapsed_ms = local_started.elapsed().as_millis(),
+                "availability local refresh finished"
+            );
+            false
+        }
+        Err(_) => {
+            request_local_availability_refresh(state);
+            warn!(
+                timeout_secs = REPAIR_LOCAL_AVAILABILITY_SYNC_TIMEOUT_SECS,
+                elapsed_ms = local_started.elapsed().as_millis(),
+                "availability local refresh timed out; continuing with cached local availability"
+            );
+            true
+        }
+    };
     let local_elapsed_ms = local_started.elapsed().as_millis();
     let remote_started = Instant::now();
     sync_remote_availability_views_once(state).await;
     info!(
         local_elapsed_ms,
+        local_refresh_timed_out,
         remote_elapsed_ms = remote_started.elapsed().as_millis(),
         total_elapsed_ms = started.elapsed().as_millis(),
         "availability sync finished"
@@ -6097,8 +6148,20 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
             Ok(response) if response.is_success() => {
                 match response.json::<LocalAvailableSubjectsResponse>() {
                     Ok(payload) => {
-                        let mut cluster = state.cluster.lock().await;
-                        cluster.replace_node_available_view(payload.node_id, &payload.subjects);
+                        let replicas_changed = {
+                            let mut cluster = state.cluster.lock().await;
+                            cluster.reconcile_node_subjects(payload.node_id, &payload.subjects)
+                        };
+                        if replicas_changed
+                            && let Err(err) = persist_cluster_replicas_state(state).await
+                        {
+                            warn!(
+                                error = %err,
+                                peer_node_id = %payload.node_id,
+                                subject_count = payload.subjects.len(),
+                                "failed to persist cluster replicas after remote availability sync"
+                            );
+                        }
                         info!(
                             peer_node_id = %peer.node_id,
                             subject_count = payload.subjects.len(),
@@ -6426,27 +6489,9 @@ async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
     let _refresh_guard = state.local_availability_refresh_lock.lock().await;
     let local_subjects = recompute_local_cluster_available_subjects(state).await;
     let subject_count = local_subjects.len();
-    let desired_subjects = local_subjects.iter().cloned().collect::<HashSet<_>>();
     let replicas_changed = {
         let mut cluster = state.cluster.lock().await;
-        let mut replicas_changed = false;
-
-        for subject in cluster.subjects_for_node(state.node_id) {
-            if !desired_subjects.contains(&subject) {
-                cluster.remove_replica(&subject, state.node_id);
-                replicas_changed = true;
-            }
-        }
-
-        cluster.replace_node_available_view(state.node_id, &local_subjects);
-
-        for subject in &local_subjects {
-            if cluster.note_replica(subject.clone(), state.node_id) {
-                replicas_changed = true;
-            }
-        }
-
-        replicas_changed
+        cluster.reconcile_node_subjects(state.node_id, &local_subjects)
     };
 
     if replicas_changed && let Err(err) = persist_cluster_replicas_state(state).await {
@@ -6542,7 +6587,10 @@ async fn persist_repair_run_record_with_retention(state: &ServerState, record: &
     let retention_cutoff = record
         .finished_at_unix
         .saturating_sub(state.repair_run_history_retention_secs);
-    if let Err(err) = store.prune_repair_run_history_before(retention_cutoff).await {
+    if let Err(err) = store
+        .prune_repair_run_history_before(retention_cutoff)
+        .await
+    {
         warn!(
             error = %err,
             retention_cutoff,
@@ -6567,8 +6615,8 @@ async fn finish_repair_run_tracking(
             .retain(|active_run| active_run.run_id != tracker.run_id);
     }
 
-    let duration_ms = u64::try_from(tracker.started_at_instant.elapsed().as_millis())
-        .unwrap_or(u64::MAX);
+    let duration_ms =
+        u64::try_from(tracker.started_at_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
     let record = RepairRunRecord {
         run_id: tracker.run_id,
         reporting_node_id: state.node_id,
@@ -6619,7 +6667,8 @@ async fn execute_tracked_local_replication_repair(
         Some(plan_summary) => plan_summary,
         None => RepairPlanSummary::from_plan(&current_replication_plan(state).await),
     };
-    let tracker = begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
+    let tracker =
+        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
     let report = replication::execute_replication_repair_inner(state, batch_size_override).await;
     finish_repair_run_tracking(
         state,
@@ -6643,13 +6692,11 @@ async fn execute_tracked_cluster_replication_repair(
         Some(plan_summary) => plan_summary,
         None => RepairPlanSummary::from_plan(&current_replication_plan(state).await),
     };
-    let tracker = begin_repair_run_tracking(
-        state,
-        replication::ReplicationRepairScope::Cluster,
-        trigger,
-    )
-    .await;
-    let report = replication::execute_cluster_replication_repair_inner(state, batch_size_override).await;
+    let tracker =
+        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Cluster, trigger)
+            .await;
+    let report =
+        replication::execute_cluster_replication_repair_inner(state, batch_size_override).await;
     finish_repair_run_tracking(
         state,
         tracker,
@@ -6816,7 +6863,6 @@ fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
                 )
                 .await
                 {
-                    Ok(response) if response.is_success() => {}
                     Ok(response) => {
                         tracing::debug!(
                             node_id = %peer.node_id,
@@ -13272,7 +13318,9 @@ async fn repair_activity_status(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let action = "auth/repair/activity/get";
-    if let Err(status) = authorize_admin_request(&state, &headers, action, true, true, json!({})).await {
+    if let Err(status) =
+        authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
         return status.into_response();
     }
 
@@ -13321,7 +13369,13 @@ async fn repair_history(
     let limit = query
         .limit
         .map(|limit| limit.clamp(1, MAX_REPAIR_RUN_HISTORY_LIMIT))
-        .or_else(|| if query.since_unix.is_none() { Some(120) } else { None });
+        .or_else(|| {
+            if query.since_unix.is_none() {
+                Some(120)
+            } else {
+                None
+            }
+        });
     let runs = {
         let store = read_store(&state, "repair_run.load_history").await;
         match store.list_repair_run_history(limit, query.since_unix).await {

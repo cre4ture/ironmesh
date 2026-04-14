@@ -3,9 +3,9 @@ use super::{
     ServerNodeConfig, ServerState, StartupRepairStatus, await_repair_busy_threshold,
     build_rendezvous_presence_registration, build_store_index_entries, cluster, constant_time_eq,
     jittered_backoff_secs, lock_store, new_store_rwlock, node_descriptor_from_presence_entry,
-    plan_peer_transport, replication::build_internal_replication_put_url, resolve_peer_base_url,
-    read_store, run_startup_replication_repair_once, should_trigger_autonomous_post_write_replication,
-    token_matches,
+    plan_peer_transport, read_store, replication::build_internal_replication_put_url,
+    resolve_peer_base_url, run_startup_replication_repair_once,
+    should_trigger_autonomous_post_write_replication, token_matches,
 };
 use axum::Extension;
 use axum_server::accept::Accept;
@@ -6182,7 +6182,10 @@ async fn tracked_local_replication_repair_persists_history_impl(backend: MainTes
         store.list_repair_run_history(Some(4), None).await.unwrap()
     };
     assert_eq!(repair_runs.len(), 1);
-    assert_eq!(repair_runs[0].trigger, super::RepairRunTrigger::ManualRequest);
+    assert_eq!(
+        repair_runs[0].trigger,
+        super::RepairRunTrigger::ManualRequest
+    );
     assert_eq!(
         repair_runs[0].scope,
         super::replication::ReplicationRepairScope::Local

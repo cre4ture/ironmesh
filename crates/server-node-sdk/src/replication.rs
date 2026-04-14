@@ -2,6 +2,8 @@ use super::*;
 use bytes::BytesMut;
 use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
+const REPAIR_PROGRESS_CHUNK_LOG_INTERVAL: usize = 128;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReplicationRepairReport {
     pub(crate) attempted_transfers: usize,
@@ -90,23 +92,15 @@ async fn execute_replication_repair_with_trigger(
 
     match scope {
         ReplicationRepairScope::Local => {
-            let report = execute_tracked_local_replication_repair(
-                &state,
-                batch_override,
-                trigger,
-                None,
-            )
-            .await;
+            let report =
+                execute_tracked_local_replication_repair(&state, batch_override, trigger, None)
+                    .await;
             (StatusCode::OK, Json(report)).into_response()
         }
         ReplicationRepairScope::Cluster => {
-            let report = execute_tracked_cluster_replication_repair(
-                &state,
-                batch_override,
-                trigger,
-                None,
-            )
-            .await;
+            let report =
+                execute_tracked_cluster_replication_repair(&state, batch_override, trigger, None)
+                    .await;
             (StatusCode::OK, Json(report)).into_response()
         }
     }
@@ -116,13 +110,8 @@ pub(crate) async fn execute_replication_repair_public(
     state: State<ServerState>,
     query: Query<ReplicationRepairQuery>,
 ) -> impl IntoResponse {
-    execute_replication_repair_with_trigger(
-        state,
-        query,
-        RepairRunTrigger::ManualRequest,
-        false,
-    )
-    .await
+    execute_replication_repair_with_trigger(state, query, RepairRunTrigger::ManualRequest, false)
+        .await
 }
 
 pub(crate) async fn execute_replication_repair_peer(
@@ -205,7 +194,24 @@ pub(crate) async fn execute_replication_repair_inner(
         };
 
         let local_missing = item.missing_nodes.contains(&state.node_id);
+        let remote_target_count = item
+            .missing_nodes
+            .iter()
+            .filter(|node_id| **node_id != state.node_id)
+            .count();
         let mut repair_source_node_id = None;
+
+        info!(
+            subject = %item.key,
+            key = %key,
+            version_id = ?version_id,
+            local_missing,
+            remote_target_count,
+            current_replica_count = item.current_nodes.len(),
+            attempted_transfers,
+            max_transfers,
+            "replication repair processing subject"
+        );
 
         let mut bundle = {
             let store = read_store(state, "replication_repair.export_bundle").await;
@@ -295,9 +301,28 @@ pub(crate) async fn execute_replication_repair_inner(
             await_repair_busy_threshold(state).await;
             attempted_transfers += 1;
 
+            info!(
+                subject = %item.key,
+                key = %key,
+                version_id = ?version_id,
+                source_node_id = %source_node.node_id,
+                target_node_id = %state.node_id,
+                attempted_transfers,
+                "replication repair starting local pull"
+            );
+
             match pull_bundle_from_source(source_node, &key, version_id.as_deref(), state).await {
                 Ok(imported_version_id) => {
                     successful_transfers += 1;
+                    info!(
+                        subject = %item.key,
+                        key = %key,
+                        version_id = ?version_id,
+                        source_node_id = %source_node.node_id,
+                        target_node_id = %state.node_id,
+                        imported_version_id = %imported_version_id,
+                        "replication repair completed local pull"
+                    );
                     publish_namespace_change(state);
 
                     let mut cluster = state.cluster.lock().await;
@@ -325,8 +350,18 @@ pub(crate) async fn execute_replication_repair_inner(
                     };
                 }
                 Err(err) => {
+                    let error_text = format!("{err:#}");
                     failed_transfers += 1;
-                    last_error = Some(format!("{err:#}"));
+                    last_error = Some(error_text.clone());
+                    warn!(
+                        subject = %item.key,
+                        key = %key,
+                        version_id = ?version_id,
+                        source_node_id = %source_node.node_id,
+                        target_node_id = %state.node_id,
+                        error = %error_text,
+                        "replication repair local pull failed"
+                    );
 
                     let mut repair_state = state.repair_state.lock().await;
                     let entry =
@@ -431,11 +466,31 @@ pub(crate) async fn execute_replication_repair_inner(
             await_repair_busy_threshold(state).await;
 
             attempted_transfers += 1;
+            info!(
+                subject = %item.key,
+                key = %key,
+                version_id = ?version_id,
+                source_node_id = %state.node_id,
+                target_node_id = %target,
+                chunk_count = bundle.manifest.chunks.len(),
+                total_size_bytes = bundle.manifest.total_size_bytes,
+                attempted_transfers,
+                "replication repair starting target push"
+            );
             let transfer_result = replicate_bundle_to_target(node, &bundle, state).await;
 
             match transfer_result {
                 Ok(remote_version_id) => {
                     successful_transfers += 1;
+                    info!(
+                        subject = %item.key,
+                        key = %key,
+                        version_id = ?version_id,
+                        source_node_id = %state.node_id,
+                        target_node_id = %target,
+                        remote_version_id = %remote_version_id,
+                        "replication repair completed target push"
+                    );
 
                     let mut cluster = state.cluster.lock().await;
                     cluster.note_replica(&item.key, target);
@@ -454,8 +509,18 @@ pub(crate) async fn execute_replication_repair_inner(
                     repair_state_dirty = true;
                 }
                 Err(err) => {
+                    let error_text = format!("{err:#}");
                     failed_transfers += 1;
-                    last_error = Some(format!("{err:#}"));
+                    last_error = Some(error_text.clone());
+                    warn!(
+                        subject = %item.key,
+                        key = %key,
+                        version_id = ?version_id,
+                        source_node_id = %state.node_id,
+                        target_node_id = %target,
+                        error = %error_text,
+                        "replication repair target push failed"
+                    );
 
                     let mut repair_state = state.repair_state.lock().await;
                     let entry =
@@ -486,6 +551,16 @@ pub(crate) async fn execute_replication_repair_inner(
         warn!(error = %err, "failed persisting repair attempts after repair run");
     }
 
+    info!(
+        attempted_transfers,
+        successful_transfers,
+        failed_transfers,
+        skipped_items,
+        skipped_backoff,
+        skipped_max_retries,
+        "replication repair local phase finished"
+    );
+
     ReplicationRepairReport {
         attempted_transfers,
         successful_transfers,
@@ -515,7 +590,21 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
     };
     let mut failed_nodes = 0usize;
 
+    info!(
+        batch_size_override = ?batch_size_override,
+        "cluster replication repair starting local phase"
+    );
+
     let local_report = execute_replication_repair_inner(state, batch_size_override).await;
+    info!(
+        attempted_transfers = local_report.attempted_transfers,
+        successful_transfers = local_report.successful_transfers,
+        failed_transfers = local_report.failed_transfers,
+        skipped_items = local_report.skipped_items,
+        skipped_backoff = local_report.skipped_backoff,
+        skipped_max_retries = local_report.skipped_max_retries,
+        "cluster replication repair finished local phase"
+    );
     accumulate_repair_report(&mut totals, &local_report);
     node_reports.push(ClusterReplicationRepairNodeReport {
         node_id: state.node_id,
@@ -545,6 +634,11 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
     for peer in peers {
         let path =
             build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
+        info!(
+            peer_node_id = %peer.node_id,
+            path = %path,
+            "cluster replication repair starting peer local phase request"
+        );
         match execute_peer_request(
             state,
             &peer,
@@ -558,6 +652,16 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
             Ok(response) if response.is_success() => {
                 match response.json::<ReplicationRepairReport>() {
                     Ok(report) => {
+                        info!(
+                            peer_node_id = %peer.node_id,
+                            attempted_transfers = report.attempted_transfers,
+                            successful_transfers = report.successful_transfers,
+                            failed_transfers = report.failed_transfers,
+                            skipped_items = report.skipped_items,
+                            skipped_backoff = report.skipped_backoff,
+                            skipped_max_retries = report.skipped_max_retries,
+                            "cluster replication repair finished peer local phase request"
+                        );
                         accumulate_repair_report(&mut totals, &report);
                         node_reports.push(ClusterReplicationRepairNodeReport {
                             node_id: peer.node_id,
@@ -575,6 +679,11 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
                     Err(err) => {
                         failed_nodes += 1;
                         let error = format!("failed decoding peer repair report: {err}");
+                        warn!(
+                            peer_node_id = %peer.node_id,
+                            error = %error,
+                            "cluster replication repair peer local phase decode failed"
+                        );
                         totals.last_error = Some(error.clone());
                         node_reports.push(ClusterReplicationRepairNodeReport {
                             node_id: peer.node_id,
@@ -594,6 +703,11 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
             Ok(response) => {
                 failed_nodes += 1;
                 let error = format!("peer repair request returned HTTP {}", response.status);
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    status = response.status,
+                    "cluster replication repair peer local phase returned non-success status"
+                );
                 totals.last_error = Some(error.clone());
                 node_reports.push(ClusterReplicationRepairNodeReport {
                     node_id: peer.node_id,
@@ -611,6 +725,11 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
             Err(err) => {
                 failed_nodes += 1;
                 let error = format!("peer repair request failed: {err:#}");
+                warn!(
+                    peer_node_id = %peer.node_id,
+                    error = %error,
+                    "cluster replication repair peer local phase request failed"
+                );
                 totals.last_error = Some(error.clone());
                 node_reports.push(ClusterReplicationRepairNodeReport {
                     node_id: peer.node_id,
@@ -707,13 +826,28 @@ fn build_replication_repair_path(
     format!("/cluster/replication/repair?{}", query.join("&"))
 }
 
+fn should_log_repair_chunk_progress(chunk_index: usize, chunk_count: usize) -> bool {
+    chunk_count <= 4
+        || chunk_index == 1
+        || chunk_index == chunk_count
+        || chunk_index % REPAIR_PROGRESS_CHUNK_LOG_INTERVAL == 0
+}
+
 async fn pull_bundle_from_source(
     source_node: &NodeDescriptor,
     key: &str,
     version_id: Option<&str>,
     state: &ServerState,
 ) -> Result<String> {
+    let transfer_started = Instant::now();
     let export_path = build_replication_export_path(key, version_id);
+    info!(
+        source_node_id = %source_node.node_id,
+        key = %key,
+        version_id = ?version_id,
+        path = %export_path,
+        "replication repair pull export request starting"
+    );
     let bundle = execute_peer_request(
         state,
         source_node,
@@ -724,9 +858,32 @@ async fn pull_bundle_from_source(
     )
     .await?
     .json::<ReplicationExportBundle>()?;
+    let chunk_count = bundle.manifest.chunks.len();
+
+    info!(
+        source_node_id = %source_node.node_id,
+        key = %bundle.key,
+        version_id = ?bundle.version_id,
+        manifest_hash = %bundle.manifest_hash,
+        chunk_count,
+        total_size_bytes = bundle.manifest.total_size_bytes,
+        "replication repair pull export ready"
+    );
 
     if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
-        for chunk in &bundle.manifest.chunks {
+        for (chunk_offset, chunk) in bundle.manifest.chunks.iter().enumerate() {
+            let chunk_index = chunk_offset + 1;
+            if should_log_repair_chunk_progress(chunk_index, chunk_count) {
+                info!(
+                    source_node_id = %source_node.node_id,
+                    key = %bundle.key,
+                    version_id = ?bundle.version_id,
+                    chunk_index,
+                    chunk_count,
+                    chunk_hash = %chunk.hash,
+                    "replication repair pull chunk progress"
+                );
+            }
             let payload = execute_peer_request(
                 state,
                 source_node,
@@ -743,8 +900,15 @@ async fn pull_bundle_from_source(
         }
     }
 
+    info!(
+        source_node_id = %source_node.node_id,
+        key = %bundle.key,
+        version_id = ?bundle.version_id,
+        manifest_hash = %bundle.manifest_hash,
+        "replication repair pull importing manifest"
+    );
     let mut store = lock_store(state, "replication_pull.import_manifest").await;
-    store
+    let imported_version_id = store
         .import_replica_manifest(
             &bundle.key,
             bundle.version_id.as_deref(),
@@ -753,7 +917,17 @@ async fn pull_bundle_from_source(
             &bundle.manifest_hash,
             &bundle.manifest_bytes,
         )
-        .await
+        .await?;
+    info!(
+        source_node_id = %source_node.node_id,
+        key = %bundle.key,
+        version_id = ?bundle.version_id,
+        imported_version_id = %imported_version_id,
+        chunk_count,
+        elapsed_ms = transfer_started.elapsed().as_millis(),
+        "replication repair pull completed"
+    );
+    Ok(imported_version_id)
 }
 
 async fn replicate_bundle_to_target(
@@ -761,6 +935,19 @@ async fn replicate_bundle_to_target(
     bundle: &ReplicationExportBundle,
     state: &ServerState,
 ) -> Result<String> {
+    let transfer_started = Instant::now();
+    let chunk_count = bundle.manifest.chunks.len();
+    info!(
+        target_node_id = %target_node.node_id,
+        key = %bundle.key,
+        version_id = ?bundle.version_id,
+        manifest_hash = %bundle.manifest_hash,
+        chunk_count,
+        total_size_bytes = bundle.manifest.total_size_bytes,
+        tombstone = bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH,
+        "replication repair target push starting"
+    );
+
     if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
         let state_query = match bundle.state {
             VersionConsistencyState::Confirmed => "confirmed",
@@ -795,6 +982,14 @@ async fn replicate_bundle_to_target(
             );
         }
 
+        info!(
+            target_node_id = %target_node.node_id,
+            key = %bundle.key,
+            version_id = ?bundle.version_id,
+            elapsed_ms = transfer_started.elapsed().as_millis(),
+            "replication repair tombstone push completed"
+        );
+
         return bundle
             .version_id
             .clone()
@@ -802,7 +997,19 @@ async fn replicate_bundle_to_target(
     }
 
     if bundle.version_id.is_some() {
-        for chunk in &bundle.manifest.chunks {
+        for (chunk_offset, chunk) in bundle.manifest.chunks.iter().enumerate() {
+            let chunk_index = chunk_offset + 1;
+            if should_log_repair_chunk_progress(chunk_index, chunk_count) {
+                info!(
+                    target_node_id = %target_node.node_id,
+                    key = %bundle.key,
+                    version_id = ?bundle.version_id,
+                    chunk_index,
+                    chunk_count,
+                    chunk_hash = %chunk.hash,
+                    "replication repair target push chunk progress"
+                );
+            }
             let payload = {
                 let guard = read_store(state, "replication_push.read_chunk").await;
                 guard
@@ -851,6 +1058,15 @@ async fn replicate_bundle_to_target(
 
             assembled.extend_from_slice(&payload);
         }
+
+        info!(
+            target_node_id = %target_node.node_id,
+            key = %bundle.key,
+            version_id = ?bundle.version_id,
+            chunk_count,
+            total_size_bytes = bundle.manifest.total_size_bytes,
+            "replication repair assembled inline object for target push"
+        );
 
         let state_query = match bundle.state {
             VersionConsistencyState::Confirmed => "confirmed",
@@ -902,6 +1118,14 @@ async fn replicate_bundle_to_target(
         bundle.version_id.as_deref(),
         parent_version_ids_json.as_deref(),
     );
+    info!(
+        target_node_id = %target_node.node_id,
+        key = %bundle.key,
+        version_id = ?bundle.version_id,
+        manifest_hash = %bundle.manifest_hash,
+        path = %manifest_path,
+        "replication repair target push manifest starting"
+    );
     let response = execute_peer_request(
         state,
         target_node,
@@ -929,6 +1153,15 @@ async fn replicate_bundle_to_target(
     }
 
     let report = response.json::<ReplicationManifestPushReport>()?;
+    info!(
+        target_node_id = %target_node.node_id,
+        key = %bundle.key,
+        version_id = ?bundle.version_id,
+        remote_version_id = %report.version_id,
+        chunk_count,
+        elapsed_ms = transfer_started.elapsed().as_millis(),
+        "replication repair target push completed"
+    );
     Ok(report.version_id)
 }
 

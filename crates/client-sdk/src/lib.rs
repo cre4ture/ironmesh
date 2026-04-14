@@ -40,9 +40,8 @@ pub use latency_probe::{
     LatencyProbeSample, LatencyProbeSummary, compare_direct_and_relay_latency,
 };
 pub use remote_sync::{
-    RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller,
-    RemoteSnapshotScope, RemoteSnapshotUpdate, RemoteSyncScheduler, RemoteSyncStrategy,
-    changed_paths_between,
+    RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+    RemoteSnapshotUpdate, RemoteSyncScheduler, RemoteSyncStrategy, changed_paths_between,
 };
 pub use session_pool::TransportSessionPoolSnapshot;
 pub use transport_sdk::{

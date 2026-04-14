@@ -1845,10 +1845,7 @@ impl PersistentStore {
         self.metadata_store.persist_repair_run_record(record).await
     }
 
-    pub async fn prune_repair_run_history_before(
-        &self,
-        finished_before_unix: u64,
-    ) -> Result<()> {
+    pub async fn prune_repair_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
         self.metadata_store
             .prune_repair_run_history_before(finished_before_unix)
             .await
@@ -4174,10 +4171,7 @@ impl PersistentStore {
     }
 
     #[cfg(test)]
-    pub async fn persist_repair_run_record_for_test(
-        &self,
-        record: &RepairRunRecord,
-    ) -> Result<()> {
+    pub async fn persist_repair_run_record_for_test(&self, record: &RepairRunRecord) -> Result<()> {
         self.metadata_store.persist_repair_run_record(record).await
     }
 

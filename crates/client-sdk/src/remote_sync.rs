@@ -168,7 +168,10 @@ impl RemoteSnapshotFetcher {
         )
     }
 
-    pub fn fetch_snapshot_blocking_with_progress<F>(&self, mut on_progress: F) -> Result<SyncSnapshot>
+    pub fn fetch_snapshot_blocking_with_progress<F>(
+        &self,
+        mut on_progress: F,
+    ) -> Result<SyncSnapshot>
     where
         F: FnMut(RemoteSnapshotFetchProgress),
     {
@@ -190,9 +193,10 @@ impl RemoteSnapshotFetcher {
             ..RemoteSnapshotFetchProgress::default()
         });
 
-        let snapshot = snapshot_from_store_index_entries_with_progress(response.entries, |progress| {
-            on_progress(progress);
-        });
+        let snapshot =
+            snapshot_from_store_index_entries_with_progress(response.entries, |progress| {
+                on_progress(progress);
+            });
 
         let file_count = snapshot
             .remote

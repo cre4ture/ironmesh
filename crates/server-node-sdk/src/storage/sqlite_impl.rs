@@ -120,9 +120,7 @@ impl MetadataStore for SqliteMetadataStore {
         finished_since_unix: Option<u64>,
     ) -> Result<Vec<RepairRunRecord>> {
         let db = self.metadata_conn()?;
-        let mut query = String::from(
-            "SELECT record_json\n             FROM repair_run_history",
-        );
+        let mut query = String::from("SELECT record_json\n             FROM repair_run_history");
         let mut conditions = Vec::new();
         if finished_since_unix.is_some() {
             conditions.push("finished_at_unix >= ?1");
@@ -134,7 +132,11 @@ impl MetadataStore for SqliteMetadataStore {
         query.push_str(" ORDER BY finished_at_unix DESC, run_id DESC");
         if limit.is_some() {
             query.push_str(" LIMIT ?");
-            query.push_str(if finished_since_unix.is_some() { "2" } else { "1" });
+            query.push_str(if finished_since_unix.is_some() {
+                "2"
+            } else {
+                "1"
+            });
         }
 
         let mut stmt = db.prepare(&query)?;

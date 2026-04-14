@@ -377,6 +377,38 @@ impl ClusterService {
         changed
     }
 
+    pub fn reconcile_node_subjects(&mut self, node_id: NodeId, subjects: &[String]) -> bool {
+        let desired_subjects: HashSet<String> = subjects.iter().cloned().collect();
+        let desired_base_keys: HashSet<String> = desired_subjects
+            .iter()
+            .map(|subject| replication_placement_key(subject).to_string())
+            .collect();
+        let current_replica_subjects = self.subjects_for_node(node_id);
+        let mut changed = self.replace_node_available_view(node_id, subjects);
+
+        for subject in current_replica_subjects {
+            let preserve_historical_version_claim = is_versioned_replication_subject(&subject)
+                && desired_base_keys.contains(replication_placement_key(&subject));
+            if !desired_subjects.contains(&subject) && !preserve_historical_version_claim {
+                self.remove_replica(&subject, node_id);
+                changed = true;
+            }
+        }
+
+        for subject in desired_subjects {
+            if self
+                .replicas_by_key
+                .entry(subject)
+                .or_default()
+                .insert(node_id)
+            {
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
     pub fn import_replicas_by_key(&mut self, replicas: HashMap<String, Vec<NodeId>>) {
         self.replicas_by_key = replicas
             .into_iter()
@@ -410,12 +442,11 @@ impl ClusterService {
     }
 
     fn current_replica_nodes_for_subject(&self, key: &str) -> HashSet<NodeId> {
-        let available = self.available_by_key.get(key).cloned().unwrap_or_default();
-        if !available.is_empty() {
-            return available;
+        let mut current = self.replicas_by_key.get(key).cloned().unwrap_or_default();
+        if let Some(available) = self.available_by_key.get(key) {
+            current.extend(available.iter().copied());
         }
-
-        self.replicas_by_key.get(key).cloned().unwrap_or_default()
+        current
     }
 
     #[allow(dead_code)]
@@ -674,6 +705,10 @@ fn select_nodes_by_rendezvous(
 
 fn replication_placement_key(key: &str) -> &str {
     key.split_once("@ver-").map(|(base, _)| base).unwrap_or(key)
+}
+
+fn is_versioned_replication_subject(key: &str) -> bool {
+    key.split_once("@ver-").is_some()
 }
 
 fn rendezvous_score(key: &str, node_id: NodeId) -> u64 {
@@ -1057,6 +1092,69 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_node_subjects_replaces_previous_membership_and_replicas() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+
+        svc.note_replica("subject-a", node_a);
+        svc.note_replica("subject-b", node_a);
+        svc.note_replica("subject-b", node_b);
+
+        let changed = svc.reconcile_node_subjects(node_a, &["subject-c".to_string()]);
+        assert!(changed);
+
+        let exported = svc.export_replicas_by_key();
+        assert_eq!(exported.get("subject-a"), None);
+        assert_eq!(exported.get("subject-b"), Some(&vec![node_b]));
+        assert_eq!(exported.get("subject-c"), Some(&vec![node_a]));
+        assert_eq!(
+            svc.available_subjects_for_node(node_a),
+            vec!["subject-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_node_subjects_noop_when_identical() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        svc.note_replica("subject-a", node_a);
+
+        let changed = svc.reconcile_node_subjects(node_a, &["subject-a".to_string()]);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn reconcile_node_subjects_preserves_historical_version_claims_for_live_base_key() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        let node_a = NodeId::new_v4();
+        svc.note_replica("subject-a", node_a);
+        svc.note_replica("subject-a@ver-old", node_a);
+        svc.note_replica("subject-a@ver-new", node_a);
+
+        let changed = svc.reconcile_node_subjects(
+            node_a,
+            &["subject-a".to_string(), "subject-a@ver-new".to_string()],
+        );
+        assert!(changed);
+
+        let exported = svc.export_replicas_by_key();
+        assert_eq!(exported.get("subject-a"), Some(&vec![node_a]));
+        assert_eq!(exported.get("subject-a@ver-new"), Some(&vec![node_a]));
+        assert_eq!(exported.get("subject-a@ver-old"), Some(&vec![node_a]));
+        assert_eq!(
+            svc.available_subjects_for_node(node_a),
+            vec!["subject-a".to_string(), "subject-a@ver-new".to_string()]
+        );
+    }
+
+    #[test]
     fn known_replication_subjects_include_available_only_subjects() {
         let local = NodeId::new_v4();
         let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
@@ -1099,6 +1197,46 @@ mod tests {
         assert_eq!(item.current_nodes, vec![node_a]);
         assert_eq!(item.missing_nodes.len(), 1);
         assert!(item.missing_nodes.contains(&node_b));
+    }
+
+    #[test]
+    fn replication_plan_unions_available_and_persisted_version_replicas() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 2,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+
+        svc.note_replica("subject-a", node_a);
+        svc.note_replica("subject-a", node_b);
+        svc.note_replica("subject-a@ver-old", node_a);
+        svc.note_replica("subject-a@ver-old", node_b);
+        svc.note_replica("subject-a@ver-new", node_b);
+
+        svc.reconcile_node_subjects(
+            node_a,
+            &["subject-a".to_string(), "subject-a@ver-old".to_string()],
+        );
+        svc.reconcile_node_subjects(
+            node_b,
+            &["subject-a".to_string(), "subject-a@ver-new".to_string()],
+        );
+
+        let plan = svc.replication_plan(&["subject-a@ver-old".to_string()]);
+        assert!(
+            plan.items.is_empty(),
+            "historical version subject should not remain under-replicated once both nodes are known to store it"
+        );
+        assert_eq!(plan.under_replicated, 0);
     }
 
     #[test]

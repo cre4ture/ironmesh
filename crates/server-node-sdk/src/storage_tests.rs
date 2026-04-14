@@ -1510,9 +1510,10 @@ async fn rename_replication_subjects_use_each_heads_own_logical_path_impl(
 
     let mut divergent_renamed_record = renamed_record.clone();
     divergent_renamed_record.object_id = tombstone_object_id.clone();
-    tombstone_index
-        .versions
-        .insert(divergent_renamed_record.version_id.clone(), divergent_renamed_record.clone());
+    tombstone_index.versions.insert(
+        divergent_renamed_record.version_id.clone(),
+        divergent_renamed_record.clone(),
+    );
     tombstone_index.head_version_ids = vec![
         tombstone_version_id.to_string(),
         divergent_renamed_record.version_id.clone(),
@@ -1525,11 +1526,17 @@ async fn rename_replication_subjects_use_each_heads_own_logical_path_impl(
 
     let subjects = store.list_replication_subjects().await.unwrap();
     assert!(
-        subjects.contains(&format!("docs/b.txt@{}", divergent_renamed_record.version_id)),
+        subjects.contains(&format!(
+            "docs/b.txt@{}",
+            divergent_renamed_record.version_id
+        )),
         "renamed head should remain advertised on its destination path, subjects={subjects:?}"
     );
     assert!(
-        !subjects.contains(&format!("docs/a.txt@{}", divergent_renamed_record.version_id)),
+        !subjects.contains(&format!(
+            "docs/a.txt@{}",
+            divergent_renamed_record.version_id
+        )),
         "renamed head must not be advertised under the old path, subjects={subjects:?}"
     );
 
@@ -3219,8 +3226,14 @@ async fn repair_run_history_roundtrip_and_prune_impl(backend: StorageTestBackend
         report: Some(serde_json::json!({ "status": "newer" })),
     };
 
-    store.persist_repair_run_record_for_test(&older).await.unwrap();
-    store.persist_repair_run_record_for_test(&newer).await.unwrap();
+    store
+        .persist_repair_run_record_for_test(&older)
+        .await
+        .unwrap();
+    store
+        .persist_repair_run_record_for_test(&newer)
+        .await
+        .unwrap();
 
     let history = store.list_repair_run_history(Some(8), None).await.unwrap();
     assert_eq!(history.len(), 2);
@@ -3242,7 +3255,13 @@ async fn repair_run_history_roundtrip_and_prune_impl(backend: StorageTestBackend
     let remaining = store.list_repair_run_history(Some(8), None).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].run_id, newer.run_id);
-    assert_eq!(remaining[0].summary.as_ref().and_then(|summary| summary.failed_nodes), Some(1));
+    assert_eq!(
+        remaining[0]
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.failed_nodes),
+        Some(1)
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }

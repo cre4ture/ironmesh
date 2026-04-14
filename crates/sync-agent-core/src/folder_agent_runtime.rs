@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
+use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
     RemoteSnapshotUpdate,
 };
-use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -622,9 +622,11 @@ fn run_folder_agent_inner(
             state: "syncing".to_string(),
             phase: "startup".to_string(),
             activity: "scanning-local-tree".to_string(),
-            base_message: "Scanning local files and reconciling startup local changes"
-                .to_string(),
-            metrics: FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+            base_message: "Scanning local files and reconciling startup local changes".to_string(),
+            metrics: FolderAgentRuntimeMetrics::from_states(
+                Some(&local_state),
+                Some(&remote_index),
+            ),
             last_success_unix_ms,
             last_error: None,
         },
@@ -644,8 +646,8 @@ fn run_folder_agent_inner(
                     watch_mode: watch_mode.to_string(),
                     state: "syncing".to_string(),
                     phase: "startup".to_string(),
-                    base_message:
-                        "Scanning local files and reconciling startup local changes".to_string(),
+                    base_message: "Scanning local files and reconciling startup local changes"
+                        .to_string(),
                     last_success_unix_ms,
                 }),
             )
@@ -907,7 +909,10 @@ fn run_folder_agent_inner(
                     phase: "steady-state".to_string(),
                     activity: "scanning-local-tree".to_string(),
                     base_message: local_scan_base_message.to_string(),
-                    metrics: FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
+                    metrics: FolderAgentRuntimeMetrics::from_states(
+                        Some(&local_state),
+                        Some(&remote_index),
+                    ),
                     last_success_unix_ms,
                     last_error: None,
                 },
@@ -1625,7 +1630,11 @@ fn fetch_remote_snapshot_with_status_progress(
                     state.to_string(),
                     phase.to_string(),
                     activity.to_string(),
-                    format_remote_fetch_progress_message(base_message, &progress, detailed_progress),
+                    format_remote_fetch_progress_message(
+                        base_message,
+                        &progress,
+                        detailed_progress,
+                    ),
                     metrics,
                     last_success_unix_ms,
                     None,
@@ -1697,9 +1706,7 @@ fn format_remote_fetch_progress_message(
         ),
         "completed" => format!(
             "{base_message}: snapshot ready with {} entrie(s) ({} file(s), {} directorie(s))",
-            progress.entry_count,
-            progress.file_count,
-            progress.directory_count,
+            progress.entry_count, progress.file_count, progress.directory_count,
         ),
         _ => base_message.to_string(),
     }
@@ -1735,7 +1742,10 @@ fn set_latest_metrics(
 fn latest_metrics_value(
     latest_metrics: &Arc<Mutex<FolderAgentRuntimeMetrics>>,
 ) -> FolderAgentRuntimeMetrics {
-    latest_metrics.lock().map(|metrics| metrics.clone()).unwrap_or_default()
+    latest_metrics
+        .lock()
+        .map(|metrics| metrics.clone())
+        .unwrap_or_default()
 }
 
 fn store_optional_unix_ms(target: &AtomicU64, value: Option<u64>) {

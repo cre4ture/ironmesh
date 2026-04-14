@@ -1,10 +1,10 @@
 #![allow(unsafe_code)]
 
 use anyhow::{Context, Result};
+use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
     IronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
 };
-use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use serde::Deserialize;
@@ -352,8 +352,8 @@ fn tree_scan_progress(tree_uri: &str) -> Result<Option<AndroidSafTreeScanProgres
             .get_string(&value)
             .context("failed to decode SAF scan progress JSON")?
             .into();
-        let progress: AndroidSafTreeScanProgress = serde_json::from_str(&value)
-            .context("failed to parse SAF scan progress JSON")?;
+        let progress: AndroidSafTreeScanProgress =
+            serde_json::from_str(&value).context("failed to parse SAF scan progress JSON")?;
         Ok(Some(progress))
     })
 }
@@ -488,8 +488,7 @@ fn format_remote_fetch_progress_message(
             let current_path = progress.current_path.as_deref().unwrap_or("<pending>");
             format!(
                 "{base_message} (normalized {} of {} remote entrie(s), current={current_path})",
-                progress.processed_entry_count,
-                progress.entry_count,
+                progress.processed_entry_count, progress.entry_count,
             )
         }
         "completed" => format!(
@@ -558,7 +557,8 @@ fn fetch_remote_snapshot_with_status_progress(
                     "building-snapshot" => {
                         progress.processed_entry_count == 0
                             || progress.processed_entry_count == progress.entry_count
-                            || progress.processed_entry_count % REMOTE_FETCH_PROGRESS_ENTRY_STRIDE == 0
+                            || progress.processed_entry_count % REMOTE_FETCH_PROGRESS_ENTRY_STRIDE
+                                == 0
                     }
                     _ => false,
                 };
@@ -1972,8 +1972,7 @@ pub(crate) fn run_saf_folder_agent_with_control(
                 "steady-state",
                 "watching-for-changes",
                 if local_sync_outcome.is_empty() {
-                    "Watching SAF tree for changes; local and remote state are aligned"
-                        .to_string()
+                    "Watching SAF tree for changes; local and remote state are aligned".to_string()
                 } else {
                     format!(
                         "Watching SAF tree for changes after local sync: {}",
@@ -2116,7 +2115,10 @@ fn set_latest_metrics(
 fn latest_metrics_value(
     latest_metrics: &Arc<Mutex<FolderAgentRuntimeMetrics>>,
 ) -> FolderAgentRuntimeMetrics {
-    latest_metrics.lock().map(|metrics| metrics.clone()).unwrap_or_default()
+    latest_metrics
+        .lock()
+        .map(|metrics| metrics.clone())
+        .unwrap_or_default()
 }
 
 fn store_optional_unix_ms(target: &AtomicU64, value: Option<u64>) {
