@@ -1,5 +1,6 @@
 use super::*;
 use bytes::BytesMut;
+use std::collections::BTreeSet;
 use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
 const REPAIR_PROGRESS_CHUNK_LOG_INTERVAL: usize = 128;
@@ -139,6 +140,267 @@ pub(crate) async fn execute_replication_repair_inner(
         cluster.update_health_and_detect_offline_transition();
         (cluster.replication_plan(&keys), cluster.list_nodes())
     };
+
+    execute_replication_repair_plan(state, plan, nodes, batch_size_override, false).await
+}
+
+pub(crate) async fn execute_targeted_replication_repair_inner(
+    state: &ServerState,
+    mut subjects: Vec<String>,
+    batch_size_override: Option<usize>,
+) -> ReplicationRepairReport {
+    let mut attempted_transfers = 0usize;
+    let mut successful_transfers = 0usize;
+    let mut failed_transfers = 0usize;
+    let mut skipped_items = 0usize;
+    let mut skipped_backoff = 0usize;
+    let mut skipped_max_retries = 0usize;
+    let mut skipped_details = Vec::new();
+    let mut last_error = None;
+    let mut repair_state_dirty = false;
+    let mut local_availability_refresh_needed = false;
+
+    let max_attempts = state.repair_config.max_retries;
+    let backoff_secs = state.repair_config.backoff_secs;
+    let max_transfers = batch_size_override.unwrap_or(subjects.len().max(1));
+    let now = unix_ts();
+
+    subjects.sort_by(|a, b| {
+        let a_versioned = parse_replication_subject(a)
+            .and_then(|(_, version_id)| version_id)
+            .is_some();
+        let b_versioned = parse_replication_subject(b)
+            .and_then(|(_, version_id)| version_id)
+            .is_some();
+        b_versioned.cmp(&a_versioned).then_with(|| a.cmp(b))
+    });
+    subjects.dedup();
+
+    for subject in subjects {
+        if attempted_transfers >= max_transfers {
+            break;
+        }
+
+        let Some((key, version_id)) = parse_replication_subject(&subject) else {
+            skipped_items += 1;
+            push_repair_skipped_detail(
+                &mut skipped_details,
+                state.node_id,
+                subject.clone(),
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                ReplicationRepairSkipReason::InvalidSubject,
+                "replication subject could not be parsed into key and version components",
+            );
+            continue;
+        };
+
+        let source_node = {
+            let mut cluster = state.cluster.lock().await;
+            cluster.update_health_and_detect_offline_transition();
+            cluster
+                .available_nodes_for_subject(&subject)
+                .into_iter()
+                .find(|node| node.node_id != state.node_id)
+        };
+
+        let Some(source_node) = source_node else {
+            skipped_items += 1;
+            push_repair_skipped_detail(
+                &mut skipped_details,
+                state.node_id,
+                subject.clone(),
+                Some(key.clone()),
+                version_id.clone(),
+                None,
+                Some(state.node_id),
+                ReplicationRepairSkipReason::SourceNodeUnavailable,
+                "targeted scrub repair could not find a healthy online source node",
+            );
+            continue;
+        };
+
+        let transfer_key = format!("{subject}|{}", state.node_id);
+        {
+            let repair_state = state.repair_state.lock().await;
+            if let Some(previous) = repair_state.attempts.get(&transfer_key) {
+                if previous.attempts > max_attempts {
+                    skipped_max_retries += 1;
+                    push_repair_skipped_detail(
+                        &mut skipped_details,
+                        state.node_id,
+                        subject.clone(),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(source_node.node_id),
+                        Some(state.node_id),
+                        ReplicationRepairSkipReason::MaxRetriesExhausted,
+                        format!(
+                            "transfer skipped after {} failed attempts (max_retries={max_attempts})",
+                            previous.attempts
+                        ),
+                    );
+                    continue;
+                }
+
+                let elapsed = now.saturating_sub(previous.last_failure_unix);
+                let required_backoff =
+                    jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
+                if elapsed < required_backoff {
+                    skipped_backoff += 1;
+                    push_repair_skipped_detail(
+                        &mut skipped_details,
+                        state.node_id,
+                        subject.clone(),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(source_node.node_id),
+                        Some(state.node_id),
+                        ReplicationRepairSkipReason::BackoffActive,
+                        format!(
+                            "retry backoff active for another {}s after {} failed attempts",
+                            required_backoff.saturating_sub(elapsed),
+                            previous.attempts
+                        ),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        await_repair_busy_threshold(state).await;
+        attempted_transfers += 1;
+        info!(
+            subject = %subject,
+            key = %key,
+            version_id = ?version_id,
+            source_node_id = %source_node.node_id,
+            target_node_id = %state.node_id,
+            attempted_transfers,
+            "targeted scrub repair starting local pull"
+        );
+
+        match pull_bundle_from_source(&source_node, &key, version_id.as_deref(), state).await {
+            Ok(imported_version_id) => {
+                match verify_local_repair_subject(state, &subject).await {
+                    Ok(()) => {
+                        successful_transfers += 1;
+                        publish_namespace_change(state);
+
+                        let mut repair_state = state.repair_state.lock().await;
+                        repair_state.attempts.remove(&transfer_key);
+                        drop(repair_state);
+                        repair_state_dirty = true;
+                        local_availability_refresh_needed = true;
+
+                        info!(
+                            subject = %subject,
+                            key = %key,
+                            version_id = ?version_id,
+                            source_node_id = %source_node.node_id,
+                            target_node_id = %state.node_id,
+                            imported_version_id = %imported_version_id,
+                            "targeted scrub repair completed local pull"
+                        );
+                    }
+                    Err(err) => {
+                        let error_text = format!("{err:#}");
+                        failed_transfers += 1;
+                        last_error = Some(error_text.clone());
+                        warn!(
+                            subject = %subject,
+                            key = %key,
+                            version_id = ?version_id,
+                            source_node_id = %source_node.node_id,
+                            target_node_id = %state.node_id,
+                            error = %error_text,
+                            "targeted scrub repair verification failed"
+                        );
+
+                        let mut repair_state = state.repair_state.lock().await;
+                        let entry = repair_state
+                            .attempts
+                            .entry(transfer_key)
+                            .or_insert(RepairAttemptEntry {
+                                attempts: 0,
+                                last_failure_unix: now,
+                            });
+                        entry.attempts = entry.attempts.saturating_add(1);
+                        entry.last_failure_unix = now;
+                        drop(repair_state);
+                        repair_state_dirty = true;
+                    }
+                }
+            }
+            Err(err) => {
+                let error_text = format!("{err:#}");
+                failed_transfers += 1;
+                last_error = Some(error_text.clone());
+                warn!(
+                    subject = %subject,
+                    key = %key,
+                    version_id = ?version_id,
+                    source_node_id = %source_node.node_id,
+                    target_node_id = %state.node_id,
+                    error = %error_text,
+                    "targeted scrub repair local pull failed"
+                );
+
+                let mut repair_state = state.repair_state.lock().await;
+                let entry = repair_state
+                    .attempts
+                    .entry(transfer_key)
+                    .or_insert(RepairAttemptEntry {
+                        attempts: 0,
+                        last_failure_unix: now,
+                    });
+                entry.attempts = entry.attempts.saturating_add(1);
+                entry.last_failure_unix = now;
+                drop(repair_state);
+                repair_state_dirty = true;
+            }
+        }
+    }
+
+    if local_availability_refresh_needed {
+        refresh_local_availability_view_once(state).await;
+    }
+
+    if repair_state_dirty && let Err(err) = persist_repair_state(state).await {
+        warn!(error = %err, "failed persisting repair attempts after targeted scrub repair");
+    }
+
+    info!(
+        attempted_transfers,
+        successful_transfers,
+        failed_transfers,
+        skipped_items,
+        skipped_backoff,
+        skipped_max_retries,
+        "targeted scrub repair local phase finished"
+    );
+
+    ReplicationRepairReport {
+        attempted_transfers,
+        successful_transfers,
+        failed_transfers,
+        skipped_items,
+        skipped_backoff,
+        skipped_max_retries,
+        skipped_details,
+        last_error,
+    }
+}
+
+async fn execute_replication_repair_plan(
+    state: &ServerState,
+    plan: ReplicationPlan,
+    nodes: Vec<NodeDescriptor>,
+    batch_size_override: Option<usize>,
+    verify_local_pulls: bool,
+) -> ReplicationRepairReport {
 
     let node_by_id: HashMap<NodeId, NodeDescriptor> =
         nodes.into_iter().map(|node| (node.node_id, node)).collect();
@@ -313,6 +575,37 @@ pub(crate) async fn execute_replication_repair_inner(
 
             match pull_bundle_from_source(source_node, &key, version_id.as_deref(), state).await {
                 Ok(imported_version_id) => {
+                    if verify_local_pulls
+                        && let Err(err) = verify_local_repair_subject(state, &item.key).await
+                    {
+                        let error_text = format!("{err:#}");
+                        failed_transfers += 1;
+                        last_error = Some(error_text.clone());
+                        warn!(
+                            subject = %item.key,
+                            key = %key,
+                            version_id = ?version_id,
+                            source_node_id = %source_node.node_id,
+                            target_node_id = %state.node_id,
+                            error = %error_text,
+                            "replication repair local pull verification failed"
+                        );
+
+                        let mut repair_state = state.repair_state.lock().await;
+                        let entry = repair_state
+                            .attempts
+                            .entry(transfer_key)
+                            .or_insert(RepairAttemptEntry {
+                                attempts: 0,
+                                last_failure_unix: now,
+                            });
+                        entry.attempts = entry.attempts.saturating_add(1);
+                        entry.last_failure_unix = now;
+                        drop(repair_state);
+                        repair_state_dirty = true;
+                        continue;
+                    }
+
                     successful_transfers += 1;
                     info!(
                         subject = %item.key,
@@ -908,6 +1201,9 @@ async fn pull_bundle_from_source(
         "replication repair pull importing manifest"
     );
     let mut store = lock_store(state, "replication_pull.import_manifest").await;
+    let _ = store
+        .drop_replica_subject(&bundle.key, bundle.version_id.as_deref())
+        .await?;
     let imported_version_id = store
         .import_replica_manifest(
             &bundle.key,
@@ -928,6 +1224,31 @@ async fn pull_bundle_from_source(
         "replication repair pull completed"
     );
     Ok(imported_version_id)
+}
+
+async fn verify_local_repair_subject(state: &ServerState, subject: &str) -> Result<()> {
+    let scrubber = {
+        let store = read_store(state, "replication_repair.verify_subject").await;
+        store.data_scrubber()
+    };
+    let subjects = BTreeSet::from([subject.to_string()]);
+    let report = scrubber.run_for_subjects(&subjects).await?;
+    if report.current_keys_scanned == 0 && report.version_records_scanned == 0 {
+        bail!("post-repair verification did not resolve subject={subject}");
+    }
+    if report.issue_count == 0 {
+        return Ok(());
+    }
+
+    let first_issue = report
+        .issues
+        .first()
+        .map(|issue| format!("{:?}: {}", issue.kind, issue.detail))
+        .unwrap_or_else(|| format!("{} issue(s) without sampled details", report.issue_count));
+    bail!(
+        "post-repair scrub verification found {} issue(s) for subject={subject}: {first_issue}",
+        report.issue_count
+    );
 }
 
 async fn replicate_bundle_to_target(

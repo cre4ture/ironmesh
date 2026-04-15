@@ -85,6 +85,7 @@ export type RepairRunTrigger =
   | "manual_request"
   | "startup_repair"
   | "background_audit"
+  | "data_scrub_auto_repair"
   | "autonomous_post_write"
   | "peer_cluster_request";
 

@@ -101,10 +101,15 @@ export function RepairPage() {
   const repairHistory = canInspectRepair ? repairHistoryQuery.data ?? null : null;
   const replicationPlan = canInspectRepair ? replicationPlanQuery.data ?? null : null;
   const scrubCluster = canInspectRepair ? scrubClusterQuery.data ?? null : null;
+  const scrubAutoRepairRuns =
+    repairHistory?.runs.filter((run) => run.trigger === "data_scrub_auto_repair") ?? [];
   const latestRun = repairActivity?.latest_run ?? null;
   const activeRuns = repairActivity?.active_runs ?? [];
   const scrubRuns = scrubCluster?.runs ?? [];
   const scrubNodes = scrubCluster?.nodes ?? [];
+  const selectedScrubRelatedRepairRuns = selectedScrubRun
+    ? findRelatedRepairRuns(selectedScrubRun, scrubAutoRepairRuns)
+    : [];
   const latestScrubRun = mostRecentScrubRun(scrubRuns);
   const retentionLabel = repairHistory
     ? formatRetentionWindow(repairHistory.retention_secs)
@@ -670,12 +675,15 @@ export function RepairPage() {
                     <Table.Th>Duration</Table.Th>
                     <Table.Th>Verified</Table.Th>
                     <Table.Th>Findings</Table.Th>
+                    <Table.Th>Auto-repair</Table.Th>
                     <Table.Th />
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
-                  {scrubRuns.map((run) => (
-                    <Table.Tr key={run.run_id}>
+                  {scrubRuns.map((run) => {
+                    const relatedRepairRuns = findRelatedRepairRuns(run, scrubAutoRepairRuns);
+
+                    return <Table.Tr key={run.run_id}>
                       <Table.Td>
                         <Stack gap={2}>
                           <Text size="sm">{formatUnixTs(run.finished_at_unix)}</Text>
@@ -711,13 +719,34 @@ export function RepairPage() {
                       <Table.Td maw={280}>
                         <Text size="sm">{describeDataScrubRunSummary(run)}</Text>
                       </Table.Td>
+                      <Table.Td miw={180}>
+                        {relatedRepairRuns.length > 0 ? (
+                          <Stack gap={6}>
+                            <Badge color="teal" variant="light">
+                              {relatedRepairRuns.length} follow-on auto-repair
+                              {relatedRepairRuns.length === 1 ? "" : "s"}
+                            </Badge>
+                            <Button
+                              size="xs"
+                              variant="light"
+                              onClick={() => setSelectedRun(relatedRepairRuns[0] ?? null)}
+                            >
+                              Inspect repair
+                            </Button>
+                          </Stack>
+                        ) : (
+                          <Text size="sm" c="dimmed">
+                            none linked
+                          </Text>
+                        )}
+                      </Table.Td>
                       <Table.Td>
                         <Button size="xs" variant="default" onClick={() => setSelectedScrubRun(run)}>
                           Inspect
                         </Button>
                       </Table.Td>
-                    </Table.Tr>
-                  ))}
+                    </Table.Tr>;
+                  })}
                 </Table.Tbody>
               </Table>
             </Table.ScrollContainer>
@@ -788,6 +817,28 @@ export function RepairPage() {
               <Text size="sm" c="dimmed">
                 {describeDataScrubRunSummary(selectedScrubRun)}
               </Text>
+              {selectedScrubRelatedRepairRuns.length > 0 ? (
+                <Card withBorder radius="md" padding="sm">
+                  <Stack gap={6}>
+                    <Text fw={600}>Follow-on auto-repair</Text>
+                    {selectedScrubRelatedRepairRuns.map((run) => (
+                      <Group key={run.run_id} justify="space-between" align="flex-start">
+                        <Stack gap={2}>
+                          <Text size="sm">
+                            {formatRepairTrigger(run.trigger)} finished {formatUnixTs(run.finished_at_unix)}
+                          </Text>
+                          <Text size="xs" c="dimmed">
+                            {describeRepairRunSummary(run)}
+                          </Text>
+                        </Stack>
+                        <Button size="xs" variant="light" onClick={() => setSelectedRun(run)}>
+                          Inspect repair
+                        </Button>
+                      </Group>
+                    ))}
+                  </Stack>
+                </Card>
+              ) : null}
               <JsonBlock value={selectedScrubRun} />
             </>
           ) : null}
@@ -844,6 +895,8 @@ function formatRepairTrigger(trigger: string): string {
       return "startup repair";
     case "background_audit":
       return "background audit";
+    case "data_scrub_auto_repair":
+      return "scrub auto-repair";
     case "autonomous_post_write":
       return "post-write";
     case "peer_cluster_request":
@@ -941,6 +994,21 @@ function formatDataScrubStatus(status: string): string {
     default:
       return status;
   }
+}
+
+function findRelatedRepairRuns(
+  scrubRun: DataScrubRunRecord,
+  repairRuns: RepairRunRecord[]
+): RepairRunRecord[] {
+  const lowerBound = scrubRun.finished_at_unix;
+  const upperBound = scrubRun.finished_at_unix + 120;
+  return repairRuns.filter(
+    (run) =>
+      run.trigger === "data_scrub_auto_repair" &&
+      run.reporting_node_id === scrubRun.reporting_node_id &&
+      run.started_at_unix >= lowerBound &&
+      run.started_at_unix <= upperBound
+  );
 }
 
 function dataScrubStateColor(state: string): string {

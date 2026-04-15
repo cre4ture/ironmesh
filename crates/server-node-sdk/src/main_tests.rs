@@ -22,6 +22,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
@@ -5902,6 +5903,576 @@ run_on_main_metadata_backends!(
     data_scrub_activity_and_history_do_not_wait_on_active_scrub_impl,
     data_scrub_activity_and_history_do_not_wait_on_active_scrub,
     data_scrub_activity_and_history_do_not_wait_on_active_scrub_turso
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataScrubAutoRepairCorruptionKind {
+    ManifestMissing,
+    ManifestUnreadable,
+    ManifestInvalid,
+    ManifestHashMismatch,
+    ManifestKeyMismatch,
+    ManifestSizeMismatch,
+    ChunkMissing,
+    ChunkUnreadable,
+    ChunkSizeMismatch,
+    ChunkHashMismatch,
+}
+
+impl DataScrubAutoRepairCorruptionKind {
+    const REPAIRABLE: [Self; 9] = [
+        Self::ManifestMissing,
+        Self::ManifestUnreadable,
+        Self::ManifestInvalid,
+        Self::ManifestHashMismatch,
+        Self::ManifestSizeMismatch,
+        Self::ChunkMissing,
+        Self::ChunkUnreadable,
+        Self::ChunkSizeMismatch,
+        Self::ChunkHashMismatch,
+    ];
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::ManifestMissing => "manifest-missing",
+            Self::ManifestUnreadable => "manifest-unreadable",
+            Self::ManifestInvalid => "manifest-invalid",
+            Self::ManifestHashMismatch => "manifest-hash-mismatch",
+            Self::ManifestKeyMismatch => "manifest-key-mismatch",
+            Self::ManifestSizeMismatch => "manifest-size-mismatch",
+            Self::ChunkMissing => "chunk-missing",
+            Self::ChunkUnreadable => "chunk-unreadable",
+            Self::ChunkSizeMismatch => "chunk-size-mismatch",
+            Self::ChunkHashMismatch => "chunk-hash-mismatch",
+        }
+    }
+
+    fn issue_kind(self) -> super::storage::DataScrubIssueKind {
+        match self {
+            Self::ManifestMissing => super::storage::DataScrubIssueKind::ManifestMissing,
+            Self::ManifestUnreadable => super::storage::DataScrubIssueKind::ManifestUnreadable,
+            Self::ManifestInvalid => super::storage::DataScrubIssueKind::ManifestInvalid,
+            Self::ManifestHashMismatch => super::storage::DataScrubIssueKind::ManifestHashMismatch,
+            Self::ManifestKeyMismatch => super::storage::DataScrubIssueKind::ManifestKeyMismatch,
+            Self::ManifestSizeMismatch => super::storage::DataScrubIssueKind::ManifestSizeMismatch,
+            Self::ChunkMissing => super::storage::DataScrubIssueKind::ChunkMissing,
+            Self::ChunkUnreadable => super::storage::DataScrubIssueKind::ChunkUnreadable,
+            Self::ChunkSizeMismatch => super::storage::DataScrubIssueKind::ChunkSizeMismatch,
+            Self::ChunkHashMismatch => super::storage::DataScrubIssueKind::ChunkHashMismatch,
+        }
+    }
+}
+
+async fn choose_locally_placed_key(state: &ServerState, prefix: &str) -> String {
+    let cluster = state.cluster.lock().await;
+    (0..256)
+        .map(|attempt| format!("{prefix}-{attempt}.bin"))
+        .find(|key| cluster.placement_for_key(key).selected_nodes.first() == Some(&state.node_id))
+        .expect("expected a scrub repair test key placed on the local node")
+}
+
+async fn seed_subject_version(
+    state: &ServerState,
+    key: &str,
+    version_id: &str,
+    payload: Vec<u8>,
+    parent_version_ids: Vec<String>,
+) {
+    let mut store = lock_store(state, "tests.data_scrub.seed_subject_version").await;
+    store
+        .put_object_versioned(
+            key,
+            Bytes::from(payload),
+            PutOptions {
+                parent_version_ids,
+                state: VersionConsistencyState::Confirmed,
+                inherit_preferred_parent: false,
+                create_snapshot: true,
+                explicit_version_id: Some(version_id.to_string()),
+            },
+        )
+        .await
+        .expect("test subject version should store");
+}
+
+async fn spawn_internal_peer_api_server(
+    state: ServerState,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test peer listener should bind");
+    let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let app = super::build_internal_peer_api().with_state(state);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("internal peer api should serve in tests");
+    });
+    (peer_base_url, handle)
+}
+
+async fn register_online_source_node(target: &ServerState, source: &ServerState, peer_base_url: &str) {
+    let mut cluster = target.cluster.lock().await;
+    cluster.register_node(super::cluster::NodeDescriptor {
+        node_id: source.node_id,
+        reachability: super::cluster::NodeReachability {
+            public_api_url: Some(peer_base_url.to_string()),
+            peer_api_url: Some(peer_base_url.to_string()),
+            relay_required: false,
+        },
+        capabilities: super::cluster::NodeCapabilities {
+            public_api: true,
+            peer_api: true,
+            relay_tunnel: false,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 1_000_000,
+        free_bytes: 900_000,
+        storage_stats: None,
+        last_heartbeat_unix: super::unix_ts(),
+        status: super::cluster::NodeStatus::Online,
+    });
+}
+
+async fn note_subject_replicas(
+    target: &ServerState,
+    source_node_id: NodeId,
+    key: &str,
+    version_ids: &[String],
+) {
+    let mut cluster = target.cluster.lock().await;
+    cluster.note_replica(key, target.node_id);
+    cluster.note_replica(key, source_node_id);
+    for version_id in version_ids {
+        cluster.note_replica(format!("{key}@{version_id}"), target.node_id);
+        cluster.note_replica(format!("{key}@{version_id}"), source_node_id);
+    }
+}
+
+fn first_chunk_info(manifest: &serde_json::Value) -> (String, usize) {
+    let first_chunk = manifest["chunks"]
+        .as_array()
+        .and_then(|chunks| chunks.first())
+        .expect("expected a chunked manifest in scrub repair test");
+    let chunk_hash = first_chunk["hash"]
+        .as_str()
+        .expect("chunk hash should be present")
+        .to_string();
+    let chunk_size = first_chunk["size_bytes"]
+        .as_u64()
+        .expect("chunk size should be present") as usize;
+    (chunk_hash, chunk_size)
+}
+
+async fn apply_data_scrub_corruption_to_subject(
+    state: &ServerState,
+    key: &str,
+    version_id: Option<&str>,
+    kind: DataScrubAutoRepairCorruptionKind,
+) {
+    let mut store = lock_store(state, "tests.data_scrub.apply_corruption").await;
+    let manifest_hash = store
+        .resolve_manifest_hash_for_key(
+            key,
+            None,
+            version_id,
+            super::storage::ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap();
+    let manifest_payload = store
+        .load_manifest_payload_for_subject_for_test(key, version_id)
+        .await
+        .unwrap()
+        .expect("expected manifest payload for scrub corruption fixture");
+    let manifest_json: serde_json::Value = serde_json::from_slice(&manifest_payload).unwrap();
+    let (chunk_hash, chunk_size) = first_chunk_info(&manifest_json);
+    let manifest_path = store.manifest_path_for_test(&manifest_hash);
+    let chunk_path = store.chunk_path_for_test(&chunk_hash);
+
+    match kind {
+        DataScrubAutoRepairCorruptionKind::ManifestMissing => {
+            fs::remove_file(&manifest_path).await.unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ManifestUnreadable => {
+            fs::remove_file(&manifest_path).await.unwrap();
+            fs::create_dir(&manifest_path).await.unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ManifestInvalid => {
+            store
+                .replace_manifest_bytes_for_subject_for_test(
+                    key,
+                    version_id,
+                    br#"{invalid-manifest-json"#,
+                )
+                .await
+                .unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ManifestHashMismatch => {
+            let mut payload = fs::read(&manifest_path).await.unwrap();
+            payload.push(b'\n');
+            fs::write(&manifest_path, payload).await.unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ManifestKeyMismatch => {
+            let mut mutated = manifest_json;
+            mutated["key"] = serde_json::Value::String(format!("mismatch/{key}"));
+            let payload = serde_json::to_vec(&mutated).unwrap();
+            store
+                .replace_manifest_bytes_for_subject_for_test(key, version_id, &payload)
+                .await
+                .unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ManifestSizeMismatch => {
+            let mut mutated = manifest_json;
+            let current_total = mutated["total_size_bytes"]
+                .as_u64()
+                .expect("manifest should expose total_size_bytes");
+            mutated["total_size_bytes"] = serde_json::Value::from(current_total + 7);
+            let payload = serde_json::to_vec(&mutated).unwrap();
+            store
+                .replace_manifest_bytes_for_subject_for_test(key, version_id, &payload)
+                .await
+                .unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ChunkMissing => {
+            fs::remove_file(&chunk_path).await.unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ChunkUnreadable => {
+            fs::remove_file(&chunk_path).await.unwrap();
+            fs::create_dir(&chunk_path).await.unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ChunkSizeMismatch => {
+            fs::write(&chunk_path, vec![0x5a; chunk_size.saturating_add(1)])
+                .await
+                .unwrap();
+        }
+        DataScrubAutoRepairCorruptionKind::ChunkHashMismatch => {
+            fs::write(&chunk_path, vec![0x5a; chunk_size]).await.unwrap();
+        }
+    }
+}
+
+async fn repair_run_history(state: &ServerState) -> Vec<super::RepairRunRecord> {
+    let store = read_store(state, "tests.data_scrub.repair_history").await;
+    store.list_repair_run_history(Some(32), None).await.unwrap()
+}
+
+async fn wait_for_data_scrub_completion(state: &ServerState) {
+    wait_for_condition("data scrub completion", Duration::from_secs(5), || {
+        let state = state.clone();
+        async move {
+            match super::local_data_scrub_activity_payload(&state).await {
+                Ok(activity) => activity.active_runs.is_empty() && activity.latest_run.is_some(),
+                Err(_) => false,
+            }
+        }
+    })
+    .await;
+}
+
+async fn wait_for_repair_history_len(state: &ServerState, minimum_len: usize) {
+    wait_for_condition("repair history growth", Duration::from_secs(5), || {
+        let state = state.clone();
+        async move { repair_run_history(&state).await.len() >= minimum_len }
+    })
+    .await;
+}
+
+async fn data_scrub_auto_repair_repairs_each_supported_corruption_kind_impl(
+    backend: MainTestBackend,
+) {
+    for kind in DataScrubAutoRepairCorruptionKind::REPAIRABLE {
+        let source = build_test_state(1, false, backend).await;
+        let target = build_test_state(1, false, backend).await;
+        let (peer_base_url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+        register_online_source_node(&target, &source, &peer_base_url).await;
+        let key = choose_locally_placed_key(&target, &format!("scrub-auto-repair-{}", kind.slug()))
+            .await;
+        let version_id = format!("ver-scrub-{}-head", kind.slug());
+        let payload = sample_large_chunked_payload();
+
+        seed_subject_version(&source, &key, &version_id, payload.clone(), Vec::new()).await;
+        seed_subject_version(&target, &key, &version_id, payload.clone(), Vec::new()).await;
+        note_subject_replicas(&target, source.node_id, &key, std::slice::from_ref(&version_id))
+            .await;
+
+        let baseline_repair_history_len = repair_run_history(&target).await.len();
+        apply_data_scrub_corruption_to_subject(&target, &key, None, kind).await;
+
+        let trigger =
+            super::start_local_data_scrub(&target, super::DataScrubRunTrigger::ManualRequest)
+                .await;
+        assert!(trigger.started, "data scrub should start for {:?}", kind);
+
+        wait_for_data_scrub_completion(&target).await;
+        wait_for_repair_history_len(&target, baseline_repair_history_len + 1).await;
+
+        let scrub_history = super::local_data_scrub_history_payload(&target, Some(8), None)
+            .await
+            .unwrap();
+        let latest_scrub = scrub_history.runs.first().expect("expected retained scrub run");
+        assert_eq!(
+            latest_scrub.status,
+            super::DataScrubRunStatus::IssuesDetected,
+            "scrub should report the detected corruption before repair for {:?}",
+            kind
+        );
+        assert!(
+            latest_scrub
+                .summary
+                .issues
+                .iter()
+                .any(|issue| issue.kind == kind.issue_kind()),
+            "latest scrub history should include {:?}, issues={:?}",
+            kind,
+            latest_scrub.summary.issues
+        );
+
+        let repair_history = repair_run_history(&target).await;
+        let latest_repair = repair_history.first().expect("expected retained repair run");
+        assert_eq!(
+            latest_repair.status,
+            super::RepairRunStatus::Completed,
+            "repair should complete for {:?}",
+            kind
+        );
+        assert!(
+            latest_repair
+                .summary
+                .as_ref()
+                .map(|summary| summary.successful_transfers)
+                .unwrap_or(0)
+                >= 1,
+            "repair should transfer at least one subject for {:?}, record={latest_repair:?}",
+            kind
+        );
+
+        {
+            let store = lock_store(&target, "tests.data_scrub.verify_after_repair").await;
+            let report = store.run_data_scrub().await.unwrap();
+            assert_eq!(
+                report.issue_count, 0,
+                "target should be scrub-clean after repair for {:?}, report={report:?}",
+                kind
+            );
+            let restored = store
+                .get_object(
+                    &key,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .expect("repaired subject should read successfully");
+            assert_eq!(restored.as_ref(), payload.as_slice());
+        }
+
+        handle.abort();
+        let _ = handle.await;
+        cleanup_test_state(&source).await;
+        cleanup_test_state(&target).await;
+    }
+}
+
+run_on_main_metadata_backends!(
+    data_scrub_auto_repair_repairs_each_supported_corruption_kind_impl,
+    data_scrub_auto_repair_repairs_each_supported_corruption_kind,
+    data_scrub_auto_repair_repairs_each_supported_corruption_kind_turso
+);
+
+async fn data_scrub_auto_repair_keeps_manifest_key_mismatch_detect_only_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let (peer_base_url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+    let key = choose_locally_placed_key(&target, "scrub-detect-only-key-mismatch").await;
+    let version_id = "ver-scrub-manifest-key-mismatch-head".to_string();
+    let payload = sample_large_chunked_payload();
+
+    seed_subject_version(&source, &key, &version_id, payload.clone(), Vec::new()).await;
+    seed_subject_version(&target, &key, &version_id, payload.clone(), Vec::new()).await;
+    note_subject_replicas(&target, source.node_id, &key, std::slice::from_ref(&version_id)).await;
+
+    let baseline_repair_history_len = repair_run_history(&target).await.len();
+    apply_data_scrub_corruption_to_subject(
+        &target,
+        &key,
+        None,
+        DataScrubAutoRepairCorruptionKind::ManifestKeyMismatch,
+    )
+    .await;
+
+    let trigger =
+        super::start_local_data_scrub(&target, super::DataScrubRunTrigger::ManualRequest).await;
+    assert!(trigger.started, "data scrub should start for manifest_key_mismatch");
+
+    wait_for_data_scrub_completion(&target).await;
+
+    let scrub_history = super::local_data_scrub_history_payload(&target, Some(8), None)
+        .await
+        .unwrap();
+    let latest_scrub = scrub_history.runs.first().expect("expected retained scrub run");
+    assert!(
+        latest_scrub
+            .summary
+            .issues
+            .iter()
+            .any(|issue| issue.kind == super::storage::DataScrubIssueKind::ManifestKeyMismatch),
+        "scrub should report manifest_key_mismatch, issues={:?}",
+        latest_scrub.summary.issues
+    );
+
+    tokio::task::yield_now().await;
+    assert_eq!(
+        repair_run_history(&target).await.len(),
+        baseline_repair_history_len,
+        "manifest_key_mismatch should remain detect-only"
+    );
+
+    {
+        let store = lock_store(&target, "tests.data_scrub.verify_detect_only").await;
+        let report = store.run_data_scrub().await.unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == super::storage::DataScrubIssueKind::ManifestKeyMismatch),
+            "detect-only issue should remain visible after scrub, report={report:?}"
+        );
+        let still_readable = store
+            .get_object(
+                &key,
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("manifest_key_mismatch should not make the subject unreadable by itself");
+        assert_eq!(still_readable.as_ref(), payload.as_slice());
+    }
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    data_scrub_auto_repair_keeps_manifest_key_mismatch_detect_only_impl,
+    data_scrub_auto_repair_keeps_manifest_key_mismatch_detect_only,
+    data_scrub_auto_repair_keeps_manifest_key_mismatch_detect_only_turso
+);
+
+async fn data_scrub_auto_repair_repairs_exact_historical_version_subject_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let (peer_base_url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &peer_base_url).await;
+    let key = choose_locally_placed_key(&target, "scrub-historical-version").await;
+    let version_a = "ver-scrub-history-v1".to_string();
+    let version_b = "ver-scrub-history-v2".to_string();
+    let payload_a = sample_large_chunked_payload();
+    let mut payload_b = sample_large_chunked_payload();
+    payload_b[0] ^= 0xff;
+
+    seed_subject_version(&source, &key, &version_a, payload_a.clone(), Vec::new()).await;
+    seed_subject_version(
+        &source,
+        &key,
+        &version_b,
+        payload_b.clone(),
+        vec![version_a.clone()],
+    )
+    .await;
+    seed_subject_version(&target, &key, &version_a, payload_a.clone(), Vec::new()).await;
+    seed_subject_version(
+        &target,
+        &key,
+        &version_b,
+        payload_b.clone(),
+        vec![version_a.clone()],
+    )
+    .await;
+    note_subject_replicas(
+        &target,
+        source.node_id,
+        &key,
+        &[version_a.clone(), version_b.clone()],
+    )
+    .await;
+
+    let baseline_repair_history_len = repair_run_history(&target).await.len();
+    apply_data_scrub_corruption_to_subject(
+        &target,
+        &key,
+        Some(&version_a),
+        DataScrubAutoRepairCorruptionKind::ManifestMissing,
+    )
+    .await;
+
+    let trigger =
+        super::start_local_data_scrub(&target, super::DataScrubRunTrigger::ManualRequest).await;
+    assert!(trigger.started, "data scrub should start for historical version repair");
+
+    wait_for_data_scrub_completion(&target).await;
+    wait_for_repair_history_len(&target, baseline_repair_history_len + 1).await;
+
+    let scrub_history = super::local_data_scrub_history_payload(&target, Some(8), None)
+        .await
+        .unwrap();
+    let latest_scrub = scrub_history.runs.first().expect("expected retained scrub run");
+    assert!(
+        latest_scrub.summary.issues.iter().any(|issue| {
+            issue.kind == super::storage::DataScrubIssueKind::ManifestMissing
+                && issue.version_id.as_deref() == Some(version_a.as_str())
+        }),
+        "historical corruption should be reported against the exact version, issues={:?}",
+        latest_scrub.summary.issues
+    );
+
+    {
+        let store = lock_store(&target, "tests.data_scrub.verify_historical_repair").await;
+        let report = store.run_data_scrub().await.unwrap();
+        assert_eq!(
+            report.issue_count, 0,
+            "target should be scrub-clean after historical version repair, report={report:?}"
+        );
+        let restored_v1 = store
+            .get_object(
+                &key,
+                None,
+                Some(&version_a),
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("historical version should read after repair");
+        assert_eq!(restored_v1.as_ref(), payload_a.as_slice());
+        let current_head = store
+            .get_object(
+                &key,
+                None,
+                None,
+                super::storage::ObjectReadMode::Preferred,
+            )
+            .await
+            .expect("current head should remain readable");
+        assert_eq!(current_head.as_ref(), payload_b.as_slice());
+    }
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    data_scrub_auto_repair_repairs_exact_historical_version_subject_impl,
+    data_scrub_auto_repair_repairs_exact_historical_version_subject,
+    data_scrub_auto_repair_repairs_exact_historical_version_subject_turso
 );
 
 #[tokio::test]

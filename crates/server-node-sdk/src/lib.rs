@@ -1539,6 +1539,7 @@ enum RepairRunTrigger {
     ManualRequest,
     StartupRepair,
     BackgroundAudit,
+    DataScrubAutoRepair,
     AutonomousPostWrite,
     PeerClusterRequest,
 }
@@ -6735,9 +6736,16 @@ struct RepairRunTracker {
 
 async fn current_replication_plan(state: &ServerState) -> ReplicationPlan {
     let keys = planning_replication_subjects(state).await;
+    current_replication_plan_for_subjects(state, &keys).await
+}
+
+async fn current_replication_plan_for_subjects(
+    state: &ServerState,
+    subjects: &[String],
+) -> ReplicationPlan {
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
-    cluster.replication_plan(&keys)
+    cluster.replication_plan(subjects)
 }
 
 async fn begin_repair_run_tracking(
@@ -6947,16 +6955,100 @@ async fn finish_data_scrub_run_tracking(
     record
 }
 
+async fn mark_local_replication_subjects_degraded(state: &ServerState, subjects: &BTreeSet<String>) {
+    if subjects.is_empty() {
+        return;
+    }
+
+    let changed = {
+        let mut cluster = state.cluster.lock().await;
+        let local_replicas = cluster
+            .subjects_for_node(state.node_id)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let local_available = cluster
+            .available_subjects_for_node(state.node_id)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        for subject in subjects {
+            if local_replicas.contains(subject) || local_available.contains(subject) {
+                changed = true;
+            }
+            cluster.remove_replica(subject, state.node_id);
+            cluster.remove_available(subject, state.node_id);
+        }
+        changed
+    };
+
+    if changed && let Err(err) = persist_cluster_replicas_state(state).await {
+        warn!(
+            error = %err,
+            subject_count = subjects.len(),
+            "failed to persist degraded local scrub subjects"
+        );
+    }
+}
+
+async fn execute_data_scrub_follow_on_repair(
+    state: ServerState,
+    scrub_run_id: String,
+    degraded_subjects: BTreeSet<String>,
+    repair_subjects: BTreeSet<String>,
+) {
+    if repair_subjects.is_empty() {
+        return;
+    }
+
+    mark_local_replication_subjects_degraded(&state, &degraded_subjects).await;
+
+    if !state.repair_config.enabled {
+        info!(
+            scrub_run_id = %scrub_run_id,
+            subject_count = repair_subjects.len(),
+            "skipping scrub follow-on repair because repair execution is disabled"
+        );
+        return;
+    }
+
+    let subjects = repair_subjects.into_iter().collect::<Vec<_>>();
+    info!(
+        scrub_run_id = %scrub_run_id,
+        subject_count = subjects.len(),
+        "starting scrub follow-on repair"
+    );
+
+    let report = execute_tracked_targeted_local_replication_repair(
+        &state,
+        subjects.clone(),
+        RepairRunTrigger::DataScrubAutoRepair,
+    )
+    .await;
+
+    info!(
+        scrub_run_id = %scrub_run_id,
+        subject_count = subjects.len(),
+        attempted = report.attempted_transfers,
+        successful = report.successful_transfers,
+        failed = report.failed_transfers,
+        skipped = report.skipped_items,
+        skipped_backoff = report.skipped_backoff,
+        skipped_max_retries = report.skipped_max_retries,
+        "finished scrub follow-on repair"
+    );
+}
+
 async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker) {
     info!(run_id = %tracker.run_id, trigger = ?tracker.trigger, "data scrub run started");
     let scrubber = {
         let store = read_store(&state, "data_scrub.clone_worker").await;
         store.data_scrubber()
     };
-    let result = scrubber.run().await;
+    let result = scrubber.run_with_repair_subjects().await;
 
     match result {
-        Ok(summary) => {
+        Ok(output) => {
+            let summary = output.report;
             let status = if summary.issue_count > 0 {
                 DataScrubRunStatus::IssuesDetected
             } else {
@@ -6971,7 +7063,19 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
                 bytes_scanned = summary.bytes_scanned,
                 "data scrub run finished"
             );
-            let _ = finish_data_scrub_run_tracking(&state, tracker, status, summary, None).await;
+            let record = finish_data_scrub_run_tracking(&state, tracker, status, summary, None).await;
+            if !output.repair_subjects.is_empty() {
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    execute_data_scrub_follow_on_repair(
+                        state_clone,
+                        record.run_id,
+                        output.degraded_subjects,
+                        output.repair_subjects,
+                    )
+                    .await;
+                });
+            }
         }
         Err(err) => {
             warn!(
@@ -7052,6 +7156,39 @@ async fn execute_tracked_local_replication_repair(
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
     let report = replication::execute_replication_repair_inner(state, batch_size_override).await;
+    finish_repair_run_tracking(
+        state,
+        tracker,
+        plan_summary,
+        RepairRunStatus::Completed,
+        Some(RepairRunSummary::from_local_report(&report)),
+        serialize_repair_run_report(&report),
+    )
+    .await;
+    report
+}
+
+async fn execute_tracked_targeted_local_replication_repair(
+    state: &ServerState,
+    subjects: Vec<String>,
+    trigger: RepairRunTrigger,
+) -> replication::ReplicationRepairReport {
+    let plan_summary = RepairPlanSummary {
+        generated_at_unix: unix_ts(),
+        under_replicated: subjects.len(),
+        over_replicated: 0,
+        cleanup_deferred_items: 0,
+        cleanup_deferred_extra_nodes: 0,
+        item_count: subjects.len(),
+    };
+    let tracker =
+        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
+    let report = replication::execute_targeted_replication_repair_inner(
+        state,
+        subjects.clone(),
+        Some(subjects.len().max(1)),
+    )
+    .await;
     finish_repair_run_tracking(
         state,
         tracker,

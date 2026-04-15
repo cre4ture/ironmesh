@@ -108,6 +108,7 @@ On every read:
 ## Future extensions
 
 - Background anti-entropy that re-fetches missing/corrupt chunks from peers.
+  See `docs/data-scrub-auto-repair-strategy.md`.
 - Configurable chunking strategy (content-defined chunking for improved dedup).
 - Refcount + garbage collection for unreferenced chunks.
 - Signed snapshot manifests for stronger tamper evidence.

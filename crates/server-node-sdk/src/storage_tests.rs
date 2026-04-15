@@ -3374,6 +3374,200 @@ run_on_all_metadata_backends!(
     data_scrub_history_roundtrip_and_prune_turso
 );
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataScrubCorruptionKind {
+    ManifestMissing,
+    ManifestUnreadable,
+    ManifestInvalid,
+    ManifestHashMismatch,
+    ManifestKeyMismatch,
+    ManifestSizeMismatch,
+    ChunkMissing,
+    ChunkUnreadable,
+    ChunkSizeMismatch,
+    ChunkHashMismatch,
+}
+
+impl DataScrubCorruptionKind {
+    const ALL: [Self; 10] = [
+        Self::ManifestMissing,
+        Self::ManifestUnreadable,
+        Self::ManifestInvalid,
+        Self::ManifestHashMismatch,
+        Self::ManifestKeyMismatch,
+        Self::ManifestSizeMismatch,
+        Self::ChunkMissing,
+        Self::ChunkUnreadable,
+        Self::ChunkSizeMismatch,
+        Self::ChunkHashMismatch,
+    ];
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::ManifestMissing => "manifest-missing",
+            Self::ManifestUnreadable => "manifest-unreadable",
+            Self::ManifestInvalid => "manifest-invalid",
+            Self::ManifestHashMismatch => "manifest-hash-mismatch",
+            Self::ManifestKeyMismatch => "manifest-key-mismatch",
+            Self::ManifestSizeMismatch => "manifest-size-mismatch",
+            Self::ChunkMissing => "chunk-missing",
+            Self::ChunkUnreadable => "chunk-unreadable",
+            Self::ChunkSizeMismatch => "chunk-size-mismatch",
+            Self::ChunkHashMismatch => "chunk-hash-mismatch",
+        }
+    }
+
+    fn issue_kind(self) -> super::DataScrubIssueKind {
+        match self {
+            Self::ManifestMissing => super::DataScrubIssueKind::ManifestMissing,
+            Self::ManifestUnreadable => super::DataScrubIssueKind::ManifestUnreadable,
+            Self::ManifestInvalid => super::DataScrubIssueKind::ManifestInvalid,
+            Self::ManifestHashMismatch => super::DataScrubIssueKind::ManifestHashMismatch,
+            Self::ManifestKeyMismatch => super::DataScrubIssueKind::ManifestKeyMismatch,
+            Self::ManifestSizeMismatch => super::DataScrubIssueKind::ManifestSizeMismatch,
+            Self::ChunkMissing => super::DataScrubIssueKind::ChunkMissing,
+            Self::ChunkUnreadable => super::DataScrubIssueKind::ChunkUnreadable,
+            Self::ChunkSizeMismatch => super::DataScrubIssueKind::ChunkSizeMismatch,
+            Self::ChunkHashMismatch => super::DataScrubIssueKind::ChunkHashMismatch,
+        }
+    }
+}
+
+async fn apply_data_scrub_corruption(
+    store: &mut PersistentStore,
+    key: &str,
+    kind: DataScrubCorruptionKind,
+) {
+    let manifest_hash = store
+        .resolve_manifest_hash_for_key(key, None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    let manifest = store
+        .load_manifest_by_hash(&manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !manifest.chunks.is_empty(),
+        "expected at least one chunk for scrub corruption test"
+    );
+    let first_chunk = manifest.chunks[0].clone();
+    let manifest_path = store.manifest_path_for_test(&manifest_hash);
+    let chunk_path = store.chunk_path_for_test(&first_chunk.hash);
+
+    match kind {
+        DataScrubCorruptionKind::ManifestMissing => {
+            fs::remove_file(&manifest_path).await.unwrap();
+        }
+        DataScrubCorruptionKind::ManifestUnreadable => {
+            fs::remove_file(&manifest_path).await.unwrap();
+            fs::create_dir(&manifest_path).await.unwrap();
+        }
+        DataScrubCorruptionKind::ManifestInvalid => {
+            store
+                .replace_manifest_bytes_for_subject_for_test(key, None, br#"{not-valid-json"#)
+                .await
+                .unwrap();
+        }
+        DataScrubCorruptionKind::ManifestHashMismatch => {
+            let mut payload = fs::read(&manifest_path).await.unwrap();
+            payload.push(b'\n');
+            fs::write(&manifest_path, payload).await.unwrap();
+        }
+        DataScrubCorruptionKind::ManifestKeyMismatch => {
+            let mut mutated = manifest.clone();
+            mutated.key = format!("mismatch/{key}");
+            let payload = serde_json::to_vec(&mutated).unwrap();
+            store
+                .replace_manifest_bytes_for_subject_for_test(key, None, &payload)
+                .await
+                .unwrap();
+        }
+        DataScrubCorruptionKind::ManifestSizeMismatch => {
+            let mut mutated = manifest.clone();
+            mutated.total_size_bytes = mutated.total_size_bytes.saturating_add(7);
+            let payload = serde_json::to_vec(&mutated).unwrap();
+            store
+                .replace_manifest_bytes_for_subject_for_test(key, None, &payload)
+                .await
+                .unwrap();
+        }
+        DataScrubCorruptionKind::ChunkMissing => {
+            fs::remove_file(&chunk_path).await.unwrap();
+        }
+        DataScrubCorruptionKind::ChunkUnreadable => {
+            fs::remove_file(&chunk_path).await.unwrap();
+            fs::create_dir(&chunk_path).await.unwrap();
+        }
+        DataScrubCorruptionKind::ChunkSizeMismatch => {
+            fs::write(
+                &chunk_path,
+                vec![0x5a; first_chunk.size_bytes.saturating_add(1)],
+            )
+            .await
+            .unwrap();
+        }
+        DataScrubCorruptionKind::ChunkHashMismatch => {
+            fs::write(&chunk_path, vec![0x5a; first_chunk.size_bytes])
+                .await
+                .unwrap();
+        }
+    }
+}
+
+async fn data_scrub_detects_each_corruption_kind_impl(backend: StorageTestBackend) {
+    for kind in DataScrubCorruptionKind::ALL {
+        let (root, mut store) = backend
+            .init_store(&format!("data-scrub-detect-{}", kind.slug()))
+            .await;
+        let key = format!("docs/{}.bin", kind.slug());
+
+        store
+            .put_object_versioned(
+                &key,
+                Bytes::from(sample_large_chunked_payload()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        apply_data_scrub_corruption(&mut store, &key, kind).await;
+
+        let report = store.run_data_scrub().await.unwrap();
+        assert!(
+            report.issues.iter().any(|issue| issue.kind == kind.issue_kind()),
+            "expected scrub to detect {:?}, issues={:?}",
+            kind,
+            report.issues
+        );
+
+        if matches!(
+            kind,
+            DataScrubCorruptionKind::ManifestInvalid
+                | DataScrubCorruptionKind::ManifestKeyMismatch
+                | DataScrubCorruptionKind::ManifestSizeMismatch
+        ) {
+            assert!(
+                !report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.kind == super::DataScrubIssueKind::ManifestHashMismatch),
+                "fixture for {:?} should not depend on manifest hash mismatch, issues={:?}",
+                kind,
+                report.issues
+            );
+        }
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+}
+
+run_on_all_metadata_backends!(
+    data_scrub_detects_each_corruption_kind_impl,
+    data_scrub_detects_each_corruption_kind,
+    data_scrub_detects_each_corruption_kind_turso
+);
+
 async fn data_scrub_detects_missing_and_corrupt_chunks_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("data-scrub-detects-issues").await;
     let payload = sample_large_chunked_payload();

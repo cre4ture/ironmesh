@@ -891,16 +891,28 @@ impl ChunkIngestor {
         }
 
         let chunk_path = chunk_path_for_hash(&self.chunks_dir, hash);
+        let mut replaced_existing_path = false;
         if fs::try_exists(&chunk_path).await? {
-            return Ok(false);
+            match fs::read(&chunk_path).await {
+                Ok(existing_payload) if hash_hex(&existing_payload) == hash => {
+                    return Ok(false);
+                }
+                Ok(_) | Err(_) => {
+                    replaced_existing_path = true;
+                }
+            }
         }
 
         if let Some(parent) = chunk_path.parent() {
             fs::create_dir_all(parent).await?;
         }
 
-        write_atomic(&chunk_path, payload).await?;
-        self.note_chunk_store_delta(payload.len() as i64).await?;
+        write_atomic_overwrite(&chunk_path, payload).await?;
+        if replaced_existing_path {
+            self.reconcile_chunk_store_bytes_state().await?;
+        } else {
+            self.note_chunk_store_delta(payload.len() as i64).await?;
+        }
         Ok(true)
     }
 
@@ -1470,6 +1482,23 @@ struct DataScrubReference {
     version_id: Option<String>,
 }
 
+impl DataScrubReference {
+    fn subject(&self) -> Option<String> {
+        let key = self.key.as_ref()?;
+        if let Some(version_id) = &self.version_id {
+            return Some(format!("{key}@{version_id}"));
+        }
+        Some(key.clone())
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DataScrubRunOutput {
+    pub(crate) report: DataScrubReport,
+    pub(crate) repair_subjects: BTreeSet<String>,
+    pub(crate) degraded_subjects: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone)]
 struct VerifiedChunkState {
     actual_size_bytes: Option<u64>,
@@ -1497,15 +1526,37 @@ impl DataScrubber {
     }
 
     pub(crate) async fn run(&self) -> Result<DataScrubReport> {
+        Ok(self.run_internal(None).await?.report)
+    }
+
+    pub(crate) async fn run_with_repair_subjects(&self) -> Result<DataScrubRunOutput> {
+        self.run_internal(None).await
+    }
+
+    pub(crate) async fn run_for_subjects(
+        &self,
+        subject_filter: &BTreeSet<String>,
+    ) -> Result<DataScrubReport> {
+        Ok(self.run_internal(Some(subject_filter)).await?.report)
+    }
+
+    async fn run_internal(
+        &self,
+        subject_filter: Option<&BTreeSet<String>>,
+    ) -> Result<DataScrubRunOutput> {
         #[cfg(test)]
         if let Some(run_test_hook) = &self.run_test_hook {
             run_test_hook.block_run().await;
         }
 
-        let mut report = DataScrubReport {
-            current_keys_scanned: self.current_state.objects.len(),
-            ..DataScrubReport::default()
+        let mut output = DataScrubRunOutput {
+            report: DataScrubReport::default(),
+            repair_subjects: BTreeSet::new(),
+            degraded_subjects: BTreeSet::new(),
         };
+        if subject_filter.is_none() {
+            output.report.current_keys_scanned = self.current_state.objects.len();
+        }
         let mut manifest_references = HashMap::<String, Vec<DataScrubReference>>::new();
         let mut reverse_current_keys = HashMap::<String, String>::new();
         for (key, object_id) in &self.current_state.object_ids {
@@ -1515,11 +1566,19 @@ impl DataScrubber {
         let mut current_keys: Vec<_> = self.current_state.objects.keys().cloned().collect();
         current_keys.sort();
         for key in current_keys {
+            if let Some(subject_filter) = subject_filter
+                && !subject_filter.contains(&key)
+            {
+                continue;
+            }
             let Some(manifest_hash) = self.current_state.objects.get(&key) else {
                 continue;
             };
             if manifest_hash == TOMBSTONE_MANIFEST_HASH {
                 continue;
+            }
+            if subject_filter.is_some() {
+                output.report.current_keys_scanned = output.report.current_keys_scanned.saturating_add(1);
             }
             manifest_references
                 .entry(manifest_hash.clone())
@@ -1533,7 +1592,9 @@ impl DataScrubber {
 
         let mut version_indexes = self.metadata_store.load_all_version_indexes().await?;
         version_indexes.sort_by(|a, b| a.object_id.cmp(&b.object_id));
-        report.version_indexes_scanned = version_indexes.len();
+        if subject_filter.is_none() {
+            output.report.version_indexes_scanned = version_indexes.len();
+        }
 
         for index in version_indexes {
             let mut records: Vec<_> = index.versions.values().cloned().collect();
@@ -1542,23 +1603,49 @@ impl DataScrubber {
                     .cmp(&b.created_at_unix)
                     .then_with(|| a.version_id.cmp(&b.version_id))
             });
-            report.version_records_scanned =
-                report.version_records_scanned.saturating_add(records.len());
+            if subject_filter.is_none() {
+                output.report.version_records_scanned = output
+                    .report
+                    .version_records_scanned
+                    .saturating_add(records.len());
+            }
+            let mut scanned_index = false;
             for record in records {
                 if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
                     continue;
+                }
+                let key = record
+                    .logical_path
+                    .clone()
+                    .or_else(|| reverse_current_keys.get(&index.object_id).cloned());
+                if let Some(subject_filter) = subject_filter {
+                    let Some(key) = key.as_deref() else {
+                        continue;
+                    };
+                    let subject = format!("{key}@{}", record.version_id);
+                    if !subject_filter.contains(&subject) {
+                        continue;
+                    }
+                    scanned_index = true;
+                    output.report.version_records_scanned = output
+                        .report
+                        .version_records_scanned
+                        .saturating_add(1);
                 }
                 manifest_references
                     .entry(record.manifest_hash.clone())
                     .or_default()
                     .push(DataScrubReference {
-                        key: record
-                            .logical_path
-                            .clone()
-                            .or_else(|| reverse_current_keys.get(&index.object_id).cloned()),
+                        key,
                         object_id: Some(index.object_id.clone()),
                         version_id: Some(record.version_id.clone()),
                     });
+            }
+            if subject_filter.is_some() && scanned_index {
+                output.report.version_indexes_scanned = output
+                    .report
+                    .version_indexes_scanned
+                    .saturating_add(1);
             }
         }
 
@@ -1567,18 +1654,19 @@ impl DataScrubber {
         let mut verified_chunks = HashMap::<String, VerifiedChunkState>::new();
 
         for manifest_hash in manifest_hashes {
-            report.manifests_scanned = report.manifests_scanned.saturating_add(1);
+            output.report.manifests_scanned = output.report.manifests_scanned.saturating_add(1);
             let contexts = manifest_references
                 .get(&manifest_hash)
                 .cloned()
                 .unwrap_or_default();
-            self.verify_manifest(&manifest_hash, &contexts, &mut verified_chunks, &mut report)
+            self.verify_manifest(&manifest_hash, &contexts, &mut verified_chunks, &mut output)
                 .await;
         }
 
-        report.sampled_issue_count = report.issues.len();
-        report.issue_sample_truncated = report.issue_count > report.issues.len();
-        Ok(report)
+        output.report.sampled_issue_count = output.report.issues.len();
+        output.report.issue_sample_truncated =
+            output.report.issue_count > output.report.issues.len();
+        Ok(output)
     }
 
     async fn verify_manifest(
@@ -1586,14 +1674,14 @@ impl DataScrubber {
         manifest_hash: &str,
         contexts: &[DataScrubReference],
         verified_chunks: &mut HashMap<String, VerifiedChunkState>,
-        report: &mut DataScrubReport,
+        output: &mut DataScrubRunOutput,
     ) {
         let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
-        let payload = match fs::read(&manifest_path).await {
+        let payload = match self.read_with_bounded_retry(&manifest_path).await {
             Ok(payload) => payload,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 self.push_issue(
-                    report,
+                    output,
                     contexts,
                     DataScrubIssueKind::ManifestMissing,
                     Some(manifest_hash.to_string()),
@@ -1604,7 +1692,7 @@ impl DataScrubber {
             }
             Err(err) => {
                 self.push_issue(
-                    report,
+                    output,
                     contexts,
                     DataScrubIssueKind::ManifestUnreadable,
                     Some(manifest_hash.to_string()),
@@ -1618,7 +1706,7 @@ impl DataScrubber {
         let computed_manifest_hash = hash_hex(&payload);
         if computed_manifest_hash != manifest_hash {
             self.push_issue(
-                report,
+                output,
                 contexts,
                 DataScrubIssueKind::ManifestHashMismatch,
                 Some(manifest_hash.to_string()),
@@ -1633,7 +1721,7 @@ impl DataScrubber {
             Ok(manifest) => manifest,
             Err(err) => {
                 self.push_issue(
-                    report,
+                    output,
                     contexts,
                     DataScrubIssueKind::ManifestInvalid,
                     Some(manifest_hash.to_string()),
@@ -1650,7 +1738,7 @@ impl DataScrubber {
             .collect::<BTreeSet<_>>();
         if !expected_keys.is_empty() && !expected_keys.contains(manifest.key.as_str()) {
             self.push_issue(
-                report,
+                output,
                 contexts,
                 DataScrubIssueKind::ManifestKeyMismatch,
                 Some(manifest_hash.to_string()),
@@ -1669,7 +1757,7 @@ impl DataScrubber {
             .fold(0usize, |acc, chunk| acc.saturating_add(chunk.size_bytes));
         if declared_total != manifest.total_size_bytes {
             self.push_issue(
-                report,
+                output,
                 contexts,
                 DataScrubIssueKind::ManifestSizeMismatch,
                 Some(manifest_hash.to_string()),
@@ -1685,14 +1773,14 @@ impl DataScrubber {
             let verified_state = if let Some(existing) = verified_chunks.get(&chunk.hash) {
                 existing.clone()
             } else {
-                let verified = self.verify_chunk(chunk, report).await;
+                let verified = self.verify_chunk(chunk, &mut output.report).await;
                 verified_chunks.insert(chunk.hash.clone(), verified.clone());
                 verified
             };
 
             if verified_state.missing {
                 self.push_issue(
-                    report,
+                    output,
                     contexts,
                     DataScrubIssueKind::ChunkMissing,
                     Some(manifest_hash.to_string()),
@@ -1704,7 +1792,7 @@ impl DataScrubber {
 
             if let Some(read_error) = &verified_state.read_error {
                 self.push_issue(
-                    report,
+                    output,
                     contexts,
                     DataScrubIssueKind::ChunkUnreadable,
                     Some(manifest_hash.to_string()),
@@ -1716,7 +1804,7 @@ impl DataScrubber {
 
             if verified_state.actual_size_bytes != Some(chunk.size_bytes as u64) {
                 self.push_issue(
-                    report,
+                    output,
                     contexts,
                     DataScrubIssueKind::ChunkSizeMismatch,
                     Some(manifest_hash.to_string()),
@@ -1732,7 +1820,7 @@ impl DataScrubber {
 
             if verified_state.actual_hash.as_deref() != Some(chunk.hash.as_str()) {
                 self.push_issue(
-                    report,
+                    output,
                     contexts,
                     DataScrubIssueKind::ChunkHashMismatch,
                     Some(manifest_hash.to_string()),
@@ -1747,6 +1835,14 @@ impl DataScrubber {
         }
     }
 
+    async fn read_with_bounded_retry(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        match fs::read(path).await {
+            Ok(payload) => Ok(payload),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(err),
+            Err(_) => fs::read(path).await,
+        }
+    }
+
     async fn verify_chunk(
         &self,
         chunk: &ChunkRef,
@@ -1754,7 +1850,7 @@ impl DataScrubber {
     ) -> VerifiedChunkState {
         report.chunks_scanned = report.chunks_scanned.saturating_add(1);
         let chunk_path = chunk_path_for_hash(&self.chunks_dir, &chunk.hash);
-        match fs::read(&chunk_path).await {
+        match self.read_with_bounded_retry(&chunk_path).await {
             Ok(payload) => {
                 report.bytes_scanned = report.bytes_scanned.saturating_add(payload.len() as u64);
                 VerifiedChunkState {
@@ -1781,13 +1877,23 @@ impl DataScrubber {
 
     fn push_issue(
         &self,
-        report: &mut DataScrubReport,
+        output: &mut DataScrubRunOutput,
         contexts: &[DataScrubReference],
         kind: DataScrubIssueKind,
         manifest_hash: Option<String>,
         chunk_hash: Option<String>,
         detail: String,
     ) {
+        if data_scrub_issue_requires_auto_repair(&kind) {
+            output
+                .repair_subjects
+                .extend(data_scrub_repair_subjects_for_contexts(contexts));
+            output
+                .degraded_subjects
+                .extend(data_scrub_all_subjects_for_contexts(contexts));
+        }
+
+        let report = &mut output.report;
         report.issue_count = report.issue_count.saturating_add(1);
         if report.issues.len() >= DATA_SCRUB_ISSUE_SAMPLE_LIMIT {
             return;
@@ -1804,6 +1910,37 @@ impl DataScrubber {
             detail,
         });
     }
+}
+
+fn data_scrub_issue_requires_auto_repair(kind: &DataScrubIssueKind) -> bool {
+    !matches!(kind, DataScrubIssueKind::ManifestKeyMismatch)
+}
+
+fn data_scrub_repair_subjects_for_contexts(contexts: &[DataScrubReference]) -> BTreeSet<String> {
+    let mut subjects = BTreeSet::new();
+    let versioned_base_keys = contexts
+        .iter()
+        .filter(|context| context.version_id.is_some())
+        .filter_map(|context| context.key.clone())
+        .collect::<HashSet<_>>();
+
+    for context in contexts {
+        match (&context.key, &context.version_id) {
+            (Some(key), Some(version_id)) => {
+                subjects.insert(format!("{key}@{version_id}"));
+            }
+            (Some(key), None) if !versioned_base_keys.contains(key) => {
+                subjects.insert(key.clone());
+            }
+            _ => {}
+        }
+    }
+
+    subjects
+}
+
+fn data_scrub_all_subjects_for_contexts(contexts: &[DataScrubReference]) -> BTreeSet<String> {
+    contexts.iter().filter_map(DataScrubReference::subject).collect()
 }
 
 impl StoreIndexInspector {
@@ -2381,6 +2518,16 @@ impl PersistentStore {
     }
 
     #[cfg(test)]
+    pub fn manifest_path_for_test(&self, manifest_hash: &str) -> PathBuf {
+        self.manifests_dir.join(format!("{manifest_hash}.json"))
+    }
+
+    #[cfg(test)]
+    pub fn chunk_path_for_test(&self, chunk_hash: &str) -> PathBuf {
+        chunk_path_for_hash(&self.chunks_dir, chunk_hash)
+    }
+
+    #[cfg(test)]
     pub fn object_count(&self) -> usize {
         self.current_state.objects.len()
     }
@@ -2397,6 +2544,95 @@ impl PersistentStore {
     #[cfg(test)]
     pub async fn list_locally_owned_manifests_for_test(&self) -> Result<Vec<String>> {
         self.metadata_store.list_locally_owned_manifests().await
+    }
+
+    #[cfg(test)]
+    pub async fn load_manifest_payload_for_subject_for_test(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<Option<Vec<u8>>> {
+        let manifest_hash = match self
+            .resolve_manifest_hash_for_key(key, None, version_id, ObjectReadMode::Preferred)
+            .await
+        {
+            Ok(manifest_hash) => manifest_hash,
+            Err(StoreReadError::NotFound) => return Ok(None),
+            Err(StoreReadError::Corrupt(detail)) => bail!(detail),
+            Err(StoreReadError::Internal(err)) => return Err(err),
+        };
+
+        let manifest_path = self.manifest_path_for_test(&manifest_hash);
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        Ok(Some(fs::read(&manifest_path).await?))
+    }
+
+    #[cfg(test)]
+    pub async fn replace_manifest_bytes_for_subject_for_test(
+        &mut self,
+        key: &str,
+        version_id: Option<&str>,
+        payload: &[u8],
+    ) -> Result<String> {
+        let manifest_hash = hash_hex(payload);
+        let manifest_path = self.manifest_path_for_test(&manifest_hash);
+        if let Some(parent) = manifest_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&manifest_path, payload).await?;
+
+        if let Some(version_id) = version_id {
+            let Some(object_id) = self.resolve_object_id_for_key_version(key, version_id).await?
+            else {
+                bail!("missing object id for key={key} version_id={version_id}");
+            };
+            let Some(mut index) = self.load_version_index_by_object_id(&object_id).await? else {
+                bail!("missing version index for key={key} version_id={version_id}");
+            };
+            let Some(record) = index.versions.get_mut(version_id) else {
+                bail!("missing version record for key={key} version_id={version_id}");
+            };
+            record.manifest_hash = manifest_hash.clone();
+            self.persist_version_index_by_object_id(&object_id, &index)
+                .await?;
+
+            if self.current_state.object_ids.get(key) == Some(&object_id)
+                && index.preferred_head_version_id.as_deref() == Some(version_id)
+            {
+                self.current_state
+                    .objects
+                    .insert(key.to_string(), manifest_hash.clone());
+                self.persist_current_state().await?;
+            }
+
+            return Ok(manifest_hash);
+        }
+
+        if let Some(object_id) = self.object_id_for_key(key)
+            && let Some(mut index) = self.load_version_index_by_object_id(&object_id).await?
+        {
+            let Some(preferred_head_version_id) = index.preferred_head_version_id.clone() else {
+                bail!("missing preferred head for key={key}");
+            };
+            let Some(record) = index.versions.get_mut(&preferred_head_version_id) else {
+                bail!("missing preferred head record for key={key}");
+            };
+            record.manifest_hash = manifest_hash.clone();
+            self.persist_version_index_by_object_id(&object_id, &index)
+                .await?;
+            self.sync_current_state_for_key_from_index(key, &index)?;
+            self.persist_current_state().await?;
+            return Ok(manifest_hash);
+        }
+
+        self.current_state
+            .objects
+            .insert(key.to_string(), manifest_hash.clone());
+        self.persist_current_state().await?;
+        Ok(manifest_hash)
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
@@ -3387,8 +3623,13 @@ impl PersistentStore {
         }
 
         let manifest_path = self.manifests_dir.join(format!("{manifest_hash}.json"));
-        if !fs::try_exists(&manifest_path).await? {
-            write_atomic(&manifest_path, manifest_payload).await?;
+        let manifest_needs_write = match fs::read(&manifest_path).await {
+            Ok(existing_payload) => existing_payload != manifest_payload,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => true,
+        };
+        if manifest_needs_write {
+            write_atomic_overwrite(&manifest_path, manifest_payload).await?;
         }
         self.mark_manifest_locally_owned(manifest_hash).await?;
 
@@ -6620,6 +6861,14 @@ fn unix_ts_nanos() -> u128 {
 }
 
 async fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
+    write_atomic_impl(path, payload, false).await
+}
+
+async fn write_atomic_overwrite(path: &Path, payload: &[u8]) -> Result<()> {
+    write_atomic_impl(path, payload, true).await
+}
+
+async fn write_atomic_impl(path: &Path, payload: &[u8], overwrite_existing: bool) -> Result<()> {
     let total_started_at = Instant::now();
     let parent = path
         .parent()
@@ -6639,6 +6888,18 @@ async fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
     fs::write(&tmp, payload).await?;
     let write_ms = write_started_at.elapsed().as_millis();
     let rename_started_at = Instant::now();
+    if overwrite_existing {
+        match fs::metadata(path).await {
+            Ok(metadata) if metadata.is_dir() => {
+                fs::remove_dir_all(path).await?;
+            }
+            Ok(_) => {
+                fs::remove_file(path).await?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
     fs::rename(&tmp, path)
         .await
         .with_context(|| format!("failed to move {} -> {}", tmp.display(), path.display()))?;
