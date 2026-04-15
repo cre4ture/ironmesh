@@ -124,6 +124,9 @@ const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
 const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 const MAX_STORAGE_STATS_HISTORY_LIMIT: usize = 250_000;
 const MAX_STORAGE_STATS_HISTORY_POINTS: usize = 4_096;
+const DATA_SCRUB_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
+const DATA_SCRUB_HISTORY_RETENTION_SECS: u64 = 12 * 30 * 24 * 60 * 60;
+const MAX_DATA_SCRUB_HISTORY_LIMIT: usize = 4_096;
 const REPAIR_RUN_HISTORY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_REPAIR_RUN_HISTORY_LIMIT: usize = 4_096;
 const UPLOAD_SESSION_PERSIST_INACTIVITY_SECS: u64 = 60;
@@ -150,7 +153,7 @@ use setup::{
     managed_rendezvous_key_path, managed_signer_ca_cert_path,
 };
 use storage::{
-    AdminAuditEvent, ChunkIngestor, ClientCredentialRecord, ClientCredentialState,
+    AdminAuditEvent, ChunkIngestor, ClientCredentialRecord, ClientCredentialState, DataScrubReport,
     MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
     MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
     PairingAuthorizationRecord, PathMutationResult, PersistentStore, PutOptions,
@@ -164,6 +167,9 @@ struct ServerState {
     cluster_id: ClusterId,
     node_id: NodeId,
     storage_stats_history_retention_secs: u64,
+    data_scrub_enabled: bool,
+    data_scrub_interval_secs: u64,
+    data_scrub_history_retention_secs: u64,
     repair_run_history_retention_secs: u64,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
@@ -206,6 +212,7 @@ struct ServerState {
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
     repair_activity: Arc<Mutex<RepairActivityRuntime>>,
+    data_scrub_activity: Arc<Mutex<DataScrubActivityRuntime>>,
     local_availability_refresh_lock: Arc<Mutex<()>>,
     local_availability_refresh_notify: Arc<Notify>,
     storage_stats_runtime: Arc<Mutex<StorageStatsRuntime>>,
@@ -1663,6 +1670,120 @@ struct RepairActivityStatusResponse {
     latest_run: Option<RepairRunRecord>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DataScrubScope {
+    Local,
+    Cluster,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DataScrubRunTrigger {
+    ManualRequest,
+    Scheduled,
+    PeerClusterRequest,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DataScrubRunStatus {
+    Clean,
+    IssuesDetected,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DataScrubActivityState {
+    Idle,
+    Running,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubRunRecord {
+    run_id: String,
+    reporting_node_id: NodeId,
+    trigger: DataScrubRunTrigger,
+    status: DataScrubRunStatus,
+    started_at_unix: u64,
+    finished_at_unix: u64,
+    duration_ms: u64,
+    summary: DataScrubReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubHistoryResponse {
+    retention_secs: u64,
+    runs: Vec<DataScrubRunRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubActiveRun {
+    run_id: String,
+    trigger: DataScrubRunTrigger,
+    started_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DataScrubActivityRuntime {
+    active_runs: Vec<DataScrubActiveRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubActivityStatusResponse {
+    state: DataScrubActivityState,
+    enabled: bool,
+    interval_secs: u64,
+    retention_secs: u64,
+    active_runs: Vec<DataScrubActiveRun>,
+    latest_run: Option<DataScrubRunRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubClusterNodeStatus {
+    node_id: NodeId,
+    state: DataScrubActivityState,
+    enabled: bool,
+    interval_secs: u64,
+    retention_secs: u64,
+    active_runs: Vec<DataScrubActiveRun>,
+    latest_run: Option<DataScrubRunRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubClusterSkippedNode {
+    node_id: NodeId,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubClusterStatusResponse {
+    nodes: Vec<DataScrubClusterNodeStatus>,
+    skipped_nodes: Vec<DataScrubClusterSkippedNode>,
+    runs: Vec<DataScrubRunRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubTriggerNodeResult {
+    node_id: NodeId,
+    started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_run: Option<DataScrubActiveRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataScrubTriggerResponse {
+    scope: DataScrubScope,
+    nodes_contacted: usize,
+    failed_nodes: usize,
+    node_results: Vec<DataScrubTriggerNodeResult>,
+}
+
 #[derive(Debug, Default)]
 struct RepairExecutorState {
     attempts: HashMap<String, RepairAttemptEntry>,
@@ -1764,6 +1885,16 @@ fn env_flag_is_truthy(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn env_flag_or(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
 }
 
 fn env_u64_or(name: &str, default: u64) -> u64 {
@@ -3706,6 +3837,30 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             "storage stats history retention override enabled"
         );
     }
+    let data_scrub_enabled = env_flag_or("IRONMESH_DATA_SCRUB_ENABLED", true);
+    let data_scrub_interval_secs = env_u64_or(
+        "IRONMESH_DATA_SCRUB_INTERVAL_SECS",
+        DATA_SCRUB_INTERVAL_SECS,
+    );
+    if data_scrub_interval_secs != DATA_SCRUB_INTERVAL_SECS {
+        info!(
+            interval_secs = data_scrub_interval_secs,
+            "data scrub interval override enabled"
+        );
+    }
+    let data_scrub_history_retention_secs = env_u64_or(
+        "IRONMESH_DATA_SCRUB_HISTORY_RETENTION_SECS",
+        DATA_SCRUB_HISTORY_RETENTION_SECS,
+    );
+    if data_scrub_history_retention_secs != DATA_SCRUB_HISTORY_RETENTION_SECS {
+        info!(
+            retention_secs = data_scrub_history_retention_secs,
+            "data scrub history retention override enabled"
+        );
+    }
+    if !data_scrub_enabled {
+        info!("background data scrubbing disabled via IRONMESH_DATA_SCRUB_ENABLED");
+    }
     let repair_run_history_retention_secs = env_u64_or(
         "IRONMESH_REPAIR_RUN_HISTORY_RETENTION_SECS",
         REPAIR_RUN_HISTORY_RETENTION_SECS,
@@ -3722,6 +3877,9 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         cluster_id: config.cluster_id,
         node_id: config.node_id,
         storage_stats_history_retention_secs,
+        data_scrub_enabled,
+        data_scrub_interval_secs,
+        data_scrub_history_retention_secs,
         repair_run_history_retention_secs,
         map_perf_logging_enabled,
         map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
@@ -3777,6 +3935,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         repair_activity: Arc::new(Mutex::new(RepairActivityRuntime::default())),
+        data_scrub_activity: Arc::new(Mutex::new(DataScrubActivityRuntime::default())),
         local_availability_refresh_lock: Arc::new(Mutex::new(())),
         local_availability_refresh_notify: Arc::new(Notify::new()),
         storage_stats_runtime: Arc::new(Mutex::new(StorageStatsRuntime::default())),
@@ -3804,6 +3963,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     );
     spawn_local_availability_refresher(state.clone(), startup_phase_anchor);
     spawn_storage_stats_refresher(state.clone());
+    spawn_data_scrubber(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
 
     let load_repair_attempts_phase_started_at =
@@ -3940,6 +4100,10 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/admin/logout", post(logout_admin_session))
         .route("/auth/repair/activity", get(repair_activity_status))
         .route("/auth/repair/history", get(repair_history))
+        .route("/auth/scrub/activity", get(data_scrub_activity_status))
+        .route("/auth/scrub/history", get(data_scrub_history))
+        .route("/auth/scrub/cluster", get(data_scrub_cluster_status))
+        .route("/auth/scrub/run", post(trigger_data_scrub_public))
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
         .route("/auth/versions/{key}", get(list_versions_admin))
@@ -4088,6 +4252,12 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
+        .route(
+            "/cluster/scrub/activity",
+            get(data_scrub_activity_status_internal),
+        )
+        .route("/cluster/scrub/history", get(data_scrub_history_internal))
+        .route("/cluster/scrub/run", post(trigger_data_scrub_peer))
         .route("/storage/stats/current", get(storage_stats_current))
         .route("/storage/stats/history", get(storage_stats_history))
         .route("/cluster/placement/{key}", get(placement_for_key))
@@ -4414,6 +4584,39 @@ fn spawn_storage_stats_refresher(state: ServerState) {
 
                     refresh_storage_stats_once(&state).await;
                 }
+            }
+        }
+    });
+}
+
+fn spawn_data_scrubber(state: ServerState) {
+    if !state.data_scrub_enabled {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(state.data_scrub_interval_secs.max(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+            let result = start_local_data_scrub(&state, DataScrubRunTrigger::Scheduled).await;
+            if result.started {
+                if let Some(active_run) = result.active_run.as_ref() {
+                    info!(
+                        run_id = %active_run.run_id,
+                        interval_secs = state.data_scrub_interval_secs,
+                        "scheduled data scrub queued"
+                    );
+                }
+            } else if let Some(active_run) = result.active_run.as_ref() {
+                info!(
+                    run_id = %active_run.run_id,
+                    interval_secs = state.data_scrub_interval_secs,
+                    "scheduled data scrub skipped because a run is already active"
+                );
             }
         }
     });
@@ -6655,6 +6858,185 @@ async fn latest_repair_run_record(state: &ServerState) -> Result<Option<RepairRu
         .await?
         .into_iter()
         .next())
+}
+
+#[derive(Debug, Clone)]
+struct DataScrubRunTracker {
+    run_id: String,
+    trigger: DataScrubRunTrigger,
+    started_at_unix: u64,
+    started_at_instant: Instant,
+}
+
+fn current_data_scrub_activity_state(active_runs: &[DataScrubActiveRun]) -> DataScrubActivityState {
+    if active_runs.is_empty() {
+        DataScrubActivityState::Idle
+    } else {
+        DataScrubActivityState::Running
+    }
+}
+
+async fn latest_data_scrub_run_record(state: &ServerState) -> Result<Option<DataScrubRunRecord>> {
+    let store = read_store(state, "data_scrub.latest").await;
+    Ok(store
+        .list_data_scrub_run_history(Some(1), None)
+        .await?
+        .into_iter()
+        .next())
+}
+
+async fn persist_data_scrub_run_record_with_retention(
+    state: &ServerState,
+    record: &DataScrubRunRecord,
+) {
+    let store = lock_store(state, "data_scrub.persist").await;
+    if let Err(err) = store.persist_data_scrub_run_record(record).await {
+        warn!(
+            error = %err,
+            run_id = %record.run_id,
+            "failed to persist data scrub history record"
+        );
+        return;
+    }
+
+    let retention_cutoff = record
+        .finished_at_unix
+        .saturating_sub(state.data_scrub_history_retention_secs);
+    if let Err(err) = store
+        .prune_data_scrub_run_history_before(retention_cutoff)
+        .await
+    {
+        warn!(
+            error = %err,
+            retention_cutoff,
+            run_id = %record.run_id,
+            "failed to prune data scrub history"
+        );
+    }
+}
+
+async fn finish_data_scrub_run_tracking(
+    state: &ServerState,
+    tracker: DataScrubRunTracker,
+    status: DataScrubRunStatus,
+    summary: DataScrubReport,
+    last_error: Option<String>,
+) -> DataScrubRunRecord {
+    {
+        let mut activity = state.data_scrub_activity.lock().await;
+        activity
+            .active_runs
+            .retain(|active_run| active_run.run_id != tracker.run_id);
+    }
+
+    let duration_ms =
+        u64::try_from(tracker.started_at_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let record = DataScrubRunRecord {
+        run_id: tracker.run_id,
+        reporting_node_id: state.node_id,
+        trigger: tracker.trigger,
+        status,
+        started_at_unix: tracker.started_at_unix,
+        finished_at_unix: unix_ts(),
+        duration_ms,
+        summary,
+        last_error,
+    };
+
+    persist_data_scrub_run_record_with_retention(state, &record).await;
+    record
+}
+
+async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker) {
+    info!(run_id = %tracker.run_id, trigger = ?tracker.trigger, "data scrub run started");
+    let scrubber = {
+        let store = read_store(&state, "data_scrub.clone_worker").await;
+        store.data_scrubber()
+    };
+    let result = scrubber.run().await;
+
+    match result {
+        Ok(summary) => {
+            let status = if summary.issue_count > 0 {
+                DataScrubRunStatus::IssuesDetected
+            } else {
+                DataScrubRunStatus::Clean
+            };
+            info!(
+                run_id = %tracker.run_id,
+                status = ?status,
+                issue_count = summary.issue_count,
+                manifests_scanned = summary.manifests_scanned,
+                chunks_scanned = summary.chunks_scanned,
+                bytes_scanned = summary.bytes_scanned,
+                "data scrub run finished"
+            );
+            let _ = finish_data_scrub_run_tracking(&state, tracker, status, summary, None).await;
+        }
+        Err(err) => {
+            warn!(
+                run_id = %tracker.run_id,
+                error = %err,
+                "data scrub run failed"
+            );
+            let _ = finish_data_scrub_run_tracking(
+                &state,
+                tracker,
+                DataScrubRunStatus::Failed,
+                DataScrubReport::default(),
+                Some(err.to_string()),
+            )
+            .await;
+        }
+    }
+}
+
+async fn start_local_data_scrub(
+    state: &ServerState,
+    trigger: DataScrubRunTrigger,
+) -> DataScrubTriggerNodeResult {
+    let active_or_new = {
+        let mut activity = state.data_scrub_activity.lock().await;
+        if let Some(active_run) = activity.active_runs.first().cloned() {
+            return DataScrubTriggerNodeResult {
+                node_id: state.node_id,
+                started: false,
+                active_run: Some(active_run),
+                error: None,
+            };
+        }
+
+        let run_id = Uuid::now_v7().to_string();
+        let started_at_unix = unix_ts();
+        let active_run = DataScrubActiveRun {
+            run_id: run_id.clone(),
+            trigger,
+            started_at_unix,
+        };
+        activity.active_runs.push(active_run.clone());
+        (
+            active_run,
+            DataScrubRunTracker {
+                run_id,
+                trigger,
+                started_at_unix,
+                started_at_instant: Instant::now(),
+            },
+        )
+    };
+
+    let (active_run, tracker) = active_or_new;
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        execute_data_scrub_run(state_clone, tracker).await;
+    });
+
+    DataScrubTriggerNodeResult {
+        node_id: state.node_id,
+        started: true,
+        active_run: Some(active_run),
+        error: None,
+    }
 }
 
 async fn execute_tracked_local_replication_repair(
@@ -9803,6 +10185,17 @@ struct StorageStatsHistoryQuery {
 struct RepairHistoryQuery {
     limit: Option<usize>,
     since_unix: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataScrubHistoryQuery {
+    limit: Option<usize>,
+    since_unix: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataScrubTriggerQuery {
+    scope: Option<DataScrubScope>,
 }
 
 #[derive(Debug, Serialize)]
@@ -13311,6 +13704,441 @@ async fn storage_stats_history(
     let samples = downsample_storage_stats_samples(samples, max_points);
 
     (StatusCode::OK, Json(samples)).into_response()
+}
+
+fn resolved_data_scrub_history_limit(
+    limit: Option<usize>,
+    since_unix: Option<u64>,
+) -> Option<usize> {
+    limit
+        .map(|limit| limit.clamp(1, MAX_DATA_SCRUB_HISTORY_LIMIT))
+        .or_else(|| {
+            if since_unix.is_none() {
+                Some(120)
+            } else {
+                None
+            }
+        })
+}
+
+async fn load_data_scrub_history_runs(
+    state: &ServerState,
+    limit: Option<usize>,
+    since_unix: Option<u64>,
+) -> Result<Vec<DataScrubRunRecord>> {
+    let store = read_store(state, "data_scrub.load_history").await;
+    store.list_data_scrub_run_history(limit, since_unix).await
+}
+
+async fn local_data_scrub_activity_payload(
+    state: &ServerState,
+) -> Result<DataScrubActivityStatusResponse> {
+    let latest_run = latest_data_scrub_run_record(state).await?;
+    let active_runs = state.data_scrub_activity.lock().await.active_runs.clone();
+    Ok(DataScrubActivityStatusResponse {
+        state: current_data_scrub_activity_state(&active_runs),
+        enabled: state.data_scrub_enabled,
+        interval_secs: state.data_scrub_interval_secs,
+        retention_secs: state.data_scrub_history_retention_secs,
+        active_runs,
+        latest_run,
+    })
+}
+
+async fn local_data_scrub_history_payload(
+    state: &ServerState,
+    limit: Option<usize>,
+    since_unix: Option<u64>,
+) -> Result<DataScrubHistoryResponse> {
+    let runs = load_data_scrub_history_runs(state, limit, since_unix).await?;
+    Ok(DataScrubHistoryResponse {
+        retention_secs: state.data_scrub_history_retention_secs,
+        runs,
+    })
+}
+
+fn build_data_scrub_history_path(limit: Option<usize>, since_unix: Option<u64>) -> String {
+    let mut query = Vec::new();
+    if let Some(limit) = limit {
+        query.push(format!("limit={limit}"));
+    }
+    if let Some(since_unix) = since_unix {
+        query.push(format!("since_unix={since_unix}"));
+    }
+    if query.is_empty() {
+        "/cluster/scrub/history".to_string()
+    } else {
+        format!("/cluster/scrub/history?{}", query.join("&"))
+    }
+}
+
+async fn data_scrub_activity_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let action = "auth/scrub/activity/get";
+    if let Err(status) =
+        authorize_admin_request(&state, &headers, action, true, true, json!({})).await
+    {
+        return status.into_response();
+    }
+
+    match local_data_scrub_activity_payload(&state).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed loading data scrub activity state");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn data_scrub_activity_status_internal(
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    match local_data_scrub_activity_payload(&state).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed loading internal data scrub activity state");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn data_scrub_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<DataScrubHistoryQuery>,
+) -> impl IntoResponse {
+    let action = "auth/scrub/history/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "limit": query.limit,
+            "since_unix": query.since_unix,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let limit = resolved_data_scrub_history_limit(query.limit, query.since_unix);
+    match local_data_scrub_history_payload(&state, limit, query.since_unix).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                ?limit,
+                since_unix = query.since_unix,
+                "failed loading data scrub history"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn data_scrub_history_internal(
+    State(state): State<ServerState>,
+    Query(query): Query<DataScrubHistoryQuery>,
+) -> impl IntoResponse {
+    let limit = resolved_data_scrub_history_limit(query.limit, query.since_unix);
+    match local_data_scrub_history_payload(&state, limit, query.since_unix).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                ?limit,
+                since_unix = query.since_unix,
+                "failed loading internal data scrub history"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn data_scrub_cluster_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<DataScrubHistoryQuery>,
+) -> impl IntoResponse {
+    let action = "auth/scrub/cluster/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "limit": query.limit,
+            "since_unix": query.since_unix,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let limit = resolved_data_scrub_history_limit(query.limit, query.since_unix);
+    let local_activity = match local_data_scrub_activity_payload(&state).await {
+        Ok(activity) => activity,
+        Err(err) => {
+            tracing::error!(error = %err, "failed loading local data scrub cluster activity");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let local_history =
+        match local_data_scrub_history_payload(&state, limit, query.since_unix).await {
+            Ok(history) => history,
+            Err(err) => {
+                tracing::error!(error = %err, "failed loading local data scrub cluster history");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+    let mut nodes = vec![DataScrubClusterNodeStatus {
+        node_id: state.node_id,
+        state: local_activity.state,
+        enabled: local_activity.enabled,
+        interval_secs: local_activity.interval_secs,
+        retention_secs: local_activity.retention_secs,
+        active_runs: local_activity.active_runs,
+        latest_run: local_activity.latest_run,
+    }];
+    let mut runs = local_history.runs;
+    let mut skipped_nodes = Vec::new();
+
+    let peers = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        cluster
+            .list_nodes()
+            .into_iter()
+            .filter(|node| {
+                node.node_id != state.node_id && node.status == cluster::NodeStatus::Online
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for peer in peers {
+        let activity = match execute_peer_request(
+            &state,
+            &peer,
+            reqwest::Method::GET,
+            "/cluster/scrub/activity",
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => {
+                match response.json::<DataScrubActivityStatusResponse>() {
+                    Ok(activity) => activity,
+                    Err(err) => {
+                        skipped_nodes.push(DataScrubClusterSkippedNode {
+                            node_id: peer.node_id,
+                            error: format!("failed decoding activity response: {err}"),
+                        });
+                        continue;
+                    }
+                }
+            }
+            Ok(response) => {
+                skipped_nodes.push(DataScrubClusterSkippedNode {
+                    node_id: peer.node_id,
+                    error: format!("activity request returned HTTP {}", response.status),
+                });
+                continue;
+            }
+            Err(err) => {
+                skipped_nodes.push(DataScrubClusterSkippedNode {
+                    node_id: peer.node_id,
+                    error: format!("activity request failed: {err:#}"),
+                });
+                continue;
+            }
+        };
+
+        let history = match execute_peer_request(
+            &state,
+            &peer,
+            reqwest::Method::GET,
+            &build_data_scrub_history_path(limit, query.since_unix),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => {
+                match response.json::<DataScrubHistoryResponse>() {
+                    Ok(history) => history,
+                    Err(err) => {
+                        skipped_nodes.push(DataScrubClusterSkippedNode {
+                            node_id: peer.node_id,
+                            error: format!("failed decoding history response: {err}"),
+                        });
+                        DataScrubHistoryResponse {
+                            retention_secs: activity.retention_secs,
+                            runs: Vec::new(),
+                        }
+                    }
+                }
+            }
+            Ok(response) => {
+                skipped_nodes.push(DataScrubClusterSkippedNode {
+                    node_id: peer.node_id,
+                    error: format!("history request returned HTTP {}", response.status),
+                });
+                DataScrubHistoryResponse {
+                    retention_secs: activity.retention_secs,
+                    runs: Vec::new(),
+                }
+            }
+            Err(err) => {
+                skipped_nodes.push(DataScrubClusterSkippedNode {
+                    node_id: peer.node_id,
+                    error: format!("history request failed: {err:#}"),
+                });
+                DataScrubHistoryResponse {
+                    retention_secs: activity.retention_secs,
+                    runs: Vec::new(),
+                }
+            }
+        };
+
+        runs.extend(history.runs);
+        nodes.push(DataScrubClusterNodeStatus {
+            node_id: peer.node_id,
+            state: activity.state,
+            enabled: activity.enabled,
+            interval_secs: activity.interval_secs,
+            retention_secs: activity.retention_secs,
+            active_runs: activity.active_runs,
+            latest_run: activity.latest_run,
+        });
+    }
+
+    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    runs.sort_by(|a, b| {
+        b.finished_at_unix
+            .cmp(&a.finished_at_unix)
+            .then_with(|| b.run_id.cmp(&a.run_id))
+    });
+    skipped_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    (
+        StatusCode::OK,
+        Json(DataScrubClusterStatusResponse {
+            nodes,
+            skipped_nodes,
+            runs,
+        }),
+    )
+        .into_response()
+}
+
+async fn trigger_data_scrub_public(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<DataScrubTriggerQuery>,
+) -> impl IntoResponse {
+    let action = "auth/scrub/run";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "scope": query.scope }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    let scope = query.scope.unwrap_or(DataScrubScope::Cluster);
+    let mut node_results =
+        vec![start_local_data_scrub(&state, DataScrubRunTrigger::ManualRequest).await];
+    let mut failed_nodes = 0usize;
+
+    if scope == DataScrubScope::Cluster {
+        let peers = {
+            let mut cluster = state.cluster.lock().await;
+            cluster.update_health_and_detect_offline_transition();
+            cluster
+                .list_nodes()
+                .into_iter()
+                .filter(|node| {
+                    node.node_id != state.node_id && node.status == cluster::NodeStatus::Online
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for peer in peers {
+            match execute_peer_request(
+                &state,
+                &peer,
+                reqwest::Method::POST,
+                "/cluster/scrub/run",
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            {
+                Ok(response) if response.is_success() => match response
+                    .json::<DataScrubTriggerNodeResult>()
+                {
+                    Ok(result) => node_results.push(result),
+                    Err(err) => {
+                        failed_nodes = failed_nodes.saturating_add(1);
+                        node_results.push(DataScrubTriggerNodeResult {
+                            node_id: peer.node_id,
+                            started: false,
+                            active_run: None,
+                            error: Some(format!("failed decoding peer trigger response: {err}")),
+                        });
+                    }
+                },
+                Ok(response) => {
+                    failed_nodes = failed_nodes.saturating_add(1);
+                    node_results.push(DataScrubTriggerNodeResult {
+                        node_id: peer.node_id,
+                        started: false,
+                        active_run: None,
+                        error: Some(format!("peer trigger returned HTTP {}", response.status)),
+                    });
+                }
+                Err(err) => {
+                    failed_nodes = failed_nodes.saturating_add(1);
+                    node_results.push(DataScrubTriggerNodeResult {
+                        node_id: peer.node_id,
+                        started: false,
+                        active_run: None,
+                        error: Some(format!("peer trigger failed: {err:#}")),
+                    });
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(DataScrubTriggerResponse {
+            scope,
+            nodes_contacted: node_results.len(),
+            failed_nodes,
+            node_results,
+        }),
+    )
+        .into_response()
+}
+
+async fn trigger_data_scrub_peer(State(state): State<ServerState>) -> impl IntoResponse {
+    let result = start_local_data_scrub(&state, DataScrubRunTrigger::PeerClusterRequest).await;
+    (StatusCode::ACCEPTED, Json(result)).into_response()
 }
 
 async fn repair_activity_status(

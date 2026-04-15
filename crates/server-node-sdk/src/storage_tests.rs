@@ -3271,3 +3271,158 @@ run_on_all_metadata_backends!(
     repair_run_history_roundtrip_and_prune,
     repair_run_history_roundtrip_and_prune_turso
 );
+
+async fn data_scrub_history_roundtrip_and_prune_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("data-scrub-history-roundtrip").await;
+
+    let older = super::super::DataScrubRunRecord {
+        run_id: "scrub-run-older".to_string(),
+        reporting_node_id: NodeId::nil(),
+        trigger: super::super::DataScrubRunTrigger::ManualRequest,
+        status: super::super::DataScrubRunStatus::IssuesDetected,
+        started_at_unix: 900,
+        finished_at_unix: 1_000,
+        duration_ms: 100,
+        summary: super::DataScrubReport {
+            current_keys_scanned: 1,
+            version_indexes_scanned: 1,
+            version_records_scanned: 1,
+            manifests_scanned: 1,
+            chunks_scanned: 2,
+            bytes_scanned: 256,
+            issue_count: 1,
+            sampled_issue_count: 1,
+            issue_sample_truncated: false,
+            issues: vec![super::DataScrubIssue {
+                kind: super::DataScrubIssueKind::ChunkMissing,
+                key: Some("docs/a.bin".to_string()),
+                object_id: Some("obj-a".to_string()),
+                version_id: Some("ver-a".to_string()),
+                manifest_hash: Some("manifest-a".to_string()),
+                chunk_hash: Some("chunk-a".to_string()),
+                detail: "chunk is missing".to_string(),
+            }],
+        },
+        last_error: None,
+    };
+    let newer = super::super::DataScrubRunRecord {
+        run_id: "scrub-run-newer".to_string(),
+        reporting_node_id: NodeId::nil(),
+        trigger: super::super::DataScrubRunTrigger::Scheduled,
+        status: super::super::DataScrubRunStatus::Clean,
+        started_at_unix: 1_900,
+        finished_at_unix: 2_000,
+        duration_ms: 200,
+        summary: super::DataScrubReport {
+            current_keys_scanned: 2,
+            version_indexes_scanned: 2,
+            version_records_scanned: 2,
+            manifests_scanned: 2,
+            chunks_scanned: 4,
+            bytes_scanned: 4_096,
+            issue_count: 0,
+            sampled_issue_count: 0,
+            issue_sample_truncated: false,
+            issues: Vec::new(),
+        },
+        last_error: None,
+    };
+
+    store
+        .persist_data_scrub_run_record_for_test(&older)
+        .await
+        .unwrap();
+    store
+        .persist_data_scrub_run_record_for_test(&newer)
+        .await
+        .unwrap();
+
+    let history = store
+        .list_data_scrub_run_history(Some(8), None)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].run_id, newer.run_id);
+    assert_eq!(history[1].run_id, older.run_id);
+
+    let filtered = store
+        .list_data_scrub_run_history(None, Some(1_500))
+        .await
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].run_id, newer.run_id);
+
+    store
+        .prune_data_scrub_run_history_before_for_test(1_500)
+        .await
+        .unwrap();
+
+    let remaining = store
+        .list_data_scrub_run_history(Some(8), None)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].run_id, newer.run_id);
+    assert_eq!(remaining[0].summary.issue_count, 0);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    data_scrub_history_roundtrip_and_prune_impl,
+    data_scrub_history_roundtrip_and_prune,
+    data_scrub_history_roundtrip_and_prune_turso
+);
+
+async fn data_scrub_detects_missing_and_corrupt_chunks_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("data-scrub-detects-issues").await;
+    let payload = sample_large_chunked_payload();
+
+    store
+        .put_object_versioned("docs/demo.bin", Bytes::from(payload), PutOptions::default())
+        .await
+        .unwrap();
+
+    let manifest_hash = store
+        .resolve_manifest_hash_for_key("docs/demo.bin", None, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap();
+    let manifest = store
+        .load_manifest_by_hash(&manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(manifest.chunks.len() >= 3);
+
+    let corrupt_chunk = &manifest.chunks[0];
+    let missing_chunk = &manifest.chunks[1];
+    let corrupt_path = chunk_path_for_hash(&store.chunks_dir, &corrupt_chunk.hash);
+    let missing_path = chunk_path_for_hash(&store.chunks_dir, &missing_chunk.hash);
+
+    fs::write(&corrupt_path, vec![0u8; corrupt_chunk.size_bytes])
+        .await
+        .unwrap();
+    fs::remove_file(&missing_path).await.unwrap();
+
+    let report = store.run_data_scrub().await.unwrap();
+    assert_eq!(report.current_keys_scanned, 1);
+    assert_eq!(report.manifests_scanned, 1);
+    assert!(report.chunks_scanned >= 3);
+    assert!(report.issue_count >= 2);
+    assert!(report.issues.iter().any(|issue| {
+        issue.kind == super::DataScrubIssueKind::ChunkHashMismatch
+            && issue.chunk_hash.as_deref() == Some(corrupt_chunk.hash.as_str())
+    }));
+    assert!(report.issues.iter().any(|issue| {
+        issue.kind == super::DataScrubIssueKind::ChunkMissing
+            && issue.chunk_hash.as_deref() == Some(missing_chunk.hash.as_str())
+    }));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    data_scrub_detects_missing_and_corrupt_chunks_impl,
+    data_scrub_detects_missing_and_corrupt_chunks,
+    data_scrub_detects_missing_and_corrupt_chunks_turso
+);

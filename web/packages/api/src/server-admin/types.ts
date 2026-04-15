@@ -154,6 +154,119 @@ export type RepairActivityStatusResponse = {
   latest_run?: RepairRunRecord | null;
 };
 
+export type DataScrubScope = "local" | "cluster";
+
+export type DataScrubRunTrigger =
+  | "manual_request"
+  | "scheduled"
+  | "peer_cluster_request";
+
+export type DataScrubRunStatus = "clean" | "issues_detected" | "failed";
+
+export type DataScrubActivityState = "idle" | "running";
+
+export type DataScrubIssueKind =
+  | "manifest_missing"
+  | "manifest_unreadable"
+  | "manifest_invalid"
+  | "manifest_hash_mismatch"
+  | "manifest_key_mismatch"
+  | "manifest_size_mismatch"
+  | "chunk_missing"
+  | "chunk_unreadable"
+  | "chunk_size_mismatch"
+  | "chunk_hash_mismatch";
+
+export type DataScrubIssue = {
+  kind: DataScrubIssueKind;
+  key?: string | null;
+  object_id?: string | null;
+  version_id?: string | null;
+  manifest_hash?: string | null;
+  chunk_hash?: string | null;
+  detail: string;
+};
+
+export type DataScrubReport = {
+  current_keys_scanned: number;
+  version_indexes_scanned: number;
+  version_records_scanned: number;
+  manifests_scanned: number;
+  chunks_scanned: number;
+  bytes_scanned: number;
+  issue_count: number;
+  sampled_issue_count: number;
+  issue_sample_truncated: boolean;
+  issues: DataScrubIssue[];
+};
+
+export type DataScrubActiveRun = {
+  run_id: string;
+  trigger: DataScrubRunTrigger;
+  started_at_unix: number;
+};
+
+export type DataScrubRunRecord = {
+  run_id: string;
+  reporting_node_id: string;
+  trigger: DataScrubRunTrigger;
+  status: DataScrubRunStatus;
+  started_at_unix: number;
+  finished_at_unix: number;
+  duration_ms: number;
+  summary: DataScrubReport;
+  last_error?: string | null;
+};
+
+export type DataScrubHistoryResponse = {
+  retention_secs: number;
+  runs: DataScrubRunRecord[];
+};
+
+export type DataScrubActivityStatusResponse = {
+  state: DataScrubActivityState;
+  enabled: boolean;
+  interval_secs: number;
+  retention_secs: number;
+  active_runs: DataScrubActiveRun[];
+  latest_run?: DataScrubRunRecord | null;
+};
+
+export type DataScrubClusterNodeStatus = {
+  node_id: string;
+  state: DataScrubActivityState;
+  enabled: boolean;
+  interval_secs: number;
+  retention_secs: number;
+  active_runs: DataScrubActiveRun[];
+  latest_run?: DataScrubRunRecord | null;
+};
+
+export type DataScrubClusterSkippedNode = {
+  node_id: string;
+  error: string;
+};
+
+export type DataScrubClusterStatusResponse = {
+  nodes: DataScrubClusterNodeStatus[];
+  skipped_nodes: DataScrubClusterSkippedNode[];
+  runs: DataScrubRunRecord[];
+};
+
+export type DataScrubTriggerNodeResult = {
+  node_id: string;
+  started: boolean;
+  active_run?: DataScrubActiveRun | null;
+  error?: string | null;
+};
+
+export type DataScrubTriggerResponse = {
+  scope: DataScrubScope;
+  nodes_contacted: number;
+  failed_nodes: number;
+  node_results: DataScrubTriggerNodeResult[];
+};
+
 export type LogsResponse = {
   entries: string[];
 };

@@ -21,7 +21,7 @@ export const serverAdminRoutes = [
   {
     id: "repair",
     label: "Repair",
-    description: "Monitor live repair activity, inspect retained repair runs, and trigger cluster repair passes without crowding the dashboard.",
+    description: "Monitor live repair activity, inspect retained repair and scrub runs, and trigger clustered maintenance passes without crowding the dashboard.",
     icon: IconActivity,
     element: <RepairPage />
   },

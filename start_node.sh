@@ -104,12 +104,15 @@ start_node() {
     return 0
   fi
 
+  # build the server-node binary to ensure it's available before starting the screen session
+  (cd "$REPO_ROOT" && cargo build -p server-node)
+
   mkdir -p "$data_dir"
   printf -v start_command \
     'cd %q && export IRONMESH_DATA_DIR=%q IRONMESH_SERVER_BIND=%q && cargo run -p server-node' \
     "$REPO_ROOT" "$data_dir" "$bind_addr"
 
-  screen -L -Logfile "$log_file" -DmS "$session_name" bash -lc "$start_command"
+  screen -L -Logfile "$log_file" -DdmS "$session_name" bash -lc "$start_command"
 
   echo "Started $node_name in screen session $session_name"
   echo "URL: $url"

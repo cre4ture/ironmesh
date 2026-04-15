@@ -11,8 +11,8 @@ use tracing::warn;
 
 use super::{
     AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentState,
-    FileVersionIndex, MetadataStore, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
-    SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
+    DataScrubRunRecord, FileVersionIndex, MetadataStore, ReconcileMarker, RepairAttemptRecord,
+    RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
 };
 
 pub(super) struct SqliteMetadataStore {
@@ -212,6 +212,110 @@ impl MetadataStore for SqliteMetadataStore {
         let db = self.metadata_conn()?;
         db.execute(
             "DELETE FROM repair_run_history\n             WHERE finished_at_unix < ?1",
+            params![u64_to_i64(finished_before_unix)?],
+        )?;
+        Ok(())
+    }
+
+    async fn list_data_scrub_run_history(
+        &self,
+        limit: Option<usize>,
+        finished_since_unix: Option<u64>,
+    ) -> Result<Vec<DataScrubRunRecord>> {
+        let db = self.metadata_conn()?;
+        let mut query =
+            String::from("SELECT record_json\n             FROM data_scrub_run_history");
+        let mut conditions = Vec::new();
+        if finished_since_unix.is_some() {
+            conditions.push("finished_at_unix >= ?1");
+        }
+        if !conditions.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&conditions.join(" AND "));
+        }
+        query.push_str(" ORDER BY finished_at_unix DESC, run_id DESC");
+        if limit.is_some() {
+            query.push_str(" LIMIT ?");
+            query.push_str(if finished_since_unix.is_some() {
+                "2"
+            } else {
+                "1"
+            });
+        }
+
+        let mut stmt = db.prepare(&query)?;
+        let mut records = Vec::new();
+        match (finished_since_unix, limit) {
+            (Some(finished_since_unix), Some(limit)) => {
+                let rows = stmt.query_map(
+                    params![u64_to_i64(finished_since_unix)?, usize_to_i64(limit)?],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?;
+                for row in rows {
+                    let payload = row?;
+                    records.push(
+                        serde_json::from_slice::<DataScrubRunRecord>(&payload)
+                            .context("invalid data scrub run history record in sqlite")?,
+                    );
+                }
+            }
+            (Some(finished_since_unix), None) => {
+                let rows = stmt.query_map(params![u64_to_i64(finished_since_unix)?], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?;
+                for row in rows {
+                    let payload = row?;
+                    records.push(
+                        serde_json::from_slice::<DataScrubRunRecord>(&payload)
+                            .context("invalid data scrub run history record in sqlite")?,
+                    );
+                }
+            }
+            (None, Some(limit)) => {
+                let rows = stmt.query_map(params![usize_to_i64(limit)?], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?;
+                for row in rows {
+                    let payload = row?;
+                    records.push(
+                        serde_json::from_slice::<DataScrubRunRecord>(&payload)
+                            .context("invalid data scrub run history record in sqlite")?,
+                    );
+                }
+            }
+            (None, None) => {
+                let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+                for row in rows {
+                    let payload = row?;
+                    records.push(
+                        serde_json::from_slice::<DataScrubRunRecord>(&payload)
+                            .context("invalid data scrub run history record in sqlite")?,
+                    );
+                }
+            }
+        }
+
+        Ok(records)
+    }
+
+    async fn persist_data_scrub_run_record(&self, record: &DataScrubRunRecord) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(record)?;
+        let db = self.metadata_conn()?;
+        db.execute(
+            "INSERT INTO data_scrub_run_history (run_id, finished_at_unix, record_json)\n             VALUES (?1, ?2, ?3)\n             ON CONFLICT(run_id) DO UPDATE SET\n                 finished_at_unix = excluded.finished_at_unix,\n                 record_json = excluded.record_json",
+            params![
+                record.run_id,
+                u64_to_i64(record.finished_at_unix)?,
+                payload
+            ],
+        )?;
+        Ok(())
+    }
+
+    async fn prune_data_scrub_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
+        let db = self.metadata_conn()?;
+        db.execute(
+            "DELETE FROM data_scrub_run_history\n             WHERE finished_at_unix < ?1",
             params![u64_to_i64(finished_before_unix)?],
         )?;
         Ok(())
@@ -859,6 +963,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             record_json BLOB NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS data_scrub_run_history (
+            run_id TEXT PRIMARY KEY,
+            finished_at_unix INTEGER NOT NULL,
+            record_json BLOB NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS cluster_replicas (
             subject TEXT NOT NULL,
             node_id TEXT NOT NULL,
@@ -908,6 +1018,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON storage_stats_history(collected_at_unix DESC);
         CREATE INDEX IF NOT EXISTS idx_repair_run_history_finished
             ON repair_run_history(finished_at_unix DESC, run_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_data_scrub_run_history_finished
+            ON data_scrub_run_history(finished_at_unix DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created
             ON admin_audit_events(created_at_unix DESC, event_id DESC);
         CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject

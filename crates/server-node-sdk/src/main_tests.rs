@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
-use super::storage::{PersistentStore, PutOptions, VersionConsistencyState};
+use super::storage::{DataScrubRunTestHook, PersistentStore, PutOptions, VersionConsistencyState};
 use axum::Router;
 use axum::body::Body;
 use axum::body::to_bytes;
@@ -5667,6 +5667,9 @@ async fn build_test_state(
         cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
         storage_stats_history_retention_secs: super::STORAGE_STATS_HISTORY_RETENTION_SECS,
+        data_scrub_enabled: true,
+        data_scrub_interval_secs: super::DATA_SCRUB_INTERVAL_SECS,
+        data_scrub_history_retention_secs: super::DATA_SCRUB_HISTORY_RETENTION_SECS,
         repair_run_history_retention_secs: super::REPAIR_RUN_HISTORY_RETENTION_SECS,
         map_perf_logging_enabled: false,
         map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
@@ -5738,6 +5741,7 @@ async fn build_test_state(
         startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
         repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
         repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
+        data_scrub_activity: Arc::new(Mutex::new(super::DataScrubActivityRuntime::default())),
         local_availability_refresh_lock: Arc::new(Mutex::new(())),
         local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),
         storage_stats_runtime: Arc::new(Mutex::new(super::StorageStatsRuntime::default())),
@@ -5834,6 +5838,71 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
         .expect("chunk should be recorded");
     assert_eq!(chunk.size_bytes, payload.len());
 }
+
+async fn data_scrub_activity_and_history_do_not_wait_on_active_scrub_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let hook = DataScrubRunTestHook::new();
+
+    {
+        let mut store = lock_store(&state, "tests.data_scrub.install_hook").await;
+        store.set_data_scrub_run_test_hook(Some(hook.clone()));
+    }
+
+    let trigger =
+        super::start_local_data_scrub(&state, super::DataScrubRunTrigger::ManualRequest).await;
+    assert!(trigger.started, "data scrub should start for the test");
+
+    tokio::time::timeout(Duration::from_secs(1), hook.wait_until_started())
+        .await
+        .expect("data scrub should reach the test hook promptly");
+
+    let activity = tokio::time::timeout(
+        Duration::from_millis(250),
+        super::local_data_scrub_activity_payload(&state),
+    )
+    .await
+    .expect("scrub activity payload should not wait on the active scrub run")
+    .unwrap();
+    assert_eq!(activity.state, super::DataScrubActivityState::Running);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert!(activity.latest_run.is_none());
+
+    let history = tokio::time::timeout(
+        Duration::from_millis(250),
+        super::local_data_scrub_history_payload(&state, Some(8), None),
+    )
+    .await
+    .expect("scrub history payload should not wait on the active scrub run")
+    .unwrap();
+    assert!(history.runs.is_empty());
+
+    hook.release_run();
+    wait_for_condition("data scrub completion", Duration::from_secs(5), || {
+        let state = state.clone();
+        async move {
+            match super::local_data_scrub_activity_payload(&state).await {
+                Ok(activity) => activity.active_runs.is_empty() && activity.latest_run.is_some(),
+                Err(_) => false,
+            }
+        }
+    })
+    .await;
+
+    {
+        let mut store = lock_store(&state, "tests.data_scrub.clear_hook").await;
+        store.set_data_scrub_run_test_hook(None);
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    data_scrub_activity_and_history_do_not_wait_on_active_scrub_impl,
+    data_scrub_activity_and_history_do_not_wait_on_active_scrub,
+    data_scrub_activity_and_history_do_not_wait_on_active_scrub_turso
+);
 
 #[tokio::test]
 async fn rendezvous_presence_registration_includes_unique_direct_candidates() {

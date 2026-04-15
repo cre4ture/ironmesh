@@ -1,9 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  getDataScrubClusterStatus,
   getRepairActivityStatus,
   getRepairHistory,
   getReplicationPlan,
+  triggerDataScrub,
   triggerReplicationRepair,
+  type DataScrubRunRecord,
   type RepairRunRecord,
   type ReplicationPlan
 } from "@ironmesh/api";
@@ -31,6 +34,7 @@ export function RepairPage() {
   const queryClient = useQueryClient();
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
   const [selectedRun, setSelectedRun] = useState<RepairRunRecord | null>(null);
+  const [selectedScrubRun, setSelectedScrubRun] = useState<DataScrubRunRecord | null>(null);
   const normalizedAdminTokenOverride = adminTokenOverride.trim();
   const hasExplicitAdminAccess =
     Boolean(normalizedAdminTokenOverride) || Boolean(sessionStatus?.authenticated);
@@ -54,12 +58,20 @@ export function RepairPage() {
     queryFn: () => getReplicationPlan(normalizedAdminTokenOverride || undefined),
     enabled: canInspectRepair
   });
+  const scrubClusterQuery = useQuery({
+    queryKey: ["repair-page", "scrub-cluster", normalizedAdminTokenOverride],
+    queryFn: () =>
+      getDataScrubClusterStatus({ limit: 120 }, normalizedAdminTokenOverride || undefined),
+    enabled: canInspectRepair,
+    refetchInterval: 5_000
+  });
 
   const refresh = useCallback(async () => {
     const queryKeys: ReadonlyArray<readonly unknown[]> = [
       ["repair-page", "activity", normalizedAdminTokenOverride],
       ["repair-page", "history", normalizedAdminTokenOverride],
-      ["repair-page", "replication-plan", normalizedAdminTokenOverride]
+      ["repair-page", "replication-plan", normalizedAdminTokenOverride],
+      ["repair-page", "scrub-cluster", normalizedAdminTokenOverride]
     ];
 
     await Promise.all(
@@ -78,24 +90,40 @@ export function RepairPage() {
       await refresh();
     }
   });
+  const scrubMutation = useMutation({
+    mutationFn: () => triggerDataScrub("cluster", normalizedAdminTokenOverride || undefined),
+    onSuccess: async () => {
+      await refresh();
+    }
+  });
 
   const repairActivity = canInspectRepair ? repairActivityQuery.data ?? null : null;
   const repairHistory = canInspectRepair ? repairHistoryQuery.data ?? null : null;
   const replicationPlan = canInspectRepair ? replicationPlanQuery.data ?? null : null;
+  const scrubCluster = canInspectRepair ? scrubClusterQuery.data ?? null : null;
   const latestRun = repairActivity?.latest_run ?? null;
   const activeRuns = repairActivity?.active_runs ?? [];
+  const scrubRuns = scrubCluster?.runs ?? [];
+  const scrubNodes = scrubCluster?.nodes ?? [];
+  const latestScrubRun = mostRecentScrubRun(scrubRuns);
   const retentionLabel = repairHistory
     ? formatRetentionWindow(repairHistory.retention_secs)
+    : "not loaded";
+  const scrubRetentionLabel = scrubNodes[0]
+    ? formatRetentionWindow(scrubNodes[0].retention_secs)
     : "not loaded";
   const loading =
     repairActivityQuery.isFetching ||
     repairHistoryQuery.isFetching ||
-    replicationPlanQuery.isFetching;
+    replicationPlanQuery.isFetching ||
+    scrubClusterQuery.isFetching;
   const error = firstErrorMessage([
+    scrubMutation.error,
     repairMutation.error,
     repairActivityQuery.error,
     repairHistoryQuery.error,
-    replicationPlanQuery.error
+    replicationPlanQuery.error,
+    scrubClusterQuery.error
   ]);
   const replicationPlanEntries = replicationPlan
     ? replicationPlan.items
@@ -111,9 +139,9 @@ export function RepairPage() {
     <Stack gap="lg">
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
-          This page is the dedicated repair workspace for operators. It shows the live node-local
-          repair state, retains recent repair runs for debugging, and keeps the full replication
-          plan off the dashboard.
+          This page is the operator workspace for repair and data scrubbing. It keeps live repair
+          state, retained repair runs, clustered scrub history, and the replication plan in one
+          maintenance view instead of crowding the dashboard.
         </Text>
         <Group>
           <Button
@@ -124,6 +152,15 @@ export function RepairPage() {
           >
             Run cluster repair pass
           </Button>
+          <Button
+            variant="default"
+            color="teal"
+            onClick={() => void scrubMutation.mutateAsync()}
+            loading={scrubMutation.isPending}
+            disabled={!canInspectRepair}
+          >
+            Run data scrub now
+          </Button>
           <Button variant="light" onClick={() => void refresh()} loading={loading}>
             Refresh
           </Button>
@@ -132,11 +169,11 @@ export function RepairPage() {
 
       {!canInspectRepair ? (
         <Alert color="blue" title="Admin access required">
-          Sign in or provide an admin token override to inspect repair activity and retained run
-          history.
+          Sign in or provide an admin token override to inspect repair activity, clustered scrub
+          history, and retained maintenance runs.
         </Alert>
       ) : null}
-      {error ? <Alert color="red" title="Failed to load repair state">{error}</Alert> : null}
+      {error ? <Alert color="red" title="Failed to load maintenance state">{error}</Alert> : null}
 
       <Grid>
         <Grid.Col span={{ base: 12, md: 4 }}>
@@ -168,6 +205,27 @@ export function RepairPage() {
             label="Planner Attention"
             value={replicationPlan ? replicationPlan.items.length : loading ? <Loader size="sm" /> : "unknown"}
             hint={replicationPlan ? `${replicationPlan.under_replicated} under · ${replicationPlan.over_replicated} over · ${replicationPlan.cleanup_deferred_items} deferred` : "Outstanding repair or cleanup items"}
+          />
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 4 }}>
+          <StatCard
+            label="Scrub Coverage"
+            value={scrubCluster ? scrubNodes.length : loading ? <Loader size="sm" /> : "unknown"}
+            hint={scrubCluster ? `${scrubCluster.skipped_nodes.length} skipped node${scrubCluster.skipped_nodes.length === 1 ? "" : "s"}` : "Reachable nodes reporting scrub state"}
+          />
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 4 }}>
+          <StatCard
+            label="Latest Scrub"
+            value={latestScrubRun ? formatUnixTs(latestScrubRun.finished_at_unix) : loading ? <Loader size="sm" /> : "none"}
+            hint={latestScrubRun ? `${formatDataScrubStatus(latestScrubRun.status)} · ${latestScrubRun.summary.issue_count} issue${latestScrubRun.summary.issue_count === 1 ? "" : "s"}` : "No retained scrub run yet"}
+          />
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 4 }}>
+          <StatCard
+            label="Latest Scrub Findings"
+            value={latestScrubRun ? latestScrubRun.summary.issue_count : loading ? <Loader size="sm" /> : "unknown"}
+            hint={latestScrubRun ? `${latestScrubRun.summary.manifests_scanned} manifests · ${latestScrubRun.summary.chunks_scanned} chunks verified` : "Latest clustered scrub findings"}
           />
         </Grid.Col>
       </Grid>
@@ -479,6 +537,198 @@ export function RepairPage() {
         </Stack>
       </Card>
 
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="md">
+          <Group justify="space-between" align="flex-start">
+            <Stack gap={4}>
+              <Text fw={700}>Data scrub status across reachable nodes</Text>
+              <Text size="sm" c="dimmed">
+                Each reachable node reports its own scrub scheduler state and latest retained scrub
+                result here.
+              </Text>
+            </Stack>
+            <Stack gap="xs" align="flex-end">
+              <Badge variant="light">retention {scrubRetentionLabel}</Badge>
+              <Badge variant="light" color={scrubNodes.length > 0 ? "teal" : "gray"}>
+                {scrubNodes.length} reachable node{scrubNodes.length === 1 ? "" : "s"}
+              </Badge>
+            </Stack>
+          </Group>
+
+          {scrubCluster && scrubCluster.skipped_nodes.length > 0 ? (
+            <Alert color="yellow" variant="light" title="Some nodes did not return scrub state">
+              {scrubCluster.skipped_nodes
+                .map((node) => `${node.node_id}: ${node.error}`)
+                .join(" | ")}
+            </Alert>
+          ) : null}
+
+          {scrubNodes.length > 0 ? (
+            <Grid>
+              {scrubNodes.map((node) => (
+                <Grid.Col key={node.node_id} span={{ base: 12, md: 6, xl: 4 }}>
+                  <Card withBorder radius="md" padding="md">
+                    <Stack gap="sm">
+                      <Group justify="space-between" align="flex-start">
+                        <Stack gap={4}>
+                          <Text fw={600} ff="monospace" style={{ wordBreak: "break-word" }}>
+                            {node.node_id}
+                          </Text>
+                          <Text size="xs" c="dimmed">
+                            {node.enabled
+                              ? `scheduled every ${formatIntervalShort(node.interval_secs)}`
+                              : "background schedule disabled"}
+                          </Text>
+                        </Stack>
+                        <Badge color={dataScrubStateColor(node.state)} variant="light">
+                          {formatDataScrubActivityState(node.state)}
+                        </Badge>
+                      </Group>
+                      <Group gap="xs">
+                        <Badge variant="light" color={node.enabled ? "teal" : "gray"}>
+                          {node.enabled ? "scheduled" : "manual only"}
+                        </Badge>
+                        <Badge variant="light">retention {formatRetentionWindow(node.retention_secs)}</Badge>
+                      </Group>
+                      {node.active_runs.length > 0 ? (
+                        <Stack gap={6}>
+                          {node.active_runs.map((activeRun) => (
+                            <Card key={activeRun.run_id} withBorder radius="md" padding="sm">
+                              <Stack gap={4}>
+                                <Group gap="xs">
+                                  <Badge color="orange" variant="light">
+                                    {formatDataScrubTrigger(activeRun.trigger)}
+                                  </Badge>
+                                  <Badge color="orange" variant="light">
+                                    running
+                                  </Badge>
+                                </Group>
+                                <Text size="sm">Started {formatUnixTs(activeRun.started_at_unix)}</Text>
+                                <Text size="xs" c="dimmed">
+                                  Run ID <Code>{activeRun.run_id}</Code>
+                                </Text>
+                              </Stack>
+                            </Card>
+                          ))}
+                        </Stack>
+                      ) : node.latest_run ? (
+                        <Card withBorder radius="md" padding="sm">
+                          <Stack gap={6}>
+                            <Group justify="space-between" align="flex-start">
+                              <Text fw={600}>Latest retained scrub</Text>
+                              <Badge color={dataScrubStatusColor(node.latest_run.status)} variant="light">
+                                {formatDataScrubStatus(node.latest_run.status)}
+                              </Badge>
+                            </Group>
+                            <Text size="sm">
+                              Finished {formatUnixTs(node.latest_run.finished_at_unix)} after {formatDurationShort(node.latest_run.duration_ms)}.
+                            </Text>
+                            <Text size="sm" c="dimmed">
+                              {describeDataScrubRunSummary(node.latest_run)}
+                            </Text>
+                          </Stack>
+                        </Card>
+                      ) : (
+                        <Text size="sm" c="dimmed">
+                          No retained scrub run yet for this node.
+                        </Text>
+                      )}
+                    </Stack>
+                  </Card>
+                </Grid.Col>
+              ))}
+            </Grid>
+          ) : (
+            <Text c="dimmed">
+              {loading ? "Loading clustered scrub state..." : "No reachable nodes reported scrub state."}
+            </Text>
+          )}
+        </Stack>
+      </Card>
+
+      <Card withBorder radius="md" padding="lg">
+        <Stack gap="md">
+          <Group justify="space-between" align="flex-start">
+            <Stack gap={4}>
+              <Text fw={700}>Retained data scrub runs</Text>
+              <Text size="sm" c="dimmed">
+                Retained scrub results are aggregated from reachable nodes so corruption checks can
+                be reviewed without jumping between node admin pages.
+              </Text>
+            </Stack>
+            <Badge variant="light">{scrubCluster ? `${scrubRuns.length} retained` : "not loaded"}</Badge>
+          </Group>
+          {scrubRuns.length > 0 ? (
+            <Table.ScrollContainer minWidth={980}>
+              <Table striped highlightOnHover withTableBorder>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>Finished</Table.Th>
+                    <Table.Th>Node</Table.Th>
+                    <Table.Th>Trigger</Table.Th>
+                    <Table.Th>Status</Table.Th>
+                    <Table.Th>Duration</Table.Th>
+                    <Table.Th>Verified</Table.Th>
+                    <Table.Th>Findings</Table.Th>
+                    <Table.Th />
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {scrubRuns.map((run) => (
+                    <Table.Tr key={run.run_id}>
+                      <Table.Td>
+                        <Stack gap={2}>
+                          <Text size="sm">{formatUnixTs(run.finished_at_unix)}</Text>
+                          <Text size="xs" c="dimmed">
+                            started {formatUnixTs(run.started_at_unix)}
+                          </Text>
+                        </Stack>
+                      </Table.Td>
+                      <Table.Td>
+                        <Text size="sm" ff="monospace" style={{ wordBreak: "break-word" }}>
+                          {run.reporting_node_id}
+                        </Text>
+                      </Table.Td>
+                      <Table.Td>
+                        <Badge color="blue" variant="light">
+                          {formatDataScrubTrigger(run.trigger)}
+                        </Badge>
+                      </Table.Td>
+                      <Table.Td>
+                        <Badge color={dataScrubStatusColor(run.status)} variant="light">
+                          {formatDataScrubStatus(run.status)}
+                        </Badge>
+                      </Table.Td>
+                      <Table.Td>{formatDurationShort(run.duration_ms)}</Table.Td>
+                      <Table.Td>
+                        <Text size="sm">
+                          {run.summary.manifests_scanned} manifests / {run.summary.chunks_scanned} chunks
+                        </Text>
+                        <Text size="xs" c="dimmed">
+                          {formatBytesShort(run.summary.bytes_scanned)} read
+                        </Text>
+                      </Table.Td>
+                      <Table.Td maw={280}>
+                        <Text size="sm">{describeDataScrubRunSummary(run)}</Text>
+                      </Table.Td>
+                      <Table.Td>
+                        <Button size="xs" variant="default" onClick={() => setSelectedScrubRun(run)}>
+                          Inspect
+                        </Button>
+                      </Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
+          ) : (
+            <Text c="dimmed">
+              {loading ? "Loading retained scrub runs..." : "No retained scrub runs yet."}
+            </Text>
+          )}
+        </Stack>
+      </Card>
+
       <Modal
         opened={selectedRun !== null}
         onClose={() => setSelectedRun(null)}
@@ -508,6 +758,37 @@ export function RepairPage() {
                 {describeRepairRunSummary(selectedRun)}
               </Text>
               <JsonBlock value={selectedRun} />
+            </>
+          ) : null}
+        </Stack>
+      </Modal>
+
+      <Modal
+        opened={selectedScrubRun !== null}
+        onClose={() => setSelectedScrubRun(null)}
+        title="Data scrub details"
+        size="xl"
+        centered
+      >
+        <Stack gap="md">
+          {selectedScrubRun ? (
+            <>
+              <Group gap="xs">
+                <Badge color="blue" variant="light">
+                  {formatDataScrubTrigger(selectedScrubRun.trigger)}
+                </Badge>
+                <Badge color={dataScrubStatusColor(selectedScrubRun.status)} variant="light">
+                  {formatDataScrubStatus(selectedScrubRun.status)}
+                </Badge>
+              </Group>
+              <Text size="sm">
+                Node <Code>{selectedScrubRun.reporting_node_id}</Code> started {formatUnixTs(selectedScrubRun.started_at_unix)} and finished {" "}
+                {formatUnixTs(selectedScrubRun.finished_at_unix)} after {formatDurationShort(selectedScrubRun.duration_ms)}.
+              </Text>
+              <Text size="sm" c="dimmed">
+                {describeDataScrubRunSummary(selectedScrubRun)}
+              </Text>
+              <JsonBlock value={selectedScrubRun} />
             </>
           ) : null}
         </Stack>
@@ -622,6 +903,99 @@ function repairStatusColor(status: string): string {
   }
 }
 
+function mostRecentScrubRun(runs: DataScrubRunRecord[]): DataScrubRunRecord | null {
+  return runs[0] ?? null;
+}
+
+function formatDataScrubActivityState(state: string): string {
+  switch (state) {
+    case "running":
+      return "running";
+    case "idle":
+    default:
+      return "idle";
+  }
+}
+
+function formatDataScrubTrigger(trigger: string): string {
+  switch (trigger) {
+    case "manual_request":
+      return "manual request";
+    case "scheduled":
+      return "scheduled";
+    case "peer_cluster_request":
+      return "peer cluster request";
+    default:
+      return trigger;
+  }
+}
+
+function formatDataScrubStatus(status: string): string {
+  switch (status) {
+    case "clean":
+      return "clean";
+    case "issues_detected":
+      return "issues detected";
+    case "failed":
+      return "failed";
+    default:
+      return status;
+  }
+}
+
+function dataScrubStateColor(state: string): string {
+  switch (state) {
+    case "running":
+      return "orange";
+    case "idle":
+    default:
+      return "gray";
+  }
+}
+
+function dataScrubStatusColor(status: string): string {
+  switch (status) {
+    case "clean":
+      return "teal";
+    case "issues_detected":
+      return "yellow";
+    case "failed":
+      return "red";
+    default:
+      return "gray";
+  }
+}
+
+function formatIntervalShort(seconds: number): string {
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = seconds / 60;
+  if (minutes < 60) {
+    return `${minutes % 1 === 0 ? minutes.toFixed(0) : minutes.toFixed(1)}m`;
+  }
+  const hours = minutes / 60;
+  if (hours < 24) {
+    return `${hours % 1 === 0 ? hours.toFixed(0) : hours.toFixed(1)}h`;
+  }
+  const days = hours / 24;
+  return `${days % 1 === 0 ? days.toFixed(0) : days.toFixed(1)}d`;
+}
+
+function formatBytesShort(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
+}
+
 function formatRetentionWindow(seconds: number): string {
   const days = Math.round(seconds / (24 * 60 * 60));
   if (days >= 365 && days % 365 === 0) {
@@ -660,6 +1034,28 @@ function describeRepairRunSummary(run: RepairRunRecord | null): string {
       ? ` Last error: ${summary.last_error}`
       : "";
   return `${summary.attempted_transfers} attempted, ${summary.successful_transfers} successful, ${summary.failed_transfers} failed, ${summary.skipped_items} skipped${nodesText}.${failureSuffix}`;
+}
+
+function describeDataScrubRunSummary(run: DataScrubRunRecord | null): string {
+  if (!run) {
+    return "No retained data scrub summary available.";
+  }
+  if (run.status === "failed") {
+    return run.last_error && run.last_error.length > 0
+      ? `Scrub failed before completion. Last error: ${run.last_error}`
+      : "Scrub failed before completion.";
+  }
+
+  const findingsText =
+    run.summary.issue_count === 0
+      ? "No issues detected."
+      : `${run.summary.issue_count} issue${run.summary.issue_count === 1 ? "" : "s"} detected.`;
+  const verificationText = `${run.summary.manifests_scanned} manifests and ${run.summary.chunks_scanned} chunks verified.`;
+  const sampleSuffix =
+    run.summary.issue_sample_truncated && run.summary.sampled_issue_count > 0
+      ? ` Showing ${run.summary.sampled_issue_count} sampled issue${run.summary.sampled_issue_count === 1 ? "" : "s"}.`
+      : "";
+  return `${findingsText} ${verificationText}${sampleSuffix}`;
 }
 
 type ReplicationPlanItem = ReplicationPlan["items"][number];

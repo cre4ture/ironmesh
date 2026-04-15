@@ -11,6 +11,11 @@ import type {
   ClientCredentialView,
   ClusterSummary,
   ControlPlanePromotionImportResponse,
+  DataScrubActivityStatusResponse,
+  DataScrubClusterStatusResponse,
+  DataScrubHistoryResponse,
+  DataScrubScope,
+  DataScrubTriggerResponse,
   LogsResponse,
   ManagedControlPlanePromotionPackage,
   ManagedRendezvousFailoverImportResponse,
@@ -261,6 +266,64 @@ export async function getRepairHistory(
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return fetchAdminJson<RepairHistoryResponse>(`/auth/repair/history${suffix}`, {
+    adminTokenOverride
+  });
+}
+
+export async function getDataScrubActivityStatus(
+  adminTokenOverride?: string
+): Promise<DataScrubActivityStatusResponse> {
+  return fetchAdminJson<DataScrubActivityStatusResponse>("/auth/scrub/activity", {
+    adminTokenOverride
+  });
+}
+
+export async function getDataScrubHistory(
+  options?: {
+    limit?: number;
+    sinceUnix?: number;
+  },
+  adminTokenOverride?: string
+): Promise<DataScrubHistoryResponse> {
+  const query = new URLSearchParams();
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.trunc(options.limit))));
+  }
+  if (typeof options?.sinceUnix === "number" && Number.isFinite(options.sinceUnix)) {
+    query.set("since_unix", String(Math.max(0, Math.trunc(options.sinceUnix))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return fetchAdminJson<DataScrubHistoryResponse>(`/auth/scrub/history${suffix}`, {
+    adminTokenOverride
+  });
+}
+
+export async function getDataScrubClusterStatus(
+  options?: {
+    limit?: number;
+    sinceUnix?: number;
+  },
+  adminTokenOverride?: string
+): Promise<DataScrubClusterStatusResponse> {
+  const query = new URLSearchParams();
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.trunc(options.limit))));
+  }
+  if (typeof options?.sinceUnix === "number" && Number.isFinite(options.sinceUnix)) {
+    query.set("since_unix", String(Math.max(0, Math.trunc(options.sinceUnix))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return fetchAdminJson<DataScrubClusterStatusResponse>(`/auth/scrub/cluster${suffix}`, {
+    adminTokenOverride
+  });
+}
+
+export async function triggerDataScrub(
+  scope: DataScrubScope = "cluster",
+  adminTokenOverride?: string
+): Promise<DataScrubTriggerResponse> {
+  return fetchAdminJson<DataScrubTriggerResponse>(`/auth/scrub/run?scope=${scope}`, {
+    method: "POST",
     adminTokenOverride
   });
 }
