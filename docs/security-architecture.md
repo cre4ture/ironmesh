@@ -114,6 +114,14 @@ Optional future improvement:
 - Self-serve enrollment via a short-lived, single-use join token:
   - node generates a keypair + CSR, presents join token, receives signed cert + assigned/confirmed `node_id`.
 
+Routine renewal target model:
+- routine node certificate renewal is authenticated by the node's current certificate and proof of key possession,
+- the control plane / issuer decides whether that authenticated `node_id` is still allowed to renew,
+- successful renewal reissues fresh key material and certificates while preserving logical `node_id`,
+- human/admin credentials remain for initial issuance, explicit revocation/disablement, and membership changes.
+
+See `docs/node-certificate-renewal-model-decision.md` for the accepted decision.
+
 ## 5. Authorization (RBAC)
 - Define scoped admin roles:
   - `maintenance.viewer` (read-only audit/list),
@@ -125,8 +133,9 @@ Optional future improvement:
 
 ### 5.1 Plane Separation Rules
 - Internal node-to-node operations (replication/reconcile/heartbeat) require node mTLS authentication.
-- Node credential issuance/rotation/revocation and membership changes are ADMIN plane operations:
-  - must not be possible via node identity alone.
+- Initial node issuance, explicit revocation/disablement, and membership changes are control/admin plane operations.
+- Routine node certificate renewal is a node-authenticated rotation operation authorized by control-plane policy.
+- Routine renewal must not by itself grant or restore cluster membership; it only rotates credentials for an already identified node that the control plane still allows.
 - Admin token is transitional; long term admin actions must be tied to a human/service principal.
 
 ## 6. Cryptography
