@@ -160,6 +160,175 @@ mod tests {
             .as_secs()
     }
 
+    fn sample_media_jpeg_bytes() -> Vec<u8> {
+        let mut image = image::RgbImage::new(8, 6);
+        for y in 0..6 {
+            for x in 0..8 {
+                let pixel = if x < 4 {
+                    image::Rgb([24, 122, 205])
+                } else {
+                    image::Rgb([242, 173, 41])
+                };
+                image.put_pixel(x, y, pixel);
+            }
+        }
+
+        let mut jpeg = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 92);
+        encoder
+            .encode_image(&image::DynamicImage::ImageRgb8(image))
+            .expect("failed to encode sample jpeg");
+        jpeg
+    }
+
+    fn sample_media_jpeg_with_gps_bytes() -> Vec<u8> {
+        jpeg_with_exif_gps(
+            sample_media_jpeg_bytes(),
+            b'N',
+            [(37, 1), (48, 1), (30, 1)],
+            b'W',
+            [(122, 1), (24, 1), (15, 1)],
+        )
+    }
+
+    fn jpeg_with_exif_gps(
+        jpeg: Vec<u8>,
+        latitude_ref: u8,
+        latitude: [(u32, u32); 3],
+        longitude_ref: u8,
+        longitude: [(u32, u32); 3],
+    ) -> Vec<u8> {
+        assert!(jpeg.starts_with(&[0xff, 0xd8]));
+
+        let mut encoded = Vec::with_capacity(jpeg.len() + 160);
+        encoded.extend_from_slice(&jpeg[..2]);
+        encoded.extend_from_slice(&exif_gps_app1_segment(
+            latitude_ref,
+            latitude,
+            longitude_ref,
+            longitude,
+        ));
+        encoded.extend_from_slice(&jpeg[2..]);
+        encoded
+    }
+
+    fn exif_gps_app1_segment(
+        latitude_ref: u8,
+        latitude: [(u32, u32); 3],
+        longitude_ref: u8,
+        longitude: [(u32, u32); 3],
+    ) -> Vec<u8> {
+        let gps_ifd_entry_count = 5u16;
+        let gps_ifd_offset = 8u32 + 2 + 12 + 4;
+        let gps_ifd_size = 2u32 + (u32::from(gps_ifd_entry_count) * 12) + 4;
+        let latitude_offset = gps_ifd_offset + gps_ifd_size;
+        let longitude_offset = latitude_offset + (3 * 8);
+
+        let mut tiff = Vec::with_capacity(longitude_offset as usize + (3 * 8));
+        tiff.extend_from_slice(b"MM");
+        tiff.extend_from_slice(&42u16.to_be_bytes());
+        tiff.extend_from_slice(&8u32.to_be_bytes());
+
+        tiff.extend_from_slice(&1u16.to_be_bytes());
+        append_ifd_entry(&mut tiff, 0x8825, 4, 1, gps_ifd_offset);
+        tiff.extend_from_slice(&0u32.to_be_bytes());
+
+        tiff.extend_from_slice(&gps_ifd_entry_count.to_be_bytes());
+        append_ifd_inline_entry(&mut tiff, 0x0000, 1, 4, [2, 3, 0, 0]);
+        append_ifd_inline_entry(&mut tiff, 0x0001, 2, 2, [latitude_ref, 0, 0, 0]);
+        append_ifd_entry(&mut tiff, 0x0002, 5, 3, latitude_offset);
+        append_ifd_inline_entry(&mut tiff, 0x0003, 2, 2, [longitude_ref, 0, 0, 0]);
+        append_ifd_entry(&mut tiff, 0x0004, 5, 3, longitude_offset);
+        tiff.extend_from_slice(&0u32.to_be_bytes());
+
+        for (numerator, denominator) in latitude {
+            tiff.extend_from_slice(&numerator.to_be_bytes());
+            tiff.extend_from_slice(&denominator.to_be_bytes());
+        }
+        for (numerator, denominator) in longitude {
+            tiff.extend_from_slice(&numerator.to_be_bytes());
+            tiff.extend_from_slice(&denominator.to_be_bytes());
+        }
+
+        let mut payload = Vec::with_capacity(6 + tiff.len());
+        payload.extend_from_slice(b"Exif\0\0");
+        payload.extend_from_slice(&tiff);
+
+        let mut segment = Vec::with_capacity(4 + payload.len());
+        segment.extend_from_slice(&[0xff, 0xe1]);
+        segment.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        segment.extend_from_slice(&payload);
+        segment
+    }
+
+    fn append_ifd_entry(
+        buffer: &mut Vec<u8>,
+        tag: u16,
+        field_type: u16,
+        count: u32,
+        value_or_offset: u32,
+    ) {
+        buffer.extend_from_slice(&tag.to_be_bytes());
+        buffer.extend_from_slice(&field_type.to_be_bytes());
+        buffer.extend_from_slice(&count.to_be_bytes());
+        buffer.extend_from_slice(&value_or_offset.to_be_bytes());
+    }
+
+    fn append_ifd_inline_entry(
+        buffer: &mut Vec<u8>,
+        tag: u16,
+        field_type: u16,
+        count: u32,
+        inline_value: [u8; 4],
+    ) {
+        buffer.extend_from_slice(&tag.to_be_bytes());
+        buffer.extend_from_slice(&field_type.to_be_bytes());
+        buffer.extend_from_slice(&count.to_be_bytes());
+        buffer.extend_from_slice(&inline_value);
+    }
+
+    async fn wait_for_store_index_entry<F>(
+        client: &AuthenticatedTestHttp,
+        prefix: &str,
+        depth: usize,
+        key: &str,
+        attempts: usize,
+        predicate: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: Fn(&serde_json::Value) -> bool,
+    {
+        let query_path = format!("/store/index?prefix={prefix}&depth={depth}");
+        for _ in 0..attempts {
+            let request = client
+                .request(Method::GET, &query_path)
+                .context("failed to build signed store index request")?;
+            if let Ok(response) = request.send().await {
+                if let Ok(response) = response.error_for_status() {
+                    if let Ok(index) = response.json::<serde_json::Value>().await {
+                        if let Some(entries) =
+                            index.get("entries").and_then(|value| value.as_array())
+                        {
+                            if let Some(entry) = entries.iter().find(|entry| {
+                                entry.get("path").and_then(|value| value.as_str()) == Some(key)
+                            }) {
+                                if predicate(entry) {
+                                    return Ok(entry.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        bail!(
+            "store index did not expose expected media metadata state for key={key} prefix={prefix}"
+        )
+    }
+
     async fn enroll_authenticated_http_client(
         base_url: &str,
         client_name: &str,
@@ -706,6 +875,131 @@ mod tests {
 
             assert!(paths.contains(&"docs/api/".to_string()));
             assert!(paths.contains(&"docs/guide/".to_string()));
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut fixture.server).await;
+        let _ = fs::remove_dir_all(&fixture.data_dir);
+        let _ = fs::remove_dir_all(&fixture.client_dir);
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "known bug: store index media metadata can stay stale after overwrite with new EXIF GPS"]
+    async fn store_index_refreshes_media_gps_after_overwrite() -> Result<()> {
+        let bind = "127.0.0.1:19123";
+        let mut fixture = start_authenticated_cluster_fixture(
+            bind,
+            "store-index-media-gps-overwrite",
+            "store-index-media-gps-overwrite-client",
+        )
+        .await?;
+
+        let result = async {
+            let key = "photos/gps-overwrite.jpg";
+            let encoded = key.replace('/', "%2F");
+            let initial_payload = sample_media_jpeg_bytes();
+            let updated_payload = sample_media_jpeg_with_gps_bytes();
+
+            assert_ne!(initial_payload, updated_payload);
+
+            fixture
+                .http
+                .request(Method::PUT, &format!("/store/{encoded}"))?
+                .header("content-type", "image/jpeg")
+                .body(initial_payload.clone())
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let initial_entry = wait_for_store_index_entry(
+                &fixture.http,
+                "photos",
+                2,
+                key,
+                120,
+                |entry| {
+                    entry
+                        .get("media")
+                        .and_then(|media| media.get("status"))
+                        .and_then(|status| status.as_str())
+                        == Some("ready")
+                },
+            )
+            .await?;
+            let initial_content_hash = initial_entry
+                .get("content_hash")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+                .context("initial store index entry missing content_hash")?;
+            assert!(
+                initial_entry["media"]["gps"].is_null(),
+                "initial upload should not expose GPS metadata: {initial_entry:#}"
+            );
+
+            fixture
+                .http
+                .request(Method::PUT, &format!("/store/{encoded}"))?
+                .header("content-type", "image/jpeg")
+                .body(updated_payload.clone())
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let overwritten_bytes = fixture
+                .http
+                .request(Method::GET, &format!("/store/{encoded}"))?
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            assert_eq!(overwritten_bytes.as_ref(), updated_payload.as_slice());
+
+            let updated_entry = wait_for_store_index_entry(
+                &fixture.http,
+                "photos",
+                2,
+                key,
+                120,
+                |entry| {
+                    let content_hash = entry.get("content_hash").and_then(|value| value.as_str());
+                    let media_status = entry
+                        .get("media")
+                        .and_then(|media| media.get("status"))
+                        .and_then(|status| status.as_str());
+                    content_hash.is_some_and(|value| value != initial_content_hash)
+                        && media_status == Some("ready")
+                },
+            )
+            .await?;
+
+            let gps = updated_entry
+                .get("media")
+                .and_then(|media| media.get("gps"))
+                .and_then(|gps| gps.as_object())
+                .context(format!(
+                    "updated store index entry should expose GPS metadata after overwrite: {updated_entry:#}"
+                ))?;
+            let latitude = gps
+                .get("latitude")
+                .and_then(|value| value.as_f64())
+                .context("updated GPS payload missing latitude")?;
+            let longitude = gps
+                .get("longitude")
+                .and_then(|value| value.as_f64())
+                .context("updated GPS payload missing longitude")?;
+
+            assert!(
+                (latitude - 37.808_333_333_333_33).abs() < 0.000_001,
+                "unexpected latitude after overwrite: {latitude}"
+            );
+            assert!(
+                (longitude - (-122.404_166_666_666_67)).abs() < 0.000_001,
+                "unexpected longitude after overwrite: {longitude}"
+            );
 
             Ok::<(), anyhow::Error>(())
         }
