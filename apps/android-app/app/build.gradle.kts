@@ -4,6 +4,69 @@ import org.gradle.api.file.Directory
 import org.gradle.api.provider.Provider
 import java.io.File
 
+private fun readWorkspacePackageVersion(workspaceRoot: File): String {
+    val cargoToml = File(workspaceRoot, "Cargo.toml")
+    if (!cargoToml.isFile) {
+        throw GradleException("Workspace Cargo.toml not found at ${cargoToml.absolutePath}")
+    }
+
+    var inWorkspacePackage = false
+    var workspaceVersion: String? = null
+    cargoToml.useLines { lines ->
+        for (rawLine in lines) {
+            val line = rawLine.trim()
+            if (line.startsWith("[") && line.endsWith("]")) {
+                inWorkspacePackage = line == "[workspace.package]"
+                continue
+            }
+
+            if (!inWorkspacePackage) {
+                continue
+            }
+
+            val match = Regex("""^version\s*=\s*\"([^\"]+)\"$""").matchEntire(line)
+            if (match != null) {
+                workspaceVersion = match.groupValues[1]
+                break
+            }
+        }
+    }
+
+    return workspaceVersion
+        ?: throw GradleException("workspace.package.version not found in ${cargoToml.absolutePath}")
+}
+
+private fun readGitDescribe(workspaceRoot: File): String {
+    val process = ProcessBuilder(
+        "git",
+        "describe",
+        "--tags",
+        "--always",
+        "--dirty=-dirty",
+        "--abbrev=12",
+    )
+        .directory(workspaceRoot)
+        .redirectErrorStream(true)
+        .start()
+
+    val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+    val exitCode = process.waitFor()
+    if (exitCode != 0 || output.isBlank()) {
+        throw GradleException(
+            "Failed to read git build revision for Android version display from ${workspaceRoot.absolutePath}",
+        )
+    }
+
+    return output
+}
+
+private fun escapeBuildConfigString(value: String): String =
+    value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+
 private fun parseVersionParts(value: String): List<Int> =
     value.split(".", "-", "_").map { it.toIntOrNull() ?: 0 }
 
@@ -43,6 +106,11 @@ private fun resolveInstalledNdk(
     return ndkBundle.takeIf { it.isDirectory }
 }
 
+val workspaceRoot = rootDir.parentFile?.parentFile ?: rootDir
+val workspaceVersion = readWorkspacePackageVersion(workspaceRoot)
+val gitBuildRevision = readGitDescribe(workspaceRoot)
+val longVersion = "${workspaceVersion}\nBuild revision: ${gitBuildRevision}"
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -57,7 +125,17 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = workspaceVersion
+        buildConfigField(
+            "String",
+            "GIT_BUILD_REVISION",
+            "\"${escapeBuildConfigString(gitBuildRevision)}\"",
+        )
+        buildConfigField(
+            "String",
+            "LONG_VERSION",
+            "\"${escapeBuildConfigString(longVersion)}\"",
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
@@ -113,7 +191,6 @@ val sdkDirectoryProvider = androidComponents.sdkComponents.sdkDirectory
 val buildRust = tasks.register<Exec>("buildRust") {
     group = "build"
 
-    val workspaceRoot = rootDir.parentFile?.parentFile ?: rootDir
     val isRelease = gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }
     val outDir = layout.buildDirectory.dir("generated/rustJniLibs").get().asFile
 
