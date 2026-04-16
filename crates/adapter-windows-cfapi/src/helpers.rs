@@ -28,7 +28,9 @@ pub struct PlaceholderFileIdentity {
     pub remote_content_hash: Option<String>,
     pub remote_content_fingerprint: Option<String>,
     pub remote_size_bytes: Option<u64>,
-    pub clean_content_fingerprint: Option<String>,
+    // Baseline fingerprint for the content version that should be treated as
+    // clean/in sync, even when that content is not fully materialized locally.
+    pub in_sync_content_fingerprint: Option<String>,
     pub provider_instance_id: Option<Uuid>,
 }
 
@@ -42,8 +44,22 @@ impl PlaceholderFileIdentity {
         }
     }
 
+    pub fn set_in_sync_content_baseline(&mut self, fingerprint: impl Into<String>) {
+        let fingerprint = fingerprint.into();
+        if self.remote_content_fingerprint.is_none() {
+            self.remote_content_fingerprint = Some(fingerprint.clone());
+        }
+        self.in_sync_content_fingerprint = Some(fingerprint);
+    }
+
+    pub fn promote_remote_to_in_sync_content_baseline(&mut self) {
+        if let Some(remote_content_fingerprint) = self.remote_content_fingerprint.clone() {
+            self.in_sync_content_fingerprint = Some(remote_content_fingerprint);
+        }
+    }
+
     pub fn encoded(&self) -> Vec<u8> {
-        let mut lines = Vec::with_capacity(8);
+        let mut lines = Vec::with_capacity(9);
         lines.push(format!("v={}", Self::SCHEMA_VERSION));
         lines.push(format!("p={}", normalize_path(&self.path)));
         if let Some(remote_version) = self
@@ -73,13 +89,16 @@ impl PlaceholderFileIdentity {
         if let Some(remote_size_bytes) = self.remote_size_bytes {
             lines.push(format!("rs={remote_size_bytes}"));
         }
-        if let Some(clean_content_fingerprint) = self
-            .clean_content_fingerprint
+        if let Some(in_sync_content_fingerprint) = self
+            .in_sync_content_fingerprint
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            lines.push(format!("cf={clean_content_fingerprint}"));
+            lines.push(format!("if={in_sync_content_fingerprint}"));
+            // Keep the legacy key name alongside the new one for backward compatibility with
+            // existing identities and older binaries that only understand cf=.
+            lines.push(format!("cf={in_sync_content_fingerprint}"));
         }
         if let Some(provider_instance_id) = self.provider_instance_id {
             lines.push(format!("pi={provider_instance_id}"));
@@ -125,8 +144,8 @@ pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<Placehol
             "rs" => {
                 identity.remote_size_bytes = value.trim().parse::<u64>().ok();
             }
-            "cf" => {
-                identity.clean_content_fingerprint = Some(value.to_string());
+            "cf" | "if" => {
+                identity.in_sync_content_fingerprint = Some(value.to_string());
             }
             "pi" => {
                 identity.provider_instance_id = Uuid::parse_str(value.trim()).ok();
@@ -338,7 +357,7 @@ mod tests {
             "cfp-b47898c3f17e6f35f2f5f7e2a28c8d7fe6cb0a58b89ea4b1d172bc5342f0cb83".to_string(),
         );
         identity.remote_size_bytes = Some(42);
-        identity.clean_content_fingerprint = Some(
+        identity.in_sync_content_fingerprint = Some(
             "cfp-42f776f4d1b1e8ea8eaf9e3f7f3a814c8fdabf52c52c520909b7eb98d8eb4d2f".to_string(),
         );
         identity.provider_instance_id =
@@ -349,5 +368,48 @@ mod tests {
             decode_placeholder_file_identity(&encoded).expect("extended metadata should decode");
 
         assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn placeholder_identity_can_promote_remote_to_in_sync_baseline() {
+        let mut identity = PlaceholderFileIdentity::new("docs/readme.txt");
+        identity.remote_content_fingerprint = Some("cfp-remote".to_string());
+
+        identity.promote_remote_to_in_sync_content_baseline();
+
+        assert_eq!(
+            identity.in_sync_content_fingerprint.as_deref(),
+            Some("cfp-remote")
+        );
+    }
+
+    #[test]
+    fn placeholder_identity_encoding_emits_new_and_legacy_in_sync_keys() {
+        let mut identity = PlaceholderFileIdentity::new("docs/readme.txt");
+        identity.set_in_sync_content_baseline("cfp-baseline");
+
+        let encoded = String::from_utf8(identity.encoded()).expect("identity encoding is utf8");
+
+        assert!(encoded.lines().any(|line| line == "if=cfp-baseline"));
+        assert!(encoded.lines().any(|line| line == "cf=cfp-baseline"));
+    }
+
+    #[test]
+    fn placeholder_identity_decodes_legacy_and_new_in_sync_keys() {
+        let legacy = b"v=2\np=docs/readme.txt\ncf=cfp-legacy\n";
+        let decoded_legacy =
+            decode_placeholder_file_identity(legacy).expect("legacy identity should decode");
+        assert_eq!(
+            decoded_legacy.in_sync_content_fingerprint.as_deref(),
+            Some("cfp-legacy")
+        );
+
+        let current = b"v=2\np=docs/readme.txt\nif=cfp-current\n";
+        let decoded_current =
+            decode_placeholder_file_identity(current).expect("current identity should decode");
+        assert_eq!(
+            decoded_current.in_sync_content_fingerprint.as_deref(),
+            Some("cfp-current")
+        );
     }
 }

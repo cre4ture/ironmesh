@@ -25,13 +25,12 @@ use crate::live::ServerNodeHydrator;
 use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
 use crate::placeholder_metadata::{
-    RemoteDeleteReconcileReport, reconcile_remote_delete_state, record_in_sync_remote_file_state,
+    RemoteDeleteReconcileReport, reconcile_remote_delete_state,
 };
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
     reconcile_sync_states, register_sync_root, unregister_sync_root,
 };
-use crate::sync_root_identity::load_registered_sync_root_context;
 use crate::windows_status::{
     WindowsStatusOptions, WindowsStatusPublisher, WindowsTrayIconHandle, spawn_remote_status_thread,
 };
@@ -704,33 +703,6 @@ fn pin_placeholder_locally(args: PinArgs) -> anyhow::Result<()> {
         );
 
         if snapshot.on_disk_data_size >= total_size && snapshot.modified_data_size == 0 {
-            match load_registered_sync_root_context(&root_path) {
-                Ok(Some(context)) => {
-                    if let Err(err) = record_in_sync_remote_file_state(
-                        &root_path,
-                        &args.path,
-                        context.identity.provider_instance_id,
-                    ) {
-                        tracing::warn!(
-                            "failed to record in-sync remote clean fingerprint for pinned placeholder {}: {err:#}",
-                            target_path.display()
-                        );
-                    }
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        "skipping in-sync local hash capture for pinned placeholder {} because {} is not currently registered",
-                        target_path.display(),
-                        root_path.display()
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to query sync root identity for pinned placeholder {}: {err:#}",
-                        target_path.display()
-                    );
-                }
-            }
             return Ok(());
         }
 

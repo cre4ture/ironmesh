@@ -44,20 +44,20 @@ pub fn record_in_sync_local_file_state(
         return Ok(());
     }
 
-    let clean_content_fingerprint = file_content_fingerprint(&full_path)?;
-    record_in_sync_content_fingerprint(
+    let local_content_fingerprint = file_content_fingerprint(&full_path)?;
+    record_in_sync_content_baseline(
         sync_root_path,
         &normalized,
         provider_instance_id,
-        &clean_content_fingerprint,
+        &local_content_fingerprint,
     )
 }
 
-pub fn record_in_sync_content_fingerprint(
+pub fn record_in_sync_content_baseline(
     sync_root_path: &Path,
     relative_path: &str,
     provider_instance_id: Uuid,
-    clean_content_fingerprint: &str,
+    in_sync_content_fingerprint: &str,
 ) -> Result<()> {
     let normalized = normalize_path(relative_path);
     if normalized.is_empty() || is_internal_sync_root_relative_path(&normalized) {
@@ -67,14 +67,11 @@ pub fn record_in_sync_content_fingerprint(
     mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
-        if identity.remote_content_fingerprint.is_none() {
-            identity.remote_content_fingerprint = Some(clean_content_fingerprint.to_string());
-        }
-        identity.clean_content_fingerprint = Some(clean_content_fingerprint.to_string());
+        identity.set_in_sync_content_baseline(in_sync_content_fingerprint);
     })
 }
 
-pub fn record_in_sync_remote_file_state(
+pub fn promote_remote_to_in_sync_content_baseline(
     sync_root_path: &Path,
     relative_path: &str,
     provider_instance_id: Uuid,
@@ -87,9 +84,7 @@ pub fn record_in_sync_remote_file_state(
     mutate_placeholder_identity_for_path(sync_root_path, &normalized, |identity| {
         identity.path = normalized.clone();
         identity.provider_instance_id = Some(provider_instance_id);
-        if let Some(remote_content_fingerprint) = identity.remote_content_fingerprint.clone() {
-            identity.clean_content_fingerprint = Some(remote_content_fingerprint);
-        }
+        identity.promote_remote_to_in_sync_content_baseline();
     })
 }
 
@@ -202,18 +197,18 @@ pub fn reconcile_remote_delete_state(
             continue;
         }
 
-        let clean_local = if placeholder_info.info().ModifiedDataSize == 0 {
+        let matches_in_sync_baseline = if placeholder_info.info().ModifiedDataSize == 0 {
             true
-        } else if let Some(clean_content_fingerprint) =
-            identity.clean_content_fingerprint.as_deref()
+        } else if let Some(in_sync_content_fingerprint) =
+            identity.in_sync_content_fingerprint.as_deref()
         {
             file_content_fingerprint(&full_path)
-                .map(|current_fingerprint| current_fingerprint == clean_content_fingerprint)
+                .map(|current_fingerprint| current_fingerprint == in_sync_content_fingerprint)
                 .unwrap_or(false)
         } else {
             false
         };
-        if !clean_local {
+        if !matches_in_sync_baseline {
             report.preserved_paths.insert(relative_path);
             continue;
         }
@@ -412,7 +407,7 @@ fn identity_has_remote_baseline(identity: &PlaceholderFileIdentity) -> bool {
         || identity.remote_content_hash.is_some()
         || identity.remote_content_fingerprint.is_some()
         || identity.remote_size_bytes.is_some()
-        || identity.clean_content_fingerprint.is_some()
+    || identity.in_sync_content_fingerprint.is_some()
 }
 
 fn is_internal_sync_root_relative_path(path: &str) -> bool {

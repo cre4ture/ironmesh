@@ -16,8 +16,8 @@ use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{decode_path_from_file_identity, path_to_relative};
 use crate::hydration_control::is_active_hydration_marked;
 use crate::placeholder_metadata::{
-    record_in_sync_content_fingerprint, record_in_sync_local_file_state,
-    record_in_sync_remote_file_state,
+    promote_remote_to_in_sync_content_baseline, record_in_sync_content_baseline,
+    record_in_sync_local_file_state,
 };
 #[cfg(test)]
 use crate::runtime::UploadReceipt;
@@ -647,17 +647,17 @@ impl SyncRootMonitor {
                     metadata.len(),
                 ) {
                     Ok(receipt) => {
-                        if let Some(clean_content_fingerprint) =
-                            receipt.clean_content_fingerprint.as_deref()
-                            && let Err(err) = record_in_sync_content_fingerprint(
+                                if let Some(in_sync_content_fingerprint) =
+                                    receipt.in_sync_content_fingerprint.as_deref()
+                                    && let Err(err) = record_in_sync_content_baseline(
                                 &self.sync_root,
                                 &rel_path,
                                 self.provider_instance_id,
-                                clean_content_fingerprint,
+                                        in_sync_content_fingerprint,
                             )
                         {
                             tracing::info!(
-                                "{}: failed to record in-sync content fingerprint for {}: {:#}",
+                                        "{}: failed to record in-sync content baseline for {}: {:#}",
                                 self.name,
                                 rel_path,
                                 err
@@ -1096,9 +1096,9 @@ fn repair_locally_renamed_materialized_file(
     if is_placeholder {
         // Renamed placeholders must be repaired without reading file content, or the
         // fingerprinting path will implicitly hydrate them. Repoint the stored
-        // FileIdentity metadata to the new relative path and restore the clean
-        // in-sync state as a metadata-only operation.
-        record_in_sync_remote_file_state(sync_root, rel_path, provider_instance_id)?;
+        // FileIdentity metadata to the new relative path and restore the in-sync
+        // content baseline as a metadata-only operation.
+        promote_remote_to_in_sync_content_baseline(sync_root, rel_path, provider_instance_id)?;
         let file = open_sync_path(path, true)?;
         cf_set_in_sync(&file)?;
         tracing::info!(

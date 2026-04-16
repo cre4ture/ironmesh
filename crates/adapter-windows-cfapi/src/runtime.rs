@@ -28,9 +28,7 @@ use crate::hydration_control::{
     clear_active_hydration, clear_hydration_cancel_request, has_hydration_cancel_request,
     mark_active_hydration,
 };
-use crate::placeholder_metadata::{
-    record_in_sync_remote_file_state, refresh_remote_placeholder_state,
-};
+use crate::placeholder_metadata::refresh_remote_placeholder_state;
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use crate::sync_root_identity::{
     SyncRootIdentity, load_registered_sync_root_context, normalize_prefix,
@@ -168,7 +166,7 @@ pub struct HydrationResult {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UploadReceipt {
     pub remote_version: Option<String>,
-    pub clean_content_fingerprint: Option<String>,
+    pub in_sync_content_fingerprint: Option<String>,
 }
 
 pub trait Uploader: Send + Sync + 'static {
@@ -229,7 +227,7 @@ impl Uploader for DemoUploader {
         tracing::info!("demo upload: path={} bytes={}", path, read_bytes);
         Ok(UploadReceipt {
             remote_version: Some("demo-upload".to_string()),
-            clean_content_fingerprint: None,
+            in_sync_content_fingerprint: None,
         })
     }
 
@@ -483,7 +481,6 @@ impl Drop for SyncRootConnection {
 
 pub(crate) struct CallbackContext {
     sync_root: PathBuf,
-    provider_instance_id: uuid::Uuid,
     runtime: Arc<CfapiRuntime>,
     hydrator: Box<dyn Hydrator>,
     hydrated_once_paths: Mutex<HashSet<String>>,
@@ -1082,6 +1079,7 @@ pub fn apply_action_plan(
             identity.remote_content_hash = Some(remote_content_hash.clone());
             identity.remote_content_fingerprint = remote_content_fingerprint.clone();
             identity.remote_size_bytes = remote_size;
+            identity.promote_remote_to_in_sync_content_baseline();
 
             inputs.push(PlaceholderInput {
                 base_dir,
@@ -1661,7 +1659,6 @@ pub fn connect_sync_root(
     let upload_debounce = Arc::new(UploadDebounceState::default());
     let mut callback_context = Box::new(CallbackContext {
         sync_root: registration.root_path.clone(),
-        provider_instance_id,
         runtime,
         hydrator,
         hydrated_once_paths: Mutex::new(HashSet::new()),
@@ -1998,36 +1995,6 @@ pub(crate) fn handle_callback_fetch_data(
             failure_info = None;
             if let Ok(mut hydrated_paths) = context.hydrated_once_paths.lock() {
                 hydrated_paths.insert(relative_path.clone());
-            }
-            if result.object_size_bytes > 0 {
-                match open_sync_path(&full_path, false).and_then(|file| {
-                    cf_get_placeholder_standard_info(&file).map_err(std::io::Error::other)
-                }) {
-                    Ok(info)
-                        if info.ModifiedDataSize == 0
-                            && info.OnDiskDataSize >= result.object_size_bytes as i64 =>
-                    {
-                        if let Err(err) = record_in_sync_remote_file_state(
-                            &context.sync_root,
-                            &relative_path,
-                            context.provider_instance_id,
-                        ) {
-                            tracing::info!(
-                                "cfapi fetch-data complete: failed to record in-sync remote clean fingerprint for {}: {:#}",
-                                relative_path,
-                                err
-                            );
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        tracing::info!(
-                            "cfapi fetch-data complete: failed to inspect hydrated file {} for local hash capture: {}",
-                            relative_path,
-                            err
-                        );
-                    }
-                }
             }
             tracing::info!(
                 "cfapi fetch-data complete: request={} path={} object_size={} range={} bytes_transferred={} state_after={} upload_debounce={}",
@@ -2420,6 +2387,7 @@ fn current_executable_icon_resource() -> Result<U16String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::decode_placeholder_file_identity;
     use std::collections::{HashMap, HashSet};
     use std::mem::size_of;
     use std::ptr::null;
@@ -2428,6 +2396,23 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use windows_sys::Win32::Storage::CloudFilters::CF_PROCESS_INFO;
+
+    struct TestSyncRootGuard {
+        root_path: PathBuf,
+    }
+
+    impl TestSyncRootGuard {
+        fn new(root_path: PathBuf) -> Self {
+            Self { root_path }
+        }
+    }
+
+    impl Drop for TestSyncRootGuard {
+        fn drop(&mut self) {
+            let _ = unregister_sync_root(&self.root_path);
+            let _ = std::fs::remove_dir_all(&self.root_path);
+        }
+    }
 
     #[test]
     fn registration_validation_rejects_empty_inputs() {
@@ -2626,6 +2611,61 @@ mod tests {
     }
 
     #[test]
+    fn apply_action_plan_creates_remote_placeholder_with_in_sync_baseline() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-apply-action-plan-placeholder-{unique}"
+        ));
+        let _guard = TestSyncRootGuard::new(sync_root.clone());
+        let registration = SyncRootRegistration::new(
+            format!("test-sync-root-{unique}"),
+            "Ironmesh Test",
+            &sync_root,
+            uuid::Uuid::new_v4(),
+            None,
+        );
+        let registered_identity =
+            register_sync_root(&registration).expect("sync root registration should succeed");
+
+        let plan = CfapiActionPlan {
+            actions: vec![CfapiAction::EnsurePlaceholder {
+                path: "videos/movie.mkv".to_string(),
+                remote_version: "v1".to_string(),
+                remote_content_hash: "h1".to_string(),
+                remote_size: Some(10_000),
+                remote_content_fingerprint: Some("cfp-remote-movie".to_string()),
+            }],
+        };
+
+        apply_action_plan(
+            &sync_root,
+            &plan,
+            registered_identity.provider_instance_id,
+            true,
+        )
+        .expect("apply_action_plan should create placeholder");
+
+        let placeholder_path = sync_root.join("videos\\movie.mkv");
+        let file = open_sync_path(&placeholder_path, false)
+            .expect("created placeholder should be reopenable");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("placeholder identity should be available");
+        let decoded = decode_placeholder_file_identity(info.file_identity())
+            .expect("created placeholder identity should decode");
+
+        assert_eq!(decoded.remote_content_fingerprint.as_deref(), Some("cfp-remote-movie"));
+        assert_eq!(
+            decoded.in_sync_content_fingerprint.as_deref(),
+            Some("cfp-remote-movie")
+        );
+
+        let encoded = std::str::from_utf8(info.file_identity())
+            .expect("placeholder identity should be utf8");
+        assert!(encoded.lines().any(|line| line == "if=cfp-remote-movie"));
+        assert!(encoded.lines().any(|line| line == "cf=cfp-remote-movie"));
+    }
+
+    #[test]
     fn close_completion_ignores_provider_originated_callbacks() {
         let sync_root = std::env::temp_dir().join(format!(
             "ironmesh-close-completion-{}",
@@ -2641,7 +2681,6 @@ mod tests {
         let uploader = Arc::new(DemoUploader);
         let callback_context = CallbackContext {
             sync_root: sync_root.clone(),
-            provider_instance_id: uuid::Uuid::new_v4(),
             runtime: runtime.clone(),
             hydrator: Box::new(DemoHydrator),
             hydrated_once_paths: Mutex::new(HashSet::new()),

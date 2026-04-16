@@ -2,7 +2,7 @@ use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
     cf_set_not_in_sync, describe_path_state,
 };
-use crate::placeholder_metadata::record_in_sync_content_fingerprint;
+use crate::placeholder_metadata::record_in_sync_content_baseline;
 use crate::runtime::{
     CfapiRuntime, UploadReceipt, Uploader, reconcile_ancestor_directory_sync_states,
 };
@@ -437,16 +437,16 @@ fn process_debounced_close_upload(
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
-    if let Some(clean_content_fingerprint) = upload_receipt.clean_content_fingerprint.as_deref()
-        && let Err(err) = record_in_sync_content_fingerprint(
+    if let Some(in_sync_content_fingerprint) = upload_receipt.in_sync_content_fingerprint.as_deref()
+        && let Err(err) = record_in_sync_content_baseline(
             &worker.sync_root,
             relative_path,
             worker.provider_instance_id,
-            clean_content_fingerprint,
+            in_sync_content_fingerprint,
         )
     {
         tracing::info!(
-            "close-completion: failed to record in-sync content fingerprint for {}: {:#}",
+            "close-completion: failed to record in-sync content baseline for {}: {:#}",
             relative_path,
             err
         );
@@ -544,7 +544,7 @@ mod tests {
                 .push((path.to_string(), payload, length));
             Ok(UploadReceipt {
                 remote_version: Some(format!("version:size={length}")),
-                clean_content_fingerprint: Some(format!("cfp-upload-{length}")),
+                in_sync_content_fingerprint: Some(format!("cfp-upload-{length}")),
             })
         }
     }
@@ -600,7 +600,7 @@ mod tests {
         assert!(hydrated_text.contains(&format!("version:size={}", payload.len())));
         let expected_fingerprint = format!("cfp-upload-{}", payload.len());
         assert_eq!(
-            receipt.clean_content_fingerprint.as_deref(),
+            receipt.in_sync_content_fingerprint.as_deref(),
             Some(expected_fingerprint.as_str())
         );
 

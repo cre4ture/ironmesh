@@ -115,13 +115,13 @@ impl Uploader for ServerNodeHydrator {
         self.sdk
             .put_large_aware_reader(path.to_string(), &mut fingerprinting_reader, length)
             .with_context(|| format!("failed to upload object for path {path}"))?;
-        let clean_content_fingerprint = fingerprinting_reader
+        let in_sync_content_fingerprint = fingerprinting_reader
             .finish()
             .with_context(|| format!("failed to finalize content fingerprint for {path}"))?;
 
         Ok(UploadReceipt {
             remote_version: Some(format!("server-head:size={length}")),
-            clean_content_fingerprint: Some(clean_content_fingerprint),
+            in_sync_content_fingerprint: Some(in_sync_content_fingerprint),
         })
     }
 
