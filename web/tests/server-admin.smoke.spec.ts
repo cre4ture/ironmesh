@@ -53,16 +53,18 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("cell", { name: "node-alpha", exact: true }).first()).toBeVisible();
   await expect(page.locator("td").filter({ hasText: /logical/ }).first()).toBeVisible();
   await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
-  await expect(page.getByRole("columnheader", { name: "Replication progress" })).toBeVisible();
-  await expect(page.getByText("photos/cover.jpg", { exact: true })).toBeVisible();
-  await expect(page.getByText("1 / 2 desired nodes currently present", { exact: true })).toBeVisible();
-  await expect(page.getByText("under replicated", { exact: true })).toBeVisible();
   await expect(
     page
       .getByRole("paragraph")
       .filter({ hasText: "Embedded listener: https://embedded-rendezvous.local:9443" })
       .getByRole("code")
   ).toBeVisible();
+
+  await page.getByText("Repair", { exact: true }).click();
+  await expect(page.getByRole("columnheader", { name: "Replication progress" })).toBeVisible();
+  await expect(page.getByText("photos/cover.jpg", { exact: true })).toBeVisible();
+  await expect(page.getByText("1 / 2 desired nodes currently present", { exact: true })).toBeVisible();
+  await expect(page.getByText("under replicated", { exact: true })).toBeVisible();
 
   await page.getByText("Provisioning", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Provisioning" })).toBeVisible();
@@ -176,6 +178,47 @@ test("server-admin provisioning can target a selected rendezvous service", async
   await expect(page.getByText("Request failed", { exact: true })).toHaveCount(0);
 });
 
+test("server-admin gallery derives child folders from nested media entries", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    galleryEntries: [
+      {
+        path: "cameras/vm1.4/",
+        entry_type: "prefix"
+      },
+      {
+        path: "cameras/vm1.4/front.jpg",
+        entry_type: "key",
+        media: {
+          status: "ready",
+          content_fingerprint: "fingerprint-vm14-front",
+          media_type: "image",
+          mime_type: "image/jpeg"
+        }
+      },
+      {
+        path: "cameras/oppo-uli/front.jpg",
+        entry_type: "key",
+        media: {
+          status: "ready",
+          content_fingerprint: "fingerprint-oppo-front",
+          media_type: "image",
+          mime_type: "image/jpeg"
+        }
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
+
+  await page.getByLabel("Prefix").fill("cameras/");
+  await page.getByRole("button", { name: "Load" }).click();
+
+  await expect(page.getByText("vm1.4/", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("oppo-uli/", { exact: true }).first()).toBeVisible();
+});
+
 test("server-admin provisioning falls back to the full bootstrap bundle when claim issuance returns 502", async ({ page }) => {
   await installServerAdminMocks(page, { bootstrapClaimMode: "bad_gateway" });
 
@@ -274,6 +317,7 @@ async function installServerAdminMocks(
     delayedInitialUnauthenticatedSessionMs?: number;
     postLoginUnauthenticatedSessionResponses?: number;
     protectDashboardAdminRoutesUntilSessionConfirmed?: boolean;
+    galleryEntries?: AdminMockStoreEntry[];
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -331,6 +375,7 @@ async function installServerAdminMocks(
     persistence_source: "node_enrollment",
     persisted: true
   };
+  const galleryEntries = options?.galleryEntries ?? createDefaultAdminGalleryEntries();
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -388,58 +433,8 @@ async function installServerAdminMocks(
       return json(route, {
         prefix: searchParams.get("prefix") ?? "",
         depth: Number(searchParams.get("depth") ?? "1"),
-        entry_count: 4,
-        entries: [
-          { path: "docs/readme.txt", entry_type: "key" },
-          { path: "media/", entry_type: "prefix" },
-          {
-            path: "gallery/cat.png",
-            entry_type: "key",
-            media: {
-              status: "ready",
-              content_fingerprint: "fingerprint-cat",
-              media_type: "image",
-              mime_type: "image/png",
-              width: 1024,
-              height: 768,
-              taken_at_unix: 1_712_345_678,
-              gps: {
-                latitude: 47.3769,
-                longitude: 8.5417
-              },
-              thumbnail: {
-                url: "/auth/media/thumbnail?key=gallery%2Fcat.png",
-                profile: "grid",
-                width: 256,
-                height: 192,
-                format: "jpeg",
-                size_bytes: 1234
-              }
-            }
-          },
-          {
-            path: "gallery/dog.jpg",
-            entry_type: "key",
-            media: {
-              status: "pending",
-              content_fingerprint: "fingerprint-dog",
-              media_type: "image",
-              mime_type: "image/jpeg",
-              gps: {
-                latitude: 40.7128,
-                longitude: -74.006
-              },
-              thumbnail: {
-                url: "/auth/media/thumbnail?key=gallery%2Fdog.jpg",
-                profile: "grid",
-                width: 256,
-                height: 256,
-                format: "jpeg",
-                size_bytes: 0
-              }
-            }
-          }
-        ]
+        entry_count: galleryEntries.length,
+        entries: galleryEntries
       });
     }
 
@@ -997,6 +992,66 @@ async function installServerAdminMocks(
 
     return route.continue();
   });
+}
+
+type AdminMockStoreEntry = {
+  path: string;
+  entry_type: "prefix" | "key";
+  media?: Record<string, unknown>;
+};
+
+function createDefaultAdminGalleryEntries(): AdminMockStoreEntry[] {
+  return [
+    { path: "docs/readme.txt", entry_type: "key" },
+    { path: "media/", entry_type: "prefix" },
+    {
+      path: "gallery/cat.png",
+      entry_type: "key",
+      media: {
+        status: "ready",
+        content_fingerprint: "fingerprint-cat",
+        media_type: "image",
+        mime_type: "image/png",
+        width: 1024,
+        height: 768,
+        taken_at_unix: 1_712_345_678,
+        gps: {
+          latitude: 47.3769,
+          longitude: 8.5417
+        },
+        thumbnail: {
+          url: "/auth/media/thumbnail?key=gallery%2Fcat.png",
+          profile: "grid",
+          width: 256,
+          height: 192,
+          format: "jpeg",
+          size_bytes: 1234
+        }
+      }
+    },
+    {
+      path: "gallery/dog.jpg",
+      entry_type: "key",
+      media: {
+        status: "pending",
+        content_fingerprint: "fingerprint-dog",
+        media_type: "image",
+        mime_type: "image/jpeg",
+        gps: {
+          latitude: 40.7128,
+          longitude: -74.006
+        },
+        thumbnail: {
+          url: "/auth/media/thumbnail?key=gallery%2Fdog.jpg",
+          profile: "grid",
+          width: 256,
+          height: 256,
+          format: "jpeg",
+          size_bytes: 0
+        }
+      }
+    }
+  ];
 }
 
 function buildCredentialList(revokedDeviceIds: Set<string>) {

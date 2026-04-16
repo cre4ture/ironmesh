@@ -17,6 +17,12 @@ import {
 import { IconRefresh } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
+import {
+  normalizeStorePath,
+  normalizeStorePrefix,
+  parentStorePrefix,
+  storeEntryName
+} from "../store-paths";
 
 const DEFAULT_EXPLORER_PREVIEW_BYTES = 1024;
 const EXPLORER_RENAME_SCAN_DEPTH = 1024;
@@ -1034,30 +1040,15 @@ function explorerDisplayPath(entry: ExplorerEntry, prefix: string): string {
 }
 
 function explorerEntryName(path: string, isPrefix: boolean): string {
-  const normalizedPath = normalizeExplorerPath(path, isPrefix).replace(/\/+$/, "");
-  if (!normalizedPath) {
-    return "";
-  }
-  return normalizedPath.split("/").pop() ?? normalizedPath;
+  return storeEntryName(path, isPrefix);
 }
 
 function normalizeExplorerPrefix(prefix: string): string {
-  const trimmed = prefix.trim().replace(/^\/+/, "");
-  if (!trimmed) {
-    return "";
-  }
-  return `${trimmed.replace(/\/+$/, "")}/`;
+  return normalizeStorePrefix(prefix);
 }
 
 function normalizeExplorerPath(path: string, isPrefix: boolean): string {
-  const trimmed = path.trim().replace(/^\/+/, "");
-  if (!trimmed) {
-    return "";
-  }
-  if (isPrefix || trimmed.endsWith("/")) {
-    return `${trimmed.replace(/\/+$/, "")}/`;
-  }
-  return trimmed;
+  return normalizeStorePath(path, isPrefix);
 }
 
 function compareNullableNumbers(
@@ -1108,11 +1099,7 @@ function formatExplorerSize(value: number | null | undefined): string {
 }
 
 function parentPrefix(path: string): string {
-  const normalized = path.replace(/\/+$/, "");
-  if (!normalized.includes("/")) {
-    return "";
-  }
-  return `${normalized.split("/").slice(0, -1).join("/")}/`;
+  return parentStorePrefix(path);
 }
 
 function normalizeExplorerSegments(path: string): string {

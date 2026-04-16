@@ -37,6 +37,12 @@ import {
   type GalleryMapProjection
 } from "./GalleryBasemapMap";
 import { JsonBlock } from "../JsonBlock/JsonBlock";
+import {
+  directChildStorePrefix,
+  normalizeStorePrefix,
+  parentStorePrefix,
+  storeEntryName
+} from "../store-paths";
 
 export type { GalleryBasemapConfig } from "./GalleryBasemapMap";
 
@@ -1886,34 +1892,23 @@ function buildGalleryNavigationItems(
   }
 
   for (const entry of entries) {
-    if (!isGalleryPrefixEntry(entry)) {
+    const targetPrefix = galleryDirectChildPrefix(entry, currentPrefix);
+    if (!targetPrefix || targetPrefix === currentPrefix) {
       continue;
     }
 
-    const normalizedPath = normalizeGalleryPrefix(entry.path);
-    if (!normalizedPath || normalizedPath === currentPrefix) {
-      continue;
-    }
-    if (!normalizedPath.startsWith(currentPrefix)) {
+    if (seenPrefixes.has(targetPrefix)) {
       continue;
     }
 
-    const relativePath = normalizedPath.slice(currentPrefix.length);
-    const trimmedRelative = relativePath.replace(/\/$/, "");
-    if (!trimmedRelative || trimmedRelative.includes("/")) {
-      continue;
-    }
-    if (seenPrefixes.has(normalizedPath)) {
-      continue;
-    }
-
-    seenPrefixes.add(normalizedPath);
+    seenPrefixes.add(targetPrefix);
+    const relativePath = targetPrefix.slice(currentPrefix.length) || targetPrefix;
     items.push({
-      key: `prefix:${normalizedPath}`,
+      key: `prefix:${targetPrefix}`,
       kind: "prefix",
-      label: `${trimmedRelative}/`,
-      description: `Open ${normalizedPath}`,
-      targetPrefix: normalizedPath
+      label: relativePath,
+      description: `Open ${targetPrefix}`,
+      targetPrefix
     });
   }
 
@@ -1926,11 +1921,11 @@ function buildGalleryNavigationItems(
 }
 
 function normalizeGalleryPrefix(path: string): string {
-  const trimmed = path.trim().replace(/^\/+/, "");
-  if (!trimmed) {
-    return "";
-  }
-  return `${trimmed.replace(/\/+$/, "")}/`;
+  return normalizeStorePrefix(path);
+}
+
+function galleryDirectChildPrefix(entry: GalleryEntry, currentPrefix: string): string | null {
+  return directChildStorePrefix(entry.path, currentPrefix, isGalleryPrefixEntry(entry));
 }
 
 function loadStoredThumbnailsPerRow(): number {
@@ -2105,15 +2100,11 @@ function formatTakenAt(value: number): string {
 }
 
 function fileName(path: string): string {
-  return path.split("/").pop() || path;
+  return storeEntryName(path, false);
 }
 
 function parentPrefix(path: string): string {
-  const normalized = path.replace(/\/+$/, "");
-  if (!normalized.includes("/")) {
-    return "";
-  }
-  return `${normalized.split("/").slice(0, -1).join("/")}/`;
+  return parentStorePrefix(path);
 }
 
 function projectGpsToWorldMap(latitude: number, longitude: number): { x: number; y: number } {
