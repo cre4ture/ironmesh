@@ -40,6 +40,7 @@ pub(crate) struct SetupBootstrapConfig {
 enum SetupLifecycleState {
     Uninitialized,
     PendingJoin,
+    Recovery,
     Online,
 }
 
@@ -181,8 +182,11 @@ pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
         return Ok(StartupMode::Runtime(ServerNodeConfig::from_env()?));
     }
 
-    let config = default_setup_bootstrap_config()?;
-    if let Some(managed_state) = read_managed_setup_state(&config.state_path)?
+    load_managed_startup_mode(default_setup_bootstrap_config()?)
+}
+
+fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<StartupMode> {
+    if let Some(mut managed_state) = read_managed_setup_state(&config.state_path)?
         && managed_state.state == SetupLifecycleState::Online
         && let Some(enrollment_path) = managed_state.runtime_node_enrollment_path.as_deref()
     {
@@ -191,6 +195,13 @@ pub(crate) fn load_startup_mode_from_env() -> Result<StartupMode> {
             let mut runtime = ServerNodeConfig::from_enrollment_path(&resolved_path)?;
             apply_managed_signer_paths(&config.data_dir, &mut runtime);
             apply_managed_rendezvous_config(&config.data_dir, &managed_state, &mut runtime);
+            if runtime_enrollment_requires_rejoin(&runtime) {
+                transition_managed_setup_state_to_recovery(
+                    &config.state_path,
+                    &mut managed_state,
+                )?;
+                return Ok(StartupMode::Setup(config));
+            }
             runtime.admin_password_hash = managed_state.admin_password_hash.clone();
             return Ok(StartupMode::Runtime(runtime));
         }
@@ -303,6 +314,15 @@ async fn start_new_cluster(
             return (
                 StatusCode::CONFLICT,
                 Json(json!({ "error": "node is already initialized" })),
+            )
+                .into_response();
+        }
+        if managed.state == SetupLifecycleState::Recovery {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "node requires cluster rejoin; import a fresh node enrollment package instead of starting a new cluster"
+                })),
             )
                 .into_response();
         }
@@ -604,6 +624,30 @@ async fn import_node_enrollment_package(
     package.bootstrap.data_dir = state.config.data_dir.display().to_string();
 
     let mut managed = state.managed_state.lock().await;
+    if managed.state == SetupLifecycleState::Recovery {
+        if let Some(expected_node_id) = managed.node_id
+            && package.bootstrap.node_id != expected_node_id
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "imported node enrollment does not match the recovering node identity"
+                })),
+            )
+                .into_response();
+        }
+        if let Some(expected_cluster_id) = managed.cluster_id
+            && package.bootstrap.cluster_id != expected_cluster_id
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "imported node enrollment does not match the recovering cluster identity"
+                })),
+            )
+                .into_response();
+        }
+    }
     if let Some(join_request) = managed.pending_join_request.as_ref()
         && package.bootstrap.node_id != join_request.node_id
     {
@@ -711,6 +755,64 @@ fn explicit_runtime_env_present() -> bool {
             .ok()
             .is_some_and(|value| !value.trim().is_empty())
     })
+}
+
+fn runtime_enrollment_requires_rejoin(config: &ServerNodeConfig) -> bool {
+    let status = collect_node_certificate_status(
+        config.public_tls.as_ref().map(|tls| tls.cert_path.as_path()),
+        config
+            .public_tls
+            .as_ref()
+            .and_then(|tls| tls.metadata_path.as_deref()),
+        config.internal_tls.as_ref().map(|tls| tls.cert_path.as_path()),
+        config
+            .internal_tls
+            .as_ref()
+            .and_then(|tls| tls.metadata_path.as_deref()),
+        NodeCertificateAutoRenewStatusView {
+            enabled: false,
+            enrollment_path: None,
+            issuer_url: None,
+            check_interval_secs: None,
+            last_attempt_unix: None,
+            last_success_unix: None,
+            last_error: None,
+            restart_required: false,
+        },
+    );
+
+    let requires_rejoin = node_certificate_requires_rejoin(&status.public_tls)
+        || node_certificate_requires_rejoin(&status.internal_tls);
+    if requires_rejoin {
+        log_certificate_lifecycle_status(&status);
+        tracing::warn!(
+            node_id = %config.node_id,
+            data_dir = %config.data_dir.display(),
+            "managed runtime enrollment is unusable; starting setup recovery mode"
+        );
+    }
+    requires_rejoin
+}
+
+fn node_certificate_requires_rejoin(status: &NodeCertificateStatusView) -> bool {
+    matches!(
+        status.state,
+        NodeCertificateLifecycleState::Expired | NodeCertificateLifecycleState::Missing
+    )
+}
+
+fn transition_managed_setup_state_to_recovery(
+    state_path: &std::path::Path,
+    managed_state: &mut ManagedSetupState,
+) -> Result<()> {
+    if managed_state.state == SetupLifecycleState::Recovery {
+        return Ok(());
+    }
+
+    managed_state.state = SetupLifecycleState::Recovery;
+    managed_state.updated_at_unix = unix_ts();
+    managed_state.pending_join_request = None;
+    write_managed_setup_state(state_path, managed_state)
 }
 
 fn default_setup_bootstrap_config() -> Result<SetupBootstrapConfig> {
@@ -1690,6 +1792,181 @@ mod tests {
             vec!["https://node-a.local:9443".to_string()]
         );
         assert!(package.bootstrap.trust_roots.rendezvous_ca_pem.is_some());
+    }
+
+    #[test]
+    fn expired_runtime_enrollment_requires_rejoin() {
+        let dir = temp_dir("expired-runtime-enrollment");
+        let node_id = NodeId::new_v4();
+        let cluster_id = Uuid::now_v7();
+        let bootstrap = TransportNodeBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            node_id,
+            mode: NodeBootstrapMode::Cluster,
+            data_dir: dir.display().to_string(),
+            bind_addr: "0.0.0.0:8443".to_string(),
+            public_url: Some("https://node-a.local:8443".to_string()),
+            labels: default_setup_labels(),
+            public_tls: Some(BootstrapServerTlsFiles {
+                cert_path: "managed/runtime/public/public.pem".to_string(),
+                key_path: "managed/runtime/public/public.key".to_string(),
+            }),
+            public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
+            public_peer_api_enabled: false,
+            internal_bind_addr: Some("0.0.0.0:18443".to_string()),
+            internal_url: Some("https://node-a.local:18443".to_string()),
+            internal_tls: Some(BootstrapTlsFiles {
+                ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
+                cert_path: "managed/runtime/internal/node.pem".to_string(),
+                key_path: "managed/runtime/internal/node.key".to_string(),
+            }),
+            rendezvous_urls: vec!["https://node-a.local:9443".to_string()],
+            rendezvous_mtls_required: true,
+            direct_endpoints: vec![
+                BootstrapEndpoint {
+                    url: "https://node-a.local:8443".to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(node_id),
+                },
+                BootstrapEndpoint {
+                    url: "https://node-a.local:18443".to_string(),
+                    usage: Some(BootstrapEndpointUse::PeerApi),
+                    node_id: Some(node_id),
+                },
+            ],
+            relay_mode: RelayMode::Fallback,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            enrollment_issuer_url: Some("https://node-a.local:8443".to_string()),
+        };
+
+        let mut artifacts = issue_self_managed_cluster_artifacts(bootstrap).unwrap();
+        let now = unix_ts();
+        let expired_policy = NodeTlsIssuePolicy {
+            issued_at_unix: now.saturating_sub(7100),
+            not_before_unix: now.saturating_sub(7200),
+            not_after_unix: now.saturating_sub(3600),
+            renew_after_unix: now.saturating_sub(3900),
+        };
+        artifacts.package.internal_tls_material = Some(
+            issue_internal_node_tls_material_from_ca(
+                &artifacts.package.bootstrap,
+                &artifacts.ca_cert_pem,
+                &artifacts.ca_key_pem,
+                expired_policy,
+            )
+            .unwrap(),
+        );
+
+        let package_path = dir.join("managed").join("runtime").join("node-enrollment.json");
+        artifacts.package.write_to_path(&package_path).unwrap();
+
+        let config = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+        assert!(runtime_enrollment_requires_rejoin(&config));
+    }
+
+    #[test]
+    fn online_managed_startup_with_expired_runtime_enrollment_falls_back_to_recovery_setup() {
+        let dir = temp_dir("expired-runtime-startup-recovery");
+        let runtime_enrollment_path = runtime_node_enrollment_path(&dir);
+        let node_id = NodeId::new_v4();
+        let cluster_id = Uuid::now_v7();
+        let bootstrap = TransportNodeBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            node_id,
+            mode: NodeBootstrapMode::Cluster,
+            data_dir: dir.display().to_string(),
+            bind_addr: "0.0.0.0:8443".to_string(),
+            public_url: Some("https://node-a.local:8443".to_string()),
+            labels: default_setup_labels(),
+            public_tls: Some(BootstrapServerTlsFiles {
+                cert_path: "managed/runtime/public/public.pem".to_string(),
+                key_path: "managed/runtime/public/public.key".to_string(),
+            }),
+            public_ca_cert_path: Some("managed/runtime/public/public-ca.pem".to_string()),
+            public_peer_api_enabled: false,
+            internal_bind_addr: Some("0.0.0.0:18443".to_string()),
+            internal_url: Some("https://node-a.local:18443".to_string()),
+            internal_tls: Some(BootstrapTlsFiles {
+                ca_cert_path: "managed/runtime/internal/cluster-ca.pem".to_string(),
+                cert_path: "managed/runtime/internal/node.pem".to_string(),
+                key_path: "managed/runtime/internal/node.key".to_string(),
+            }),
+            rendezvous_urls: vec!["https://node-a.local:9443".to_string()],
+            rendezvous_mtls_required: true,
+            direct_endpoints: vec![
+                BootstrapEndpoint {
+                    url: "https://node-a.local:8443".to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(node_id),
+                },
+                BootstrapEndpoint {
+                    url: "https://node-a.local:18443".to_string(),
+                    usage: Some(BootstrapEndpointUse::PeerApi),
+                    node_id: Some(node_id),
+                },
+            ],
+            relay_mode: RelayMode::Fallback,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            enrollment_issuer_url: Some("https://node-a.local:8443".to_string()),
+        };
+
+        let mut artifacts = issue_self_managed_cluster_artifacts(bootstrap).unwrap();
+        let now = unix_ts();
+        let expired_policy = NodeTlsIssuePolicy {
+            issued_at_unix: now.saturating_sub(7100),
+            not_before_unix: now.saturating_sub(7200),
+            not_after_unix: now.saturating_sub(3600),
+            renew_after_unix: now.saturating_sub(3900),
+        };
+        artifacts.package.internal_tls_material = Some(
+            issue_internal_node_tls_material_from_ca(
+                &artifacts.package.bootstrap,
+                &artifacts.ca_cert_pem,
+                &artifacts.ca_key_pem,
+                expired_policy,
+            )
+            .unwrap(),
+        );
+        artifacts.package.write_to_path(&runtime_enrollment_path).unwrap();
+
+        let state_path = managed_setup_state_path(&dir);
+        write_managed_setup_state(
+            &state_path,
+            &ManagedSetupState {
+                state: SetupLifecycleState::Online,
+                cluster_id: Some(cluster_id),
+                node_id: Some(node_id),
+                runtime_node_enrollment_path: Some(runtime_enrollment_path.display().to_string()),
+                ..ManagedSetupState::default()
+            },
+        )
+        .unwrap();
+
+        let startup_mode = load_managed_startup_mode(SetupBootstrapConfig {
+            data_dir: dir.clone(),
+            bind_addr: "127.0.0.1:8443".parse().unwrap(),
+            state_path: state_path.clone(),
+            bootstrap_cert_path: bootstrap_setup_cert_path(&dir),
+            bootstrap_key_path: bootstrap_setup_key_path(&dir),
+        })
+        .unwrap();
+
+        assert!(matches!(startup_mode, StartupMode::Setup(_)));
+        let restored = read_managed_setup_state(&state_path).unwrap().unwrap();
+        assert_eq!(restored.state, SetupLifecycleState::Recovery);
+        assert_eq!(restored.cluster_id, Some(cluster_id));
+        assert_eq!(restored.node_id, Some(node_id));
+        assert!(restored.pending_join_request.is_none());
     }
 
     #[test]

@@ -145,6 +145,17 @@ To keep the first slice low-effort and reviewable, the implementation makes the 
   - first-slice automatic renewal runs from the background renewal loop after node startup,
   - it is not attempted before listener startup because issuer resolution now depends on live cluster membership.
 
+### Expired credential recovery
+
+Managed setup-mode nodes now recover expired runtime node certificates by falling back to setup recovery mode on startup instead of attempting normal runtime startup.
+
+The current recovery slice makes these concrete choices:
+
+- startup inspects the stored runtime node enrollment package and treats expired or otherwise unreadable configured node certificates as a recovery condition,
+- setup recovery preserves the existing `cluster_id` and stable `node_id`,
+- `start-cluster` is rejected while a node is in recovery so the operator cannot accidentally replace an existing cluster identity,
+- the recovery workflow is: generate a fresh join request, issue a fresh node enrollment package from an existing control-plane node, and import that package to return to runtime.
+
 ### Remaining gap
 
-Expired node certificates still require a later recovery or re-enrollment flow. The current routine renewal path only works while the node can still authenticate with its currently valid internal certificate.
+This recovery path currently covers the managed setup-mode workflow. Non-managed/manual deployments still require an operator to replace the node enrollment package out of band.

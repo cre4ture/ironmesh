@@ -5,7 +5,7 @@ mod tests {
 
     use std::collections::HashSet;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
     use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,8 +14,14 @@ mod tests {
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
     use client_sdk::{ClientIdentityMaterial, IronMeshClient, build_signed_request_headers};
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, SanType,
+    };
     use reqwest::{Method, RequestBuilder, StatusCode};
+    use time::OffsetDateTime;
     use tokio::time::sleep;
+    use transport_sdk::{BootstrapTlsMaterialMetadata, NodeEnrollmentPackage};
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -158,6 +164,28 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    fn find_available_bind_addr() -> Result<String> {
+        for _ in 0..64 {
+            let public_listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .context("failed binding temporary public listener")?;
+            let public_addr = public_listener
+                .local_addr()
+                .context("failed reading temporary public listener address")?;
+            let Some(internal_port) = public_addr.port().checked_add(10_000) else {
+                continue;
+            };
+            let internal_addr = format!("127.0.0.1:{internal_port}");
+            let Ok(internal_listener) = std::net::TcpListener::bind(&internal_addr) else {
+                continue;
+            };
+            drop(internal_listener);
+            drop(public_listener);
+            return Ok(public_addr.to_string());
+        }
+
+        bail!("failed to allocate an available bind address")
     }
 
     fn sample_media_jpeg_bytes() -> Vec<u8> {
@@ -603,12 +631,33 @@ mod tests {
         session_cookie: &str,
         join_request: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        issue_node_enrollment_from_join_request_with_cookie_and_tls_policy(
+            http,
+            bind,
+            session_cookie,
+            join_request,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn issue_node_enrollment_from_join_request_with_cookie_and_tls_policy(
+        http: &reqwest::Client,
+        bind: &str,
+        session_cookie: &str,
+        join_request: &serde_json::Value,
+        tls_validity_secs: Option<u64>,
+        tls_renewal_window_secs: Option<u64>,
+    ) -> Result<serde_json::Value> {
         http.post(format!(
             "https://{bind}/auth/node-join-requests/issue-enrollment"
         ))
         .header(reqwest::header::COOKIE, session_cookie)
         .json(&serde_json::json!({
             "join_request": join_request,
+            "tls_validity_secs": tls_validity_secs,
+            "tls_renewal_window_secs": tls_renewal_window_secs,
         }))
         .send()
         .await?
@@ -616,6 +665,86 @@ mod tests {
         .json()
         .await
         .context("failed decoding node enrollment from join request response")
+    }
+
+    fn replace_runtime_internal_certificate_with_expired_one(
+        enrollment_path: &Path,
+        ca_cert_path: &Path,
+        ca_key_path: &Path,
+    ) -> Result<()> {
+        let mut package = NodeEnrollmentPackage::from_path(enrollment_path)
+            .context("failed loading runtime node enrollment package")?;
+        let internal_material = package
+            .internal_tls_material
+            .as_mut()
+            .context("runtime node enrollment package is missing internal TLS material")?;
+
+        let ca_cert_pem = fs::read_to_string(ca_cert_path)
+            .with_context(|| format!("failed reading {}", ca_cert_path.display()))?;
+        let ca_key_pem = fs::read_to_string(ca_key_path)
+            .with_context(|| format!("failed reading {}", ca_key_path.display()))?;
+
+        let issuer_key = KeyPair::from_pem(&ca_key_pem).context("failed parsing cluster CA key")?;
+        let issuer = Issuer::from_ca_cert_pem(&ca_cert_pem, issuer_key)
+            .context("failed creating cluster CA issuer")?;
+
+        let now = unix_ts();
+        let not_before_unix = now.saturating_sub(7200);
+        let not_after_unix = now.saturating_sub(3600);
+        let issued_at_unix = now.saturating_sub(7100);
+        let renew_after_unix = now.saturating_sub(3900);
+
+        let mut params = CertificateParams::new(Vec::new())
+            .context("failed creating expired internal TLS certificate params")?;
+        params.distinguished_name = DistinguishedName::new();
+        params.distinguished_name.push(
+            DnType::CommonName,
+            format!("ironmesh-node-{}", package.bootstrap.node_id),
+        );
+        params.is_ca = IsCa::NoCa;
+        params.not_before = OffsetDateTime::from_unix_timestamp(not_before_unix as i64)
+            .context("failed setting expired internal TLS not_before")?;
+        params.not_after = OffsetDateTime::from_unix_timestamp(not_after_unix as i64)
+            .context("failed setting expired internal TLS not_after")?;
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+        params.subject_alt_names = vec![
+            SanType::URI(
+                format!("urn:ironmesh:node:{}", package.bootstrap.node_id)
+                    .try_into()
+                    .context("invalid expired internal TLS node URI SAN")?,
+            ),
+            SanType::URI(
+                format!("urn:ironmesh:cluster:{}", package.bootstrap.cluster_id)
+                    .try_into()
+                    .context("invalid expired internal TLS cluster URI SAN")?,
+            ),
+        ];
+
+        let key_pair = KeyPair::generate().context("failed generating expired internal TLS key")?;
+        let cert = params
+            .signed_by(&key_pair, &issuer)
+            .context("failed signing expired internal TLS certificate")?;
+
+        internal_material.ca_cert_pem = ca_cert_pem;
+        internal_material.cert_pem = cert.pem();
+        internal_material.key_pem = key_pair.serialize_pem();
+        internal_material.metadata = BootstrapTlsMaterialMetadata {
+            issued_at_unix,
+            not_before_unix,
+            not_after_unix,
+            renew_after_unix,
+            certificate_fingerprint: format!(
+                "expired-internal-{}-{}",
+                package.bootstrap.node_id, not_after_unix
+            ),
+        };
+
+        package
+            .write_to_path(enrollment_path)
+            .context("failed writing expired runtime node enrollment package")
     }
 
     async fn issue_bootstrap_bundle_with_cookie(
@@ -4116,6 +4245,165 @@ mod tests {
         let _ = fs::remove_dir_all(&data_a);
         let _ = fs::remove_dir_all(&data_b);
         let _ = fs::remove_dir_all(&client_a.client_dir);
+
+        result
+    }
+
+    #[tokio::test]
+    async fn expired_zero_touch_node_can_rejoin_with_new_enrollment_bundle() -> Result<()> {
+        let bind_a = find_available_bind_addr()?;
+        let mut bind_b = find_available_bind_addr()?;
+        while bind_b == bind_a {
+            bind_b = find_available_bind_addr()?;
+        }
+        let admin_password = "expired-node-rejoin-password";
+
+        let data_a = fresh_data_dir("zero-touch-expired-rejoin-a");
+        let data_b = fresh_data_dir("zero-touch-expired-rejoin-b");
+
+        let insecure_http = insecure_https_client()?;
+        let mut node_a = start_zero_touch_server(&bind_a, &data_a).await?;
+        let mut node_b = start_zero_touch_server(&bind_b, &data_b).await?;
+
+        let result = async {
+            let start_cluster_response =
+                setup_start_cluster(&insecure_http, &bind_a, admin_password).await?;
+            wait_for_runtime_admin_surface(&insecure_http, &bind_a).await?;
+            let admin_cookie_a =
+                admin_login_cookie(&insecure_http, &bind_a, admin_password).await?;
+
+            let first_join_request = setup_generate_join_request(&insecure_http, &bind_b).await?;
+            let node_id = first_join_request
+                .get("node_id")
+                .and_then(|value| value.as_str())
+                .context("first join request missing node_id")?
+                .to_string();
+            let cluster_id = start_cluster_response
+                .get("cluster_id")
+                .and_then(|value| value.as_str())
+                .context("start cluster response missing cluster_id")?
+                .to_string();
+
+            let initial_package = issue_node_enrollment_from_join_request_with_cookie(
+                &insecure_http,
+                &bind_a,
+                &admin_cookie_a,
+                &first_join_request,
+            )
+            .await?;
+            setup_import_node_enrollment(
+                &insecure_http,
+                &bind_b,
+                admin_password,
+                &initial_package,
+            )
+            .await?;
+            wait_for_runtime_admin_surface(&insecure_http, &bind_b).await?;
+
+            stop_server(&mut node_b).await;
+            replace_runtime_internal_certificate_with_expired_one(
+                &data_b.join("managed").join("runtime").join("node-enrollment.json"),
+                &data_a.join("managed").join("signer").join("cluster-ca.pem"),
+                &data_a.join("managed").join("signer").join("cluster-ca.key"),
+            )?;
+
+            node_b = start_zero_touch_server(&bind_b, &data_b).await?;
+
+            let recovery_status: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(data_b.join("managed").join("setup-state.json"))
+                    .context("failed reading recovered node setup-state.json")?,
+            )
+            .context("failed parsing recovered node setup-state.json")?;
+            assert_eq!(
+                recovery_status
+                    .get("state")
+                    .and_then(|value| value.as_str()),
+                Some("recovery")
+            );
+            assert_eq!(
+                recovery_status
+                    .get("node_id")
+                    .and_then(|value| value.as_str()),
+                Some(node_id.as_str())
+            );
+            assert_eq!(
+                recovery_status
+                    .get("cluster_id")
+                    .and_then(|value| value.as_str()),
+                Some(cluster_id.as_str())
+            );
+
+            let start_cluster_response = insecure_http
+                .post(format!("https://{bind_b}/setup/start-cluster"))
+                .json(&serde_json::json!({
+                    "admin_password": admin_password,
+                    "public_origin": format!("https://{bind_b}"),
+                }))
+                .send()
+                .await?;
+            assert_eq!(start_cluster_response.status(), StatusCode::CONFLICT);
+
+            let rejoin_request = setup_generate_join_request(&insecure_http, &bind_b).await?;
+            assert_eq!(
+                rejoin_request
+                    .get("node_id")
+                    .and_then(|value| value.as_str()),
+                Some(node_id.as_str())
+            );
+
+            let rejoin_package = issue_node_enrollment_from_join_request_with_cookie(
+                &insecure_http,
+                &bind_a,
+                &admin_cookie_a,
+                &rejoin_request,
+            )
+            .await?;
+            let import_response = setup_import_node_enrollment(
+                &insecure_http,
+                &bind_b,
+                admin_password,
+                &rejoin_package,
+            )
+            .await?;
+            assert_eq!(
+                import_response
+                    .get("node_id")
+                    .and_then(|value| value.as_str()),
+                Some(node_id.as_str())
+            );
+            assert_eq!(
+                import_response
+                    .get("cluster_id")
+                    .and_then(|value| value.as_str()),
+                Some(cluster_id.as_str())
+            );
+
+            wait_for_runtime_admin_surface(&insecure_http, &bind_b).await?;
+            let admin_cookie_b =
+                admin_login_cookie(&insecure_http, &bind_b, admin_password).await?;
+            let session: serde_json::Value = insecure_http
+                .get(format!("https://{bind_b}/auth/admin/session"))
+                .header(reqwest::header::COOKIE, &admin_cookie_b)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                session
+                    .get("authenticated")
+                    .and_then(|value| value.as_bool()),
+                Some(true)
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut node_a).await;
+        stop_server(&mut node_b).await;
+        let _ = fs::remove_dir_all(&data_a);
+        let _ = fs::remove_dir_all(&data_b);
 
         result
     }
