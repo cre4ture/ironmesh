@@ -1547,7 +1547,6 @@ mod tests {
             node_enrollment_path: None,
             node_enrollment_auto_renew_enabled: false,
             node_enrollment_auto_renew_check_secs: node_enrollment_auto_renew_check_secs(),
-            node_enrollment_renewal_admin_token: None,
             heartbeat_timeout_secs: 90,
             audit_interval_secs: 3600,
             replica_view_sync_interval_secs: DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS,

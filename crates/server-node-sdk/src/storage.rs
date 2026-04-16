@@ -1578,7 +1578,8 @@ impl DataScrubber {
                 continue;
             }
             if subject_filter.is_some() {
-                output.report.current_keys_scanned = output.report.current_keys_scanned.saturating_add(1);
+                output.report.current_keys_scanned =
+                    output.report.current_keys_scanned.saturating_add(1);
             }
             manifest_references
                 .entry(manifest_hash.clone())
@@ -1627,10 +1628,8 @@ impl DataScrubber {
                         continue;
                     }
                     scanned_index = true;
-                    output.report.version_records_scanned = output
-                        .report
-                        .version_records_scanned
-                        .saturating_add(1);
+                    output.report.version_records_scanned =
+                        output.report.version_records_scanned.saturating_add(1);
                 }
                 manifest_references
                     .entry(record.manifest_hash.clone())
@@ -1642,10 +1641,8 @@ impl DataScrubber {
                     });
             }
             if subject_filter.is_some() && scanned_index {
-                output.report.version_indexes_scanned = output
-                    .report
-                    .version_indexes_scanned
-                    .saturating_add(1);
+                output.report.version_indexes_scanned =
+                    output.report.version_indexes_scanned.saturating_add(1);
             }
         }
 
@@ -1940,7 +1937,10 @@ fn data_scrub_repair_subjects_for_contexts(contexts: &[DataScrubReference]) -> B
 }
 
 fn data_scrub_all_subjects_for_contexts(contexts: &[DataScrubReference]) -> BTreeSet<String> {
-    contexts.iter().filter_map(DataScrubReference::subject).collect()
+    contexts
+        .iter()
+        .filter_map(DataScrubReference::subject)
+        .collect()
 }
 
 impl StoreIndexInspector {
@@ -2585,7 +2585,9 @@ impl PersistentStore {
         fs::write(&manifest_path, payload).await?;
 
         if let Some(version_id) = version_id {
-            let Some(object_id) = self.resolve_object_id_for_key_version(key, version_id).await?
+            let Some(object_id) = self
+                .resolve_object_id_for_key_version(key, version_id)
+                .await?
             else {
                 bail!("missing object id for key={key} version_id={version_id}");
             };

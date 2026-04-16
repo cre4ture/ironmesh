@@ -320,13 +320,12 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
                         );
 
                         let mut repair_state = state.repair_state.lock().await;
-                        let entry = repair_state
-                            .attempts
-                            .entry(transfer_key)
-                            .or_insert(RepairAttemptEntry {
+                        let entry = repair_state.attempts.entry(transfer_key).or_insert(
+                            RepairAttemptEntry {
                                 attempts: 0,
                                 last_failure_unix: now,
-                            });
+                            },
+                        );
                         entry.attempts = entry.attempts.saturating_add(1);
                         entry.last_failure_unix = now;
                         drop(repair_state);
@@ -349,13 +348,14 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
                 );
 
                 let mut repair_state = state.repair_state.lock().await;
-                let entry = repair_state
-                    .attempts
-                    .entry(transfer_key)
-                    .or_insert(RepairAttemptEntry {
-                        attempts: 0,
-                        last_failure_unix: now,
-                    });
+                let entry =
+                    repair_state
+                        .attempts
+                        .entry(transfer_key)
+                        .or_insert(RepairAttemptEntry {
+                            attempts: 0,
+                            last_failure_unix: now,
+                        });
                 entry.attempts = entry.attempts.saturating_add(1);
                 entry.last_failure_unix = now;
                 drop(repair_state);
@@ -401,7 +401,6 @@ async fn execute_replication_repair_plan(
     batch_size_override: Option<usize>,
     verify_local_pulls: bool,
 ) -> ReplicationRepairReport {
-
     let node_by_id: HashMap<NodeId, NodeDescriptor> =
         nodes.into_iter().map(|node| (node.node_id, node)).collect();
 
@@ -592,13 +591,12 @@ async fn execute_replication_repair_plan(
                         );
 
                         let mut repair_state = state.repair_state.lock().await;
-                        let entry = repair_state
-                            .attempts
-                            .entry(transfer_key)
-                            .or_insert(RepairAttemptEntry {
+                        let entry = repair_state.attempts.entry(transfer_key).or_insert(
+                            RepairAttemptEntry {
                                 attempts: 0,
                                 last_failure_unix: now,
-                            });
+                            },
+                        );
                         entry.attempts = entry.attempts.saturating_add(1);
                         entry.last_failure_unix = now;
                         drop(repair_state);

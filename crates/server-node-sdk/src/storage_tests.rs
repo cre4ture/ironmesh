@@ -3535,7 +3535,10 @@ async fn data_scrub_detects_each_corruption_kind_impl(backend: StorageTestBacken
 
         let report = store.run_data_scrub().await.unwrap();
         assert!(
-            report.issues.iter().any(|issue| issue.kind == kind.issue_kind()),
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == kind.issue_kind()),
             "expected scrub to detect {:?}, issues={:?}",
             kind,
             report.issues

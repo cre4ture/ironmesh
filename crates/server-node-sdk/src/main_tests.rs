@@ -292,7 +292,6 @@ fn test_cluster_config_without_internal_tls(
         node_enrollment_path: None,
         node_enrollment_auto_renew_enabled: false,
         node_enrollment_auto_renew_check_secs: 300,
-        node_enrollment_renewal_admin_token: None,
         heartbeat_timeout_secs: 90,
         audit_interval_secs: 3600,
         replica_view_sync_interval_secs: 5,
@@ -315,6 +314,168 @@ fn test_cluster_config_without_internal_tls(
         admin_password_hash: None,
         require_client_auth: false,
     }
+}
+
+fn install_internal_tls_for_test_config(
+    signer_state: &ServerState,
+    config: &mut ServerNodeConfig,
+    internal_bind_addr: SocketAddr,
+) {
+    let bootstrap = transport_sdk::NodeBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: config.cluster_id,
+        node_id: config.node_id,
+        mode: transport_sdk::NodeBootstrapMode::Cluster,
+        data_dir: config.data_dir.to_string_lossy().into_owned(),
+        bind_addr: config.bind_addr.to_string(),
+        public_url: config.public_url.clone(),
+        labels: config.labels.clone(),
+        public_tls: None,
+        public_ca_cert_path: None,
+        public_peer_api_enabled: config.public_peer_api_enabled,
+        internal_bind_addr: Some(internal_bind_addr.to_string()),
+        internal_url: Some(format!("https://{internal_bind_addr}")),
+        internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+            ca_cert_path: "tls/cluster-ca.pem".to_string(),
+            cert_path: "tls/internal.pem".to_string(),
+            key_path: "tls/internal.key".to_string(),
+        }),
+        rendezvous_urls: config.rendezvous_urls.clone(),
+        rendezvous_mtls_required: config.rendezvous_mtls_required,
+        direct_endpoints: Vec::new(),
+        relay_mode: config.relay_mode,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: signer_state.cluster_ca_pem.clone(),
+            public_api_ca_pem: signer_state.public_ca_pem.clone(),
+            rendezvous_ca_pem: signer_state.rendezvous_ca_pem.clone(),
+        },
+        enrollment_issuer_url: config.enrollment_issuer_url.clone(),
+    };
+    let material = super::issue_internal_node_tls_material(
+        signer_state,
+        &bootstrap,
+        default_tls_issue_policy(),
+    )
+    .unwrap();
+
+    let tls_dir = config.data_dir.join("tls");
+    std::fs::create_dir_all(&tls_dir).unwrap();
+    let ca_cert_path = tls_dir.join("cluster-ca.pem");
+    let cert_path = tls_dir.join("internal.pem");
+    let key_path = tls_dir.join("internal.key");
+    let metadata_path = tls_dir.join("internal.metadata.json");
+    std::fs::write(&ca_cert_path, &material.ca_cert_pem).unwrap();
+    std::fs::write(&cert_path, &material.cert_pem).unwrap();
+    std::fs::write(&key_path, &material.key_pem).unwrap();
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&material.metadata).unwrap(),
+    )
+    .unwrap();
+
+    config.internal_tls = Some(super::InternalTlsConfig {
+        bind_addr: internal_bind_addr,
+        internal_url: Some(format!("https://{internal_bind_addr}")),
+        ca_cert_path,
+        cert_path,
+        key_path,
+        metadata_path: Some(metadata_path),
+    });
+}
+
+async fn register_cluster_node(
+    state: &ServerState,
+    node_id: NodeId,
+    public_api_url: Option<&str>,
+    peer_api_url: Option<&str>,
+) {
+    let mut cluster = state.cluster.lock().await;
+    cluster.register_node(super::cluster::NodeDescriptor {
+        node_id,
+        reachability: super::cluster::NodeReachability {
+            public_api_url: public_api_url.map(ToOwned::to_owned),
+            peer_api_url: peer_api_url.map(ToOwned::to_owned),
+            relay_required: false,
+        },
+        capabilities: super::cluster::NodeCapabilities {
+            public_api: public_api_url.is_some(),
+            peer_api: peer_api_url.is_some(),
+            relay_tunnel: false,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 1_000_000,
+        free_bytes: 900_000,
+        storage_stats: None,
+        last_heartbeat_unix: super::unix_ts(),
+        status: super::cluster::NodeStatus::Online,
+    });
+}
+
+async fn register_node_with_server(
+    base_url: &str,
+    node_id: NodeId,
+    public_api_url: Option<&str>,
+    peer_api_url: Option<&str>,
+) {
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{}/cluster/nodes/{}",
+            base_url.trim_end_matches('/'),
+            node_id
+        ))
+        .json(&serde_json::json!({
+            "reachability": {
+                "public_api_url": public_api_url,
+                "peer_api_url": peer_api_url,
+                "relay_required": false,
+            },
+            "capabilities": {
+                "public_api": public_api_url.is_some(),
+                "peer_api": peer_api_url.is_some(),
+                "relay_tunnel": false,
+            },
+            "labels": {},
+            "capacity_bytes": 1_000_000u64,
+            "free_bytes": 900_000u64,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+async fn register_node_with_server_client(
+    client: &reqwest::Client,
+    base_url: &str,
+    node_id: NodeId,
+    public_api_url: Option<&str>,
+    peer_api_url: Option<&str>,
+) {
+    let response = client
+        .put(format!(
+            "{}/cluster/nodes/{}",
+            base_url.trim_end_matches('/'),
+            node_id
+        ))
+        .json(&serde_json::json!({
+            "reachability": {
+                "public_api_url": public_api_url,
+                "peer_api_url": peer_api_url,
+                "relay_required": false,
+            },
+            "capabilities": {
+                "public_api": public_api_url.is_some(),
+                "peer_api": peer_api_url.is_some(),
+                "relay_tunnel": false,
+            },
+            "labels": {},
+            "capacity_bytes": 1_000_000u64,
+            "free_bytes": 900_000u64,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
 fn sample_tls_material() -> transport_sdk::BootstrapMutualTlsMaterial {
@@ -2492,7 +2653,6 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
 #[tokio::test]
 async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, public_ca_key_pem) = generate_test_internal_ca();
     state.cluster_ca_pem = Some(cluster_ca_pem);
@@ -2539,9 +2699,20 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
     let package: transport_sdk::NodeEnrollmentPackage =
         serde_json::from_slice(&issued_body).unwrap();
 
-    let renewed = super::renew_node_enrollment(
+    register_cluster_node(
+        &state,
+        package.bootstrap.node_id,
+        package.bootstrap.public_url.as_deref(),
+        package.bootstrap.internal_url.as_deref(),
+    )
+    .await;
+
+    let renewed = super::renew_node_enrollment_authenticated(
         State(state.clone()),
-        headers,
+        super::InternalCaller {
+            node_id: package.bootstrap.node_id,
+            cluster_id: state.cluster_id,
+        },
         Json(super::NodeEnrollmentRenewRequest {
             package: package.clone(),
             tls_validity_secs: Some(14 * 24 * 60 * 60),
@@ -2603,11 +2774,142 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
 }
 
 #[tokio::test]
+async fn renew_node_enrollment_rejects_foreign_package_node_id() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem);
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    let issued = super::issue_node_enrollment(
+        State(state.clone()),
+        headers,
+        Json(super::NodeBootstrapIssueRequest {
+            node_id: Some(NodeId::new_v4()),
+            mode: Some(transport_sdk::NodeBootstrapMode::Cluster),
+            data_dir: Some("./data/node-renew-foreign".to_string()),
+            bind_addr: Some("127.0.0.1:28081".to_string()),
+            public_url: Some("https://node-renew-foreign.example".to_string()),
+            labels: None,
+            public_tls: Some(transport_sdk::BootstrapServerTlsFiles {
+                cert_path: "tls/public.pem".to_string(),
+                key_path: "tls/public.key".to_string(),
+            }),
+            public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+            public_peer_api_enabled: Some(false),
+            internal_bind_addr: Some("127.0.0.1:38081".to_string()),
+            internal_url: Some("https://127.0.0.1:38081".to_string()),
+            internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+                ca_cert_path: "tls/cluster-ca.pem".to_string(),
+                cert_path: "tls/internal.pem".to_string(),
+                key_path: "tls/internal.key".to_string(),
+            }),
+            enrollment_issuer_url: Some("https://issuer.example".to_string()),
+            tls_validity_secs: Some(7 * 24 * 60 * 60),
+            tls_renewal_window_secs: Some(24 * 60 * 60),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued_body = to_bytes(issued.into_body(), usize::MAX).await.unwrap();
+    let package: transport_sdk::NodeEnrollmentPackage =
+        serde_json::from_slice(&issued_body).unwrap();
+
+    let renewed = super::renew_node_enrollment_authenticated(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: state.node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::NodeEnrollmentRenewRequest {
+            package,
+            tls_validity_secs: Some(14 * 24 * 60 * 60),
+            tls_renewal_window_secs: Some(2 * 24 * 60 * 60),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(renewed.status(), StatusCode::FORBIDDEN);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn renew_node_enrollment_rejects_node_missing_from_cluster_membership() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+    let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
+    state.cluster_ca_pem = Some(cluster_ca_pem);
+    state.internal_ca_key_pem = Some(internal_ca_key_pem);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    let issued = super::issue_node_enrollment(
+        State(state.clone()),
+        headers,
+        Json(super::NodeBootstrapIssueRequest {
+            node_id: Some(NodeId::new_v4()),
+            mode: Some(transport_sdk::NodeBootstrapMode::Cluster),
+            data_dir: Some("./data/node-renew-missing-membership".to_string()),
+            bind_addr: Some("127.0.0.1:28082".to_string()),
+            public_url: Some("https://node-renew-missing-membership.example".to_string()),
+            labels: None,
+            public_tls: Some(transport_sdk::BootstrapServerTlsFiles {
+                cert_path: "tls/public.pem".to_string(),
+                key_path: "tls/public.key".to_string(),
+            }),
+            public_ca_cert_path: Some("tls/public-ca.pem".to_string()),
+            public_peer_api_enabled: Some(false),
+            internal_bind_addr: Some("127.0.0.1:38082".to_string()),
+            internal_url: Some("https://127.0.0.1:38082".to_string()),
+            internal_tls: Some(transport_sdk::BootstrapTlsFiles {
+                ca_cert_path: "tls/cluster-ca.pem".to_string(),
+                cert_path: "tls/internal.pem".to_string(),
+                key_path: "tls/internal.key".to_string(),
+            }),
+            enrollment_issuer_url: Some("https://issuer.example".to_string()),
+            tls_validity_secs: Some(7 * 24 * 60 * 60),
+            tls_renewal_window_secs: Some(24 * 60 * 60),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued_body = to_bytes(issued.into_body(), usize::MAX).await.unwrap();
+    let package: transport_sdk::NodeEnrollmentPackage =
+        serde_json::from_slice(&issued_body).unwrap();
+
+    let renewed = super::renew_node_enrollment_authenticated(
+        State(state.clone()),
+        super::InternalCaller {
+            node_id: package.bootstrap.node_id,
+            cluster_id: state.cluster_id,
+        },
+        Json(super::NodeEnrollmentRenewRequest {
+            package,
+            tls_validity_secs: Some(14 * 24 * 60 * 60),
+            tls_renewal_window_secs: Some(2 * 24 * 60 * 60),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(renewed.status(), StatusCode::FORBIDDEN);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_required() {
     let root = fresh_test_dir("node-auto-renew");
     let issuer_dir = root.join("issuer");
     let issuer_bind_addr = free_bind_addr();
     let issuer_public_url = format!("http://{issuer_bind_addr}");
+    let issuer_internal_bind_addr = free_bind_addr();
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let cluster_ca_path = issuer_dir.join("cluster-ca.pem");
     let cluster_ca_key_path = issuer_dir.join("cluster-ca.key");
@@ -2615,11 +2917,22 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+
     let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
-    issuer_config.admin_token = Some("admin-secret".to_string());
+    issuer_config.cluster_id = state.cluster_id;
     issuer_config.public_url = Some(issuer_public_url.clone());
     issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
     issuer_config.internal_ca_key_path = Some(cluster_ca_key_path.clone());
+    install_internal_tls_for_test_config(&state, &mut issuer_config, issuer_internal_bind_addr);
+    let issuer_internal_url = issuer_config
+        .internal_tls
+        .as_ref()
+        .and_then(|tls| tls.internal_url.clone())
+        .unwrap();
+    let issuer_node_id = issuer_config.node_id;
     let issuer_handle = tokio::spawn(async move { super::run(issuer_config).await });
     let http = reqwest::Client::new();
     wait_for_http_status(
@@ -2630,9 +2943,6 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     )
     .await;
 
-    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
     let package_path = root.join("node-enrollment.json");
     let internal_bind_addr = free_bind_addr();
     let bootstrap = transport_sdk::NodeBootstrap {
@@ -2688,7 +2998,6 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     let mut config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
     config.enrollment_issuer_url = Some(issuer_public_url);
     config.node_enrollment_auto_renew_enabled = true;
-    config.node_enrollment_renewal_admin_token = Some("admin-secret".to_string());
     let loaded_public_fingerprint =
         super::parse_certificate_details_from_path(&config.public_tls.as_ref().unwrap().cert_path)
             .unwrap()
@@ -2702,6 +3011,23 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
     state.enrollment_issuer_url = config.enrollment_issuer_url.clone();
     state.node_enrollment_path = Some(package_path.clone());
     state.node_enrollment_auto_renew_enabled = true;
+    register_cluster_node(
+        &state,
+        issuer_node_id,
+        Some(&config.enrollment_issuer_url.clone().unwrap()),
+        Some(&issuer_internal_url),
+    )
+    .await;
+    register_node_with_server(
+        config.enrollment_issuer_url.as_deref().unwrap(),
+        config.node_id,
+        config.public_url.as_deref(),
+        config
+            .internal_tls
+            .as_ref()
+            .and_then(|tls| tls.internal_url.as_deref()),
+    )
+    .await;
     state.public_tls_runtime = Some(super::PublicTlsRuntime {
         config: axum_server::tls_rustls::RustlsConfig::from_pem_file(
             &config.public_tls.as_ref().unwrap().cert_path,
@@ -2743,8 +3069,24 @@ async fn automatic_node_enrollment_renewal_live_reloads_tls_and_clears_restart_r
         .config
         .get_inner();
 
+    let issuer_internal_http = super::build_internal_mtls_http_client_for_expected_peer(
+        &config.internal_tls.as_ref().unwrap().ca_cert_path,
+        &config.internal_tls.as_ref().unwrap().cert_path,
+        &config.internal_tls.as_ref().unwrap().key_path,
+        issuer_node_id,
+        state.cluster_id,
+    )
+    .unwrap();
+    wait_for_http_status(
+        &issuer_internal_http,
+        &format!("{issuer_internal_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
+
     assert!(
-        super::renew_node_enrollment_package_if_due(&config)
+        super::renew_node_enrollment_package_if_due(&state, &config)
             .await
             .unwrap()
     );
@@ -2854,6 +3196,7 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     let issuer_dir = root.join("issuer");
     let issuer_bind_addr = free_bind_addr();
     let issuer_public_url = format!("http://{issuer_bind_addr}");
+    let issuer_internal_bind_addr = free_bind_addr();
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let cluster_ca_path = issuer_dir.join("cluster-ca.pem");
     let cluster_ca_key_path = issuer_dir.join("cluster-ca.key");
@@ -2861,11 +3204,22 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+
     let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
-    issuer_config.admin_token = Some("admin-secret".to_string());
+    issuer_config.cluster_id = state.cluster_id;
     issuer_config.public_url = Some(issuer_public_url.clone());
     issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
     issuer_config.internal_ca_key_path = Some(cluster_ca_key_path.clone());
+    install_internal_tls_for_test_config(&state, &mut issuer_config, issuer_internal_bind_addr);
+    let issuer_internal_url = issuer_config
+        .internal_tls
+        .as_ref()
+        .and_then(|tls| tls.internal_url.clone())
+        .unwrap();
+    let issuer_node_id = issuer_config.node_id;
     let issuer_handle = tokio::spawn(async move { super::run(issuer_config).await });
     let issuer_http = reqwest::Client::new();
     wait_for_http_status(
@@ -2875,10 +3229,6 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
         Duration::from_secs(5),
     )
     .await;
-
-    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
 
     let package_path = root.join("node-enrollment.json");
     let bind_addr = free_bind_addr();
@@ -2938,7 +3288,6 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
     config.enrollment_issuer_url = Some(issuer_public_url.clone());
     config.node_enrollment_auto_renew_enabled = true;
     config.node_enrollment_auto_renew_check_secs = 1;
-    config.node_enrollment_renewal_admin_token = Some("admin-secret".to_string());
     let public_ca_cert_path = config.public_ca_cert_path.clone().unwrap();
     let internal_tls = config.internal_tls.clone().unwrap();
     let expected_internal_node_id = config.node_id;
@@ -2960,6 +3309,21 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
         expected_internal_cluster_id,
     )
     .unwrap();
+    let issuer_internal_http = super::build_internal_mtls_http_client_for_expected_peer(
+        &internal_tls.ca_cert_path,
+        &internal_tls.cert_path,
+        &internal_tls.key_path,
+        issuer_node_id,
+        expected_internal_cluster_id,
+    )
+    .unwrap();
+    wait_for_http_status(
+        &issuer_internal_http,
+        &format!("{issuer_internal_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
     let node_handle = tokio::spawn(async move { super::run(config).await });
 
     wait_for_http_status(
@@ -2974,6 +3338,21 @@ async fn automatic_node_enrollment_renewal_rotates_served_public_and_internal_ce
         &internal_health_url,
         StatusCode::OK,
         Duration::from_secs(5),
+    )
+    .await;
+    register_node_with_server(
+        &issuer_public_url,
+        expected_internal_node_id,
+        Some(&format!("https://{bind_addr}")),
+        Some(&format!("https://{internal_bind_addr}")),
+    )
+    .await;
+    register_node_with_server_client(
+        &public_http,
+        &format!("https://{bind_addr}"),
+        issuer_node_id,
+        Some(&issuer_public_url),
+        Some(&issuer_internal_url),
     )
     .await;
 
@@ -3105,6 +3484,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     let issuer_dir = root.join("issuer");
     let issuer_bind_addr = free_bind_addr();
     let issuer_public_url = format!("http://{issuer_bind_addr}");
+    let issuer_internal_bind_addr = free_bind_addr();
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let cluster_ca_path = issuer_dir.join("cluster-ca.pem");
     let cluster_ca_key_path = issuer_dir.join("cluster-ca.key");
@@ -3112,11 +3492,23 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     std::fs::write(&cluster_ca_path, &cluster_ca_pem).unwrap();
     std::fs::write(&cluster_ca_key_path, &internal_ca_key_pem).unwrap();
 
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
+    state.rendezvous_ca_pem = Some(cluster_ca_pem.clone());
+
     let mut issuer_config = test_cluster_config_without_internal_tls(&issuer_dir, issuer_bind_addr);
-    issuer_config.admin_token = Some("admin-secret".to_string());
+    issuer_config.cluster_id = state.cluster_id;
     issuer_config.public_url = Some(issuer_public_url.clone());
     issuer_config.public_ca_cert_path = Some(cluster_ca_path.clone());
     issuer_config.internal_ca_key_path = Some(cluster_ca_key_path.clone());
+    install_internal_tls_for_test_config(&state, &mut issuer_config, issuer_internal_bind_addr);
+    let issuer_internal_url = issuer_config
+        .internal_tls
+        .as_ref()
+        .and_then(|tls| tls.internal_url.clone())
+        .unwrap();
+    let issuer_node_id = issuer_config.node_id;
     let issuer_handle = tokio::spawn(async move { super::run(issuer_config).await });
     let issuer_http = reqwest::Client::new();
     wait_for_http_status(
@@ -3126,11 +3518,6 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
         Duration::from_secs(5),
     )
     .await;
-
-    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.cluster_ca_pem = Some(cluster_ca_pem.clone());
-    state.internal_ca_key_pem = Some(internal_ca_key_pem.clone());
-    state.rendezvous_ca_pem = Some(cluster_ca_pem.clone());
 
     let package_path = root.join("node-enrollment.json");
     let internal_bind_addr = free_bind_addr();
@@ -3179,12 +3566,40 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     let mut config = super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
     config.enrollment_issuer_url = Some(issuer_public_url.clone());
     config.node_enrollment_auto_renew_enabled = true;
-    config.node_enrollment_renewal_admin_token = Some("admin-secret".to_string());
     let internal_tls = config.internal_tls.clone().unwrap();
     let initial_internal_fingerprint =
         super::parse_certificate_details_from_path(&internal_tls.cert_path)
             .unwrap()
             .certificate_fingerprint;
+    register_cluster_node(
+        &state,
+        issuer_node_id,
+        Some(&issuer_public_url),
+        Some(&issuer_internal_url),
+    )
+    .await;
+    register_node_with_server(
+        &issuer_public_url,
+        config.node_id,
+        config.public_url.as_deref(),
+        internal_tls.internal_url.as_deref(),
+    )
+    .await;
+    let issuer_internal_http = super::build_internal_mtls_http_client_for_expected_peer(
+        &internal_tls.ca_cert_path,
+        &internal_tls.cert_path,
+        &internal_tls.key_path,
+        issuer_node_id,
+        state.cluster_id,
+    )
+    .unwrap();
+    wait_for_http_status(
+        &issuer_internal_http,
+        &format!("{issuer_internal_url}/health"),
+        StatusCode::OK,
+        Duration::from_secs(5),
+    )
+    .await;
 
     let capture_dir = root.join("capture");
     std::fs::create_dir_all(&capture_dir).unwrap();
@@ -3329,7 +3744,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
     );
 
     assert!(
-        super::renew_node_enrollment_package_if_due(&config)
+        super::renew_node_enrollment_package_if_due(&state, &config)
             .await
             .unwrap()
     );
@@ -6011,7 +6426,11 @@ async fn spawn_internal_peer_api_server(
     (peer_base_url, handle)
 }
 
-async fn register_online_source_node(target: &ServerState, source: &ServerState, peer_base_url: &str) {
+async fn register_online_source_node(
+    target: &ServerState,
+    source: &ServerState,
+    peer_base_url: &str,
+) {
     let mut cluster = target.cluster.lock().await;
     cluster.register_node(super::cluster::NodeDescriptor {
         node_id: source.node_id,
@@ -6147,7 +6566,9 @@ async fn apply_data_scrub_corruption_to_subject(
                 .unwrap();
         }
         DataScrubAutoRepairCorruptionKind::ChunkHashMismatch => {
-            fs::write(&chunk_path, vec![0x5a; chunk_size]).await.unwrap();
+            fs::write(&chunk_path, vec![0x5a; chunk_size])
+                .await
+                .unwrap();
         }
     }
 }
@@ -6186,22 +6607,26 @@ async fn data_scrub_auto_repair_repairs_each_supported_corruption_kind_impl(
         let target = build_test_state(1, false, backend).await;
         let (peer_base_url, handle) = spawn_internal_peer_api_server(source.clone()).await;
         register_online_source_node(&target, &source, &peer_base_url).await;
-        let key = choose_locally_placed_key(&target, &format!("scrub-auto-repair-{}", kind.slug()))
-            .await;
+        let key =
+            choose_locally_placed_key(&target, &format!("scrub-auto-repair-{}", kind.slug())).await;
         let version_id = format!("ver-scrub-{}-head", kind.slug());
         let payload = sample_large_chunked_payload();
 
         seed_subject_version(&source, &key, &version_id, payload.clone(), Vec::new()).await;
         seed_subject_version(&target, &key, &version_id, payload.clone(), Vec::new()).await;
-        note_subject_replicas(&target, source.node_id, &key, std::slice::from_ref(&version_id))
-            .await;
+        note_subject_replicas(
+            &target,
+            source.node_id,
+            &key,
+            std::slice::from_ref(&version_id),
+        )
+        .await;
 
         let baseline_repair_history_len = repair_run_history(&target).await.len();
         apply_data_scrub_corruption_to_subject(&target, &key, None, kind).await;
 
         let trigger =
-            super::start_local_data_scrub(&target, super::DataScrubRunTrigger::ManualRequest)
-                .await;
+            super::start_local_data_scrub(&target, super::DataScrubRunTrigger::ManualRequest).await;
         assert!(trigger.started, "data scrub should start for {:?}", kind);
 
         wait_for_data_scrub_completion(&target).await;
@@ -6210,7 +6635,10 @@ async fn data_scrub_auto_repair_repairs_each_supported_corruption_kind_impl(
         let scrub_history = super::local_data_scrub_history_payload(&target, Some(8), None)
             .await
             .unwrap();
-        let latest_scrub = scrub_history.runs.first().expect("expected retained scrub run");
+        let latest_scrub = scrub_history
+            .runs
+            .first()
+            .expect("expected retained scrub run");
         assert_eq!(
             latest_scrub.status,
             super::DataScrubRunStatus::IssuesDetected,
@@ -6229,7 +6657,9 @@ async fn data_scrub_auto_repair_repairs_each_supported_corruption_kind_impl(
         );
 
         let repair_history = repair_run_history(&target).await;
-        let latest_repair = repair_history.first().expect("expected retained repair run");
+        let latest_repair = repair_history
+            .first()
+            .expect("expected retained repair run");
         assert_eq!(
             latest_repair.status,
             super::RepairRunStatus::Completed,
@@ -6256,12 +6686,7 @@ async fn data_scrub_auto_repair_repairs_each_supported_corruption_kind_impl(
                 kind
             );
             let restored = store
-                .get_object(
-                    &key,
-                    None,
-                    None,
-                    super::storage::ObjectReadMode::Preferred,
-                )
+                .get_object(&key, None, None, super::storage::ObjectReadMode::Preferred)
                 .await
                 .expect("repaired subject should read successfully");
             assert_eq!(restored.as_ref(), payload.as_slice());
@@ -6293,7 +6718,13 @@ async fn data_scrub_auto_repair_keeps_manifest_key_mismatch_detect_only_impl(
 
     seed_subject_version(&source, &key, &version_id, payload.clone(), Vec::new()).await;
     seed_subject_version(&target, &key, &version_id, payload.clone(), Vec::new()).await;
-    note_subject_replicas(&target, source.node_id, &key, std::slice::from_ref(&version_id)).await;
+    note_subject_replicas(
+        &target,
+        source.node_id,
+        &key,
+        std::slice::from_ref(&version_id),
+    )
+    .await;
 
     let baseline_repair_history_len = repair_run_history(&target).await.len();
     apply_data_scrub_corruption_to_subject(
@@ -6306,14 +6737,20 @@ async fn data_scrub_auto_repair_keeps_manifest_key_mismatch_detect_only_impl(
 
     let trigger =
         super::start_local_data_scrub(&target, super::DataScrubRunTrigger::ManualRequest).await;
-    assert!(trigger.started, "data scrub should start for manifest_key_mismatch");
+    assert!(
+        trigger.started,
+        "data scrub should start for manifest_key_mismatch"
+    );
 
     wait_for_data_scrub_completion(&target).await;
 
     let scrub_history = super::local_data_scrub_history_payload(&target, Some(8), None)
         .await
         .unwrap();
-    let latest_scrub = scrub_history.runs.first().expect("expected retained scrub run");
+    let latest_scrub = scrub_history
+        .runs
+        .first()
+        .expect("expected retained scrub run");
     assert!(
         latest_scrub
             .summary
@@ -6342,12 +6779,7 @@ async fn data_scrub_auto_repair_keeps_manifest_key_mismatch_detect_only_impl(
             "detect-only issue should remain visible after scrub, report={report:?}"
         );
         let still_readable = store
-            .get_object(
-                &key,
-                None,
-                None,
-                super::storage::ObjectReadMode::Preferred,
-            )
+            .get_object(&key, None, None, super::storage::ObjectReadMode::Preferred)
             .await
             .expect("manifest_key_mismatch should not make the subject unreadable by itself");
         assert_eq!(still_readable.as_ref(), payload.as_slice());
@@ -6416,7 +6848,10 @@ async fn data_scrub_auto_repair_repairs_exact_historical_version_subject_impl(
 
     let trigger =
         super::start_local_data_scrub(&target, super::DataScrubRunTrigger::ManualRequest).await;
-    assert!(trigger.started, "data scrub should start for historical version repair");
+    assert!(
+        trigger.started,
+        "data scrub should start for historical version repair"
+    );
 
     wait_for_data_scrub_completion(&target).await;
     wait_for_repair_history_len(&target, baseline_repair_history_len + 1).await;
@@ -6424,7 +6859,10 @@ async fn data_scrub_auto_repair_repairs_exact_historical_version_subject_impl(
     let scrub_history = super::local_data_scrub_history_payload(&target, Some(8), None)
         .await
         .unwrap();
-    let latest_scrub = scrub_history.runs.first().expect("expected retained scrub run");
+    let latest_scrub = scrub_history
+        .runs
+        .first()
+        .expect("expected retained scrub run");
     assert!(
         latest_scrub.summary.issues.iter().any(|issue| {
             issue.kind == super::storage::DataScrubIssueKind::ManifestMissing
@@ -6452,12 +6890,7 @@ async fn data_scrub_auto_repair_repairs_exact_historical_version_subject_impl(
             .expect("historical version should read after repair");
         assert_eq!(restored_v1.as_ref(), payload_a.as_slice());
         let current_head = store
-            .get_object(
-                &key,
-                None,
-                None,
-                super::storage::ObjectReadMode::Preferred,
-            )
+            .get_object(&key, None, None, super::storage::ObjectReadMode::Preferred)
             .await
             .expect("current head should remain readable");
         assert_eq!(current_head.as_ref(), payload_b.as_slice());

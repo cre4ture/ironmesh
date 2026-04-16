@@ -110,14 +110,41 @@ Potential transport choices:
 
 ## Follow-up Work
 
-1. Define the renewal protocol and transport shape.
-2. Define the authoritative issuer-side authorization checks for renewal.
+1. Review whether the first-slice internal-peer transport should remain the long-term renewal transport or be replaced by a dedicated issuer protocol.
+2. Define richer issuer-side authorization checks for renewal beyond current cluster membership presence.
 3. Define the fallback / re-enrollment path for expired certificates.
-4. Replace the current token-gated renewal model in implementation.
-5. Update tests and operational docs when the implementation changes.
+4. Review whether renewal should independently source mutable bootstrap metadata instead of trusting the caller-supplied package for non-identity fields.
+5. Update operational docs and recovery runbooks around renewal failures.
 
 ## Current Implementation Note
 
-The current codebase still uses a separate renewal admin token for automatic node enrollment renewal.
+The current codebase now implements routine automatic node enrollment renewal as a node-authenticated control-plane operation.
 
-This document records the accepted future-direction decision and should be treated as the design target for subsequent implementation work.
+### First implementation decisions
+
+To keep the first slice low-effort and reviewable, the implementation makes the following concrete choices for the open protocol points:
+
+- Transport:
+  - automatic renewal resolves `bootstrap.enrollment_issuer_url` against the node's current cluster membership view by exact normalized `public_api_url` match,
+  - after that lookup it sends `POST /cluster/node-enrollments/renew` over the existing internal peer API path,
+  - authentication is the existing internal mTLS node certificate and proof of private-key possession from the TLS handshake.
+- Authorization:
+  - the issuer requires the authenticated peer certificate `cluster_id` to match the issuer cluster,
+  - the authenticated `node_id` must match the requested enrollment package `node_id`,
+  - the authenticated `node_id` must still exist in the issuer's current cluster membership view.
+- Current control-plane limitation:
+  - there is not yet a separate disabled / revoked / replacement lifecycle state for server-node renewal authorization,
+  - in this first slice, removal from current cluster membership is the denial mechanism beyond certificate validity.
+- Current metadata trust choice:
+  - the first slice reuses the caller-supplied enrollment package bootstrap for non-identity fields,
+  - it does not yet perform a separate control-plane reconciliation of mutable bootstrap metadata such as URLs or labels before re-issuance.
+- Scope limitation:
+  - routine automatic renewal currently requires a cluster-mode node enrollment with internal TLS material,
+  - it also requires the issuer node to be discoverable in current cluster membership with a usable peer transport path.
+- Startup behavior:
+  - first-slice automatic renewal runs from the background renewal loop after node startup,
+  - it is not attempted before listener startup because issuer resolution now depends on live cluster membership.
+
+### Remaining gap
+
+Expired node certificates still require a later recovery or re-enrollment flow. The current routine renewal path only works while the node can still authenticate with its currently valid internal certificate.
