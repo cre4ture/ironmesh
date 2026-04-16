@@ -113,7 +113,7 @@ Potential transport choices:
 1. Review whether the first-slice internal-peer transport should remain the long-term renewal transport or be replaced by a dedicated issuer protocol.
 2. Define richer issuer-side authorization checks for renewal beyond current cluster membership presence.
 3. Define the fallback / re-enrollment path for expired certificates.
-4. Review whether renewal should independently source mutable bootstrap metadata instead of trusting the caller-supplied package for non-identity fields.
+4. Review whether public certificate SAN preservation should continue using the node's current public certificate material or move to a different issuer-side policy.
 5. Update operational docs and recovery runbooks around renewal failures.
 
 ## Current Implementation Note
@@ -130,14 +130,17 @@ To keep the first slice low-effort and reviewable, the implementation makes the 
   - authentication is the existing internal mTLS node certificate and proof of private-key possession from the TLS handshake.
 - Authorization:
   - the issuer requires the authenticated peer certificate `cluster_id` to match the issuer cluster,
-  - the authenticated `node_id` must match the requested enrollment package `node_id`,
   - the authenticated `node_id` must still exist in the issuer's current cluster membership view.
 - Current control-plane limitation:
   - there is not yet a separate disabled / revoked / replacement lifecycle state for server-node renewal authorization,
   - in this first slice, removal from current cluster membership is the denial mechanism beyond certificate validity.
-- Current metadata trust choice:
-  - the first slice reuses the caller-supplied enrollment package bootstrap for non-identity fields,
-  - it does not yet perform a separate control-plane reconciliation of mutable bootstrap metadata such as URLs or labels before re-issuance.
+- Current renewal wire shape:
+  - the renewal request no longer sends the full node enrollment package or caller-owned bootstrap metadata,
+  - caller-owned local bootstrap fields stay on the renewing node and are merged locally with the issuer response after renewal,
+  - the renewal response returns only fresh TLS material plus issuer-owned trust roots and `enrollment_issuer_url`.
+- Current public certificate continuity choice:
+  - when public TLS is configured, the renewal request carries the current public certificate PEM so the issuer can preserve the existing public certificate SAN set without relying on bootstrap `public_url` or bind-address fields,
+  - validity lifetime and renewal window are now defined purely by the issuing node on each renewal and are not taken from the caller request.
 - Scope limitation:
   - routine automatic renewal currently requires a cluster-mode node enrollment with internal TLS material,
   - it also requires the issuer node to be discoverable in current cluster membership with a usable peer transport path.

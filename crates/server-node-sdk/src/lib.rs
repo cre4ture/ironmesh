@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2006,34 +2006,6 @@ fn build_tls_material_metadata(
     })
 }
 
-fn node_enrollment_preserved_tls_policy(
-    package: &NodeEnrollmentPackage,
-) -> (Option<u64>, Option<u64>) {
-    let material = package
-        .internal_tls_material
-        .as_ref()
-        .or(package.public_tls_material.as_ref());
-    let Some(material) = material else {
-        return (None, None);
-    };
-    let validity_secs = material
-        .metadata
-        .not_after_unix
-        .saturating_sub(material.metadata.issued_at_unix);
-    let renewal_window_secs = material
-        .metadata
-        .not_after_unix
-        .saturating_sub(material.metadata.renew_after_unix);
-    if validity_secs < 60 * 60 || renewal_window_secs < 300 || renewal_window_secs >= validity_secs
-    {
-        return (None, None);
-    }
-    (
-        (validity_secs > 0).then_some(validity_secs),
-        (renewal_window_secs > 0).then_some(renewal_window_secs),
-    )
-}
-
 fn node_enrollment_due_for_renewal(package: &NodeEnrollmentPackage, now: u64) -> bool {
     [
         package.public_tls_material.as_ref(),
@@ -2100,8 +2072,6 @@ async fn renew_node_enrollment_package_if_due(
         .map(|value| value.trim_end_matches('/').to_string())
         .context("node enrollment auto-renew requires bootstrap.enrollment_issuer_url")?;
     let issuer_node = resolve_node_enrollment_issuer_descriptor(state, &issuer_url).await?;
-    let (tls_validity_secs, tls_renewal_window_secs) =
-        node_enrollment_preserved_tls_policy(&package);
     let response = execute_peer_request(
         state,
         &issuer_node,
@@ -2111,11 +2081,7 @@ async fn renew_node_enrollment_package_if_due(
             name: "content-type".to_string(),
             value: "application/json".to_string(),
         }],
-        serde_json::to_vec(&NodeEnrollmentRenewRequest {
-            package: package.clone(),
-            tls_validity_secs,
-            tls_renewal_window_secs,
-        })
+        serde_json::to_vec(&build_node_enrollment_renew_request(&package))
         .context("failed encoding automatic node enrollment renewal request")?,
     )
     .await
@@ -2135,12 +2101,54 @@ async fn renew_node_enrollment_package_if_due(
         );
     }
     let renewed = response
-        .json::<NodeEnrollmentPackage>()
+        .json::<NodeEnrollmentRenewResponse>()
         .context("failed decoding automatic node enrollment renewal response")?;
+    let renewed = merge_node_enrollment_renew_response(package, renewed)?;
     renewed.validate()?;
     renewed.write_to_path(enrollment_path)?;
     let _ = materialize_node_enrollment_package(renewed)?;
     Ok(true)
+}
+
+fn build_node_enrollment_renew_request(package: &NodeEnrollmentPackage) -> NodeEnrollmentRenewRequest {
+    NodeEnrollmentRenewRequest {
+        current_public_tls_cert_pem: package
+            .public_tls_material
+            .as_ref()
+            .map(|material| material.cert_pem.clone()),
+    }
+}
+
+fn merge_node_enrollment_renew_response(
+    mut package: NodeEnrollmentPackage,
+    response: NodeEnrollmentRenewResponse,
+) -> Result<NodeEnrollmentPackage> {
+    if response.cluster_id != package.bootstrap.cluster_id {
+        bail!(
+            "renewed node enrollment response cluster_id {} does not match local cluster_id {}",
+            response.cluster_id,
+            package.bootstrap.cluster_id
+        );
+    }
+    if response.node_id != package.bootstrap.node_id {
+        bail!(
+            "renewed node enrollment response node_id {} does not match local node_id {}",
+            response.node_id,
+            package.bootstrap.node_id
+        );
+    }
+
+    if package.bootstrap.public_tls.is_some() != response.public_tls_material.is_some() {
+        bail!(
+            "renewed node enrollment response public TLS material does not match local public TLS configuration"
+        );
+    }
+
+    package.bootstrap.trust_roots = response.trust_roots;
+    package.bootstrap.enrollment_issuer_url = response.enrollment_issuer_url;
+    package.internal_tls_material = Some(response.internal_tls_material);
+    package.public_tls_material = response.public_tls_material;
+    Ok(package)
 }
 
 fn load_tls_material_metadata_sidecar(
@@ -10414,9 +10422,18 @@ struct NodeBootstrapIssueRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct NodeEnrollmentRenewRequest {
-    package: NodeEnrollmentPackage,
-    tls_validity_secs: Option<u64>,
-    tls_renewal_window_secs: Option<u64>,
+    current_public_tls_cert_pem: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NodeEnrollmentRenewResponse {
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    trust_roots: BootstrapTrustRoots,
+    enrollment_issuer_url: Option<String>,
+    #[serde(default)]
+    public_tls_material: Option<BootstrapMutualTlsMaterial>,
+    internal_tls_material: BootstrapMutualTlsMaterial,
 }
 
 #[derive(Debug, Deserialize)]
@@ -11241,14 +11258,62 @@ fn build_public_node_subject_alt_names(bootstrap: &TransportNodeBootstrap) -> Re
     Ok(subject_alt_names)
 }
 
-fn issue_internal_node_tls_material(
+fn extract_public_node_subject_alt_names_from_cert_pem(cert_pem: &str) -> Result<Vec<SanType>> {
+    let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes())
+        .context("failed parsing current public TLS certificate PEM")?;
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert_der.as_ref())
+        .context("failed parsing current public TLS certificate")?;
+
+    let mut subject_alt_names = Vec::new();
+    let mut seen_dns = HashSet::new();
+    let mut seen_ips = HashSet::new();
+
+    for extension in parsed.extensions() {
+        let parsed_extension = extension.parsed_extension();
+        if let ParsedExtension::SubjectAlternativeName(san) = parsed_extension {
+            for name in &san.general_names {
+                match name {
+                    x509_parser::extensions::GeneralName::DNSName(name) => {
+                        let dns_name = (*name).to_string();
+                        if seen_dns.insert(dns_name.clone()) {
+                            subject_alt_names.push(SanType::DnsName(
+                                dns_name
+                                    .try_into()
+                                    .context("invalid current public TLS DNS SAN")?,
+                            ));
+                        }
+                    }
+                    x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                        let ip_addr = match bytes.len() {
+                            4 => IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+                            16 => {
+                                let mut octets = [0_u8; 16];
+                                octets.copy_from_slice(bytes);
+                                IpAddr::V6(Ipv6Addr::from(octets))
+                            }
+                            len => bail!("unsupported current public TLS IP SAN length {len}"),
+                        };
+                        if seen_ips.insert(ip_addr) {
+                            subject_alt_names.push(SanType::IpAddress(ip_addr));
+                        }
+                    }
+                    other => {
+                        bail!("unsupported SAN type in current public TLS certificate: {other:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(subject_alt_names)
+}
+
+fn issue_internal_node_tls_material_for_identity(
     state: &ServerState,
-    bootstrap: &TransportNodeBootstrap,
+    cluster_id: ClusterId,
+    node_id: NodeId,
     policy: NodeTlsIssuePolicy,
 ) -> std::result::Result<BootstrapMutualTlsMaterial, StatusCode> {
-    if bootstrap.internal_tls.is_none() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
     let trust_material =
         load_live_trust_material(state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let ca_cert_pem = trust_material
@@ -11270,10 +11335,9 @@ fn issue_internal_node_tls_material(
     let mut params =
         CertificateParams::new(Vec::new()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.distinguished_name = DistinguishedName::new();
-    params.distinguished_name.push(
-        DnType::CommonName,
-        format!("ironmesh-node-{}", bootstrap.node_id),
-    );
+    params
+        .distinguished_name
+        .push(DnType::CommonName, format!("ironmesh-node-{node_id}"));
     params.is_ca = IsCa::NoCa;
     params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -11283,8 +11347,18 @@ fn issue_internal_node_tls_material(
         ExtendedKeyUsagePurpose::ClientAuth,
         ExtendedKeyUsagePurpose::ServerAuth,
     ];
-    params.subject_alt_names =
-        build_internal_node_subject_alt_names(bootstrap).map_err(|_| StatusCode::BAD_REQUEST)?;
+    params.subject_alt_names = vec![
+        SanType::URI(
+            format!("urn:ironmesh:node:{node_id}")
+                .try_into()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:cluster:{cluster_id}")
+                .try_into()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        ),
+    ];
 
     let key_pair = KeyPair::generate().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let cert = params
@@ -11301,14 +11375,12 @@ fn issue_internal_node_tls_material(
     })
 }
 
-fn issue_public_node_tls_material(
+fn issue_public_node_tls_material_with_subject_alt_names(
     state: &ServerState,
-    bootstrap: &TransportNodeBootstrap,
+    node_id: NodeId,
+    subject_alt_names: Vec<SanType>,
     policy: NodeTlsIssuePolicy,
-) -> std::result::Result<Option<BootstrapMutualTlsMaterial>, StatusCode> {
-    if bootstrap.public_tls.is_none() {
-        return Ok(None);
-    }
+) -> std::result::Result<BootstrapMutualTlsMaterial, StatusCode> {
     let trust_material =
         load_live_trust_material(state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let ca_cert_pem = trust_material
@@ -11334,18 +11406,16 @@ fn issue_public_node_tls_material(
     let mut params =
         CertificateParams::new(Vec::new()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.distinguished_name = DistinguishedName::new();
-    params.distinguished_name.push(
-        DnType::CommonName,
-        format!("ironmesh-public-{}", bootstrap.node_id),
-    );
+    params
+        .distinguished_name
+        .push(DnType::CommonName, format!("ironmesh-public-{node_id}"));
     params.is_ca = IsCa::NoCa;
     params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    params.subject_alt_names =
-        build_public_node_subject_alt_names(bootstrap).map_err(|_| StatusCode::BAD_REQUEST)?;
+    params.subject_alt_names = subject_alt_names;
 
     let key_pair = KeyPair::generate().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let cert = params
@@ -11354,12 +11424,47 @@ fn issue_public_node_tls_material(
     let cert_pem = cert.pem();
     let metadata = build_tls_material_metadata(&cert_pem, policy)?;
 
-    Ok(Some(BootstrapMutualTlsMaterial {
+    Ok(BootstrapMutualTlsMaterial {
         ca_cert_pem: ca_cert_pem.to_string(),
         cert_pem,
         key_pem: key_pair.serialize_pem(),
         metadata,
-    }))
+    })
+}
+
+fn issue_internal_node_tls_material(
+    state: &ServerState,
+    bootstrap: &TransportNodeBootstrap,
+    policy: NodeTlsIssuePolicy,
+) -> std::result::Result<BootstrapMutualTlsMaterial, StatusCode> {
+    if bootstrap.internal_tls.is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    issue_internal_node_tls_material_for_identity(
+        state,
+        bootstrap.cluster_id,
+        bootstrap.node_id,
+        policy,
+    )
+}
+
+fn issue_public_node_tls_material(
+    state: &ServerState,
+    bootstrap: &TransportNodeBootstrap,
+    policy: NodeTlsIssuePolicy,
+) -> std::result::Result<Option<BootstrapMutualTlsMaterial>, StatusCode> {
+    if bootstrap.public_tls.is_none() {
+        return Ok(None);
+    }
+    let subject_alt_names =
+        build_public_node_subject_alt_names(bootstrap).map_err(|_| StatusCode::BAD_REQUEST)?;
+    issue_public_node_tls_material_with_subject_alt_names(
+        state,
+        bootstrap.node_id,
+        subject_alt_names,
+        policy,
+    )
+    .map(Some)
 }
 
 async fn issue_bootstrap_bundle(
@@ -12955,26 +13060,6 @@ async fn renew_node_enrollment_authenticated(
             "authenticated renewal caller does not belong to this cluster".to_string(),
         );
     }
-    if request.package.bootstrap.mode != NodeBootstrapMode::Cluster {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "node enrollment renewal only supports cluster node enrollments in the first implementation"
-                .to_string(),
-        );
-    }
-    if request.package.bootstrap.cluster_id != state.cluster_id {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "requested node enrollment package cluster_id does not match the issuer cluster"
-                .to_string(),
-        );
-    }
-    if caller.node_id != request.package.bootstrap.node_id {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "authenticated node may only renew its own enrollment package".to_string(),
-        );
-    }
 
     let renewal_authorized = {
         let cluster = state.cluster.lock().await;
@@ -12991,79 +13076,91 @@ async fn renew_node_enrollment_authenticated(
         );
     }
 
-    if let Err(err) = request.package.validate() {
-        return error_response(StatusCode::BAD_REQUEST, err.to_string());
-    }
-
-    let issue_policy =
-        match build_tls_issue_policy(request.tls_validity_secs, request.tls_renewal_window_secs) {
-            Ok(policy) => policy,
-            Err(status) => {
-                return error_response(status, "invalid TLS validity policy".to_string());
-            }
-        };
+    let issue_policy = match build_tls_issue_policy(None, None) {
+        Ok(policy) => policy,
+        Err(status) => {
+            return error_response(status, "invalid issuer TLS validity policy".to_string());
+        }
+    };
 
     let previous_public_fingerprint = request
-        .package
-        .public_tls_material
-        .as_ref()
-        .map(|material| material.metadata.certificate_fingerprint.clone());
-    let previous_internal_fingerprint = request
-        .package
-        .internal_tls_material
-        .as_ref()
-        .map(|material| material.metadata.certificate_fingerprint.clone());
+        .current_public_tls_cert_pem
+        .as_deref()
+        .and_then(|cert_pem| parse_certificate_details_from_pem(cert_pem).ok())
+        .map(|details| details.certificate_fingerprint);
 
-    let bootstrap = request.package.bootstrap;
-    let internal_tls_material = if bootstrap.internal_tls.is_some() {
-        match issue_internal_node_tls_material(&state, &bootstrap, issue_policy) {
-            Ok(material) => Some(material),
+    let internal_tls_material =
+        match issue_internal_node_tls_material_for_identity(&state, state.cluster_id, caller.node_id, issue_policy)
+        {
+            Ok(material) => material,
             Err(status) => {
                 return error_response(
                     status,
                     "failed to renew internal node TLS material".to_string(),
                 );
             }
+        };
+
+    let public_tls_material = match request.current_public_tls_cert_pem.as_deref() {
+        Some(cert_pem) => {
+            let subject_alt_names = match extract_public_node_subject_alt_names_from_cert_pem(cert_pem)
+            {
+                Ok(subject_alt_names) => subject_alt_names,
+                Err(err) => {
+                    return error_response(StatusCode::BAD_REQUEST, err.to_string());
+                }
+            };
+            match issue_public_node_tls_material_with_subject_alt_names(
+                &state,
+                caller.node_id,
+                subject_alt_names,
+                issue_policy,
+            ) {
+                Ok(material) => Some(material),
+                Err(status) => {
+                    return error_response(
+                        status,
+                        "failed to renew public node TLS material".to_string(),
+                    );
+                }
+            }
         }
-    } else {
-        None
+        None => None,
     };
-    let public_tls_material = match issue_public_node_tls_material(&state, &bootstrap, issue_policy)
-    {
-        Ok(material) => material,
+
+    let trust_roots = match bootstrap_trust_roots(&state) {
+        Ok(trust_roots) => trust_roots,
         Err(status) => {
             return error_response(
                 status,
-                "failed to renew public node TLS material".to_string(),
+                "failed to resolve renewal trust roots".to_string(),
             );
         }
     };
-
-    let package = NodeEnrollmentPackage {
-        bootstrap,
+    let response = NodeEnrollmentRenewResponse {
+        cluster_id: state.cluster_id,
+        node_id: caller.node_id,
+        trust_roots,
+        enrollment_issuer_url: local_public_enrollment_issuer_url(&state).await,
         public_tls_material,
         internal_tls_material,
     };
-    if let Err(err) = package.validate() {
-        return error_response(StatusCode::BAD_REQUEST, err.to_string());
-    }
 
     info!(
         node_id = %caller.node_id,
         previous_public_certificate_fingerprint = ?previous_public_fingerprint,
-        new_public_certificate_fingerprint = ?package
+        new_public_certificate_fingerprint = ?response
             .public_tls_material
             .as_ref()
             .map(|material| material.metadata.certificate_fingerprint.clone()),
-        previous_internal_certificate_fingerprint = ?previous_internal_fingerprint,
-        new_internal_certificate_fingerprint = ?package
+        new_internal_certificate_fingerprint = %response
             .internal_tls_material
-            .as_ref()
-            .map(|material| material.metadata.certificate_fingerprint.clone()),
+            .metadata
+            .certificate_fingerprint,
         "renewed node enrollment via internal mTLS authentication"
     );
 
-    (StatusCode::CREATED, Json(package)).into_response()
+    (StatusCode::CREATED, Json(response)).into_response()
 }
 
 async fn issue_pairing_token_impl(

@@ -2713,20 +2713,33 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
             node_id: package.bootstrap.node_id,
             cluster_id: state.cluster_id,
         },
-        Json(super::NodeEnrollmentRenewRequest {
-            package: package.clone(),
-            tls_validity_secs: Some(14 * 24 * 60 * 60),
-            tls_renewal_window_secs: Some(2 * 24 * 60 * 60),
-        }),
+        Json(super::build_node_enrollment_renew_request(&package)),
     )
     .await
     .into_response();
     assert_eq!(renewed.status(), StatusCode::CREATED);
     let renewed_body = to_bytes(renewed.into_body(), usize::MAX).await.unwrap();
-    let renewed_package: transport_sdk::NodeEnrollmentPackage =
-        serde_json::from_slice(&renewed_body).unwrap();
+    let renewed_json: serde_json::Value = serde_json::from_slice(&renewed_body).unwrap();
+    assert!(renewed_json.get("bootstrap").is_none());
+    let renewed_response: super::NodeEnrollmentRenewResponse =
+        serde_json::from_value(renewed_json).unwrap();
+    let renewed_package =
+        super::merge_node_enrollment_renew_response(package.clone(), renewed_response).unwrap();
 
     assert_eq!(renewed_package.bootstrap.node_id, package.bootstrap.node_id);
+    assert_eq!(renewed_package.bootstrap.data_dir, package.bootstrap.data_dir);
+    assert_eq!(renewed_package.bootstrap.public_url, package.bootstrap.public_url);
+    assert_eq!(renewed_package.bootstrap.internal_url, package.bootstrap.internal_url);
+    assert_eq!(renewed_package.bootstrap.labels, package.bootstrap.labels);
+    assert_eq!(
+        renewed_package.bootstrap.rendezvous_urls,
+        package.bootstrap.rendezvous_urls
+    );
+    assert_eq!(renewed_package.bootstrap.relay_mode, package.bootstrap.relay_mode);
+    assert_eq!(
+        renewed_package.bootstrap.direct_endpoints,
+        package.bootstrap.direct_endpoints
+    );
     assert_ne!(
         renewed_package
             .internal_tls_material
@@ -2774,7 +2787,7 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
 }
 
 #[tokio::test]
-async fn renew_node_enrollment_rejects_foreign_package_node_id() {
+async fn renew_node_enrollment_rejects_invalid_current_public_certificate() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
@@ -2818,22 +2831,28 @@ async fn renew_node_enrollment_rejects_foreign_package_node_id() {
     let package: transport_sdk::NodeEnrollmentPackage =
         serde_json::from_slice(&issued_body).unwrap();
 
+    register_cluster_node(
+        &state,
+        package.bootstrap.node_id,
+        package.bootstrap.public_url.as_deref(),
+        package.bootstrap.internal_url.as_deref(),
+    )
+    .await;
+
     let renewed = super::renew_node_enrollment_authenticated(
         State(state.clone()),
         super::InternalCaller {
-            node_id: state.node_id,
+            node_id: package.bootstrap.node_id,
             cluster_id: state.cluster_id,
         },
         Json(super::NodeEnrollmentRenewRequest {
-            package,
-            tls_validity_secs: Some(14 * 24 * 60 * 60),
-            tls_renewal_window_secs: Some(2 * 24 * 60 * 60),
+            current_public_tls_cert_pem: Some("not-a-certificate".to_string()),
         }),
     )
     .await
     .into_response();
 
-    assert_eq!(renewed.status(), StatusCode::FORBIDDEN);
+    assert_eq!(renewed.status(), StatusCode::BAD_REQUEST);
 
     cleanup_test_state(&state).await;
 }
@@ -2889,11 +2908,7 @@ async fn renew_node_enrollment_rejects_node_missing_from_cluster_membership() {
             node_id: package.bootstrap.node_id,
             cluster_id: state.cluster_id,
         },
-        Json(super::NodeEnrollmentRenewRequest {
-            package,
-            tls_validity_secs: Some(14 * 24 * 60 * 60),
-            tls_renewal_window_secs: Some(2 * 24 * 60 * 60),
-        }),
+        Json(super::build_node_enrollment_renew_request(&package)),
     )
     .await
     .into_response();
