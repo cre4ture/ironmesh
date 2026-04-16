@@ -887,9 +887,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "known bug: store index media metadata can stay stale after overwrite with new EXIF GPS"]
     async fn store_index_refreshes_media_gps_after_overwrite() -> Result<()> {
-        let bind = "127.0.0.1:19123";
+        let bind = "127.0.0.1:19154";
         let mut fixture = start_authenticated_cluster_fixture(
             bind,
             "store-index-media-gps-overwrite",

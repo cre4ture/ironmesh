@@ -62,6 +62,133 @@ fn sample_oriented_jpeg_bytes(orientation: u16) -> Vec<u8> {
     jpeg_with_exif_orientation(jpeg, orientation)
 }
 
+fn sample_media_jpeg_bytes() -> Vec<u8> {
+    let mut image = image::RgbImage::new(8, 6);
+    for y in 0..6 {
+        for x in 0..8 {
+            let pixel = if x < 4 {
+                image::Rgb([24, 122, 205])
+            } else {
+                image::Rgb([242, 173, 41])
+            };
+            image.put_pixel(x, y, pixel);
+        }
+    }
+
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 92);
+    encoder
+        .encode_image(&image::DynamicImage::ImageRgb8(image))
+        .unwrap();
+    jpeg
+}
+
+fn sample_media_jpeg_with_gps_bytes() -> Vec<u8> {
+    jpeg_with_exif_gps(
+        sample_media_jpeg_bytes(),
+        b'N',
+        [(37, 1), (48, 1), (30, 1)],
+        b'W',
+        [(122, 1), (24, 1), (15, 1)],
+    )
+}
+
+fn jpeg_with_exif_gps(
+    jpeg: Vec<u8>,
+    latitude_ref: u8,
+    latitude: [(u32, u32); 3],
+    longitude_ref: u8,
+    longitude: [(u32, u32); 3],
+) -> Vec<u8> {
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+
+    let mut encoded = Vec::with_capacity(jpeg.len() + 160);
+    encoded.extend_from_slice(&jpeg[..2]);
+    encoded.extend_from_slice(&exif_gps_app1_segment(
+        latitude_ref,
+        latitude,
+        longitude_ref,
+        longitude,
+    ));
+    encoded.extend_from_slice(&jpeg[2..]);
+    encoded
+}
+
+fn exif_gps_app1_segment(
+    latitude_ref: u8,
+    latitude: [(u32, u32); 3],
+    longitude_ref: u8,
+    longitude: [(u32, u32); 3],
+) -> Vec<u8> {
+    let gps_ifd_entry_count = 5u16;
+    let gps_ifd_offset = 8u32 + 2 + 12 + 4;
+    let gps_ifd_size = 2u32 + (u32::from(gps_ifd_entry_count) * 12) + 4;
+    let latitude_offset = gps_ifd_offset + gps_ifd_size;
+    let longitude_offset = latitude_offset + (3 * 8);
+
+    let mut tiff = Vec::with_capacity(longitude_offset as usize + (3 * 8));
+    tiff.extend_from_slice(b"MM");
+    tiff.extend_from_slice(&42u16.to_be_bytes());
+    tiff.extend_from_slice(&8u32.to_be_bytes());
+
+    tiff.extend_from_slice(&1u16.to_be_bytes());
+    append_ifd_entry(&mut tiff, 0x8825, 4, 1, gps_ifd_offset);
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+
+    tiff.extend_from_slice(&gps_ifd_entry_count.to_be_bytes());
+    append_ifd_inline_entry(&mut tiff, 0x0000, 1, 4, [2, 3, 0, 0]);
+    append_ifd_inline_entry(&mut tiff, 0x0001, 2, 2, [latitude_ref, 0, 0, 0]);
+    append_ifd_entry(&mut tiff, 0x0002, 5, 3, latitude_offset);
+    append_ifd_inline_entry(&mut tiff, 0x0003, 2, 2, [longitude_ref, 0, 0, 0]);
+    append_ifd_entry(&mut tiff, 0x0004, 5, 3, longitude_offset);
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+
+    for (numerator, denominator) in latitude {
+        tiff.extend_from_slice(&numerator.to_be_bytes());
+        tiff.extend_from_slice(&denominator.to_be_bytes());
+    }
+    for (numerator, denominator) in longitude {
+        tiff.extend_from_slice(&numerator.to_be_bytes());
+        tiff.extend_from_slice(&denominator.to_be_bytes());
+    }
+
+    let mut payload = Vec::with_capacity(6 + tiff.len());
+    payload.extend_from_slice(b"Exif\0\0");
+    payload.extend_from_slice(&tiff);
+
+    let mut segment = Vec::with_capacity(4 + payload.len());
+    segment.extend_from_slice(&[0xff, 0xe1]);
+    segment.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    segment.extend_from_slice(&payload);
+    segment
+}
+
+fn append_ifd_entry(
+    buffer: &mut Vec<u8>,
+    tag: u16,
+    field_type: u16,
+    count: u32,
+    value_or_offset: u32,
+) {
+    buffer.extend_from_slice(&tag.to_be_bytes());
+    buffer.extend_from_slice(&field_type.to_be_bytes());
+    buffer.extend_from_slice(&count.to_be_bytes());
+    buffer.extend_from_slice(&value_or_offset.to_be_bytes());
+}
+
+fn append_ifd_inline_entry(
+    buffer: &mut Vec<u8>,
+    tag: u16,
+    field_type: u16,
+    count: u32,
+    inline_value: [u8; 4],
+) {
+    buffer.extend_from_slice(&tag.to_be_bytes());
+    buffer.extend_from_slice(&field_type.to_be_bytes());
+    buffer.extend_from_slice(&count.to_be_bytes());
+    buffer.extend_from_slice(&inline_value);
+}
+
 fn sample_video_thumbnail_bytes() -> Vec<u8> {
     let mut image = image::RgbImage::new(256, 144);
     for y in 0..144 {
@@ -2570,6 +2697,77 @@ run_on_all_metadata_backends!(
     lookup_media_cache_deletes_invalid_metadata_records_impl,
     lookup_media_cache_deletes_invalid_metadata_records,
     lookup_media_cache_deletes_invalid_metadata_records_turso
+);
+
+async fn ensure_media_metadata_refreshes_gps_after_overwrite_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-overwrite-gps").await;
+
+    let initial_put = store
+        .put_object_versioned(
+            "photos/gps-overwrite.jpg",
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let initial_metadata = store
+        .ensure_media_metadata(&initial_put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected initial media metadata");
+    assert!(initial_metadata.gps.is_none());
+
+    let updated_put = store
+        .put_object_versioned(
+            "photos/gps-overwrite.jpg",
+            Bytes::from(sample_media_jpeg_with_gps_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(initial_put.manifest_hash, updated_put.manifest_hash);
+
+    let updated_metadata = store
+        .ensure_media_metadata(&updated_put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected updated media metadata");
+    assert_ne!(
+        initial_metadata.content_fingerprint,
+        updated_metadata.content_fingerprint
+    );
+
+    let gps = updated_metadata.gps.expect("expected GPS metadata after overwrite");
+    assert!((gps.latitude - 37.808_333_333_333_33).abs() < 0.000_001);
+    assert!((gps.longitude - (-122.404_166_666_666_67)).abs() < 0.000_001);
+
+    let lookup = store
+        .lookup_media_cache(&updated_put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected media cache lookup after overwrite");
+    let lookup_metadata = lookup
+        .metadata
+        .expect("expected cached media metadata after overwrite");
+    let lookup_gps = lookup_metadata
+        .gps
+        .expect("expected cached GPS metadata after overwrite");
+    assert!((lookup_gps.latitude - gps.latitude).abs() < 0.000_001);
+    assert!((lookup_gps.longitude - gps.longitude).abs() < 0.000_001);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_metadata_refreshes_gps_after_overwrite_impl,
+    ensure_media_metadata_refreshes_gps_after_overwrite,
+    ensure_media_metadata_refreshes_gps_after_overwrite_turso
 );
 
 async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes_impl(
