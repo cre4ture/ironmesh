@@ -97,8 +97,11 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import io.ironmesh.android.data.FolderSyncProfileStatus
 import io.ironmesh.android.data.FolderSyncRuntimeMetrics
+import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.RustSafBridge
 import io.ironmesh.android.data.RustPreferencesBridge
+import io.ironmesh.android.ui.FolderSyncActivityFilter
+import io.ironmesh.android.ui.FolderSyncHistoryState
 import io.ironmesh.android.ui.GalleryViewMode
 import io.ironmesh.android.ui.GalleryImageItem
 import io.ironmesh.android.ui.GallerySortOption
@@ -725,6 +728,7 @@ private fun FolderSyncControls(
 
     state.syncProfiles.forEach { profile ->
         val profileStatus = profileStatuses[profile.id]
+        val historyState = state.folderSyncHistory[profile.id] ?: FolderSyncHistoryState()
         Surface(
             modifier = Modifier.fillMaxWidth(),
             tonalElevation = 2.dp,
@@ -844,6 +848,11 @@ private fun FolderSyncControls(
                                 )
                             }
                     }
+                FolderSyncHistoryPanel(
+                    profileId = profile.id,
+                    historyState = historyState,
+                    vm = vm,
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Switch(
                         checked = profile.enabled,
@@ -874,6 +883,146 @@ private fun FolderSyncBadge(text: String) {
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
         )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FolderSyncHistoryPanel(
+    profileId: String,
+    historyState: FolderSyncHistoryState,
+    vm: MainViewModel,
+) {
+    val filteredRecords = historyState.records.filter { record ->
+        folderSyncHistoryMatchesFilter(record, historyState.filter)
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(onClick = { vm.toggleFolderSyncHistory(profileId) }) {
+                Text(if (historyState.expanded) "Hide Activity" else "Recent Activity")
+            }
+            if (historyState.loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                )
+            }
+        }
+
+        if (!historyState.expanded) {
+            return@Column
+        }
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            FolderSyncActivityFilter.entries.forEach { filter ->
+                FilterChip(
+                    selected = historyState.filter == filter,
+                    onClick = { vm.setFolderSyncHistoryFilter(profileId, filter) },
+                    label = { Text(folderSyncActivityFilterLabel(filter)) },
+                )
+            }
+        }
+
+        historyState.error
+            ?.takeIf { it.isNotBlank() }
+            ?.let { message ->
+                Text(
+                    text = "History error: $message",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+        when {
+            filteredRecords.isEmpty() && historyState.records.isEmpty() && !historyState.loading -> {
+                Text(
+                    text = "No recorded activity yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            filteredRecords.isEmpty() && !historyState.loading -> {
+                Text(
+                    text = "No activity matches the current filter.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            else -> {
+                filteredRecords.forEach { record ->
+                    FolderSyncHistoryRow(record)
+                }
+            }
+        }
+
+        if (historyState.nextBeforeId != null) {
+            OutlinedButton(
+                onClick = { vm.loadMoreFolderSyncHistory(profileId) },
+                enabled = !historyState.loading,
+            ) {
+                Text("Load More")
+            }
+        }
+    }
+}
+
+@Composable
+private fun FolderSyncHistoryRow(record: FolderSyncModificationRecord) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        tonalElevation = 1.dp,
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FolderSyncBadge(folderSyncOperationLabel(record.operation))
+                Text(
+                    text = formatTimestamp(record.occurredUnixMs),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (record.outcome.equals("error", ignoreCase = true)) {
+                    Text(
+                        text = "Error",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+            Text(
+                text = record.localRelativePath.ifBlank { record.remoteKey },
+                style = MaterialTheme.typography.bodySmall,
+            )
+            folderSyncHistorySecondaryText(record)
+                ?.let { details ->
+                    Text(
+                        text = details,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            record.errorText
+                ?.takeIf { it.isNotBlank() }
+                ?.let { message ->
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+        }
     }
 }
 
@@ -1464,6 +1613,69 @@ private fun recentWorkSummary(metrics: FolderSyncRuntimeMetrics): String? {
         parts += "${metrics.ensuredDirectoryCount} directory update(s)"
     }
     return parts.takeIf { it.isNotEmpty() }?.joinToString(", ")
+}
+
+private fun folderSyncActivityFilterLabel(filter: FolderSyncActivityFilter): String {
+    return when (filter) {
+        FolderSyncActivityFilter.ALL -> "All"
+        FolderSyncActivityFilter.UPLOADS -> "Uploads"
+        FolderSyncActivityFilter.DOWNLOADS -> "Downloads"
+        FolderSyncActivityFilter.DELETES -> "Deletes"
+    }
+}
+
+private fun folderSyncHistoryMatchesFilter(
+    record: FolderSyncModificationRecord,
+    filter: FolderSyncActivityFilter,
+): Boolean {
+    return when (filter) {
+        FolderSyncActivityFilter.ALL -> true
+        FolderSyncActivityFilter.UPLOADS -> record.operation == "upload"
+        FolderSyncActivityFilter.DOWNLOADS -> record.operation == "download"
+        FolderSyncActivityFilter.DELETES ->
+            record.operation == "delete-local" || record.operation == "delete-remote"
+    }
+}
+
+private fun folderSyncOperationLabel(operation: String): String {
+    return when (operation) {
+        "upload" -> "Upload"
+        "download" -> "Download"
+        "delete-local" -> "Delete local"
+        "delete-remote" -> "Delete remote"
+        else -> displayStatusToken(operation)
+    }
+}
+
+private fun folderSyncHistorySecondaryText(record: FolderSyncModificationRecord): String? {
+    val parts = mutableListOf<String>()
+    record.sizeBytes?.let { sizeBytes ->
+        parts += formatByteCount(sizeBytes)
+    }
+    if (record.phase.isNotBlank()) {
+        parts += displayStatusToken(record.phase)
+    }
+    if (record.triggerSource.isNotBlank()) {
+        parts += if (record.triggerSource == "conflict-resolution") {
+            "Conflict resolution"
+        } else {
+            displayStatusToken(record.triggerSource)
+        }
+    }
+    if (record.remoteKey.isNotBlank() && record.remoteKey != record.localRelativePath) {
+        parts += record.remoteKey
+    }
+    return parts.takeIf { it.isNotEmpty() }?.joinToString(" - ")
+}
+
+private fun formatByteCount(sizeBytes: Long): String {
+    val kib = 1024.0
+    val mib = kib * 1024.0
+    return when {
+        sizeBytes >= mib.toLong() -> String.format("%.1f MB", sizeBytes / mib)
+        sizeBytes >= kib.toLong() -> String.format("%.1f KB", sizeBytes / kib)
+        else -> "$sizeBytes B"
+    }
 }
 
 private fun startupDetailSummary(metrics: FolderSyncRuntimeMetrics): String? {

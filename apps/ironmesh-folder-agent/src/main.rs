@@ -32,6 +32,8 @@ struct Args {
     #[arg(long)]
     root_dir: PathBuf,
     #[arg(long, global = true)]
+    state_root_dir: Option<PathBuf>,
+    #[arg(long, global = true)]
     server_base_url: Option<String>,
     #[arg(long, global = true)]
     bootstrap_file: Option<PathBuf>,
@@ -188,7 +190,15 @@ fn run_gnome_command(args: &Args, command: &GnomeCommand) -> Result<()> {
 fn run_conflict_command(args: &Args, command: &ConflictCommand) -> Result<()> {
     let scope = PathScope::new(args.prefix.clone());
     let target = resolve_startup_target(args)?;
-    let state_store = StartupStateStore::new(&args.root_dir, &scope, &target.connection_target);
+    let state_store = match args.state_root_dir.as_deref() {
+        Some(state_root_dir) => StartupStateStore::new_with_state_root(
+            &args.root_dir,
+            &scope,
+            &target.connection_target,
+            state_root_dir,
+        ),
+        None => StartupStateStore::new(&args.root_dir, &scope, &target.connection_target),
+    };
     let client_identity_json =
         read_optional_client_identity_json(args.client_identity_file.as_deref())?;
 
@@ -296,7 +306,7 @@ fn run_agent(args: &Args) -> Result<()> {
         read_optional_client_identity_json(args.client_identity_file.as_deref())?;
     let runtime_options = FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
-        state_root_dir: None,
+        state_root_dir: args.state_root_dir.clone(),
         local_tree_uri: None,
         server_base_url: target.server_base_url.clone(),
         client_bootstrap_json: target.client_bootstrap_json.clone(),

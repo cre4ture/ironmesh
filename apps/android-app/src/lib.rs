@@ -100,7 +100,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use sync_agent_core::{
     FolderAgentRuntimeMetrics, FolderAgentRuntimeOptions, FolderAgentRuntimeStatus,
-    FolderAgentStatusCallback, build_configured_client, describe_connection_target,
+    FolderAgentStatusCallback, ModificationHistoryPage, ModificationLogStore,
+    ModificationOperation, PathScope, build_configured_client, describe_connection_target,
     run_folder_agent, run_folder_agent_with_control,
 };
 use tokio::task::JoinHandle;
@@ -220,6 +221,22 @@ fn android_cache_dir() -> Result<PathBuf> {
     })
 }
 
+fn android_no_backup_files_dir() -> Result<PathBuf> {
+    with_android_preferences_env(|env, class| {
+        let value = env
+            .call_static_method(&class, "noBackupFilesDirPath", "()Ljava/lang/String;", &[])
+            .context("failed to query Android no-backup files dir path")?
+            .l()
+            .context("Android no-backup files dir path returned invalid value")?;
+        let value = JString::from(value);
+        let value: String = env
+            .get_string(&value)
+            .context("failed to decode Android no-backup files dir path")?
+            .into();
+        Ok(PathBuf::from(value))
+    })
+}
+
 fn android_download_stage_root(category: &str, scope: &str) -> Result<PathBuf> {
     let cache_dir = android_cache_dir()?;
     let scope = scope.trim();
@@ -234,7 +251,43 @@ fn android_download_stage_root(category: &str, scope: &str) -> Result<PathBuf> {
 }
 
 fn android_folder_sync_state_root() -> Result<PathBuf> {
-    Ok(android_cache_dir()?.join("ironmesh-folder-sync-state"))
+    Ok(android_no_backup_files_dir()?.join("ironmesh-folder-sync-state"))
+}
+
+fn folder_sync_modification_history_json(
+    connection_input: String,
+    local_folder: String,
+    local_tree_uri: Option<String>,
+    prefix: Option<String>,
+    limit: Option<usize>,
+    before_id: Option<i64>,
+    operation: Option<ModificationOperation>,
+) -> Result<String> {
+    let normalized_connection_input = normalized_connection_input_string(connection_input)?;
+    let normalized_local_tree_uri = normalize_optional_string(local_tree_uri);
+    let normalized_prefix = normalize_optional_string(prefix);
+    let (server_base_url, client_bootstrap_json) =
+        split_connection_input(normalized_connection_input)?;
+    let connection_target = describe_connection_target(
+        server_base_url.as_deref(),
+        client_bootstrap_json.as_deref(),
+    )
+    .context("failed to derive connection target for folder sync modification history")?;
+    let scope = PathScope::new(normalized_prefix);
+    let local_folder_path = PathBuf::from(local_folder);
+    let identity_root = normalized_local_tree_uri
+        .as_deref()
+        .map(saf_sync::state_identity_root)
+        .unwrap_or_else(|| local_folder_path.clone());
+    let store = ModificationLogStore::new_with_state_root(
+        &identity_root,
+        &local_folder_path,
+        &scope,
+        &connection_target,
+        &android_folder_sync_state_root()?,
+    );
+    let history: ModificationHistoryPage = store.list(limit, before_id, operation)?;
+    serde_json::to_string(&history).context("failed to serialize folder sync modification history")
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -1608,6 +1661,69 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
             throw_java_error(
                 &mut env,
                 format!("rust getContinuousFolderSyncStatus failed: {err:#}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// This function is intended to be called from Java via JNI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getFolderSyncModificationHistory(
+    mut env: JNIEnv,
+    _class: JClass,
+    connection_input: JString,
+    local_folder: JString,
+    local_tree_uri: jstring,
+    prefix: jstring,
+    limit: jint,
+    before_id: jlong,
+    operation: jstring,
+) -> jstring {
+    let result = (|| -> Result<String> {
+        let connection_input: String = env.get_string(&connection_input)?.into();
+        let local_folder: String = env.get_string(&local_folder)?.into();
+        let local_tree_uri = optional_jstring(&mut env, local_tree_uri)?;
+        let prefix = optional_jstring(&mut env, prefix)?;
+        let operation = normalize_optional_string(optional_jstring(&mut env, operation)?);
+        let operation = match operation.as_deref() {
+            Some("upload") => Some(ModificationOperation::Upload),
+            Some("download") => Some(ModificationOperation::Download),
+            Some("delete-local") => Some(ModificationOperation::DeleteLocal),
+            Some("delete-remote") => Some(ModificationOperation::DeleteRemote),
+            Some(other) => anyhow::bail!("unsupported modification history operation filter {other}"),
+            None => None,
+        };
+        folder_sync_modification_history_json(
+            connection_input,
+            local_folder,
+            local_tree_uri,
+            prefix,
+            Some(usize::try_from(limit).unwrap_or(1).max(1)),
+            if before_id > 0 { Some(before_id) } else { None },
+            operation,
+        )
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(value) => value.into_raw(),
+            Err(err) => {
+                throw_java_error(
+                    &mut env,
+                    format!(
+                        "rust getFolderSyncModificationHistory failed to create java string: {err:#}"
+                    ),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_java_error(
+                &mut env,
+                format!("rust getFolderSyncModificationHistory failed: {err:#}"),
             );
             std::ptr::null_mut()
         }

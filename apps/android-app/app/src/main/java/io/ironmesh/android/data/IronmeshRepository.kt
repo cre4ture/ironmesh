@@ -300,6 +300,27 @@ class IronmeshRepository {
         )
     }
 
+    fun getFolderSyncModificationHistory(
+        connectionInput: String,
+        profile: FolderSyncConfig,
+        limit: Int = 20,
+        beforeId: Long? = null,
+        operation: String? = null,
+    ): FolderSyncModificationHistory {
+        return decodeJson(
+            RustClientBridge.getFolderSyncModificationHistory(
+                normalizedConnectionInput(connectionInput),
+                profile.localFolder,
+                profile.localFolderTreeUri?.takeIf { it.isNotBlank() },
+                profile.prefix.takeIf { it.isNotBlank() },
+                limit.coerceAtLeast(1),
+                beforeId ?: 0L,
+                operation?.trim()?.takeIf { it.isNotEmpty() },
+            ),
+            FolderSyncModificationHistory::class.java,
+        )
+    }
+
     fun hasContinuousFolderSyncActive(): Boolean {
         return RustClientBridge.hasContinuousFolderSyncActive()
     }

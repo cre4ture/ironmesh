@@ -20,12 +20,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_agent_core::{
     FolderAgentRuntimeMetrics, FolderAgentRuntimeOptions, FolderAgentRuntimeStatus,
-    FolderAgentStatusCallback, LocalEntryKind, LocalEntryState, LocalTreeState, PathScope,
-    RemoteTreeIndex, StartupStateStore, build_configured_client, delete_remote_file,
-    describe_connection_target, diff_local_trees, load_local_baseline_hashes_with_retries,
+    FolderAgentStatusCallback, LocalEntryKind, LocalEntryState, LocalTreeState,
+    ModificationLogContext, ModificationLogStore, ModificationOperation, ModificationOutcome,
+    ModificationPhase, ModificationTriggerSource, PathScope, RemoteTreeIndex,
+    StartupStateStore, build_configured_client, delete_remote_file, describe_connection_target,
+    diff_local_trees, load_local_baseline_hashes_with_retries,
     load_local_baseline_with_retries, parent_directories, remote_file_hashes_by_local_path,
     remote_file_paths_by_local_path, startup_add_delete_conflicts,
-    startup_baseline_state_from_remote_index,
+    startup_baseline_state_from_remote_index, try_record_modification,
 };
 use sync_core::{EntryKind, SyncSnapshot};
 
@@ -248,7 +250,7 @@ const SAF_SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
 const REMOTE_FETCH_PROGRESS_INTERVAL: Duration = Duration::from_millis(750);
 const REMOTE_FETCH_PROGRESS_ENTRY_STRIDE: u64 = 512;
 
-fn state_identity_root(tree_uri: &str) -> PathBuf {
+pub(crate) fn state_identity_root(tree_uri: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     tree_uri.hash(&mut hasher);
     PathBuf::from(format!("/android-saf/{:016x}", hasher.finish()))
@@ -709,7 +711,13 @@ fn ensure_tree_directory(tree_uri: &str, relative_path: &str) -> Result<()> {
     })
 }
 
-fn delete_tree_path(tree_uri: &str, relative_path: &str) -> Result<()> {
+fn delete_tree_path(
+    tree_uri: &str,
+    relative_path: &str,
+    remote_key: &str,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
+) -> Result<()> {
     with_bridge_env(|env, class| {
         let j_tree_uri = env
             .new_string(tree_uri)
@@ -717,7 +725,8 @@ fn delete_tree_path(tree_uri: &str, relative_path: &str) -> Result<()> {
         let j_relative_path = env
             .new_string(relative_path)
             .context("failed to allocate relative path string")?;
-        env.call_static_method(
+        let removed = env
+            .call_static_method(
             &class,
             "deleteTreePath",
             "(Ljava/lang/String;Ljava/lang/String;)Z",
@@ -726,7 +735,22 @@ fn delete_tree_path(tree_uri: &str, relative_path: &str) -> Result<()> {
                 JValue::Object(j_relative_path.as_ref()),
             ],
         )
-        .context("RustSafBridge.deleteTreePath failed")?;
+        .context("RustSafBridge.deleteTreePath failed")?
+        .z()
+        .context("RustSafBridge.deleteTreePath returned invalid value")?;
+        if removed {
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::DeleteLocal,
+                ModificationOutcome::Success,
+                relative_path,
+                remote_key,
+                None,
+                None,
+                None,
+            );
+        }
         Ok(())
     })
 }
@@ -898,12 +922,14 @@ fn upload_saf_file(
     scope: &PathScope,
     relative_path: &str,
     size_bytes: u64,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
 ) -> Result<String> {
     let remote_key = scope.local_to_remote(relative_path).ok_or_else(|| {
         anyhow::anyhow!("refusing to upload local root without concrete scoped path")
     })?;
 
-    with_bridge_env(|env, class| {
+    let result = with_bridge_env(|env, class| {
         let input_stream = open_tree_input_stream(env, &class, tree_uri, relative_path)?;
         let mut reader = JavaInputStreamReader::new(env, input_stream)?;
         let mut hashing_reader = HashingReader::new(&mut reader);
@@ -913,7 +939,38 @@ fn upload_saf_file(
                 format!("failed to upload local file {relative_path} to {remote_key}")
             })?;
         Ok(hashing_reader.content_hash_hex())
-    })
+    });
+
+    match result {
+        Ok(content_hash) => {
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::Upload,
+                ModificationOutcome::Success,
+                relative_path,
+                remote_key.as_str(),
+                Some(size_bytes),
+                Some(content_hash.as_str()),
+                None,
+            );
+            Ok(content_hash)
+        }
+        Err(error) => {
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::Upload,
+                ModificationOutcome::Error,
+                relative_path,
+                remote_key.as_str(),
+                Some(size_bytes),
+                None,
+                Some(&format!("{error:#}")),
+            );
+            Err(error)
+        }
+    }
 }
 
 fn saf_file_content_hash(tree_uri: &str, relative_path: &str) -> Result<String> {
@@ -958,9 +1015,11 @@ fn download_remote_file_to_saf(
     client: &IronMeshClient,
     local_relative_path: &str,
     remote_key: &str,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
 ) -> Result<()> {
     let staging_root = crate::android_download_stage_root("saf-sync-downloads", tree_uri)?;
-    with_bridge_env(|env, class| {
+    let result = with_bridge_env(|env, class| {
         let output_stream = open_tree_output_stream(env, &class, tree_uri, local_relative_path)?;
         let mut writer = JavaOutputStreamWriter::new(env, output_stream)?;
         client
@@ -970,7 +1029,38 @@ fn download_remote_file_to_saf(
             format!("failed to flush downloaded SAF file {local_relative_path}")
         })?;
         Ok(())
-    })
+    });
+
+    match result {
+        Ok(()) => {
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::Download,
+                ModificationOutcome::Success,
+                local_relative_path,
+                remote_key,
+                None,
+                None,
+                None,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::Download,
+                ModificationOutcome::Error,
+                local_relative_path,
+                remote_key,
+                None,
+                None,
+                Some(&format!("{error:#}")),
+            );
+            Err(error)
+        }
+    }
 }
 
 fn local_paths_to_preserve_on_startup_saf(
@@ -1164,6 +1254,8 @@ fn apply_remote_snapshot_saf(
     scope: &PathScope,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
     remote_index: &mut RemoteTreeIndex,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
     status_callback: Option<&FolderAgentStatusCallback>,
     scan_status: Option<&SafScanStatusContext>,
 ) -> Result<(LocalTreeState, RemoteApplyOutcome)> {
@@ -1214,12 +1306,26 @@ fn apply_remote_snapshot_saf(
                     Some((EntryKind::File, remote_key)) => {
                         outcome.changed_path_count += 1;
                         outcome.downloaded_file_count += 1;
-                        download_remote_file_to_saf(tree_uri, client, path, remote_key)?;
+                        download_remote_file_to_saf(
+                            tree_uri,
+                            client,
+                            path,
+                            remote_key,
+                            modification_log,
+                            modification_context,
+                        )?;
                     }
                     None => {
                         outcome.changed_path_count += 1;
                         outcome.removed_local_path_count += 1;
-                        delete_tree_path(tree_uri, path)?;
+                        let remote_key = scope.local_to_remote(path).unwrap_or_else(|| path.clone());
+                        delete_tree_path(
+                            tree_uri,
+                            path,
+                            remote_key.as_str(),
+                            modification_log,
+                            modification_context,
+                        )?;
                         suppressed_uploads.remove(path);
                     }
                 }
@@ -1265,7 +1371,14 @@ fn apply_remote_snapshot_saf(
                 }
                 outcome.changed_path_count += 1;
                 outcome.downloaded_file_count += 1;
-                download_remote_file_to_saf(tree_uri, client, file, remote_key)?;
+                download_remote_file_to_saf(
+                    tree_uri,
+                    client,
+                    file,
+                    remote_key,
+                    modification_log,
+                    modification_context,
+                )?;
             }
 
             *remote_index = next_index;
@@ -1301,6 +1414,8 @@ fn sync_local_changes_saf(
     scope: &PathScope,
     remote_index: &mut RemoteTreeIndex,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
     status_callback: Option<&FolderAgentStatusCallback>,
     scan_status: Option<&SafScanStatusContext>,
 ) -> Result<LocalSyncOutcome> {
@@ -1356,7 +1471,15 @@ fn sync_local_changes_saf(
         let remote_key = scope.local_to_remote(path).ok_or_else(|| {
             anyhow::anyhow!("refusing to upload local root without concrete scoped path")
         })?;
-        let content_hash = upload_saf_file(tree_uri, client, scope, path, entry_state.size_bytes)?;
+        let content_hash = upload_saf_file(
+            tree_uri,
+            client,
+            scope,
+            path,
+            entry_state.size_bytes,
+            modification_log,
+            modification_context,
+        )?;
         outcome.uploaded_file_count += 1;
         let upload_message = format!("Uploaded SAF file {path} to {remote_key}");
         log_android_info(upload_message.as_str());
@@ -1397,7 +1520,7 @@ fn sync_local_changes_saf(
                 continue;
             }
 
-            delete_remote_file(client, scope, &path)?;
+            delete_remote_file(client, scope, &path, modification_log, modification_context)?;
             outcome.deleted_remote_file_count += 1;
             suppressed_uploads.remove(&path);
             remote_index.files.remove(&path);
@@ -1438,6 +1561,37 @@ pub(crate) fn run_saf_folder_agent_with_control(
         ),
         None => StartupStateStore::new(&state_identity_root, &scope, &connection_target),
     };
+    let modification_log_store = match options.state_root_dir.as_deref() {
+        Some(state_root_dir) => ModificationLogStore::new_with_state_root(
+            &state_identity_root,
+            &options.root_dir,
+            &scope,
+            &connection_target,
+            state_root_dir,
+        ),
+        None => ModificationLogStore::new(
+            &state_identity_root,
+            &options.root_dir,
+            &scope,
+            &connection_target,
+        ),
+    };
+    let startup_reconcile_log_context = ModificationLogContext::new(
+        ModificationPhase::Startup,
+        ModificationTriggerSource::StartupReconcile,
+    );
+    let remote_refresh_log_context = ModificationLogContext::new(
+        ModificationPhase::SteadyState,
+        ModificationTriggerSource::RemoteRefresh,
+    );
+    let local_watch_log_context = ModificationLogContext::new(
+        ModificationPhase::SteadyState,
+        ModificationTriggerSource::LocalWatch,
+    );
+    let local_scan_log_context = ModificationLogContext::new(
+        ModificationPhase::SteadyState,
+        ModificationTriggerSource::LocalScan,
+    );
     let client = configured_client(options)?;
     let snapshot_scope = RemoteSnapshotScope::new(
         scope.remote_prefix().map(ToString::to_string),
@@ -1627,6 +1781,8 @@ pub(crate) fn run_saf_folder_agent_with_control(
         &scope,
         &mut suppressed_uploads,
         &mut remote_index,
+        Some(&modification_log_store),
+        Some(&startup_reconcile_log_context),
         status_callback.as_ref(),
         Some(&SafScanStatusContext {
             options: options.clone(),
@@ -1638,7 +1794,14 @@ pub(crate) fn run_saf_folder_agent_with_control(
         }),
     )?;
     for path in &remote_delete_wins_paths {
-        delete_tree_path(tree_uri, path)?;
+        let remote_key = scope.local_to_remote(path).unwrap_or_else(|| path.clone());
+        delete_tree_path(
+            tree_uri,
+            path,
+            remote_key.as_str(),
+            Some(&modification_log_store),
+            Some(&startup_reconcile_log_context),
+        )?;
         suppressed_uploads.remove(path);
     }
     initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
@@ -1704,6 +1867,8 @@ pub(crate) fn run_saf_folder_agent_with_control(
         &scope,
         &mut remote_index,
         &mut suppressed_uploads,
+        Some(&modification_log_store),
+        Some(&startup_reconcile_log_context),
         status_callback.as_ref(),
         Some(&SafScanStatusContext {
             options: options.clone(),
@@ -1849,6 +2014,8 @@ pub(crate) fn run_saf_folder_agent_with_control(
                 &scope,
                 &mut suppressed_uploads,
                 &mut remote_index,
+                Some(&modification_log_store),
+                Some(&remote_refresh_log_context),
                 status_callback.as_ref(),
                 Some(&SafScanStatusContext {
                     options: options.clone(),
@@ -1936,6 +2103,12 @@ pub(crate) fn run_saf_folder_agent_with_control(
                 &scope,
                 &mut remote_index,
                 &mut suppressed_uploads,
+                Some(&modification_log_store),
+                Some(if observer_hint_triggered {
+                    &local_watch_log_context
+                } else {
+                    &local_scan_log_context
+                }),
                 status_callback.as_ref(),
                 Some(&SafScanStatusContext {
                     options: options.clone(),

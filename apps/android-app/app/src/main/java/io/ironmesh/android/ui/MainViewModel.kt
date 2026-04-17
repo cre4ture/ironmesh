@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.FolderSyncConfig
+import io.ironmesh.android.data.FolderSyncModificationRecord
 import io.ironmesh.android.data.FolderSyncServiceStatus
 import io.ironmesh.android.data.IronmeshPreferences
 import io.ironmesh.android.data.IronmeshRepository
@@ -35,8 +36,27 @@ enum class MainSection {
     GALLERY,
 }
 
+enum class FolderSyncActivityFilter {
+    ALL,
+    UPLOADS,
+    DOWNLOADS,
+    DELETES,
+}
+
 private const val GALLERY_ROOT_DOCUMENT_ID = "dir:"
 private const val GALLERY_ROOT_PATH = "/"
+private const val FOLDER_SYNC_HISTORY_PAGE_SIZE = 20
+private const val FOLDER_SYNC_HISTORY_REFRESH_MS = 5_000L
+
+data class FolderSyncHistoryState(
+    val expanded: Boolean = false,
+    val records: List<FolderSyncModificationRecord> = emptyList(),
+    val nextBeforeId: Long? = null,
+    val filter: FolderSyncActivityFilter = FolderSyncActivityFilter.ALL,
+    val loading: Boolean = false,
+    val error: String? = null,
+    val lastLoadedUnixMs: Long = 0L,
+)
 
 data class GalleryImageItem(
     val documentUri: Uri,
@@ -72,6 +92,7 @@ data class MainUiState(
     val objectBody: String = "",
     val syncProfiles: List<FolderSyncConfig> = emptyList(),
     val folderSyncStatus: FolderSyncServiceStatus = FolderSyncServiceStatus(),
+    val folderSyncHistory: Map<String, FolderSyncHistoryState> = emptyMap(),
     val newSyncLabel: String = "",
     val newSyncPrefix: String = "",
     val newSyncLocalFolder: String = "",
@@ -192,6 +213,9 @@ class MainViewModel(
 
     fun selectSection(section: MainSection) {
         uiState.value = uiState.value.copy(selectedSection = section)
+        if (section == MainSection.SETTINGS) {
+            refreshExpandedFolderSyncHistory(force = true)
+        }
     }
 
     fun refreshGallery() {
@@ -362,8 +386,12 @@ class MainViewModel(
     fun removeFolderSyncProfile(profileId: String) {
         val updated = uiState.value.syncProfiles.filterNot { it.id == profileId }
         IronmeshPreferences.setFolderSyncConfigs(getApplication(), updated)
+        val updatedHistory = uiState.value.folderSyncHistory.toMutableMap().apply {
+            remove(profileId)
+        }
         uiState.value = uiState.value.copy(
             syncProfiles = updated,
+            folderSyncHistory = updatedHistory,
             status = "Removed sync profile",
         )
         FolderSyncScheduler.reschedule(getApplication())
@@ -372,6 +400,41 @@ class MainViewModel(
     fun runFolderSyncNow() {
         FolderSyncScheduler.runNow(getApplication())
         setStatus("Folder sync scheduled")
+    }
+
+    fun toggleFolderSyncHistory(profileId: String) {
+        val current = uiState.value.folderSyncHistory[profileId] ?: FolderSyncHistoryState()
+        updateFolderSyncHistoryState(profileId) { historyState ->
+            historyState.copy(
+                expanded = !current.expanded,
+                error = if (current.expanded) null else historyState.error,
+            )
+        }
+        val next = uiState.value.folderSyncHistory[profileId] ?: FolderSyncHistoryState()
+        if (next.expanded && (next.records.isEmpty() || isHistoryStale(next))) {
+            refreshFolderSyncHistory(profileId)
+        }
+    }
+
+    fun setFolderSyncHistoryFilter(
+        profileId: String,
+        filter: FolderSyncActivityFilter,
+    ) {
+        updateFolderSyncHistoryState(profileId) { historyState ->
+            historyState.copy(filter = filter)
+        }
+    }
+
+    fun loadMoreFolderSyncHistory(profileId: String) {
+        val current = uiState.value.folderSyncHistory[profileId] ?: return
+        if (current.loading || current.nextBeforeId == null) {
+            return
+        }
+        refreshFolderSyncHistory(
+            profileId = profileId,
+            beforeId = current.nextBeforeId,
+            append = true,
+        )
     }
 
     fun startWebUi() {
@@ -477,15 +540,117 @@ class MainViewModel(
 
     private fun observeFolderSyncStatus() {
         viewModelScope.launch {
+            var historyRefreshTick = 0
             while (isActive) {
                 val status = withContext(Dispatchers.IO) {
                     runCatching { repository.getContinuousFolderSyncStatus() }
                         .getOrDefault(FolderSyncServiceStatus())
                 }
                 uiState.value = uiState.value.copy(folderSyncStatus = status)
+                historyRefreshTick += 1
+                if (historyRefreshTick >= 5) {
+                    historyRefreshTick = 0
+                    refreshExpandedFolderSyncHistory()
+                }
                 delay(1_000)
             }
         }
+    }
+
+    private fun refreshExpandedFolderSyncHistory(force: Boolean = false) {
+        if (uiState.value.selectedSection != MainSection.SETTINGS) {
+            return
+        }
+        val historyStates = uiState.value.folderSyncHistory
+        historyStates.forEach { (profileId, historyState) ->
+            if (!historyState.expanded || historyState.loading) {
+                return@forEach
+            }
+            if (force || isHistoryStale(historyState)) {
+                refreshFolderSyncHistory(profileId)
+            }
+        }
+    }
+
+    private fun refreshFolderSyncHistory(
+        profileId: String,
+        beforeId: Long? = null,
+        append: Boolean = false,
+    ) {
+        val profile = uiState.value.syncProfiles.firstOrNull { it.id == profileId } ?: return
+        val existing = uiState.value.folderSyncHistory[profileId] ?: FolderSyncHistoryState()
+        if (existing.loading) {
+            return
+        }
+
+        val limit = if (append) {
+            FOLDER_SYNC_HISTORY_PAGE_SIZE
+        } else {
+            existing.records.size.coerceAtLeast(FOLDER_SYNC_HISTORY_PAGE_SIZE)
+        }
+        val connectionInput = currentConnectionInput()
+        updateFolderSyncHistoryState(profileId) { historyState ->
+            historyState.copy(
+                expanded = true,
+                loading = true,
+                error = null,
+            )
+        }
+
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    repository.getFolderSyncModificationHistory(
+                        connectionInput = connectionInput,
+                        profile = profile,
+                        limit = limit,
+                        beforeId = beforeId,
+                    )
+                }
+            }
+                .onSuccess { history ->
+                    updateFolderSyncHistoryState(profileId) { historyState ->
+                        val nextRecords = if (append) {
+                            (historyState.records + history.records).distinctBy { record -> record.id }
+                        } else {
+                            history.records
+                        }
+                        historyState.copy(
+                            expanded = true,
+                            records = nextRecords,
+                            nextBeforeId = history.nextBeforeId,
+                            loading = false,
+                            error = null,
+                            lastLoadedUnixMs = System.currentTimeMillis(),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    updateFolderSyncHistoryState(profileId) { historyState ->
+                        historyState.copy(
+                            expanded = true,
+                            loading = false,
+                            error = error.message ?: "Failed to load recent activity",
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun updateFolderSyncHistoryState(
+        profileId: String,
+        transform: (FolderSyncHistoryState) -> FolderSyncHistoryState,
+    ) {
+        val current = uiState.value.folderSyncHistory[profileId] ?: FolderSyncHistoryState()
+        val updated = uiState.value.folderSyncHistory.toMutableMap().apply {
+            put(profileId, transform(current))
+        }
+        uiState.value = uiState.value.copy(folderSyncHistory = updated)
+    }
+
+    private fun isHistoryStale(historyState: FolderSyncHistoryState): Boolean {
+        return System.currentTimeMillis() - historyState.lastLoadedUnixMs >=
+            FOLDER_SYNC_HISTORY_REFRESH_MS
     }
 
     private data class GalleryLoadSnapshot(

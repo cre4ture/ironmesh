@@ -8,9 +8,12 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::{
-    PathScope, StartupStateStore, absolute_path, build_configured_client, conflict_copy_dir,
-    copy_file_atomically, current_unix_ms, delete_conflict_copies, local_entry_state_for_path,
-    newest_remote_conflict_copy, normalize_relative_path, upload_transfer_state_path,
+    ModificationLogContext, ModificationLogStore, ModificationOperation, ModificationOutcome,
+    ModificationPhase, ModificationTriggerSource, PathScope, StartupStateStore, absolute_path,
+    build_configured_client, conflict_copy_dir, copy_file_atomically, current_unix_ms,
+    delete_conflict_copies, describe_connection_target, local_entry_state_for_path,
+    newest_remote_conflict_copy, normalize_relative_path, try_record_modification,
+    upload_transfer_state_path,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
@@ -81,6 +84,18 @@ pub fn resolve_conflict_action(
             })
         }
         ConflictResolutionStrategy::KeepRemote => {
+            let connection_target = describe_connection_target(server_base_url, client_bootstrap_json)
+                .context("failed to resolve connection target for conflict resolution")?;
+            let modification_log_store = ModificationLogStore::from_state_store(
+                state_store,
+                root_dir,
+                scope,
+                &connection_target,
+            );
+            let modification_context = ModificationLogContext::new(
+                ModificationPhase::Manual,
+                ModificationTriggerSource::ConflictResolution,
+            );
             let conflict = state_store
                 .load_conflict(normalized_path.as_str())?
                 .with_context(|| format!("conflict not found for path={normalized_path}"))?;
@@ -123,6 +138,8 @@ pub fn resolve_conflict_action(
                         scope,
                         normalized_path.as_str(),
                         metadata.len(),
+                        Some(&modification_log_store),
+                        Some(&modification_context),
                     )?;
 
                     if let Some(entry_state) =
@@ -160,7 +177,16 @@ pub fn resolve_conflict_action(
                         &local_target,
                     )?;
 
-                    remove_local_path(root_dir, normalized_path.as_str())?;
+                    let remote_key = scope
+                        .local_to_remote(normalized_path.as_str())
+                        .unwrap_or_else(|| normalized_path.clone());
+                    remove_local_path(
+                        root_dir,
+                        normalized_path.as_str(),
+                        Some(remote_key.as_str()),
+                        Some(&modification_log_store),
+                        Some(&modification_context),
+                    )?;
 
                     let client = build_configured_client(
                         server_base_url,
@@ -168,7 +194,13 @@ pub fn resolve_conflict_action(
                         server_ca_pem,
                         client_identity_json,
                     )?;
-                    delete_remote_file(&client, scope, normalized_path.as_str())?;
+                    delete_remote_file(
+                        &client,
+                        scope,
+                        normalized_path.as_str(),
+                        Some(&modification_log_store),
+                        Some(&modification_context),
+                    )?;
                     state_store.remove_baseline_entry(normalized_path.as_str())?;
 
                     let removed_conflict_rows =
@@ -200,6 +232,8 @@ pub fn upload_local_file(
     scope: &PathScope,
     relative_path: &str,
     _size_bytes: u64,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
 ) -> Result<String> {
     let absolute = absolute_path(root_dir, relative_path);
     let content_hash = file_content_hash(&absolute)?;
@@ -209,9 +243,35 @@ pub fn upload_local_file(
     })?;
     let state_path = upload_transfer_state_path(root_dir, &remote_key);
 
-    client
-        .put_file_resumable(remote_key.clone(), &absolute, &state_path)
-        .with_context(|| format!("failed to upload local file {relative_path} to {remote_key}"))?;
+    let result = client.put_file_resumable(remote_key.clone(), &absolute, &state_path);
+    if let Err(error) = result {
+        let error = error
+            .context(format!("failed to upload local file {relative_path} to {remote_key}"));
+        try_record_modification(
+            modification_log,
+            modification_context,
+            ModificationOperation::Upload,
+            ModificationOutcome::Error,
+            relative_path,
+            remote_key.as_str(),
+            Some(_size_bytes),
+            Some(content_hash.as_str()),
+            Some(&format!("{error:#}")),
+        );
+        return Err(error);
+    }
+
+    try_record_modification(
+        modification_log,
+        modification_context,
+        ModificationOperation::Upload,
+        ModificationOutcome::Success,
+        relative_path,
+        remote_key.as_str(),
+        Some(_size_bytes),
+        Some(content_hash.as_str()),
+        None,
+    );
 
     Ok(content_hash)
 }
@@ -220,32 +280,104 @@ pub fn delete_remote_file(
     client: &IronMeshClient,
     scope: &PathScope,
     file_path: &str,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
 ) -> Result<()> {
     let Some(remote_key) = scope.local_to_remote(file_path) else {
         return Ok(());
     };
 
-    client
-        .delete_path_blocking(&remote_key)
-        .with_context(|| format!("failed to delete remote file {remote_key}"))?;
+    let result = client.delete_path_blocking(&remote_key);
+    if let Err(error) = result {
+        let error = error.context(format!("failed to delete remote file {remote_key}"));
+        try_record_modification(
+            modification_log,
+            modification_context,
+            ModificationOperation::DeleteRemote,
+            ModificationOutcome::Error,
+            file_path,
+            remote_key.as_str(),
+            None,
+            None,
+            Some(&format!("{error:#}")),
+        );
+        return Err(error);
+    }
+
+    try_record_modification(
+        modification_log,
+        modification_context,
+        ModificationOperation::DeleteRemote,
+        ModificationOutcome::Success,
+        file_path,
+        remote_key.as_str(),
+        None,
+        None,
+        None,
+    );
 
     Ok(())
 }
 
-pub fn remove_local_path(root_dir: &Path, relative_path: &str) -> Result<()> {
+pub fn remove_local_path(
+    root_dir: &Path,
+    relative_path: &str,
+    remote_key: Option<&str>,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
+) -> Result<()> {
     let absolute = absolute_path(root_dir, relative_path);
+    let resolved_remote_key = remote_key.unwrap_or(relative_path);
 
     match fs::metadata(&absolute) {
         Ok(metadata) => {
             if metadata.is_dir() {
-                fs::remove_dir_all(&absolute).with_context(|| {
-                    format!("failed to remove local directory {}", absolute.display())
-                })?;
+                if let Err(error) = fs::remove_dir_all(&absolute) {
+                    let error = anyhow::Error::from(error)
+                        .context(format!("failed to remove local directory {}", absolute.display()));
+                    try_record_modification(
+                        modification_log,
+                        modification_context,
+                        ModificationOperation::DeleteLocal,
+                        ModificationOutcome::Error,
+                        relative_path,
+                        resolved_remote_key,
+                        None,
+                        None,
+                        Some(&format!("{error:#}")),
+                    );
+                    return Err(error);
+                }
             } else {
-                fs::remove_file(&absolute).with_context(|| {
-                    format!("failed to remove local file {}", absolute.display())
-                })?;
+                if let Err(error) = fs::remove_file(&absolute) {
+                    let error = anyhow::Error::from(error)
+                        .context(format!("failed to remove local file {}", absolute.display()));
+                    try_record_modification(
+                        modification_log,
+                        modification_context,
+                        ModificationOperation::DeleteLocal,
+                        ModificationOutcome::Error,
+                        relative_path,
+                        resolved_remote_key,
+                        None,
+                        None,
+                        Some(&format!("{error:#}")),
+                    );
+                    return Err(error);
+                }
             }
+
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::DeleteLocal,
+                ModificationOutcome::Success,
+                relative_path,
+                resolved_remote_key,
+                None,
+                None,
+                None,
+            );
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -368,9 +500,9 @@ mod tests {
         fs::write(root.join("nested/file.txt"), b"hello").unwrap();
         fs::write(root.join("nested/dir/child.txt"), b"child").unwrap();
 
-        remove_local_path(&root, "nested/file.txt").unwrap();
-        remove_local_path(&root, "nested/dir").unwrap();
-        remove_local_path(&root, "nested/missing.txt").unwrap();
+        remove_local_path(&root, "nested/file.txt", None, None, None).unwrap();
+        remove_local_path(&root, "nested/dir", None, None, None).unwrap();
+        remove_local_path(&root, "nested/missing.txt", None, None, None).unwrap();
 
         assert!(!root.join("nested/file.txt").exists());
         assert!(!root.join("nested/dir").exists());
@@ -410,7 +542,7 @@ mod tests {
     fn delete_remote_file_skips_empty_local_root_mapping() {
         let scope = PathScope::new(Some("cameras/vm1".to_string()));
         let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:65535");
-        delete_remote_file(&client, &scope, "").unwrap();
+        delete_remote_file(&client, &scope, "", None, None).unwrap();
     }
 
     fn test_root() -> PathBuf {

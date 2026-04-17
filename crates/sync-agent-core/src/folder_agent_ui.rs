@@ -1,9 +1,10 @@
 use crate::{
-    ConflictResolutionResult, ConflictResolutionStrategy, PathScope, StartupStateStore,
-    StoredConflict, newest_remote_conflict_copy, resolve_conflict_action,
+    ConflictResolutionResult, ConflictResolutionStrategy, ModificationHistoryPage,
+    ModificationLogStore, ModificationOperation, PathScope, StartupStateStore, StoredConflict,
+    newest_remote_conflict_copy, resolve_conflict_action,
 };
 use anyhow::Result;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderValue};
 use axum::response::{Html, IntoResponse, Response};
@@ -31,6 +32,7 @@ struct FolderAgentUiStateInner {
     client_identity_json: Option<String>,
     scope: PathScope,
     state_store: StartupStateStore,
+    modification_log_store: ModificationLogStore,
     operation_lock: Mutex<()>,
 }
 
@@ -45,6 +47,7 @@ impl FolderAgentUiState {
         client_identity_json: Option<String>,
         scope: PathScope,
         state_store: StartupStateStore,
+        modification_log_store: ModificationLogStore,
     ) -> Self {
         Self {
             inner: Arc::new(FolderAgentUiStateInner {
@@ -56,6 +59,7 @@ impl FolderAgentUiState {
                 client_identity_json,
                 scope,
                 state_store,
+                modification_log_store,
                 operation_lock: Mutex::new(()),
             }),
         }
@@ -107,6 +111,7 @@ fn router(state: FolderAgentUiState) -> Router {
         .route("/ui/app.js", get(app_js))
         .route("/api/health", get(health))
         .route("/api/info", get(info))
+        .route("/api/modifications", get(list_modifications))
         .route("/api/conflicts", get(list_conflicts))
         .route("/api/conflicts/resolve", post(resolve_conflict))
         .with_state(state)
@@ -148,6 +153,7 @@ struct InfoResponse {
     connection_target: String,
     prefix: Option<String>,
     state_db_path: String,
+    modification_log_db_path: String,
 }
 
 async fn info(State(state): State<FolderAgentUiState>) -> impl IntoResponse {
@@ -159,8 +165,36 @@ async fn info(State(state): State<FolderAgentUiState>) -> impl IntoResponse {
             connection_target: inner.connection_target.clone(),
             prefix: inner.scope.remote_prefix().map(ToString::to_string),
             state_db_path: inner.state_store.path.display().to_string(),
+            modification_log_db_path: inner.modification_log_store.path().display().to_string(),
         }),
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct ModificationsQuery {
+    limit: Option<usize>,
+    before_id: Option<i64>,
+    operation: Option<ModificationOperation>,
+}
+
+async fn list_modifications(
+    State(state): State<FolderAgentUiState>,
+    Query(query): Query<ModificationsQuery>,
+) -> Response {
+    let inner = state.inner.clone();
+
+    let outcome = tokio::task::spawn_blocking(move || -> Result<ModificationHistoryPage> {
+        inner
+            .modification_log_store
+            .list(query.limit, query.before_id, query.operation)
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(history)) => (StatusCode::OK, Json(history)).into_response(),
+        Ok(Err(err)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
 }
 
 #[derive(Debug, Serialize)]

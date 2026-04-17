@@ -123,5 +123,16 @@ object RustClientBridge {
     external fun getContinuousFolderSyncStatus(): String
 
     @JvmStatic
+    external fun getFolderSyncModificationHistory(
+        connectionInput: String,
+        localFolder: String,
+        localFolderTreeUri: String?,
+        prefix: String?,
+        limit: Int,
+        beforeId: Long,
+        operation: String?,
+    ): String
+
+    @JvmStatic
     external fun hasContinuousFolderSyncActive(): Boolean
 }

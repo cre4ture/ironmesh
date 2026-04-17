@@ -11,6 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::folder_agent_startup::StartupConflict;
 use crate::{LocalEntryKind, LocalEntryState, LocalTreeState, normalize_relative_path};
 
+pub(crate) const FOLDER_AGENT_BASELINE_FILE_NAME: &str = "baseline.sqlite";
+pub(crate) const FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME: &str = "modification-log.sqlite";
+
 #[derive(Debug, Clone)]
 pub struct PathScope {
     prefix: Option<String>,
@@ -63,6 +66,48 @@ impl PathScope {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct FolderAgentProfilePaths {
+    pub scope_fingerprint: String,
+    pub baseline_path: PathBuf,
+    pub modification_log_path: PathBuf,
+}
+
+pub(crate) fn default_folder_agent_state_root() -> PathBuf {
+    xdg_state_home().unwrap_or_else(std::env::temp_dir).join("ironmesh").join("folder-agent")
+}
+
+pub(crate) fn folder_agent_profile_paths(
+    identity_root: &Path,
+    scope: &PathScope,
+    connection_target: &str,
+    state_root_dir: &Path,
+) -> FolderAgentProfilePaths {
+    let mut hasher = DefaultHasher::new();
+    identity_root.to_string_lossy().hash(&mut hasher);
+    scope.remote_prefix().unwrap_or_default().hash(&mut hasher);
+    connection_target.hash(&mut hasher);
+    let scope_fingerprint = format!("{:016x}", hasher.finish());
+
+    let profile_dir = state_root_dir.join("profiles").join(&scope_fingerprint);
+    FolderAgentProfilePaths {
+        scope_fingerprint,
+        baseline_path: profile_dir.join(FOLDER_AGENT_BASELINE_FILE_NAME),
+        modification_log_path: profile_dir.join(FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME),
+    }
+}
+
+fn xdg_state_home() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".local").join("state"))
+}
+
 #[derive(Clone)]
 pub struct StartupStateStore {
     pub path: PathBuf,
@@ -82,7 +127,7 @@ pub const BASELINE_SCHEMA_VERSION_CURRENT: i64 = 2;
 
 impl StartupStateStore {
     pub fn new(root_dir: &Path, scope: &PathScope, server_base_url: &str) -> Self {
-        Self::new_with_state_root(root_dir, scope, server_base_url, &std::env::temp_dir())
+        Self::new_with_state_root(root_dir, scope, server_base_url, &default_folder_agent_state_root())
     }
 
     pub fn new_with_state_root(
@@ -91,18 +136,10 @@ impl StartupStateStore {
         server_base_url: &str,
         state_root_dir: &Path,
     ) -> Self {
-        let mut hasher = DefaultHasher::new();
-        root_dir.to_string_lossy().hash(&mut hasher);
-        scope.remote_prefix().unwrap_or_default().hash(&mut hasher);
-        server_base_url.hash(&mut hasher);
-        let fingerprint = hasher.finish();
-
-        let mut path = state_root_dir.to_path_buf();
-        path.push("ironmesh-folder-agent");
-        path.push(format!("baseline-{fingerprint:016x}.sqlite"));
+        let profile_paths = folder_agent_profile_paths(root_dir, scope, server_base_url, state_root_dir);
         Self {
-            path,
-            scope_fingerprint: format!("{fingerprint:016x}"),
+            path: profile_paths.baseline_path,
+            scope_fingerprint: profile_paths.scope_fingerprint,
         }
     }
 
@@ -1056,18 +1093,18 @@ mod tests {
         assert!(store.path.starts_with(&state_root));
         assert_eq!(
             store.path.parent().unwrap().file_name().unwrap(),
-            "ironmesh-folder-agent"
+            store.scope_fingerprint.as_str()
         );
-        let file_name = store
-            .path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
         assert_eq!(
-            file_name,
-            format!("baseline-{}.sqlite", store.scope_fingerprint)
+            store
+                .path
+                .parent()
+                .and_then(|value| value.parent())
+                .and_then(|value| value.file_name())
+                .unwrap(),
+            "profiles"
         );
+        assert_eq!(store.path.file_name().unwrap(), FOLDER_AGENT_BASELINE_FILE_NAME);
 
         fs::remove_dir_all(root).unwrap();
     }

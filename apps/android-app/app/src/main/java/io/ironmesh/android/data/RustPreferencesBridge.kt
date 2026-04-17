@@ -26,4 +26,10 @@ object RustPreferencesBridge {
         val context = appContext ?: error("RustPreferencesBridge is not initialized")
         return context.cacheDir.absolutePath
     }
+
+    @JvmStatic
+    fun noBackupFilesDirPath(): String {
+        val context = appContext ?: error("RustPreferencesBridge is not initialized")
+        return context.noBackupFilesDir.absolutePath
+    }
 }

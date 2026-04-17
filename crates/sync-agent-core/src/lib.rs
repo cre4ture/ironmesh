@@ -1,10 +1,12 @@
 mod folder_agent_conflicts;
+mod folder_agent_modification_log;
 mod folder_agent_runtime;
 mod folder_agent_startup;
 mod folder_agent_state;
 mod folder_agent_ui;
 
 pub use folder_agent_conflicts::*;
+pub use folder_agent_modification_log::*;
 pub use folder_agent_runtime::*;
 pub use folder_agent_startup::*;
 pub use folder_agent_state::*;

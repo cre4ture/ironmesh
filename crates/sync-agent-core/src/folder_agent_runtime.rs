@@ -18,8 +18,10 @@ use sync_core::{EntryKind, SyncSnapshot};
 
 use crate::{
     FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeScanProgress, LocalTreeState,
-    PathScope, RemoteTreeIndex, StartupStateStore, absolute_path, build_configured_client,
-    cleanup_ironmesh_part_files, delete_remote_file, describe_connection_target, diff_local_trees,
+    ModificationLogContext, ModificationLogStore, ModificationOperation, ModificationOutcome,
+    ModificationPhase, ModificationTriggerSource, PathScope, RemoteTreeIndex,
+    StartupStateStore, absolute_path, build_configured_client, cleanup_ironmesh_part_files,
+    delete_remote_file, describe_connection_target, diff_local_trees,
     download_transfer_state_path, download_transfer_temp_path,
     load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
     local_entry_state_for_path, local_paths_to_preserve_on_startup,
@@ -27,7 +29,7 @@ use crate::{
     remote_file_paths_by_local_path, remove_local_path, scan_local_tree,
     scan_local_tree_with_progress, spawn_ui_server, startup_add_delete_conflicts,
     startup_baseline_state_from_remote_index, startup_dual_modify_conflicts,
-    startup_remote_delete_wins_paths, upload_local_file,
+    startup_remote_delete_wins_paths, try_record_modification, upload_local_file,
 };
 
 #[derive(Debug, Clone)]
@@ -328,6 +330,37 @@ fn run_folder_agent_inner(
         ),
         None => StartupStateStore::new(&options.root_dir, &scope, &connection_target),
     };
+    let modification_log_store = match options.state_root_dir.as_deref() {
+        Some(state_root_dir) => ModificationLogStore::new_with_state_root(
+            &options.root_dir,
+            &options.root_dir,
+            &scope,
+            &connection_target,
+            state_root_dir,
+        ),
+        None => ModificationLogStore::new(
+            &options.root_dir,
+            &options.root_dir,
+            &scope,
+            &connection_target,
+        ),
+    };
+    let startup_reconcile_log_context = ModificationLogContext::new(
+        ModificationPhase::Startup,
+        ModificationTriggerSource::StartupReconcile,
+    );
+    let remote_refresh_log_context = ModificationLogContext::new(
+        ModificationPhase::SteadyState,
+        ModificationTriggerSource::RemoteRefresh,
+    );
+    let local_watch_log_context = ModificationLogContext::new(
+        ModificationPhase::SteadyState,
+        ModificationTriggerSource::LocalWatch,
+    );
+    let local_scan_log_context = ModificationLogContext::new(
+        ModificationPhase::SteadyState,
+        ModificationTriggerSource::LocalScan,
+    );
 
     fs::create_dir_all(&options.root_dir).with_context(|| {
         format!(
@@ -356,6 +389,7 @@ fn run_folder_agent_inner(
             options.client_identity_json.clone(),
             scope.clone(),
             state_store.clone(),
+            modification_log_store.clone(),
         );
         Some(spawn_ui_server(listener, ui_state))
     } else {
@@ -553,9 +587,18 @@ fn run_folder_agent_inner(
         &scope,
         &mut suppressed_uploads,
         &mut remote_index,
+        Some(&modification_log_store),
+        Some(&startup_reconcile_log_context),
     )?;
     for path in &remote_delete_wins_paths {
-        remove_local_path(&options.root_dir, path)?;
+        let remote_key = scope.local_to_remote(path).unwrap_or_else(|| path.clone());
+        remove_local_path(
+            &options.root_dir,
+            path,
+            Some(remote_key.as_str()),
+            Some(&modification_log_store),
+            Some(&startup_reconcile_log_context),
+        )?;
         suppressed_uploads.remove(path);
     }
     initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
@@ -639,6 +682,8 @@ fn run_folder_agent_inner(
                 &scope,
                 &mut remote_index,
                 &mut suppressed_uploads,
+                Some(&modification_log_store),
+                Some(&startup_reconcile_log_context),
                 status_callback.as_ref(),
                 Some(&LocalScanStatusContext {
                     options: options.clone(),
@@ -811,6 +856,8 @@ fn run_folder_agent_inner(
                 &scope,
                 &mut suppressed_uploads,
                 &mut remote_index,
+                Some(&modification_log_store),
+                Some(&remote_refresh_log_context),
             )?);
             remote_updates_applied = true;
         }
@@ -925,6 +972,12 @@ fn run_folder_agent_inner(
                         &scope,
                         &mut remote_index,
                         &mut suppressed_uploads,
+                        Some(&modification_log_store),
+                        Some(if local_scan_requested {
+                            &local_watch_log_context
+                        } else {
+                            &local_scan_log_context
+                        }),
                         status_callback.as_ref(),
                         Some(&LocalScanStatusContext {
                             options: options.clone(),
@@ -1113,6 +1166,8 @@ fn sync_local_changes(
     scope: &PathScope,
     remote_index: &mut RemoteTreeIndex,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
     status_callback: Option<&FolderAgentStatusCallback>,
     local_scan_status: Option<&LocalScanStatusContext>,
 ) -> Result<LocalSyncOutcome> {
@@ -1173,7 +1228,15 @@ fn sync_local_changes(
         }
 
         let content_hash =
-            upload_local_file(root_dir, client, scope, path, entry_state.size_bytes)?;
+            upload_local_file(
+                root_dir,
+                client,
+                scope,
+                path,
+                entry_state.size_bytes,
+                modification_log,
+                modification_context,
+            )?;
         outcome.uploaded_file_count += 1;
         remote_index.files.insert(path.clone());
         for parent in parent_directories(path) {
@@ -1213,7 +1276,7 @@ fn sync_local_changes(
                 continue;
             }
 
-            delete_remote_file(client, scope, &path)?;
+            delete_remote_file(client, scope, &path, modification_log, modification_context)?;
             outcome.deleted_remote_file_count += 1;
             suppressed_uploads.remove(&path);
             remote_index.files.remove(&path);
@@ -1241,6 +1304,8 @@ fn apply_remote_snapshot(
     scope: &PathScope,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
     remote_index: &mut RemoteTreeIndex,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
 ) -> Result<RemoteApplyOutcome> {
     let mut outcome = RemoteApplyOutcome::default();
     let mut next_index = RemoteTreeIndex::default();
@@ -1320,6 +1385,8 @@ fn apply_remote_snapshot(
                             remote_key,
                             content_hash,
                             state_store,
+                            modification_log,
+                            modification_context,
                         )?;
                         if let Some(entry_state) = local_entry_state_for_path(root_dir, path)? {
                             suppressed_uploads.insert(path.to_string(), entry_state);
@@ -1328,7 +1395,14 @@ fn apply_remote_snapshot(
                     None => {
                         outcome.changed_path_count += 1;
                         outcome.removed_local_path_count += 1;
-                        remove_local_path(root_dir, path)?;
+                        let remote_key = scope.local_to_remote(path).unwrap_or_else(|| path.to_string());
+                        remove_local_path(
+                            root_dir,
+                            path,
+                            Some(remote_key.as_str()),
+                            modification_log,
+                            modification_context,
+                        )?;
                         suppressed_uploads.remove(path);
                         if let Some(store) = state_store {
                             store.remove_baseline_entry(path).with_context(|| {
@@ -1385,6 +1459,8 @@ fn apply_remote_snapshot(
                     remote_key,
                     content_hash,
                     state_store,
+                    modification_log,
+                    modification_context,
                 )?;
                 if let Some(entry_state) = local_entry_state_for_path(root_dir, file)? {
                     suppressed_uploads.insert(file.clone(), entry_state);
@@ -1816,6 +1892,8 @@ fn download_remote_file(
     remote_key: &str,
     remote_content_hash: Option<&str>,
     state_store: Option<&StartupStateStore>,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
 ) -> Result<()> {
     let target = absolute_path(root_dir, local_relative_path);
     let temp_path = download_transfer_temp_path(root_dir, remote_key);
@@ -1830,10 +1908,27 @@ fn download_remote_file(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
     }
-    client
-        .download_file_resumable(remote_key, None, None, &target, &temp_path, &state_path)
-        .with_context(|| format!("failed to download remote file {remote_key}"))?;
+    let download_result =
+        client.download_file_resumable(remote_key, None, None, &target, &temp_path, &state_path);
+    if let Err(error) = download_result {
+        let error = error.context(format!("failed to download remote file {remote_key}"));
+        try_record_modification(
+            modification_log,
+            modification_context,
+            ModificationOperation::Download,
+            ModificationOutcome::Error,
+            local_relative_path,
+            remote_key,
+            None,
+            remote_content_hash,
+            Some(&format!("{error:#}")),
+        );
+        return Err(error);
+    }
 
+    let size_bytes = fs::metadata(&target)
+        .with_context(|| format!("failed to inspect downloaded file {}", target.display()))?
+        .len();
     if let Some(store) = state_store {
         let metadata = fs::metadata(&target)
             .with_context(|| format!("failed to inspect downloaded file {}", target.display()))?;
@@ -1844,6 +1939,18 @@ fn download_remote_file(
                 format!("failed to persist baseline file entry for {local_relative_path}")
             })?;
     }
+
+    try_record_modification(
+        modification_log,
+        modification_context,
+        ModificationOperation::Download,
+        ModificationOutcome::Success,
+        local_relative_path,
+        remote_key,
+        Some(size_bytes),
+        remote_content_hash,
+        None,
+    );
 
     Ok(())
 }
