@@ -1,4 +1,4 @@
-mod saf_sync;
+mod android_saf_backend;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -106,8 +106,6 @@ use sync_agent_core::{
 };
 use tokio::task::JoinHandle;
 
-use crate::saf_sync::{initialize_android_saf_bridge, run_saf_folder_agent_with_control};
-
 fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     if let Some(rt) = RUNTIME.get() {
@@ -205,22 +203,6 @@ fn persist_android_connection_bootstrap(bootstrap: &ConnectionBootstrap) -> Resu
     })
 }
 
-fn android_cache_dir() -> Result<PathBuf> {
-    with_android_preferences_env(|env, class| {
-        let value = env
-            .call_static_method(&class, "cacheDirPath", "()Ljava/lang/String;", &[])
-            .context("failed to query Android cache dir path")?
-            .l()
-            .context("Android cache dir path returned invalid value")?;
-        let value = JString::from(value);
-        let value: String = env
-            .get_string(&value)
-            .context("failed to decode Android cache dir path")?
-            .into();
-        Ok(PathBuf::from(value))
-    })
-}
-
 fn android_no_backup_files_dir() -> Result<PathBuf> {
     with_android_preferences_env(|env, class| {
         let value = env
@@ -238,13 +220,13 @@ fn android_no_backup_files_dir() -> Result<PathBuf> {
 }
 
 fn android_download_stage_root(category: &str, scope: &str) -> Result<PathBuf> {
-    let cache_dir = android_cache_dir()?;
+    let state_dir = android_no_backup_files_dir()?;
     let scope = scope.trim();
     if scope.is_empty() {
         anyhow::bail!("android download staging scope cannot be empty");
     }
     let scope_hash = blake3::hash(scope.as_bytes()).to_hex().to_string();
-    Ok(cache_dir
+    Ok(state_dir
         .join("ironmesh-downloads")
         .join(category)
         .join(scope_hash))
@@ -277,7 +259,7 @@ fn folder_sync_modification_history_json(
     let local_folder_path = PathBuf::from(local_folder);
     let identity_root = normalized_local_tree_uri
         .as_deref()
-        .map(saf_sync::state_identity_root)
+        .map(android_saf_backend::backend_identity_root)
         .unwrap_or_else(|| local_folder_path.clone());
     let store = ModificationLogStore::new_with_state_root(
         &identity_root,
@@ -499,7 +481,7 @@ impl AndroidFolderSyncManager {
             .name(format!("ironmesh-folder-sync-{profile_id}"))
             .spawn(move || {
                 let result = if options.local_tree_uri.is_some() {
-                    run_saf_folder_agent_with_control(
+                    android_saf_backend::run_backend_with_control(
                         &options,
                         thread_running,
                         Some(status_callback),
@@ -1490,7 +1472,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
         initialize_android_preferences_bridge(&mut env)?;
 
         if local_tree_uri.is_some() {
-            initialize_android_saf_bridge(&mut env)?;
+            android_saf_backend::initialize_backend_bridge(&mut env)?;
         }
 
         let options = FolderAgentRuntimeOptions {
@@ -1511,7 +1493,11 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
         };
 
         if options.local_tree_uri.is_some() {
-            run_saf_folder_agent_with_control(&options, Arc::new(AtomicBool::new(true)), None)
+            android_saf_backend::run_backend_with_control(
+                &options,
+                Arc::new(AtomicBool::new(true)),
+                None,
+            )
         } else {
             run_folder_agent(&options)
         }
@@ -1552,7 +1538,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
         initialize_android_preferences_bridge(&mut env)?;
 
         if local_tree_uri.is_some() {
-            initialize_android_saf_bridge(&mut env)?;
+            android_saf_backend::initialize_backend_bridge(&mut env)?;
         }
 
         let options = FolderAgentRuntimeOptions {

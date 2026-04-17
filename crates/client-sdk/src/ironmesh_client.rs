@@ -3115,6 +3115,14 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 }
 
 fn place_downloaded_file(temp_path: &Path, target_path: &Path) -> Result<()> {
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create download target directory {}",
+                parent.display()
+            )
+        })?;
+    }
     match fs::remove_file(target_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -3404,6 +3412,32 @@ mod tests {
             paths,
             vec!["docs/", "docs/guides/", "docs/guides/readme.md"]
         );
+    }
+
+    #[test]
+    fn place_downloaded_file_creates_missing_target_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-place-downloaded-file-test-{}-{}",
+            std::process::id(),
+            nonce
+        ));
+        let source_dir = root.join("source");
+        let target_dir = root.join("target").join("nested");
+        fs::create_dir_all(&source_dir).unwrap();
+        let temp_path = source_dir.join("download.part");
+        let target_path = target_dir.join("download.bin");
+        fs::write(&temp_path, b"hello").unwrap();
+
+        place_downloaded_file(&temp_path, &target_path).unwrap();
+
+        assert_eq!(fs::read(&target_path).unwrap(), b"hello");
+        assert!(!temp_path.exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

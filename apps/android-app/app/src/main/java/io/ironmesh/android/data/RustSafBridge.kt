@@ -140,6 +140,43 @@ object RustSafBridge {
         return DocumentsContract.deleteDocument(resolver, documentUri)
     }
 
+    @JvmStatic
+    fun statTreePath(treeUriString: String, relativePath: String): String? {
+        val resolver = requireResolver()
+        val treeUri = Uri.parse(treeUriString)
+        val documentUri = resolveExistingDocumentUri(resolver, treeUri, relativePath) ?: return null
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
+
+        resolver.query(documentUri, projection, null, null, null)?.use { cursor ->
+            if (!cursor.moveToFirst()) {
+                return null
+            }
+
+            val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            val sizeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
+            val modifiedIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+            val mimeType = cursor.getString(mimeIndex)
+            val sizeBytes = cursor.getLong(sizeIndex).coerceAtLeast(0L)
+            val modifiedUnixMs = cursor.getLong(modifiedIndex).coerceAtLeast(0L)
+
+            return JSONObject()
+                .put("path", normalizeRelativePath(relativePath))
+                .put(
+                    "kind",
+                    if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) "directory" else "file",
+                )
+                .put("sizeBytes", sizeBytes)
+                .put("modifiedUnixMs", modifiedUnixMs)
+                .toString()
+        }
+
+        return null
+    }
+
     private fun requireResolver(): ContentResolver {
         return appContext?.contentResolver
             ?: error("RustSafBridge is not initialized")

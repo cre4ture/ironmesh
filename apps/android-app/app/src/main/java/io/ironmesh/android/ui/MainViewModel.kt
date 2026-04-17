@@ -398,6 +398,15 @@ class MainViewModel(
     }
 
     fun runFolderSyncNow() {
+        val status = uiState.value.folderSyncStatus
+        val continuousSyncActive = status.activeProfileCount > 0L &&
+            status.serviceState in setOf("starting", "running", "syncing")
+        if (continuousSyncActive) {
+            refreshExpandedFolderSyncHistory(force = true)
+            setStatus("Continuous folder sync already active; manual one-shot run skipped")
+            return
+        }
+
         FolderSyncScheduler.runNow(getApplication())
         setStatus("Folder sync scheduled")
     }

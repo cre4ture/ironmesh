@@ -30,6 +30,25 @@ pub fn local_paths_to_preserve_on_startup(
     baseline: Option<&LocalTreeState>,
     remote_hashes: &BTreeMap<String, String>,
 ) -> BTreeSet<String> {
+    local_paths_to_preserve_on_startup_with_hash(
+        local_state,
+        baseline,
+        remote_hashes,
+        "local file",
+        |path| local_file_content_hash(root_dir, path),
+    )
+}
+
+pub fn local_paths_to_preserve_on_startup_with_hash<F>(
+    local_state: &LocalTreeState,
+    baseline: Option<&LocalTreeState>,
+    remote_hashes: &BTreeMap<String, String>,
+    path_kind_label: &str,
+    mut content_hash_for_path: F,
+) -> BTreeSet<String>
+where
+    F: FnMut(&str) -> Result<String>,
+{
     let mut preserve = BTreeSet::new();
 
     for (path, entry_state) in local_state {
@@ -39,12 +58,12 @@ pub fn local_paths_to_preserve_on_startup(
 
         let Some(previous) = baseline.and_then(|state| state.get(path)) else {
             if let Some(remote_hash) = remote_hashes.get(path) {
-                match local_file_content_hash(root_dir, path) {
+                match content_hash_for_path(path) {
                     Ok(local_hash) if local_hash == *remote_hash => continue,
                     Ok(_) => {}
                     Err(error) => {
                         tracing::warn!(
-                            "startup-state: failed to hash local file {path}: {error}; preserving local bytes"
+                            "startup-state: failed to hash {path_kind_label} {path}: {error}; preserving local bytes"
                         );
                     }
                 }
@@ -55,12 +74,12 @@ pub fn local_paths_to_preserve_on_startup(
 
         if previous != entry_state {
             if let Some(remote_hash) = remote_hashes.get(path) {
-                match local_file_content_hash(root_dir, path) {
+                match content_hash_for_path(path) {
                     Ok(local_hash) if local_hash == *remote_hash => continue,
                     Ok(_) => {}
                     Err(error) => {
                         tracing::warn!(
-                            "startup-state: failed to hash local file {path}: {error}; preserving local bytes"
+                            "startup-state: failed to hash {path_kind_label} {path}: {error}; preserving local bytes"
                         );
                     }
                 }
@@ -70,6 +89,56 @@ pub fn local_paths_to_preserve_on_startup(
     }
 
     preserve
+}
+
+pub fn local_paths_matching_remote_on_startup<F>(
+    local_state: &LocalTreeState,
+    baseline: Option<&LocalTreeState>,
+    baseline_hashes: &BTreeMap<String, String>,
+    remote_hashes: &BTreeMap<String, String>,
+    path_kind_label: &str,
+    mut content_hash_for_path: F,
+) -> BTreeSet<String>
+where
+    F: FnMut(&str) -> Result<String>,
+{
+    let mut matched = BTreeSet::new();
+
+    for (path, entry_state) in local_state {
+        if entry_state.kind != LocalEntryKind::File {
+            continue;
+        }
+
+        let Some(remote_hash) = remote_hashes.get(path) else {
+            continue;
+        };
+
+        if baseline.and_then(|state| state.get(path)) == Some(entry_state)
+            && baseline_hashes
+                .get(path)
+                .is_some_and(|baseline_hash| baseline_hash == remote_hash)
+        {
+            matched.insert(path.clone());
+            continue;
+        }
+
+        match content_hash_for_path(path) {
+            Ok(local_hash) if local_hash == *remote_hash => {
+                matched.insert(path.clone());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "startup-state: failed to hash {} {} for remote-match check: {}; treating as requiring remote apply",
+                    path_kind_label,
+                    path,
+                    error,
+                );
+            }
+        }
+    }
+
+    matched
 }
 
 pub fn remote_file_hashes_by_local_path(
@@ -134,6 +203,29 @@ pub fn startup_remote_delete_wins_paths(
     remote_files: &BTreeSet<String>,
     preserve_local_files: &BTreeSet<String>,
 ) -> BTreeSet<String> {
+    startup_remote_delete_wins_paths_with_hash(
+        local_state,
+        baseline,
+        baseline_hashes,
+        remote_files,
+        preserve_local_files,
+        "local file",
+        |path| local_file_content_hash(root_dir, path),
+    )
+}
+
+pub fn startup_remote_delete_wins_paths_with_hash<F>(
+    local_state: &LocalTreeState,
+    baseline: Option<&LocalTreeState>,
+    baseline_hashes: &BTreeMap<String, String>,
+    remote_files: &BTreeSet<String>,
+    preserve_local_files: &BTreeSet<String>,
+    path_kind_label: &str,
+    mut content_hash_for_path: F,
+) -> BTreeSet<String>
+where
+    F: FnMut(&str) -> Result<String>,
+{
     let mut delete_wins = BTreeSet::new();
 
     for (path, entry_state) in local_state {
@@ -156,14 +248,14 @@ pub fn startup_remote_delete_wins_paths(
             let Some(expected_hash) = baseline_hashes.get(path) else {
                 continue;
             };
-            match local_file_content_hash(root_dir, path) {
+            match content_hash_for_path(path) {
                 Ok(local_hash) if local_hash == *expected_hash => {
                     delete_wins.insert(path.clone());
                 }
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
-                        "startup-state: failed to hash local file {path} for remote-delete check: {error}; preserving local bytes"
+                        "startup-state: failed to hash {path_kind_label} {path} for remote-delete check: {error}; preserving local bytes"
                     );
                 }
             }
@@ -448,6 +540,29 @@ pub fn startup_dual_modify_conflicts(
     remote_hashes: &BTreeMap<String, String>,
     preserve_local_files: &BTreeSet<String>,
 ) -> Vec<StartupConflict> {
+    startup_dual_modify_conflicts_with_hash(
+        local_state,
+        baseline,
+        baseline_hashes,
+        remote_hashes,
+        preserve_local_files,
+        "local file",
+        |path| local_file_content_hash(root_dir, path),
+    )
+}
+
+pub fn startup_dual_modify_conflicts_with_hash<F>(
+    local_state: &LocalTreeState,
+    baseline: Option<&LocalTreeState>,
+    baseline_hashes: &BTreeMap<String, String>,
+    remote_hashes: &BTreeMap<String, String>,
+    preserve_local_files: &BTreeSet<String>,
+    path_kind_label: &str,
+    mut content_hash_for_path: F,
+) -> Vec<StartupConflict>
+where
+    F: FnMut(&str) -> Result<String>,
+{
     let mut conflicts = Vec::new();
 
     for path in preserve_local_files {
@@ -462,11 +577,11 @@ pub fn startup_dual_modify_conflicts(
             continue;
         };
 
-        let local_hash = match local_file_content_hash(root_dir, path) {
+        let local_hash = match content_hash_for_path(path) {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(
-                    "startup-state: failed to hash local file {path} for dual-modify check: {error}; treating as conflict"
+                    "startup-state: failed to hash {path_kind_label} {path} for dual-modify check: {error}; treating as conflict"
                 );
                 let stored_baseline = baseline.and_then(|state| state.get(path));
                 let reason = match stored_baseline {
@@ -658,6 +773,75 @@ mod tests {
 
         assert_eq!(preserve.len(), 1);
         assert!(preserve.contains("docs/readme.txt"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_remote_match_uses_baseline_hash_for_unchanged_file() {
+        let root = test_root();
+        write_file(&root, "docs/readme.txt", b"hello");
+
+        let entry = local_entry_state_for_path(&root, "docs/readme.txt")
+            .unwrap()
+            .unwrap();
+        let mut local = LocalTreeState::new();
+        local.insert("docs/readme.txt".to_string(), entry.clone());
+
+        let mut baseline = LocalTreeState::new();
+        baseline.insert("docs/readme.txt".to_string(), entry);
+
+        let local_hash = local_file_content_hash(&root, "docs/readme.txt").unwrap();
+        let mut baseline_hashes = BTreeMap::new();
+        baseline_hashes.insert("docs/readme.txt".to_string(), local_hash.clone());
+        let mut remote_hashes = BTreeMap::new();
+        remote_hashes.insert("docs/readme.txt".to_string(), local_hash);
+
+        let matched = local_paths_matching_remote_on_startup(
+            &local,
+            Some(&baseline),
+            &baseline_hashes,
+            &remote_hashes,
+            "local file",
+            |_| -> Result<String> {
+                panic!("unchanged file should not need hashing when baseline hash matches remote")
+            },
+        );
+
+        assert!(matched.contains("docs/readme.txt"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_remote_match_hashes_file_when_baseline_missing() {
+        let root = test_root();
+        write_file(&root, "docs/readme.txt", b"hello");
+
+        let mut local = LocalTreeState::new();
+        local.insert(
+            "docs/readme.txt".to_string(),
+            local_entry_state_for_path(&root, "docs/readme.txt")
+                .unwrap()
+                .unwrap(),
+        );
+
+        let mut remote_hashes = BTreeMap::new();
+        remote_hashes.insert(
+            "docs/readme.txt".to_string(),
+            local_file_content_hash(&root, "docs/readme.txt").unwrap(),
+        );
+
+        let matched = local_paths_matching_remote_on_startup(
+            &local,
+            None,
+            &BTreeMap::new(),
+            &remote_hashes,
+            "local file",
+            |path| local_file_content_hash(&root, path),
+        );
+
+        assert!(matched.contains("docs/readme.txt"));
 
         fs::remove_dir_all(root).unwrap();
     }

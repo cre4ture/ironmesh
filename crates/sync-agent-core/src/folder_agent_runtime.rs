@@ -21,15 +21,16 @@ use crate::{
     ModificationLogContext, ModificationLogStore, ModificationOperation, ModificationOutcome,
     ModificationPhase, ModificationTriggerSource, PathScope, RemoteTreeIndex,
     StartupStateStore, absolute_path, build_configured_client, cleanup_ironmesh_part_files,
-    delete_remote_file, describe_connection_target, diff_local_trees,
+    describe_connection_target, diff_local_trees,
     download_transfer_state_path, download_transfer_temp_path,
     load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
-    local_entry_state_for_path, local_paths_to_preserve_on_startup,
+    local_entry_state_for_path, local_paths_matching_remote_on_startup,
+    local_paths_to_preserve_on_startup_with_hash,
     materialize_remote_conflict_copies, parent_directories, remote_file_hashes_by_local_path,
-    remote_file_paths_by_local_path, remove_local_path, scan_local_tree,
+    remote_file_paths_by_local_path, remove_local_path,
     scan_local_tree_with_progress, spawn_ui_server, startup_add_delete_conflicts,
-    startup_baseline_state_from_remote_index, startup_dual_modify_conflicts,
-    startup_remote_delete_wins_paths, try_record_modification, upload_local_file,
+    startup_baseline_state_from_remote_index, startup_dual_modify_conflicts_with_hash,
+    startup_remote_delete_wins_paths_with_hash, try_record_modification, upload_local_file,
 };
 
 #[derive(Debug, Clone)]
@@ -196,11 +197,284 @@ impl FolderAgentRuntimeStatus {
     }
 }
 
+pub trait FolderAgentLocalBackend {
+    fn storage_mode_label(&self, options: &FolderAgentRuntimeOptions) -> &'static str;
+
+    fn watch_mode_label(&self, options: &FolderAgentRuntimeOptions) -> &'static str;
+
+    fn local_tree_label(&self, _options: &FolderAgentRuntimeOptions) -> &'static str {
+        "local files"
+    }
+
+    fn file_hash_label(&self, _options: &FolderAgentRuntimeOptions) -> &'static str {
+        "local file"
+    }
+
+    fn watch_idle_message(&self, _options: &FolderAgentRuntimeOptions) -> String {
+        "Watching for changes; local and remote state are aligned".to_string()
+    }
+
+    fn watch_after_local_sync_message(
+        &self,
+        _options: &FolderAgentRuntimeOptions,
+        summary: &str,
+    ) -> String {
+        format!("Watching for changes after local sync: {summary}")
+    }
+
+    fn state_identity_root(&self, options: &FolderAgentRuntimeOptions) -> Result<PathBuf>;
+
+    fn prepare(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()>;
+
+    fn cleanup_startup_artifacts(&mut self, _options: &FolderAgentRuntimeOptions) -> Result<()> {
+        Ok(())
+    }
+
+    fn materialize_remote_conflict_copies(
+        &mut self,
+        _options: &FolderAgentRuntimeOptions,
+        _client: &IronMeshClient,
+        _scope: &PathScope,
+        _conflicts: &[crate::StartupConflict],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn scan_local_tree_with_progress(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        on_progress: &mut dyn FnMut(&LocalTreeScanProgress),
+    ) -> Result<LocalTreeState>;
+
+    fn local_entry_state(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        relative_path: &str,
+    ) -> Result<Option<LocalEntryState>>;
+
+    fn file_content_hash(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        relative_path: &str,
+    ) -> Result<String>;
+
+    fn ensure_local_directory(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        relative_path: &str,
+    ) -> Result<()>;
+
+    fn upload_local_file(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        client: &IronMeshClient,
+        scope: &PathScope,
+        relative_path: &str,
+        size_bytes: u64,
+    ) -> Result<String>;
+
+    fn download_remote_file(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        client: &IronMeshClient,
+        local_relative_path: &str,
+        remote_key: &str,
+    ) -> Result<()>;
+
+    fn remove_local_path(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        relative_path: &str,
+    ) -> Result<()>;
+
+    fn start_local_change_monitor(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()>;
+
+    fn local_change_hint_pending(&mut self, options: &FolderAgentRuntimeOptions) -> Result<bool>;
+
+    fn acknowledge_local_change_hint(
+        &mut self,
+        _options: &FolderAgentRuntimeOptions,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct NativeFilesystemBackend {
+    local_event_rx: Option<mpsc::Receiver<()>>,
+    watcher: Option<RecommendedWatcher>,
+}
+
+impl FolderAgentLocalBackend for NativeFilesystemBackend {
+    fn storage_mode_label(&self, _options: &FolderAgentRuntimeOptions) -> &'static str {
+        "filesystem"
+    }
+
+    fn watch_mode_label(&self, options: &FolderAgentRuntimeOptions) -> &'static str {
+        watch_mode_label(options)
+    }
+
+    fn state_identity_root(&self, options: &FolderAgentRuntimeOptions) -> Result<PathBuf> {
+        Ok(options.root_dir.clone())
+    }
+
+    fn prepare(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()> {
+        fs::create_dir_all(&options.root_dir).with_context(|| {
+            format!(
+                "failed to create root directory {}",
+                options.root_dir.display()
+            )
+        })
+    }
+
+    fn cleanup_startup_artifacts(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()> {
+        cleanup_ironmesh_part_files(&options.root_dir, false).map(|_| ())
+    }
+
+    fn materialize_remote_conflict_copies(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        client: &IronMeshClient,
+        scope: &PathScope,
+        conflicts: &[crate::StartupConflict],
+    ) -> Result<()> {
+        materialize_remote_conflict_copies(&options.root_dir, client, scope, conflicts)
+    }
+
+    fn scan_local_tree_with_progress(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        on_progress: &mut dyn FnMut(&LocalTreeScanProgress),
+    ) -> Result<LocalTreeState> {
+        scan_local_tree_with_progress(&options.root_dir, |progress| on_progress(progress))
+    }
+
+    fn local_entry_state(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        relative_path: &str,
+    ) -> Result<Option<LocalEntryState>> {
+        local_entry_state_for_path(&options.root_dir, relative_path)
+    }
+
+    fn file_content_hash(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        relative_path: &str,
+    ) -> Result<String> {
+        crate::local_file_content_hash(&options.root_dir, relative_path)
+    }
+
+    fn ensure_local_directory(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        relative_path: &str,
+    ) -> Result<()> {
+        let absolute = absolute_path(&options.root_dir, relative_path);
+        fs::create_dir_all(&absolute).with_context(|| {
+            format!(
+                "failed to materialize remote directory {}",
+                absolute.display()
+            )
+        })
+    }
+
+    fn upload_local_file(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        client: &IronMeshClient,
+        scope: &PathScope,
+        relative_path: &str,
+        size_bytes: u64,
+    ) -> Result<String> {
+        upload_local_file(
+            &options.root_dir,
+            client,
+            scope,
+            relative_path,
+            size_bytes,
+            None,
+            None,
+        )
+    }
+
+    fn download_remote_file(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        client: &IronMeshClient,
+        local_relative_path: &str,
+        remote_key: &str,
+    ) -> Result<()> {
+        download_remote_file(
+            &options.root_dir,
+            client,
+            local_relative_path,
+            remote_key,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn remove_local_path(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        relative_path: &str,
+    ) -> Result<()> {
+        remove_local_path(&options.root_dir, relative_path, None, None, None)
+    }
+
+    fn start_local_change_monitor(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()> {
+        self.local_event_rx = None;
+        self.watcher = None;
+
+        if options.run_once || options.no_watch_local {
+            return Ok(());
+        }
+
+        let (local_event_tx, local_event_rx) = mpsc::channel::<()>();
+        let watcher = start_local_watcher(options.root_dir.clone(), local_event_tx)?;
+        self.local_event_rx = Some(local_event_rx);
+        self.watcher = Some(watcher);
+        Ok(())
+    }
+
+    fn local_change_hint_pending(&mut self, _options: &FolderAgentRuntimeOptions) -> Result<bool> {
+        let Some(local_event_rx) = &self.local_event_rx else {
+            return Ok(false);
+        };
+
+        let mut local_scan_requested = false;
+        while local_event_rx.try_recv().is_ok() {
+            local_scan_requested = true;
+        }
+        Ok(local_scan_requested)
+    }
+}
+
 pub fn run_folder_agent_with_control(
     options: &FolderAgentRuntimeOptions,
     running: Arc<AtomicBool>,
     install_signal_handler: bool,
     status_callback: Option<FolderAgentStatusCallback>,
+) -> Result<()> {
+    let mut backend = NativeFilesystemBackend::default();
+    run_folder_agent_with_backend_control(
+        options,
+        running,
+        install_signal_handler,
+        status_callback,
+        &mut backend,
+    )
+}
+
+pub fn run_folder_agent_with_backend_control<B: FolderAgentLocalBackend>(
+    options: &FolderAgentRuntimeOptions,
+    running: Arc<AtomicBool>,
+    install_signal_handler: bool,
+    status_callback: Option<FolderAgentStatusCallback>,
+    backend: &mut B,
 ) -> Result<()> {
     common::logging::init_compact_tracing_default("info");
     let prefix_label = options.prefix.as_deref().unwrap_or("<root>");
@@ -208,8 +482,8 @@ pub fn run_folder_agent_with_control(
         status_callback.as_ref(),
         options,
         None,
-        "filesystem",
-        watch_mode_label(options),
+        backend.storage_mode_label(options),
+        backend.watch_mode_label(options),
         "starting",
         "startup",
         "initializing",
@@ -226,6 +500,7 @@ pub fn run_folder_agent_with_control(
         running,
         install_signal_handler,
         status_callback.clone(),
+        backend,
     );
 
     if let Err(error) = &result {
@@ -233,8 +508,8 @@ pub fn run_folder_agent_with_control(
             status_callback.as_ref(),
             options,
             None,
-            "filesystem",
-            watch_mode_label(options),
+            backend.storage_mode_label(options),
+            backend.watch_mode_label(options),
             "error",
             "error",
             "failed",
@@ -300,46 +575,51 @@ struct BlockingStatusProgress {
 struct LocalScanStatusContext {
     options: FolderAgentRuntimeOptions,
     connection_target: String,
-    watch_mode: String,
     state: String,
     phase: String,
     base_message: String,
     last_success_unix_ms: Option<u64>,
 }
 
-fn run_folder_agent_inner(
+fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     options: &FolderAgentRuntimeOptions,
     running: Arc<AtomicBool>,
     install_signal_handler: bool,
     status_callback: Option<FolderAgentStatusCallback>,
+    backend: &mut B,
 ) -> Result<()> {
     let scope = PathScope::new(options.prefix.clone());
-    let watch_mode = watch_mode_label(options);
+    let storage_mode = backend.storage_mode_label(options);
+    let watch_mode = backend.watch_mode_label(options);
+    let local_tree_label = backend.local_tree_label(options);
+    let file_hash_label = backend.file_hash_label(options);
+    let idle_watch_message = backend.watch_idle_message(options);
     let connection_target = describe_connection_target(
         options.server_base_url.as_deref(),
         options.client_bootstrap_json.as_deref(),
     )?;
     let mut last_success_unix_ms = None;
     let last_success_shared = Arc::new(AtomicU64::new(0));
+    let state_identity_root = backend.state_identity_root(options)?;
     let state_store = match options.state_root_dir.as_deref() {
         Some(state_root_dir) => StartupStateStore::new_with_state_root(
-            &options.root_dir,
+            &state_identity_root,
             &scope,
             &connection_target,
             state_root_dir,
         ),
-        None => StartupStateStore::new(&options.root_dir, &scope, &connection_target),
+        None => StartupStateStore::new(&state_identity_root, &scope, &connection_target),
     };
     let modification_log_store = match options.state_root_dir.as_deref() {
         Some(state_root_dir) => ModificationLogStore::new_with_state_root(
-            &options.root_dir,
+            &state_identity_root,
             &options.root_dir,
             &scope,
             &connection_target,
             state_root_dir,
         ),
         None => ModificationLogStore::new(
-            &options.root_dir,
+            &state_identity_root,
             &options.root_dir,
             &scope,
             &connection_target,
@@ -362,12 +642,7 @@ fn run_folder_agent_inner(
         ModificationTriggerSource::LocalScan,
     );
 
-    fs::create_dir_all(&options.root_dir).with_context(|| {
-        format!(
-            "failed to create root directory {}",
-            options.root_dir.display()
-        )
-    })?;
+    backend.prepare(options)?;
 
     let _ui_handle = if let Some(bind_addr) = options.ui_bind.as_deref() {
         let listener = std::net::TcpListener::bind(bind_addr)
@@ -396,33 +671,34 @@ fn run_folder_agent_inner(
         None
     };
 
-    if let Err(error) = cleanup_ironmesh_part_files(&options.root_dir, false) {
+    if let Err(error) = backend.cleanup_startup_artifacts(options) {
         tracing::warn!("startup-state: failed to cleanup partial download artifacts: {error}");
     }
+
+    let initial_scan_message = format!("Scanning {local_tree_label} before initial reconciliation");
 
     emit_status(
         status_callback.as_ref(),
         options,
         Some(&connection_target),
-        "filesystem",
+        storage_mode,
         watch_mode,
         "starting",
         "startup",
         "scanning-local-tree",
-        "Scanning local files before initial reconciliation",
+        &initial_scan_message,
         FolderAgentRuntimeMetrics::default(),
         last_success_unix_ms,
         None,
     );
     let local_state_before_remote_sync = scan_local_tree_with_status_progress(
+        backend,
         options,
         &connection_target,
-        watch_mode,
         status_callback.as_ref(),
         "starting",
         "startup",
-        "Scanning local files before initial reconciliation",
-        &options.root_dir,
+        &initial_scan_message,
         None,
         last_success_unix_ms,
     )
@@ -434,7 +710,7 @@ fn run_folder_agent_inner(
         status_callback.as_ref(),
         options,
         Some(&connection_target),
-        "filesystem",
+        storage_mode,
         watch_mode,
         "starting",
         "startup",
@@ -482,7 +758,7 @@ fn run_folder_agent_inner(
         status_callback.as_ref(),
         options,
         Some(&connection_target),
-        "filesystem",
+        storage_mode,
         watch_mode,
         "starting",
         "startup",
@@ -513,19 +789,29 @@ fn run_folder_agent_inner(
         remote_file_paths_by_local_path(&initial_snapshot, &scope);
     let remote_hashes_before_remote_sync =
         remote_file_hashes_by_local_path(&initial_snapshot, &scope);
-    let preserve_local_files = local_paths_to_preserve_on_startup(
-        &options.root_dir,
+    let preserve_local_files = local_paths_to_preserve_on_startup_with_hash(
         &local_state_before_remote_sync,
         baseline_before_remote_sync.as_ref(),
         &remote_hashes_before_remote_sync,
+        file_hash_label,
+        |path| backend.file_content_hash(options, path),
     );
-    let remote_delete_wins_paths = startup_remote_delete_wins_paths(
-        &options.root_dir,
+    let matching_remote_files = local_paths_matching_remote_on_startup(
+        &local_state_before_remote_sync,
+        baseline_before_remote_sync.as_ref(),
+        &baseline_hashes_before_remote_sync,
+        &remote_hashes_before_remote_sync,
+        file_hash_label,
+        |path| backend.file_content_hash(options, path),
+    );
+    let remote_delete_wins_paths = startup_remote_delete_wins_paths_with_hash(
         &local_state_before_remote_sync,
         baseline_before_remote_sync.as_ref(),
         &baseline_hashes_before_remote_sync,
         &remote_files_before_remote_sync,
         &preserve_local_files,
+        file_hash_label,
+        |path| backend.file_content_hash(options, path),
     );
     let mut startup_conflicts = startup_add_delete_conflicts(
         &local_state_before_remote_sync,
@@ -534,16 +820,17 @@ fn run_folder_agent_inner(
         &preserve_local_files,
         &remote_delete_wins_paths,
     );
-    startup_conflicts.extend(startup_dual_modify_conflicts(
-        &options.root_dir,
+    startup_conflicts.extend(startup_dual_modify_conflicts_with_hash(
         &local_state_before_remote_sync,
         baseline_before_remote_sync.as_ref(),
         &baseline_hashes_before_remote_sync,
         &remote_hashes_before_remote_sync,
         &preserve_local_files,
+        file_hash_label,
+        |path| backend.file_content_hash(options, path),
     ));
     if let Err(error) =
-        materialize_remote_conflict_copies(&options.root_dir, &client, &scope, &startup_conflicts)
+        backend.materialize_remote_conflict_copies(options, &client, &scope, &startup_conflicts)
     {
         tracing::warn!("startup-state: failed to materialize conflict copies: {error}");
     }
@@ -558,7 +845,7 @@ fn run_folder_agent_inner(
         status_callback.as_ref(),
         options,
         Some(&connection_target),
-        "filesystem",
+        storage_mode,
         watch_mode,
         "starting",
         "startup",
@@ -578,11 +865,13 @@ fn run_folder_agent_inner(
     let mut remote_index = RemoteTreeIndex::default();
     let mut suppressed_uploads: BTreeMap<String, LocalEntryState> = BTreeMap::new();
     let mut initial_remote_outcome = apply_remote_snapshot(
-        &options.root_dir,
+        backend,
+        options,
         &client,
         &initial_snapshot,
         None,
         Some(&preserve_local_files),
+        Some(&matching_remote_files),
         Some(&state_store),
         &scope,
         &mut suppressed_uploads,
@@ -592,10 +881,12 @@ fn run_folder_agent_inner(
     )?;
     for path in &remote_delete_wins_paths {
         let remote_key = scope.local_to_remote(path).unwrap_or_else(|| path.clone());
-        remove_local_path(
-            &options.root_dir,
+        remove_local_path_with_logging(
+            backend,
+            options,
             path,
-            Some(remote_key.as_str()),
+            remote_key.as_str(),
+            Some(&state_store),
             Some(&modification_log_store),
             Some(&startup_reconcile_log_context),
         )?;
@@ -603,15 +894,17 @@ fn run_folder_agent_inner(
     }
     initial_remote_outcome.removed_local_path_count += remote_delete_wins_paths.len();
 
+    let startup_remote_rescan_message =
+        format!("Rescanning {local_tree_label} after applying startup remote changes");
+
     let mut local_state = scan_local_tree_with_status_progress(
+        backend,
         options,
         &connection_target,
-        watch_mode,
         status_callback.as_ref(),
         "syncing",
         "startup",
-        "Rescanning local files after applying startup remote changes",
-        &options.root_dir,
+        &startup_remote_rescan_message,
         Some(&remote_index),
         last_success_unix_ms,
     )
@@ -641,7 +934,7 @@ fn run_folder_agent_inner(
         status_callback.as_ref(),
         options,
         Some(&connection_target),
-        "filesystem",
+        storage_mode,
         watch_mode,
         "syncing",
         "startup",
@@ -655,17 +948,20 @@ fn run_folder_agent_inner(
         None,
     );
 
+    let startup_local_sync_message =
+        format!("Scanning {local_tree_label} and reconciling startup local changes");
+
     let initial_local_sync_outcome = run_with_status_heartbeat(
         status_callback.clone(),
         BlockingStatusProgress {
             options: options.clone(),
             connection_target: Some(connection_target.clone()),
-            storage_mode: "filesystem".to_string(),
+            storage_mode: storage_mode.to_string(),
             watch_mode: watch_mode.to_string(),
             state: "syncing".to_string(),
             phase: "startup".to_string(),
             activity: "scanning-local-tree".to_string(),
-            base_message: "Scanning local files and reconciling startup local changes".to_string(),
+            base_message: startup_local_sync_message.clone(),
             metrics: FolderAgentRuntimeMetrics::from_states(
                 Some(&local_state),
                 Some(&remote_index),
@@ -675,7 +971,8 @@ fn run_folder_agent_inner(
         },
         || {
             sync_local_changes(
-                &options.root_dir,
+                backend,
+                options,
                 &client,
                 &mut local_state,
                 Some(&state_store),
@@ -688,11 +985,9 @@ fn run_folder_agent_inner(
                 Some(&LocalScanStatusContext {
                     options: options.clone(),
                     connection_target: connection_target.clone(),
-                    watch_mode: watch_mode.to_string(),
                     state: "syncing".to_string(),
                     phase: "startup".to_string(),
-                    base_message: "Scanning local files and reconciling startup local changes"
-                        .to_string(),
+                    base_message: startup_local_sync_message.clone(),
                     last_success_unix_ms,
                 }),
             )
@@ -737,7 +1032,7 @@ fn run_folder_agent_inner(
             status_callback.as_ref(),
             options,
             Some(&connection_target),
-            "filesystem",
+            storage_mode,
             watch_mode,
             "stopped",
             "shutdown",
@@ -757,7 +1052,7 @@ fn run_folder_agent_inner(
         status_callback.as_ref(),
         options,
         Some(&connection_target),
-        "filesystem",
+        storage_mode,
         watch_mode,
         "running",
         "steady-state",
@@ -782,9 +1077,11 @@ fn run_folder_agent_inner(
     let remote_status_callback = status_callback.clone();
     let remote_options = options.clone();
     let remote_connection_target = connection_target.clone();
+    let remote_storage_mode = storage_mode.to_string();
     let remote_watch_mode = watch_mode.to_string();
     let remote_latest_metrics = latest_metrics.clone();
     let remote_last_success = last_success_shared.clone();
+    let remote_idle_message = idle_watch_message.clone();
     let remote_thread = refresh_poller.spawn_changed_paths_loop(
         remote_running,
         Some(initial_snapshot),
@@ -792,7 +1089,7 @@ fn run_folder_agent_inner(
             fetch_remote_snapshot_with_status_progress(
                 &remote_options,
                 &remote_connection_target,
-                "filesystem",
+                &remote_storage_mode,
                 &remote_watch_mode,
                 remote_status_callback.as_ref(),
                 "running",
@@ -802,7 +1099,7 @@ fn run_folder_agent_inner(
                 &refresh_fetcher,
                 latest_metrics_value(&remote_latest_metrics),
                 load_optional_unix_ms(&remote_last_success),
-                Some("Watching for changes; local and remote state are aligned"),
+                Some(remote_idle_message.as_str()),
             )
         },
         move |update| {
@@ -812,15 +1109,7 @@ fn run_folder_agent_inner(
         },
     );
 
-    let (local_event_tx, local_event_rx) = mpsc::channel::<()>();
-    let _watcher = if options.no_watch_local {
-        None
-    } else {
-        Some(start_local_watcher(
-            options.root_dir.clone(),
-            local_event_tx,
-        )?)
-    };
+    backend.start_local_change_monitor(options)?;
 
     let mut next_local_scan = Instant::now() + local_scan_interval;
 
@@ -836,7 +1125,7 @@ fn run_folder_agent_inner(
                 status_callback.as_ref(),
                 options,
                 Some(&connection_target),
-                "filesystem",
+                storage_mode,
                 watch_mode,
                 "syncing",
                 "steady-state",
@@ -847,10 +1136,12 @@ fn run_folder_agent_inner(
                 None,
             );
             combined_remote_outcome.accumulate(apply_remote_snapshot(
-                &options.root_dir,
+                backend,
+                options,
                 &client,
                 &update.snapshot,
                 Some(&update.changed_paths),
+                None,
                 None,
                 Some(&state_store),
                 &scope,
@@ -863,15 +1154,16 @@ fn run_folder_agent_inner(
         }
 
         if remote_updates_applied {
+            let remote_rescan_message =
+                format!("Rescanning {local_tree_label} after applying remote changes");
             local_state = scan_local_tree_with_status_progress(
+                backend,
                 options,
                 &connection_target,
-                watch_mode,
                 status_callback.as_ref(),
                 "syncing",
                 "steady-state",
-                "Rescanning local files after applying remote changes",
-                &options.root_dir,
+                &remote_rescan_message,
                 Some(&remote_index),
                 last_success_unix_ms,
             )
@@ -893,7 +1185,7 @@ fn run_folder_agent_inner(
                 status_callback.as_ref(),
                 options,
                 Some(&connection_target),
-                "filesystem",
+                storage_mode,
                 watch_mode,
                 "running",
                 "steady-state",
@@ -909,10 +1201,7 @@ fn run_folder_agent_inner(
             set_latest_metrics(&latest_metrics, &remote_runtime_metrics);
         }
 
-        let mut local_scan_requested = false;
-        while local_event_rx.try_recv().is_ok() {
-            local_scan_requested = true;
-        }
+        let local_scan_requested = backend.local_change_hint_pending(options)?;
 
         if local_scan_requested || Instant::now() >= next_local_scan {
             let previous_local_state = local_state.clone();
@@ -922,25 +1211,25 @@ fn run_folder_agent_inner(
                 "running"
             };
             let local_scan_message = if local_scan_requested {
-                "Local change detected; scanning local files"
+                format!("Local change detected; scanning {local_tree_label}")
             } else {
-                "Checking local files for changes"
+                format!("Checking {local_tree_label} for changes")
             };
             let local_scan_base_message = if local_scan_requested {
-                "Scanning local files and reconciling event-driven local changes"
+                format!("Scanning {local_tree_label} and reconciling event-driven local changes")
             } else {
-                "Checking local files for changes"
+                format!("Checking {local_tree_label} for changes")
             };
             emit_status(
                 status_callback.as_ref(),
                 options,
                 Some(&connection_target),
-                "filesystem",
+                storage_mode,
                 watch_mode,
                 local_scan_state,
                 "steady-state",
                 "scanning-local-tree",
-                local_scan_message,
+                &local_scan_message,
                 FolderAgentRuntimeMetrics::from_states(Some(&local_state), Some(&remote_index)),
                 last_success_unix_ms,
                 None,
@@ -950,12 +1239,12 @@ fn run_folder_agent_inner(
                 BlockingStatusProgress {
                     options: options.clone(),
                     connection_target: Some(connection_target.clone()),
-                    storage_mode: "filesystem".to_string(),
+                    storage_mode: storage_mode.to_string(),
                     watch_mode: watch_mode.to_string(),
                     state: local_scan_state.to_string(),
                     phase: "steady-state".to_string(),
                     activity: "scanning-local-tree".to_string(),
-                    base_message: local_scan_base_message.to_string(),
+                    base_message: local_scan_base_message.clone(),
                     metrics: FolderAgentRuntimeMetrics::from_states(
                         Some(&local_state),
                         Some(&remote_index),
@@ -965,7 +1254,8 @@ fn run_folder_agent_inner(
                 },
                 || {
                     sync_local_changes(
-                        &options.root_dir,
+                        backend,
+                        options,
                         &client,
                         &mut local_state,
                         Some(&state_store),
@@ -982,10 +1272,9 @@ fn run_folder_agent_inner(
                         Some(&LocalScanStatusContext {
                             options: options.clone(),
                             connection_target: connection_target.clone(),
-                            watch_mode: watch_mode.to_string(),
                             state: local_scan_state.to_string(),
                             phase: "steady-state".to_string(),
-                            base_message: local_scan_base_message.to_string(),
+                            base_message: local_scan_base_message.clone(),
                             last_success_unix_ms,
                         }),
                     )
@@ -993,6 +1282,9 @@ fn run_folder_agent_inner(
             )?;
             if local_state != previous_local_state {
                 baseline_dirty = true;
+            }
+            if local_scan_requested {
+                backend.acknowledge_local_change_hint(options)?;
             }
             next_local_scan = Instant::now() + local_scan_interval;
             last_success_unix_ms = Some(now_unix_ms());
@@ -1011,17 +1303,17 @@ fn run_folder_agent_inner(
                 status_callback.as_ref(),
                 options,
                 Some(&connection_target),
-                "filesystem",
+                storage_mode,
                 watch_mode,
                 "running",
                 "steady-state",
                 "watching-for-changes",
                 if local_sync_outcome.is_empty() {
-                    "Watching for changes; local and remote state are aligned".to_string()
+                    idle_watch_message.clone()
                 } else {
-                    format!(
-                        "Watching for changes after local sync: {}",
-                        format_local_sync_summary(local_sync_outcome)
+                    backend.watch_after_local_sync_message(
+                        options,
+                        &format_local_sync_summary(local_sync_outcome),
                     )
                 },
                 local_runtime_metrics.clone(),
@@ -1050,7 +1342,7 @@ fn run_folder_agent_inner(
         status_callback.as_ref(),
         options,
         Some(&connection_target),
-        "filesystem",
+        storage_mode,
         watch_mode,
         "stopped",
         "shutdown",
@@ -1158,8 +1450,224 @@ fn start_local_watcher(
     Ok(watcher)
 }
 
-fn sync_local_changes(
-    root_dir: &Path,
+fn scan_local_tree_without_status<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+) -> Result<LocalTreeState> {
+    let mut on_progress = |_progress: &LocalTreeScanProgress| {};
+    backend.scan_local_tree_with_progress(options, &mut on_progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    client: &IronMeshClient,
+    scope: &PathScope,
+    relative_path: &str,
+    size_bytes: u64,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
+) -> Result<String> {
+    let remote_key = scope.local_to_remote(relative_path).ok_or_else(|| {
+        anyhow::anyhow!("refusing to upload local root without concrete scoped path")
+    })?;
+
+    match backend.upload_local_file(options, client, scope, relative_path, size_bytes) {
+        Ok(content_hash) => {
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::Upload,
+                ModificationOutcome::Success,
+                relative_path,
+                remote_key.as_str(),
+                Some(size_bytes),
+                Some(content_hash.as_str()),
+                None,
+            );
+            Ok(content_hash)
+        }
+        Err(error) => {
+            let error =
+                error.context(format!("failed to upload local file {relative_path} to {remote_key}"));
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::Upload,
+                ModificationOutcome::Error,
+                relative_path,
+                remote_key.as_str(),
+                Some(size_bytes),
+                None,
+                Some(&format!("{error:#}")),
+            );
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_remote_file_with_logging<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    client: &IronMeshClient,
+    local_relative_path: &str,
+    remote_key: &str,
+    remote_content_hash: Option<&str>,
+    state_store: Option<&StartupStateStore>,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
+) -> Result<LocalEntryState> {
+    match backend.download_remote_file(options, client, local_relative_path, remote_key) {
+        Ok(()) => {
+            let entry_state = backend
+                .local_entry_state(options, local_relative_path)?
+                .filter(|entry| entry.kind == LocalEntryKind::File)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "downloaded remote file {remote_key} did not materialize as a local file"
+                    )
+                })?;
+
+            if let Some(store) = state_store {
+                store
+                    .upsert_baseline_entry_with_hash(
+                        local_relative_path,
+                        &entry_state,
+                        remote_content_hash,
+                    )
+                    .with_context(|| {
+                        format!("failed to persist baseline file entry for {local_relative_path}")
+                    })?;
+            }
+
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::Download,
+                ModificationOutcome::Success,
+                local_relative_path,
+                remote_key,
+                Some(entry_state.size_bytes),
+                remote_content_hash,
+                None,
+            );
+            Ok(entry_state)
+        }
+        Err(error) => {
+            let error = error.context(format!("failed to download remote file {remote_key}"));
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::Download,
+                ModificationOutcome::Error,
+                local_relative_path,
+                remote_key,
+                None,
+                remote_content_hash,
+                Some(&format!("{error:#}")),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn delete_remote_file_with_logging(
+    client: &IronMeshClient,
+    scope: &PathScope,
+    file_path: &str,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
+) -> Result<()> {
+    let Some(remote_key) = scope.local_to_remote(file_path) else {
+        return Ok(());
+    };
+
+    let result = client.delete_path_blocking(&remote_key);
+    if let Err(error) = result {
+        let error = error.context(format!("failed to delete remote file {remote_key}"));
+        try_record_modification(
+            modification_log,
+            modification_context,
+            ModificationOperation::DeleteRemote,
+            ModificationOutcome::Error,
+            file_path,
+            remote_key.as_str(),
+            None,
+            None,
+            Some(&format!("{error:#}")),
+        );
+        return Err(error);
+    }
+
+    try_record_modification(
+        modification_log,
+        modification_context,
+        ModificationOperation::DeleteRemote,
+        ModificationOutcome::Success,
+        file_path,
+        remote_key.as_str(),
+        None,
+        None,
+        None,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remove_local_path_with_logging<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    relative_path: &str,
+    remote_key: &str,
+    state_store: Option<&StartupStateStore>,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
+) -> Result<()> {
+    match backend.remove_local_path(options, relative_path) {
+        Ok(()) => {
+            if let Some(store) = state_store {
+                store
+                    .remove_baseline_entry(relative_path)
+                    .with_context(|| format!("failed to remove baseline entry for {relative_path}"))?;
+            }
+
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::DeleteLocal,
+                ModificationOutcome::Success,
+                relative_path,
+                remote_key,
+                None,
+                None,
+                None,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let error = error.context(format!("failed to remove local path {relative_path}"));
+            try_record_modification(
+                modification_log,
+                modification_context,
+                ModificationOperation::DeleteLocal,
+                ModificationOutcome::Error,
+                relative_path,
+                remote_key,
+                None,
+                None,
+                Some(&format!("{error:#}")),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn sync_local_changes<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
     client: &IronMeshClient,
     local_state: &mut LocalTreeState,
     state_store: Option<&StartupStateStore>,
@@ -1173,19 +1681,18 @@ fn sync_local_changes(
 ) -> Result<LocalSyncOutcome> {
     let current = match local_scan_status {
         Some(progress) => scan_local_tree_with_status_progress(
+            backend,
             &progress.options,
             &progress.connection_target,
-            &progress.watch_mode,
             status_callback,
             &progress.state,
             &progress.phase,
             &progress.base_message,
-            root_dir,
             Some(remote_index),
             progress.last_success_unix_ms,
         )
         .context("failed to scan local root")?,
-        None => scan_local_tree(root_dir).context("failed to scan local root")?,
+        None => scan_local_tree_without_status(backend, options).context("failed to scan local root")?,
     };
     let diff = diff_local_trees(local_state, &current);
     let mut outcome = LocalSyncOutcome {
@@ -1227,16 +1734,16 @@ fn sync_local_changes(
             continue;
         }
 
-        let content_hash =
-            upload_local_file(
-                root_dir,
-                client,
-                scope,
-                path,
-                entry_state.size_bytes,
-                modification_log,
-                modification_context,
-            )?;
+        let content_hash = upload_local_file_with_logging(
+            backend,
+            options,
+            client,
+            scope,
+            path,
+            entry_state.size_bytes,
+            modification_log,
+            modification_context,
+        )?;
         outcome.uploaded_file_count += 1;
         remote_index.files.insert(path.clone());
         for parent in parent_directories(path) {
@@ -1276,7 +1783,13 @@ fn sync_local_changes(
                 continue;
             }
 
-            delete_remote_file(client, scope, &path, modification_log, modification_context)?;
+            delete_remote_file_with_logging(
+                client,
+                scope,
+                &path,
+                modification_log,
+                modification_context,
+            )?;
             outcome.deleted_remote_file_count += 1;
             suppressed_uploads.remove(&path);
             remote_index.files.remove(&path);
@@ -1294,12 +1807,14 @@ fn sync_local_changes(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_remote_snapshot(
-    root_dir: &Path,
+fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
     client: &IronMeshClient,
     snapshot: &SyncSnapshot,
     changed_paths: Option<&[String]>,
     preserve_local_files: Option<&BTreeSet<String>>,
+    matching_remote_files: Option<&BTreeSet<String>>,
     state_store: Option<&StartupStateStore>,
     scope: &PathScope,
     suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
@@ -1357,15 +1872,9 @@ fn apply_remote_snapshot(
                     Some((EntryKind::Directory, _)) => {
                         outcome.changed_path_count += 1;
                         outcome.ensured_directory_count += 1;
-                        let directory = absolute_path(root_dir, path);
-                        fs::create_dir_all(&directory).with_context(|| {
-                            format!(
-                                "failed to materialize remote directory {}",
-                                directory.display()
-                            )
-                        })?;
+                        backend.ensure_local_directory(options, path)?;
                         if let Some(store) = state_store
-                            && let Some(entry_state) = local_entry_state_for_path(root_dir, path)?
+                            && let Some(entry_state) = backend.local_entry_state(options, path)?
                         {
                             store
                                 .upsert_baseline_entry(path, &entry_state)
@@ -1378,8 +1887,9 @@ fn apply_remote_snapshot(
                         outcome.changed_path_count += 1;
                         outcome.downloaded_file_count += 1;
                         let content_hash = entry_hashes.get(path).map(|hash| hash.as_str());
-                        download_remote_file(
-                            root_dir,
+                        let entry_state = download_remote_file_with_logging(
+                            backend,
+                            options,
                             client,
                             path,
                             remote_key,
@@ -1388,27 +1898,22 @@ fn apply_remote_snapshot(
                             modification_log,
                             modification_context,
                         )?;
-                        if let Some(entry_state) = local_entry_state_for_path(root_dir, path)? {
-                            suppressed_uploads.insert(path.to_string(), entry_state);
-                        }
+                        suppressed_uploads.insert(path.to_string(), entry_state);
                     }
                     None => {
                         outcome.changed_path_count += 1;
                         outcome.removed_local_path_count += 1;
                         let remote_key = scope.local_to_remote(path).unwrap_or_else(|| path.to_string());
-                        remove_local_path(
-                            root_dir,
+                        remove_local_path_with_logging(
+                            backend,
+                            options,
                             path,
-                            Some(remote_key.as_str()),
+                            remote_key.as_str(),
+                            state_store,
                             modification_log,
                             modification_context,
                         )?;
                         suppressed_uploads.remove(path);
-                        if let Some(store) = state_store {
-                            store.remove_baseline_entry(path).with_context(|| {
-                                format!("failed to remove baseline entry for {path}")
-                            })?;
-                        }
                     }
                 }
             }
@@ -1416,17 +1921,17 @@ fn apply_remote_snapshot(
         }
         None => {
             for directory in &next_index.directories {
+                if backend
+                    .local_entry_state(options, directory)?
+                    .is_some_and(|entry| entry.kind == LocalEntryKind::Directory)
+                {
+                    continue;
+                }
                 outcome.changed_path_count += 1;
                 outcome.ensured_directory_count += 1;
-                let absolute = absolute_path(root_dir, directory);
-                fs::create_dir_all(&absolute).with_context(|| {
-                    format!(
-                        "failed to materialize remote directory {}",
-                        absolute.display()
-                    )
-                })?;
+                backend.ensure_local_directory(options, directory)?;
                 if let Some(store) = state_store
-                    && let Some(entry_state) = local_entry_state_for_path(root_dir, directory)?
+                    && let Some(entry_state) = backend.local_entry_state(options, directory)?
                 {
                     store
                         .upsert_baseline_entry(directory, &entry_state)
@@ -1443,8 +1948,17 @@ fn apply_remote_snapshot(
                 let Some((EntryKind::File, remote_key)) = entry_kinds.get(file) else {
                     continue;
                 };
+                let local_entry_state = backend.local_entry_state(options, file)?;
                 if preserve_local_files.is_some_and(|set| set.contains(file))
-                    && local_entry_state_for_path(root_dir, file)?
+                    && local_entry_state
+                        .as_ref()
+                        .is_some_and(|entry| entry.kind == LocalEntryKind::File)
+                {
+                    continue;
+                }
+                if matching_remote_files.is_some_and(|set| set.contains(file))
+                    && local_entry_state
+                        .as_ref()
                         .is_some_and(|entry| entry.kind == LocalEntryKind::File)
                 {
                     continue;
@@ -1452,8 +1966,9 @@ fn apply_remote_snapshot(
                 outcome.changed_path_count += 1;
                 outcome.downloaded_file_count += 1;
                 let content_hash = entry_hashes.get(file).map(|hash| hash.as_str());
-                download_remote_file(
-                    root_dir,
+                let entry_state = download_remote_file_with_logging(
+                    backend,
+                    options,
                     client,
                     file,
                     remote_key,
@@ -1462,9 +1977,7 @@ fn apply_remote_snapshot(
                     modification_log,
                     modification_context,
                 )?;
-                if let Some(entry_state) = local_entry_state_for_path(root_dir, file)? {
-                    suppressed_uploads.insert(file.clone(), entry_state);
-                }
+                suppressed_uploads.insert(file.clone(), entry_state);
             }
 
             *remote_index = next_index;
@@ -1548,30 +2061,33 @@ where
     result
 }
 
-fn scan_local_tree_with_status_progress(
+fn scan_local_tree_with_status_progress<B: FolderAgentLocalBackend>(
+    backend: &mut B,
     options: &FolderAgentRuntimeOptions,
     connection_target: &str,
-    watch_mode: &str,
     status_callback: Option<&FolderAgentStatusCallback>,
     state: &str,
     phase: &str,
     base_message: &str,
-    root: &Path,
     remote_index: Option<&RemoteTreeIndex>,
     last_success_unix_ms: Option<u64>,
 ) -> Result<LocalTreeState> {
     let Some(callback) = status_callback.cloned() else {
-        return scan_local_tree(root);
+        return scan_local_tree_without_status(backend, options);
     };
+
+    let storage_mode = backend.storage_mode_label(options).to_string();
+    let watch_mode = backend.watch_mode_label(options).to_string();
 
     let last_reported_at = Arc::new(Mutex::new(Instant::now() - LOCAL_SCAN_PROGRESS_INTERVAL));
     let last_reported_entry_count = Arc::new(AtomicU64::new(0));
 
-    scan_local_tree_with_progress(root, {
+    backend.scan_local_tree_with_progress(options, &mut {
         let callback = callback.clone();
         let options = options.clone();
         let connection_target = connection_target.to_string();
-        let watch_mode = watch_mode.to_string();
+        let storage_mode = storage_mode.clone();
+        let watch_mode = watch_mode.clone();
         let remote_metrics = FolderAgentRuntimeMetrics::from_states(None, remote_index);
         let last_reported_at = last_reported_at.clone();
         let last_reported_entry_count = last_reported_entry_count.clone();
@@ -1602,7 +2118,7 @@ fn scan_local_tree_with_status_progress(
             callback(FolderAgentRuntimeStatus::new(
                 &options,
                 Some(&connection_target),
-                "filesystem",
+                &storage_mode,
                 &watch_mode,
                 state.to_string(),
                 phase.to_string(),
