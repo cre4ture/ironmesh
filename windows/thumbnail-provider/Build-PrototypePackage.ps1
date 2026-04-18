@@ -2,9 +2,11 @@ param(
     [ValidateSet("debug", "release")]
     [string]$Configuration = "debug",
     [string]$Architecture = "x64",
+    [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
+    [string]$PackageVersion,
     [switch]$StageOnly,
     [switch]$Install,
-    [string]$CertificateSubject = "CN=Ironmesh Dev",
+    [string]$CertificateSubject = "CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21",
     [string]$CertificatePassword = "ironmesh-dev"
 )
 
@@ -38,6 +40,66 @@ function Test-IsElevated {
 function Get-RepoRoot {
     $scriptDir = Split-Path -Parent $PSCommandPath
     return (Resolve-Path (Join-Path $scriptDir "..\\..")).Path
+}
+
+function Get-WorkspaceCargoVersion {
+    param([string]$RepoRoot)
+
+    $workspaceManifestPath = Join-Path $RepoRoot 'Cargo.toml'
+    $inWorkspacePackage = $false
+
+    foreach ($line in Get-Content -Path $workspaceManifestPath) {
+        if ($line -match '^\[workspace\.package\]\s*$') {
+            $inWorkspacePackage = $true
+            continue
+        }
+
+        if ($inWorkspacePackage -and $line -match '^\[') {
+            break
+        }
+
+        if ($inWorkspacePackage -and $line -match '^\s*version\s*=\s*"([^"]+)"\s*$') {
+            return $matches[1]
+        }
+    }
+
+    throw "Unable to determine [workspace.package].version from $workspaceManifestPath"
+}
+
+function Convert-CargoVersionToPackageVersion {
+    param([string]$CargoVersion)
+
+    if ($CargoVersion -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
+        throw "Cargo workspace version '$CargoVersion' must be a plain semantic version like 0.1.0 to derive an MSIX package version automatically. Use -PackageVersion to override."
+    }
+
+    return "$($matches[1]).$($matches[2]).$($matches[3]).0"
+}
+
+function Save-StagedManifest {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [string]$Version
+    )
+
+    [xml]$manifest = Get-Content -Raw -Path $SourcePath
+    $manifest.Package.Identity.Version = $Version
+
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Indent = $true
+    $settings.IndentChars = '  '
+    $settings.NewLineChars = "`r`n"
+    $settings.NewLineHandling = [System.Xml.NewLineHandling]::Replace
+    $settings.Encoding = [System.Text.UTF8Encoding]::new($false)
+
+    $writer = [System.Xml.XmlWriter]::Create($DestinationPath, $settings)
+    try {
+        $manifest.Save($writer)
+    }
+    finally {
+        $writer.Dispose()
+    }
 }
 
 function Find-WindowsSdkTool {
@@ -144,10 +206,16 @@ $assetsPath = Join-Path $scriptDir "Assets"
 $outputRoot = Join-Path $scriptDir "out"
 $stagePath = Join-Path $outputRoot "stage"
 $cargoTargetDir = Join-Path $outputRoot "cargo-target"
-$packageName = "IronmeshThumbnailProviderPrototype.msix"
+$packageName = "IronMesh.msix"
 $packagePath = Join-Path $outputRoot $packageName
-$pfxPath = Join-Path $outputRoot "IronmeshThumbnailProviderPrototype.pfx"
-$cerPath = Join-Path $outputRoot "IronmeshThumbnailProviderPrototype.cer"
+$pfxPath = Join-Path $outputRoot "IronMesh.pfx"
+$cerPath = Join-Path $outputRoot "IronMesh.cer"
+$cargoVersion = Get-WorkspaceCargoVersion -RepoRoot $repoRoot
+$resolvedPackageVersion = if ($PackageVersion) {
+    $PackageVersion
+} else {
+    Convert-CargoVersionToPackageVersion -CargoVersion $cargoVersion
+}
 
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 if (Test-Path $stagePath) {
@@ -155,18 +223,24 @@ if (Test-Path $stagePath) {
 }
 New-Item -ItemType Directory -Force -Path $stagePath | Out-Null
 
-$cargoArgs = @("build", "-p", "windows-thumbnail-provider", "-p", "os-integration")
+$cargoArgs = @("build", "-p", "windows-thumbnail-provider", "-p", "os-integration", "-p", "ironmesh-folder-agent")
 if ($Configuration -eq "release") {
     $cargoArgs += "--release"
 }
 
-Write-Step "Building windows-thumbnail-provider and os-integration ($Configuration)"
+Write-Step "Building windows-thumbnail-provider, os-integration, and ironmesh-folder-agent ($Configuration)"
+if ($PackageVersion) {
+    Write-Step "Using explicit package version $resolvedPackageVersion"
+} else {
+    Write-Step "Using package version $resolvedPackageVersion derived from workspace Cargo version $cargoVersion"
+}
 $env:CARGO_TARGET_DIR = $cargoTargetDir
 Invoke-NativeChecked -FilePath "cargo" -Arguments $cargoArgs
 
 $targetDir = if ($Configuration -eq "release") { "release" } else { "debug" }
 $dllPath = Join-Path $cargoTargetDir "$targetDir\\windows_thumbnail_provider.dll"
 $exePath = Join-Path $cargoTargetDir "$targetDir\\os-integration.exe"
+$folderAgentPath = Join-Path $cargoTargetDir "$targetDir\\ironmesh-folder-agent.exe"
 
 if (-not (Test-Path $dllPath)) {
     throw "Expected DLL not found: $dllPath"
@@ -174,11 +248,15 @@ if (-not (Test-Path $dllPath)) {
 if (-not (Test-Path $exePath)) {
     throw "Expected EXE not found: $exePath"
 }
+if (-not (Test-Path $folderAgentPath)) {
+    throw "Expected folder agent EXE not found: $folderAgentPath"
+}
 
 Write-Step "Staging package contents under $stagePath"
-Copy-Item $manifestPath (Join-Path $stagePath "AppxManifest.xml")
+Save-StagedManifest -SourcePath $manifestPath -DestinationPath (Join-Path $stagePath "AppxManifest.xml") -Version $resolvedPackageVersion
 Copy-Item $dllPath (Join-Path $stagePath "windows_thumbnail_provider.dll")
 Copy-Item $exePath (Join-Path $stagePath "os-integration.exe")
+Copy-Item $folderAgentPath (Join-Path $stagePath "ironmesh-folder-agent.exe")
 Copy-Item $assetsPath (Join-Path $stagePath "Assets") -Recurse
 
 $makeAppx = Find-WindowsSdkTool -ToolName "MakeAppx.exe" -PreferredArchitecture $Architecture

@@ -5,6 +5,7 @@ Status: Design note plus initial fixed-bitmap prototype scaffold for Explorer th
 Related notes:
 
 - [Nextcloud CFAPI Behavior Reference](others/nextcloud-cfapi-behavior.md)
+- [Windows MSIX Release And Update Strategy](windows-msix-release-update-strategy.md)
 
 ## Goal
 

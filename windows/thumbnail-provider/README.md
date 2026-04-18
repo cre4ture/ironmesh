@@ -54,7 +54,7 @@ The manifest currently points the `Application` executable at `os-integration.ex
 5. Unregister any existing unpackaged Ironmesh sync root registration for the test root.
 6. Re-register and serve the sync root using the packaged `os-integration.exe` from the installed package location, not the repo-local `target\debug\os-integration.exe`.
    - Example PowerShell:
-     - `$pkg = Get-AppxPackage Ironmesh.ThumbnailProvider.Prototype`
+   - `$pkg = Get-AppxPackage UlrichHornung.IronMesh`
      - `$exe = Join-Path $pkg.InstallLocation 'os-integration.exe'`
      - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
    - The first run uses `--bootstrap-file` to seed `%LocalAppData%\Ironmesh\sync-roots\...`.
@@ -74,6 +74,8 @@ Why this matters:
 
 This repo currently does not include a fully automated MSIX/sparse-package build pipeline for the prototype yet.
 
+For the planned production release and update path, see [../../docs/windows-msix-release-update-strategy.md](../../docs/windows-msix-release-update-strategy.md).
+
 That is still intentionally incremental:
 
 - Explorer must load the packaged thumbnail handler
@@ -91,12 +93,15 @@ Typical usage:
    - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -StageOnly`
 2. Build, pack, sign, and install:
    - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install`
+3. Override the package version explicitly if needed:
+   - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -PackageVersion 1.0.2.0 -Install`
 
 The helper will:
 
 - build `windows-thumbnail-provider`
 - build `os-integration`
-- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, and `os-integration.exe`
+- build `ironmesh-folder-agent`
+- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, `os-integration.exe`, and `ironmesh-folder-agent.exe`
 - if the Windows SDK tools are installed, also:
   - create/reuse a self-signed developer certificate
   - generate an `.msix`
@@ -107,8 +112,44 @@ Notes:
 
 - the helper auto-discovers `MakeAppx.exe` and `SignTool.exe` under `C:\Program Files (x86)\Windows Kits\10\bin` even if they are not on `PATH`
 - `-StageOnly` is the safest way to verify the prototype package contents today
+- by default the helper derives the package version from `[workspace.package].version` in the repo-root `Cargo.toml` as `major.minor.patch.0`
 - full `.msix` packing and signing now work on a machine with the Windows SDK tools available
 - `-Install` is optional and may require both the usual Windows developer/sideloading settings and an elevated PowerShell so the self-signed cert can be imported into `Cert:\LocalMachine\TrustedPeople`
+
+## Store upload helper
+
+There is now a separate PowerShell helper for Partner Center upload packaging at `windows/thumbnail-provider/Build-StoreUploadPackage.ps1`.
+
+Typical usage:
+
+1. Build a Store upload package using the workspace Cargo version automatically:
+   - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-StoreUploadPackage.ps1`
+2. Override the package version for a release build:
+   - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-StoreUploadPackage.ps1 -PackageVersion 1.0.2.0`
+3. Also include raw PDBs in `.appxsym` for Partner Center crash analytics:
+   - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-StoreUploadPackage.ps1 -PackageVersion 1.0.2.0 -IncludePdbSymbols`
+
+The helper will:
+
+- build `windows-thumbnail-provider` and `os-integration` in release mode
+- build `ironmesh-folder-agent` in release mode
+- stage the Store manifest, assets, DLL, and EXEs
+- create an `.msix`
+- sign the `.msix` with a local self-signed certificate matching the Store publisher by default
+- create a `.msixupload` archive for Partner Center
+
+Outputs land under `windows/thumbnail-provider/out/store-upload/<identity>_<version>_x64/`.
+
+Notes:
+
+- the script is focused on the current `x64` Store release path
+- by default the helper derives the package version from `[workspace.package].version` in the repo-root `Cargo.toml` as `major.minor.patch.0`
+- Store-compatible versioning must keep the first segment at `1` or higher and the fourth segment at `0`, for example `1.0.2.0`
+- if the workspace Cargo version still starts with `0`, automatic Store upload packaging will fail until you either bump Cargo to `1.x.y` or pass `-PackageVersion`
+- the script uses an isolated cargo target directory for each run so stale artifact locks do not block packaging
+- `-SkipSigning` leaves the package unsigned for upload-only scenarios; local installation will not work until the package is signed
+- `-IncludePdbSymbols` packages raw PDBs into `.appxsym`; use that only if you are comfortable uploading private symbol information
+- the script prepares the upload artifact only; Partner Center metadata, screenshots, age ratings, privacy policy, and certification notes still have to be filled manually
 
 ## Install and Reinstall Workflow
 
@@ -117,12 +158,12 @@ Use this when iterating on the thumbnail provider DLL, the manifest, or the pack
 1. Build, pack, sign, and install from an elevated PowerShell:
    - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install`
 2. Start the packaged host from the installed package location:
-   - `$pkg = Get-AppxPackage Ironmesh.ThumbnailProvider.Prototype`
+   - `$pkg = Get-AppxPackage UlrichHornung.IronMesh`
    - `$exe = Join-Path $pkg.InstallLocation 'os-integration.exe'`
    - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
    - After that first successful run, the packaged host will reuse the canonical `%LocalAppData%\Ironmesh\sync-roots\...` bootstrap and client identity for the same sync root.
 3. If you changed any packaged content and Windows reports `0x80073CFB`, bump the package version in `windows/thumbnail-provider/AppxManifest.xml`:
-   - update `<Identity ... Version="...">`
+   - update `<Identity ... Version="...">` using Store-compatible versioning such as `0.1.1.0`
    - reinstall with the helper script
 4. If Windows reports `0x80073D02`, the installed package is still loaded by Explorer, `dllhost.exe`, or the packaged `os-integration.exe`:
    - the helper now installs with `Add-AppxPackage -ForceApplicationShutdown`, which is usually enough

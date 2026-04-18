@@ -11,13 +11,13 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap mp desktop desktop3 desktop4 com cloudfiles2 rescap">
   <Identity
-    Name="Ironmesh.ThumbnailProvider.Prototype"
-    Publisher="CN=Ironmesh Dev"
-    Version="0.1.0.14" />
+    Name="UlrichHornung.IronMesh"
+    Publisher="CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21"
+    Version="0.1.0.0" />
   <Properties>
-    <DisplayName>Ironmesh Thumbnail Provider Prototype</DisplayName>
-    <PublisherDisplayName>Ironmesh</PublisherDisplayName>
-    <Description>Prototype packaged thumbnail handler for dehydrated Ironmesh CFAPI placeholders.</Description>
+    <DisplayName>IronMesh</DisplayName>
+    <PublisherDisplayName>Ulrich Hornung</PublisherDisplayName>
+    <Description>Windows filesystem integration for IronMesh.</Description>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   <Resources>
@@ -36,8 +36,8 @@
       Executable="os-integration.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="Ironmesh Thumbnail Provider Prototype"
-        Description="Prototype packaged thumbnail handler for Ironmesh placeholders"
+        DisplayName="IronMesh"
+        Description="Windows filesystem integration for IronMesh"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png" />
