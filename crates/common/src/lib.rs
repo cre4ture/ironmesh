@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 pub mod content_fingerprint;
 pub mod logging;
+pub mod range_chunk_cache;
 pub mod traced_mutex;
 pub mod traced_rwlock;
 

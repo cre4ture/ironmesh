@@ -2,21 +2,47 @@ use crate::content_fingerprint::FingerprintingReader;
 use crate::runtime::{
     HydrationProgress, HydrationRequest, HydrationResult, Hydrator, UploadReceipt, Uploader,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
     ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
+use common::range_chunk_cache::{RangeChunkCache, RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES};
 use reqwest::Url;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RangeChunkCacheKey {
+    path: String,
+    remote_version: String,
+    chunk_index: u64,
+}
+
+impl RangeChunkCacheKey {
+    fn new(path: &str, remote_version: &str, chunk_index: u64) -> Self {
+        Self {
+            path: path.to_string(),
+            remote_version: remote_version.to_string(),
+            chunk_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedRangeChunk {
+    object_size_bytes: u64,
+    payload: Vec<u8>,
+}
 
 #[derive(Clone)]
 pub struct ServerNodeHydrator {
     sdk: IronMeshClient,
     download_stage_root: PathBuf,
+    range_chunk_cache: Arc<Mutex<RangeChunkCache<RangeChunkCacheKey, CachedRangeChunk>>>,
 }
 
 impl ServerNodeHydrator {
@@ -24,6 +50,7 @@ impl ServerNodeHydrator {
         Self {
             sdk,
             download_stage_root,
+            range_chunk_cache: Arc::new(Mutex::new(RangeChunkCache::default())),
         }
     }
 
@@ -44,6 +71,76 @@ impl ServerNodeHydrator {
             sdk,
             windows_download_stage_root(base_url.as_str())?,
         ))
+    }
+
+    fn read_cached_range_chunk(
+        &self,
+        path: &str,
+        remote_version: &str,
+        chunk_index: u64,
+    ) -> Result<Option<Arc<CachedRangeChunk>>> {
+        let key = RangeChunkCacheKey::new(path, remote_version, chunk_index);
+        let mut cache = self
+            .range_chunk_cache
+            .lock()
+            .map_err(|_| anyhow!("range chunk cache lock poisoned"))?;
+        Ok(cache.get(&key))
+    }
+
+    fn cache_range_chunk(
+        &self,
+        path: &str,
+        remote_version: &str,
+        chunk_index: u64,
+        chunk: CachedRangeChunk,
+    ) -> Result<Arc<CachedRangeChunk>> {
+        if chunk.payload.is_empty() {
+            return Ok(Arc::new(chunk));
+        }
+
+        let key = RangeChunkCacheKey::new(path, remote_version, chunk_index);
+        let mut cache = self
+            .range_chunk_cache
+            .lock()
+            .map_err(|_| anyhow!("range chunk cache lock poisoned"))?;
+        Ok(cache.insert(key, chunk))
+    }
+
+    fn download_range_chunk(
+        &self,
+        path: &str,
+        chunk_start: u64,
+        chunk_length: u64,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<CachedRangeChunk> {
+        let mut downloaded = Vec::new();
+        let mut on_progress = |_progress: DownloadProgress| {};
+        let result = self
+            .sdk
+            .download_range_to_writer_with_progress_blocking(
+                DownloadRangeRequest {
+                    key: path,
+                    snapshot: None,
+                    version: None,
+                    range: client_sdk::RequestedRange {
+                        offset: chunk_start,
+                        length: chunk_length,
+                    },
+                },
+                &mut downloaded,
+                &mut on_progress,
+                should_cancel,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to fetch ranged object chunk for path {path} chunk_offset={chunk_start}"
+                )
+            })?;
+
+        Ok(CachedRangeChunk {
+            object_size_bytes: result.object_size_bytes,
+            payload: downloaded,
+        })
     }
 }
 
@@ -71,35 +168,88 @@ impl Hydrator for ServerNodeHydrator {
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<HydrationResult> {
         tracing::info!(
-            "hydrating range path {path} from server range: {}",
-            request.range,
+            "hydrating range path {path} from server required_range={} transfer_range={}",
+            request.required_range,
+            request.transfer_range,
             path = request.path,
         );
-        let result = self
-            .sdk
-            .download_range_to_writer_with_progress_blocking(
-                DownloadRangeRequest {
-                    key: request.path,
-                    snapshot: None,
-                    version: None,
-                    range: request.range,
-                },
-                writer,
-                &mut |progress: DownloadProgress| {
-                    on_progress(HydrationProgress {
-                        object_size_bytes: progress.object_size_bytes,
-                        range: progress.range,
-                        bytes_transferred: progress.bytes_downloaded,
-                    });
-                },
-                should_cancel,
-            )
-            .with_context(|| format!("failed to fetch ranged object for path {}", request.path))?;
+        if request.transfer_range.length == 0 {
+            return Ok(HydrationResult {
+                object_size_bytes: 0,
+                range: request.transfer_range,
+                bytes_transferred: 0,
+            });
+        }
+
+        let chunk_size = RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES as u64;
+        let range_end_exclusive = request
+            .transfer_range
+            .offset
+            .saturating_add(request.transfer_range.length);
+        let first_chunk_index = request.transfer_range.offset / chunk_size;
+        let last_chunk_index = range_end_exclusive.saturating_sub(1) / chunk_size;
+        let mut bytes_transferred = 0_u64;
+        let mut object_size_bytes = 0_u64;
+
+        for chunk_index in first_chunk_index..=last_chunk_index {
+            if should_cancel() {
+                return Err(anyhow!("hydration canceled for {}", request.path));
+            }
+
+            let chunk_start = chunk_index.saturating_mul(chunk_size);
+            let chunk = if let Some(chunk) =
+                self.read_cached_range_chunk(request.path, request.remote_version, chunk_index)?
+            {
+                chunk
+            } else {
+                let downloaded =
+                    self.download_range_chunk(request.path, chunk_start, chunk_size, should_cancel)?;
+                self.cache_range_chunk(
+                    request.path,
+                    request.remote_version,
+                    chunk_index,
+                    downloaded,
+                )?
+            };
+
+            object_size_bytes = object_size_bytes.max(chunk.object_size_bytes);
+            let slice_start = request.transfer_range.offset.saturating_sub(chunk_start) as usize;
+            let slice_end = range_end_exclusive
+                .min(chunk_start.saturating_add(chunk.payload.len() as u64))
+                .saturating_sub(chunk_start) as usize;
+            if slice_start < slice_end {
+                writer.write_all(&chunk.payload[slice_start..slice_end]).map_err(|err| {
+                    anyhow!("failed to write hydrated bytes for {}: {err}", request.path)
+                })?;
+                bytes_transferred = bytes_transferred
+                    .saturating_add(slice_end.saturating_sub(slice_start) as u64);
+                on_progress(HydrationProgress {
+                    object_size_bytes,
+                    range: request.transfer_range,
+                    bytes_transferred,
+                });
+            }
+
+            if chunk.payload.len() < RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES {
+                break;
+            }
+        }
+
+        writer
+            .flush()
+            .map_err(|err| anyhow!("failed to flush hydrated bytes for {}: {err}", request.path))?;
+
+        if object_size_bytes == 0 {
+            object_size_bytes = request
+                .transfer_range
+                .offset
+                .saturating_add(bytes_transferred);
+        }
 
         Ok(HydrationResult {
-            object_size_bytes: result.object_size_bytes,
-            range: result.range,
-            bytes_transferred: result.bytes_downloaded,
+            object_size_bytes,
+            range: request.transfer_range,
+            bytes_transferred,
         })
     }
 }

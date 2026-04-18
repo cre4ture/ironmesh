@@ -3,8 +3,9 @@
 use crate::runtime::ReplayAction;
 use anyhow::{Context, Result, anyhow};
 use client_sdk::IronMeshClient;
+use common::range_chunk_cache::RangeChunkCache;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,8 +27,9 @@ impl OfflineObjectCacheMode {
     }
 }
 
-pub(crate) const RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
-const RANGE_CHUNK_CACHE_MAX_CHUNKS: usize = 16;
+pub(crate) use common::range_chunk_cache::{
+    RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES, RANGE_CHUNK_CACHE_MAX_CHUNKS,
+};
 
 #[derive(Debug)]
 pub struct ClientRightsEdgeState {
@@ -37,7 +39,7 @@ pub struct ClientRightsEdgeState {
     upload_state_dir: PathBuf,
     object_cache_dir: PathBuf,
     queue: Mutex<MutationLog>,
-    range_chunk_cache: Mutex<RangeChunkCache>,
+    range_chunk_cache: Mutex<RangeChunkCache<RangeChunkCacheKey, Vec<u8>>>,
     object_cache_mode: OfflineObjectCacheMode,
 }
 
@@ -53,38 +55,6 @@ impl RangeChunkCacheKey {
             content_hash: content_hash.to_string(),
             chunk_index,
         }
-    }
-}
-
-#[derive(Debug, Default)]
-struct RangeChunkCache {
-    chunks: HashMap<RangeChunkCacheKey, Arc<Vec<u8>>>,
-    access_order: VecDeque<RangeChunkCacheKey>,
-}
-
-impl RangeChunkCache {
-    fn get(&mut self, key: &RangeChunkCacheKey) -> Option<Arc<Vec<u8>>> {
-        let bytes = self.chunks.get(key).cloned()?;
-        self.touch(key.clone());
-        Some(bytes)
-    }
-
-    fn insert(&mut self, key: RangeChunkCacheKey, bytes: Arc<Vec<u8>>) {
-        self.chunks.insert(key.clone(), bytes);
-        self.touch(key);
-
-        while self.chunks.len() > RANGE_CHUNK_CACHE_MAX_CHUNKS {
-            let Some(oldest) = self.access_order.pop_front() else {
-                break;
-            };
-            if self.chunks.remove(&oldest).is_some() {
-                break;
-            }
-        }
-    }
-
-    fn touch(&mut self, key: RangeChunkCacheKey) {
-        self.access_order.push_back(key);
     }
 }
 
@@ -459,9 +429,8 @@ impl ClientRightsEdgeState {
         chunk_index: u64,
         payload: Vec<u8>,
     ) -> Result<Arc<Vec<u8>>> {
-        let payload = Arc::new(payload);
         if payload.is_empty() {
-            return Ok(payload);
+            return Ok(Arc::new(payload));
         }
 
         let key = RangeChunkCacheKey::new(content_hash, chunk_index);
@@ -469,8 +438,7 @@ impl ClientRightsEdgeState {
             .range_chunk_cache
             .lock()
             .map_err(|_| anyhow!("range chunk cache lock poisoned"))?;
-        cache.insert(key, Arc::clone(&payload));
-        Ok(payload)
+        Ok(cache.insert(key, payload))
     }
 
     pub fn spawn_sync_loop(
