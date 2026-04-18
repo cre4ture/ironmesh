@@ -2006,17 +2006,19 @@ impl StoreIndexInspector {
             }))
     }
 
-    pub(crate) async fn object_sizes_by_key(
+    pub(crate) async fn object_sizes_and_content_fingerprints_by_key(
         &self,
         object_hashes: &HashMap<String, String>,
-    ) -> Result<HashMap<String, u64>> {
+    ) -> Result<(HashMap<String, u64>, HashMap<String, String>)> {
         let mut sizes = HashMap::with_capacity(object_hashes.len());
+        let mut content_fingerprints = HashMap::with_capacity(object_hashes.len());
         for (key, manifest_hash) in object_hashes {
             if let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? {
                 sizes.insert(key.clone(), manifest.total_size_bytes as u64);
+                content_fingerprints.insert(key.clone(), content_fingerprint_from_manifest(&manifest));
             }
         }
-        Ok(sizes)
+        Ok((sizes, content_fingerprints))
     }
 
     pub(crate) async fn object_modified_at_by_key(

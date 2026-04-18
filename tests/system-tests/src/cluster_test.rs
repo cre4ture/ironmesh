@@ -6,6 +6,7 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU16, Ordering};
     use std::time::Duration;
     use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -166,23 +167,35 @@ mod tests {
             .as_secs()
     }
 
+    static NEXT_CLUSTER_TEST_BIND_PORT: AtomicU16 = AtomicU16::new(20_000);
+
     fn find_available_bind_addr() -> Result<String> {
-        for _ in 0..64 {
-            let public_listener = std::net::TcpListener::bind("127.0.0.1:0")
-                .context("failed binding temporary public listener")?;
-            let public_addr = public_listener
-                .local_addr()
-                .context("failed reading temporary public listener address")?;
-            let Some(internal_port) = public_addr.port().checked_add(10_000) else {
-                continue;
-            };
+        const PUBLIC_PORT_START: u16 = 20_000;
+        const PUBLIC_PORT_END_EXCLUSIVE: u16 = 45_000;
+        const INTERNAL_PORT_OFFSET: u16 = 10_000;
+
+        let candidate_count = usize::from(PUBLIC_PORT_END_EXCLUSIVE - PUBLIC_PORT_START);
+        let start_port = NEXT_CLUSTER_TEST_BIND_PORT.fetch_add(1, Ordering::Relaxed);
+
+        for offset in 0..candidate_count {
+            let public_port = PUBLIC_PORT_START
+                + ((start_port.wrapping_sub(PUBLIC_PORT_START) as usize + offset)
+                    % candidate_count) as u16;
+            let internal_port = public_port + INTERNAL_PORT_OFFSET;
+            let public_addr = format!("127.0.0.1:{public_port}");
             let internal_addr = format!("127.0.0.1:{internal_port}");
-            let Ok(internal_listener) = std::net::TcpListener::bind(&internal_addr) else {
+
+            let Ok(public_listener) = std::net::TcpListener::bind(&public_addr) else {
                 continue;
             };
+            let Ok(internal_listener) = std::net::TcpListener::bind(&internal_addr) else {
+                drop(public_listener);
+                continue;
+            };
+
             drop(internal_listener);
             drop(public_listener);
-            return Ok(public_addr.to_string());
+            return Ok(public_addr);
         }
 
         bail!("failed to allocate an available bind address")

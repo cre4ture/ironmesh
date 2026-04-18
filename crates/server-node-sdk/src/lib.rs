@@ -7753,6 +7753,7 @@ type StoreIndexSnapshotScan = (
     Vec<String>,
     HashMap<String, String>,
     HashMap<String, u64>,
+    HashMap<String, String>,
     HashMap<String, u64>,
 );
 
@@ -8881,9 +8882,13 @@ async fn list_store_index_response(
         let store = read_store(state, "store_index.clone_worker").await;
         (store.store_index_inspector(), store.waited_ms())
     };
-    let (keys, key_hashes, key_sizes, key_modified_times): StoreIndexSnapshotScan = if let Some(
-        snapshot_id,
-    ) =
+    let (
+        keys,
+        key_hashes,
+        key_sizes,
+        key_content_fingerprints,
+        key_modified_times,
+    ): StoreIndexSnapshotScan = if let Some(snapshot_id) =
         query.snapshot.as_deref()
     {
         match store_index_inspector
@@ -8898,13 +8903,13 @@ async fn list_store_index_response(
                 );
                 let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
                 keys.sort();
-                let sizes = match store_index_inspector
-                    .object_sizes_by_key(&object_hashes)
+                let (sizes, content_fingerprints) = match store_index_inspector
+                    .object_sizes_and_content_fingerprints_by_key(&object_hashes)
                     .await
                 {
-                    Ok(sizes) => sizes,
+                    Ok(values) => values,
                     Err(err) => {
-                        tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to compute snapshot key sizes");
+                        tracing::error!(snapshot_id = %snapshot_id, error = %err, "failed to compute snapshot key metadata");
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
@@ -8926,7 +8931,7 @@ async fn list_store_index_response(
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
-                (keys, object_hashes, sizes, modified_times)
+                (keys, object_hashes, sizes, content_fingerprints, modified_times)
             }
             Ok(None) => return StatusCode::NOT_FOUND.into_response(),
             Err(err) => {
@@ -8942,13 +8947,13 @@ async fn list_store_index_response(
         );
         let mut keys: Vec<String> = object_hashes.keys().cloned().collect();
         keys.sort();
-        let sizes = match store_index_inspector
-            .object_sizes_by_key(&object_hashes)
+        let (sizes, content_fingerprints) = match store_index_inspector
+            .object_sizes_and_content_fingerprints_by_key(&object_hashes)
             .await
         {
-            Ok(sizes) => sizes,
+            Ok(values) => values,
             Err(err) => {
-                tracing::error!(error = %err, "failed to compute current key sizes");
+                tracing::error!(error = %err, "failed to compute current key metadata");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
@@ -8962,7 +8967,7 @@ async fn list_store_index_response(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        (keys, object_hashes, sizes, modified_times)
+        (keys, object_hashes, sizes, content_fingerprints, modified_times)
     };
     let snapshot_scan_ms = snapshot_scan_started_at.elapsed().as_millis();
     if snapshot_scan_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
@@ -8986,6 +8991,7 @@ async fn list_store_index_response(
         depth,
         Some(&key_hashes),
         Some(&key_sizes),
+        Some(&key_content_fingerprints),
         Some(&key_modified_times),
     );
     let media_entry_count = entries
@@ -9286,7 +9292,7 @@ fn media_type_for_path(path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
-    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None)
+    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None)
 }
 
 fn filter_store_index_object_maps_for_prefix(
@@ -9316,6 +9322,7 @@ fn build_store_index_entries_with_hashes(
     depth: usize,
     hashes_by_key: Option<&HashMap<String, String>>,
     sizes_by_key: Option<&HashMap<String, u64>>,
+    content_fingerprints_by_key: Option<&HashMap<String, String>>,
     modified_times_by_key: Option<&HashMap<String, u64>>,
 ) -> Vec<StoreIndexEntry> {
     let normalized_prefix = prefix.trim().trim_matches('/');
@@ -9362,6 +9369,9 @@ fn build_store_index_entries_with_hashes(
     for path in file_entries {
         let content_hash = hashes_by_key.and_then(|values| values.get(&path)).cloned();
         let size_bytes = sizes_by_key.and_then(|values| values.get(&path)).copied();
+        let content_fingerprint = content_fingerprints_by_key
+            .and_then(|values| values.get(&path))
+            .cloned();
         let modified_at_unix = modified_times_by_key
             .and_then(|values| values.get(&path))
             .copied();
@@ -9372,7 +9382,7 @@ fn build_store_index_entries_with_hashes(
             content_hash,
             size_bytes,
             modified_at_unix,
-            content_fingerprint: None,
+            content_fingerprint,
             media: None,
         });
     }

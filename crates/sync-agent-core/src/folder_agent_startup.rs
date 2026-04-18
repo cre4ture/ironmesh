@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use client_sdk::IronMeshClient;
+use common::content_fingerprint::file_content_fingerprint;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -35,7 +36,7 @@ pub fn local_paths_to_preserve_on_startup(
         baseline,
         remote_hashes,
         "local file",
-        |path| local_file_content_hash(root_dir, path),
+        |path| local_file_content_fingerprint(root_dir, path),
     )
 }
 
@@ -141,7 +142,7 @@ where
     matched
 }
 
-pub fn remote_file_hashes_by_local_path(
+pub fn remote_file_content_fingerprints_by_local_path(
     snapshot: &SyncSnapshot,
     scope: &PathScope,
 ) -> BTreeMap<String, String> {
@@ -151,10 +152,14 @@ pub fn remote_file_hashes_by_local_path(
         if entry.kind != EntryKind::File {
             continue;
         }
-        let Some(content_hash) = entry.content_hash.as_deref() else {
+        let Some(content_fingerprint) = entry
+            .content_fingerprint
+            .as_deref()
+            .or(entry.content_hash.as_deref())
+        else {
             continue;
         };
-        if content_hash.is_empty() {
+        if content_fingerprint.is_empty() {
             continue;
         }
 
@@ -165,7 +170,7 @@ pub fn remote_file_hashes_by_local_path(
         if local_path.is_empty() {
             continue;
         }
-        by_local_path.insert(local_path, content_hash.to_string());
+        by_local_path.insert(local_path, content_fingerprint.to_string());
     }
 
     by_local_path
@@ -210,7 +215,7 @@ pub fn startup_remote_delete_wins_paths(
         remote_files,
         preserve_local_files,
         "local file",
-        |path| local_file_content_hash(root_dir, path),
+        |path| local_file_content_fingerprint(root_dir, path),
     )
 }
 
@@ -547,7 +552,7 @@ pub fn startup_dual_modify_conflicts(
         remote_hashes,
         preserve_local_files,
         "local file",
-        |path| local_file_content_hash(root_dir, path),
+        |path| local_file_content_fingerprint(root_dir, path),
     )
 }
 
@@ -640,31 +645,14 @@ where
     conflicts
 }
 
-pub fn local_file_content_hash(root_dir: &Path, relative_path: &str) -> Result<String> {
+pub fn local_file_content_fingerprint(root_dir: &Path, relative_path: &str) -> Result<String> {
     let absolute = absolute_path(root_dir, relative_path);
-    let mut file = File::open(&absolute).with_context(|| {
+    file_content_fingerprint(&absolute).with_context(|| {
         format!(
-            "failed to open local file for hashing {}",
+            "failed to compute local content fingerprint {}",
             absolute.display()
         )
-    })?;
-
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).with_context(|| {
-            format!(
-                "failed to read local file for hashing {}",
-                absolute.display()
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(hasher.finalize().to_hex().to_string())
+    })
 }
 
 pub fn startup_baseline_state_from_remote_index(
@@ -740,7 +728,7 @@ mod tests {
         let mut remote_hashes = BTreeMap::new();
         remote_hashes.insert(
             "docs/readme.txt".to_string(),
-            local_file_content_hash(&root, "docs/readme.txt").unwrap(),
+            local_file_content_fingerprint(&root, "docs/readme.txt").unwrap(),
         );
 
         let preserve = local_paths_to_preserve_on_startup(&root, &local, None, &remote_hashes);
@@ -791,7 +779,7 @@ mod tests {
         let mut baseline = LocalTreeState::new();
         baseline.insert("docs/readme.txt".to_string(), entry);
 
-        let local_hash = local_file_content_hash(&root, "docs/readme.txt").unwrap();
+        let local_hash = local_file_content_fingerprint(&root, "docs/readme.txt").unwrap();
         let mut baseline_hashes = BTreeMap::new();
         baseline_hashes.insert("docs/readme.txt".to_string(), local_hash.clone());
         let mut remote_hashes = BTreeMap::new();
@@ -829,7 +817,7 @@ mod tests {
         let mut remote_hashes = BTreeMap::new();
         remote_hashes.insert(
             "docs/readme.txt".to_string(),
-            local_file_content_hash(&root, "docs/readme.txt").unwrap(),
+            local_file_content_fingerprint(&root, "docs/readme.txt").unwrap(),
         );
 
         let matched = local_paths_matching_remote_on_startup(
@@ -838,12 +826,35 @@ mod tests {
             &BTreeMap::new(),
             &remote_hashes,
             "local file",
-            |path| local_file_content_hash(&root, path),
+            |path| local_file_content_fingerprint(&root, path),
         );
 
         assert!(matched.contains("docs/readme.txt"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_file_content_fingerprints_prefer_fingerprint_over_hash() {
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![sync_core::NamespaceEntry {
+                path: "docs/readme.txt".to_string(),
+                kind: EntryKind::File,
+                version: Some("v1".to_string()),
+                content_hash: Some("manifest-hash".to_string()),
+                content_fingerprint: Some("shared-fingerprint".to_string()),
+                size_bytes: Some(5),
+            }],
+        };
+
+        let fingerprints =
+            remote_file_content_fingerprints_by_local_path(&snapshot, &PathScope::new(None));
+
+        assert_eq!(
+            fingerprints.get("docs/readme.txt").map(String::as_str),
+            Some("shared-fingerprint")
+        );
     }
 
     #[test]

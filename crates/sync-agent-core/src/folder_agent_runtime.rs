@@ -24,9 +24,10 @@ use crate::{
     describe_connection_target, diff_local_trees,
     download_transfer_state_path, download_transfer_temp_path,
     load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
-    local_entry_state_for_path, local_paths_matching_remote_on_startup,
+    local_entry_state_for_path, local_file_content_fingerprint,
+    local_paths_matching_remote_on_startup,
     local_paths_to_preserve_on_startup_with_hash,
-    materialize_remote_conflict_copies, parent_directories, remote_file_hashes_by_local_path,
+    materialize_remote_conflict_copies, parent_directories,
     remote_file_paths_by_local_path, remove_local_path,
     scan_local_tree_with_progress, spawn_ui_server, startup_add_delete_conflicts,
     startup_baseline_state_from_remote_index, startup_dual_modify_conflicts_with_hash,
@@ -252,7 +253,7 @@ pub trait FolderAgentLocalBackend {
         relative_path: &str,
     ) -> Result<Option<LocalEntryState>>;
 
-    fn file_content_hash(
+    fn file_content_fingerprint(
         &mut self,
         options: &FolderAgentRuntimeOptions,
         relative_path: &str,
@@ -357,12 +358,12 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
         local_entry_state_for_path(&options.root_dir, relative_path)
     }
 
-    fn file_content_hash(
+    fn file_content_fingerprint(
         &mut self,
         options: &FolderAgentRuntimeOptions,
         relative_path: &str,
     ) -> Result<String> {
-        crate::local_file_content_hash(&options.root_dir, relative_path)
+        local_file_content_fingerprint(&options.root_dir, relative_path)
     }
 
     fn ensure_local_directory(
@@ -788,13 +789,13 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let remote_files_before_remote_sync =
         remote_file_paths_by_local_path(&initial_snapshot, &scope);
     let remote_hashes_before_remote_sync =
-        remote_file_hashes_by_local_path(&initial_snapshot, &scope);
+        crate::remote_file_content_fingerprints_by_local_path(&initial_snapshot, &scope);
     let preserve_local_files = local_paths_to_preserve_on_startup_with_hash(
         &local_state_before_remote_sync,
         baseline_before_remote_sync.as_ref(),
         &remote_hashes_before_remote_sync,
         file_hash_label,
-        |path| backend.file_content_hash(options, path),
+        |path| backend.file_content_fingerprint(options, path),
     );
     let matching_remote_files = local_paths_matching_remote_on_startup(
         &local_state_before_remote_sync,
@@ -802,8 +803,24 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         &baseline_hashes_before_remote_sync,
         &remote_hashes_before_remote_sync,
         file_hash_label,
-        |path| backend.file_content_hash(options, path),
+        |path| backend.file_content_fingerprint(options, path),
     );
+    for path in &matching_remote_files {
+        let Some(entry_state) = local_state_before_remote_sync.get(path) else {
+            continue;
+        };
+        state_store
+            .upsert_baseline_entry_with_hash(
+                path,
+                entry_state,
+                remote_hashes_before_remote_sync.get(path).map(String::as_str),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to repair baseline fingerprint for startup-matched file {path}"
+                )
+            })?;
+    }
     let remote_delete_wins_paths = startup_remote_delete_wins_paths_with_hash(
         &local_state_before_remote_sync,
         baseline_before_remote_sync.as_ref(),
@@ -811,7 +828,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         &remote_files_before_remote_sync,
         &preserve_local_files,
         file_hash_label,
-        |path| backend.file_content_hash(options, path),
+        |path| backend.file_content_fingerprint(options, path),
     );
     let mut startup_conflicts = startup_add_delete_conflicts(
         &local_state_before_remote_sync,
@@ -827,7 +844,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         &remote_hashes_before_remote_sync,
         &preserve_local_files,
         file_hash_label,
-        |path| backend.file_content_hash(options, path),
+        |path| backend.file_content_fingerprint(options, path),
     ));
     if let Err(error) =
         backend.materialize_remote_conflict_copies(options, &client, &scope, &startup_conflicts)
@@ -913,6 +930,12 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         &local_state,
         &remote_index,
         &preserve_local_files,
+    );
+    seed_downloaded_remote_files_into_local_state(
+        &mut local_state,
+        &remote_index,
+        &suppressed_uploads,
+        Some(&preserve_local_files),
     );
     state_store
         .persist_local_baseline(&local_state)
@@ -1168,6 +1191,12 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 last_success_unix_ms,
             )
             .context("failed to rescan local state after remote update")?;
+            seed_downloaded_remote_files_into_local_state(
+                &mut local_state,
+                &remote_index,
+                &suppressed_uploads,
+                None,
+            );
             baseline_dirty = true;
             last_success_unix_ms = Some(now_unix_ms());
             store_optional_unix_ms(&last_success_shared, last_success_unix_ms);
@@ -1409,6 +1438,28 @@ fn sample_local_paths(local_state: &LocalTreeState, limit: usize) -> String {
     sample
 }
 
+fn seed_downloaded_remote_files_into_local_state(
+    local_state: &mut LocalTreeState,
+    remote_index: &RemoteTreeIndex,
+    suppressed_uploads: &BTreeMap<String, LocalEntryState>,
+    excluded_paths: Option<&BTreeSet<String>>,
+) {
+    for (path, entry_state) in suppressed_uploads {
+        if entry_state.kind != LocalEntryKind::File {
+            continue;
+        }
+        if !remote_index.files.contains(path) {
+            continue;
+        }
+        if excluded_paths.is_some_and(|paths| paths.contains(path)) {
+            continue;
+        }
+        local_state
+            .entry(path.clone())
+            .or_insert_with(|| entry_state.clone());
+    }
+}
+
 fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<IronMeshClient> {
     build_configured_client(
         options.server_base_url.as_deref(),
@@ -1458,21 +1509,6 @@ fn scan_local_tree_without_status<B: FolderAgentLocalBackend>(
     backend.scan_local_tree_with_progress(options, &mut on_progress)
 }
 
-fn uploaded_remote_content_hash(
-    client: &IronMeshClient,
-    remote_key: &str,
-) -> Result<Option<String>> {
-    let response = client
-        .store_index_blocking(Some(remote_key), 1, None)
-        .with_context(|| format!("failed to query remote hash for uploaded key {remote_key}"))?;
-    Ok(response
-        .entries
-        .into_iter()
-        .find(|entry| crate::normalize_relative_path(&entry.path) == remote_key)
-        .and_then(|entry| entry.content_hash)
-        .filter(|value| !value.trim().is_empty()))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
     backend: &mut B,
@@ -1489,17 +1525,7 @@ fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
     })?;
 
     match backend.upload_local_file(options, client, scope, relative_path, size_bytes) {
-        Ok(content_hash) => {
-            let content_hash = match uploaded_remote_content_hash(client, &remote_key) {
-                Ok(Some(remote_content_hash)) => remote_content_hash,
-                Ok(None) => content_hash,
-                Err(error) => {
-                    tracing::warn!(
-                        "failed to resolve canonical remote hash for uploaded file {relative_path}: {error}"
-                    );
-                    content_hash
-                }
-            };
+        Ok(content_fingerprint) => {
             try_record_modification(
                 modification_log,
                 modification_context,
@@ -1508,10 +1534,10 @@ fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
                 relative_path,
                 remote_key.as_str(),
                 Some(size_bytes),
-                Some(content_hash.as_str()),
+                Some(content_fingerprint.as_str()),
                 None,
             );
-            Ok(content_hash)
+            Ok(content_fingerprint)
         }
         Err(error) => {
             let error =
@@ -1867,7 +1893,10 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
             }
             EntryKind::File => {
                 next_index.files.insert(local_path.clone());
-                if let Some(content_hash) = entry.content_hash.as_deref()
+                if let Some(content_hash) = entry
+                    .content_fingerprint
+                    .as_deref()
+                    .or(entry.content_hash.as_deref())
                     && !content_hash.trim().is_empty()
                 {
                     entry_hashes.insert(local_path.clone(), content_hash.to_string());
@@ -2531,5 +2560,67 @@ fn local_entry_state_from_metadata(metadata: &fs::Metadata) -> LocalEntryState {
         kind,
         size_bytes: metadata.len(),
         modified_unix_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_downloaded_remote_files_into_local_state_preserves_recent_downloads() {
+        let mut local_state = LocalTreeState::new();
+        let mut remote_index = RemoteTreeIndex::default();
+        let mut suppressed_uploads = BTreeMap::new();
+
+        remote_index.files.insert("docs/readme.txt".to_string());
+        suppressed_uploads.insert(
+            "docs/readme.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 9,
+                modified_unix_ms: 123,
+            },
+        );
+
+        seed_downloaded_remote_files_into_local_state(
+            &mut local_state,
+            &remote_index,
+            &suppressed_uploads,
+            None,
+        );
+
+        assert_eq!(
+            local_state.get("docs/readme.txt"),
+            suppressed_uploads.get("docs/readme.txt")
+        );
+    }
+
+    #[test]
+    fn seed_downloaded_remote_files_into_local_state_respects_exclusions() {
+        let mut local_state = LocalTreeState::new();
+        let mut remote_index = RemoteTreeIndex::default();
+        let mut suppressed_uploads = BTreeMap::new();
+        let mut excluded_paths = BTreeSet::new();
+
+        remote_index.files.insert("docs/readme.txt".to_string());
+        suppressed_uploads.insert(
+            "docs/readme.txt".to_string(),
+            LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 9,
+                modified_unix_ms: 123,
+            },
+        );
+        excluded_paths.insert("docs/readme.txt".to_string());
+
+        seed_downloaded_remote_files_into_local_state(
+            &mut local_state,
+            &remote_index,
+            &suppressed_uploads,
+            Some(&excluded_paths),
+        );
+
+        assert!(!local_state.contains_key("docs/readme.txt"));
     }
 }

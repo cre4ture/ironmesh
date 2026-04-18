@@ -1,8 +1,8 @@
 #![cfg(windows)]
 
-pub(crate) use common::content_fingerprint::{
-    ContentFingerprintBuilder, FingerprintingReader, file_content_fingerprint,
-};
+#[cfg(test)]
+pub(crate) use common::content_fingerprint::ContentFingerprintBuilder;
+pub(crate) use common::content_fingerprint::{FingerprintingReader, file_content_fingerprint};
 
 #[cfg(test)]
 mod tests {

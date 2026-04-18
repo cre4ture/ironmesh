@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use client_sdk::IronMeshClient;
+use common::content_fingerprint::FingerprintingReader;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use serde::Deserialize;
@@ -380,12 +381,12 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         stat_tree_entry(self.tree_uri()?, relative_path)
     }
 
-    fn file_content_hash(
+    fn file_content_fingerprint(
         &mut self,
         _options: &FolderAgentRuntimeOptions,
         relative_path: &str,
     ) -> Result<String> {
-        saf_file_content_hash(self.tree_uri()?, relative_path)
+        saf_file_content_fingerprint(self.tree_uri()?, relative_path)
     }
 
     fn ensure_local_directory(
@@ -753,34 +754,6 @@ impl Drop for JavaOutputStreamWriter<'_, '_> {
     }
 }
 
-struct HashingReader<R> {
-    inner: R,
-    hasher: blake3::Hasher,
-}
-
-impl<R> HashingReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hasher: blake3::Hasher::new(),
-        }
-    }
-
-    fn content_hash_hex(&self) -> String {
-        self.hasher.finalize().to_hex().to_string()
-    }
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.inner.read(buf)?;
-        if read > 0 {
-            self.hasher.update(&buf[..read]);
-        }
-        Ok(read)
-    }
-}
-
 fn upload_saf_file(
     tree_uri: &str,
     client: &IronMeshClient,
@@ -795,32 +768,41 @@ fn upload_saf_file(
     with_bridge_env(|env, class| {
         let input_stream = open_tree_input_stream(env, &class, tree_uri, relative_path)?;
         let mut reader = JavaInputStreamReader::new(env, input_stream)?;
-        let mut hashing_reader = HashingReader::new(&mut reader);
+        let mut fingerprinting_reader = FingerprintingReader::new(&mut reader, size_bytes);
         client
-            .put_large_aware_reader(remote_key.clone(), &mut hashing_reader, size_bytes)
+            .put_large_aware_reader(remote_key.clone(), &mut fingerprinting_reader, size_bytes)
             .with_context(|| {
                 format!("failed to upload local file {relative_path} to {remote_key}")
             })?;
-        Ok(hashing_reader.content_hash_hex())
+        fingerprinting_reader.finish()
     })
 }
 
-fn saf_file_content_hash(tree_uri: &str, relative_path: &str) -> Result<String> {
+fn saf_file_content_fingerprint(tree_uri: &str, relative_path: &str) -> Result<String> {
+    let entry = stat_tree_entry(tree_uri, relative_path)?
+        .ok_or_else(|| anyhow::anyhow!("missing SAF file {relative_path}"))?;
+    anyhow::ensure!(
+        entry.kind == LocalEntryKind::File,
+        "refusing to fingerprint non-file SAF path {relative_path}"
+    );
+
     with_bridge_env(|env, class| {
         let input_stream = open_tree_input_stream(env, &class, tree_uri, relative_path)?;
         let mut reader = JavaInputStreamReader::new(env, input_stream)?;
-        let mut hasher = blake3::Hasher::new();
+        let mut fingerprinting_reader =
+            FingerprintingReader::new(&mut reader, entry.size_bytes);
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let read = reader
+            let read = fingerprinting_reader
                 .read(&mut buffer)
-                .with_context(|| format!("failed to read SAF file for hashing {relative_path}"))?;
+                .with_context(|| {
+                    format!("failed to read SAF file for fingerprinting {relative_path}")
+                })?;
             if read == 0 {
                 break;
             }
-            hasher.update(&buffer[..read]);
         }
-        Ok(hasher.finalize().to_hex().to_string())
+        fingerprinting_reader.finish()
     })
 }
 

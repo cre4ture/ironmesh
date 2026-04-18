@@ -1,10 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use client_sdk::IronMeshClient;
+use common::content_fingerprint::file_content_fingerprint;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use crate::{
@@ -389,48 +388,9 @@ pub fn remove_local_path(
     Ok(())
 }
 
-struct HashingReader<R> {
-    inner: R,
-    hasher: blake3::Hasher,
-}
-
-impl<R> HashingReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hasher: blake3::Hasher::new(),
-        }
-    }
-
-    fn content_hash_hex(&self) -> String {
-        self.hasher.finalize().to_hex().to_string()
-    }
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.inner.read(buf)?;
-        if read > 0 {
-            self.hasher.update(&buf[..read]);
-        }
-        Ok(read)
-    }
-}
-
 fn file_content_hash(path: &Path) -> Result<String> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open local file {}", path.display()))?;
-    let mut reader = HashingReader::new(file);
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .with_context(|| format!("failed to hash local file {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-    }
-    Ok(reader.content_hash_hex())
+    file_content_fingerprint(path)
+        .with_context(|| format!("failed to compute local content fingerprint {}", path.display()))
 }
 
 fn preserve_local_conflict_copy(

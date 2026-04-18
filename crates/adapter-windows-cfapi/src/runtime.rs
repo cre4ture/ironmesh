@@ -258,7 +258,9 @@ fn placeholder_info_matches_desired_sync_state(
     desired_state: DesiredSyncState,
 ) -> bool {
     match desired_state {
-        DesiredSyncState::InSync => info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC,
+        DesiredSyncState::InSync => {
+            info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC && info.ModifiedDataSize == 0
+        }
         DesiredSyncState::NotInSync => info.InSyncState == CF_IN_SYNC_STATE_NOT_IN_SYNC,
     }
 }
@@ -1609,6 +1611,31 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
             }
         };
 
+        if matches!(desired_state, DesiredSyncState::InSync) {
+            match cf_get_placeholder_standard_info(&file) {
+                Ok(info) if info.ModifiedDataSize != 0 => {
+                    tracing::info!(
+                        "sync-state: preserved dirty placeholder path={} desired={:?} modified={} state_before={}",
+                        relative_path,
+                        desired_state,
+                        info.ModifiedDataSize,
+                        state_before
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::info!(
+                        "sync-state: could not inspect {} before {:?} update; continuing: {} state_before={}",
+                        full_path.display(),
+                        desired_state,
+                        err,
+                        state_before
+                    );
+                }
+            }
+        }
+
         let result = match desired_state {
             DesiredSyncState::InSync => cf_set_in_sync(&file).map(|_| {
                 stats.marked_in_sync += 1;
@@ -2533,9 +2560,10 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_sync_state_match_helper_uses_in_sync_state_only() {
+    fn placeholder_sync_state_match_helper_requires_clean_local_data_for_in_sync() {
         let mut info = CF_PLACEHOLDER_STANDARD_INFO {
             InSyncState: CF_IN_SYNC_STATE_IN_SYNC,
+            ModifiedDataSize: 0,
             ..Default::default()
         };
         assert!(placeholder_info_matches_desired_sync_state(
@@ -2547,6 +2575,13 @@ mod tests {
             DesiredSyncState::NotInSync
         ));
 
+        info.ModifiedDataSize = 128;
+        assert!(!placeholder_info_matches_desired_sync_state(
+            &info,
+            DesiredSyncState::InSync
+        ));
+
+        info.ModifiedDataSize = 0;
         info.InSyncState = CF_IN_SYNC_STATE_NOT_IN_SYNC;
         assert!(placeholder_info_matches_desired_sync_state(
             &info,

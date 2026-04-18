@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
@@ -4709,6 +4708,42 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
 }
 
 #[test]
+fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
+    let keys = vec!["docs/readme.txt".to_string()];
+    let hashes = std::collections::HashMap::from([(
+        "docs/readme.txt".to_string(),
+        "manifest-hash".to_string(),
+    )]);
+    let sizes = std::collections::HashMap::from([("docs/readme.txt".to_string(), 42_u64)]);
+    let content_fingerprints = std::collections::HashMap::from([(
+        "docs/readme.txt".to_string(),
+        "shared-fingerprint".to_string(),
+    )]);
+
+    let entries = super::build_store_index_entries_with_hashes(
+        &keys,
+        "",
+        2,
+        Some(&hashes),
+        Some(&sizes),
+        Some(&content_fingerprints),
+        None,
+    );
+
+    let file_entry = entries
+        .iter()
+        .find(|entry| entry.path == "docs/readme.txt")
+        .expect("file entry should be present");
+
+    assert_eq!(file_entry.content_hash.as_deref(), Some("manifest-hash"));
+    assert_eq!(
+        file_entry.content_fingerprint.as_deref(),
+        Some("shared-fingerprint")
+    );
+    assert_eq!(file_entry.size_bytes, Some(42));
+}
+
+#[test]
 fn autonomous_post_write_replication_trigger_guard_blocks_internal_writes() {
     assert!(should_trigger_autonomous_post_write_replication(
         true, false
@@ -8384,11 +8419,7 @@ async fn cleanup_test_state(state: &ServerState) {
 }
 
 fn fresh_test_dir(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("ironmesh-{name}-{unique}"));
+    let path = std::env::temp_dir().join(format!("ironmesh-{name}-{}", Uuid::new_v4()));
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::create_dir_all(&path);
     path
