@@ -1526,6 +1526,7 @@ impl DataScrubber {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn run(&self) -> Result<DataScrubReport> {
         Ok(self.run_internal(None).await?.report)
     }

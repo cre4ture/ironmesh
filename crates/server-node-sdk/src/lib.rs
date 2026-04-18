@@ -372,6 +372,7 @@ struct PublicTlsRuntime {
 
 #[derive(Clone)]
 struct OutboundClients {
+    #[cfg(test)]
     internal_http: reqwest::Client,
     rendezvous_control: Option<RendezvousControlClient>,
     rendezvous_controls: Vec<RendezvousEndpointClient>,
@@ -2280,6 +2281,7 @@ fn node_certificate_restart_required(
     })
 }
 
+#[cfg(test)]
 async fn current_internal_http(state: &ServerState) -> reqwest::Client {
     state.outbound_clients.read().await.internal_http.clone()
 }
@@ -2574,6 +2576,7 @@ fn build_outbound_clients_with_urls(
     rendezvous_urls: &[String],
 ) -> Result<OutboundClients> {
     let trust_material = load_live_trust_material(state)?;
+    #[cfg(test)]
     let internal_http = if let Some(internal_tls) = state.internal_tls_runtime.as_ref() {
         build_internal_mtls_http_client(
             &internal_tls.ca_cert_path,
@@ -2607,6 +2610,7 @@ fn build_outbound_clients_with_urls(
         };
 
     Ok(OutboundClients {
+        #[cfg(test)]
         internal_http,
         rendezvous_control,
         rendezvous_controls,
@@ -3666,6 +3670,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
     );
     let startup_phase_anchor = Instant::now();
 
+    #[cfg(test)]
     let internal_http = if let Some(internal_tls) = config.internal_tls.as_ref() {
         build_internal_mtls_http_client(
             &internal_tls.ca_cert_path,
@@ -3955,6 +3960,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
             ..NodeEnrollmentAutoRenewState::default()
         })),
         outbound_clients: Arc::new(RwLock::new(OutboundClients {
+            #[cfg(test)]
             internal_http,
             rendezvous_control,
             rendezvous_controls,
@@ -15184,6 +15190,7 @@ async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
     persister.persist_cluster_replicas(&replicas).await
 }
 
+#[cfg(test)]
 fn build_http_client_from_optional_pem(server_ca_pem: Option<&str>) -> Result<reqwest::Client> {
     let builder = reqwest::Client::builder();
     let builder = if let Some(server_ca_pem) = server_ca_pem {
@@ -15244,6 +15251,7 @@ fn load_root_cert_store_from_pem_path(ca_path: &PathBuf) -> Result<RootCertStore
     Ok(roots)
 }
 
+#[cfg(test)]
 fn build_internal_mtls_http_client(
     ca_path: &PathBuf,
     cert_path: &PathBuf,
