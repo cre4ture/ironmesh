@@ -11,18 +11,22 @@ NODE_B_BIND="0.0.0.0:18482"
 NODE_A_URL="https://127.0.0.1:18481"
 NODE_B_URL="https://127.0.0.1:18482"
 ADMIN_PASSWORD="correct horse battery staple"
+SERVER_NODE_BUILT=0
 
 usage() {
   cat <<EOF
 Usage:
-  $0 [start|stop|restart] {$NODE_A_NAME|$NODE_B_NAME}
-  $0 {$NODE_A_NAME|$NODE_B_NAME}
+  $0 [start|stop|restart] {$NODE_A_NAME|$NODE_B_NAME}...
+  $0 {$NODE_A_NAME|$NODE_B_NAME}...
 
 Examples:
   $0 $NODE_A_NAME
+  $0 $NODE_A_NAME $NODE_B_NAME
   $0 start $NODE_B_NAME
   $0 stop $NODE_A_NAME
-  $0 restart $NODE_B_NAME
+  $0 restart $NODE_A_NAME $NODE_B_NAME
+
+Actions are applied sequentially in the order provided.
 EOF
 }
 
@@ -31,6 +35,15 @@ require_screen() {
     echo "screen is required but was not found in PATH" >&2
     exit 1
   fi
+}
+
+ensure_server_node_built() {
+  if [[ "$SERVER_NODE_BUILT" -eq 1 ]]; then
+    return 0
+  fi
+
+  (cd "$REPO_ROOT" && cargo build -p server-node)
+  SERVER_NODE_BUILT=1
 }
 
 validate_node_name() {
@@ -104,8 +117,8 @@ start_node() {
     return 0
   fi
 
-  # build the server-node binary to ensure it's available before starting the screen session
-  (cd "$REPO_ROOT" && cargo build -p server-node)
+  # build the server-node binary once before the first node start in this invocation
+  ensure_server_node_built
 
   mkdir -p "$data_dir"
   printf -v start_command \
@@ -146,31 +159,51 @@ restart_node() {
   start_node "$node_name"
 }
 
-if [[ $# -eq 1 ]]; then
-  ACTION="start"
-  NODE_NAME="$1"
-elif [[ $# -eq 2 ]]; then
-  ACTION="$1"
-  NODE_NAME="$2"
-else
+if [[ $# -lt 1 ]]; then
   usage >&2
   exit 1
 fi
 
-validate_node_name "$NODE_NAME"
+ACTION="start"
 
-case "$ACTION" in
-  start)
-    start_node "$NODE_NAME"
-    ;;
-  stop)
-    stop_node "$NODE_NAME"
-    ;;
-  restart)
-    restart_node "$NODE_NAME"
-    ;;
-  *)
-    usage >&2
-    exit 1
+case "$1" in
+  start|stop|restart)
+    ACTION="$1"
+    shift
     ;;
 esac
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
+
+NODE_NAMES=("$@")
+
+for node_name in "${NODE_NAMES[@]}"; do
+  validate_node_name "$node_name"
+done
+
+for index in "${!NODE_NAMES[@]}"; do
+  node_name="${NODE_NAMES[$index]}"
+
+  if (( ${#NODE_NAMES[@]} > 1 )); then
+    echo "[$((index + 1))/${#NODE_NAMES[@]}] $ACTION $node_name"
+  fi
+
+  case "$ACTION" in
+    start)
+      start_node "$node_name"
+      ;;
+    stop)
+      stop_node "$node_name"
+      ;;
+    restart)
+      restart_node "$node_name"
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
