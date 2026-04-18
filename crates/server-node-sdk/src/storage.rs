@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use common::NodeId;
+use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use exif::{In, Reader as ExifReader, Tag, Value};
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
@@ -6012,14 +6013,13 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
 }
 
 fn content_fingerprint_from_manifest(manifest: &ObjectManifest) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ironmesh-content-fingerprint-v1");
-    hasher.update(&(manifest.total_size_bytes as u64).to_le_bytes());
-    for chunk in &manifest.chunks {
-        hasher.update(chunk.hash.as_bytes());
-        hasher.update(&(chunk.size_bytes as u64).to_le_bytes());
-    }
-    format!("cfp-{}", hasher.finalize().to_hex())
+    content_fingerprint_from_chunk_refs(
+        manifest.total_size_bytes as u64,
+        manifest
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.hash.as_str(), chunk.size_bytes as u64)),
+    )
 }
 
 async fn file_size_bytes(path: &Path) -> Result<u64> {

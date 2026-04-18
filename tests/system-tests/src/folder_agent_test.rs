@@ -10,12 +10,15 @@ use bytes::Bytes;
 use client_sdk::IronMeshClient;
 use rusqlite::{Connection, OptionalExtension};
 use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use sync_agent_core::{
+    ModificationLogRecord, ModificationLogStore, ModificationOperation, ModificationOutcome,
+    PathScope, StartupStateStore,
+};
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
@@ -426,16 +429,33 @@ fn baseline_db_path(
     connection_target: &str,
     prefix: Option<&str>,
 ) -> Result<PathBuf> {
-    let mut hasher = DefaultHasher::new();
-    root_dir.to_string_lossy().hash(&mut hasher);
-    prefix.unwrap_or_default().hash(&mut hasher);
-    connection_target.hash(&mut hasher);
-    let fingerprint = hasher.finish();
+    let scope = PathScope::new(prefix.map(|value| value.to_string()));
+    Ok(StartupStateStore::new(root_dir, &scope, connection_target).path)
+}
 
-    let mut path = std::env::temp_dir();
-    path.push("ironmesh-folder-agent");
-    path.push(format!("baseline-{fingerprint:016x}.sqlite"));
-    Ok(path)
+fn modification_log_records(
+    root_dir: &Path,
+    connection_target: &str,
+    prefix: Option<&str>,
+) -> Result<Vec<ModificationLogRecord>> {
+    let scope = PathScope::new(prefix.map(|value| value.to_string()));
+    let store = ModificationLogStore::new(root_dir, root_dir, &scope, connection_target);
+    Ok(store.list(Some(500), None, None)?.records)
+}
+
+fn successful_modification_count(
+    records: &[ModificationLogRecord],
+    operation: ModificationOperation,
+    local_relative_path: &str,
+) -> usize {
+    records
+        .iter()
+        .filter(|record| {
+            record.operation == operation
+                && record.outcome == ModificationOutcome::Success
+                && record.local_relative_path == local_relative_path
+        })
+        .count()
 }
 
 fn delete_baseline_entry(root_dir: &Path, connection_target: &str, path: &str) -> Result<()> {
@@ -679,6 +699,110 @@ async fn folder_agent_run_once_bootstraps_and_exits() -> Result<()> {
         wait_for_local_file_bytes(&local_root.join("once/seed.txt"), b"seed-remote", 120).await?;
         wait_for_local_file_bytes(&local_root.join("once/local.txt"), b"local-before-run", 120)
             .await?;
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    stop_server(&mut fixture.server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_run_once_skips_unchanged_uploads_and_downloads_on_repeat_run(
+) -> Result<()> {
+    let bind = "127.0.0.1:19427";
+    let local_root = fresh_data_dir("folder-agent-repeat-noop-root");
+
+    let mut fixture = start_authenticated_folder_agent_fixture(bind).await?;
+    let sdk = fixture.sdk.clone();
+
+    let result = async {
+        sdk.put_large_aware("repeat-noop/remote.txt", Bytes::from_static(b"remote-seed"))
+            .await?;
+
+        fs::create_dir_all(local_root.join("repeat-noop")).with_context(|| {
+            format!(
+                "failed to create local directory {}",
+                local_root.join("repeat-noop").display()
+            )
+        })?;
+        fs::write(local_root.join("repeat-noop/local.txt"), b"local-seed").with_context(|| {
+            format!(
+                "failed to write local file {}",
+                local_root.join("repeat-noop/local.txt").display()
+            )
+        })?;
+
+        run_folder_agent_once(&fixture.connection, &local_root, None, 250, 250, true).await?;
+
+        wait_for_local_file_bytes(
+            &local_root.join("repeat-noop/remote.txt"),
+            b"remote-seed",
+            120,
+        )
+        .await?;
+        wait_for_remote_file_bytes(&sdk, "repeat-noop/local.txt", b"local-seed", 120).await?;
+
+        let initial_records =
+            modification_log_records(&local_root, fixture.connection.target_label(), None)?;
+        let initial_download_count = successful_modification_count(
+            &initial_records,
+            ModificationOperation::Download,
+            "repeat-noop/remote.txt",
+        );
+        let initial_upload_count = successful_modification_count(
+            &initial_records,
+            ModificationOperation::Upload,
+            "repeat-noop/local.txt",
+        );
+
+        assert!(
+            initial_download_count >= 1,
+            "expected first run to download repeat-noop/remote.txt"
+        );
+        assert!(
+            initial_upload_count >= 1,
+            "expected first run to upload repeat-noop/local.txt"
+        );
+
+        run_folder_agent_once(&fixture.connection, &local_root, None, 250, 250, true).await?;
+
+        wait_for_local_file_bytes(
+            &local_root.join("repeat-noop/remote.txt"),
+            b"remote-seed",
+            120,
+        )
+        .await?;
+        wait_for_remote_file_bytes(&sdk, "repeat-noop/local.txt", b"local-seed", 120).await?;
+
+        let repeated_records =
+            modification_log_records(&local_root, fixture.connection.target_label(), None)?;
+        let repeated_download_count = successful_modification_count(
+            &repeated_records,
+            ModificationOperation::Download,
+            "repeat-noop/remote.txt",
+        );
+        let repeated_upload_count = successful_modification_count(
+            &repeated_records,
+            ModificationOperation::Upload,
+            "repeat-noop/local.txt",
+        );
+
+        assert_eq!(
+            repeated_download_count, initial_download_count,
+            "second run should not redownload unchanged repeat-noop/remote.txt"
+        );
+        assert_eq!(
+            repeated_upload_count, initial_upload_count,
+            "second run should not reupload unchanged repeat-noop/local.txt"
+        );
+        assert_eq!(
+            repeated_records.len(),
+            initial_records.len(),
+            "second run should not record new modification actions for an already aligned tree"
+        );
 
         Ok::<(), anyhow::Error>(())
     }

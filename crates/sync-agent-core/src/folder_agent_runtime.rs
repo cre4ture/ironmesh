@@ -1458,6 +1458,21 @@ fn scan_local_tree_without_status<B: FolderAgentLocalBackend>(
     backend.scan_local_tree_with_progress(options, &mut on_progress)
 }
 
+fn uploaded_remote_content_hash(
+    client: &IronMeshClient,
+    remote_key: &str,
+) -> Result<Option<String>> {
+    let response = client
+        .store_index_blocking(Some(remote_key), 1, None)
+        .with_context(|| format!("failed to query remote hash for uploaded key {remote_key}"))?;
+    Ok(response
+        .entries
+        .into_iter()
+        .find(|entry| crate::normalize_relative_path(&entry.path) == remote_key)
+        .and_then(|entry| entry.content_hash)
+        .filter(|value| !value.trim().is_empty()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
     backend: &mut B,
@@ -1475,6 +1490,16 @@ fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
 
     match backend.upload_local_file(options, client, scope, relative_path, size_bytes) {
         Ok(content_hash) => {
+            let content_hash = match uploaded_remote_content_hash(client, &remote_key) {
+                Ok(Some(remote_content_hash)) => remote_content_hash,
+                Ok(None) => content_hash,
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to resolve canonical remote hash for uploaded file {relative_path}: {error}"
+                    );
+                    content_hash
+                }
+            };
             try_record_modification(
                 modification_log,
                 modification_context,
