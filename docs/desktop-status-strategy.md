@@ -76,7 +76,9 @@ Implementation shape:
 
 Current repo implementation:
 
+- `crates/desktop-status/src/gnome.rs`
 - `apps/ironmesh-folder-agent/src/gnome.rs`
+- `crates/adapter-linux-fuse/src/gnome.rs`
 - `apps/ironmesh-folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/`
 
 ### 2. Windows
@@ -132,7 +134,9 @@ interaction.
 
 The GNOME publisher combines two sources:
 
-- local sync state from `sync-agent-core::run_folder_agent_with_control` status callbacks,
+- local runtime state from the active desktop runtime:
+  - `sync-agent-core::run_folder_agent_with_control` status callbacks for folder sync,
+  - Linux FUSE mount lifecycle state from `adapter-linux-fuse`,
 - authenticated remote status from existing IronMesh client JSON endpoints:
   - `/cluster/status`
   - `/cluster/replication/plan`
@@ -140,14 +144,14 @@ The GNOME publisher combines two sources:
 
 This gives us:
 
-- local engine state without inventing a second sync state machine,
+- local engine or mount state without inventing a second desktop-side status service,
 - server / cluster visibility without requiring a second desktop-side service.
 
 ### Current scope
 
 The first GNOME slice is intentionally single-profile on desktop:
 
-- one `ironmesh-folder-agent` runtime,
+- one active desktop runtime (`ironmesh-folder-agent` or Linux FUSE mount),
 - one top-bar indicator,
 - one aggregated profile label.
 
@@ -159,15 +163,22 @@ without redesigning the extension.
 Recommended GNOME workflow today:
 
 1. Install the extension:
-   - `cargo run -p ironmesh-folder-agent -- --root-dir /tmp/placeholder gnome install-extension`
-2. Start the folder agent with GNOME status publishing:
-   - `cargo run -p ironmesh-folder-agent -- --root-dir <dir> --server-base-url <url> --client-identity-file <file> --publish-gnome-status`
+  - `cargo run -p ironmesh-folder-agent -- --root-dir /tmp/placeholder gnome install-extension`
+  - or `cargo run -p os-integration -- --mountpoint /tmp/placeholder gnome install-extension`
+2. Start a desktop runtime with GNOME status publishing:
+  - folder agent: `cargo run -p ironmesh-folder-agent -- --root-dir <dir> --server-base-url <url> --client-identity-file <file> --publish-gnome-status`
+  - Linux FUSE: `cargo run -p os-integration -- --server-base-url <url> --client-identity-file <file> --mountpoint <dir> --publish-gnome-status`
 3. Let the extension read the shared status file from the runtime directory.
 
 Notes:
 
 - `gnome print-status-path` prints the exact JSON path the extension watches.
 - `--gnome-status-file` lets development environments override the default runtime path.
+- On GNOME Wayland, a newly copied user extension may not be discoverable until the next session.
+  The installer now queues IronMesh in `org.gnome.shell enabled-extensions`, but initial activation
+  can still require logging out and back in.
+- Linux FUSE snapshot mode can also publish GNOME status, but its connection and replication rows
+  remain intentionally static/unknown because no live server polling is active.
 
 ## Follow-up backlog
 

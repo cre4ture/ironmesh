@@ -372,6 +372,22 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
         relative_path: &str,
     ) -> Result<()> {
         let absolute = absolute_path(&options.root_dir, relative_path);
+        match fs::metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(_) => {
+                fs::remove_file(&absolute).with_context(|| {
+                    format!(
+                        "failed to remove local file before materializing remote directory {}",
+                        absolute.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect local path {}", absolute.display()));
+            }
+        }
         fs::create_dir_all(&absolute).with_context(|| {
             format!(
                 "failed to materialize remote directory {}",
@@ -1635,16 +1651,32 @@ fn delete_remote_file_with_logging(
         return Ok(());
     };
 
-    let result = client.delete_path_blocking(&remote_key);
+    delete_remote_path_with_logging(
+        client,
+        file_path,
+        remote_key.as_str(),
+        modification_log,
+        modification_context,
+    )
+}
+
+fn delete_remote_path_with_logging(
+    client: &IronMeshClient,
+    local_relative_path: &str,
+    remote_key: &str,
+    modification_log: Option<&ModificationLogStore>,
+    modification_context: Option<&ModificationLogContext>,
+) -> Result<()> {
+    let result = client.delete_path_blocking(remote_key);
     if let Err(error) = result {
-        let error = error.context(format!("failed to delete remote file {remote_key}"));
+        let error = error.context(format!("failed to delete remote path {remote_key}"));
         try_record_modification(
             modification_log,
             modification_context,
             ModificationOperation::DeleteRemote,
             ModificationOutcome::Error,
-            file_path,
-            remote_key.as_str(),
+            local_relative_path,
+            remote_key,
             None,
             None,
             Some(&format!("{error:#}")),
@@ -1657,14 +1689,34 @@ fn delete_remote_file_with_logging(
         modification_context,
         ModificationOperation::DeleteRemote,
         ModificationOutcome::Success,
-        file_path,
-        remote_key.as_str(),
+        local_relative_path,
+        remote_key,
         None,
         None,
         None,
     );
 
     Ok(())
+}
+
+fn remove_remote_directory_subtree_from_index(remote_index: &mut RemoteTreeIndex, path: &str) {
+    let prefix = format!("{path}/");
+    remote_index.directories.retain(|entry| {
+        entry != path && !entry.starts_with(&prefix)
+    });
+    remote_index
+        .files
+        .retain(|entry| !entry.starts_with(&prefix));
+}
+
+fn remove_suppressed_upload_path_and_descendants(
+    suppressed_uploads: &mut BTreeMap<String, LocalEntryState>,
+    path: &str,
+) {
+    let prefix = format!("{path}/");
+    suppressed_uploads.retain(|entry_path, _| {
+        entry_path != path && !entry_path.starts_with(&prefix)
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1754,6 +1806,19 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
     };
 
     for path in &diff.created_directories {
+        if remote_index.files.contains(path) || suppressed_uploads.contains_key(path) {
+            delete_remote_file_with_logging(
+                client,
+                scope,
+                path,
+                modification_log,
+                modification_context,
+            )?;
+            outcome.deleted_remote_file_count += 1;
+            remote_index.files.remove(path);
+            suppressed_uploads.remove(path);
+        }
+
         if remote_index.directories.contains(path) {
             continue;
         }
@@ -1777,6 +1842,23 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
         let Some(entry_state) = current.get(path) else {
             continue;
         };
+
+        if remote_index.directories.contains(path) {
+            let Some(mut remote_key) = scope.local_to_remote(path) else {
+                continue;
+            };
+            remote_key.push('/');
+            delete_remote_path_with_logging(
+                client,
+                path,
+                remote_key.as_str(),
+                modification_log,
+                modification_context,
+            )?;
+            outcome.deleted_remote_file_count += 1;
+            remove_remote_directory_subtree_from_index(remote_index, path);
+            remove_suppressed_upload_path_and_descendants(suppressed_uploads, path);
+        }
 
         if let Some(expected) = suppressed_uploads.get(path)
             && expected == entry_state
@@ -1823,10 +1905,43 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
                 continue;
             };
 
-            if previous.kind != LocalEntryKind::File {
-                suppressed_uploads.remove(&path);
+            if previous.kind == LocalEntryKind::Directory {
+                let prefix = format!("{path}/");
+                let known_remote_directory = remote_index.directories.contains(&path)
+                    || remote_index.files.iter().any(|entry| entry.starts_with(&prefix))
+                    || suppressed_uploads
+                        .keys()
+                        .any(|entry| entry == &path || entry.starts_with(&prefix));
+
+                if !known_remote_directory {
+                    remove_suppressed_upload_path_and_descendants(suppressed_uploads, &path);
+                    continue;
+                }
+
+                let Some(mut remote_key) = scope.local_to_remote(&path) else {
+                    remove_suppressed_upload_path_and_descendants(suppressed_uploads, &path);
+                    continue;
+                };
+                remote_key.push('/');
+                delete_remote_path_with_logging(
+                    client,
+                    &path,
+                    remote_key.as_str(),
+                    modification_log,
+                    modification_context,
+                )?;
+                outcome.deleted_remote_file_count += 1;
+                remove_remote_directory_subtree_from_index(remote_index, &path);
+                remove_suppressed_upload_path_and_descendants(suppressed_uploads, &path);
+                if let Some(store) = state_store {
+                    store.remove_baseline_entry(&path).with_context(|| {
+                        format!("failed to remove baseline entry for {path}")
+                    })?;
+                }
+                tracing::info!("local-sync: deleted remote directory marker {path}/");
                 continue;
             }
+
             let known_remote_file =
                 remote_index.files.contains(&path) || suppressed_uploads.contains_key(&path);
             if !known_remote_file {

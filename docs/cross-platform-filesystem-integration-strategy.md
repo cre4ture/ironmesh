@@ -302,6 +302,30 @@ cargo run -p os-integration -- \
 - Even with `--offline-object-cache off`, the live mount keeps a small in-memory range chunk cache
   for repeated reads during the current mount session.
 
+GNOME status integration:
+
+```bash
+cargo run -p os-integration -- \
+  --mountpoint /tmp/placeholder \
+  gnome install-extension
+
+mkdir -p /tmp/ironmesh-mount-live
+cargo run -p os-integration -- \
+  --server-base-url http://127.0.0.1:18080 \
+  --client-identity-file /path/to/client-identity.json \
+  --mountpoint /tmp/ironmesh-mount-live \
+  --publish-gnome-status
+```
+
+- `gnome print-status-path` prints the JSON path watched by the GNOME Shell extension.
+- `--gnome-status-file` overrides the default `$XDG_RUNTIME_DIR/ironmesh/gnome-status.json`
+  location.
+- `--remote-status-poll-interval-ms` controls how often the GNOME surface refreshes authenticated
+  connection and replication status; this is separate from `--remote-refresh-interval-ms`, which
+  controls namespace refresh behavior for the mounted filesystem.
+- Snapshot-mode mounts can publish GNOME status too, but they report static snapshot state instead
+  of live connection/replication health.
+
 Recommended same-device deployment:
 
 ```bash

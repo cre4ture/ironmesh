@@ -70,17 +70,14 @@ class IronmeshIndicator extends PanelMenu.Button {
         });
         const titleLabel = new St.Label({
             text: title,
-            x_align: St.Align.START,
             style_class: 'ironmesh-status-title',
         });
         const valueLabel = new St.Label({
             text: 'Waiting for IronMesh',
-            x_align: St.Align.START,
             style_class: 'ironmesh-status-value',
         });
         const detailLabel = new St.Label({
             text: '',
-            x_align: St.Align.START,
             style_class: 'ironmesh-status-detail',
         });
         detailLabel.clutter_text.set_line_wrap(true);

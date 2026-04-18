@@ -1,3 +1,6 @@
+mod gnome;
+mod publisher;
+
 use anyhow::{Context, Result, anyhow};
 use client_sdk::IronMeshClient;
 use serde::{Deserialize, Serialize};
@@ -6,6 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub use gnome::{
+    GNOME_EXTENSION_UUID, GnomeExtensionInstallOutcome, default_gnome_status_file_path,
+    install_gnome_extension_from,
+};
+pub use publisher::{
+    DesktopStatusPublisher, DesktopStatusPublisherOptions, spawn_remote_status_thread,
+};
 
 const DEFAULT_REMOTE_STATUS_POLL_INTERVAL_MS: u64 = 5_000;
 

@@ -1,6 +1,7 @@
 #![cfg(not(windows))]
 
 pub mod client_rights_edge;
+pub mod gnome;
 pub mod mount_main;
 
 use std::collections::HashMap;

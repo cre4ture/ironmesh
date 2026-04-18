@@ -3,13 +3,19 @@
 use crate::client_rights_edge::{
     ClientRightsEdgeState, OfflineObjectCacheMode, RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES,
 };
+use crate::gnome::{
+    GNOME_EXTENSION_UUID, GnomeStatusOptions, GnomeStatusRuntime,
+    default_remote_status_poll_interval_ms, default_status_file_path,
+    failed_mount_sync_facet, install_extension, mounted_sync_facet, snapshot_connection_facet,
+    snapshot_replication_facet, starting_mount_sync_facet, stopped_mount_sync_facet,
+};
 use crate::runtime::{
     DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, IronmeshFuseFs, Uploader,
     mount_action_plan_until_shutdown, mount_fs_until_shutdown,
 };
 use crate::{FuseAction, FuseActionPlan, LinuxFuseAdapter};
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
     ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, RemoteSnapshotFetcher,
@@ -40,6 +46,8 @@ const LONG_VERSION: &str = git_version::git_version!(
 #[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(long)]
     snapshot_file: Option<PathBuf>,
     #[arg(long)]
@@ -66,10 +74,38 @@ struct Args {
     depth: usize,
     #[arg(long, default_value_t = 3000)]
     remote_refresh_interval_ms: u64,
+    #[arg(long, default_value_t = false, global = true)]
+    publish_gnome_status: bool,
+    #[arg(long, global = true)]
+    gnome_status_file: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = default_remote_status_poll_interval_ms(),
+        global = true
+    )]
+    remote_status_poll_interval_ms: u64,
 }
 
 struct ResolvedUpstreamTarget {
     client: IronMeshClient,
+    connection_target: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Install or inspect the native GNOME Shell indicator integration.
+    Gnome {
+        #[command(subcommand)]
+        command: GnomeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GnomeCommand {
+    /// Copy the GNOME Shell extension into ~/.local/share/gnome-shell/extensions and try to enable it.
+    InstallExtension,
+    /// Print the JSON path consumed by the GNOME Shell extension.
+    PrintStatusPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -90,6 +126,45 @@ impl From<CliOfflineObjectCacheMode> for OfflineObjectCacheMode {
 pub fn mount_main() -> Result<()> {
     common::logging::init_compact_tracing_default("info");
     let args = Args::parse();
+    if let Some(command) = args.command.as_ref() {
+        return run_command(&args, command);
+    }
+
+    run_mount(&args)
+}
+
+fn run_command(args: &Args, command: &Command) -> Result<()> {
+    match command {
+        Command::Gnome { command } => run_gnome_command(args, command),
+    }
+}
+
+fn run_gnome_command(args: &Args, command: &GnomeCommand) -> Result<()> {
+    match command {
+        GnomeCommand::InstallExtension => {
+            let outcome = install_extension(true)?;
+            println!(
+                "gnome: installed extension {} to {}",
+                GNOME_EXTENSION_UUID,
+                outcome.install_dir.display()
+            );
+            if let Some(note) = outcome.enable_note {
+                println!("gnome: {note}");
+            }
+            Ok(())
+        }
+        GnomeCommand::PrintStatusPath => {
+            let path = match args.gnome_status_file.as_ref() {
+                Some(path) => path.clone(),
+                None => default_status_file_path()?,
+            };
+            println!("{}", path.display());
+            Ok(())
+        }
+    }
+}
+
+fn run_mount(args: &Args) -> Result<()> {
     let client_identity = resolve_client_identity(&args)?;
     let upstream_target = resolve_upstream_target(&args, client_identity.as_ref())?;
 
@@ -103,6 +178,51 @@ pub fn mount_main() -> Result<()> {
         anyhow::bail!("set either --snapshot-file, --server-base-url, or --bootstrap-file");
     }
 
+    let connection_target = upstream_target
+        .as_ref()
+        .map(|target| target.connection_target.clone())
+        .unwrap_or_else(|| snapshot_connection_target_label(args));
+    let gnome_status = if args.publish_gnome_status {
+        Some(start_gnome_status(
+            args,
+            connection_target,
+            upstream_target.as_ref().map(|target| target.client.clone()),
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(status) = gnome_status.as_ref() {
+        update_gnome_sync(status, starting_mount_sync_facet(&args.mountpoint));
+        if let Some(snapshot_file) = args.snapshot_file.as_ref() {
+            update_gnome_connection(status, snapshot_connection_facet(snapshot_file));
+            update_gnome_replication(status, snapshot_replication_facet());
+        }
+    }
+
+    let result = (|| -> Result<()> {
+        run_mount_inner(args, upstream_target, client_identity.is_some(), gnome_status.as_ref())
+    })();
+
+    if let Some(status) = gnome_status {
+        if let Err(error) = &result {
+            update_gnome_sync(&status, failed_mount_sync_facet(&args.mountpoint, error));
+        } else {
+            update_gnome_sync(&status, stopped_mount_sync_facet(&args.mountpoint));
+        }
+        status.shutdown();
+    }
+
+    result
+}
+
+fn run_mount_inner(
+    args: &Args,
+    upstream_target: Option<ResolvedUpstreamTarget>,
+    has_client_identity: bool,
+    gnome_status: Option<&GnomeStatusRuntime>,
+) -> Result<()> {
+
     let adapter = LinuxFuseAdapter::new(args.fs_name.clone());
     let download_stage_root = download_stage_root(&args)?;
     let mut config = FuseMountConfig::new(args.mountpoint.clone(), args.fs_name.clone());
@@ -114,6 +234,9 @@ pub fn mount_main() -> Result<()> {
         let snapshot: SyncSnapshot = serde_json::from_str(&json)
             .with_context(|| format!("failed to parse {}", snapshot_file.display()))?;
         let action_plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
+        if let Some(status) = gnome_status {
+            update_gnome_sync(status, mounted_sync_facet(&args.mountpoint));
+        }
         return mount_action_plan_until_shutdown(
             &config,
             action_plan,
@@ -142,7 +265,7 @@ pub fn mount_main() -> Result<()> {
         }
         Err(error) => {
             if is_unauthorized_store_index_error(&error) {
-                let auth_hint = live_mount_auth_hint(&args, client_identity.is_some());
+                let auth_hint = live_mount_auth_hint(&args, has_client_identity);
                 return Err(error).context(format!(
                     "initial remote snapshot fetch was unauthorized; {auth_hint}"
                 ));
@@ -242,6 +365,9 @@ pub fn mount_main() -> Result<()> {
         Some(refresh_rx),
     );
     fs.apply_replay_actions(&replay_actions)?;
+    if let Some(status) = gnome_status {
+        update_gnome_sync(status, mounted_sync_facet(&args.mountpoint));
+    }
     let result = mount_fs_until_shutdown(&config, fs);
 
     refresh_running.store(false, Ordering::SeqCst);
@@ -249,6 +375,57 @@ pub fn mount_main() -> Result<()> {
     let _ = sync_thread.join();
 
     result
+}
+
+fn start_gnome_status(
+    args: &Args,
+    connection_target: String,
+    client: Option<IronMeshClient>,
+) -> Result<GnomeStatusRuntime> {
+    let status_file = match args.gnome_status_file.as_ref() {
+        Some(path) => path.clone(),
+        None => default_status_file_path()?,
+    };
+    GnomeStatusRuntime::start(
+        &GnomeStatusOptions {
+            profile_label: crate::gnome::derive_profile_label(
+                args.prefix.as_deref(),
+                &args.mountpoint,
+            ),
+            root_dir: args.mountpoint.clone(),
+            connection_target,
+            status_file,
+            remote_status_poll_interval_ms: args.remote_status_poll_interval_ms,
+        },
+        client,
+    )
+}
+
+fn snapshot_connection_target_label(args: &Args) -> String {
+    args.snapshot_file
+        .as_ref()
+        .map(|path| format!("snapshot:{}", path.display()))
+        .unwrap_or_else(|| "snapshot".to_string())
+}
+
+fn update_gnome_connection(status: &GnomeStatusRuntime, facet: desktop_status::StatusFacet) {
+    if let Err(error) = status.update_connection(facet) {
+        tracing::warn!("gnome-status: failed to persist Linux FUSE connection status: {error:#}");
+    }
+}
+
+fn update_gnome_sync(status: &GnomeStatusRuntime, facet: desktop_status::StatusFacet) {
+    if let Err(error) = status.update_sync(facet) {
+        tracing::warn!("gnome-status: failed to persist Linux FUSE sync status: {error:#}");
+    }
+}
+
+fn update_gnome_replication(status: &GnomeStatusRuntime, facet: desktop_status::StatusFacet) {
+    if let Err(error) = status.update_replication(facet) {
+        tracing::warn!(
+            "gnome-status: failed to persist Linux FUSE replication status: {error:#}"
+        );
+    }
 }
 
 fn effective_client_edge_state_dir(args: &Args) -> Result<PathBuf> {
@@ -345,7 +522,11 @@ fn resolve_upstream_target(
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_override.clone());
         }
         let client = bootstrap.build_client_with_optional_identity(client_identity)?;
-        return Ok(Some(ResolvedUpstreamTarget { client }));
+        let connection_target = bootstrap.connection_target_label()?;
+        return Ok(Some(ResolvedUpstreamTarget {
+            client,
+            connection_target,
+        }));
     }
 
     let Some(server_base_url) = args.server_base_url.as_deref() else {
@@ -357,7 +538,10 @@ fn resolve_upstream_target(
         server_ca_override.as_deref(),
         client_identity,
     )?;
-    Ok(Some(ResolvedUpstreamTarget { client }))
+    Ok(Some(ResolvedUpstreamTarget {
+        client,
+        connection_target: base_url.to_string(),
+    }))
 }
 
 fn default_client_identity_path(bootstrap_path: &std::path::Path) -> PathBuf {
@@ -767,6 +951,7 @@ mod tests {
 
     fn sample_args() -> Args {
         Args {
+            command: None,
             snapshot_file: None,
             server_base_url: Some("http://127.0.0.1:8080".to_string()),
             bootstrap_file: None,
@@ -780,6 +965,9 @@ mod tests {
             prefix: None,
             depth: 64,
             remote_refresh_interval_ms: 3000,
+            publish_gnome_status: false,
+            gnome_status_file: None,
+            remote_status_poll_interval_ms: default_remote_status_poll_interval_ms(),
         }
     }
 

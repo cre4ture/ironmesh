@@ -394,6 +394,130 @@ async fn wait_for_remote_directory(
     bail!("remote directory marker not observed for {normalized}")
 }
 
+async fn wait_for_remote_directory_marker_shape(
+    sdk: &IronMeshClient,
+    dir_path: &str,
+    retries: usize,
+) -> Result<()> {
+    let normalized = dir_path.trim_matches('/').replace('\\', "/");
+    let expected_marker = format!("{normalized}/");
+
+    for _ in 0..retries {
+        if let Ok(index) = sdk.store_index(None, 128, None).await {
+            let has_directory_marker = index
+                .entries
+                .iter()
+                .any(|entry| entry.path == expected_marker);
+            let has_plain_file = index
+                .entries
+                .iter()
+                .any(|entry| entry.path == normalized && !entry.path.ends_with('/'));
+
+            if has_directory_marker && !has_plain_file {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let snapshot = sdk
+        .store_index(None, 128, None)
+        .await
+        .map(|index| {
+            index
+                .entries
+                .into_iter()
+                .map(|entry| format!("{} [{}]", entry.path, entry.entry_type))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|err| format!("store-index-error: {err}"));
+    bail!(
+        "remote directory marker shape not observed for {expected_marker}; index={snapshot}"
+    )
+}
+
+async fn wait_for_remote_plain_file_shape(
+    sdk: &IronMeshClient,
+    file_path: &str,
+    retries: usize,
+) -> Result<()> {
+    let normalized = file_path.trim_matches('/').replace('\\', "/");
+    let marker_path = format!("{normalized}/");
+
+    for _ in 0..retries {
+        if let Ok(index) = sdk.store_index(None, 128, None).await {
+            let has_plain_file = index
+                .entries
+                .iter()
+                .any(|entry| entry.path == normalized && !entry.path.ends_with('/'));
+            let has_directory_shape = index.entries.iter().any(|entry| {
+                entry.path == marker_path || entry.path.starts_with(&marker_path)
+            });
+
+            if has_plain_file && !has_directory_shape {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let snapshot = sdk
+        .store_index(None, 128, None)
+        .await
+        .map(|index| {
+            index
+                .entries
+                .into_iter()
+                .map(|entry| format!("{} [{}]", entry.path, entry.entry_type))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|err| format!("store-index-error: {err}"));
+    bail!("remote plain-file shape not observed for {normalized}; index={snapshot}")
+}
+
+async fn wait_for_remote_path_absence_any_shape(
+    sdk: &IronMeshClient,
+    path: &str,
+    retries: usize,
+) -> Result<()> {
+    let normalized = path.trim_matches('/').replace('\\', "/");
+    let prefix = format!("{normalized}/");
+
+    for _ in 0..retries {
+        if let Ok(index) = sdk.store_index(None, 128, None).await {
+            let found = index.entries.iter().any(|entry| {
+                entry.path == normalized
+                    || entry.path == prefix
+                    || entry.path.starts_with(&prefix)
+            });
+
+            if !found {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let snapshot = sdk
+        .store_index(None, 128, None)
+        .await
+        .map(|index| {
+            index
+                .entries
+                .into_iter()
+                .map(|entry| format!("{} [{}]", entry.path, entry.entry_type))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|err| format!("store-index-error: {err}"));
+    bail!("remote path still present for {normalized}; index={snapshot}")
+}
+
 async fn wait_for_remote_file_absence(
     sdk: &IronMeshClient,
     key: &str,
@@ -525,6 +649,75 @@ async fn wait_for_baseline_content_hash(
     }
 
     bail!("expected baseline hash to be present for path={path}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaselineEntryKind {
+    File,
+    Directory,
+}
+
+async fn wait_for_baseline_kind(
+    root_dir: &Path,
+    connection_target: &str,
+    path: &str,
+    expected_kind: BaselineEntryKind,
+    retries: usize,
+) -> Result<()> {
+    let expected_code = match expected_kind {
+        BaselineEntryKind::File => 0_i64,
+        BaselineEntryKind::Directory => 1_i64,
+    };
+
+    for _ in 0..retries {
+        let baseline_path = baseline_db_path(root_dir, connection_target, None)?;
+        if let Ok(connection) = Connection::open(&baseline_path) {
+            let kind_code: Option<i64> = connection
+                .query_row(
+                    "SELECT kind FROM baseline_entries WHERE path = ?1",
+                    [path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .with_context(|| format!("failed to query sqlite baseline kind for {path}"))?;
+            if kind_code == Some(expected_code) {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("expected baseline kind {expected_kind:?} for path={path}")
+}
+
+async fn wait_for_baseline_absence(
+    root_dir: &Path,
+    connection_target: &str,
+    path: &str,
+    retries: usize,
+) -> Result<()> {
+    for _ in 0..retries {
+        let baseline_path = baseline_db_path(root_dir, connection_target, None)?;
+        if let Ok(connection) = Connection::open(&baseline_path) {
+            let exists = connection
+                .query_row(
+                    "SELECT 1 FROM baseline_entries WHERE path = ?1",
+                    [path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .with_context(|| format!("failed to query sqlite baseline presence for {path}"))?
+                .is_some();
+            if !exists {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("expected baseline entry to be absent for path={path}")
 }
 
 async fn wait_for_startup_conflict_reason(
@@ -665,6 +858,124 @@ async fn folder_agent_applies_remote_add_update_delete_without_restart() -> Resu
             delete_remote_key_by_query(&sdk, "live/new.txt").await?;
             wait_for_local_absence(&added_path, 220).await?;
 
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut agent).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut fixture.server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_applies_remote_path_type_transitions_without_restart() -> Result<()> {
+    let bind = "127.0.0.1:19429";
+    let local_root = fresh_data_dir("folder-agent-remote-type-transition-root");
+
+    let mut fixture = start_authenticated_folder_agent_fixture(bind).await?;
+    let sdk = fixture.sdk.clone();
+
+    let result = async {
+        sdk.put_large_aware(
+            "remote-type-flip/file-to-dir",
+            Bytes::from_static(b"remote-file-v1"),
+        )
+        .await?;
+        sdk.put("remote-type-flip/dir-to-file/", Bytes::new()).await?;
+        sdk.put_large_aware(
+            "remote-type-flip/dir-to-file/child.txt",
+            Bytes::from_static(b"remote-dir-child"),
+        )
+        .await?;
+
+        let mut agent =
+            start_folder_agent(&fixture.connection, &local_root, None, 250, 2_000, true).await?;
+        let scenario = async {
+            wait_for_local_file_bytes(
+                &local_root.join("remote-type-flip/file-to-dir"),
+                b"remote-file-v1",
+                220,
+            )
+            .await?;
+            wait_for_local_file_bytes(
+                &local_root.join("remote-type-flip/dir-to-file/child.txt"),
+                b"remote-dir-child",
+                220,
+            )
+            .await?;
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "remote-type-flip/file-to-dir",
+                BaselineEntryKind::File,
+                240,
+            )
+            .await?;
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "remote-type-flip/dir-to-file",
+                BaselineEntryKind::Directory,
+                240,
+            )
+            .await?;
+
+            delete_remote_key_by_query(&sdk, "remote-type-flip/file-to-dir").await?;
+            sdk.put("remote-type-flip/file-to-dir/", Bytes::new()).await?;
+            sdk.put_large_aware(
+                "remote-type-flip/file-to-dir/child.txt",
+                Bytes::from_static(b"remote-dir-v2"),
+            )
+            .await?;
+
+            delete_remote_key_by_query(&sdk, "remote-type-flip/dir-to-file/").await?;
+            sdk.put_large_aware(
+                "remote-type-flip/dir-to-file",
+                Bytes::from_static(b"remote-file-v2"),
+            )
+            .await?;
+
+            wait_for_local_dir(&local_root.join("remote-type-flip/file-to-dir"), 240).await?;
+            wait_for_local_file_bytes(
+                &local_root.join("remote-type-flip/file-to-dir/child.txt"),
+                b"remote-dir-v2",
+                240,
+            )
+            .await?;
+            wait_for_local_file_bytes(
+                &local_root.join("remote-type-flip/dir-to-file"),
+                b"remote-file-v2",
+                240,
+            )
+            .await?;
+            assert!(
+                !local_root
+                    .join("remote-type-flip/dir-to-file/child.txt")
+                    .exists(),
+                "dir-to-file replacement should remove the previous local subtree"
+            );
+
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "remote-type-flip/file-to-dir",
+                BaselineEntryKind::Directory,
+                240,
+            )
+            .await?;
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "remote-type-flip/dir-to-file",
+                BaselineEntryKind::File,
+                240,
+            )
+            .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -874,6 +1185,197 @@ async fn folder_agent_does_not_redownload_just_uploaded_local_file() -> Result<(
                 "steady-state remote refresh should not redownload steady-local-upload/local.txt after its local upload"
             );
 
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut agent).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut fixture.server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_uploads_local_path_type_transitions_without_restart() -> Result<()> {
+    let bind = "127.0.0.1:19430";
+    let local_root = fresh_data_dir("folder-agent-local-type-transition-root");
+
+    let mut fixture = start_authenticated_folder_agent_fixture(bind).await?;
+    let sdk = fixture.sdk.clone();
+
+    let result = async {
+        fs::create_dir_all(local_root.join("local-type-flip/dir-to-file"))?;
+        fs::write(
+            local_root.join("local-type-flip/file-to-dir"),
+            b"local-file-v1",
+        )?;
+        fs::write(
+            local_root.join("local-type-flip/dir-to-file/child.txt"),
+            b"local-dir-child",
+        )?;
+
+        let mut agent =
+            start_folder_agent(&fixture.connection, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            wait_for_remote_plain_file_shape(&sdk, "local-type-flip/file-to-dir", 220).await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "local-type-flip/file-to-dir",
+                b"local-file-v1",
+                220,
+            )
+            .await?;
+            wait_for_remote_directory_marker_shape(&sdk, "local-type-flip/dir-to-file", 220)
+                .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "local-type-flip/dir-to-file/child.txt",
+                b"local-dir-child",
+                220,
+            )
+            .await?;
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "local-type-flip/file-to-dir",
+                BaselineEntryKind::File,
+                240,
+            )
+            .await?;
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "local-type-flip/dir-to-file",
+                BaselineEntryKind::Directory,
+                240,
+            )
+            .await?;
+
+            fs::remove_file(local_root.join("local-type-flip/file-to-dir"))?;
+            fs::create_dir_all(local_root.join("local-type-flip/file-to-dir"))?;
+            fs::write(
+                local_root.join("local-type-flip/file-to-dir/child.txt"),
+                b"local-dir-v2",
+            )?;
+
+            fs::remove_dir_all(local_root.join("local-type-flip/dir-to-file"))?;
+            fs::write(
+                local_root.join("local-type-flip/dir-to-file"),
+                b"local-file-v2",
+            )?;
+
+            wait_for_remote_directory_marker_shape(&sdk, "local-type-flip/file-to-dir", 240)
+                .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "local-type-flip/file-to-dir/child.txt",
+                b"local-dir-v2",
+                240,
+            )
+            .await?;
+            wait_for_remote_plain_file_shape(&sdk, "local-type-flip/dir-to-file", 240).await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "local-type-flip/dir-to-file",
+                b"local-file-v2",
+                240,
+            )
+            .await?;
+            wait_for_remote_file_absence(&sdk, "local-type-flip/dir-to-file/child.txt", 240)
+                .await?;
+
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "local-type-flip/file-to-dir",
+                BaselineEntryKind::Directory,
+                240,
+            )
+            .await?;
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "local-type-flip/dir-to-file",
+                BaselineEntryKind::File,
+                240,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut agent).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut fixture.server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
+async fn folder_agent_propagates_empty_directory_delete_and_replacement() -> Result<()> {
+    let bind = "127.0.0.1:19431";
+    let local_root = fresh_data_dir("folder-agent-empty-dir-lifecycle-root");
+
+    let mut fixture = start_authenticated_folder_agent_fixture(bind).await?;
+    let sdk = fixture.sdk.clone();
+
+    let result = async {
+        let mut agent =
+            start_folder_agent(&fixture.connection, &local_root, None, 2_000, 250, true).await?;
+        let scenario = async {
+            fs::create_dir_all(local_root.join("empty-lifecycle/marker-only"))?;
+
+            wait_for_remote_directory_marker_shape(&sdk, "empty-lifecycle/marker-only", 220)
+                .await?;
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "empty-lifecycle/marker-only",
+                BaselineEntryKind::Directory,
+                240,
+            )
+            .await?;
+
+            fs::remove_dir(local_root.join("empty-lifecycle/marker-only"))?;
+
+            wait_for_remote_path_absence_any_shape(&sdk, "empty-lifecycle/marker-only", 240)
+                .await?;
+            wait_for_baseline_absence(
+                &local_root,
+                fixture.connection.target_label(),
+                "empty-lifecycle/marker-only",
+                240,
+            )
+            .await?;
+
+            fs::write(
+                local_root.join("empty-lifecycle/marker-only"),
+                b"replacement-file",
+            )?;
+
+            wait_for_remote_plain_file_shape(&sdk, "empty-lifecycle/marker-only", 240).await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "empty-lifecycle/marker-only",
+                b"replacement-file",
+                240,
+            )
+            .await?;
+            wait_for_baseline_kind(
+                &local_root,
+                fixture.connection.target_label(),
+                "empty-lifecycle/marker-only",
+                BaselineEntryKind::File,
+                240,
+            )
+            .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
