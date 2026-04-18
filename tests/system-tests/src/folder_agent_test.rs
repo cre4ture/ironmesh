@@ -814,6 +814,81 @@ async fn folder_agent_run_once_skips_unchanged_uploads_and_downloads_on_repeat_r
 }
 
 #[tokio::test]
+async fn folder_agent_does_not_redownload_just_uploaded_local_file() -> Result<()> {
+    let bind = "127.0.0.1:19428";
+    let local_root = fresh_data_dir("folder-agent-no-redownload-after-upload-root");
+
+    let mut fixture = start_authenticated_folder_agent_fixture(bind).await?;
+    let sdk = fixture.sdk.clone();
+
+    let result = async {
+        let mut agent =
+            start_folder_agent(&fixture.connection, &local_root, None, 250, 250, true).await?;
+        let scenario = async {
+            fs::create_dir_all(local_root.join("steady-local-upload")).with_context(|| {
+                format!(
+                    "failed to create local directory {}",
+                    local_root.join("steady-local-upload").display()
+                )
+            })?;
+            fs::write(
+                local_root.join("steady-local-upload/local.txt"),
+                b"local-upload-seed",
+            )
+            .with_context(|| {
+                format!(
+                    "failed to write local file {}",
+                    local_root.join("steady-local-upload/local.txt").display()
+                )
+            })?;
+
+            wait_for_remote_file_bytes(
+                &sdk,
+                "steady-local-upload/local.txt",
+                b"local-upload-seed",
+                120,
+            )
+            .await?;
+
+            sleep(Duration::from_millis(1_500)).await;
+
+            let records =
+                modification_log_records(&local_root, fixture.connection.target_label(), None)?;
+            let upload_count = successful_modification_count(
+                &records,
+                ModificationOperation::Upload,
+                "steady-local-upload/local.txt",
+            );
+            let download_count = successful_modification_count(
+                &records,
+                ModificationOperation::Download,
+                "steady-local-upload/local.txt",
+            );
+
+            assert!(
+                upload_count >= 1,
+                "expected a successful upload for steady-local-upload/local.txt"
+            );
+            assert_eq!(
+                download_count, 0,
+                "steady-state remote refresh should not redownload steady-local-upload/local.txt after its local upload"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_folder_agent(&mut agent).await;
+        scenario
+    }
+    .await;
+
+    stop_server(&mut fixture.server).await;
+    let _ = fs::remove_dir_all(&local_root);
+    result
+}
+
+#[tokio::test]
 async fn folder_agent_propagates_local_file_deletions_to_remote() -> Result<()> {
     let bind = "127.0.0.1:19414";
     let local_root = fresh_data_dir("folder-agent-delete-root");

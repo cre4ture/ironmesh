@@ -1857,6 +1857,55 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
     Ok(outcome)
 }
 
+fn matching_local_entry_for_remote_file_change<B: FolderAgentLocalBackend>(
+    backend: &mut B,
+    options: &FolderAgentRuntimeOptions,
+    path: &str,
+    remote_content_hash: Option<&str>,
+    state_store: Option<&StartupStateStore>,
+) -> Result<Option<LocalEntryState>> {
+    let Some(remote_content_hash) = remote_content_hash.filter(|hash| !hash.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    let local_entry_state = match backend.local_entry_state(options, path) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(
+                "remote-sync: failed to stat local file {path} while checking for a redundant download: {error:#}"
+            );
+            return Ok(None);
+        }
+    };
+    let Some(entry_state) = local_entry_state else {
+        return Ok(None);
+    };
+    if entry_state.kind != LocalEntryKind::File {
+        return Ok(None);
+    }
+
+    let local_content_hash = match backend.file_content_fingerprint(options, path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            tracing::warn!(
+                "remote-sync: failed to fingerprint local file {path} while checking for a redundant download: {error:#}"
+            );
+            return Ok(None);
+        }
+    };
+    if local_content_hash != remote_content_hash {
+        return Ok(None);
+    }
+
+    if let Some(store) = state_store {
+        store
+            .upsert_baseline_entry_with_hash(path, &entry_state, Some(remote_content_hash))
+            .with_context(|| format!("failed to persist baseline file entry for {path}"))?;
+    }
+
+    Ok(Some(entry_state))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
     backend: &mut B,
@@ -1939,8 +1988,22 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                     }
                     Some((EntryKind::File, remote_key)) => {
                         outcome.changed_path_count += 1;
-                        outcome.downloaded_file_count += 1;
                         let content_hash = entry_hashes.get(path).map(|hash| hash.as_str());
+                        if let Some(entry_state) = matching_local_entry_for_remote_file_change(
+                            backend,
+                            options,
+                            path,
+                            content_hash,
+                            state_store,
+                        )? {
+                            tracing::info!(
+                                "remote-sync: skipped download for {path}; local file already matches remote content"
+                            );
+                            suppressed_uploads.insert(path.to_string(), entry_state);
+                            continue;
+                        }
+
+                        outcome.downloaded_file_count += 1;
                         let entry_state = download_remote_file_with_logging(
                             backend,
                             options,
