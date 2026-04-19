@@ -199,7 +199,7 @@ Direct server mode:
 mkdir -p /tmp/ironmesh-mount
 cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
-  --client-identity-file /path/to/client-identity.json \
+	--client-identity-file /path/to/ironmesh-client-identity.json \
   --mountpoint /tmp/ironmesh-mount
 ```
 
@@ -208,7 +208,9 @@ Notes:
 - Live mounts now require client auth when the server protects `/store/*` APIs. In direct mode,
   pass `--client-identity-file`.
 - In bootstrap mode, `ironmesh-os-integration` auto-loads a sibling
-  `bootstrap.client-identity.json` when present.
+	`*.client-identity.json` file when present, for example
+	`ironmesh-client-bootstrap.client-identity.json` next to
+	`ironmesh-client-bootstrap.json`.
 - `--remote-refresh-interval-ms` controls fallback polling/retry cadence for namespace updates in live modes.
 - Snapshot mode is still available for debugging with `--snapshot-file`.
 

@@ -281,7 +281,7 @@ Direct/bootstrap client-rights edge mode:
 mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
-  --client-identity-file /path/to/client-identity.json \
+  --client-identity-file /path/to/ironmesh-client-identity.json \
   --mountpoint /tmp/ironmesh-mount-live
 ```
 
@@ -289,7 +289,9 @@ cargo run -p os-integration -- \
   should be paired with `--client-identity-file`.
 - `--bootstrap-file` is the equivalent authenticated entrypoint when a client bootstrap bundle is
   preferred over a raw base URL. If `--client-identity-file` is omitted, the adapter also checks
-  for a sibling `bootstrap.client-identity.json`.
+  for a sibling `*.client-identity.json`, for example
+  `ironmesh-client-bootstrap.client-identity.json` next to
+  `ironmesh-client-bootstrap.json`.
 - Local writes, deletes, and renames are captured into a durable local mutation queue first and
   then synchronized through client APIs.
 - Offline restart replays the last cached snapshot plus queued local mutations.
@@ -312,7 +314,7 @@ cargo run -p os-integration -- \
 mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
   --server-base-url http://127.0.0.1:18080 \
-  --client-identity-file /path/to/client-identity.json \
+  --client-identity-file /path/to/ironmesh-client-identity.json \
   --mountpoint /tmp/ironmesh-mount-live \
   --publish-gnome-status
 ```

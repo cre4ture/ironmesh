@@ -53,7 +53,7 @@ These are the main release-surface candidates already visible in the repo and wo
 | Desktop config path | Windows uses `%LOCALAPPDATA%\Ironmesh\desktop-client-config\instances.json`; Linux uses `$XDG_CONFIG_HOME/ironmesh/desktop-client-config/instances.json` and `$XDG_STATE_HOME/ironmesh/desktop-client-config/last-launch-report.json`, with migration from legacy uppercase XDG roots | Users, scripts, and packaged apps may start depending on these paths |
 | Sync-root local state path | Windows CFAPI uses `%LOCALAPPDATA%\Ironmesh\sync-roots\<label-hash>\...` for `connection-bootstrap.json`, `client-identity.json`, and `desktop-status.json` | This becomes a persistence and migration contract |
 | Folder-agent state root | `sync-agent-core` defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/folder-agent/` and should stay aligned with the Linux persisted-state root family | Consistent Linux XDG roots reduce migration and support complexity |
-| Bootstrap and identity file naming | Live flows use sibling `*.client-identity.json` discovery, fallback `ironmesh-client-identity.json`, and some Windows flows also refer to `.ironmesh-client-identity.json` | Naming drift here will break enroll/bootstrap reuse and migration |
+| Bootstrap and identity file naming | External examples should use `ironmesh-client-bootstrap*.json`; live flows infer sibling `*.client-identity.json` files such as `ironmesh-client-bootstrap.client-identity.json`; Windows sync-root persistence should stay on `connection-bootstrap.json` and `client-identity.json` under `%LOCALAPPDATA%\Ironmesh\sync-roots\...` | This freezes the release-facing handoff names and keeps legacy hidden Windows names out of current docs and packaging |
 | Inter-node identity contract | Peer TLS identity is based on cert SAN values like `urn:ironmesh:node:<uuid>` | This is a core compatibility and security contract |
 | HTTP API versioning | Public routes are currently unversioned | Decide whether unversioned routes are acceptable for v1 or need pre-release versioning |
 | Windows package identity | The Store/MSIX strategy doc now treats the reserved Partner Center identity as fixed | Package identity stability affects install/update continuity |
@@ -262,8 +262,8 @@ Primary repo areas:
 - [docs](.)
 - [scripts](../scripts)
 - [start_node.sh](../start_node.sh)
-- [ironmesh-client-bootstrap-cli-client.client-identity.json](../ironmesh-client-bootstrap-cli-client.client-identity.json)
-- [ironmesh-client-bootstrap-cli-client.json](../ironmesh-client-bootstrap-cli-client.json)
+- [ironmesh-client-bootstrap.client-identity.json](../ironmesh-client-bootstrap.client-identity.json)
+- [ironmesh-client-bootstrap.json](../ironmesh-client-bootstrap.json)
 
 Checklist:
 

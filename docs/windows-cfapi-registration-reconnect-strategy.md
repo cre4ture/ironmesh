@@ -131,11 +131,11 @@ We should keep the initial implementation minimal and avoid adding mirrored meta
 
 Current on-disk metadata is not sufficient to make this decision reliably:
 
-- `.ironmesh-connection.json`
+- `%LocalAppData%\Ironmesh\sync-roots\...\connection-bootstrap.json`
   - useful for connectivity,
   - not a strong ownership marker,
   - can also be stored outside the sync root when `--bootstrap-file` is used.
-- `.ironmesh-client-identity.json`
+- `%LocalAppData%\Ironmesh\sync-roots\...\client-identity.json`
   - identifies the device,
   - not the local root ownership,
   - can also live outside the sync root.

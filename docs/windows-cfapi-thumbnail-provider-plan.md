@@ -36,9 +36,9 @@ In other words:
     - `path=<remote path>`
     - `version=<remote version>`
 - `crates/adapter-windows-cfapi/src/connection_config.rs`
-  - persists `.ironmesh-connection.json` inside the sync root
+  - persists `connection-bootstrap.json` under `%LocalAppData%\Ironmesh\sync-roots\...`
 - `crates/adapter-windows-cfapi/src/auth.rs`
-  - persists `.ironmesh-client-identity.json` inside the sync root
+  - persists `client-identity.json` under `%LocalAppData%\Ironmesh\sync-roots\...`
 
 ### Remote thumbnail side
 
@@ -105,8 +105,8 @@ Add a reusable core crate for thumbnail fetch logic:
 Suggested responsibilities:
 
 - discover the sync root from a file path,
-- load `.ironmesh-connection.json`,
-- load `.ironmesh-client-identity.json`,
+- load `%LocalAppData%\Ironmesh\sync-roots\...\connection-bootstrap.json`,
+- load `%LocalAppData%\Ironmesh\sync-roots\...\client-identity.json`,
 - parse placeholder file identity or derive the remote key from the path,
 - build an authenticated `IronMeshClient`,
 - call the existing thumbnail endpoint,
@@ -178,8 +178,8 @@ The thumbnail handler should not invent a second auth story.
 
 Use the same local sync-root artifacts the CFAPI provider already persists:
 
-- `.ironmesh-connection.json`
-- `.ironmesh-client-identity.json`
+- `%LocalAppData%\Ironmesh\sync-roots\...\connection-bootstrap.json`
+- `%LocalAppData%\Ironmesh\sync-roots\...\client-identity.json`
 
 Flow:
 

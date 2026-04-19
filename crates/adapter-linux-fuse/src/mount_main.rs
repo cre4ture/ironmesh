@@ -1245,11 +1245,11 @@ mod tests {
     #[test]
     fn default_client_identity_path_uses_bootstrap_stem() {
         let path = default_client_identity_path(std::path::Path::new(
-            "/tmp/ironmesh-client-bootstrap-cli-client.json",
+            "/tmp/ironmesh-client-bootstrap.json",
         ));
         assert_eq!(
             path,
-            PathBuf::from("/tmp/ironmesh-client-bootstrap-cli-client.client-identity.json")
+            PathBuf::from("/tmp/ironmesh-client-bootstrap.client-identity.json")
         );
     }
 

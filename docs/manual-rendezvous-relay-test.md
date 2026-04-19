@@ -188,11 +188,11 @@ curl --silent --insecure "$NODE_A_URL/cluster/nodes"
 You need one bootstrap bundle from each node:
 
 1. on node A, use `Bootstrap bundle` and save the JSON as:
-   - PowerShell: `Join-Path $Root "client-bootstrap-node-a.json"`
-   - Bash: `"$ROOT/client-bootstrap-node-a.json"`
+  - PowerShell: `Join-Path $Root "ironmesh-client-bootstrap-node-a.json"`
+  - Bash: `"$ROOT/ironmesh-client-bootstrap-node-a.json"`
 2. on node B, issue another bootstrap bundle and save it as:
-   - PowerShell: `Join-Path $Root "client-bootstrap-node-b.json"`
-   - Bash: `"$ROOT/client-bootstrap-node-b.json"`
+  - PowerShell: `Join-Path $Root "ironmesh-client-bootstrap-node-b.json"`
+  - Bash: `"$ROOT/ironmesh-client-bootstrap-node-b.json"`
 
 Node B may ask you to sign in first with the password from step 6 if the session is gone.
 
@@ -201,8 +201,8 @@ Node B may ask you to sign in first with the password from step 6 if the session
 PowerShell:
 
 ```powershell
-$BootstrapAPath = Join-Path $Root "client-bootstrap-node-a.json"
-$ClientIdentityPath = Join-Path $Root "client-identity.json"
+$BootstrapAPath = Join-Path $Root "ironmesh-client-bootstrap-node-a.json"
+$ClientIdentityPath = Join-Path $Root "ironmesh-client-bootstrap-node-a.client-identity.json"
 
 cargo run -p cli-client -- `
   --bootstrap-file $BootstrapAPath `
@@ -212,8 +212,8 @@ cargo run -p cli-client -- `
 ```
 
 ```bash
-BOOTSTRAP_A_PATH="$ROOT/client-bootstrap-node-a.json"
-CLIENT_IDENTITY_PATH="$ROOT/client-identity.json"
+BOOTSTRAP_A_PATH="$ROOT/ironmesh-client-bootstrap-node-a.json"
+CLIENT_IDENTITY_PATH="$ROOT/ironmesh-client-bootstrap-node-a.client-identity.json"
 
 cargo run -p cli-client -- \
   --bootstrap-file "$BOOTSTRAP_A_PATH" \
@@ -275,8 +275,8 @@ To make the client prefer rendezvous relay instead of the direct public endpoint
 PowerShell:
 
 ```powershell
-$BootstrapBPath = Join-Path $Root "client-bootstrap-node-b.json"
-$RelayBootstrapBPath = Join-Path $Root "client-bootstrap-node-b.relay.json"
+$BootstrapBPath = Join-Path $Root "ironmesh-client-bootstrap-node-b.json"
+$RelayBootstrapBPath = Join-Path $Root "ironmesh-client-bootstrap-node-b.relay.json"
 
 $bootstrap = Get-Content $BootstrapBPath -Raw | ConvertFrom-Json
 foreach ($endpoint in $bootstrap.direct_endpoints) {
@@ -288,8 +288,8 @@ $bootstrap | ConvertTo-Json -Depth 20 | Set-Content $RelayBootstrapBPath
 ```
 
 ```bash
-BOOTSTRAP_B_PATH="$ROOT/client-bootstrap-node-b.json"
-RELAY_BOOTSTRAP_B_PATH="$ROOT/client-bootstrap-node-b.relay.json"
+BOOTSTRAP_B_PATH="$ROOT/ironmesh-client-bootstrap-node-b.json"
+RELAY_BOOTSTRAP_B_PATH="$ROOT/ironmesh-client-bootstrap-node-b.relay.json"
 
 export BOOTSTRAP_B_PATH
 export RELAY_BOOTSTRAP_B_PATH
