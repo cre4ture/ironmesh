@@ -127,6 +127,15 @@ Optional overrides:
 - `IRONMESH_LOCAL_CLUSTER_DIR`
 - `IRONMESH_SERVER_BIN`
 
+## Runtime Env Contract
+
+Treat only a small runtime subset as the first-release env var contract.
+
+- `ironmesh-server-node` supported runtime envs: `IRONMESH_NODE_ENROLLMENT_FILE`, `IRONMESH_NODE_BOOTSTRAP_FILE`, `IRONMESH_NODE_ID`, `IRONMESH_CLUSTER_ID`, `IRONMESH_DATA_DIR`, `IRONMESH_SERVER_BIND`, `IRONMESH_PUBLIC_URL`, `IRONMESH_PUBLIC_TLS_CERT`, `IRONMESH_PUBLIC_TLS_KEY`, `IRONMESH_INTERNAL_BIND`, `IRONMESH_INTERNAL_URL`, `IRONMESH_INTERNAL_TLS_CA_CERT`, `IRONMESH_INTERNAL_TLS_CERT`, `IRONMESH_INTERNAL_TLS_KEY`, `IRONMESH_RENDEZVOUS_URLS`, `IRONMESH_RENDEZVOUS_CA_CERT`, `IRONMESH_RENDEZVOUS_MTLS_REQUIRED`, `IRONMESH_RELAY_MODE`, `IRONMESH_ADMIN_TOKEN`, and `IRONMESH_REQUIRE_CLIENT_AUTH`.
+- `ironmesh-rendezvous-service` supported runtime envs: `IRONMESH_RENDEZVOUS_BIND`, `IRONMESH_RENDEZVOUS_PUBLIC_URL`, `IRONMESH_RELAY_PUBLIC_URLS`, `IRONMESH_RENDEZVOUS_CLIENT_CA_CERT`, `IRONMESH_RENDEZVOUS_TLS_CERT`, `IRONMESH_RENDEZVOUS_TLS_KEY`, `IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE`, and `IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE`.
+- Local-dev or helper-only envs are intentionally separate contracts: `IRONMESH_LOCAL_CLUSTER_*`, `IRONMESH_SERVER_BIN`, `IRONMESH_CLI_BIN`, and `IRONMESH_RENDEZVOUS_DEPLOY_*`. `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP` is development-only and should not be treated as a production runtime contract.
+- Advanced tuning and debug envs such as `IRONMESH_METADATA_*`, `IRONMESH_AUTONOMOUS_*`, `IRONMESH_REPLICATION_*`, `IRONMESH_REPAIR_*`, `IRONMESH_DATA_SCRUB_*`, `IRONMESH_STORAGE_STATS_*`, `IRONMESH_MAP_*`, and `IRONMESH_TEST_*` are current operational knobs, not frozen compatibility promises for the first release.
+
 ## Local git hooks (recommended)
 
 Enable repository-managed hooks once per clone:
@@ -224,6 +233,8 @@ Notes:
 - CI branch-protection alignment and nightly-lane triage steps are documented in [docs/ci-runbook.md](docs/ci-runbook.md).
 
 ## API semantics (current)
+
+The env vars referenced in the tuning subsections below are current operational knobs. They are useful for local operations and controlled deployments, but they are not the first-release compatibility contract unless they are also listed in the runtime env contract section above.
 
 ### Versioning and commit
 
