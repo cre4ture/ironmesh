@@ -1,4 +1,3 @@
-#![cfg(windows)]
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
@@ -16,11 +15,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
-use windows_client_config::{
+use desktop_client_config::{
     FolderAgentInstance, LaunchReport, ManagedInstanceStore, OsIntegrationInstance,
-    STARTUP_TASK_ID, default_instance_store_path, default_launch_report_path,
-    generate_instance_id, launch_enabled_instances, load_last_launch_report,
-    package_root_from_current_exe, save_launch_report,
+    OS_INTEGRATION_MANAGEMENT_SUPPORTED, PLATFORM_KIND, STARTUP_INTEGRATION_LABEL,
+    STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE, default_instance_store_path,
+    default_launch_report_path, generate_instance_id, launch_enabled_instances,
+    load_last_launch_report, migrate_legacy_state_paths, package_root_from_current_exe,
+    save_launch_report,
 };
 
 #[derive(Debug, Parser)]
@@ -43,10 +44,14 @@ struct AppState {
 
 #[derive(Debug, Serialize)]
 struct ConfigResponse {
+    platform: &'static str,
+    supports_os_integration: bool,
     config_path: String,
     launch_report_path: String,
     package_root: String,
-    startup_task_id: &'static str,
+    startup_integration_label: &'static str,
+    startup_integration_value: &'static str,
+    startup_integration_note: &'static str,
     store: ManagedInstanceStore,
     last_launch_report: Option<LaunchReport>,
 }
@@ -57,47 +62,61 @@ struct UpsertOsIntegrationInstanceRequest {
     label: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
-    sync_root_id: String,
-    display_name: String,
+    sync_root_id: Option<String>,
+    display_name: Option<String>,
     root_path: String,
-    #[serde(default)]
-    server_base_url: Option<Option<String>>,
+    server_base_url: Option<String>,
     prefix: Option<String>,
     bootstrap_file: Option<String>,
+    snapshot_file: Option<String>,
+    client_identity_file: Option<String>,
+    server_ca_path: Option<String>,
+    client_edge_state_dir: Option<String>,
+    fs_name: Option<String>,
     #[serde(default)]
-    client_identity_file: Option<Option<String>>,
+    allow_other: bool,
     #[serde(default)]
-    server_ca_cert: Option<Option<String>>,
+    publish_gnome_status: bool,
+    gnome_status_file: Option<String>,
+    remote_refresh_interval_ms: Option<String>,
+    remote_status_poll_interval_ms: Option<String>,
+    depth: Option<String>,
 }
 
 impl UpsertOsIntegrationInstanceRequest {
-    fn into_instance(self, existing: Option<&OsIntegrationInstance>) -> Result<OsIntegrationInstance, ApiError> {
+    fn into_instance(self, _existing: Option<&OsIntegrationInstance>) -> Result<OsIntegrationInstance, ApiError> {
         let instance = OsIntegrationInstance {
             id: normalize_optional_string(self.id)
                 .unwrap_or_else(|| generate_instance_id("os-integration")),
             label: required_field("os-integration label", self.label)?,
             enabled: self.enabled,
-            sync_root_id: required_field("sync_root_id", self.sync_root_id)?,
-            display_name: required_field("display_name", self.display_name)?,
+            sync_root_id: normalize_optional_string(self.sync_root_id),
+            display_name: normalize_optional_string(self.display_name),
             root_path: required_field("root_path", self.root_path)?,
-            server_base_url: resolve_hidden_optional_string(
-              self.server_base_url,
-              existing.and_then(|candidate| candidate.server_base_url.as_deref()),
-            ),
+            server_base_url: normalize_optional_string(self.server_base_url),
             prefix: normalize_optional_string(self.prefix),
             bootstrap_file: normalize_optional_string(self.bootstrap_file),
-            client_identity_file: resolve_hidden_optional_string(
-              self.client_identity_file,
-              existing.and_then(|candidate| candidate.client_identity_file.as_deref()),
-            ),
-            server_ca_cert: resolve_hidden_optional_string(
-              self.server_ca_cert,
-              existing.and_then(|candidate| candidate.server_ca_cert.as_deref()),
-            ),
+            snapshot_file: normalize_optional_string(self.snapshot_file),
+            client_identity_file: normalize_optional_string(self.client_identity_file),
+            server_ca_path: normalize_optional_string(self.server_ca_path),
+            client_edge_state_dir: normalize_optional_string(self.client_edge_state_dir),
+            fs_name: normalize_optional_string(self.fs_name),
+            allow_other: self.allow_other,
+            publish_gnome_status: self.publish_gnome_status,
+            gnome_status_file: normalize_optional_string(self.gnome_status_file),
+            remote_refresh_interval_ms: parse_optional_u64_field(
+                "remote_refresh_interval_ms",
+                self.remote_refresh_interval_ms,
+            )?,
+            remote_status_poll_interval_ms: parse_optional_u64_field(
+                "remote_status_poll_interval_ms",
+                self.remote_status_poll_interval_ms,
+            )?,
+            depth: parse_optional_usize_field("depth", self.depth)?,
         };
         instance
-          .validate()
-          .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            .validate()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
         Ok(instance)
     }
 }
@@ -192,6 +211,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let bind_addr: SocketAddr = cli.bind.parse().context("failed parsing --bind address")?;
     let package_root = package_root_from_current_exe()?;
+  migrate_legacy_state_paths()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let state = AppState {
         instance_store_path: default_instance_store_path(),
@@ -361,10 +381,14 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
     let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)?;
     let last_launch_report = load_last_launch_report(&state.launch_report_path)?;
     Ok(ConfigResponse {
+    platform: PLATFORM_KIND,
+    supports_os_integration: OS_INTEGRATION_MANAGEMENT_SUPPORTED,
         config_path: state.instance_store_path.display().to_string(),
         launch_report_path: state.launch_report_path.display().to_string(),
         package_root: state.package_root.display().to_string(),
-        startup_task_id: STARTUP_TASK_ID,
+    startup_integration_label: STARTUP_INTEGRATION_LABEL,
+    startup_integration_value: STARTUP_INTEGRATION_VALUE,
+    startup_integration_note: STARTUP_INTEGRATION_NOTE,
         store,
         last_launch_report,
     })
@@ -387,6 +411,31 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
         .filter(|candidate| !candidate.is_empty())
 }
 
+fn parse_optional_u64_field(field_name: &str, value: Option<String>) -> Result<Option<u64>, ApiError> {
+  let Some(value) = normalize_optional_string(value) else {
+    return Ok(None);
+  };
+
+  value
+    .parse::<u64>()
+    .map(Some)
+    .map_err(|_| ApiError::bad_request(format!("{} must be a whole number", field_name)))
+}
+
+fn parse_optional_usize_field(
+  field_name: &str,
+  value: Option<String>,
+) -> Result<Option<usize>, ApiError> {
+  let Some(value) = normalize_optional_string(value) else {
+    return Ok(None);
+  };
+
+  value
+    .parse::<usize>()
+    .map(Some)
+    .map_err(|_| ApiError::bad_request(format!("{} must be a whole number", field_name)))
+}
+
 fn resolve_hidden_optional_string(
   requested_value: Option<Option<String>>,
   existing_value: Option<&str>,
@@ -402,10 +451,30 @@ fn default_enabled() -> bool {
 }
 
 fn open_browser(url: &str) -> Result<()> {
-    Command::new("explorer.exe")
-        .arg(url)
-        .spawn()
-        .with_context(|| format!("failed opening browser at {}", url))?;
+  #[cfg(windows)]
+  let mut command = {
+    let mut command = Command::new("explorer.exe");
+    command.arg(url);
+    command
+  };
+
+  #[cfg(target_os = "linux")]
+  let mut command = {
+    let mut command = Command::new("xdg-open");
+    command.arg(url);
+    command
+  };
+
+  #[cfg(not(any(windows, target_os = "linux")))]
+  let mut command = {
+    let mut command = Command::new("open");
+    command.arg(url);
+    command
+  };
+
+  command
+    .spawn()
+    .with_context(|| format!("failed opening browser at {}", url))?;
     Ok(())
 }
 
@@ -431,7 +500,7 @@ const APP_HTML: &str = r###"<!doctype html>
       document.documentElement.setAttribute("data-mantine-color-scheme", computedColorScheme);
     } catch {}
   </script>
-  <title>IronMesh Windows Config</title>
+  <title>IronMesh Desktop Config</title>
   <link rel="stylesheet" href="/app.css" />
 </head>
 <body>
@@ -483,7 +552,7 @@ const APP_HTML: &str = r###"<!doctype html>
           </svg>
           <div class="brand-copy">
             <span class="brand-name">ironmesh</span>
-            <span class="brand-surface">Windows Config</span>
+            <span class="brand-surface">Desktop Config</span>
           </div>
         </div>
 
@@ -505,11 +574,11 @@ const APP_HTML: &str = r###"<!doctype html>
         <nav class="shell-nav" aria-label="Configuration sections">
           <a class="shell-nav-link" href="#runtime-panel">
             <span class="nav-title">Runtime</span>
-            <span class="nav-description">Package paths, startup task, and the last recorded launcher run.</span>
+            <span class="nav-description">Package paths, startup integration, and the last recorded launcher run.</span>
           </a>
-          <a class="shell-nav-link" href="#os-panel">
-            <span class="nav-title">Explorer Sync Roots</span>
-            <span class="nav-description">Configure the packaged Windows Explorer integration instances.</span>
+          <a id="os-nav-link" class="shell-nav-link" href="#os-panel">
+            <span id="os-nav-title" class="nav-title">OS Integration</span>
+            <span id="os-nav-description" class="nav-description">Configure platform-specific filesystem integration instances.</span>
           </a>
           <a class="shell-nav-link" href="#folder-panel">
             <span class="nav-title">Folder Sync Jobs</span>
@@ -526,13 +595,13 @@ const APP_HTML: &str = r###"<!doctype html>
         <div class="shell-content">
           <section class="page-header">
             <div class="page-copy">
-              <p class="eyebrow">Packaged Windows Client</p>
+              <p class="eyebrow">Packaged Desktop Client</p>
               <h1>Configure background sync services</h1>
-              <p class="lede">Define Explorer sync roots and folder sync jobs, then let the packaged background launcher restart enabled instances after login using the same visual shell style as the other IronMesh web surfaces.</p>
+              <p class="lede">Define managed background services, review launcher output, and restart enabled instances from the same desktop configuration surface on Windows and Linux.</p>
             </div>
             <div class="page-summary">
-              <div class="summary-chip">
-                <span class="summary-label">Explorer Sync Roots</span>
+              <div id="os-summary-chip" class="summary-chip">
+                <span id="os-summary-label" class="summary-label">OS Integration</span>
                 <strong id="os-instance-count">0</strong>
               </div>
               <div class="summary-chip">
@@ -546,31 +615,33 @@ const APP_HTML: &str = r###"<!doctype html>
             <div class="panel-header">
               <div>
                 <h2>Runtime</h2>
-                <p>Current package paths, startup task identity, and the last recorded background launch report.</p>
+                <p>Current package paths, startup integration state, and the last recorded background launch report.</p>
               </div>
             </div>
             <dl class="meta-grid">
               <div><dt>Config Store</dt><dd id="config-path">Loading...</dd></div>
               <div><dt>Launch Report</dt><dd id="launch-report-path">Loading...</dd></div>
               <div><dt>Package Root</dt><dd id="package-root">Loading...</dd></div>
-              <div><dt>Startup Task</dt><dd id="startup-task-id">Loading...</dd></div>
+              <div><dt id="startup-integration-label">Startup Integration</dt><dd id="startup-integration-value">Loading...</dd></div>
             </dl>
-            <pre id="launch-report">No background launch recorded yet.</pre>
+            <p id="startup-integration-note" class="panel-note">Loading...</p>
+            <pre id="launch-report">No launcher run recorded yet.</pre>
           </section>
 
           <section id="os-panel" class="panel panel-split">
             <div class="panel-column">
               <div class="panel-header">
                 <div>
-                  <h2>Windows Explorer Sync Roots</h2>
-                  <p>Each entry serves one packaged sync root in Explorer, including placeholder handling and Cloud Files integration.</p>
+                  <h2 id="os-panel-title">OS Integration Instances</h2>
+                  <p id="os-panel-description">Each entry serves one packaged filesystem integration runtime for the current desktop platform.</p>
                 </div>
                 <button id="clear-os-form" class="secondary">New Instance</button>
               </div>
               <div id="os-instance-list" class="instance-list"></div>
             </div>
             <form id="os-form" class="instance-form panel-form">
-              <h3>Configure Explorer Sync Root</h3>
+              <h3 id="os-form-title">Configure OS Integration</h3>
+              <p id="os-platform-note" class="panel-note">Loading...</p>
               <input type="hidden" id="os-id" />
               <label>
                 <span class="field-label">Instance Name</span>
@@ -581,35 +652,108 @@ const APP_HTML: &str = r###"<!doctype html>
                 <input type="checkbox" id="os-enabled" checked />
                 <span class="checkbox-copy">
                   <span class="field-label">Start automatically after login</span>
-                  <span class="field-help">The background launcher starts this sync root when you sign in to Windows.</span>
+                  <span class="field-help">The launcher will try to restart this instance when platform startup integration is available.</span>
                 </span>
               </label>
+              <div id="os-windows-fields" class="form-section">
+                <h4>Windows Explorer</h4>
+                <label>
+                  <span class="field-label">Sync Root Identifier</span>
+                  <span class="field-help">Stable unique identifier for this Windows Explorer sync root.</span>
+                  <input id="os-sync-root-id" />
+                </label>
+                <label>
+                  <span class="field-label">Folder Name in Explorer</span>
+                  <span class="field-help">Name shown to the user for this sync root in Windows Explorer.</span>
+                  <input id="os-display-name" />
+                </label>
+              </div>
               <label>
-                <span class="field-label">Sync Root Identifier</span>
-                <span class="field-help">Stable unique identifier for this Windows Explorer sync root.</span>
-                <input id="os-sync-root-id" required />
-              </label>
-              <label>
-                <span class="field-label">Folder Name in Explorer</span>
-                <span class="field-help">Name shown to the user for this sync root in Windows Explorer.</span>
-                <input id="os-display-name" required />
-              </label>
-              <label>
-                <span class="field-label">Local Folder Location</span>
-                <span class="field-help">Local folder path where this sync root is mounted.</span>
+                <span id="os-root-path-label" class="field-label">Local Folder Location</span>
+                <span id="os-root-path-help" class="field-help">Local folder path where this sync root is mounted.</span>
                 <input id="os-root-path" required />
               </label>
-              <label>
-                <span class="field-label">Remote Folder Prefix</span>
-                <span class="field-help">Optional remote subfolder or namespace prefix for this instance.</span>
-                <input id="os-prefix" />
-              </label>
-              <label>
-                <span class="field-label">Initial Setup File</span>
-                <span class="field-help">Optional bootstrap JSON file used for first-time setup.</span>
-                <input id="os-bootstrap-file" />
-              </label>
-              <button type="submit">Save Explorer Sync Root</button>
+              <div class="form-section">
+                <h4>Connection</h4>
+                <label>
+                  <span class="field-label">Server Base URL</span>
+                  <span class="field-help">Optional explicit server-node base URL when not relying solely on bootstrap material.</span>
+                  <input id="os-server-base-url" placeholder="https://node.example" />
+                </label>
+                <label>
+                  <span class="field-label">Initial Setup File</span>
+                  <span class="field-help">Optional bootstrap JSON file used for first-time setup or live connection bootstrap.</span>
+                  <input id="os-bootstrap-file" />
+                </label>
+                <label>
+                  <span class="field-label">Client Identity File</span>
+                  <span class="field-help">Optional client identity JSON used for authenticated live mounts.</span>
+                  <input id="os-client-identity-file" />
+                </label>
+                <label>
+                  <span id="os-server-ca-label" class="field-label">Server CA File</span>
+                  <span id="os-server-ca-help" class="field-help">Optional trust anchor used for remote TLS connections.</span>
+                  <input id="os-server-ca-path" />
+                </label>
+                <label>
+                  <span class="field-label">Remote Folder Prefix</span>
+                  <span class="field-help">Optional remote subfolder or namespace prefix for this instance.</span>
+                  <input id="os-prefix" />
+                </label>
+              </div>
+              <div id="os-linux-fields" class="form-section" hidden>
+                <h4>Linux FUSE Options</h4>
+                <label>
+                  <span class="field-label">Snapshot File</span>
+                  <span class="field-help">Optional SyncSnapshot JSON file for offline or demo mounts. Leave Server Base URL and Initial Setup File empty when using this.</span>
+                  <input id="os-snapshot-file" />
+                </label>
+                <label>
+                  <span class="field-label">Client Edge State Directory</span>
+                  <span class="field-help">Optional persistent state directory for the live rights edge and hydrated-object cache.</span>
+                  <input id="os-client-edge-state-dir" />
+                </label>
+                <label>
+                  <span class="field-label">Filesystem Name</span>
+                  <span class="field-help">Optional mount name shown by FUSE tooling. The runtime defaults to ironmesh.</span>
+                  <input id="os-fs-name" placeholder="ironmesh" />
+                </label>
+                <label>
+                  <span class="field-label">Namespace Depth</span>
+                  <span class="field-help">Optional namespace traversal depth for live refreshes. Leave empty to use the runtime default.</span>
+                  <input id="os-depth" type="number" min="1" placeholder="64" />
+                </label>
+                <label>
+                  <span class="field-label">Remote Refresh Interval (ms)</span>
+                  <span class="field-help">Optional interval for refreshing live namespace state. Leave empty to use the runtime default.</span>
+                  <input id="os-remote-refresh-interval-ms" type="number" min="1" placeholder="3000" />
+                </label>
+                <label>
+                  <span class="field-label">GNOME Status File Override</span>
+                  <span class="field-help">Optional override for the JSON status file consumed by the GNOME Shell extension.</span>
+                  <input id="os-gnome-status-file" />
+                </label>
+                <label>
+                  <span class="field-label">GNOME Status Poll Interval (ms)</span>
+                  <span class="field-help">Optional poll interval for desktop connection and replication status updates.</span>
+                  <input id="os-remote-status-poll-interval-ms" type="number" min="1" placeholder="3000" />
+                </label>
+                <label class="checkbox checkbox-field">
+                  <input type="checkbox" id="os-allow-other" />
+                  <span class="checkbox-copy">
+                    <span class="field-label">Allow other local users</span>
+                    <span class="field-help">Passes --allow-other to FUSE so other local users can access the mount when the system FUSE policy allows it.</span>
+                  </span>
+                </label>
+                <label class="checkbox checkbox-field">
+                  <input type="checkbox" id="os-publish-gnome-status" />
+                  <span class="checkbox-copy">
+                    <span class="field-label">Publish GNOME status</span>
+                    <span class="field-help">Writes desktop status updates for the packaged GNOME Shell extension while the mount is running.</span>
+                  </span>
+                </label>
+              </div>
+              <button id="os-submit-button" type="submit">Save OS Integration</button>
             </form>
           </section>
 
@@ -636,7 +780,7 @@ const APP_HTML: &str = r###"<!doctype html>
                 <input type="checkbox" id="folder-enabled" checked />
                 <span class="checkbox-copy">
                   <span class="field-label">Start automatically after login</span>
-                  <span class="field-help">The background launcher starts this sync job when you sign in to Windows.</span>
+                  <span class="field-help">The launcher will try to restart this sync job when platform startup integration is available.</span>
                 </span>
               </label>
               <label>
@@ -1049,6 +1193,12 @@ button.secondary {
   margin-bottom: 18px;
 }
 
+.panel-note {
+  margin: 0 0 20px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .panel-header p {
   margin: 6px 0 0;
   color: var(--muted);
@@ -1122,6 +1272,21 @@ dd {
 .instance-form h3 {
   margin: 0 0 4px;
   font-size: 22px;
+}
+
+.form-section {
+  display: grid;
+  gap: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--panel-border);
+}
+
+.form-section h4 {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 
 .instance-form label {
@@ -1342,12 +1507,21 @@ function renderLaunchReport(report) {
 
 function renderInstanceCard(instance, kind, onEdit, onDelete) {
   const details = kind === 'os'
-    ? [
-        ['Sync Root Identifier', instance.sync_root_id],
-        ['Folder Name in Explorer', instance.display_name],
-        ['Local Folder Location', instance.root_path],
-        ['Initial Setup File', instance.bootstrap_file || ''],
-      ]
+    ? currentConfig?.platform === 'linux'
+      ? [
+          ['Mountpoint', instance.root_path],
+          ['Connection Source', instance.snapshot_file || instance.bootstrap_file || instance.server_base_url || ''],
+          ['Client Identity File', instance.client_identity_file || ''],
+          ['Remote Folder Prefix', instance.prefix || ''],
+          ['GNOME Status Publishing', instance.publish_gnome_status ? 'Enabled' : 'Disabled'],
+        ]
+      : [
+          ['Sync Root Identifier', instance.sync_root_id],
+          ['Folder Name in Explorer', instance.display_name],
+          ['Local Folder Location', instance.root_path],
+          ['Initial Setup File', instance.bootstrap_file || ''],
+          ['Remote Folder Prefix', instance.prefix || ''],
+        ]
     : [
         ['Folder to Sync', instance.root_dir],
         ['Local State Storage', instance.state_root_dir || ''],
@@ -1360,7 +1534,7 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
       <div class="actions">
         <div>
           <strong>${escapeHtml(instance.label)}</strong>
-          <div class="instance-meta">${instance.enabled ? 'Enabled after login' : 'Disabled after login'}</div>
+          <div class="instance-meta">${instance.enabled ? 'Enabled' : 'Disabled'}</div>
         </div>
         <div class="actions">
           <button type="button" class="secondary" onclick="${onEdit}('${encodeURIComponent(instance.id)}')">Edit</button>
@@ -1374,20 +1548,93 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
   `;
 }
 
+function applyOsPlatformChrome(platform) {
+  const isWindows = platform === 'windows';
+  const isLinux = platform === 'linux';
+
+  document.getElementById('os-nav-title').textContent = isWindows
+    ? 'Explorer Sync Roots'
+    : isLinux
+      ? 'Linux FUSE Mounts'
+      : 'OS Integration';
+  document.getElementById('os-nav-description').textContent = isWindows
+    ? 'Configure packaged Windows Explorer sync-root instances.'
+    : isLinux
+      ? 'Configure packaged Linux FUSE mount instances.'
+      : 'Configure platform-specific filesystem integration instances.';
+  document.getElementById('os-summary-label').textContent = isWindows
+    ? 'Explorer Sync Roots'
+    : isLinux
+      ? 'Linux FUSE Mounts'
+      : 'OS Integration';
+  document.getElementById('os-panel-title').textContent = isWindows
+    ? 'Windows Explorer Sync Roots'
+    : isLinux
+      ? 'Linux FUSE Mounts'
+      : 'OS Integration Instances';
+  document.getElementById('os-panel-description').textContent = isWindows
+    ? 'Each entry serves one packaged Windows Explorer sync root with the current client package.'
+    : isLinux
+      ? 'Each entry launches one packaged Linux FUSE mount runtime with its own mountpoint and connection settings.'
+      : 'Each entry serves one packaged filesystem integration runtime for the current desktop platform.';
+  document.getElementById('os-form-title').textContent = isWindows
+    ? 'Configure Explorer Sync Root'
+    : isLinux
+      ? 'Configure Linux FUSE Mount'
+      : 'Configure OS Integration';
+  document.getElementById('os-platform-note').textContent = isWindows
+    ? 'Windows instances register packaged Explorer sync roots. Sync Root Identifier and Folder Name in Explorer are required.'
+    : isLinux
+      ? 'Linux instances launch the packaged FUSE mount runtime. Set a mountpoint and provide either a snapshot file, a bootstrap file, or a server base URL.'
+      : 'OS integration management is unavailable on this platform.';
+  document.getElementById('os-root-path-label').textContent = isWindows ? 'Local Folder Location' : 'Mountpoint';
+  document.getElementById('os-root-path-help').textContent = isWindows
+    ? 'Local folder path where this sync root is mounted.'
+    : 'Directory where the IronMesh FUSE filesystem should be mounted.';
+  document.getElementById('os-server-ca-label').textContent = isWindows ? 'Server CA Certificate' : 'Server CA PEM File';
+  document.getElementById('os-server-ca-help').textContent = isWindows
+    ? 'Optional certificate path used to trust the remote server for Explorer sync-root sessions.'
+    : 'Optional PEM path used to trust the remote server for live FUSE mounts.';
+  document.getElementById('os-submit-button').textContent = isWindows
+    ? 'Save Explorer Sync Root'
+    : isLinux
+      ? 'Save Linux FUSE Mount'
+      : 'Save OS Integration';
+  document.getElementById('os-windows-fields').hidden = !isWindows;
+  document.getElementById('os-linux-fields').hidden = !isLinux;
+}
+
 function renderConfig(config) {
   currentConfig = config;
+  document.title = config.platform === 'windows'
+    ? 'IronMesh Windows Config'
+    : config.platform === 'linux'
+      ? 'IronMesh Linux Config'
+      : 'IronMesh Desktop Config';
   document.getElementById('config-path').textContent = config.config_path;
   document.getElementById('launch-report-path').textContent = config.launch_report_path;
   document.getElementById('package-root').textContent = config.package_root;
-  document.getElementById('startup-task-id').textContent = config.startup_task_id;
+  document.getElementById('startup-integration-label').textContent = config.startup_integration_label;
+  document.getElementById('startup-integration-value').textContent = config.startup_integration_value;
+  document.getElementById('startup-integration-note').textContent = config.startup_integration_note;
   document.getElementById('os-instance-count').textContent = String(config.store.os_integration_instances.length);
   document.getElementById('folder-instance-count').textContent = String(config.store.folder_agent_instances.length);
   renderLaunchReport(config.last_launch_report);
+  applyOsPlatformChrome(config.platform);
+
+  const supportsOsIntegration = !!config.supports_os_integration;
+  document.getElementById('os-nav-link').hidden = !supportsOsIntegration;
+  document.getElementById('os-summary-chip').hidden = !supportsOsIntegration;
+  document.getElementById('os-panel').hidden = !supportsOsIntegration;
 
   const osTarget = document.getElementById('os-instance-list');
-  osTarget.innerHTML = config.store.os_integration_instances.length
-    ? config.store.os_integration_instances.map((instance) => renderInstanceCard(instance, 'os', 'editOsInstance', 'deleteOsInstance')).join('')
-    : '<p class="empty">No os-integration instances configured yet.</p>';
+  if (supportsOsIntegration) {
+    osTarget.innerHTML = config.store.os_integration_instances.length
+      ? config.store.os_integration_instances.map((instance) => renderInstanceCard(instance, 'os', 'editOsInstance', 'deleteOsInstance')).join('')
+      : '<p class="empty">No os-integration instances configured yet.</p>';
+  } else {
+    osTarget.innerHTML = '';
+  }
 
   const folderTarget = document.getElementById('folder-instance-list');
   folderTarget.innerHTML = config.store.folder_agent_instances.length
@@ -1408,8 +1655,20 @@ function clearOsForm() {
   document.getElementById('os-sync-root-id').value = '';
   document.getElementById('os-display-name').value = '';
   document.getElementById('os-root-path').value = '';
+  document.getElementById('os-server-base-url').value = '';
   document.getElementById('os-prefix').value = '';
   document.getElementById('os-bootstrap-file').value = '';
+  document.getElementById('os-snapshot-file').value = '';
+  document.getElementById('os-client-identity-file').value = '';
+  document.getElementById('os-server-ca-path').value = '';
+  document.getElementById('os-client-edge-state-dir').value = '';
+  document.getElementById('os-fs-name').value = '';
+  document.getElementById('os-depth').value = '';
+  document.getElementById('os-remote-refresh-interval-ms').value = '';
+  document.getElementById('os-gnome-status-file').value = '';
+  document.getElementById('os-remote-status-poll-interval-ms').value = '';
+  document.getElementById('os-allow-other').checked = false;
+  document.getElementById('os-publish-gnome-status').checked = false;
 }
 
 function clearFolderForm() {
@@ -1439,11 +1698,23 @@ window.editOsInstance = function(encodedId) {
   document.getElementById('os-id').value = instance.id;
   document.getElementById('os-label').value = instance.label;
   document.getElementById('os-enabled').checked = !!instance.enabled;
-  document.getElementById('os-sync-root-id').value = instance.sync_root_id;
-  document.getElementById('os-display-name').value = instance.display_name;
+  document.getElementById('os-sync-root-id').value = instance.sync_root_id || '';
+  document.getElementById('os-display-name').value = instance.display_name || '';
   document.getElementById('os-root-path').value = instance.root_path;
+  document.getElementById('os-server-base-url').value = instance.server_base_url || '';
   document.getElementById('os-prefix').value = instance.prefix || '';
   document.getElementById('os-bootstrap-file').value = instance.bootstrap_file || '';
+  document.getElementById('os-snapshot-file').value = instance.snapshot_file || '';
+  document.getElementById('os-client-identity-file').value = instance.client_identity_file || '';
+  document.getElementById('os-server-ca-path').value = instance.server_ca_path || '';
+  document.getElementById('os-client-edge-state-dir').value = instance.client_edge_state_dir || '';
+  document.getElementById('os-fs-name').value = instance.fs_name || '';
+  document.getElementById('os-depth').value = instance.depth || '';
+  document.getElementById('os-remote-refresh-interval-ms').value = instance.remote_refresh_interval_ms || '';
+  document.getElementById('os-gnome-status-file').value = instance.gnome_status_file || '';
+  document.getElementById('os-remote-status-poll-interval-ms').value = instance.remote_status_poll_interval_ms || '';
+  document.getElementById('os-allow-other').checked = !!instance.allow_other;
+  document.getElementById('os-publish-gnome-status').checked = !!instance.publish_gnome_status;
 };
 
 window.editFolderInstance = function(encodedId) {
@@ -1488,8 +1759,20 @@ async function submitOsForm(event) {
     sync_root_id: document.getElementById('os-sync-root-id').value,
     display_name: document.getElementById('os-display-name').value,
     root_path: document.getElementById('os-root-path').value,
+    server_base_url: document.getElementById('os-server-base-url').value,
     prefix: document.getElementById('os-prefix').value,
     bootstrap_file: document.getElementById('os-bootstrap-file').value,
+    snapshot_file: document.getElementById('os-snapshot-file').value,
+    client_identity_file: document.getElementById('os-client-identity-file').value,
+    server_ca_path: document.getElementById('os-server-ca-path').value,
+    client_edge_state_dir: document.getElementById('os-client-edge-state-dir').value,
+    fs_name: document.getElementById('os-fs-name').value,
+    allow_other: document.getElementById('os-allow-other').checked,
+    publish_gnome_status: document.getElementById('os-publish-gnome-status').checked,
+    gnome_status_file: document.getElementById('os-gnome-status-file').value,
+    remote_refresh_interval_ms: document.getElementById('os-remote-refresh-interval-ms').value,
+    remote_status_poll_interval_ms: document.getElementById('os-remote-status-poll-interval-ms').value,
+    depth: document.getElementById('os-depth').value,
   };
   const config = await fetchJson('/api/os-integration-instances', {
     method: 'POST',

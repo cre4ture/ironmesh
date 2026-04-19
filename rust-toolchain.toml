@@ -1,4 +1,4 @@
 [toolchain]
 channel = "nightly-2026-02-17"
 components = ["rustfmt", "clippy"]
-targets = ["aarch64-linux-android", "x86_64-linux-android"]
+targets = ["aarch64-linux-android", "x86_64-linux-android", "x86_64-pc-windows-gnu"]

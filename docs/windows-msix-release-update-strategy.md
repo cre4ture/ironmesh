@@ -105,9 +105,9 @@ Package upgrades must not be the place where user state lives.
 
 Persist mutable state in the existing external locations instead:
 
-- `%LocalAppData%\Ironmesh\windows-client-config\instances.json`
+- `%LocalAppData%\Ironmesh\desktop-client-config\instances.json`
   - persisted multi-instance definitions for packaged `os-integration.exe` and `ironmesh-folder-agent.exe` launches.
-- `%LocalAppData%\Ironmesh\windows-client-config\last-launch-report.json`
+- `%LocalAppData%\Ironmesh\desktop-client-config\last-launch-report.json`
   - last startup-task launch report recorded by the packaged background launcher.
 - `%LocalAppData%\Ironmesh\sync-roots\...`
   - per-sync-root bootstrap, client identity, and related runtime state.

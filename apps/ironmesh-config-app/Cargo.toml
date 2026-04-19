@@ -13,7 +13,7 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-windows-client-config = { path = "../../crates/windows-client-config" }
+desktop-client-config = { path = "../../crates/desktop-client-config" }
 
 [target.'cfg(windows)'.build-dependencies]
 winres.workspace = true

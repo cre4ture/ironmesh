@@ -8,7 +8,7 @@ build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
-windows-client-config = { path = "../../crates/windows-client-config" }
+desktop-client-config = { path = "../../crates/desktop-client-config" }
 
 [target.'cfg(windows)'.build-dependencies]
 winres.workspace = true
