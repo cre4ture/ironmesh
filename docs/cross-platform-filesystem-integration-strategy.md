@@ -200,7 +200,7 @@ Current Linux FUSE interpretation:
   - CI now includes a Windows compile check lane for the CFAPI adapter.
   - `crates/adapter-linux-fuse` live mount now consumes the same polling abstraction to materialize remote additions without remounting.
   - `crates/sync-agent-core` with reusable local tree scanning, diffing, and remote index utilities.
-  - `apps/ironmesh-folder-agent`:
+  - `apps/folder-agent`:
     - OS-independent local-folder synchronization runtime,
     - initial remote materialization into a configured local root folder,
     - hybrid change detection: periodic local scans + native filesystem watcher events,

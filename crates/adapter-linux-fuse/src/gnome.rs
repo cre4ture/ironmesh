@@ -147,6 +147,6 @@ pub fn snapshot_replication_facet() -> StatusFacet {
 
 fn extension_source_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../apps/ironmesh-folder-agent/gnome-shell-extension")
+        .join("../../apps/folder-agent/gnome-shell-extension")
         .join(GNOME_EXTENSION_UUID)
 }

@@ -76,8 +76,8 @@ Primary repo areas:
 - [apps/server-node/src/main.rs](../apps/server-node/src/main.rs)
 - [apps/rendezvous-service/src/config.rs](../apps/rendezvous-service/src/config.rs)
 - [apps/os-integration/src/main.rs](../apps/os-integration/src/main.rs)
-- [apps/ironmesh-config-app/src/main.rs](../apps/ironmesh-config-app/src/main.rs)
-- [apps/ironmesh-folder-agent/src/main.rs](../apps/ironmesh-folder-agent/src/main.rs)
+- [apps/config-app/src/main.rs](../apps/config-app/src/main.rs)
+- [apps/folder-agent/src/main.rs](../apps/folder-agent/src/main.rs)
 - [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs)
 
 Checklist:
@@ -192,10 +192,10 @@ Primary repo areas:
 
 - [docs/windows-msix-release-update-strategy.md](windows-msix-release-update-strategy.md)
 - [windows/thumbnail-provider](../windows/thumbnail-provider)
-- [apps/ironmesh-config-app](../apps/ironmesh-config-app)
-- [apps/ironmesh-background-launcher](../apps/ironmesh-background-launcher)
+- [apps/config-app](../apps/config-app)
+- [apps/background-launcher](../apps/background-launcher)
 - [apps/os-integration](../apps/os-integration)
-- [apps/ironmesh-folder-agent](../apps/ironmesh-folder-agent)
+- [apps/folder-agent](../apps/folder-agent)
 
 Checklist:
 

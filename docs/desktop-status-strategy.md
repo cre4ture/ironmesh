@@ -77,9 +77,9 @@ Implementation shape:
 Current repo implementation:
 
 - `crates/desktop-status/src/gnome.rs`
-- `apps/ironmesh-folder-agent/src/gnome.rs`
+- `apps/folder-agent/src/gnome.rs`
 - `crates/adapter-linux-fuse/src/gnome.rs`
-- `apps/ironmesh-folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/`
+- `apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/`
 
 ### 2. Windows
 

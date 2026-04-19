@@ -36,7 +36,7 @@ windows-sys = { version = "0.61", features = [
 server_node = { path = "../../apps/server-node", package = "server-node", artifact = "bin" }
 cli_client = { path = "../../apps/cli-client", package = "cli-client", artifact = "bin" }
 os_integration = { path = "../../apps/os-integration", package = "os-integration", artifact = "bin" }
-ironmesh_folder_agent = { path = "../../apps/ironmesh-folder-agent", package = "ironmesh-folder-agent", artifact = "bin" }
+ironmesh_folder_agent = { path = "../../apps/folder-agent", package = "ironmesh-folder-agent", artifact = "bin" }
 rendezvous_service = { path = "../../apps/rendezvous-service", package = "rendezvous-service", artifact = "bin" }
 
 [lints]

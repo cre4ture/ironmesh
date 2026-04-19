@@ -19,7 +19,7 @@ This is intended as an in-repo handoff document for a macOS development machine 
   - `crates/client-sdk`
   - `crates/sync-core`
   - `crates/sync-agent-core`
-  - `apps/ironmesh-folder-agent`
+  - `apps/folder-agent`
 - Existing platform integration patterns:
   - Android: `DocumentsProvider`
   - Linux: FUSE adapter
@@ -125,7 +125,7 @@ This is the lowest-priority track right now.
 Why it stays on the list:
 
 - It is likely the fastest way to ship a basic native-feeling macOS integration if File Provider is blocked.
-- It can reuse the existing `apps/ironmesh-folder-agent` work with relatively little backend change.
+- It can reuse the existing `apps/folder-agent` work with relatively little backend change.
 
 Why it is lowest priority:
 
@@ -135,7 +135,7 @@ Why it is lowest priority:
 
 What it would look like:
 
-- Use `apps/ironmesh-folder-agent` to sync a normal local folder.
+- Use `apps/folder-agent` to sync a normal local folder.
 - Add a Finder Sync extension for:
   - badges
   - context menu actions
