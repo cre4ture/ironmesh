@@ -539,11 +539,11 @@ export function ControlPlanePage() {
       <Card withBorder radius="md" padding="lg">
         <Stack gap="sm">
           <Group justify="space-between">
-            <Text fw={700}>Dedicated standalone rendezvous-service</Text>
+            <Text fw={700}>Dedicated standalone ironmesh-rendezvous-service</Text>
             <Badge color="blue" variant="light">advanced/manual</Badge>
           </Group>
           <Text c="dimmed">
-            A pure standalone <code>rendezvous-service</code> is still the advanced operator path. The current UI now
+            A pure standalone <code>ironmesh-rendezvous-service</code> is still the advanced operator path. The current UI now
             covers both supported node-to-node transfer workflows, but it does not yet automate direct import into the
             standalone service itself.
           </Text>

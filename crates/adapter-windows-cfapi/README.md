@@ -1,6 +1,6 @@
 # IronMesh Windows CFAPI Adapter
 
-This crate contains the Windows Cloud Files (`CFAPI`) adapter used by `os-integration`.
+This crate contains the Windows Cloud Files (`CFAPI`) adapter used by `ironmesh-os-integration`.
 
 It is responsible for:
 
@@ -21,10 +21,10 @@ It is responsible for:
 
 - The adapter now exposes a manual cancel path for a currently running hydration.
 - This is mainly intended for debugging and test scenarios where a large placeholder hydration was triggered accidentally and you want to stop it without waiting for the full download to finish.
-- The running `os-integration serve` process publishes active-hydration markers under `%LocalAppData%\Ironmesh\sync-roots\...` while a file fetch is in flight.
+- The running `ironmesh-os-integration serve` process publishes active-hydration markers under `%LocalAppData%\Ironmesh\sync-roots\...` while a file fetch is in flight.
 - A cancel request can be issued either:
   - through the packaged Explorer Cloud Files context menu verb `Cancel Hydration`
-  - or directly through `os-integration cancel-hydration --root-path <sync-root> --path <relative-or-absolute-path>`
+  - or directly through `ironmesh-os-integration cancel-hydration --root-path <sync-root> --path <relative-or-absolute-path>`
 - The cancel request is best-effort and only applies to hydrations that are active at the moment of the request.
 - The backend cancellation signal is threaded into the download path, so a large in-flight ranged download can stop mid-transfer instead of waiting for the full object to complete.
 

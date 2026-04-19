@@ -287,7 +287,7 @@ Invoke-NativeChecked -FilePath "cargo" -Arguments $cargoArgs
 
 $targetDir = if ($Configuration -eq "release") { "release" } else { "debug" }
 $dllPath = Join-Path $cargoTargetDir "$targetDir\\windows_thumbnail_provider.dll"
-$exePath = Join-Path $cargoTargetDir "$targetDir\\os-integration.exe"
+$exePath = Join-Path $cargoTargetDir "$targetDir\\ironmesh-os-integration.exe"
 $folderAgentPath = Join-Path $cargoTargetDir "$targetDir\\ironmesh-folder-agent.exe"
 $backgroundLauncherPath = Join-Path $cargoTargetDir "$targetDir\ironmesh-background-launcher.exe"
 $configAppPath = Join-Path $cargoTargetDir "$targetDir\ironmesh-config-app.exe"
@@ -311,7 +311,7 @@ if (-not (Test-Path $configAppPath)) {
 Write-Step "Staging package contents under $stagePath"
 Save-StagedManifest -SourcePath $manifestPath -DestinationPath (Join-Path $stagePath "AppxManifest.xml") -Version $resolvedPackageVersion
 Copy-Item $dllPath (Join-Path $stagePath "windows_thumbnail_provider.dll")
-Copy-Item $exePath (Join-Path $stagePath "os-integration.exe")
+Copy-Item $exePath (Join-Path $stagePath "ironmesh-os-integration.exe")
 Copy-Item $folderAgentPath (Join-Path $stagePath "ironmesh-folder-agent.exe")
 Copy-Item $backgroundLauncherPath (Join-Path $stagePath "ironmesh-background-launcher.exe")
 Copy-Item $configAppPath (Join-Path $stagePath "ironmesh-config-app.exe")

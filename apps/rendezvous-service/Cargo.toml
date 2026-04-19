@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 build = "build.rs"
+default-run = "ironmesh-rendezvous-service"
+autobins = false
+
+[[bin]]
+name = "ironmesh-rendezvous-service"
+path = "src/main.rs"
 
 [dependencies]
 aes-gcm-siv = "0.11"

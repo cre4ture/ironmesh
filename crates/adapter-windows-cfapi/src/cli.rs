@@ -144,7 +144,7 @@ fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconci
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "os-integration")]
+#[command(name = "ironmesh-os-integration")]
 #[command(about = "Combined CLI for register, unregister, serve, and pin")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]

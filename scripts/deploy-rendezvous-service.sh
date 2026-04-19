@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE_NAME="rendezvous-service"
-BINARY_NAME="rendezvous-service"
+BINARY_NAME="ironmesh-rendezvous-service"
 MANIFEST_PATH="${ROOT_DIR}/apps/rendezvous-service/Cargo.toml"
 
 TARGET_TRIPLE="${IRONMESH_RENDEZVOUS_TARGET:-x86_64-unknown-linux-musl}"
@@ -84,7 +84,7 @@ Notes:
 Example:
   scripts/deploy-rendezvous-service.sh \
     --remote-dir /srv/ironmesh/rendezvous \
-    --remote-start-cmd 'source /etc/ironmesh/rendezvous.env && exec ./rendezvous-service' \
+    --remote-start-cmd 'source /etc/ironmesh/rendezvous.env && exec ./ironmesh-rendezvous-service' \
     rendezvous-a rendezvous-b
 EOF
 }

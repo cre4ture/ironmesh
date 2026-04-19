@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const EXPECTED_NAME: &str = "ironmesh-rendezvous-service";
 
 fn expected_version_outputs(binary_name: &str) -> [String; 2] {
     let build_revision =
@@ -14,16 +15,16 @@ fn expected_version_outputs(binary_name: &str) -> [String; 2] {
 
 #[test]
 fn version_reports_package_version() {
-    let output = Command::cargo_bin("rendezvous-service")
-        .expect("rendezvous-service binary should build")
+    let output = Command::cargo_bin(EXPECTED_NAME)
+        .expect("ironmesh-rendezvous-service binary should build")
         .arg("--version")
         .output()
-        .expect("rendezvous-service --version should run");
+        .expect("ironmesh-rendezvous-service --version should run");
 
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("version output should be valid UTF-8");
-    let expected = expected_version_outputs("rendezvous-service");
+    let expected = expected_version_outputs(EXPECTED_NAME);
     assert!(
         expected.iter().any(|candidate| candidate == &stdout),
         "unexpected stdout: {stdout}"

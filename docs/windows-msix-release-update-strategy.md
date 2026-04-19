@@ -82,7 +82,7 @@ The production package should include at least:
   - visible packaged configuration UI and first-run entry point for Windows users.
 - `ironmesh-background-launcher.exe`
   - startup-task target that relaunches enabled background instances after user login.
-- `os-integration.exe`
+- `ironmesh-os-integration.exe`
   - packaged full-trust host for Windows filesystem integration and status surface.
 - `ironmesh-folder-agent.exe`
   - packaged folder synchronization agent so Windows installs can reuse the same helper binary without a second installer.
@@ -94,7 +94,7 @@ The intended user flow is:
 
 - install the package from Microsoft Store,
 - open the packaged configuration app first,
-- define one or more `os-integration.exe` and `ironmesh-folder-agent.exe` instances,
+- define one or more `ironmesh-os-integration.exe` and `ironmesh-folder-agent.exe` instances,
 - let the packaged background launcher restart enabled instances after login.
 
 If additional Windows-only helpers are required later, they should either live in the same package or in a deliberately versioned packaged companion path. The first release should avoid splitting the Windows desktop product across multiple independently updating installers.
@@ -106,7 +106,7 @@ Package upgrades must not be the place where user state lives.
 Persist mutable state in the existing external locations instead:
 
 - `%LocalAppData%\Ironmesh\desktop-client-config\instances.json`
-  - persisted multi-instance definitions for packaged `os-integration.exe` and `ironmesh-folder-agent.exe` launches.
+  - persisted multi-instance definitions for packaged `ironmesh-os-integration.exe` and `ironmesh-folder-agent.exe` launches.
 - `%LocalAppData%\Ironmesh\desktop-client-config\last-launch-report.json`
   - last startup-task launch report recorded by the packaged background launcher.
 - `%LocalAppData%\Ironmesh\sync-roots\...`
@@ -356,7 +356,7 @@ The first production design should assume short downtime during upgrade is accep
 
 That means:
 
-- `os-integration.exe` should be able to shut down cleanly,
+- `ironmesh-os-integration.exe` should be able to shut down cleanly,
 - external state should be sufficient for reconnect on the next launch,
 - the host should not rely on in-memory-only registration state that would be lost during update.
 
@@ -401,7 +401,7 @@ The first implementation can be explicit and conservative. It does not need a co
 
 Not every update needs the same user interruption.
 
-- If only `os-integration.exe` changes and the packaged shell DLLs do not, restarting the host is sufficient.
+- If only `ironmesh-os-integration.exe` changes and the packaged shell DLLs do not, restarting the host is sufficient.
 - If any packaged shell COM DLL changes, Explorer restart guidance should be shown.
 
 That split gives us a better user experience than forcing the same restart guidance for every release.

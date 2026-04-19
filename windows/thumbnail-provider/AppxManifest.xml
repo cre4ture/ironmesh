@@ -55,7 +55,7 @@
     </Application>
     <Application
       Id="IronmeshOsIntegration"
-      Executable="os-integration.exe"
+      Executable="ironmesh-os-integration.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="IronMesh OS Integration"

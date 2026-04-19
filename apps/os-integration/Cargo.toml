@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 build = "build.rs"
+default-run = "ironmesh-os-integration"
+autobins = false
+
+[[bin]]
+name = "ironmesh-os-integration"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true

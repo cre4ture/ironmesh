@@ -45,10 +45,10 @@ These are the main release-surface candidates already visible in the repo and wo
 | Surface | Current state to verify | Why it matters |
 | --- | --- | --- |
 | CLI command name | `apps/cli-client` remains the Cargo package name, while the public binary and command name are `ironmesh` | Cargo/package naming can stay internal, but released executable naming must stay stable |
-| Service binary name | `server-node` is both package name and command name | Node automation and cluster tooling will depend on it |
-| Rendezvous service name | `rendezvous-service` is both package name and command name | Deployment and troubleshooting depend on it |
-| Desktop executable set | `ironmesh-config-app`, `ironmesh-background-launcher`, `os-integration`, `ironmesh-folder-agent` are treated as sibling packaged executables | Package layout and launcher behavior become user-visible contracts |
-| Filesystem integration naming | `os-integration` is the intended public wrapper while Linux FUSE and Windows CFAPI adapter names remain implementation details underneath it | Keeping one documented entrypoint avoids support and packaging drift |
+| Service binary name | `apps/server-node` remains the Cargo package name, while the public binary and command name are `ironmesh-server-node` | Node automation and cluster tooling will depend on it |
+| Rendezvous service name | `apps/rendezvous-service` remains the Cargo package name, while the public binary and command name are `ironmesh-rendezvous-service` | Deployment and troubleshooting depend on it |
+| Desktop executable set | `ironmesh-config-app`, `ironmesh-background-launcher`, `ironmesh-os-integration`, `ironmesh-folder-agent` are treated as sibling packaged executables | Package layout and launcher behavior become user-visible contracts |
+| Filesystem integration naming | `ironmesh-os-integration` is the intended public wrapper while Linux FUSE and Windows CFAPI adapter names remain implementation details underneath it | Keeping one documented entrypoint avoids support and packaging drift |
 | Windows startup task ID | `IronmeshBackgroundLauncher` is hard-coded | OS-level registration names are expensive to change later |
 | Desktop config path | Windows uses `%LOCALAPPDATA%\Ironmesh\desktop-client-config\instances.json`; Linux uses `$XDG_CONFIG_HOME/ironmesh/desktop-client-config/instances.json` and `$XDG_STATE_HOME/ironmesh/desktop-client-config/last-launch-report.json`, with migration from legacy uppercase XDG roots | Users, scripts, and packaged apps may start depending on these paths |
 | Sync-root local state path | Windows CFAPI uses `%LOCALAPPDATA%\Ironmesh\sync-roots\<label-hash>\...` for `connection-bootstrap.json`, `client-identity.json`, and `desktop-status.json` | This becomes a persistence and migration contract |

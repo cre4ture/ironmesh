@@ -74,7 +74,7 @@ just test-system-nightly-one tests::autonomous_peer_heartbeat_recovers_after_pee
 
 ## System-tests toolchain policy (nightly)
 
-`tests/system-tests` uses Cargo binary artifact dependencies to consume the `server-node` and `ironmesh` binaries directly during test runs.
+`tests/system-tests` uses Cargo binary artifact dependencies to consume the `ironmesh-server-node` and `ironmesh` binaries directly during test runs.
 
 Why this was chosen:
 
@@ -97,7 +97,7 @@ If you must run with stable for local work, use explicit binaries instead of art
 
 ```bash
 cargo build -p server-node -p cli-client
-IRONMESH_SERVER_BIN=target/debug/server-node \
+IRONMESH_SERVER_BIN=target/debug/ironmesh-server-node \
 IRONMESH_CLI_BIN=target/debug/ironmesh \
 cargo +stable test -p system-tests
 ```
@@ -119,7 +119,7 @@ Defaults:
 - Base port: `18080` (nodes on `18080..18083`)
 - Data + logs + pid files: `data/local-cluster/`
 
-For the newer rendezvous-plus-relay architecture, use the dedicated manual recipe in [docs/manual-rendezvous-relay-test.md](docs/manual-rendezvous-relay-test.md). The helper script does not yet start `rendezvous-service`. For local plain-HTTP rendezvous testing, the manual recipe now sets `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` explicitly because insecure startup is refused by default.
+For the newer rendezvous-plus-relay architecture, use the dedicated manual recipe in [docs/manual-rendezvous-relay-test.md](docs/manual-rendezvous-relay-test.md). The helper script does not yet start `ironmesh-rendezvous-service`. For local plain-HTTP rendezvous testing, the manual recipe now sets `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` explicitly because insecure startup is refused by default.
 
 Optional overrides:
 
@@ -191,7 +191,7 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ## Linux FUSE mount
 
-The Linux entrypoint is `os-integration`. The mountpoint directory must already exist, and in practice it should be empty before mounting.
+The Linux entrypoint is `ironmesh-os-integration`. The mountpoint directory must already exist, and in practice it should be empty before mounting.
 
 Direct server mode:
 
@@ -207,7 +207,7 @@ Notes:
 
 - Live mounts now require client auth when the server protects `/store/*` APIs. In direct mode,
   pass `--client-identity-file`.
-- In bootstrap mode, `os-integration` auto-loads a sibling
+- In bootstrap mode, `ironmesh-os-integration` auto-loads a sibling
   `bootstrap.client-identity.json` when present.
 - `--remote-refresh-interval-ms` controls fallback polling/retry cadence for namespace updates in live modes.
 - Snapshot mode is still available for debugging with `--snapshot-file`.

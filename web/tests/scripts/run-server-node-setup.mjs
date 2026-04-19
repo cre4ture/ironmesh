@@ -8,7 +8,7 @@ const binaryPath = resolve(
   repoRoot,
   "target",
   "debug",
-  process.platform === "win32" ? "server-node.exe" : "server-node"
+  process.platform === "win32" ? "ironmesh-server-node.exe" : "ironmesh-server-node"
 );
 
 rmSync(dataDir, { recursive: true, force: true });

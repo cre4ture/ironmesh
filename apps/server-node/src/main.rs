@@ -12,7 +12,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 );
 
 #[derive(Debug, Parser)]
-#[command(name = "server-node")]
+#[command(name = "ironmesh-server-node")]
 #[command(about = "Ironmesh server node")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]

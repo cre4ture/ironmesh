@@ -23,7 +23,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 );
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Parser)]
-#[command(name = "rendezvous-service")]
+#[command(name = "ironmesh-rendezvous-service")]
 #[command(about = "Standalone Ironmesh rendezvous plus relay service")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
@@ -178,7 +178,7 @@ impl RendezvousServiceConfig {
         }
 
         anyhow::bail!(
-            "rendezvous-service refuses insecure HTTP startup without mTLS; configure IRONMESH_RENDEZVOUS_CLIENT_CA_CERT plus IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY, or use a failover package with IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE and IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE, or set IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true for local development/testing only"
+            "ironmesh-rendezvous-service refuses insecure HTTP startup without mTLS; configure IRONMESH_RENDEZVOUS_CLIENT_CA_CERT plus IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY, or use a failover package with IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE and IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE, or set IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true for local development/testing only"
         )
     }
 
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn cli_config_parses_failover_args() {
         let cli = RendezvousServiceCliConfig::try_parse_from([
-            "rendezvous-service",
+            "ironmesh-rendezvous-service",
             "--failover-package",
             "/tmp/failover.json",
             "--failover-passphrase=swordfish",

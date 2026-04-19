@@ -1312,14 +1312,14 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     }
 
     let artifact_path = match name {
-        "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_server-node"),
+        "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_ironmesh-server-node"),
         "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_ironmesh"),
-        "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_os-integration"),
+        "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_ironmesh-os-integration"),
         "ironmesh-folder-agent" => {
             option_env!("CARGO_BIN_FILE_IRONMESH_FOLDER_AGENT_ironmesh-folder-agent")
         }
         "rendezvous-service" => {
-            option_env!("CARGO_BIN_FILE_RENDEZVOUS_SERVICE_rendezvous-service")
+            option_env!("CARGO_BIN_FILE_RENDEZVOUS_SERVICE_ironmesh-rendezvous-service")
         }
         _ => None,
     };
@@ -1330,7 +1330,10 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
 
     let workspace_root = workspace_root()?;
     let executable_name = match name {
+        "server-node" => "ironmesh-server-node",
         "cli-client" => "ironmesh",
+        "os-integration" => "ironmesh-os-integration",
+        "rendezvous-service" => "ironmesh-rendezvous-service",
         _ => name,
     };
     let path = workspace_root

@@ -52,7 +52,7 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
   await expect(page.locator("pre").filter({ hasText: "rendezvous.example:9443" }).first()).toBeVisible();
   await expect(page.getByText("Export rendezvous-only failover package")).toBeVisible();
-  await expect(page.getByText("Dedicated standalone rendezvous-service")).toBeVisible();
+  await expect(page.getByText("Dedicated standalone ironmesh-rendezvous-service")).toBeVisible();
 
   await page.getByText("Setup", { exact: true }).click();
   await expect(page.getByText("Bootstrap setup APIs are not active on this node")).toBeVisible();
