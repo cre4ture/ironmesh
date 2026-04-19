@@ -348,9 +348,9 @@ mod tests {
                 && let Ok(response) = response.error_for_status()
                 && let Ok(index) = response.json::<serde_json::Value>().await
                 && let Some(entries) = index.get("entries").and_then(|value| value.as_array())
-                && let Some(entry) = entries.iter().find(|entry| {
-                    entry.get("path").and_then(|value| value.as_str()) == Some(key)
-                })
+                && let Some(entry) = entries
+                    .iter()
+                    .find(|entry| entry.get("path").and_then(|value| value.as_str()) == Some(key))
                 && predicate(entry)
             {
                 return Ok(entry.clone());
