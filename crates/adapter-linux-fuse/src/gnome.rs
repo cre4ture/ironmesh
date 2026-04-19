@@ -2,13 +2,13 @@
 
 use anyhow::Result;
 use client_sdk::IronMeshClient;
-pub use desktop_status::{
-    GNOME_EXTENSION_UUID, GnomeExtensionInstallOutcome, default_remote_status_poll_interval_ms,
-    derive_profile_label,
-};
 use desktop_status::{
     DesktopStatusPublisher, DesktopStatusPublisherOptions, StatusFacet,
     default_gnome_status_file_path, install_gnome_extension_from, spawn_remote_status_thread,
+};
+pub use desktop_status::{
+    GNOME_EXTENSION_UUID, GnomeExtensionInstallOutcome, default_remote_status_poll_interval_ms,
+    derive_profile_label,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,12 +31,14 @@ pub struct GnomeStatusRuntime {
 
 impl GnomeStatusRuntime {
     pub fn start(options: &GnomeStatusOptions, client: Option<IronMeshClient>) -> Result<Self> {
-        let publisher = Arc::new(DesktopStatusPublisher::new(&DesktopStatusPublisherOptions {
-            profile_label: options.profile_label.clone(),
-            root_dir: options.root_dir.clone(),
-            connection_target: options.connection_target.clone(),
-            status_file: options.status_file.clone(),
-        })?);
+        let publisher = Arc::new(DesktopStatusPublisher::new(
+            &DesktopStatusPublisherOptions {
+                profile_label: options.profile_label.clone(),
+                root_dir: options.root_dir.clone(),
+                connection_target: options.connection_target.clone(),
+                status_file: options.status_file.clone(),
+            },
+        )?);
         let running = Arc::new(AtomicBool::new(true));
         let remote_thread = match client {
             Some(client) => Some(spawn_remote_status_thread(
@@ -70,12 +72,10 @@ impl GnomeStatusRuntime {
 
     pub fn shutdown(self) {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(remote_thread) = self.remote_thread {
-            if let Err(error) = remote_thread.join() {
-                tracing::warn!(
-                    "gnome-status: Linux FUSE remote status thread join failed: {error:?}"
-                );
-            }
+        if let Some(remote_thread) = self.remote_thread
+            && let Err(error) = remote_thread.join()
+        {
+            tracing::warn!("gnome-status: Linux FUSE remote status thread join failed: {error:?}");
         }
         if let Err(error) = self.publisher.persist() {
             tracing::warn!("gnome-status: Linux FUSE final persist failed: {error:#}");

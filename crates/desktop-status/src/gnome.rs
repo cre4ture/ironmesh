@@ -181,7 +181,10 @@ fn queue_extension_for_next_login(uuid: &str) -> Result<QueueExtensionResult> {
 fn parse_enabled_extensions_value(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
     let trimmed = trimmed.strip_prefix("@as ").unwrap_or(trimmed);
-    let Some(inner) = trimmed.strip_prefix('[').and_then(|value| value.strip_suffix(']')) else {
+    let Some(inner) = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
         return Vec::new();
     };
 
@@ -276,7 +279,9 @@ mod tests {
     #[test]
     fn parse_enabled_extensions_supports_plain_arrays() {
         assert_eq!(
-            parse_enabled_extensions_value("['ding@rastersoft.com', 'ironmesh-status@ironmesh.io']"),
+            parse_enabled_extensions_value(
+                "['ding@rastersoft.com', 'ironmesh-status@ironmesh.io']"
+            ),
             vec![
                 "ding@rastersoft.com".to_string(),
                 "ironmesh-status@ironmesh.io".to_string(),

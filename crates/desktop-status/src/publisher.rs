@@ -1,7 +1,6 @@
 use crate::{
-    DesktopStatusDocument, RemoteStatusUpdate, StatusFacet, StatusSnapshot,
-    build_status_document, poll_remote_status, sleep_with_stop, starting_snapshot,
-    write_status_document,
+    DesktopStatusDocument, RemoteStatusUpdate, StatusFacet, StatusSnapshot, build_status_document,
+    poll_remote_status, sleep_with_stop, starting_snapshot, write_status_document,
 };
 use anyhow::{Context, Result, anyhow};
 use client_sdk::IronMeshClient;

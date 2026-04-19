@@ -83,8 +83,9 @@ pub fn resolve_conflict_action(
             })
         }
         ConflictResolutionStrategy::KeepRemote => {
-            let connection_target = describe_connection_target(server_base_url, client_bootstrap_json)
-                .context("failed to resolve connection target for conflict resolution")?;
+            let connection_target =
+                describe_connection_target(server_base_url, client_bootstrap_json)
+                    .context("failed to resolve connection target for conflict resolution")?;
             let modification_log_store = ModificationLogStore::from_state_store(
                 state_store,
                 root_dir,
@@ -244,8 +245,9 @@ pub fn upload_local_file(
 
     let result = client.put_file_resumable(remote_key.clone(), &absolute, &state_path);
     if let Err(error) = result {
-        let error = error
-            .context(format!("failed to upload local file {relative_path} to {remote_key}"));
+        let error = error.context(format!(
+            "failed to upload local file {relative_path} to {remote_key}"
+        ));
         try_record_modification(
             modification_log,
             modification_context,
@@ -332,8 +334,10 @@ pub fn remove_local_path(
         Ok(metadata) => {
             if metadata.is_dir() {
                 if let Err(error) = fs::remove_dir_all(&absolute) {
-                    let error = anyhow::Error::from(error)
-                        .context(format!("failed to remove local directory {}", absolute.display()));
+                    let error = anyhow::Error::from(error).context(format!(
+                        "failed to remove local directory {}",
+                        absolute.display()
+                    ));
                     try_record_modification(
                         modification_log,
                         modification_context,
@@ -349,8 +353,10 @@ pub fn remove_local_path(
                 }
             } else {
                 if let Err(error) = fs::remove_file(&absolute) {
-                    let error = anyhow::Error::from(error)
-                        .context(format!("failed to remove local file {}", absolute.display()));
+                    let error = anyhow::Error::from(error).context(format!(
+                        "failed to remove local file {}",
+                        absolute.display()
+                    ));
                     try_record_modification(
                         modification_log,
                         modification_context,
@@ -389,8 +395,12 @@ pub fn remove_local_path(
 }
 
 fn file_content_hash(path: &Path) -> Result<String> {
-    file_content_fingerprint(path)
-        .with_context(|| format!("failed to compute local content fingerprint {}", path.display()))
+    file_content_fingerprint(path).with_context(|| {
+        format!(
+            "failed to compute local content fingerprint {}",
+            path.display()
+        )
+    })
 }
 
 fn preserve_local_conflict_copy(

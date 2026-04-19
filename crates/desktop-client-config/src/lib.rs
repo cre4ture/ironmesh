@@ -78,7 +78,8 @@ impl ManagedInstanceStore {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         ensure_parent_dir(path)?;
-        let payload = serde_json::to_vec_pretty(self).context("failed serializing managed instance store")?;
+        let payload =
+            serde_json::to_vec_pretty(self).context("failed serializing managed instance store")?;
         fs::write(path, payload)
             .with_context(|| format!("failed writing managed instance store {}", path.display()))
     }
@@ -111,13 +112,15 @@ impl ManagedInstanceStore {
 
     pub fn remove_os_integration(&mut self, id: &str) -> bool {
         let initial_len = self.os_integration_instances.len();
-        self.os_integration_instances.retain(|candidate| candidate.id != id);
+        self.os_integration_instances
+            .retain(|candidate| candidate.id != id);
         initial_len != self.os_integration_instances.len()
     }
 
     pub fn remove_folder_agent(&mut self, id: &str) -> bool {
         let initial_len = self.folder_agent_instances.len();
-        self.folder_agent_instances.retain(|candidate| candidate.id != id);
+        self.folder_agent_instances
+            .retain(|candidate| candidate.id != id);
         initial_len != self.folder_agent_instances.len()
     }
 
@@ -186,7 +189,9 @@ pub struct OsIntegrationInstance {
 impl OsIntegrationInstance {
     pub fn validate(&self) -> Result<()> {
         if !OS_INTEGRATION_MANAGEMENT_SUPPORTED {
-            bail!("os-integration instances are only managed by this config surface on Windows and Linux");
+            bail!(
+                "os-integration instances are only managed by this config surface on Windows and Linux"
+            );
         }
         if self.id.trim().is_empty() {
             bail!("os-integration instance id must not be empty");
@@ -200,8 +205,16 @@ impl OsIntegrationInstance {
 
         #[cfg(windows)]
         {
-            let sync_root_id = self.sync_root_id.as_deref().map(str::trim).unwrap_or_default();
-            let display_name = self.display_name.as_deref().map(str::trim).unwrap_or_default();
+            let sync_root_id = self
+                .sync_root_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            let display_name = self
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
             if sync_root_id.is_empty() {
                 bail!("os-integration sync_root_id must not be empty");
             }
@@ -212,9 +225,21 @@ impl OsIntegrationInstance {
 
         #[cfg(target_os = "linux")]
         {
-            let snapshot_file = self.snapshot_file.as_deref().map(str::trim).filter(|value| !value.is_empty());
-            let server_base_url = self.server_base_url.as_deref().map(str::trim).filter(|value| !value.is_empty());
-            let bootstrap_file = self.bootstrap_file.as_deref().map(str::trim).filter(|value| !value.is_empty());
+            let snapshot_file = self
+                .snapshot_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let server_base_url = self
+                .server_base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let bootstrap_file = self
+                .bootstrap_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
 
             if snapshot_file.is_some() && (server_base_url.is_some() || bootstrap_file.is_some()) {
                 bail!(
@@ -257,15 +282,27 @@ impl OsIntegrationInstance {
                 self.root_path.clone(),
             ];
 
-            push_optional_arg(&mut args, "--server-base-url", self.server_base_url.as_deref());
+            push_optional_arg(
+                &mut args,
+                "--server-base-url",
+                self.server_base_url.as_deref(),
+            );
             push_optional_arg(&mut args, "--prefix", self.prefix.as_deref());
-            push_optional_arg(&mut args, "--bootstrap-file", self.bootstrap_file.as_deref());
+            push_optional_arg(
+                &mut args,
+                "--bootstrap-file",
+                self.bootstrap_file.as_deref(),
+            );
             push_optional_arg(
                 &mut args,
                 "--client-identity-file",
                 self.client_identity_file.as_deref(),
             );
-            push_optional_arg(&mut args, "--server-ca-cert", self.server_ca_path.as_deref());
+            push_optional_arg(
+                &mut args,
+                "--server-ca-cert",
+                self.server_ca_path.as_deref(),
+            );
 
             args
         }
@@ -275,9 +312,21 @@ impl OsIntegrationInstance {
             let mut args = vec!["--mountpoint".to_string(), self.root_path.clone()];
 
             push_optional_arg(&mut args, "--snapshot-file", self.snapshot_file.as_deref());
-            push_optional_arg(&mut args, "--server-base-url", self.server_base_url.as_deref());
-            push_optional_arg(&mut args, "--bootstrap-file", self.bootstrap_file.as_deref());
-            push_optional_arg(&mut args, "--server-ca-pem-file", self.server_ca_path.as_deref());
+            push_optional_arg(
+                &mut args,
+                "--server-base-url",
+                self.server_base_url.as_deref(),
+            );
+            push_optional_arg(
+                &mut args,
+                "--bootstrap-file",
+                self.bootstrap_file.as_deref(),
+            );
+            push_optional_arg(
+                &mut args,
+                "--server-ca-pem-file",
+                self.server_ca_path.as_deref(),
+            );
             push_optional_arg(
                 &mut args,
                 "--client-identity-file",
@@ -290,7 +339,11 @@ impl OsIntegrationInstance {
             );
             push_optional_arg(&mut args, "--prefix", self.prefix.as_deref());
             push_optional_arg(&mut args, "--fs-name", self.fs_name.as_deref());
-            push_optional_arg(&mut args, "--gnome-status-file", self.gnome_status_file.as_deref());
+            push_optional_arg(
+                &mut args,
+                "--gnome-status-file",
+                self.gnome_status_file.as_deref(),
+            );
             push_optional_u64(
                 &mut args,
                 "--remote-refresh-interval-ms",
@@ -364,9 +417,21 @@ impl FolderAgentInstance {
     pub fn command_args(&self) -> Vec<String> {
         let mut args = vec!["--root-dir".to_string(), self.root_dir.clone()];
 
-        push_optional_arg(&mut args, "--state-root-dir", self.state_root_dir.as_deref());
-        push_optional_arg(&mut args, "--server-base-url", self.server_base_url.as_deref());
-        push_optional_arg(&mut args, "--bootstrap-file", self.bootstrap_file.as_deref());
+        push_optional_arg(
+            &mut args,
+            "--state-root-dir",
+            self.state_root_dir.as_deref(),
+        );
+        push_optional_arg(
+            &mut args,
+            "--server-base-url",
+            self.server_base_url.as_deref(),
+        );
+        push_optional_arg(
+            &mut args,
+            "--bootstrap-file",
+            self.bootstrap_file.as_deref(),
+        );
         push_optional_arg(
             &mut args,
             "--server-ca-pem-file",
@@ -449,10 +514,7 @@ pub fn migrate_legacy_state_paths() -> Result<()> {
             &legacy_instance_store_path(),
             &default_instance_store_path(),
         )?;
-        migrate_legacy_windows_file(
-            &legacy_launch_report_path(),
-            &default_launch_report_path(),
-        )?;
+        migrate_legacy_windows_file(&legacy_launch_report_path(), &default_launch_report_path())?;
     }
 
     Ok(())

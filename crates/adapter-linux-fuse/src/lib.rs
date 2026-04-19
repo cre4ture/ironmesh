@@ -2008,7 +2008,7 @@ pub mod runtime {
             reply.entry(&TTL, &child.attr(self.uid, self.gid), 0);
         }
 
-        fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
             self.drain_remote_updates();
 
             let Some(node) = self.nodes.get(&ino) else {

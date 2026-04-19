@@ -250,11 +250,9 @@ fn folder_sync_modification_history_json(
     let normalized_prefix = normalize_optional_string(prefix);
     let (server_base_url, client_bootstrap_json) =
         split_connection_input(normalized_connection_input)?;
-    let connection_target = describe_connection_target(
-        server_base_url.as_deref(),
-        client_bootstrap_json.as_deref(),
-    )
-    .context("failed to derive connection target for folder sync modification history")?;
+    let connection_target =
+        describe_connection_target(server_base_url.as_deref(), client_bootstrap_json.as_deref())
+            .context("failed to derive connection target for folder sync modification history")?;
     let scope = PathScope::new(normalized_prefix);
     let local_folder_path = PathBuf::from(local_folder);
     let identity_root = normalized_local_tree_uri
@@ -1679,7 +1677,9 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
             Some("download") => Some(ModificationOperation::Download),
             Some("delete-local") => Some(ModificationOperation::DeleteLocal),
             Some("delete-remote") => Some(ModificationOperation::DeleteRemote),
-            Some(other) => anyhow::bail!("unsupported modification history operation filter {other}"),
+            Some(other) => {
+                anyhow::bail!("unsupported modification history operation filter {other}")
+            }
             None => None,
         };
         folder_sync_modification_history_json(

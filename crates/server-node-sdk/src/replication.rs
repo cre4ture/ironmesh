@@ -1075,6 +1075,7 @@ fn accumulate_repair_report(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_repair_skipped_detail(
     skipped_details: &mut Vec<ReplicationRepairSkippedItem>,
     report_node_id: NodeId,
@@ -1121,7 +1122,7 @@ fn should_log_repair_chunk_progress(chunk_index: usize, chunk_count: usize) -> b
     chunk_count <= 4
         || chunk_index == 1
         || chunk_index == chunk_count
-        || chunk_index % REPAIR_PROGRESS_CHUNK_LOG_INTERVAL == 0
+        || chunk_index.is_multiple_of(REPAIR_PROGRESS_CHUNK_LOG_INTERVAL)
 }
 
 async fn pull_bundle_from_source(

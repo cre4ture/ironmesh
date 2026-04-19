@@ -24,9 +24,7 @@ use crate::hydration_control::{is_active_hydration_marked, request_hydration_can
 use crate::live::ServerNodeHydrator;
 use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
-use crate::placeholder_metadata::{
-    RemoteDeleteReconcileReport, reconcile_remote_delete_state,
-};
+use crate::placeholder_metadata::{RemoteDeleteReconcileReport, reconcile_remote_delete_state};
 use crate::runtime::{
     CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
     reconcile_sync_states, register_sync_root, unregister_sync_root,

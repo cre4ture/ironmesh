@@ -15,8 +15,8 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use sync_agent_core::{
-    FolderAgentLocalBackend, FolderAgentRuntimeOptions, FolderAgentStatusCallback,
-    LocalEntryKind, LocalEntryState, LocalTreeScanProgress, LocalTreeState, PathScope,
+    FolderAgentLocalBackend, FolderAgentRuntimeOptions, FolderAgentStatusCallback, LocalEntryKind,
+    LocalEntryState, LocalTreeScanProgress, LocalTreeState, PathScope,
     run_folder_agent_with_backend_control,
 };
 
@@ -349,8 +349,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
                     };
 
                     let enough_entries = progress.scanned_entry_count
-                        >= last_reported_entry_count
-                            .saturating_add(SAF_SCAN_PROGRESS_ENTRY_STRIDE);
+                        >= last_reported_entry_count.saturating_add(SAF_SCAN_PROGRESS_ENTRY_STRIDE);
                     let enough_time = last_reported_at.elapsed() >= SAF_SCAN_PROGRESS_INTERVAL;
                     if !enough_entries && !enough_time && progress.pending_directory_count != 0 {
                         continue;
@@ -789,15 +788,12 @@ fn saf_file_content_fingerprint(tree_uri: &str, relative_path: &str) -> Result<S
     with_bridge_env(|env, class| {
         let input_stream = open_tree_input_stream(env, &class, tree_uri, relative_path)?;
         let mut reader = JavaInputStreamReader::new(env, input_stream)?;
-        let mut fingerprinting_reader =
-            FingerprintingReader::new(&mut reader, entry.size_bytes);
+        let mut fingerprinting_reader = FingerprintingReader::new(&mut reader, entry.size_bytes);
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let read = fingerprinting_reader
-                .read(&mut buffer)
-                .with_context(|| {
-                    format!("failed to read SAF file for fingerprinting {relative_path}")
-                })?;
+            let read = fingerprinting_reader.read(&mut buffer).with_context(|| {
+                format!("failed to read SAF file for fingerprinting {relative_path}")
+            })?;
             if read == 0 {
                 break;
             }
@@ -819,9 +815,9 @@ fn download_remote_file_to_saf(
         client
             .download_to_writer_resumable_staged(remote_key, None, None, &mut writer, &staging_root)
             .with_context(|| format!("failed to download remote file {remote_key}"))?;
-        writer
-            .flush()
-            .with_context(|| format!("failed to flush downloaded SAF file {local_relative_path}"))?;
+        writer.flush().with_context(|| {
+            format!("failed to flush downloaded SAF file {local_relative_path}")
+        })?;
         Ok(())
     })
 }

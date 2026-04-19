@@ -306,8 +306,7 @@ fn path_hydrated_frontier(path: &Path) -> Option<u64> {
     Some(info.OnDiskDataSize.max(info.ValidatedDataSize).max(0) as u64)
 }
 
-const MAX_OPTIONAL_FETCH_TRANSFER_LENGTH_BYTES: u64 =
-    RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES as u64 * 2;
+const MAX_OPTIONAL_FETCH_TRANSFER_LENGTH_BYTES: u64 = RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES as u64 * 2;
 
 fn requested_range_end(range: RequestedRange) -> u64 {
     range.offset.saturating_add(range.length)
@@ -1911,11 +1910,8 @@ pub(crate) fn handle_callback_fetch_data(
         offset: fetch_data.optional_file_offset.max(0) as u64,
         length: fetch_data.optional_length.max(0) as u64,
     };
-    let transfer_range = select_fetch_data_transfer_range(
-        required_range,
-        optional_range,
-        fetch_data.flags,
-    );
+    let transfer_range =
+        select_fetch_data_transfer_range(required_range, optional_range, fetch_data.flags);
     let mut failure_info = Some(ExecuteTransferDataFailureInfo {
         range: required_range,
         completion_status: STATUS_CLOUD_FILE_UNSUCCESSFUL,
@@ -2705,9 +2701,8 @@ mod tests {
     #[test]
     fn apply_action_plan_creates_remote_placeholder_with_in_sync_baseline() {
         let unique = uuid::Uuid::new_v4();
-        let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-apply-action-plan-placeholder-{unique}"
-        ));
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-apply-action-plan-placeholder-{unique}"));
         let _guard = TestSyncRootGuard::new(sync_root.clone());
         let registration = SyncRootRegistration::new(
             format!("test-sync-root-{unique}"),
@@ -2745,14 +2740,17 @@ mod tests {
         let decoded = decode_placeholder_file_identity(info.file_identity())
             .expect("created placeholder identity should decode");
 
-        assert_eq!(decoded.remote_content_fingerprint.as_deref(), Some("cfp-remote-movie"));
+        assert_eq!(
+            decoded.remote_content_fingerprint.as_deref(),
+            Some("cfp-remote-movie")
+        );
         assert_eq!(
             decoded.in_sync_content_fingerprint.as_deref(),
             Some("cfp-remote-movie")
         );
 
-        let encoded = std::str::from_utf8(info.file_identity())
-            .expect("placeholder identity should be utf8");
+        let encoded =
+            std::str::from_utf8(info.file_identity()).expect("placeholder identity should be utf8");
         assert!(encoded.lines().any(|line| line == "if=cfp-remote-movie"));
         assert!(encoded.lines().any(|line| line == "cf=cfp-remote-movie"));
     }

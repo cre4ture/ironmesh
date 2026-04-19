@@ -255,7 +255,7 @@ where
         let processed_entry_count = (index + 1) as u64;
         if processed_entry_count == 1
             || processed_entry_count == total_entries
-            || processed_entry_count % SNAPSHOT_BUILD_PROGRESS_STRIDE == 0
+            || processed_entry_count.is_multiple_of(SNAPSHOT_BUILD_PROGRESS_STRIDE)
         {
             on_progress(RemoteSnapshotFetchProgress {
                 phase: "building-snapshot".to_string(),

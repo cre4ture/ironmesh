@@ -647,17 +647,17 @@ impl SyncRootMonitor {
                     metadata.len(),
                 ) {
                     Ok(receipt) => {
-                                if let Some(in_sync_content_fingerprint) =
-                                    receipt.in_sync_content_fingerprint.as_deref()
-                                    && let Err(err) = record_in_sync_content_baseline(
+                        if let Some(in_sync_content_fingerprint) =
+                            receipt.in_sync_content_fingerprint.as_deref()
+                            && let Err(err) = record_in_sync_content_baseline(
                                 &self.sync_root,
                                 &rel_path,
                                 self.provider_instance_id,
-                                        in_sync_content_fingerprint,
+                                in_sync_content_fingerprint,
                             )
                         {
                             tracing::info!(
-                                        "{}: failed to record in-sync content baseline for {}: {:#}",
+                                "{}: failed to record in-sync content baseline for {}: {:#}",
                                 self.name,
                                 rel_path,
                                 err

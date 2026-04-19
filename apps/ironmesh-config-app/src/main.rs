@@ -2,12 +2,19 @@
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use desktop_client_config::{
+    FolderAgentInstance, LaunchReport, ManagedInstanceStore, OS_INTEGRATION_MANAGEMENT_SUPPORTED,
+    OsIntegrationInstance, PLATFORM_KIND, STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE,
+    STARTUP_INTEGRATION_VALUE, default_instance_store_path, default_launch_report_path,
+    generate_instance_id, launch_enabled_instances, load_last_launch_report,
+    migrate_legacy_state_paths, package_root_from_current_exe, save_launch_report,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -15,14 +22,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
-use desktop_client_config::{
-    FolderAgentInstance, LaunchReport, ManagedInstanceStore, OsIntegrationInstance,
-    OS_INTEGRATION_MANAGEMENT_SUPPORTED, PLATFORM_KIND, STARTUP_INTEGRATION_LABEL,
-    STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE, default_instance_store_path,
-    default_launch_report_path, generate_instance_id, launch_enabled_instances,
-    load_last_launch_report, migrate_legacy_state_paths, package_root_from_current_exe,
-    save_launch_report,
-};
 
 #[derive(Debug, Parser)]
 #[command(name = "ironmesh-config-app")]
@@ -84,7 +83,10 @@ struct UpsertOsIntegrationInstanceRequest {
 }
 
 impl UpsertOsIntegrationInstanceRequest {
-    fn into_instance(self, _existing: Option<&OsIntegrationInstance>) -> Result<OsIntegrationInstance, ApiError> {
+    fn into_instance(
+        self,
+        _existing: Option<&OsIntegrationInstance>,
+    ) -> Result<OsIntegrationInstance, ApiError> {
         let instance = OsIntegrationInstance {
             id: normalize_optional_string(self.id)
                 .unwrap_or_else(|| generate_instance_id("os-integration")),
@@ -145,7 +147,10 @@ struct UpsertFolderAgentInstanceRequest {
 }
 
 impl UpsertFolderAgentInstanceRequest {
-  fn into_instance(self, existing: Option<&FolderAgentInstance>) -> Result<FolderAgentInstance, ApiError> {
+    fn into_instance(
+        self,
+        existing: Option<&FolderAgentInstance>,
+    ) -> Result<FolderAgentInstance, ApiError> {
         let instance = FolderAgentInstance {
             id: normalize_optional_string(self.id)
                 .unwrap_or_else(|| generate_instance_id("folder-agent")),
@@ -154,17 +159,17 @@ impl UpsertFolderAgentInstanceRequest {
             root_dir: required_field("root_dir", self.root_dir)?,
             state_root_dir: normalize_optional_string(self.state_root_dir),
             server_base_url: resolve_hidden_optional_string(
-              self.server_base_url,
-              existing.and_then(|candidate| candidate.server_base_url.as_deref()),
+                self.server_base_url,
+                existing.and_then(|candidate| candidate.server_base_url.as_deref()),
             ),
             bootstrap_file: normalize_optional_string(self.bootstrap_file),
             server_ca_pem_file: resolve_hidden_optional_string(
-              self.server_ca_pem_file,
-              existing.and_then(|candidate| candidate.server_ca_pem_file.as_deref()),
+                self.server_ca_pem_file,
+                existing.and_then(|candidate| candidate.server_ca_pem_file.as_deref()),
             ),
             client_identity_file: resolve_hidden_optional_string(
-              self.client_identity_file,
-              existing.and_then(|candidate| candidate.client_identity_file.as_deref()),
+                self.client_identity_file,
+                existing.and_then(|candidate| candidate.client_identity_file.as_deref()),
             ),
             prefix: normalize_optional_string(self.prefix),
             ui_bind: normalize_optional_string(self.ui_bind),
@@ -172,8 +177,8 @@ impl UpsertFolderAgentInstanceRequest {
             no_watch_local: self.no_watch_local,
         };
         instance
-          .validate()
-          .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            .validate()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
         Ok(instance)
     }
 }
@@ -211,7 +216,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let bind_addr: SocketAddr = cli.bind.parse().context("failed parsing --bind address")?;
     let package_root = package_root_from_current_exe()?;
-  migrate_legacy_state_paths()?;
+    migrate_legacy_state_paths()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let state = AppState {
         instance_store_path: default_instance_store_path(),
@@ -225,8 +230,14 @@ async fn main() -> Result<()> {
         .route("/app.css", get(app_css))
         .route("/app.js", get(app_js))
         .route("/api/config", get(get_config))
-        .route("/api/os-integration-instances", post(upsert_os_integration_instance))
-        .route("/api/folder-agent-instances", post(upsert_folder_agent_instance))
+        .route(
+            "/api/os-integration-instances",
+            post(upsert_os_integration_instance),
+        )
+        .route(
+            "/api/folder-agent-instances",
+            post(upsert_folder_agent_instance),
+        )
         .route(
             "/api/os-integration-instances/{id}",
             delete(delete_os_integration_instance),
@@ -242,7 +253,9 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .context("failed binding config UI listener")?;
-    let local_addr = listener.local_addr().context("failed reading local listener address")?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed reading local listener address")?;
     let local_url = format!("http://127.0.0.1:{}/", local_addr.port());
 
     if !cli.no_browser {
@@ -268,7 +281,10 @@ async fn app_css() -> impl IntoResponse {
 }
 
 async fn app_js() -> impl IntoResponse {
-    ([(CONTENT_TYPE, "application/javascript; charset=utf-8")], APP_JS)
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        APP_JS,
+    )
 }
 
 async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, ApiError> {
@@ -282,22 +298,25 @@ async fn upsert_os_integration_instance(
 ) -> Result<Json<ConfigResponse>, ApiError> {
     let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
         .map_err(ApiError::internal)?;
-  let existing = request
-    .id
-    .as_deref()
-    .map(str::trim)
-    .filter(|id| !id.is_empty())
-    .and_then(|id| {
-      store
-        .os_integration_instances
-        .iter()
-        .find(|candidate| candidate.id == id)
-    });
-  let instance = request.into_instance(existing)?;
+    let existing = request
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .and_then(|id| {
+            store
+                .os_integration_instances
+                .iter()
+                .find(|candidate| candidate.id == id)
+        });
+    let instance = request.into_instance(existing)?;
     store.upsert_os_integration(instance);
-    store.save(&state.instance_store_path)
+    store
+        .save(&state.instance_store_path)
         .map_err(ApiError::internal)?;
-    Ok(Json(load_config_response(&state).map_err(ApiError::internal)?))
+    Ok(Json(
+        load_config_response(&state).map_err(ApiError::internal)?,
+    ))
 }
 
 async fn upsert_folder_agent_instance(
@@ -306,22 +325,25 @@ async fn upsert_folder_agent_instance(
 ) -> Result<Json<ConfigResponse>, ApiError> {
     let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
         .map_err(ApiError::internal)?;
-  let existing = request
-    .id
-    .as_deref()
-    .map(str::trim)
-    .filter(|id| !id.is_empty())
-    .and_then(|id| {
-      store
-        .folder_agent_instances
-        .iter()
-        .find(|candidate| candidate.id == id)
-    });
-  let instance = request.into_instance(existing)?;
+    let existing = request
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .and_then(|id| {
+            store
+                .folder_agent_instances
+                .iter()
+                .find(|candidate| candidate.id == id)
+        });
+    let instance = request.into_instance(existing)?;
     store.upsert_folder_agent(instance);
-    store.save(&state.instance_store_path)
+    store
+        .save(&state.instance_store_path)
         .map_err(ApiError::internal)?;
-    Ok(Json(load_config_response(&state).map_err(ApiError::internal)?))
+    Ok(Json(
+        load_config_response(&state).map_err(ApiError::internal)?,
+    ))
 }
 
 async fn delete_os_integration_instance(
@@ -336,9 +358,12 @@ async fn delete_os_integration_instance(
             id
         )));
     }
-    store.save(&state.instance_store_path)
+    store
+        .save(&state.instance_store_path)
         .map_err(ApiError::internal)?;
-    Ok(Json(load_config_response(&state).map_err(ApiError::internal)?))
+    Ok(Json(
+        load_config_response(&state).map_err(ApiError::internal)?,
+    ))
 }
 
 async fn delete_folder_agent_instance(
@@ -353,14 +378,15 @@ async fn delete_folder_agent_instance(
             id
         )));
     }
-    store.save(&state.instance_store_path)
+    store
+        .save(&state.instance_store_path)
         .map_err(ApiError::internal)?;
-    Ok(Json(load_config_response(&state).map_err(ApiError::internal)?))
+    Ok(Json(
+        load_config_response(&state).map_err(ApiError::internal)?,
+    ))
 }
 
-async fn launch_enabled_now(
-    State(state): State<AppState>,
-) -> Result<Json<LaunchReport>, ApiError> {
+async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<LaunchReport>, ApiError> {
     let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
         .map_err(ApiError::internal)?;
     let report = launch_enabled_instances(&store, &state.package_root);
@@ -381,14 +407,14 @@ fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
     let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)?;
     let last_launch_report = load_last_launch_report(&state.launch_report_path)?;
     Ok(ConfigResponse {
-    platform: PLATFORM_KIND,
-    supports_os_integration: OS_INTEGRATION_MANAGEMENT_SUPPORTED,
+        platform: PLATFORM_KIND,
+        supports_os_integration: OS_INTEGRATION_MANAGEMENT_SUPPORTED,
         config_path: state.instance_store_path.display().to_string(),
         launch_report_path: state.launch_report_path.display().to_string(),
         package_root: state.package_root.display().to_string(),
-    startup_integration_label: STARTUP_INTEGRATION_LABEL,
-    startup_integration_value: STARTUP_INTEGRATION_VALUE,
-    startup_integration_note: STARTUP_INTEGRATION_NOTE,
+        startup_integration_label: STARTUP_INTEGRATION_LABEL,
+        startup_integration_value: STARTUP_INTEGRATION_VALUE,
+        startup_integration_note: STARTUP_INTEGRATION_NOTE,
         store,
         last_launch_report,
     })
@@ -411,39 +437,42 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
         .filter(|candidate| !candidate.is_empty())
 }
 
-fn parse_optional_u64_field(field_name: &str, value: Option<String>) -> Result<Option<u64>, ApiError> {
-  let Some(value) = normalize_optional_string(value) else {
-    return Ok(None);
-  };
+fn parse_optional_u64_field(
+    field_name: &str,
+    value: Option<String>,
+) -> Result<Option<u64>, ApiError> {
+    let Some(value) = normalize_optional_string(value) else {
+        return Ok(None);
+    };
 
-  value
-    .parse::<u64>()
-    .map(Some)
-    .map_err(|_| ApiError::bad_request(format!("{} must be a whole number", field_name)))
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| ApiError::bad_request(format!("{} must be a whole number", field_name)))
 }
 
 fn parse_optional_usize_field(
-  field_name: &str,
-  value: Option<String>,
+    field_name: &str,
+    value: Option<String>,
 ) -> Result<Option<usize>, ApiError> {
-  let Some(value) = normalize_optional_string(value) else {
-    return Ok(None);
-  };
+    let Some(value) = normalize_optional_string(value) else {
+        return Ok(None);
+    };
 
-  value
-    .parse::<usize>()
-    .map(Some)
-    .map_err(|_| ApiError::bad_request(format!("{} must be a whole number", field_name)))
+    value
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| ApiError::bad_request(format!("{} must be a whole number", field_name)))
 }
 
 fn resolve_hidden_optional_string(
-  requested_value: Option<Option<String>>,
-  existing_value: Option<&str>,
+    requested_value: Option<Option<String>>,
+    existing_value: Option<&str>,
 ) -> Option<String> {
-  match requested_value {
-    Some(value) => normalize_optional_string(value),
-    None => existing_value.map(str::to_owned),
-  }
+    match requested_value {
+        Some(value) => normalize_optional_string(value),
+        None => existing_value.map(str::to_owned),
+    }
 }
 
 fn default_enabled() -> bool {
@@ -451,30 +480,30 @@ fn default_enabled() -> bool {
 }
 
 fn open_browser(url: &str) -> Result<()> {
-  #[cfg(windows)]
-  let mut command = {
-    let mut command = Command::new("explorer.exe");
-    command.arg(url);
-    command
-  };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        command.arg(url);
+        command
+    };
 
-  #[cfg(target_os = "linux")]
-  let mut command = {
-    let mut command = Command::new("xdg-open");
-    command.arg(url);
-    command
-  };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
 
-  #[cfg(not(any(windows, target_os = "linux")))]
-  let mut command = {
-    let mut command = Command::new("open");
-    command.arg(url);
-    command
-  };
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
 
-  command
-    .spawn()
-    .with_context(|| format!("failed opening browser at {}", url))?;
+    command
+        .spawn()
+        .with_context(|| format!("failed opening browser at {}", url))?;
     Ok(())
 }
 

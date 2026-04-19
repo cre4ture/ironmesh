@@ -196,10 +196,7 @@ fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<StartupMode
             apply_managed_signer_paths(&config.data_dir, &mut runtime);
             apply_managed_rendezvous_config(&config.data_dir, &managed_state, &mut runtime);
             if runtime_enrollment_requires_rejoin(&runtime) {
-                transition_managed_setup_state_to_recovery(
-                    &config.state_path,
-                    &mut managed_state,
-                )?;
+                transition_managed_setup_state_to_recovery(&config.state_path, &mut managed_state)?;
                 return Ok(StartupMode::Setup(config));
             }
             runtime.admin_password_hash = managed_state.admin_password_hash.clone();
@@ -759,12 +756,18 @@ fn explicit_runtime_env_present() -> bool {
 
 fn runtime_enrollment_requires_rejoin(config: &ServerNodeConfig) -> bool {
     let status = collect_node_certificate_status(
-        config.public_tls.as_ref().map(|tls| tls.cert_path.as_path()),
+        config
+            .public_tls
+            .as_ref()
+            .map(|tls| tls.cert_path.as_path()),
         config
             .public_tls
             .as_ref()
             .and_then(|tls| tls.metadata_path.as_deref()),
-        config.internal_tls.as_ref().map(|tls| tls.cert_path.as_path()),
+        config
+            .internal_tls
+            .as_ref()
+            .map(|tls| tls.cert_path.as_path()),
         config
             .internal_tls
             .as_ref()
@@ -1862,7 +1865,10 @@ mod tests {
             .unwrap(),
         );
 
-        let package_path = dir.join("managed").join("runtime").join("node-enrollment.json");
+        let package_path = dir
+            .join("managed")
+            .join("runtime")
+            .join("node-enrollment.json");
         artifacts.package.write_to_path(&package_path).unwrap();
 
         let config = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
@@ -1937,7 +1943,10 @@ mod tests {
             )
             .unwrap(),
         );
-        artifacts.package.write_to_path(&runtime_enrollment_path).unwrap();
+        artifacts
+            .package
+            .write_to_path(&runtime_enrollment_path)
+            .unwrap();
 
         let state_path = managed_setup_state_path(&dir);
         write_managed_setup_state(

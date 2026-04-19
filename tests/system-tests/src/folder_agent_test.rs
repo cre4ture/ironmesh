@@ -433,9 +433,7 @@ async fn wait_for_remote_directory_marker_shape(
                 .join(", ")
         })
         .unwrap_or_else(|err| format!("store-index-error: {err}"));
-    bail!(
-        "remote directory marker shape not observed for {expected_marker}; index={snapshot}"
-    )
+    bail!("remote directory marker shape not observed for {expected_marker}; index={snapshot}")
 }
 
 async fn wait_for_remote_plain_file_shape(
@@ -452,9 +450,10 @@ async fn wait_for_remote_plain_file_shape(
                 .entries
                 .iter()
                 .any(|entry| entry.path == normalized && !entry.path.ends_with('/'));
-            let has_directory_shape = index.entries.iter().any(|entry| {
-                entry.path == marker_path || entry.path.starts_with(&marker_path)
-            });
+            let has_directory_shape = index
+                .entries
+                .iter()
+                .any(|entry| entry.path == marker_path || entry.path.starts_with(&marker_path));
 
             if has_plain_file && !has_directory_shape {
                 return Ok(());
@@ -490,9 +489,7 @@ async fn wait_for_remote_path_absence_any_shape(
     for _ in 0..retries {
         if let Ok(index) = sdk.store_index(None, 128, None).await {
             let found = index.entries.iter().any(|entry| {
-                entry.path == normalized
-                    || entry.path == prefix
-                    || entry.path.starts_with(&prefix)
+                entry.path == normalized || entry.path == prefix || entry.path.starts_with(&prefix)
             });
 
             if !found {
@@ -886,7 +883,8 @@ async fn folder_agent_applies_remote_path_type_transitions_without_restart() -> 
             Bytes::from_static(b"remote-file-v1"),
         )
         .await?;
-        sdk.put("remote-type-flip/dir-to-file/", Bytes::new()).await?;
+        sdk.put("remote-type-flip/dir-to-file/", Bytes::new())
+            .await?;
         sdk.put_large_aware(
             "remote-type-flip/dir-to-file/child.txt",
             Bytes::from_static(b"remote-dir-child"),
@@ -926,7 +924,8 @@ async fn folder_agent_applies_remote_path_type_transitions_without_restart() -> 
             .await?;
 
             delete_remote_key_by_query(&sdk, "remote-type-flip/file-to-dir").await?;
-            sdk.put("remote-type-flip/file-to-dir/", Bytes::new()).await?;
+            sdk.put("remote-type-flip/file-to-dir/", Bytes::new())
+                .await?;
             sdk.put_large_aware(
                 "remote-type-flip/file-to-dir/child.txt",
                 Bytes::from_static(b"remote-dir-v2"),
@@ -1021,8 +1020,7 @@ async fn folder_agent_run_once_bootstraps_and_exits() -> Result<()> {
 }
 
 #[tokio::test]
-async fn folder_agent_run_once_skips_unchanged_uploads_and_downloads_on_repeat_run(
-) -> Result<()> {
+async fn folder_agent_run_once_skips_unchanged_uploads_and_downloads_on_repeat_run() -> Result<()> {
     let bind = "127.0.0.1:19427";
     let local_root = fresh_data_dir("folder-agent-repeat-noop-root");
 
@@ -1222,13 +1220,8 @@ async fn folder_agent_uploads_local_path_type_transitions_without_restart() -> R
             start_folder_agent(&fixture.connection, &local_root, None, 2_000, 250, true).await?;
         let scenario = async {
             wait_for_remote_plain_file_shape(&sdk, "local-type-flip/file-to-dir", 220).await?;
-            wait_for_remote_file_bytes(
-                &sdk,
-                "local-type-flip/file-to-dir",
-                b"local-file-v1",
-                220,
-            )
-            .await?;
+            wait_for_remote_file_bytes(&sdk, "local-type-flip/file-to-dir", b"local-file-v1", 220)
+                .await?;
             wait_for_remote_directory_marker_shape(&sdk, "local-type-flip/dir-to-file", 220)
                 .await?;
             wait_for_remote_file_bytes(
@@ -1278,13 +1271,8 @@ async fn folder_agent_uploads_local_path_type_transitions_without_restart() -> R
             )
             .await?;
             wait_for_remote_plain_file_shape(&sdk, "local-type-flip/dir-to-file", 240).await?;
-            wait_for_remote_file_bytes(
-                &sdk,
-                "local-type-flip/dir-to-file",
-                b"local-file-v2",
-                240,
-            )
-            .await?;
+            wait_for_remote_file_bytes(&sdk, "local-type-flip/dir-to-file", b"local-file-v2", 240)
+                .await?;
             wait_for_remote_file_absence(&sdk, "local-type-flip/dir-to-file/child.txt", 240)
                 .await?;
 

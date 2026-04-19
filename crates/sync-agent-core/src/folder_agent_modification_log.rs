@@ -177,12 +177,8 @@ impl ModificationLogStore {
         connection_target: &str,
         state_root_dir: &Path,
     ) -> Self {
-        let profile_paths = folder_agent_profile_paths(
-            identity_root,
-            scope,
-            connection_target,
-            state_root_dir,
-        );
+        let profile_paths =
+            folder_agent_profile_paths(identity_root, scope, connection_target, state_root_dir);
         Self::from_profile_paths(profile_paths, root_dir_label, scope, connection_target)
     }
 
@@ -227,8 +223,8 @@ impl ModificationLogStore {
 
     pub fn append(&self, entry: &ModificationLogEntry) -> Result<i64> {
         let connection = self.sqlite_connection()?;
-        let occurred_unix_ms = i64::try_from(now_unix_ms())
-            .context("modification log timestamp overflow")?;
+        let occurred_unix_ms =
+            i64::try_from(now_unix_ms()).context("modification log timestamp overflow")?;
         let size_bytes = entry
             .size_bytes
             .map(i64::try_from)
@@ -355,8 +351,12 @@ impl ModificationLogStore {
             })?;
         }
 
-        let connection = Connection::open(&self.path)
-            .with_context(|| format!("failed to open sqlite modification log {}", self.path.display()))?;
+        let connection = Connection::open(&self.path).with_context(|| {
+            format!(
+                "failed to open sqlite modification log {}",
+                self.path.display()
+            )
+        })?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .context("failed to set modification log journal_mode")?;
@@ -410,9 +410,9 @@ impl ModificationLogStore {
             .context("failed to read modification log schema version")?;
 
         let schema_version = match stored_version {
-            Some(raw) => raw
-                .parse::<i64>()
-                .with_context(|| format!("invalid sqlite modification log schema version: {raw}"))?,
+            Some(raw) => raw.parse::<i64>().with_context(|| {
+                format!("invalid sqlite modification log schema version: {raw}")
+            })?,
             None => MODIFICATION_LOG_SCHEMA_VERSION_CURRENT,
         };
 
@@ -465,8 +465,9 @@ impl ModificationLogStore {
     }
 
     fn prune_retained(&self, connection: &Connection) -> Result<()> {
-        let retention_cutoff = i64::try_from(now_unix_ms().saturating_sub(MODIFICATION_LOG_RETENTION_MS))
-            .context("modification log retention cutoff overflow")?;
+        let retention_cutoff =
+            i64::try_from(now_unix_ms().saturating_sub(MODIFICATION_LOG_RETENTION_MS))
+                .context("modification log retention cutoff overflow")?;
         connection
             .execute(
                 "DELETE FROM modification_actions WHERE occurred_unix_ms < ?1",
@@ -491,6 +492,7 @@ impl ModificationLogStore {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn try_record_modification(
     store: Option<&ModificationLogStore>,
     context: Option<&ModificationLogContext>,
@@ -537,7 +539,11 @@ pub fn try_record_modification(
     }
 }
 
-fn query_records<P>(connection: &Connection, query: &str, params: P) -> Result<Vec<ModificationLogRecord>>
+fn query_records<P>(
+    connection: &Connection,
+    query: &str,
+    params: P,
+) -> Result<Vec<ModificationLogRecord>>
 where
     P: rusqlite::Params,
 {
@@ -699,14 +705,20 @@ mod tests {
 
         let first_page = store.list(Some(1), None, None).unwrap();
         assert_eq!(first_page.records.len(), 1);
-        assert_eq!(first_page.records[0].operation, ModificationOperation::DeleteRemote);
+        assert_eq!(
+            first_page.records[0].operation,
+            ModificationOperation::DeleteRemote
+        );
         assert!(first_page.next_before_id.is_some());
 
         let second_page = store
             .list(Some(2), first_page.next_before_id, None)
             .unwrap();
         assert_eq!(second_page.records.len(), 1);
-        assert_eq!(second_page.records[0].operation, ModificationOperation::Upload);
+        assert_eq!(
+            second_page.records[0].operation,
+            ModificationOperation::Upload
+        );
 
         let uploads = store
             .list(Some(8), None, Some(ModificationOperation::Upload))

@@ -8,7 +8,7 @@ use client_sdk::{
     ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
-use common::range_chunk_cache::{RangeChunkCache, RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES};
+use common::range_chunk_cache::{RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES, RangeChunkCache};
 use reqwest::Url;
 use std::fs;
 use std::io::Write;
@@ -202,8 +202,12 @@ impl Hydrator for ServerNodeHydrator {
             {
                 chunk
             } else {
-                let downloaded =
-                    self.download_range_chunk(request.path, chunk_start, chunk_size, should_cancel)?;
+                let downloaded = self.download_range_chunk(
+                    request.path,
+                    chunk_start,
+                    chunk_size,
+                    should_cancel,
+                )?;
                 self.cache_range_chunk(
                     request.path,
                     request.remote_version,
@@ -218,11 +222,13 @@ impl Hydrator for ServerNodeHydrator {
                 .min(chunk_start.saturating_add(chunk.payload.len() as u64))
                 .saturating_sub(chunk_start) as usize;
             if slice_start < slice_end {
-                writer.write_all(&chunk.payload[slice_start..slice_end]).map_err(|err| {
-                    anyhow!("failed to write hydrated bytes for {}: {err}", request.path)
-                })?;
-                bytes_transferred = bytes_transferred
-                    .saturating_add(slice_end.saturating_sub(slice_start) as u64);
+                writer
+                    .write_all(&chunk.payload[slice_start..slice_end])
+                    .map_err(|err| {
+                        anyhow!("failed to write hydrated bytes for {}: {err}", request.path)
+                    })?;
+                bytes_transferred =
+                    bytes_transferred.saturating_add(slice_end.saturating_sub(slice_start) as u64);
                 on_progress(HydrationProgress {
                     object_size_bytes,
                     range: request.transfer_range,

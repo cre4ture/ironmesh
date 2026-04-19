@@ -74,7 +74,10 @@ pub(crate) struct FolderAgentProfilePaths {
 }
 
 pub(crate) fn default_folder_agent_state_root() -> PathBuf {
-    xdg_state_home().unwrap_or_else(std::env::temp_dir).join("ironmesh").join("folder-agent")
+    xdg_state_home()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ironmesh")
+        .join("folder-agent")
 }
 
 pub(crate) fn folder_agent_profile_paths(
@@ -127,7 +130,12 @@ pub const BASELINE_SCHEMA_VERSION_CURRENT: i64 = 2;
 
 impl StartupStateStore {
     pub fn new(root_dir: &Path, scope: &PathScope, server_base_url: &str) -> Self {
-        Self::new_with_state_root(root_dir, scope, server_base_url, &default_folder_agent_state_root())
+        Self::new_with_state_root(
+            root_dir,
+            scope,
+            server_base_url,
+            &default_folder_agent_state_root(),
+        )
     }
 
     pub fn new_with_state_root(
@@ -136,7 +144,8 @@ impl StartupStateStore {
         server_base_url: &str,
         state_root_dir: &Path,
     ) -> Self {
-        let profile_paths = folder_agent_profile_paths(root_dir, scope, server_base_url, state_root_dir);
+        let profile_paths =
+            folder_agent_profile_paths(root_dir, scope, server_base_url, state_root_dir);
         Self {
             path: profile_paths.baseline_path,
             scope_fingerprint: profile_paths.scope_fingerprint,
@@ -1104,7 +1113,10 @@ mod tests {
                 .unwrap(),
             "profiles"
         );
-        assert_eq!(store.path.file_name().unwrap(), FOLDER_AGENT_BASELINE_FILE_NAME);
+        assert_eq!(
+            store.path.file_name().unwrap(),
+            FOLDER_AGENT_BASELINE_FILE_NAME
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

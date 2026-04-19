@@ -2016,7 +2016,8 @@ impl StoreIndexInspector {
         for (key, manifest_hash) in object_hashes {
             if let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? {
                 sizes.insert(key.clone(), manifest.total_size_bytes as u64);
-                content_fingerprints.insert(key.clone(), content_fingerprint_from_manifest(&manifest));
+                content_fingerprints
+                    .insert(key.clone(), content_fingerprint_from_manifest(&manifest));
             }
         }
         Ok((sizes, content_fingerprints))
@@ -3213,12 +3214,9 @@ impl PersistentStore {
         version_id: Option<&str>,
         read_mode: ObjectReadMode,
     ) -> Result<Option<ReplicationExportBundle>> {
-        let object_id = if version_id.is_some() {
-            self.resolve_object_id_for_key_version(
-                key,
-                version_id.expect("version_id.is_some() checked above"),
-            )
-            .await?
+        let object_id = if let Some(version_id) = version_id {
+            self.resolve_object_id_for_key_version(key, version_id)
+                .await?
         } else {
             self.object_id_for_key(key)
         };
@@ -3342,12 +3340,9 @@ impl PersistentStore {
         version_id: Option<&str>,
         read_mode: ObjectReadMode,
     ) -> Result<Option<MetadataExportBundle>> {
-        let object_id = if version_id.is_some() {
-            self.resolve_object_id_for_key_version(
-                key,
-                version_id.expect("version_id.is_some() checked above"),
-            )
-            .await?
+        let object_id = if let Some(version_id) = version_id {
+            self.resolve_object_id_for_key_version(key, version_id)
+                .await?
         } else {
             self.object_id_for_key(key)
                 .or(self.resolve_object_id_for_key_history(key).await?)

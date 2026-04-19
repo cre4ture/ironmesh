@@ -2083,7 +2083,7 @@ async fn renew_node_enrollment_package_if_due(
             value: "application/json".to_string(),
         }],
         serde_json::to_vec(&build_node_enrollment_renew_request(&package))
-        .context("failed encoding automatic node enrollment renewal request")?,
+            .context("failed encoding automatic node enrollment renewal request")?,
     )
     .await
     .context("failed requesting automatic node enrollment renewal")?;
@@ -2111,7 +2111,9 @@ async fn renew_node_enrollment_package_if_due(
     Ok(true)
 }
 
-fn build_node_enrollment_renew_request(package: &NodeEnrollmentPackage) -> NodeEnrollmentRenewRequest {
+fn build_node_enrollment_renew_request(
+    package: &NodeEnrollmentPackage,
+) -> NodeEnrollmentRenewRequest {
     NodeEnrollmentRenewRequest {
         current_public_tls_cert_pem: package
             .public_tls_material
@@ -3537,7 +3539,6 @@ async fn shutdown_signal() {
 
 async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let config = config;
     let public_tls_runtime = match config.public_tls.as_ref() {
         Some(public_tls) => Some(PublicTlsRuntime {
             config: RustlsConfig::from_pem_file(&public_tls.cert_path, &public_tls.key_path)
@@ -13105,27 +13106,30 @@ async fn renew_node_enrollment_authenticated(
         .and_then(|cert_pem| parse_certificate_details_from_pem(cert_pem).ok())
         .map(|details| details.certificate_fingerprint);
 
-    let internal_tls_material =
-        match issue_internal_node_tls_material_for_identity(&state, state.cluster_id, caller.node_id, issue_policy)
-        {
-            Ok(material) => material,
-            Err(status) => {
-                return error_response(
-                    status,
-                    "failed to renew internal node TLS material".to_string(),
-                );
-            }
-        };
+    let internal_tls_material = match issue_internal_node_tls_material_for_identity(
+        &state,
+        state.cluster_id,
+        caller.node_id,
+        issue_policy,
+    ) {
+        Ok(material) => material,
+        Err(status) => {
+            return error_response(
+                status,
+                "failed to renew internal node TLS material".to_string(),
+            );
+        }
+    };
 
     let public_tls_material = match request.current_public_tls_cert_pem.as_deref() {
         Some(cert_pem) => {
-            let subject_alt_names = match extract_public_node_subject_alt_names_from_cert_pem(cert_pem)
-            {
-                Ok(subject_alt_names) => subject_alt_names,
-                Err(err) => {
-                    return error_response(StatusCode::BAD_REQUEST, err.to_string());
-                }
-            };
+            let subject_alt_names =
+                match extract_public_node_subject_alt_names_from_cert_pem(cert_pem) {
+                    Ok(subject_alt_names) => subject_alt_names,
+                    Err(err) => {
+                        return error_response(StatusCode::BAD_REQUEST, err.to_string());
+                    }
+                };
             match issue_public_node_tls_material_with_subject_alt_names(
                 &state,
                 caller.node_id,
@@ -13147,10 +13151,7 @@ async fn renew_node_enrollment_authenticated(
     let trust_roots = match bootstrap_trust_roots(&state) {
         Ok(trust_roots) => trust_roots,
         Err(status) => {
-            return error_response(
-                status,
-                "failed to resolve renewal trust roots".to_string(),
-            );
+            return error_response(status, "failed to resolve renewal trust roots".to_string());
         }
     };
     let response = NodeEnrollmentRenewResponse {
@@ -14245,13 +14246,13 @@ async fn data_scrub_cluster_status(
         });
     }
 
-    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    nodes.sort_by_key(|node| node.node_id);
     runs.sort_by(|a, b| {
         b.finished_at_unix
             .cmp(&a.finished_at_unix)
             .then_with(|| b.run_id.cmp(&a.run_id))
     });
-    skipped_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    skipped_nodes.sort_by_key(|node| node.node_id);
 
     (
         StatusCode::OK,

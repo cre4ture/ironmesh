@@ -5,9 +5,9 @@ use crate::client_rights_edge::{
 };
 use crate::gnome::{
     GNOME_EXTENSION_UUID, GnomeStatusOptions, GnomeStatusRuntime,
-    default_remote_status_poll_interval_ms, default_status_file_path,
-    failed_mount_sync_facet, install_extension, mounted_sync_facet, snapshot_connection_facet,
-    snapshot_replication_facet, starting_mount_sync_facet, stopped_mount_sync_facet,
+    default_remote_status_poll_interval_ms, default_status_file_path, failed_mount_sync_facet,
+    install_extension, mounted_sync_facet, snapshot_connection_facet, snapshot_replication_facet,
+    starting_mount_sync_facet, stopped_mount_sync_facet,
 };
 use crate::runtime::{
     DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, IronmeshFuseFs, Uploader,
@@ -165,8 +165,8 @@ fn run_gnome_command(args: &Args, command: &GnomeCommand) -> Result<()> {
 }
 
 fn run_mount(args: &Args) -> Result<()> {
-    let client_identity = resolve_client_identity(&args)?;
-    let upstream_target = resolve_upstream_target(&args, client_identity.as_ref())?;
+    let client_identity = resolve_client_identity(args)?;
+    let upstream_target = resolve_upstream_target(args, client_identity.as_ref())?;
 
     if args.snapshot_file.is_some() {
         if args.server_base_url.is_some() || args.bootstrap_file.is_some() {
@@ -200,9 +200,12 @@ fn run_mount(args: &Args) -> Result<()> {
         }
     }
 
-    let result = (|| -> Result<()> {
-        run_mount_inner(args, upstream_target, client_identity.is_some(), gnome_status.as_ref())
-    })();
+    let result = run_mount_inner(
+        args,
+        upstream_target,
+        client_identity.is_some(),
+        gnome_status.as_ref(),
+    );
 
     if let Some(status) = gnome_status {
         if let Err(error) = &result {
@@ -222,9 +225,8 @@ fn run_mount_inner(
     has_client_identity: bool,
     gnome_status: Option<&GnomeStatusRuntime>,
 ) -> Result<()> {
-
     let adapter = LinuxFuseAdapter::new(args.fs_name.clone());
-    let download_stage_root = download_stage_root(&args)?;
+    let download_stage_root = download_stage_root(args)?;
     let mut config = FuseMountConfig::new(args.mountpoint.clone(), args.fs_name.clone());
     config.allow_other = args.allow_other;
 
@@ -249,7 +251,7 @@ fn run_mount_inner(
         .as_ref()
         .map(|target| target.client.clone())
         .ok_or_else(|| anyhow::anyhow!("missing upstream target for live mount"))?;
-    let client_edge_state_dir = effective_client_edge_state_dir(&args)?;
+    let client_edge_state_dir = effective_client_edge_state_dir(args)?;
     let client_edge_state = Arc::new(ClientRightsEdgeState::new(
         client_edge_state_dir,
         args.offline_object_cache.into(),
@@ -265,7 +267,7 @@ fn run_mount_inner(
         }
         Err(error) => {
             if is_unauthorized_store_index_error(&error) {
-                let auth_hint = live_mount_auth_hint(&args, has_client_identity);
+                let auth_hint = live_mount_auth_hint(args, has_client_identity);
                 return Err(error).context(format!(
                     "initial remote snapshot fetch was unauthorized; {auth_hint}"
                 ));
@@ -422,9 +424,7 @@ fn update_gnome_sync(status: &GnomeStatusRuntime, facet: desktop_status::StatusF
 
 fn update_gnome_replication(status: &GnomeStatusRuntime, facet: desktop_status::StatusFacet) {
     if let Err(error) = status.update_replication(facet) {
-        tracing::warn!(
-            "gnome-status: failed to persist Linux FUSE replication status: {error:#}"
-        );
+        tracing::warn!("gnome-status: failed to persist Linux FUSE replication status: {error:#}");
     }
 }
 

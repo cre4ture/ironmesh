@@ -19,19 +19,17 @@ use sync_core::{EntryKind, SyncSnapshot};
 use crate::{
     FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeScanProgress, LocalTreeState,
     ModificationLogContext, ModificationLogStore, ModificationOperation, ModificationOutcome,
-    ModificationPhase, ModificationTriggerSource, PathScope, RemoteTreeIndex,
-    StartupStateStore, absolute_path, build_configured_client, cleanup_ironmesh_part_files,
-    describe_connection_target, diff_local_trees,
-    download_transfer_state_path, download_transfer_temp_path,
-    load_local_baseline_hashes_with_retries, load_local_baseline_with_retries,
-    local_entry_state_for_path, local_file_content_fingerprint,
-    local_paths_matching_remote_on_startup,
-    local_paths_to_preserve_on_startup_with_hash,
-    materialize_remote_conflict_copies, parent_directories,
-    remote_file_paths_by_local_path, remove_local_path,
-    scan_local_tree_with_progress, spawn_ui_server, startup_add_delete_conflicts,
-    startup_baseline_state_from_remote_index, startup_dual_modify_conflicts_with_hash,
-    startup_remote_delete_wins_paths_with_hash, try_record_modification, upload_local_file,
+    ModificationPhase, ModificationTriggerSource, PathScope, RemoteTreeIndex, StartupStateStore,
+    absolute_path, build_configured_client, cleanup_ironmesh_part_files,
+    describe_connection_target, diff_local_trees, download_transfer_state_path,
+    download_transfer_temp_path, load_local_baseline_hashes_with_retries,
+    load_local_baseline_with_retries, local_entry_state_for_path, local_file_content_fingerprint,
+    local_paths_matching_remote_on_startup, local_paths_to_preserve_on_startup_with_hash,
+    materialize_remote_conflict_copies, parent_directories, remote_file_paths_by_local_path,
+    remove_local_path, scan_local_tree_with_progress, spawn_ui_server,
+    startup_add_delete_conflicts, startup_baseline_state_from_remote_index,
+    startup_dual_modify_conflicts_with_hash, startup_remote_delete_wins_paths_with_hash,
+    try_record_modification, upload_local_file,
 };
 
 #[derive(Debug, Clone)]
@@ -384,8 +382,9 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect local path {}", absolute.display()));
+                return Err(error).with_context(|| {
+                    format!("failed to inspect local path {}", absolute.display())
+                });
             }
         }
         fs::create_dir_all(&absolute).with_context(|| {
@@ -829,12 +828,12 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
             .upsert_baseline_entry_with_hash(
                 path,
                 entry_state,
-                remote_hashes_before_remote_sync.get(path).map(String::as_str),
+                remote_hashes_before_remote_sync
+                    .get(path)
+                    .map(String::as_str),
             )
             .with_context(|| {
-                format!(
-                    "failed to repair baseline fingerprint for startup-matched file {path}"
-                )
+                format!("failed to repair baseline fingerprint for startup-matched file {path}")
             })?;
     }
     let remote_delete_wins_paths = startup_remote_delete_wins_paths_with_hash(
@@ -1400,6 +1399,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_status(
     callback: Option<&FolderAgentStatusCallback>,
     options: &FolderAgentRuntimeOptions,
@@ -1556,8 +1556,9 @@ fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
             Ok(content_fingerprint)
         }
         Err(error) => {
-            let error =
-                error.context(format!("failed to upload local file {relative_path} to {remote_key}"));
+            let error = error.context(format!(
+                "failed to upload local file {relative_path} to {remote_key}"
+            ));
             try_record_modification(
                 modification_log,
                 modification_context,
@@ -1701,9 +1702,9 @@ fn delete_remote_path_with_logging(
 
 fn remove_remote_directory_subtree_from_index(remote_index: &mut RemoteTreeIndex, path: &str) {
     let prefix = format!("{path}/");
-    remote_index.directories.retain(|entry| {
-        entry != path && !entry.starts_with(&prefix)
-    });
+    remote_index
+        .directories
+        .retain(|entry| entry != path && !entry.starts_with(&prefix));
     remote_index
         .files
         .retain(|entry| !entry.starts_with(&prefix));
@@ -1714,9 +1715,8 @@ fn remove_suppressed_upload_path_and_descendants(
     path: &str,
 ) {
     let prefix = format!("{path}/");
-    suppressed_uploads.retain(|entry_path, _| {
-        entry_path != path && !entry_path.starts_with(&prefix)
-    });
+    suppressed_uploads
+        .retain(|entry_path, _| entry_path != path && !entry_path.starts_with(&prefix));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1734,7 +1734,9 @@ fn remove_local_path_with_logging<B: FolderAgentLocalBackend>(
             if let Some(store) = state_store {
                 store
                     .remove_baseline_entry(relative_path)
-                    .with_context(|| format!("failed to remove baseline entry for {relative_path}"))?;
+                    .with_context(|| {
+                        format!("failed to remove baseline entry for {relative_path}")
+                    })?;
             }
 
             try_record_modification(
@@ -1768,6 +1770,7 @@ fn remove_local_path_with_logging<B: FolderAgentLocalBackend>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_local_changes<B: FolderAgentLocalBackend>(
     backend: &mut B,
     options: &FolderAgentRuntimeOptions,
@@ -1795,7 +1798,9 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
             progress.last_success_unix_ms,
         )
         .context("failed to scan local root")?,
-        None => scan_local_tree_without_status(backend, options).context("failed to scan local root")?,
+        None => {
+            scan_local_tree_without_status(backend, options).context("failed to scan local root")?
+        }
     };
     let diff = diff_local_trees(local_state, &current);
     let mut outcome = LocalSyncOutcome {
@@ -1908,7 +1913,10 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
             if previous.kind == LocalEntryKind::Directory {
                 let prefix = format!("{path}/");
                 let known_remote_directory = remote_index.directories.contains(&path)
-                    || remote_index.files.iter().any(|entry| entry.starts_with(&prefix))
+                    || remote_index
+                        .files
+                        .iter()
+                        .any(|entry| entry.starts_with(&prefix))
                     || suppressed_uploads
                         .keys()
                         .any(|entry| entry == &path || entry.starts_with(&prefix));
@@ -1934,9 +1942,9 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
                 remove_remote_directory_subtree_from_index(remote_index, &path);
                 remove_suppressed_upload_path_and_descendants(suppressed_uploads, &path);
                 if let Some(store) = state_store {
-                    store.remove_baseline_entry(&path).with_context(|| {
-                        format!("failed to remove baseline entry for {path}")
-                    })?;
+                    store
+                        .remove_baseline_entry(&path)
+                        .with_context(|| format!("failed to remove baseline entry for {path}"))?;
                 }
                 tracing::info!("local-sync: deleted remote directory marker {path}/");
                 continue;
@@ -1979,7 +1987,8 @@ fn matching_local_entry_for_remote_file_change<B: FolderAgentLocalBackend>(
     remote_content_hash: Option<&str>,
     state_store: Option<&StartupStateStore>,
 ) -> Result<Option<LocalEntryState>> {
-    let Some(remote_content_hash) = remote_content_hash.filter(|hash| !hash.trim().is_empty()) else {
+    let Some(remote_content_hash) = remote_content_hash.filter(|hash| !hash.trim().is_empty())
+    else {
         return Ok(None);
     };
 
@@ -2135,7 +2144,9 @@ fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
                     None => {
                         outcome.changed_path_count += 1;
                         outcome.removed_local_path_count += 1;
-                        let remote_key = scope.local_to_remote(path).unwrap_or_else(|| path.to_string());
+                        let remote_key = scope
+                            .local_to_remote(path)
+                            .unwrap_or_else(|| path.to_string());
                         remove_local_path_with_logging(
                             backend,
                             options,
@@ -2293,6 +2304,7 @@ where
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_local_tree_with_status_progress<B: FolderAgentLocalBackend>(
     backend: &mut B,
     options: &FolderAgentRuntimeOptions,
@@ -2388,6 +2400,7 @@ fn format_local_scan_progress_message(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_remote_snapshot_with_status_progress(
     options: &FolderAgentRuntimeOptions,
     connection_target: &str,
@@ -2633,6 +2646,7 @@ fn format_remote_apply_summary(outcome: RemoteApplyOutcome) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn download_remote_file(
     root_dir: &Path,
     client: &IronMeshClient,

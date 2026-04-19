@@ -2726,15 +2726,27 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
         super::merge_node_enrollment_renew_response(package.clone(), renewed_response).unwrap();
 
     assert_eq!(renewed_package.bootstrap.node_id, package.bootstrap.node_id);
-    assert_eq!(renewed_package.bootstrap.data_dir, package.bootstrap.data_dir);
-    assert_eq!(renewed_package.bootstrap.public_url, package.bootstrap.public_url);
-    assert_eq!(renewed_package.bootstrap.internal_url, package.bootstrap.internal_url);
+    assert_eq!(
+        renewed_package.bootstrap.data_dir,
+        package.bootstrap.data_dir
+    );
+    assert_eq!(
+        renewed_package.bootstrap.public_url,
+        package.bootstrap.public_url
+    );
+    assert_eq!(
+        renewed_package.bootstrap.internal_url,
+        package.bootstrap.internal_url
+    );
     assert_eq!(renewed_package.bootstrap.labels, package.bootstrap.labels);
     assert_eq!(
         renewed_package.bootstrap.rendezvous_urls,
         package.bootstrap.rendezvous_urls
     );
-    assert_eq!(renewed_package.bootstrap.relay_mode, package.bootstrap.relay_mode);
+    assert_eq!(
+        renewed_package.bootstrap.relay_mode,
+        package.bootstrap.relay_mode
+    );
     assert_eq!(
         renewed_package.bootstrap.direct_endpoints,
         package.bootstrap.direct_endpoints

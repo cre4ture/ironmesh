@@ -2743,7 +2743,9 @@ async fn ensure_media_metadata_refreshes_gps_after_overwrite_impl(backend: Stora
         updated_metadata.content_fingerprint
     );
 
-    let gps = updated_metadata.gps.expect("expected GPS metadata after overwrite");
+    let gps = updated_metadata
+        .gps
+        .expect("expected GPS metadata after overwrite");
     assert!((gps.latitude - 37.808_333_333_333_33).abs() < 0.000_001);
     assert!((gps.longitude - (-122.404_166_666_666_67)).abs() < 0.000_001);
 

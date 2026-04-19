@@ -2,7 +2,11 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+  # Transitive through turso 0.6.0-pre.2 when the optional turso metadata backend is enabled.
+  # The upstream crate currently has no maintained replacement or safe upgrade path.
+  "RUSTSEC-2024-0436",
+]
 
 [licenses]
 confidence-threshold = 0.9

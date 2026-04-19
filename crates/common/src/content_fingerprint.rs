@@ -172,9 +172,9 @@ mod tests {
         builder.update(&payload);
         let from_builder = builder.finish()?;
 
-        let chunk_refs = payload.chunks(super::CONTENT_FINGERPRINT_CHUNK_SIZE_BYTES).map(|chunk| {
-            (blake3::hash(chunk).to_hex().to_string(), chunk.len() as u64)
-        });
+        let chunk_refs = payload
+            .chunks(super::CONTENT_FINGERPRINT_CHUNK_SIZE_BYTES)
+            .map(|chunk| (blake3::hash(chunk).to_hex().to_string(), chunk.len() as u64));
         let from_chunk_refs = content_fingerprint_from_chunk_refs(payload.len() as u64, chunk_refs);
 
         assert_eq!(from_builder, from_chunk_refs);

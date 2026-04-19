@@ -407,7 +407,7 @@ fn identity_has_remote_baseline(identity: &PlaceholderFileIdentity) -> bool {
         || identity.remote_content_hash.is_some()
         || identity.remote_content_fingerprint.is_some()
         || identity.remote_size_bytes.is_some()
-    || identity.in_sync_content_fingerprint.is_some()
+        || identity.in_sync_content_fingerprint.is_some()
 }
 
 fn is_internal_sync_root_relative_path(path: &str) -> bool {

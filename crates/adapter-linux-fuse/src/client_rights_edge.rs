@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use client_sdk::IronMeshClient;
 use common::range_chunk_cache::RangeChunkCache;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,9 +27,7 @@ impl OfflineObjectCacheMode {
     }
 }
 
-pub(crate) use common::range_chunk_cache::{
-    RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES, RANGE_CHUNK_CACHE_MAX_CHUNKS,
-};
+pub(crate) use common::range_chunk_cache::RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES;
 
 #[derive(Debug)]
 pub struct ClientRightsEdgeState {
@@ -965,6 +963,7 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::range_chunk_cache::RANGE_CHUNK_CACHE_MAX_CHUNKS;
 
     fn temp_state_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

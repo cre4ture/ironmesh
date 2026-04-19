@@ -1,12 +1,11 @@
 use anyhow::Result;
+use desktop_status::{
+    DesktopStatusPublisher, DesktopStatusPublisherOptions, default_gnome_status_file_path,
+    install_gnome_extension_from, spawn_remote_status_thread, sync_status_facet_from_runtime_state,
+};
 pub use desktop_status::{
     GNOME_EXTENSION_UUID, GnomeExtensionInstallOutcome, default_remote_status_poll_interval_ms,
     derive_profile_label,
-};
-use desktop_status::{
-    DesktopStatusPublisher, DesktopStatusPublisherOptions, default_gnome_status_file_path,
-    install_gnome_extension_from, spawn_remote_status_thread,
-    sync_status_facet_from_runtime_state,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,12 +40,14 @@ pub fn run_with_gnome_status(
     runtime_options: &FolderAgentRuntimeOptions,
     gnome_options: &GnomeRunOptions,
 ) -> Result<()> {
-    let publisher = Arc::new(DesktopStatusPublisher::new(&DesktopStatusPublisherOptions {
-        profile_label: gnome_options.profile_label.clone(),
-        root_dir: gnome_options.root_dir.clone(),
-        connection_target: gnome_options.connection_target.clone(),
-        status_file: gnome_options.status_file.clone(),
-    })?);
+    let publisher = Arc::new(DesktopStatusPublisher::new(
+        &DesktopStatusPublisherOptions {
+            profile_label: gnome_options.profile_label.clone(),
+            root_dir: gnome_options.root_dir.clone(),
+            connection_target: gnome_options.connection_target.clone(),
+            status_file: gnome_options.status_file.clone(),
+        },
+    )?);
     let running = Arc::new(AtomicBool::new(true));
 
     let remote_thread = match build_configured_client(
@@ -90,10 +91,10 @@ pub fn run_with_gnome_status(
     );
 
     running.store(false, Ordering::SeqCst);
-    if let Some(remote_thread) = remote_thread {
-        if let Err(error) = remote_thread.join() {
-            tracing::warn!("gnome-status: remote status thread join failed: {error:?}");
-        }
+    if let Some(remote_thread) = remote_thread
+        && let Err(error) = remote_thread.join()
+    {
+        tracing::warn!("gnome-status: remote status thread join failed: {error:?}");
     }
 
     if let Err(error) = publisher.persist() {

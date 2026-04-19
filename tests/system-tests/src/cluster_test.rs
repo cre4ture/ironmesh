@@ -179,8 +179,8 @@ mod tests {
 
         for offset in 0..candidate_count {
             let public_port = PUBLIC_PORT_START
-                + ((start_port.wrapping_sub(PUBLIC_PORT_START) as usize + offset)
-                    % candidate_count) as u16;
+                + ((start_port.wrapping_sub(PUBLIC_PORT_START) as usize + offset) % candidate_count)
+                    as u16;
             let internal_port = public_port + INTERNAL_PORT_OFFSET;
             let public_addr = format!("127.0.0.1:{public_port}");
             let internal_addr = format!("127.0.0.1:{internal_port}");
@@ -344,22 +344,16 @@ mod tests {
             let request = client
                 .request(Method::GET, &query_path)
                 .context("failed to build signed store index request")?;
-            if let Ok(response) = request.send().await {
-                if let Ok(response) = response.error_for_status() {
-                    if let Ok(index) = response.json::<serde_json::Value>().await {
-                        if let Some(entries) =
-                            index.get("entries").and_then(|value| value.as_array())
-                        {
-                            if let Some(entry) = entries.iter().find(|entry| {
-                                entry.get("path").and_then(|value| value.as_str()) == Some(key)
-                            }) {
-                                if predicate(entry) {
-                                    return Ok(entry.clone());
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Ok(response) = request.send().await
+                && let Ok(response) = response.error_for_status()
+                && let Ok(index) = response.json::<serde_json::Value>().await
+                && let Some(entries) = index.get("entries").and_then(|value| value.as_array())
+                && let Some(entry) = entries.iter().find(|entry| {
+                    entry.get("path").and_then(|value| value.as_str()) == Some(key)
+                })
+                && predicate(entry)
+            {
+                return Ok(entry.clone());
             }
 
             sleep(Duration::from_millis(100)).await;
@@ -2009,7 +2003,7 @@ mod tests {
         let base_c = format!("http://{bind_c}");
         let base_d = format!("http://{bind_d}");
         let base_e = format!("http://{bind_e}");
-        let internal_nodes = vec![
+        let internal_nodes = [
             (
                 internal_base_url_from_public_bind(bind_a)?,
                 mtls_client_from_data_dir(&data_a)?,
@@ -4304,18 +4298,16 @@ mod tests {
                 &first_join_request,
             )
             .await?;
-            setup_import_node_enrollment(
-                &insecure_http,
-                &bind_b,
-                admin_password,
-                &initial_package,
-            )
-            .await?;
+            setup_import_node_enrollment(&insecure_http, &bind_b, admin_password, &initial_package)
+                .await?;
             wait_for_runtime_admin_surface(&insecure_http, &bind_b).await?;
 
             stop_server(&mut node_b).await;
             replace_runtime_internal_certificate_with_expired_one(
-                &data_b.join("managed").join("runtime").join("node-enrollment.json"),
+                &data_b
+                    .join("managed")
+                    .join("runtime")
+                    .join("node-enrollment.json"),
                 &data_a.join("managed").join("signer").join("cluster-ca.pem"),
                 &data_a.join("managed").join("signer").join("cluster-ca.key"),
             )?;
