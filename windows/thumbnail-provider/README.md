@@ -36,12 +36,17 @@ This must stay aligned with:
 The prototype package root should contain at least:
 
 - `AppxManifest.xml`
+- `ironmesh-config-app.exe`
+- `ironmesh-background-launcher.exe`
 - `windows_thumbnail_provider.dll`
 - `os-integration.exe`
+- `ironmesh-folder-agent.exe`
 - `Assets/SmallLogo.png`
 - `Assets/StoreLogo.png`
 
-The manifest currently points the `Application` executable at `os-integration.exe` because that binary already represents the Windows filesystem integration surface in this repo.
+The manifest now exposes the packaged `ironmesh-config-app.exe` as the visible user-facing entry point, registers `ironmesh-background-launcher.exe` as the login-time startup task, and keeps `os-integration.exe` plus `ironmesh-folder-agent.exe` as hidden packaged full-trust entry points.
+
+For normal packaged-client testing, start IronMesh through the packaged config app and define instances there first. The direct `os-integration.exe serve ...` flow below remains useful when you need low-level CFAPI or thumbnail-provider verification.
 
 ## Typical manual prototype flow
 
@@ -101,7 +106,9 @@ The helper will:
 - build `windows-thumbnail-provider`
 - build `os-integration`
 - build `ironmesh-folder-agent`
-- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, `os-integration.exe`, and `ironmesh-folder-agent.exe`
+- build `ironmesh-background-launcher`
+- build `ironmesh-config-app`
+- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, `os-integration.exe`, `ironmesh-folder-agent.exe`, `ironmesh-background-launcher.exe`, and `ironmesh-config-app.exe`
 - if the Windows SDK tools are installed, also:
   - create/reuse a self-signed developer certificate
   - generate an `.msix`
@@ -131,8 +138,7 @@ Typical usage:
 
 The helper will:
 
-- build `windows-thumbnail-provider` and `os-integration` in release mode
-- build `ironmesh-folder-agent` in release mode
+- build `windows-thumbnail-provider`, `os-integration`, `ironmesh-folder-agent`, `ironmesh-background-launcher`, and `ironmesh-config-app` in release mode
 - stage the Store manifest, assets, DLL, and EXEs
 - create an `.msix`
 - sign the `.msix` with a local self-signed certificate matching the Store publisher by default

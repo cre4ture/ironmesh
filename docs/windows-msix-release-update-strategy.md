@@ -78,6 +78,10 @@ For this repo, the manifest should now carry the exact Partner Center identity v
 
 The production package should include at least:
 
+- `ironmesh-config-app.exe`
+  - visible packaged configuration UI and first-run entry point for Windows users.
+- `ironmesh-background-launcher.exe`
+  - startup-task target that relaunches enabled background instances after user login.
 - `os-integration.exe`
   - packaged full-trust host for Windows filesystem integration and status surface.
 - `ironmesh-folder-agent.exe`
@@ -85,6 +89,13 @@ The production package should include at least:
 - `windows_thumbnail_provider.dll`
   - packaged COM DLL for thumbnail and related Cloud Files handlers.
 - packaged visual assets and manifest metadata.
+
+The intended user flow is:
+
+- install the package from Microsoft Store,
+- open the packaged configuration app first,
+- define one or more `os-integration.exe` and `ironmesh-folder-agent.exe` instances,
+- let the packaged background launcher restart enabled instances after login.
 
 If additional Windows-only helpers are required later, they should either live in the same package or in a deliberately versioned packaged companion path. The first release should avoid splitting the Windows desktop product across multiple independently updating installers.
 
@@ -94,6 +105,10 @@ Package upgrades must not be the place where user state lives.
 
 Persist mutable state in the existing external locations instead:
 
+- `%LocalAppData%\Ironmesh\windows-client-config\instances.json`
+  - persisted multi-instance definitions for packaged `os-integration.exe` and `ironmesh-folder-agent.exe` launches.
+- `%LocalAppData%\Ironmesh\windows-client-config\last-launch-report.json`
+  - last startup-task launch report recorded by the packaged background launcher.
 - `%LocalAppData%\Ironmesh\sync-roots\...`
   - per-sync-root bootstrap, client identity, and related runtime state.
 - `%LocalAppData%\Ironmesh\thumbnail-cache`

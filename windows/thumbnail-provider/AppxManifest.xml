@@ -13,11 +13,11 @@
   <Identity
     Name="UlrichHornung.IronMesh"
     Publisher="CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21"
-    Version="0.1.0.0" />
+    Version="0.1.0.1" />
   <Properties>
     <DisplayName>IronMesh</DisplayName>
     <PublisherDisplayName>Ulrich Hornung</PublisherDisplayName>
-    <Description>Windows filesystem integration for IronMesh.</Description>
+    <Description>Configure IronMesh shared folders and Windows filesystem integration.</Description>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   <Resources>
@@ -32,15 +32,38 @@
   </Capabilities>
   <Applications>
     <Application
-      Id="IronmeshThumbnailProvider"
-      Executable="os-integration.exe"
+      Id="IronmeshConfigApp"
+      Executable="ironmesh-config-app.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="IronMesh"
-        Description="Windows filesystem integration for IronMesh"
+        Description="Configure IronMesh shared folders and background services"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\StoreLogo.png"
         Square44x44Logo="Assets\SmallLogo.png" />
+      <Extensions>
+        <desktop:Extension
+          Category="windows.startupTask"
+          Executable="ironmesh-background-launcher.exe"
+          EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask
+            TaskId="IronmeshBackgroundLauncher"
+            Enabled="true"
+            DisplayName="IronMesh background services" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+    <Application
+      Id="IronmeshOsIntegration"
+      Executable="os-integration.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="IronMesh OS Integration"
+        Description="Packaged Windows filesystem integration host for IronMesh"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\StoreLogo.png"
+        Square44x44Logo="Assets\SmallLogo.png"
+        AppListEntry="none" />
       <Extensions>
         <com:Extension Category="windows.comServer">
           <com:ComServer>
@@ -90,6 +113,18 @@
           </desktop3:CloudFiles>
         </desktop3:Extension>
       </Extensions>
+    </Application>
+    <Application
+      Id="IronmeshFolderAgent"
+      Executable="ironmesh-folder-agent.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="IronMesh Folder Agent"
+        Description="Packaged background folder synchronization agent for IronMesh"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\StoreLogo.png"
+        Square44x44Logo="Assets\SmallLogo.png"
+        AppListEntry="none" />
     </Application>
   </Applications>
 </Package>

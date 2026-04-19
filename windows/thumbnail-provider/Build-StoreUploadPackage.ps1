@@ -365,18 +365,22 @@ if (-not $SkipSigning) {
     }
 }
 
-Write-Step 'Building windows-thumbnail-provider, os-integration, and ironmesh-folder-agent (release)'
+Write-Step 'Building windows-thumbnail-provider, os-integration, ironmesh-folder-agent, ironmesh-background-launcher, and ironmesh-config-app (release)'
 $env:CARGO_TARGET_DIR = $cargoTargetDir
-Invoke-NativeChecked -FilePath 'cargo' -Arguments @('build', '-p', 'windows-thumbnail-provider', '-p', 'os-integration', '-p', 'ironmesh-folder-agent', '--release')
+Invoke-NativeChecked -FilePath 'cargo' -Arguments @('build', '-p', 'windows-thumbnail-provider', '-p', 'os-integration', '-p', 'ironmesh-folder-agent', '-p', 'ironmesh-background-launcher', '-p', 'ironmesh-config-app', '--release')
 
 $releaseDir = Join-Path $cargoTargetDir 'release'
 $dllPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.dll' -FallbackPatterns @('windows_thumbnail_provider-*.dll')
 $exePath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'os-integration.exe' -FallbackPatterns @('os_integration-*.exe', 'os-integration-*.exe')
 $folderAgentPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.exe' -FallbackPatterns @('ironmesh_folder_agent-*.exe', 'ironmesh-folder-agent-*.exe')
+$backgroundLauncherPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.exe' -FallbackPatterns @('ironmesh_background_launcher-*.exe', 'ironmesh-background-launcher-*.exe')
+$configAppPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-config-app.exe' -FallbackPatterns @('ironmesh_config_app-*.exe', 'ironmesh-config-app-*.exe')
 $pdbCandidates = @(
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.pdb' -FallbackPatterns @('windows_thumbnail_provider-*.pdb')
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'os-integration.pdb' -FallbackPatterns @('os_integration-*.pdb', 'os-integration-*.pdb')
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.pdb' -FallbackPatterns @('ironmesh_folder_agent-*.pdb', 'ironmesh-folder-agent-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.pdb' -FallbackPatterns @('ironmesh_background_launcher-*.pdb', 'ironmesh-background-launcher-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-config-app.pdb' -FallbackPatterns @('ironmesh_config_app-*.pdb', 'ironmesh-config-app-*.pdb')
 ) | Where-Object { Test-Path $_ }
 
 if (-not (Test-Path $dllPath)) {
@@ -388,12 +392,20 @@ if (-not (Test-Path $exePath)) {
 if (-not (Test-Path $folderAgentPath)) {
     throw "Expected folder agent EXE not found: $folderAgentPath"
 }
+if (-not (Test-Path $backgroundLauncherPath)) {
+    throw "Expected background launcher EXE not found: $backgroundLauncherPath"
+}
+if (-not (Test-Path $configAppPath)) {
+    throw "Expected config app EXE not found: $configAppPath"
+}
 
 Write-Step 'Staging Store package contents'
 Save-StagedManifest -SourcePath $manifestPath -DestinationPath (Join-Path $stagePath 'AppxManifest.xml') -Version $resolvedVersion
 Copy-Item $dllPath (Join-Path $stagePath 'windows_thumbnail_provider.dll')
 Copy-Item $exePath (Join-Path $stagePath 'os-integration.exe')
 Copy-Item $folderAgentPath (Join-Path $stagePath 'ironmesh-folder-agent.exe')
+Copy-Item $backgroundLauncherPath (Join-Path $stagePath 'ironmesh-background-launcher.exe')
+Copy-Item $configAppPath (Join-Path $stagePath 'ironmesh-config-app.exe')
 Copy-Item $assetsPath (Join-Path $stagePath 'Assets') -Recurse
 
 Write-Step 'Packing MSIX with MakeAppx.exe'

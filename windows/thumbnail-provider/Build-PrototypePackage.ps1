@@ -1,3 +1,44 @@
+<#
+.SYNOPSIS
+Builds, stages, optionally signs, and optionally installs the local IronMesh prototype MSIX package.
+
+.DESCRIPTION
+Run this script from the repository root when testing the packaged Windows prototype.
+
+Common usage:
+
+- Stage package contents only:
+    powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -StageOnly
+
+- Build, pack, sign, and install the debug prototype:
+    powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install
+
+- Build, pack, sign, and install a release prototype:
+    powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Configuration release -Install
+
+- Override the package version explicitly:
+    powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -PackageVersion 1.0.2.0 -Install
+
+Notes:
+
+- Rust/Cargo must be available.
+- Full packing and signing require Windows SDK tools such as MakeAppx.exe and SignTool.exe.
+- -Install may require an elevated PowerShell session so the development certificate can be imported into LocalMachine\TrustedPeople.
+- After installation, launch the packaged IronMesh config app from the Start menu for the normal packaged-client flow.
+
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -StageOnly
+
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install
+
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Configuration release -Install
+
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -PackageVersion 1.0.2.0 -Install
+#>
+
 param(
     [ValidateSet("debug", "release")]
     [string]$Configuration = "debug",
@@ -223,12 +264,19 @@ if (Test-Path $stagePath) {
 }
 New-Item -ItemType Directory -Force -Path $stagePath | Out-Null
 
-$cargoArgs = @("build", "-p", "windows-thumbnail-provider", "-p", "os-integration", "-p", "ironmesh-folder-agent")
+$cargoArgs = @(
+    "build",
+    "-p", "windows-thumbnail-provider",
+    "-p", "os-integration",
+    "-p", "ironmesh-folder-agent",
+    "-p", "ironmesh-background-launcher",
+    "-p", "ironmesh-config-app"
+)
 if ($Configuration -eq "release") {
     $cargoArgs += "--release"
 }
 
-Write-Step "Building windows-thumbnail-provider, os-integration, and ironmesh-folder-agent ($Configuration)"
+Write-Step "Building windows-thumbnail-provider, os-integration, ironmesh-folder-agent, ironmesh-background-launcher, and ironmesh-config-app ($Configuration)"
 if ($PackageVersion) {
     Write-Step "Using explicit package version $resolvedPackageVersion"
 } else {
@@ -241,6 +289,8 @@ $targetDir = if ($Configuration -eq "release") { "release" } else { "debug" }
 $dllPath = Join-Path $cargoTargetDir "$targetDir\\windows_thumbnail_provider.dll"
 $exePath = Join-Path $cargoTargetDir "$targetDir\\os-integration.exe"
 $folderAgentPath = Join-Path $cargoTargetDir "$targetDir\\ironmesh-folder-agent.exe"
+$backgroundLauncherPath = Join-Path $cargoTargetDir "$targetDir\ironmesh-background-launcher.exe"
+$configAppPath = Join-Path $cargoTargetDir "$targetDir\ironmesh-config-app.exe"
 
 if (-not (Test-Path $dllPath)) {
     throw "Expected DLL not found: $dllPath"
@@ -251,12 +301,20 @@ if (-not (Test-Path $exePath)) {
 if (-not (Test-Path $folderAgentPath)) {
     throw "Expected folder agent EXE not found: $folderAgentPath"
 }
+if (-not (Test-Path $backgroundLauncherPath)) {
+    throw "Expected background launcher EXE not found: $backgroundLauncherPath"
+}
+if (-not (Test-Path $configAppPath)) {
+    throw "Expected config app EXE not found: $configAppPath"
+}
 
 Write-Step "Staging package contents under $stagePath"
 Save-StagedManifest -SourcePath $manifestPath -DestinationPath (Join-Path $stagePath "AppxManifest.xml") -Version $resolvedPackageVersion
 Copy-Item $dllPath (Join-Path $stagePath "windows_thumbnail_provider.dll")
 Copy-Item $exePath (Join-Path $stagePath "os-integration.exe")
 Copy-Item $folderAgentPath (Join-Path $stagePath "ironmesh-folder-agent.exe")
+Copy-Item $backgroundLauncherPath (Join-Path $stagePath "ironmesh-background-launcher.exe")
+Copy-Item $configAppPath (Join-Path $stagePath "ironmesh-config-app.exe")
 Copy-Item $assetsPath (Join-Path $stagePath "Assets") -Recurse
 
 $makeAppx = Find-WindowsSdkTool -ToolName "MakeAppx.exe" -PreferredArchitecture $Architecture
