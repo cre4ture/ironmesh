@@ -14,11 +14,11 @@ fn expected_version_outputs(binary_name: &str) -> [String; 2] {
 
 #[test]
 fn version_reports_package_version() {
-    let output = Command::cargo_bin("cli-client")
-        .expect("cli-client binary should build")
+    let output = Command::cargo_bin("ironmesh")
+        .expect("ironmesh binary should build")
         .arg("--version")
         .output()
-        .expect("cli-client --version should run");
+        .expect("ironmesh --version should run");
 
     assert!(output.status.success());
 

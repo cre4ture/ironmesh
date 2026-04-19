@@ -12,14 +12,10 @@ fn expected_version_outputs(binary_name: &str) -> [String; 2] {
     ]
 }
 
-#[cfg(windows)]
-const EXPECTED_NAME: &str = "adapter-windows-cfapi";
-
-#[cfg(not(windows))]
-const EXPECTED_NAME: &str = "adapter-linux-fuse-mount";
+const EXPECTED_NAME: &str = "os-integration";
 
 #[test]
-fn version_reports_nested_platform_cli_package_version() {
+fn version_reports_public_entrypoint_name() {
     let output = Command::cargo_bin("os-integration")
         .expect("os-integration binary should build")
         .arg("--version")

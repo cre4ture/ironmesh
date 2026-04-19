@@ -1313,7 +1313,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
 
     let artifact_path = match name {
         "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_server-node"),
-        "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_cli-client"),
+        "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_ironmesh"),
         "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_os-integration"),
         "ironmesh-folder-agent" => {
             option_env!("CARGO_BIN_FILE_IRONMESH_FOLDER_AGENT_ironmesh-folder-agent")
@@ -1329,7 +1329,14 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     }
 
     let workspace_root = workspace_root()?;
-    let path = workspace_root.join("target").join("debug").join(name);
+    let executable_name = match name {
+        "cli-client" => "ironmesh",
+        _ => name,
+    };
+    let path = workspace_root
+        .join("target")
+        .join("debug")
+        .join(executable_name);
 
     if !path.exists() {
         bail!(

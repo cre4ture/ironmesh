@@ -40,7 +40,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 );
 
 #[derive(Debug, Parser)]
-#[command(name = "adapter-linux-fuse-mount")]
+#[command(name = "os-integration")]
 #[command(about = "Mount an Ironmesh FUSE view from a SyncSnapshot JSON or a live server-node")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]

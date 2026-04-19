@@ -44,15 +44,15 @@ These are the main release-surface candidates already visible in the repo and wo
 
 | Surface | Current state to verify | Why it matters |
 | --- | --- | --- |
-| CLI command name | `apps/cli-client` builds from the `cli-client` package but exposes the user command name `ironmesh` | Scripts, docs, packaging, and support instructions need one stable name |
+| CLI command name | `apps/cli-client` remains the Cargo package name, while the public binary and command name are `ironmesh` | Cargo/package naming can stay internal, but released executable naming must stay stable |
 | Service binary name | `server-node` is both package name and command name | Node automation and cluster tooling will depend on it |
 | Rendezvous service name | `rendezvous-service` is both package name and command name | Deployment and troubleshooting depend on it |
 | Desktop executable set | `ironmesh-config-app`, `ironmesh-background-launcher`, `os-integration`, `ironmesh-folder-agent` are treated as sibling packaged executables | Package layout and launcher behavior become user-visible contracts |
-| Filesystem integration naming | `os-integration` delegates to `adapter-linux-fuse-mount` on Linux and `adapter-windows-cfapi` on Windows | Decide whether adapter-specific names are public or internal-only |
+| Filesystem integration naming | `os-integration` is the intended public wrapper while Linux FUSE and Windows CFAPI adapter names remain implementation details underneath it | Keeping one documented entrypoint avoids support and packaging drift |
 | Windows startup task ID | `IronmeshBackgroundLauncher` is hard-coded | OS-level registration names are expensive to change later |
-| Desktop config path | Windows uses `%LOCALAPPDATA%\Ironmesh\desktop-client-config\instances.json`; Linux uses XDG config for `instances.json` and XDG state for `last-launch-report.json` | Users, scripts, and packaged apps may start depending on these paths |
+| Desktop config path | Windows uses `%LOCALAPPDATA%\Ironmesh\desktop-client-config\instances.json`; Linux uses `$XDG_CONFIG_HOME/ironmesh/desktop-client-config/instances.json` and `$XDG_STATE_HOME/ironmesh/desktop-client-config/last-launch-report.json`, with migration from legacy uppercase XDG roots | Users, scripts, and packaged apps may start depending on these paths |
 | Sync-root local state path | Windows CFAPI uses `%LOCALAPPDATA%\Ironmesh\sync-roots\<label-hash>\...` for `connection-bootstrap.json`, `client-identity.json`, and `desktop-status.json` | This becomes a persistence and migration contract |
-| Folder-agent state root | `sync-agent-core` defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/folder-agent/` | Note the lowercase `ironmesh` root compared with `Ironmesh` elsewhere |
+| Folder-agent state root | `sync-agent-core` defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/folder-agent/` and should stay aligned with the Linux persisted-state root family | Consistent Linux XDG roots reduce migration and support complexity |
 | Bootstrap and identity file naming | Live flows use sibling `*.client-identity.json` discovery, fallback `ironmesh-client-identity.json`, and some Windows flows also refer to `.ironmesh-client-identity.json` | Naming drift here will break enroll/bootstrap reuse and migration |
 | Inter-node identity contract | Peer TLS identity is based on cert SAN values like `urn:ironmesh:node:<uuid>` | This is a core compatibility and security contract |
 | HTTP API versioning | Public routes are currently unversioned | Decide whether unversioned routes are acceptable for v1 or need pre-release versioning |

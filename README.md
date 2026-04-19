@@ -40,7 +40,7 @@ Ironmesh is also a test of what is now possible for an individual builder. AI co
 - `crates/common` — shared models used by all nodes/apps.
 - `crates/client-sdk` — client library with server access + local cache.
 - `apps/server-node` — storage server node.
-- `apps/cli-client` — CLI client and built-in web interface endpoint.
+- `apps/cli-client` — Cargo package for the public `ironmesh` CLI and built-in web interface endpoint.
 - `apps/android-app` — Android-facing Rust app layer.
 - `apps/ios-app` — iOS-facing Rust app layer.
 
@@ -74,7 +74,7 @@ just test-system-nightly-one tests::autonomous_peer_heartbeat_recovers_after_pee
 
 ## System-tests toolchain policy (nightly)
 
-`tests/system-tests` uses Cargo binary artifact dependencies to consume `server-node` and `cli-client` binaries directly during test runs.
+`tests/system-tests` uses Cargo binary artifact dependencies to consume the `server-node` and `ironmesh` binaries directly during test runs.
 
 Why this was chosen:
 
@@ -98,7 +98,7 @@ If you must run with stable for local work, use explicit binaries instead of art
 ```bash
 cargo build -p server-node -p cli-client
 IRONMESH_SERVER_BIN=target/debug/server-node \
-IRONMESH_CLI_BIN=target/debug/cli-client \
+IRONMESH_CLI_BIN=target/debug/ironmesh \
 cargo +stable test -p system-tests
 ```
 
@@ -207,7 +207,7 @@ Notes:
 
 - Live mounts now require client auth when the server protects `/store/*` APIs. In direct mode,
   pass `--client-identity-file`.
-- In bootstrap mode, `adapter-linux-fuse-mount` auto-loads a sibling
+- In bootstrap mode, `os-integration` auto-loads a sibling
   `bootstrap.client-identity.json` when present.
 - `--remote-refresh-interval-ms` controls fallback polling/retry cadence for namespace updates in live modes.
 - Snapshot mode is still available for debugging with `--snapshot-file`.

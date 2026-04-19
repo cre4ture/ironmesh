@@ -187,7 +187,7 @@ Current Linux FUSE interpretation:
   - `crates/adapter-windows-cfapi` runtime with:
     - sync-root registration + placeholder creation,
     - fetch-data hydration callbacks backed by `server-node`,
-    - registration utility binary: `adapter-windows-cfapi-register`,
+    - registration helper implementation in `crates/adapter-windows-cfapi/src/register.rs`,
     - remote namespace refresh via server notifications first, with polling fallback.
   - Shared polling abstraction in `crates/client-sdk/src/remote_sync.rs`:
     - SDK-owned polling thread (`RemoteSnapshotPoller`),

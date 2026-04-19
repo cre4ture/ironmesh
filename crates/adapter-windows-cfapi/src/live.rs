@@ -300,15 +300,15 @@ pub fn normalize_base_url(input: &str) -> Result<Url> {
     normalize_server_base_url(input)
 }
 
+const WINDOWS_LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
+const WINDOWS_DOWNLOAD_STAGE_SUBDIR: &str = "cfapi-downloads";
+
 pub fn windows_download_stage_root(scope: &str) -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let path = base
-        .join("ironmesh")
-        .join("cfapi-downloads")
-        .join(download_scope_label(scope));
+    let path = windows_download_stage_base_root(base).join(download_scope_label(scope));
     fs::create_dir_all(&path)
         .with_context(|| format!("failed to create download stage root {}", path.display()))?;
     Ok(path)
@@ -322,6 +322,11 @@ fn download_scope_label(scope: &str) -> String {
     blake3::hash(scope.as_bytes()).to_hex().to_string()
 }
 
+fn windows_download_stage_base_root(base: PathBuf) -> PathBuf {
+    base.join(WINDOWS_LOCAL_STATE_ROOT_DIR)
+        .join(WINDOWS_DOWNLOAD_STAGE_SUBDIR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +335,14 @@ mod tests {
     fn base_url_normalization_adds_scheme_and_trailing_slash() {
         let url = normalize_base_url("127.0.0.1:18080").expect("url should be valid");
         assert_eq!(url.as_str(), "http://127.0.0.1:18080/");
+    }
+
+    #[test]
+    fn windows_download_stage_root_uses_ironmesh_localappdata_root() {
+        let base = PathBuf::from("C:/Users/Example/AppData/Local");
+        assert_eq!(
+            windows_download_stage_base_root(base.clone()),
+            base.join("Ironmesh").join("cfapi-downloads")
+        );
     }
 }
