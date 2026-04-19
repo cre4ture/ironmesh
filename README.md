@@ -274,6 +274,13 @@ The env vars referenced in the tuning subsections below are current operational 
 - `ironmesh serve-web` provides an interactive web UI for upload/download, key browsing, health checks, and replication-plan inspection.
 	- Web backend routes and static assets are provided by `crates/web-ui-backend`.
 
+### CLI connection flags
+
+- `ironmesh`, `ironmesh-os-integration`, and `ironmesh-folder-agent` should all treat `--server-base-url` as the canonical direct-connection flag.
+- `--bootstrap-file` is the canonical bootstrap-driven alternative across those clients.
+- `--client-identity-file` and `--server-ca-pem-file` remain the canonical explicit auth and CA override flags for these direct/bootstrap flows.
+- `ironmesh` still accepts legacy `--server-url` as a compatibility alias, but release-facing docs and automation should move to `--server-base-url`.
+
 ### Reconciliation and maintenance
 
 - Cluster node membership endpoints:

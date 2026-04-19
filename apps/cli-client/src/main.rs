@@ -66,8 +66,8 @@ struct LatencyTestSuiteResult {
 #[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]
 struct Cli {
-    #[arg(long)]
-    server_url: Option<String>,
+    #[arg(long = "server-base-url", alias = "server-url")]
+    server_base_url: Option<String>,
     #[arg(long)]
     bootstrap_file: Option<PathBuf>,
     #[arg(long)]
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
     info!(
         command = command_name(&cli.command),
         connection_source = connection_source(&cli),
-        server_url = cli.server_url.as_deref().unwrap_or("<none>"),
+        server_base_url = cli.server_base_url.as_deref().unwrap_or("<none>"),
         bootstrap_file = path_for_log(cli.bootstrap_file.as_deref()),
         client_identity_file = path_for_log(configured_client_identity_path(&cli).as_deref()),
         server_ca_pem_file = path_for_log(cli.server_ca_pem_file.as_deref()),
@@ -240,7 +240,7 @@ async fn main() -> Result<()> {
                 connection_source = connection_source(&cli),
                 "starting cli web interface"
             );
-            let web_ui_config = if cli.server_url.is_some() || cli.bootstrap_file.is_some() {
+            let web_ui_config = if cli.server_base_url.is_some() || cli.bootstrap_file.is_some() {
                 let client = build_authenticated_sdk_from_cli(&cli).await?;
                 log_client_transport_ready("serve_web", &client);
                 let mut web_ui_config = WebUiConfig::from_client(client);
@@ -267,7 +267,7 @@ async fn main() -> Result<()> {
             } else {
                 warn!(
                     bind_addr = %bind_addr,
-                    "starting web interface without bootstrap or server URL; UI will begin disconnected"
+                    "starting web interface without bootstrap or direct server base URL; UI will begin disconnected"
                 );
                 WebUiConfig::new("http://127.0.0.1:9")
             }
@@ -340,8 +340,8 @@ async fn enroll_from_bootstrap(
     device_id: Option<&str>,
     label: Option<&str>,
 ) -> Result<()> {
-    if cli.server_url.is_some() {
-        bail!("enroll requires --bootstrap-file and does not accept --server-url");
+    if cli.server_base_url.is_some() {
+        bail!("enroll requires --bootstrap-file and does not accept --server-base-url");
     }
 
     let bootstrap_path = cli
@@ -416,18 +416,18 @@ fn build_authenticated_sdk_from_cli_blocking(cli: &Cli) -> Result<IronMeshClient
         return Ok(client);
     }
 
-    let server_url = cli
-        .server_url
+    let server_base_url = cli
+        .server_base_url
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("set either --bootstrap-file or --server-url"))?;
-    let base_url = normalize_server_base_url(server_url)?;
+        .ok_or_else(|| anyhow::anyhow!("set either --bootstrap-file or --server-base-url"))?;
+    let base_url = normalize_server_base_url(server_base_url)?;
     info!(
-        server_url = %base_url,
+        server_base_url = %base_url,
         client_identity_file = path_for_log(client_identity_path.as_deref()),
         server_ca_pem_file = path_for_log(cli.server_ca_pem_file.as_deref()),
         authenticated,
         client_device_id,
-        "building authenticated client from direct server URL"
+        "building authenticated client from direct server base URL"
     );
     let client = match client_identity.as_ref() {
         Some(identity) => build_http_client_with_identity_from_pem(
@@ -948,8 +948,8 @@ fn command_name(command: &Commands) -> &'static str {
 fn connection_source(cli: &Cli) -> &'static str {
     if cli.bootstrap_file.is_some() {
         "bootstrap"
-    } else if cli.server_url.is_some() {
-        "server_url"
+    } else if cli.server_base_url.is_some() {
+        "server_base_url"
     } else {
         "none"
     }
@@ -1059,4 +1059,44 @@ fn unix_ts_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_accepts_server_base_url_flag() {
+        let cli = Cli::try_parse_from([
+            "ironmesh",
+            "--server-base-url",
+            "http://127.0.0.1:8080",
+            "health",
+        ])
+        .expect("canonical direct flag should parse");
+
+        assert_eq!(
+            cli.server_base_url.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(connection_source(&cli), "server_base_url");
+    }
+
+    #[test]
+    fn cli_accepts_legacy_server_url_alias() {
+        let cli = Cli::try_parse_from([
+            "ironmesh",
+            "--server-url",
+            "http://127.0.0.1:8080",
+            "health",
+        ])
+        .expect("legacy direct flag alias should parse");
+
+        assert_eq!(
+            cli.server_base_url.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(connection_source(&cli), "server_base_url");
+    }
 }

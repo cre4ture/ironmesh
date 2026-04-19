@@ -107,7 +107,7 @@ In practice, this means the peer/client transport work should land before large 
 | `crates/server-node-sdk/src/storage.rs` | `DeviceAuthRecord { public_key_pem, issued_credential_pem, ... }` | `ClientCredentialRecord { public key or cert fingerprint, ... }` | The live auth path is credential-based now; persisted naming is aligned and fingerprint metadata is exposed, with only optional schema hardening left. |
 | `crates/adapter-windows-cfapi/src/connection_config.rs` | direct base URL + pairing bootstrap resolution | bootstrap-driven transport config | Windows adapter should consume the same transport stack as other clients. |
 | `apps/android-app/src/lib.rs` | JNI functions taking `base_url`, `server_ca_pem`, `auth_token` | JNI functions taking bootstrap or persisted client identity handle | Mobile bindings should stop wiring direct URL and bearer token everywhere. |
-| `apps/cli-client/src/main.rs` | `--server-url` | `--bootstrap` or `--rendezvous-url` based startup | CLI should exercise the same connection model as real clients. |
+| `apps/cli-client/src/main.rs` | `--server-base-url` (legacy alias: `--server-url`) | `--bootstrap` or `--rendezvous-url` based startup | CLI should exercise the same connection model as real clients. |
 
 ## 5. New crate layout
 
@@ -242,7 +242,7 @@ Recommended responsibilities:
 ### `apps/cli-client`
 
 - [x] Update normal CLI data and read-only commands to use bootstrap-aware client construction instead of resolving one direct URL up front.
-- [ ] Replace `--server-url` in `apps/cli-client/src/main.rs` with bootstrap- or rendezvous-based startup inputs.
+- [ ] Retire the legacy `--server-url` alias in `apps/cli-client/src/main.rs` once bootstrap- or rendezvous-based startup fully replaces direct base-URL startup.
 - [x] Update `serve-web` wiring so the embedded web UI also talks through the new client transport stack.
 
 ### `crates/adapter-windows-cfapi`
