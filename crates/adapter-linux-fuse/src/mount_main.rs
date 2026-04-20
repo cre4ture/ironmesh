@@ -1289,8 +1289,8 @@ mod tests {
     fn client_rights_edge_range_hydration_uses_placeholder_version_selector() {
         assert_recorded_range_hydration_requests(
             "v1:size=22",
-            "HEAD /store/docs%2Fphoto.jpg?version=v1 HTTP/1.1",
-            "GET /store/docs%2Fphoto.jpg?version=v1 HTTP/1.1",
+            "HEAD /api/v1/store/docs%2Fphoto.jpg?version=v1 HTTP/1.1",
+            "GET /api/v1/store/docs%2Fphoto.jpg?version=v1 HTTP/1.1",
             "\r\nrange: bytes=0-21\r\n",
         );
     }
@@ -1299,8 +1299,8 @@ mod tests {
     fn client_rights_edge_range_hydration_omits_server_head_placeholder_selector() {
         assert_recorded_range_hydration_requests(
             "server-head:size=22",
-            "HEAD /store/docs%2Fphoto.jpg HTTP/1.1",
-            "GET /store/docs%2Fphoto.jpg HTTP/1.1",
+            "HEAD /api/v1/store/docs%2Fphoto.jpg HTTP/1.1",
+            "GET /api/v1/store/docs%2Fphoto.jpg HTTP/1.1",
             "\r\nrange: bytes=0-21\r\n",
         );
     }
@@ -1381,8 +1381,8 @@ mod tests {
 
         let recorded_requests = requests.lock().expect("request log lock should succeed");
         assert_eq!(recorded_requests.len(), 2);
-        assert!(recorded_requests[0].starts_with("HEAD /store/docs%2Fphoto.jpg HTTP/1.1"));
-        assert!(recorded_requests[1].starts_with("GET /store/docs%2Fphoto.jpg HTTP/1.1"));
+        assert!(recorded_requests[0].starts_with("HEAD /api/v1/store/docs%2Fphoto.jpg HTTP/1.1"));
+        assert!(recorded_requests[1].starts_with("GET /api/v1/store/docs%2Fphoto.jpg HTTP/1.1"));
 
         let _ = fs::remove_dir_all(&state_dir);
         let _ = fs::remove_dir_all(&stage_dir);
