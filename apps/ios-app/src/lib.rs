@@ -818,17 +818,17 @@ mod tests {
 
     fn test_router(state: TestServerState) -> Router {
         Router::new()
-            .route("/store/index", get(list_store_index))
-            .route("/store/delete", post(delete_by_query))
-            .route("/store/rename", post(rename_path))
+            .route("/api/v1/store/index", get(list_store_index))
+            .route("/api/v1/store/delete", post(delete_by_query))
+            .route("/api/v1/store/rename", post(rename_path))
             .route(
-                "/store/{*key}",
+                "/api/v1/store/{*key}",
                 put(put_object)
                     .get(get_object)
                     .head(head_object)
                     .delete(delete_object),
             )
-            .route("/versions/{*key}", get(list_versions))
+            .route("/api/v1/versions/{*key}", get(list_versions))
             .with_state(state)
     }
 
