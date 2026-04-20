@@ -255,9 +255,9 @@ Primary repo areas:
 
 Checklist:
 
-- [ ] Enumerate stable or semi-stable persisted files by platform, including `instances.json`, `last-launch-report.json`, `connection-bootstrap.json`, `client-identity.json`, `desktop-status.json`, GNOME status JSON, and the folder-agent SQLite files.
-- [ ] Decide whether path-root casing differences such as `Ironmesh` versus `ironmesh` are intentional release contracts or inconsistencies to fix before release.
-- [ ] Review migration behavior for legacy paths such as `windows-client-config` and older bootstrap or identity-file discovery names.
+- [x] Enumerate stable or semi-stable persisted files by platform, including `instances.json`, `last-launch-report.json`, `connection-bootstrap.json`, `client-identity.json`, `desktop-status.json`, GNOME status JSON, and the folder-agent SQLite files.
+- [x] Decide whether path-root casing differences such as `Ironmesh` versus `ironmesh` are intentional release contracts or inconsistencies to fix before release.
+- [x] Review migration behavior for legacy paths such as `windows-client-config` and older bootstrap or identity-file discovery names.
 - [x] Review JSON and SQLite format stability, including whether explicit schema or format version markers are needed before release.
 - [x] Keep stable JSON stores on explicit format markers; `instances.json` and `last-launch-report.json` currently use `version: 1` with compatibility for missing legacy versions.
 - [x] Confirm compatibility behavior for SQLite stores that now persist explicit schema markers, including legacy databases that predate the marker rows.
@@ -267,24 +267,46 @@ Working evidence log:
 
 - Reviewed paths:
    - [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs)
+   - [crates/adapter-windows-cfapi/src/local_state.rs](../crates/adapter-windows-cfapi/src/local_state.rs)
+   - [crates/adapter-windows-cfapi/src/auth.rs](../crates/adapter-windows-cfapi/src/auth.rs)
+   - [crates/adapter-linux-fuse/src/mount_main.rs](../crates/adapter-linux-fuse/src/mount_main.rs)
+   - [crates/desktop-status/src/gnome.rs](../crates/desktop-status/src/gnome.rs)
+   - [crates/sync-agent-core/src/folder_agent_state.rs](../crates/sync-agent-core/src/folder_agent_state.rs)
    - [crates/client-sdk/src/content_addressed_client_cache.rs](../crates/client-sdk/src/content_addressed_client_cache.rs)
    - [crates/server-node-sdk/src/storage/sqlite_impl.rs](../crates/server-node-sdk/src/storage/sqlite_impl.rs)
    - [docs/backwards-compatibility-aliases.md](backwards-compatibility-aliases.md)
+   - [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md)
    - [docs/windows-msix-release-update-strategy.md](windows-msix-release-update-strategy.md)
 - Confirmed stable contracts:
    - `instances.json` and `last-launch-report.json` now persist top-level `version: 1` and accept missing version in legacy files.
    - The client content cache and server metadata SQLite stores now persist explicit `schema_version` markers and treat missing legacy marker rows as current while rejecting future versions.
-   - Desktop config roots remain `%LOCALAPPDATA%\Ironmesh\desktop-client-config\...` on Windows and XDG `ironmesh/...` roots on Linux, with migration from older legacy roots still in place.
+   - Desktop config roots remain `%LOCALAPPDATA%\Ironmesh\desktop-client-config\...` on Windows and XDG `ironmesh/...` roots on Linux; that casing split is now treated as an intentional OS-specific release contract, with migration from older legacy roots still in place.
+
+  | Platform | Path / file family | Classification | Format / derivation | Compatibility / migration notes |
+  | --- | --- | --- | --- | --- |
+  | Windows | `%LOCALAPPDATA%\Ironmesh\desktop-client-config\instances.json` | `public stable` | JSON with top-level `version: 1` | Migrates from `%LOCALAPPDATA%\Ironmesh\windows-client-config\instances.json` |
+  | Windows | `%LOCALAPPDATA%\Ironmesh\desktop-client-config\last-launch-report.json` | `stable internal` | JSON with top-level `version: 1` | Migrates from `%LOCALAPPDATA%\Ironmesh\windows-client-config\last-launch-report.json` |
+  | Windows | `%LOCALAPPDATA%\Ironmesh\sync-roots\<sanitized-leaf>-<blake3(normalized-sync-root)>\{connection-bootstrap.json, client-identity.json, desktop-status.json}` | `semi-stable` | Directory label is deterministic from the normalized sync-root path plus the leaf name | Current release-facing persisted sync-root state; preferred names are `connection-bootstrap.json` and `client-identity.json` |
+  | Windows | hidden `*.ironmesh-connection.json` and `*.ironmesh-client-identity.json` discovery names | `legacy/internal` | Legacy hidden filenames | Keep out of release-facing docs; use only as compatibility readers if still needed |
+  | Windows | `%LOCALAPPDATA%\Ironmesh\thumbnail-cache` and `%LOCALAPPDATA%\Ironmesh\thumbnail-provider.log` | `stable internal` | Packaged runtime cache and diagnostics | Explicitly documented as out-of-package mutable state in the Windows MSIX strategy |
+  | Linux | `${XDG_CONFIG_HOME:-$HOME/.config}/ironmesh/desktop-client-config/instances.json` | `public stable` | JSON with top-level `version: 1` | Lower-case XDG root is intentional on Linux |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/desktop-client-config/last-launch-report.json` | `stable internal` | JSON with top-level `version: 1` | Lower-case XDG root is intentional on Linux |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/os-integration/client-rights-edge/<sanitized-scope>/state/{pending-mutations.json, remote-snapshot.json}` plus sibling `staged/`, `upload-state/`, and `object-cache/` | `semi-stable root, private internal contents` | Root is derived from direct URL or bootstrap path, prefix, and mountpoint; contents are implementation detail | `--client-edge-state-dir` overrides the default root |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/os-integration/downloads/<blake3(scope)>/` | `private implementation` | Deterministic blake3 hash of connection target, prefix, and mountpoint | Download staging only |
+  | Linux | `${XDG_RUNTIME_DIR}/ironmesh/gnome-status.json` | `semi-stable` | Desktop-status JSON document | `--gnome-status-file` overrides the default runtime path |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/folder-agent/profiles/<scope_fingerprint>/{baseline.sqlite, modification-log.sqlite}` | `semi-stable` | SQLite baseline plus modification log under a derived per-profile directory | Derivation reviewed below; current fingerprint implementation is not yet a frozen release contract |
 - Findings:
-   - `question`: the repo still needs one explicit platform-by-platform persisted-file matrix that covers GNOME status JSON, sync-root local state files, and folder-agent SQLite state alongside the versioned stores above.
-   - `minor`: the new format markers are now explicit for the reviewed stores, but the remaining path and file inventory is still spread across implementation code and strategy docs.
+   - `major`: [crates/sync-agent-core/src/folder_agent_state.rs](../crates/sync-agent-core/src/folder_agent_state.rs) derives `profiles/<scope_fingerprint>/` with Rust `DefaultHasher`. That hash function is not an explicit cross-release compatibility contract, so folder-agent profile directory names can drift across toolchain or standard-library changes and orphan `baseline.sqlite` plus `modification-log.sqlite` state.
+   - `minor`: the Windows sync-root state family is on current release-facing names (`connection-bootstrap.json`, `client-identity.json`, `desktop-status.json`), but legacy hidden `.ironmesh-*` discovery names still exist in implementation and should remain compatibility-only.
 - Missing tests or docs:
-   - The persisted-file compatibility matrix is still missing.
-   - Deterministic derived-path rules still need one place where they are documented for release review.
+   - Add an explicit regression test or helper contract for folder-agent profile path derivation before freezing the persisted-path surface.
+   - If legacy hidden Windows discovery names remain supported through release, add them to [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) instead of leaving them implicit in implementation code.
 - Proposed pre-release actions:
-   - Extend this pass into a platform-by-platform persisted-file matrix and keep [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) as the cleanup ledger for any retained legacy readers.
+   - Replace the `DefaultHasher`-based folder-agent `scope_fingerprint` with an explicitly stable digest, or add a migration plan that carries existing profile directories forward.
+   - Keep the Windows `Ironmesh` root and Linux `ironmesh` XDG roots as intentional OS-specific contracts, and keep [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) as the cleanup ledger for retained legacy readers.
 - Deferred post-release items:
    - Remove missing-version compatibility paths only after the supported upgrade window no longer requires reading pre-marker files or databases.
+   - Remove legacy hidden Windows bootstrap and identity discovery names once the compatibility window closes.
 
 Exit criteria:
 
