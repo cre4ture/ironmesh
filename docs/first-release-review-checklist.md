@@ -61,6 +61,8 @@ These are the main release-surface candidates already visible in the repo and wo
 | Managed rendezvous failover package JSON | Export/import packages should keep top-level fields `version`, `cluster_id`, `source_node_id`, `target_node_id`, `exported_at_unix`, `public_url`, `pbkdf2_rounds`, `salt_b64`, `nonce_b64`, and `ciphertext_b64` stable; the encrypted payload should continue carrying the standalone mTLS client CA plus the server cert and key | Failover handoff files become an operator disaster-recovery contract |
 | Inter-node identity contract | Peer TLS identity is based on cert SAN values like `urn:ironmesh:node:<uuid>` | This is a core compatibility and security contract |
 | HTTP API versioning | Public routes are currently unversioned | Decide whether unversioned routes are acceptable for v1 or need pre-release versioning |
+| Client-facing JSON error shape | Current v1 error bodies stay on the top-level `{ "error": "<message>" }` envelope across server-node and bundled web routes | Bundled clients and external tooling need one predictable error body while routes remain unversioned |
+| Desktop managed JSON schema markers | `instances.json` and `last-launch-report.json` persist top-level `version: 1` and accept missing version from older files | Desktop state needs an explicit migration marker before release |
 | Windows package identity | The Store/MSIX strategy doc now treats the reserved Partner Center identity as fixed | Package identity stability affects install/update continuity |
 
 ## Suggested Review Split
@@ -138,6 +140,7 @@ Checklist:
 - [ ] Review `ConnectionBootstrap`, client enrollment, bootstrap-claim redemption, direct-vs-relay target selection, and client identity loading.
 - [ ] Decide whether `web-ui-backend` routes are part of the stable release surface or only internal to bundled tools.
 - [ ] Review whether unversioned HTTP routes and JSON payloads are acceptable for the first release or need a versioning story before release.
+- [ ] Freeze the first-release JSON error envelope, currently top-level `{ "error": string }`, unless route versioning or a richer typed error contract lands before release.
 - [ ] Map every stable client-facing route and payload to existing automated tests or create missing-test follow-ups.
 
 Exit criteria:
@@ -185,6 +188,8 @@ Checklist:
 - [ ] Decide whether path-root casing differences such as `Ironmesh` versus `ironmesh` are intentional release contracts or inconsistencies to fix before release.
 - [ ] Review migration behavior for legacy paths such as `windows-client-config` and older bootstrap or identity-file discovery names.
 - [ ] Review JSON and SQLite format stability, including whether explicit schema or format version markers are needed before release.
+- [ ] Keep stable JSON stores on explicit format markers; `instances.json` and `last-launch-report.json` currently use `version: 1` with compatibility for missing legacy versions.
+- [ ] Review remaining SQLite stores without explicit schema markers, especially the client cache and server metadata DBs, and decide whether they need a pre-release schema-version table or an explicit compatibility waiver.
 - [ ] Verify deterministic path derivation where state directories are keyed by sync-root path hashing or other derived labels.
 
 Exit criteria:

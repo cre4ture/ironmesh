@@ -558,8 +558,19 @@ struct WebLatencyProbeResponse {
     comparison: Option<LatencyProbeComparison>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ErrorResponseBody {
+    error: String,
+}
+
 fn error_response(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
-    (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
+    (
+        status,
+        Json(ErrorResponseBody {
+            error: message.into(),
+        }),
+    )
+        .into_response()
 }
 
 async fn fetch_server_json(state: &WebState, path: &str) -> Result<serde_json::Value> {
@@ -2606,7 +2617,9 @@ async fn web_update_rendezvous(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_store_restore_path;
+    use super::{ErrorResponseBody, error_response, normalize_store_restore_path};
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
 
     #[test]
     fn normalize_store_restore_path_distinguishes_files_and_prefixes() {
@@ -2623,5 +2636,25 @@ mod tests {
             "docs/archive/"
         );
         assert_eq!(normalize_store_restore_path("   ", false), "");
+    }
+
+    #[tokio::test]
+    async fn error_response_preserves_public_json_contract() {
+        let response = error_response(StatusCode::BAD_REQUEST, "bad input");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body should be readable");
+        let payload: ErrorResponseBody =
+            serde_json::from_slice(&body).expect("error response should be valid json");
+
+        assert_eq!(
+            payload,
+            ErrorResponseBody {
+                error: "bad input".to_string(),
+            }
+        );
     }
 }

@@ -52,13 +52,28 @@ const CONFIG_SUBDIR: &str = "windows-client-config";
 const CONFIG_SUBDIR: &str = "desktop-client-config";
 const INSTANCE_STORE_FILE_NAME: &str = "instances.json";
 const LAST_LAUNCH_REPORT_FILE_NAME: &str = "last-launch-report.json";
+const MANAGED_INSTANCE_STORE_VERSION: u32 = 1;
+const LAUNCH_REPORT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedInstanceStore {
+    #[serde(default = "managed_instance_store_version")]
+    pub version: u32,
     #[serde(default)]
     pub os_integration_instances: Vec<OsIntegrationInstance>,
     #[serde(default)]
     pub folder_agent_instances: Vec<FolderAgentInstance>,
+}
+
+
+impl Default for ManagedInstanceStore {
+    fn default() -> Self {
+        Self {
+            version: MANAGED_INSTANCE_STORE_VERSION,
+            os_integration_instances: Vec::new(),
+            folder_agent_instances: Vec::new(),
+        }
+    }
 }
 
 impl ManagedInstanceStore {
@@ -73,15 +88,32 @@ impl ManagedInstanceStore {
             return Ok(Self::default());
         }
 
-        serde_json::from_str(&raw)
-            .with_context(|| format!("failed parsing managed instance store {}", path.display()))
+        let store: ManagedInstanceStore = serde_json::from_str(&raw)
+            .with_context(|| format!("failed parsing managed instance store {}", path.display()))?;
+        store.validate_version(path)?;
+        Ok(store)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         ensure_parent_dir(path)?;
-        let payload = serde_json::to_vec_pretty(self).context("failed serializing managed instance store")?;
+        let mut store = self.clone();
+        store.version = MANAGED_INSTANCE_STORE_VERSION;
+        let payload = serde_json::to_vec_pretty(&store)
+            .context("failed serializing managed instance store")?;
         fs::write(path, payload)
             .with_context(|| format!("failed writing managed instance store {}", path.display()))
+    }
+
+    fn validate_version(&self, path: &Path) -> Result<()> {
+        if self.version != MANAGED_INSTANCE_STORE_VERSION {
+            bail!(
+                "unsupported managed instance store version {} in {} (current={})",
+                self.version,
+                path.display(),
+                MANAGED_INSTANCE_STORE_VERSION
+            );
+        }
+        Ok(())
     }
 
     pub fn upsert_os_integration(&mut self, instance: OsIntegrationInstance) {
@@ -396,15 +428,17 @@ impl FolderAgentInstance {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaunchReport {
+    #[serde(default = "launch_report_version")]
+    pub version: u32,
     pub launched_at_unix_ms: u64,
     pub package_root: String,
     pub total_enabled: usize,
     pub outcomes: Vec<LaunchOutcome>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaunchOutcome {
     pub instance_kind: String,
     pub id: String,
@@ -458,14 +492,18 @@ pub fn load_last_launch_report(path: &Path) -> Result<Option<LaunchReport>> {
         return Ok(None);
     }
 
-    serde_json::from_str(&raw)
-        .with_context(|| format!("failed parsing launch report {}", path.display()))
-        .map(Some)
+    let report: LaunchReport = serde_json::from_str(&raw)
+        .with_context(|| format!("failed parsing launch report {}", path.display()))?;
+    validate_launch_report_version(&report, path)?;
+    Ok(Some(report))
 }
 
 pub fn save_launch_report(path: &Path, report: &LaunchReport) -> Result<()> {
     ensure_parent_dir(path)?;
-    let payload = serde_json::to_vec_pretty(report).context("failed serializing launch report")?;
+    let mut report = report.clone();
+    report.version = LAUNCH_REPORT_VERSION;
+    let payload =
+        serde_json::to_vec_pretty(&report).context("failed serializing launch report")?;
     fs::write(path, payload)
         .with_context(|| format!("failed writing launch report {}", path.display()))
 }
@@ -526,6 +564,7 @@ pub fn launch_enabled_instances(store: &ManagedInstanceStore, package_root: &Pat
     }
 
     LaunchReport {
+        version: LAUNCH_REPORT_VERSION,
         launched_at_unix_ms: unix_ts_ms(),
         package_root: package_root.display().to_string(),
         total_enabled: outcomes.len(),
@@ -673,4 +712,199 @@ fn unix_ts_ms() -> u64 {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn managed_instance_store_version() -> u32 {
+    MANAGED_INSTANCE_STORE_VERSION
+}
+
+fn launch_report_version() -> u32 {
+    LAUNCH_REPORT_VERSION
+}
+
+fn validate_launch_report_version(report: &LaunchReport, path: &Path) -> Result<()> {
+    if report.version != LAUNCH_REPORT_VERSION {
+        bail!(
+            "unsupported launch report version {} in {} (current={})",
+            report.version,
+            path.display(),
+            LAUNCH_REPORT_VERSION
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "windows-client-config-{prefix}-{}-{}",
+            std::process::id(),
+            unix_ts_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should create");
+        dir.join("state.json")
+    }
+
+    #[test]
+    fn managed_instance_store_roundtrip_persists_version() {
+        let path = temp_path("instance-store-roundtrip");
+        let store = ManagedInstanceStore {
+            os_integration_instances: vec![OsIntegrationInstance {
+                id: "os-1".to_string(),
+                label: "Docs".to_string(),
+                enabled: true,
+                sync_root_id: None,
+                display_name: None,
+                root_path: "C:/Docs".to_string(),
+                server_base_url: Some("https://node.example".to_string()),
+                prefix: None,
+                bootstrap_file: None,
+                snapshot_file: None,
+                client_identity_file: None,
+                server_ca_path: None,
+                client_edge_state_dir: None,
+                fs_name: None,
+                allow_other: false,
+                publish_gnome_status: false,
+                gnome_status_file: None,
+                remote_refresh_interval_ms: None,
+                remote_status_poll_interval_ms: None,
+                depth: None,
+            }],
+            ..ManagedInstanceStore::default()
+        };
+
+        store.save(&path).expect("store should save");
+        let loaded = ManagedInstanceStore::load_or_default(&path).expect("store should load");
+
+        assert_eq!(loaded.version, MANAGED_INSTANCE_STORE_VERSION);
+        assert_eq!(loaded.os_integration_instances.len(), 1);
+        assert!(loaded.folder_agent_instances.is_empty());
+        assert_eq!(loaded.os_integration_instances[0].id, "os-1");
+        assert_eq!(loaded.os_integration_instances[0].label, "Docs");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn managed_instance_store_accepts_legacy_missing_version() {
+        let path = temp_path("instance-store-legacy");
+        std::fs::write(
+            &path,
+            r#"{
+  "os_integration_instances": [],
+  "folder_agent_instances": []
+}"#,
+        )
+        .expect("legacy store should write");
+
+        let loaded = ManagedInstanceStore::load_or_default(&path).expect("legacy store should load");
+
+        assert_eq!(loaded.version, MANAGED_INSTANCE_STORE_VERSION);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn managed_instance_store_rejects_future_version() {
+        let path = temp_path("instance-store-future");
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 99,
+  "os_integration_instances": [],
+  "folder_agent_instances": []
+}"#,
+        )
+        .expect("future store should write");
+
+        let err = ManagedInstanceStore::load_or_default(&path)
+            .expect_err("future store version should fail");
+        assert!(err.to_string().contains("unsupported managed instance store version 99"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn launch_report_roundtrip_persists_version() {
+        let path = temp_path("launch-report-roundtrip");
+        let report = LaunchReport {
+            version: LAUNCH_REPORT_VERSION,
+            launched_at_unix_ms: 1,
+            package_root: "C:/Ironmesh".to_string(),
+            total_enabled: 1,
+            outcomes: vec![LaunchOutcome {
+                instance_kind: "folder-agent".to_string(),
+                id: "folder-1".to_string(),
+                label: "Folder".to_string(),
+                executable: "C:/Ironmesh/ironmesh-folder-agent.exe".to_string(),
+                command_line: vec!["--root-dir".to_string(), "C:/Data".to_string()],
+                pid: Some(42),
+                error: None,
+            }],
+        };
+
+        save_launch_report(&path, &report).expect("launch report should save");
+        let loaded = load_last_launch_report(&path)
+            .expect("launch report should load")
+            .expect("launch report should exist");
+
+        assert_eq!(loaded, report);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn launch_report_accepts_legacy_missing_version() {
+        let path = temp_path("launch-report-legacy");
+        std::fs::write(
+            &path,
+            r#"{
+  "launched_at_unix_ms": 1,
+  "package_root": "C:/Ironmesh",
+  "total_enabled": 0,
+  "outcomes": []
+}"#,
+        )
+        .expect("legacy launch report should write");
+
+        let loaded = load_last_launch_report(&path)
+            .expect("legacy launch report should load")
+            .expect("launch report should exist");
+
+        assert_eq!(loaded.version, LAUNCH_REPORT_VERSION);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn launch_report_rejects_future_version() {
+        let path = temp_path("launch-report-future");
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 99,
+  "launched_at_unix_ms": 1,
+  "package_root": "C:/Ironmesh",
+  "total_enabled": 0,
+  "outcomes": []
+}"#,
+        )
+        .expect("future launch report should write");
+
+        let err = load_last_launch_report(&path)
+            .expect_err("future launch report version should fail");
+        assert!(err.to_string().contains("unsupported launch report version 99"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = path.parent().map(std::fs::remove_dir_all);
+    }
 }

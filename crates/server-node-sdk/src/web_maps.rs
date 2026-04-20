@@ -3,7 +3,7 @@ use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
     CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -31,6 +31,11 @@ pub(crate) struct WebMapMbtilesMetadataResponse {
     maxzoom: Option<u8>,
     name: Option<String>,
     version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ErrorResponseBody {
+    error: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -493,7 +498,13 @@ pub(crate) async fn read_logical_range_bytes_from_store(
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(json!({ "error": message.into() }))).into_response()
+    (
+        status,
+        Json(ErrorResponseBody {
+            error: message.into(),
+        }),
+    )
+        .into_response()
 }
 
 fn validate_manifest_key(raw: &str) -> std::result::Result<String, (StatusCode, String)> {
@@ -634,6 +645,33 @@ fn validate_split_logical_file_manifest(
     }
 
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorResponseBody, error_response};
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn error_response_preserves_public_json_contract() {
+        let response = error_response(StatusCode::BAD_REQUEST, "bad manifest");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body should be readable");
+        let payload: ErrorResponseBody =
+            serde_json::from_slice(&body).expect("error response should be valid json");
+
+        assert_eq!(
+            payload,
+            ErrorResponseBody {
+                error: "bad manifest".to_string(),
+            }
+        );
+    }
 }
 
 async fn load_split_logical_file_manifest(
