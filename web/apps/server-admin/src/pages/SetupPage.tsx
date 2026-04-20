@@ -280,7 +280,7 @@ async function waitForRuntimeTransition(
   for (let attempt = 0; attempt < 30; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
     try {
-      const response = await fetch("/auth/admin/session", {
+      const response = await fetch("/api/v1/auth/admin/session", {
         cache: "no-store",
         credentials: "same-origin"
       });

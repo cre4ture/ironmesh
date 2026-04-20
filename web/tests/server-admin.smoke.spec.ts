@@ -2,8 +2,14 @@ import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
+const API_V1_PREFIX = "/api/v1";
+
+function apiV1(path: string): string {
+  return `${API_V1_PREFIX}${path}`;
+}
+
 test("server-admin runtime smoke flow renders and navigates", async ({ page }) => {
-  await installServerAdminMocks(page);
+  const mockState = await installServerAdminMocks(page);
 
   await page.goto("/");
 
@@ -156,6 +162,31 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByLabel("Passphrase").nth(3).fill("promotion-passphrase");
   await page.getByRole("button", { name: "Import promotion package" }).click();
   await expect(page.getByText("tls/cluster-ca.pem")).toBeVisible();
+
+  const requestedPaths = mockState.requestedPaths();
+  expect(requestedPaths).toEqual(
+    expect.arrayContaining([
+      apiV1("/auth/admin/session"),
+      apiV1("/auth/admin/login"),
+      apiV1("/auth/store/index"),
+      apiV1("/cluster/status"),
+      apiV1("/health"),
+      apiV1("/storage/stats/current"),
+      apiV1("/auth/bootstrap-claims/issue"),
+      apiV1("/auth/rendezvous-config")
+    ])
+  );
+  expect(
+    requestedPaths.some((path) => path.startsWith(apiV1("/auth/managed-rendezvous/failover/export")))
+  ).toBe(true);
+  expect(requestedPaths.some((path) => path.startsWith(apiV1("/auth/media/thumbnail")))).toBe(true);
+  expect(requestedPaths.some((path) => path.startsWith(apiV1("/maps/")))).toBe(true);
+  expect(requestedPaths).not.toContain("/auth/admin/session");
+  expect(requestedPaths).not.toContain("/auth/store/index");
+  expect(requestedPaths).not.toContain("/cluster/status");
+  expect(requestedPaths).not.toContain("/health");
+  expect(requestedPaths).not.toContain("/storage/stats/current");
+  expect(requestedPaths).not.toContain("/auth/bootstrap-claims/issue");
 });
 
 test("server-admin provisioning can target a selected rendezvous service", async ({ page }) => {
@@ -376,13 +407,15 @@ async function installServerAdminMocks(
     persisted: true
   };
   const galleryEntries = options?.galleryEntries ?? createDefaultAdminGalleryEntries();
+  const requestedPaths = new Set<string>();
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const { pathname, searchParams } = url;
     const method = route.request().method();
+    requestedPaths.add(pathname);
 
-    if (pathname === "/auth/admin/session" && method === "GET") {
+    if (pathname === apiV1("/auth/admin/session") && method === "GET") {
       let sessionAuthenticated = authenticated;
       if (sessionAuthenticated && remainingPostLoginUnauthenticatedSessionResponses > 0) {
         remainingPostLoginUnauthenticatedSessionResponses -= 1;
@@ -409,7 +442,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/admin/login" && method === "POST") {
+    if (pathname === apiV1("/auth/admin/login") && method === "POST") {
       authenticated = true;
       sessionConfirmed = false;
       remainingPostLoginUnauthenticatedSessionResponses =
@@ -417,18 +450,18 @@ async function installServerAdminMocks(
       return json(route, { status: "ok" });
     }
 
-    if (pathname === "/auth/admin/logout" && method === "POST") {
+    if (pathname === apiV1("/auth/admin/logout") && method === "POST") {
       authenticated = false;
       sessionConfirmed = false;
       remainingPostLoginUnauthenticatedSessionResponses = 0;
       return json(route, { status: "ok" });
     }
 
-    if (pathname === "/auth/store/snapshots" && method === "GET") {
+    if (pathname === apiV1("/auth/store/snapshots") && method === "GET") {
       return json(route, [{ id: "snapshot-admin-001" }]);
     }
 
-    if (pathname === "/auth/store/index" && method === "GET") {
+    if (pathname === apiV1("/auth/store/index") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       return json(route, {
         prefix: searchParams.get("prefix") ?? "",
@@ -438,7 +471,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/media/thumbnail" && method === "GET") {
+    if (pathname === apiV1("/auth/media/thumbnail") && method === "GET") {
       await route.fulfill({
         status: 200,
         contentType: "image/png",
@@ -447,8 +480,8 @@ async function installServerAdminMocks(
       return;
     }
 
-    if (pathname.startsWith("/auth/store/") && method === "GET") {
-      if (pathname === "/auth/store/gallery%2Fcat.png") {
+    if (pathname.startsWith(apiV1("/auth/store/")) && method === "GET") {
+      if (pathname === apiV1("/auth/store/gallery%2Fcat.png")) {
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
       await route.fulfill({
@@ -459,7 +492,7 @@ async function installServerAdminMocks(
       return;
     }
 
-    if (pathname === "/api/maps/logical-file") {
+    if (pathname === apiV1("/maps/logical-file")) {
       const rangeHeader = route.request().headers().range;
       const commonHeaders = {
         "accept-ranges": "bytes",
@@ -512,7 +545,7 @@ async function installServerAdminMocks(
       }
     }
 
-    if (pathname === "/api/maps/mbtiles-metadata" && method === "GET") {
+    if (pathname === apiV1("/maps/mbtiles-metadata") && method === "GET") {
       return json(route, {
         attribution: "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors.",
         center: [0, 20, 1],
@@ -522,7 +555,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname.startsWith("/api/maps/tiles/") && method === "GET") {
+    if (pathname.startsWith(apiV1("/maps/tiles/")) && method === "GET") {
       await route.fulfill({
         status: 200,
         headers: {
@@ -534,7 +567,7 @@ async function installServerAdminMocks(
       return;
     }
 
-    if (pathname.startsWith("/api/maps/vector-tiles/") && method === "GET") {
+    if (pathname.startsWith(apiV1("/maps/vector-tiles/")) && method === "GET") {
       await route.fulfill({
         status: 200,
         headers: {
@@ -547,7 +580,7 @@ async function installServerAdminMocks(
       return;
     }
 
-    if (pathname.startsWith("/api/maps/fonts/") && method === "GET") {
+    if (pathname.startsWith(apiV1("/maps/fonts/")) && method === "GET") {
       await route.fulfill({
         status: 200,
         headers: {
@@ -559,7 +592,7 @@ async function installServerAdminMocks(
       return;
     }
 
-    if (pathname === "/cluster/status" && method === "GET") {
+    if (pathname === apiV1("/cluster/status") && method === "GET") {
       if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
         await route.fulfill({ status: 401 });
         return;
@@ -577,7 +610,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/cluster/nodes" && method === "GET") {
+    if (pathname === apiV1("/cluster/nodes") && method === "GET") {
       if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
         await route.fulfill({ status: 401 });
         return;
@@ -650,7 +683,7 @@ async function installServerAdminMocks(
       ]);
     }
 
-    if (pathname === "/cluster/replication/plan" && method === "GET") {
+    if (pathname === apiV1("/cluster/replication/plan") && method === "GET") {
       if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
         await route.fulfill({ status: 401 });
         return;
@@ -675,7 +708,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/cluster/replication/repair" && method === "POST") {
+    if (pathname === apiV1("/cluster/replication/repair") && method === "POST") {
       return json(route, {
         status: "repair-triggered",
         repaired_items: 1
@@ -691,7 +724,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/health" && method === "GET") {
+    if (pathname === apiV1("/health") && method === "GET") {
       return json(route, {
         node_id: "node-alpha",
         role: "server-node",
@@ -701,7 +734,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/storage/stats/current" && method === "GET") {
+    if (pathname === apiV1("/storage/stats/current") && method === "GET") {
       return json(route, {
         sample: {
           collected_at_unix: 1_900_000_120,
@@ -722,7 +755,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/storage/stats/history" && method === "GET") {
+    if (pathname === apiV1("/storage/stats/history") && method === "GET") {
       expect(searchParams.get("max_points")).toBe("360");
       expect(searchParams.get("since_unix")).not.toBeNull();
       return json(route, [
@@ -825,7 +858,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/bootstrap-claims/issue" && method === "POST") {
+    if (pathname === apiV1("/auth/bootstrap-claims/issue") && method === "POST") {
       const body = route.request().postDataJSON() as { preferred_rendezvous_url?: string | null };
       if (options?.bootstrapClaimMode === "bad_gateway") {
         await route.fulfill({
@@ -851,11 +884,11 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/bootstrap-bundles/issue" && method === "POST") {
+    if (pathname === apiV1("/auth/bootstrap-bundles/issue") && method === "POST") {
       return json(route, bootstrapBundle);
     }
 
-    if (pathname === "/auth/node-join-requests/issue-enrollment" && method === "POST") {
+    if (pathname === apiV1("/auth/node-join-requests/issue-enrollment") && method === "POST") {
       return json(route, {
         bootstrap: {
           cluster_id: "cluster-alpha"
@@ -869,11 +902,11 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/client-credentials" && method === "GET") {
+    if (pathname === apiV1("/auth/client-credentials") && method === "GET") {
       return json(route, buildCredentialList(revokedDeviceIds));
     }
 
-    if (pathname === "/auth/rendezvous-config" && method === "GET") {
+    if (pathname === apiV1("/auth/rendezvous-config") && method === "GET") {
       if (options?.protectDashboardAdminRoutesUntilSessionConfirmed && !sessionConfirmed) {
         await route.fulfill({ status: 401 });
         return;
@@ -881,7 +914,7 @@ async function installServerAdminMocks(
       return json(route, rendezvousConfig);
     }
 
-    if (pathname === "/auth/rendezvous-config" && method === "PUT") {
+    if (pathname === apiV1("/auth/rendezvous-config") && method === "PUT") {
       const body = route.request().postDataJSON() as { editable_urls?: string[] };
       rendezvousConfig = {
         ...rendezvousConfig,
@@ -894,12 +927,12 @@ async function installServerAdminMocks(
       return json(route, rendezvousConfig);
     }
 
-    if (pathname.startsWith("/auth/client-credentials/") && method === "DELETE") {
+    if (pathname.startsWith(apiV1("/auth/client-credentials/")) && method === "DELETE") {
       revokedDeviceIds.add(decodeURIComponent(pathname.split("/").pop() ?? ""));
       return json(route, { status: "revoked" });
     }
 
-    if (pathname === "/auth/node-certificates/status" && method === "GET") {
+    if (pathname === apiV1("/auth/node-certificates/status") && method === "GET") {
       return json(route, {
         public_tls: {
           name: "public",
@@ -940,7 +973,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/managed-control-plane/promotion/export" && method === "POST") {
+    if (pathname === apiV1("/auth/managed-control-plane/promotion/export") && method === "POST") {
       return json(route, {
         signer_backup: {
           version: 1,
@@ -953,7 +986,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/managed-rendezvous/failover/export" && method === "POST") {
+    if (pathname === apiV1("/auth/managed-rendezvous/failover/export") && method === "POST") {
       return json(route, {
         version: 1,
         cluster_id: "cluster-alpha",
@@ -963,7 +996,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/managed-rendezvous/failover/import" && method === "POST") {
+    if (pathname === apiV1("/auth/managed-rendezvous/failover/import") && method === "POST") {
       return json(route, {
         status: "imported",
         cluster_id: "cluster-alpha",
@@ -976,7 +1009,7 @@ async function installServerAdminMocks(
       });
     }
 
-    if (pathname === "/auth/managed-control-plane/promotion/import" && method === "POST") {
+    if (pathname === apiV1("/auth/managed-control-plane/promotion/import") && method === "POST") {
       return json(route, {
         status: "imported",
         cluster_id: "cluster-alpha",
@@ -992,6 +1025,10 @@ async function installServerAdminMocks(
 
     return route.continue();
   });
+
+  return {
+    requestedPaths: () => Array.from(requestedPaths)
+  };
 }
 
 type AdminMockStoreEntry = {
@@ -1020,7 +1057,7 @@ function createDefaultAdminGalleryEntries(): AdminMockStoreEntry[] {
           longitude: 8.5417
         },
         thumbnail: {
-          url: "/auth/media/thumbnail?key=gallery%2Fcat.png",
+          url: "/api/v1/auth/media/thumbnail?key=gallery%2Fcat.png",
           profile: "grid",
           width: 256,
           height: 192,
@@ -1042,7 +1079,7 @@ function createDefaultAdminGalleryEntries(): AdminMockStoreEntry[] {
           longitude: -74.006
         },
         thumbnail: {
-          url: "/auth/media/thumbnail?key=gallery%2Fdog.jpg",
+          url: "/api/v1/auth/media/thumbnail?key=gallery%2Fdog.jpg",
           profile: "grid",
           width: 256,
           height: 256,

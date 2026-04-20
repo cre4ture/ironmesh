@@ -994,7 +994,7 @@ fn media_thumbnail_request_path(remote_key: &str) -> AnyhowResult<String> {
         bail!("remote key is empty");
     }
 
-    let mut url = Url::parse("https://ironmesh.invalid/media/thumbnail")
+    let mut url = Url::parse("https://ironmesh.invalid/api/v1/media/thumbnail")
         .context("invalid base thumbnail URL")?;
     url.query_pairs_mut().append_pair("key", remote_key);
     Ok(relative_request_path(&url))
@@ -1325,7 +1325,7 @@ mod tests {
     fn media_thumbnail_request_path_percent_encodes_remote_key() {
         let path = media_thumbnail_request_path("gallery/cat one.png")
             .expect("thumbnail request path should build");
-        assert_eq!(path, "/media/thumbnail?key=gallery%2Fcat+one.png");
+        assert_eq!(path, "/api/v1/media/thumbnail?key=gallery%2Fcat+one.png");
     }
 
     #[test]

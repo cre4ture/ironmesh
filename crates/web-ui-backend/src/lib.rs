@@ -32,6 +32,7 @@ const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKEND_REVISION: &str =
     git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
+const WEB_API_V1_PREFIX: &str = "/api/v1";
 
 mod mbtiles;
 
@@ -280,9 +281,46 @@ pub fn router(config: WebUiConfig) -> Router {
         })),
     };
 
-    Router::new()
-        .route("/", get(web_static_index))
-        .route("/ironmesh-favicon.svg", get(web_static_favicon))
+    let api_v1 = Router::new()
+        .route("/media/thumbnail", get(web_media_thumbnail))
+        .route("/maps/mbtiles-metadata", get(web_map_mbtiles_metadata))
+        .route("/maps/logical-file", get(web_map_logical_file))
+        .route("/maps/tiles/{z}/{x}/{y}", get(web_map_xyz_tile))
+        .route("/maps/vector-tiles/{z}/{x}/{y}", get(web_map_vector_tile))
+        .route("/maps/fonts/{fontstack}/{range}", get(web_map_font_range))
+        .route("/health", get(web_health))
+        .route("/snapshots", get(web_snapshots))
+        .route("/versions", get(web_versions))
+        .route("/cluster/status", get(web_cluster_status))
+        .route("/cluster/nodes", get(web_cluster_nodes))
+        .route("/cluster/replication/plan", get(web_replication_plan))
+        .route("/store/list", get(web_store_list))
+        .route("/store/get", get(web_store_get))
+        .route("/store/put", post(web_store_put))
+        .route("/store/rename", post(web_store_rename))
+        .route("/store/delete", delete(web_store_delete))
+        .route("/store/restore", post(web_store_restore))
+        .route("/store/uploads/start", post(web_store_upload_start))
+        .route(
+            "/store/uploads/{upload_id}/chunk/{index}",
+            put(web_store_upload_chunk),
+        )
+        .route(
+            "/store/uploads/{upload_id}/complete",
+            post(web_store_upload_complete),
+        )
+        .route("/store/get-binary", get(web_store_get_binary))
+        .route("/store/stream-binary", get(web_store_stream_binary))
+        .route("/store/put-binary", post(web_store_put_binary))
+        .route(
+            "/rendezvous",
+            get(web_rendezvous).put(web_update_rendezvous),
+        )
+        .route("/rendezvous/refresh", post(web_refresh_rendezvous))
+        .route("/latency-test", post(web_latency_test))
+        .route("/ping", get(web_ping));
+
+    let legacy_api = Router::new()
         .route("/media/thumbnail", get(web_media_thumbnail))
         .route("/api/maps/mbtiles-metadata", get(web_map_mbtiles_metadata))
         .route("/api/maps/logical-file", get(web_map_logical_file))
@@ -325,7 +363,13 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/api/rendezvous/refresh", post(web_refresh_rendezvous))
         .route("/api/latency-test", post(web_latency_test))
-        .route("/api/ping", get(web_ping))
+        .route("/api/ping", get(web_ping));
+
+    Router::new()
+        .route("/", get(web_static_index))
+        .route("/ironmesh-favicon.svg", get(web_static_favicon))
+        .nest(WEB_API_V1_PREFIX, api_v1)
+        .merge(legacy_api)
         .route("/{*path}", get(web_static_file))
         .with_state(state)
 }

@@ -15,6 +15,8 @@ use super::{
     RepairRunRecord, SnapshotInfo, SnapshotManifest, StorageStatsSample, StorageStatsState,
 };
 
+const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
+
 pub(super) struct SqliteMetadataStore {
     metadata: Mutex<Connection>,
 }
@@ -918,6 +920,11 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         PRAGMA synchronous = NORMAL;
         PRAGMA foreign_keys = ON;
 
+        CREATE TABLE IF NOT EXISTS metadata_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS current_objects (
             key TEXT PRIMARY KEY,
             manifest_hash TEXT NOT NULL,
@@ -1026,7 +1033,104 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON cluster_replicas(subject);
         ",
     )?;
+
+    let stored_version = db
+        .query_row(
+            "SELECT value FROM metadata_meta WHERE key = ?1",
+            ["schema_version"],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("failed to read sqlite metadata schema version")?;
+
+    let schema_version = match stored_version {
+        Some(raw) => raw
+            .parse::<i64>()
+            .with_context(|| format!("invalid sqlite metadata schema version: {raw}"))?,
+        None => METADATA_SCHEMA_VERSION_CURRENT,
+    };
+
+    if schema_version != METADATA_SCHEMA_VERSION_CURRENT {
+        anyhow::bail!(
+            "unsupported sqlite metadata schema version: {} (current={})",
+            schema_version,
+            METADATA_SCHEMA_VERSION_CURRENT
+        );
+    }
+
+    db.execute(
+        "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![
+            "schema_version",
+            METADATA_SCHEMA_VERSION_CURRENT.to_string()
+        ],
+    )
+    .context("failed to persist sqlite metadata schema version")?;
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_metadata_db_persists_schema_version() {
+        let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+
+        init_metadata_db(&db).expect("metadata schema should initialize");
+
+        let schema_version: String = db
+            .query_row(
+                "SELECT value FROM metadata_meta WHERE key = ?1",
+                ["schema_version"],
+                |row| row.get(0),
+            )
+            .expect("schema version should persist");
+        assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
+    }
+
+    #[test]
+    fn init_metadata_db_accepts_missing_legacy_schema_version() {
+        let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+
+        init_metadata_db(&db).expect("metadata schema should initialize");
+        db.execute(
+            "DELETE FROM metadata_meta WHERE key = ?1",
+            ["schema_version"],
+        )
+        .expect("schema version row should delete");
+
+        init_metadata_db(&db).expect("legacy metadata schema should be accepted");
+
+        let schema_version: String = db
+            .query_row(
+                "SELECT value FROM metadata_meta WHERE key = ?1",
+                ["schema_version"],
+                |row| row.get(0),
+            )
+            .expect("schema version should be restored");
+        assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
+    }
+
+    #[test]
+    fn init_metadata_db_rejects_future_schema_version() {
+        let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+
+        init_metadata_db(&db).expect("metadata schema should initialize");
+        db.execute(
+            "UPDATE metadata_meta SET value = ?2 WHERE key = ?1",
+            params!["schema_version", "99"],
+        )
+        .expect("future schema version should write");
+
+        let err = init_metadata_db(&db).expect_err("future schema version should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported sqlite metadata schema version: 99")
+        );
+    }
 }
 
 fn load_current_state_from_db(db: &Connection) -> Result<CurrentState> {

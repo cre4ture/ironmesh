@@ -97,29 +97,29 @@ function adminBinaryObjectUrl(key: string, snapshotId: string | null): string {
     query.set("snapshot", snapshotId);
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
-  return `/auth/store/${encodeURIComponent(key)}${suffix}`;
+  return `/api/v1/auth/store/${encodeURIComponent(key)}${suffix}`;
 }
 
 function logicalMapFileUrl(manifestKey: string): string {
   const query = new URLSearchParams({ manifest_key: manifestKey });
-  return `/api/maps/logical-file?${query.toString()}`;
+  return `/api/v1/maps/logical-file?${query.toString()}`;
 }
 
 function logicalMapMetadataUrl(manifestKey: string): string {
   const query = new URLSearchParams({ manifest_key: manifestKey });
-  return `/api/maps/mbtiles-metadata?${query.toString()}`;
+  return `/api/v1/maps/mbtiles-metadata?${query.toString()}`;
 }
 
 function logicalMapTileUrlTemplate(manifestKey: string): string {
   const query = new URLSearchParams({ manifest_key: manifestKey });
-  return `/api/maps/tiles/{z}/{x}/{y}?${query.toString()}`;
+  return `/api/v1/maps/tiles/{z}/{x}/{y}?${query.toString()}`;
 }
 
 function logicalMapVectorTileUrlTemplate(manifestKey: string): string {
   const query = new URLSearchParams({ manifest_key: manifestKey });
-  return `/api/maps/vector-tiles/{z}/{x}/{y}?${query.toString()}`;
+  return `/api/v1/maps/vector-tiles/{z}/{x}/{y}?${query.toString()}`;
 }
 
 function logicalMapGlyphUrlTemplate(): string {
-  return "/api/maps/fonts/{fontstack}/{range}.pbf";
+  return "/api/v1/maps/fonts/{fontstack}/{range}.pbf";
 }

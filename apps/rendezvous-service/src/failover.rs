@@ -227,7 +227,10 @@ mod tests {
             .as_object()
             .expect("failover package should serialize as an object");
 
-        assert_eq!(object.get("version").and_then(serde_json::Value::as_u64), Some(1));
+        assert_eq!(
+            object.get("version").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
         assert!(object.contains_key("cluster_id"));
         assert!(object.contains_key("source_node_id"));
         assert!(object.contains_key("target_node_id"));
@@ -289,9 +292,7 @@ mod tests {
             Some(client_ca_cert_pem)
         );
         assert_eq!(
-            object
-                .get("public_url")
-                .and_then(serde_json::Value::as_str),
+            object.get("public_url").and_then(serde_json::Value::as_str),
             Some(public_url)
         );
         assert!(object.contains_key("cert_pem"));

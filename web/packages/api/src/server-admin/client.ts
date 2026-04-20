@@ -39,6 +39,12 @@ type AdminRequestOptions = {
   adminTokenOverride?: string;
 };
 
+const API_V1_PREFIX = "/api/v1";
+
+function apiV1(path: string): string {
+  return `${API_V1_PREFIX}${path}`;
+}
+
 function buildAdminHeaders(adminTokenOverride?: string, extraHeaders?: HeadersInit): HeadersInit {
   const headers = new Headers(extraHeaders);
   if (adminTokenOverride?.trim()) {
@@ -69,18 +75,18 @@ async function fetchAdminJson<T>(
 export async function getAdminSessionStatus(
   adminTokenOverride?: string
 ): Promise<AdminSessionStatus> {
-  return fetchAdminJson<AdminSessionStatus>("/auth/admin/session", { adminTokenOverride });
+  return fetchAdminJson<AdminSessionStatus>(apiV1("/auth/admin/session"), { adminTokenOverride });
 }
 
 export async function loginAdmin(password: string): Promise<{ status: string }> {
-  return fetchAdminJson<{ status: string }>("/auth/admin/login", {
+  return fetchAdminJson<{ status: string }>(apiV1("/auth/admin/login"), {
     method: "POST",
     body: { password }
   });
 }
 
 export async function logoutAdmin(adminTokenOverride?: string): Promise<{ status: string }> {
-  return fetchAdminJson<{ status: string }>("/auth/admin/logout", {
+  return fetchAdminJson<{ status: string }>(apiV1("/auth/admin/logout"), {
     method: "POST",
     adminTokenOverride
   });
@@ -89,7 +95,7 @@ export async function logoutAdmin(adminTokenOverride?: string): Promise<{ status
 export async function listAdminSnapshots(
   adminTokenOverride?: string
 ): Promise<AdminSnapshotSummary[]> {
-  return fetchAdminJson<AdminSnapshotSummary[]>("/auth/store/snapshots", {
+  return fetchAdminJson<AdminSnapshotSummary[]>(apiV1("/auth/store/snapshots"), {
     adminTokenOverride
   });
 }
@@ -111,7 +117,7 @@ export async function listAdminStoreEntries(
     query.set("snapshot", snapshot.trim());
   }
   query.set("view", view);
-  return fetchAdminJson<AdminStoreListResponse>(`/auth/store/index?${query.toString()}`, {
+  return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
     adminTokenOverride
   });
 }
@@ -129,7 +135,7 @@ export function getAdminStoreDownloadUrl(
     query.set("version", version.trim());
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
-  return `/auth/store/${encodeURIComponent(key)}${suffix}`;
+  return `${apiV1("/auth/store")}/${encodeURIComponent(key)}${suffix}`;
 }
 
 export async function getAdminStoreValue(
@@ -180,7 +186,7 @@ export async function getAdminVersionGraph(
   adminTokenOverride?: string
 ): Promise<AdminVersionGraphResponse> {
   return fetchAdminJson<AdminVersionGraphResponse>(
-    `/auth/versions/${encodeURIComponent(key)}`,
+    `${apiV1("/auth/versions")}/${encodeURIComponent(key)}`,
     {
       adminTokenOverride
     }
@@ -193,7 +199,7 @@ export async function deleteAdminStorePath(
 ): Promise<Record<string, unknown> | null> {
   const query = new URLSearchParams({ key: path });
   return fetchAdminJson<Record<string, unknown> | null>(
-    `/auth/store/delete?${query.toString()}`,
+    `${apiV1("/auth/store/delete")}?${query.toString()}`,
     {
       method: "POST",
       adminTokenOverride
@@ -207,7 +213,7 @@ export async function renameAdminStorePath(
   overwrite = false,
   adminTokenOverride?: string
 ): Promise<Record<string, unknown> | null> {
-  return fetchAdminJson<Record<string, unknown> | null>("/auth/store/rename", {
+  return fetchAdminJson<Record<string, unknown> | null>(apiV1("/auth/store/rename"), {
     method: "POST",
     adminTokenOverride,
     body: {
@@ -221,7 +227,7 @@ export async function renameAdminStorePath(
 export async function getClusterSummary(
   adminTokenOverride?: string
 ): Promise<ClusterSummary> {
-  return fetchAdminJson<ClusterSummary>("/cluster/status", {
+  return fetchAdminJson<ClusterSummary>(apiV1("/cluster/status"), {
     adminTokenOverride
   });
 }
@@ -229,7 +235,7 @@ export async function getClusterSummary(
 export async function getClusterNodes(
   adminTokenOverride?: string
 ): Promise<NodeDescriptor[]> {
-  return fetchAdminJson<NodeDescriptor[]>("/cluster/nodes", {
+  return fetchAdminJson<NodeDescriptor[]>(apiV1("/cluster/nodes"), {
     adminTokenOverride
   });
 }
@@ -237,7 +243,7 @@ export async function getClusterNodes(
 export async function getReplicationPlan(
   adminTokenOverride?: string
 ): Promise<ReplicationPlan> {
-  return fetchAdminJson<ReplicationPlan>("/cluster/replication/plan", {
+  return fetchAdminJson<ReplicationPlan>(apiV1("/cluster/replication/plan"), {
     adminTokenOverride
   });
 }
@@ -245,7 +251,7 @@ export async function getReplicationPlan(
 export async function getRepairActivityStatus(
   adminTokenOverride?: string
 ): Promise<RepairActivityStatusResponse> {
-  return fetchAdminJson<RepairActivityStatusResponse>("/auth/repair/activity", {
+  return fetchAdminJson<RepairActivityStatusResponse>(apiV1("/auth/repair/activity"), {
     adminTokenOverride
   });
 }
@@ -265,7 +271,7 @@ export async function getRepairHistory(
     query.set("since_unix", String(Math.max(0, Math.trunc(options.sinceUnix))));
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
-  return fetchAdminJson<RepairHistoryResponse>(`/auth/repair/history${suffix}`, {
+  return fetchAdminJson<RepairHistoryResponse>(`${apiV1("/auth/repair/history")}${suffix}`, {
     adminTokenOverride
   });
 }
@@ -273,7 +279,7 @@ export async function getRepairHistory(
 export async function getDataScrubActivityStatus(
   adminTokenOverride?: string
 ): Promise<DataScrubActivityStatusResponse> {
-  return fetchAdminJson<DataScrubActivityStatusResponse>("/auth/scrub/activity", {
+  return fetchAdminJson<DataScrubActivityStatusResponse>(apiV1("/auth/scrub/activity"), {
     adminTokenOverride
   });
 }
@@ -293,7 +299,7 @@ export async function getDataScrubHistory(
     query.set("since_unix", String(Math.max(0, Math.trunc(options.sinceUnix))));
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
-  return fetchAdminJson<DataScrubHistoryResponse>(`/auth/scrub/history${suffix}`, {
+  return fetchAdminJson<DataScrubHistoryResponse>(`${apiV1("/auth/scrub/history")}${suffix}`, {
     adminTokenOverride
   });
 }
@@ -313,7 +319,7 @@ export async function getDataScrubClusterStatus(
     query.set("since_unix", String(Math.max(0, Math.trunc(options.sinceUnix))));
   }
   const suffix = query.toString() ? `?${query.toString()}` : "";
-  return fetchAdminJson<DataScrubClusterStatusResponse>(`/auth/scrub/cluster${suffix}`, {
+  return fetchAdminJson<DataScrubClusterStatusResponse>(`${apiV1("/auth/scrub/cluster")}${suffix}`, {
     adminTokenOverride
   });
 }
@@ -322,7 +328,7 @@ export async function triggerDataScrub(
   scope: DataScrubScope = "cluster",
   adminTokenOverride?: string
 ): Promise<DataScrubTriggerResponse> {
-  return fetchAdminJson<DataScrubTriggerResponse>(`/auth/scrub/run?scope=${scope}`, {
+  return fetchAdminJson<DataScrubTriggerResponse>(`${apiV1("/auth/scrub/run")}?scope=${scope}`, {
     method: "POST",
     adminTokenOverride
   });
@@ -331,7 +337,7 @@ export async function triggerDataScrub(
 export async function triggerReplicationRepair(
   adminTokenOverride?: string
 ): Promise<Record<string, unknown>> {
-  return fetchAdminJson<Record<string, unknown>>("/cluster/replication/repair?scope=cluster", {
+  return fetchAdminJson<Record<string, unknown>>(`${apiV1("/cluster/replication/repair")}?scope=cluster`, {
     method: "POST",
     adminTokenOverride
   });
@@ -369,7 +375,7 @@ async function readAdminErrorMessage(response: Response): Promise<string> {
 export async function clearAdminMediaCache(
   adminTokenOverride?: string
 ): Promise<AdminMediaCacheClearResponse> {
-  return fetchAdminJson<AdminMediaCacheClearResponse>("/auth/media/cache/clear?approve=true", {
+  return fetchAdminJson<AdminMediaCacheClearResponse>(`${apiV1("/auth/media/cache/clear")}?approve=true`, {
     method: "POST",
     adminTokenOverride
   });
@@ -383,14 +389,14 @@ export async function getRecentLogs(limit = 200): Promise<LogsResponse> {
 }
 
 export async function getServerHealth(): Promise<ServerHealthResponse> {
-  return fetchJson<ServerHealthResponse>("/health", {
+  return fetchJson<ServerHealthResponse>(apiV1("/health"), {
     credentials: "same-origin",
     cache: "no-store"
   });
 }
 
 export async function getStorageStatsCurrent(): Promise<StorageStatsCurrentResponse> {
-  return fetchJson<StorageStatsCurrentResponse>("/storage/stats/current", {
+  return fetchJson<StorageStatsCurrentResponse>(apiV1("/storage/stats/current"), {
     credentials: "same-origin",
     cache: "no-store"
   });
@@ -415,7 +421,7 @@ export async function getStorageStatsHistory(options?: {
     query.set("limit", "120");
   }
 
-  return fetchJson<StorageStatsSample[]>(`/storage/stats/history?${query.toString()}`, {
+  return fetchJson<StorageStatsSample[]>(`${apiV1("/storage/stats/history")}?${query.toString()}`, {
     credentials: "same-origin",
     cache: "no-store"
   });
@@ -470,7 +476,7 @@ export async function issueBootstrapBundle(
   request: { label?: string | null; expires_in_secs?: number | null },
   adminTokenOverride?: string
 ): Promise<BootstrapBundle> {
-  return fetchAdminJson<BootstrapBundle>("/auth/bootstrap-bundles/issue", {
+  return fetchAdminJson<BootstrapBundle>(apiV1("/auth/bootstrap-bundles/issue"), {
     method: "POST",
     adminTokenOverride,
     body: request
@@ -485,7 +491,7 @@ export async function issueBootstrapClaim(
   },
   adminTokenOverride?: string
 ): Promise<BootstrapClaimIssueResponse> {
-  return fetchAdminJson<BootstrapClaimIssueResponse>("/auth/bootstrap-claims/issue", {
+  return fetchAdminJson<BootstrapClaimIssueResponse>(apiV1("/auth/bootstrap-claims/issue"), {
     method: "POST",
     adminTokenOverride,
     body: request
@@ -500,7 +506,7 @@ export async function issueNodeEnrollmentFromJoinRequest(
   },
   adminTokenOverride?: string
 ): Promise<NodeEnrollmentPackage> {
-  return fetchAdminJson<NodeEnrollmentPackage>("/auth/node-join-requests/issue-enrollment", {
+  return fetchAdminJson<NodeEnrollmentPackage>(apiV1("/auth/node-join-requests/issue-enrollment"), {
     method: "POST",
     adminTokenOverride,
     body: request
@@ -510,7 +516,7 @@ export async function issueNodeEnrollmentFromJoinRequest(
 export async function listClientCredentials(
   adminTokenOverride?: string
 ): Promise<ClientCredentialView[]> {
-  return fetchAdminJson<ClientCredentialView[]>("/auth/client-credentials", {
+  return fetchAdminJson<ClientCredentialView[]>(apiV1("/auth/client-credentials"), {
     adminTokenOverride
   });
 }
@@ -521,7 +527,7 @@ export async function revokeClientCredential(
   adminTokenOverride?: string
 ): Promise<void> {
   const query = reason?.trim() ? `?reason=${encodeURIComponent(reason.trim())}` : "";
-  await fetchAdminJson(`/auth/client-credentials/${encodeURIComponent(deviceId)}${query}`, {
+  await fetchAdminJson(`${apiV1("/auth/client-credentials")}/${encodeURIComponent(deviceId)}${query}`, {
     method: "DELETE",
     adminTokenOverride
   });
@@ -530,7 +536,7 @@ export async function revokeClientCredential(
 export async function getNodeCertificateStatus(
   adminTokenOverride?: string
 ): Promise<NodeCertificateStatusResponse> {
-  return fetchAdminJson<NodeCertificateStatusResponse>("/auth/node-certificates/status", {
+  return fetchAdminJson<NodeCertificateStatusResponse>(apiV1("/auth/node-certificates/status"), {
     adminTokenOverride
   });
 }
@@ -538,7 +544,7 @@ export async function getNodeCertificateStatus(
 export async function getRendezvousConfig(
   adminTokenOverride?: string
 ): Promise<RendezvousConfigView> {
-  return fetchAdminJson<RendezvousConfigView>("/auth/rendezvous-config", {
+  return fetchAdminJson<RendezvousConfigView>(apiV1("/auth/rendezvous-config"), {
     adminTokenOverride
   });
 }
@@ -547,7 +553,7 @@ export async function updateRendezvousConfig(
   request: { editable_urls: string[] },
   adminTokenOverride?: string
 ): Promise<RendezvousConfigView> {
-  return fetchAdminJson<RendezvousConfigView>("/auth/rendezvous-config", {
+  return fetchAdminJson<RendezvousConfigView>(apiV1("/auth/rendezvous-config"), {
     method: "PUT",
     adminTokenOverride,
     body: request
@@ -563,7 +569,7 @@ export async function exportManagedRendezvousFailover(
   adminTokenOverride?: string
 ): Promise<ManagedRendezvousFailoverPackage> {
   return fetchAdminJson<ManagedRendezvousFailoverPackage>(
-    "/auth/managed-rendezvous/failover/export",
+    apiV1("/auth/managed-rendezvous/failover/export"),
     {
       method: "POST",
       adminTokenOverride,
@@ -581,7 +587,7 @@ export async function importManagedRendezvousFailover(
   adminTokenOverride?: string
 ): Promise<ManagedRendezvousFailoverImportResponse> {
   return fetchAdminJson<ManagedRendezvousFailoverImportResponse>(
-    "/auth/managed-rendezvous/failover/import",
+    apiV1("/auth/managed-rendezvous/failover/import"),
     {
       method: "POST",
       adminTokenOverride,
@@ -599,7 +605,7 @@ export async function exportManagedControlPlanePromotion(
   adminTokenOverride?: string
 ): Promise<ManagedControlPlanePromotionPackage> {
   return fetchAdminJson<ManagedControlPlanePromotionPackage>(
-    "/auth/managed-control-plane/promotion/export",
+    apiV1("/auth/managed-control-plane/promotion/export"),
     {
       method: "POST",
       adminTokenOverride,
@@ -617,7 +623,7 @@ export async function importManagedControlPlanePromotion(
   adminTokenOverride?: string
 ): Promise<ControlPlanePromotionImportResponse> {
   return fetchAdminJson<ControlPlanePromotionImportResponse>(
-    "/auth/managed-control-plane/promotion/import",
+    apiV1("/auth/managed-control-plane/promotion/import"),
     {
       method: "POST",
       adminTokenOverride,

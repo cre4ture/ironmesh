@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{IronMeshClient, TransportSessionPoolSnapshot};
 
-const LATENCY_PROBE_ROUTE: &str = "/diagnostics/latency";
+const LATENCY_PROBE_ROUTE: &str = "/api/v1/diagnostics/latency";
 const LATENCY_PROBE_HEADER_NODE_ID: &str = "x-ironmesh-latency-node-id";
 const LATENCY_PROBE_HEADER_RESPONSE_BYTES: &str = "x-ironmesh-latency-response-bytes";
 const LATENCY_PROBE_HEADER_SERVER_DURATION_MS: &str = "x-ironmesh-latency-server-duration-ms";

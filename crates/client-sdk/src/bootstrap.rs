@@ -21,7 +21,7 @@ use crate::connection::{
 use crate::device_auth::{
     DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device_blocking_from_pem,
 };
-use crate::ironmesh_client::{IronMeshClient, normalize_server_base_url};
+use crate::ironmesh_client::{CLIENT_API_V1_PREFIX, IronMeshClient, normalize_server_base_url};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionBootstrap {
@@ -803,7 +803,7 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
     let endpoint = Url::parse(server_base_url)
         .with_context(|| format!("invalid planned bootstrap URL {server_base_url}"))?;
     let health_url = endpoint
-        .join("health")
+        .join(&format!("{}/health", CLIENT_API_V1_PREFIX.trim_start_matches('/')))
         .with_context(|| format!("failed to build health URL from {endpoint}"))?;
 
     let probe_client = if endpoint.scheme() == "https" {
@@ -1148,9 +1148,13 @@ mod tests {
         };
 
         let json = serde_json::to_value(&response).expect("response should serialize");
-        let object = json.as_object().expect("response should serialize as an object");
+        let object = json
+            .as_object()
+            .expect("response should serialize as an object");
         assert_eq!(
-            object.get("device_label").and_then(serde_json::Value::as_str),
+            object
+                .get("device_label")
+                .and_then(serde_json::Value::as_str),
             Some("Tablet")
         );
         assert!(!object.contains_key("label"));

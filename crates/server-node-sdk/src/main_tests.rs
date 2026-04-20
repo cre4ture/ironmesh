@@ -938,7 +938,9 @@ fn client_device_enroll_response_serializes_device_label() {
         .as_object()
         .expect("response should serialize as an object");
     assert_eq!(
-        object.get("device_label").and_then(serde_json::Value::as_str),
+        object
+            .get("device_label")
+            .and_then(serde_json::Value::as_str),
         Some("Tablet")
     );
     assert!(!object.contains_key("label"));

@@ -531,7 +531,9 @@ mod tests {
             .as_object()
             .expect("redeem request should serialize as an object");
         assert_eq!(
-            object.get("device_label").and_then(serde_json::Value::as_str),
+            object
+                .get("device_label")
+                .and_then(serde_json::Value::as_str),
             Some("Tablet")
         );
         assert!(!object.contains_key("label"));
@@ -568,7 +570,9 @@ mod tests {
             .as_object()
             .expect("redeem response should serialize as an object");
         assert_eq!(
-            object.get("device_label").and_then(serde_json::Value::as_str),
+            object
+                .get("device_label")
+                .and_then(serde_json::Value::as_str),
             Some("Tablet")
         );
         assert!(!object.contains_key("label"));
@@ -583,8 +587,8 @@ mod tests {
             serde_json::Value::String("Phone".to_string()),
         );
 
-        let parsed: ClientBootstrapClaimRedeemResponse = serde_json::from_value(legacy)
-            .expect("legacy redeem response should deserialize");
+        let parsed: ClientBootstrapClaimRedeemResponse =
+            serde_json::from_value(legacy).expect("legacy redeem response should deserialize");
 
         assert_eq!(parsed.label.as_deref(), Some("Phone"));
     }

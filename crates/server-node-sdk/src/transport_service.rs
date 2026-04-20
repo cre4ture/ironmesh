@@ -7,10 +7,12 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use percent_encoding::percent_decode_str;
+use std::borrow::Cow;
 use tower::ServiceExt;
 
 use crate::{
-    BufferedTransportRequest, BufferedTransportResponse, InternalCaller, ServerState,
+    BufferedTransportRequest, BufferedTransportResponse, InternalCaller,
+    PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE, PUBLIC_API_V1_PREFIX, ServerState,
     StoreIndexChangeWaitQuery, StoreIndexQuery, TransportHeader, build_internal_peer_api,
     cluster_status, commit_version, complete_upload_session_route, confirm_version,
     copy_object_path, delete_object, delete_object_by_query, delete_upload_session,
@@ -33,6 +35,26 @@ pub(super) enum TransportExecutionScope {
     Internal(InternalCaller),
 }
 
+pub(super) fn strip_public_api_v1_prefix(path: &str) -> &str {
+    if let Some(rest) = path.strip_prefix(PUBLIC_API_V1_PREFIX)
+        && !rest.is_empty()
+        && (rest.starts_with('/') || rest.starts_with('?'))
+    {
+        rest
+    } else {
+        path
+    }
+}
+
+pub(super) fn normalize_public_api_v1_path_and_query(path_and_query: &str) -> Cow<'_, str> {
+    let normalized = strip_public_api_v1_prefix(path_and_query);
+    if normalized == path_and_query {
+        Cow::Borrowed(path_and_query)
+    } else {
+        Cow::Owned(normalized.to_string())
+    }
+}
+
 pub(super) async fn execute_buffered_transport_request(
     state: &ServerState,
     scope: &TransportExecutionScope,
@@ -51,10 +73,12 @@ async fn try_execute_direct_transport_request(
 ) -> Result<Option<BufferedTransportResponse>> {
     let method = request.method.trim();
     let raw_path = request.path.trim();
+    let normalized_raw_path = normalize_public_api_v1_path_and_query(raw_path);
     let path_only = raw_path
         .split_once('?')
         .map(|(path, _)| path)
         .unwrap_or(raw_path);
+    let path_only = strip_public_api_v1_prefix(path_only);
     let headers = header_map_from_transport_headers(&request.headers)?;
 
     let response = match (method, path_only) {
@@ -70,15 +94,18 @@ async fn try_execute_direct_transport_request(
             Some(latency_diagnostic(State(state.clone()), Query(query)).await)
         }
         ("GET", "/store/index") => {
-            let query = parse_query::<StoreIndexQuery>(raw_path).map_err(|err| {
+            let query = parse_query::<StoreIndexQuery>(&normalized_raw_path).map_err(|err| {
                 anyhow::anyhow!("failed parsing store index query {raw_path}: {err}")
             })?;
-            Some(list_store_index_response(state, query, "/media/thumbnail").await)
+            Some(list_store_index_response(state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await)
         }
         ("GET", "/store/index/changes/wait") => {
-            let query = parse_query::<StoreIndexChangeWaitQuery>(raw_path).map_err(|err| {
-                anyhow::anyhow!("failed parsing store index change wait query {raw_path}: {err}")
-            })?;
+            let query =
+                parse_query::<StoreIndexChangeWaitQuery>(&normalized_raw_path).map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed parsing store index change wait query {raw_path}: {err}"
+                    )
+                })?;
             Some(
                 wait_for_store_index_change(State(state.clone()), Query(query))
                     .await
@@ -86,9 +113,10 @@ async fn try_execute_direct_transport_request(
             )
         }
         ("GET", "/media/thumbnail") => {
-            let query = parse_query::<crate::MediaThumbnailQuery>(raw_path).map_err(|err| {
-                anyhow::anyhow!("failed parsing media thumbnail query {raw_path}: {err}")
-            })?;
+            let query =
+                parse_query::<crate::MediaThumbnailQuery>(&normalized_raw_path).map_err(|err| {
+                    anyhow::anyhow!("failed parsing media thumbnail query {raw_path}: {err}")
+                })?;
             Some(get_media_thumbnail_response(state, query).await)
         }
         ("GET", path) if path.starts_with("/store/uploads/") => {
@@ -100,15 +128,16 @@ async fn try_execute_direct_transport_request(
             )
         }
         ("GET", path) if path.starts_with("/store/") => {
-            let query = parse_query::<crate::ObjectGetQuery>(raw_path)
+            let query = parse_query::<crate::ObjectGetQuery>(&normalized_raw_path)
                 .map_err(|err| anyhow::anyhow!("failed parsing object query {raw_path}: {err}"))?;
             let key = decode_route_tail(path, "/store/")?;
             Some(get_object_response(state, &key, query, &headers, false).await)
         }
         ("HEAD", path) if path.starts_with("/store/") => {
-            let query = parse_query::<crate::ObjectGetQuery>(raw_path).map_err(|err| {
-                anyhow::anyhow!("failed parsing object HEAD query {raw_path}: {err}")
-            })?;
+            let query =
+                parse_query::<crate::ObjectGetQuery>(&normalized_raw_path).map_err(|err| {
+                    anyhow::anyhow!("failed parsing object HEAD query {raw_path}: {err}")
+                })?;
             let key = decode_route_tail(path, "/store/")?;
             Some(get_object_response(state, &key, query, &headers, true).await)
         }
@@ -280,7 +309,50 @@ fn build_public_transport_router(state: ServerState) -> Router {
             require_client_or_admin_auth,
         ));
 
-    Router::new()
+    let public_api_v1 = Router::new()
+        .route("/health", get(health))
+        .route(
+            "/auth/bootstrap-claims/redeem",
+            post(redeem_client_bootstrap_claim),
+        )
+        .route("/auth/device/enroll", post(enroll_client_device))
+        .route("/storage/stats/current", get(storage_stats_current))
+        .route("/storage/stats/history", get(storage_stats_history))
+        .route("/cluster/placement/{key}", get(placement_for_key))
+        .route(
+            "/cluster/replication/audit",
+            post(trigger_replication_audit),
+        )
+        .route(
+            "/cluster/replication/repair",
+            post(replication::execute_replication_repair_public),
+        )
+        .route(
+            "/cluster/replication/cleanup",
+            post(execute_replication_cleanup),
+        )
+        .route("/cluster/reconcile/{node_id}", post(reconcile_from_node))
+        .route("/maintenance/cleanup", post(run_cleanup))
+        .route(
+            "/maintenance/tombstones/compact",
+            post(run_tombstone_compaction),
+        )
+        .route(
+            "/maintenance/tombstones/archive",
+            get(list_tombstone_archives),
+        )
+        .route(
+            "/maintenance/tombstones/archive/restore",
+            post(run_tombstone_archive_restore),
+        )
+        .route(
+            "/maintenance/tombstones/archive/purge",
+            post(run_tombstone_archive_purge),
+        )
+        .merge(public_cluster_info_api.clone())
+        .merge(public_client_api.clone());
+
+    let legacy_public_api = Router::new()
         .route("/health", get(health))
         .route(
             "/auth/bootstrap-claims/redeem",
@@ -321,7 +393,11 @@ fn build_public_transport_router(state: ServerState) -> Router {
             post(run_tombstone_archive_purge),
         )
         .merge(public_cluster_info_api)
-        .merge(public_client_api)
+        .merge(public_client_api);
+
+    Router::new()
+        .nest(PUBLIC_API_V1_PREFIX, public_api_v1)
+        .merge(legacy_public_api)
         .with_state(state)
 }
 

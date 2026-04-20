@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use rendezvous_server::{
     RendezvousAppState, RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerConfig,
-    RendezvousServerTlsIdentity,
-    serve as serve_rendezvous,
+    RendezvousServerTlsIdentity, serve as serve_rendezvous,
 };
 
 #[derive(Debug, Clone)]

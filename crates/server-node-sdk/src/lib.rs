@@ -140,6 +140,9 @@ const SLOW_MEDIA_THUMBNAIL_PHASE_LOG_THRESHOLD_MS: u128 = 250;
 const SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS: u128 = 250;
 const MAX_LATENCY_DIAGNOSTIC_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_LATENCY_DIAGNOSTIC_SERVER_DELAY_MS: u64 = 5_000;
+pub(crate) const PUBLIC_API_V1_PREFIX: &str = "/api/v1";
+const PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/media/thumbnail";
+const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thumbnail";
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -4203,14 +4206,66 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         )
         .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
 
-    let public_app = Router::new()
-        .route("/", get(ui::index))
-        .route("/ironmesh-favicon.svg", get(ui::favicon))
-        .route("/assets/{*path}", get(ui::static_asset))
-        .route("/ui/assets/{*path}", get(ui::static_asset))
-        .route("/ui/app.css", get(ui::app_css))
-        .route("/ui/app.js", get(ui::app_js))
-        .route("/logs", get(ui::list_logs))
+    let public_maps_api = Router::new()
+        .route("/maps/mbtiles-metadata", get(web_maps::mbtiles_metadata))
+        .route(
+            "/maps/logical-file",
+            get(web_maps::logical_file).head(web_maps::logical_file),
+        )
+        .route("/maps/tiles/{z}/{x}/{y}", get(web_maps::xyz_tile))
+        .route("/maps/vector-tiles/{z}/{x}/{y}", get(web_maps::vector_tile))
+        .route("/maps/fonts/{fontstack}/{range}", get(web_maps::font_range));
+
+    let public_api_v1 = Router::new()
+        .route("/health", get(health))
+        .route(
+            "/auth/bootstrap-claims/redeem",
+            post(redeem_client_bootstrap_claim),
+        )
+        .route("/auth/device/enroll", post(enroll_client_device))
+        .route("/storage/stats/current", get(storage_stats_current))
+        .route("/storage/stats/history", get(storage_stats_history))
+        .route(
+            "/cluster/nodes/{node_id}",
+            put(register_node).delete(remove_node),
+        )
+        .route("/cluster/placement/{key}", get(placement_for_key))
+        .route(
+            "/cluster/replication/audit",
+            post(trigger_replication_audit),
+        )
+        .route(
+            "/cluster/replication/repair",
+            post(replication::execute_replication_repair_public),
+        )
+        .route(
+            "/cluster/replication/cleanup",
+            post(execute_replication_cleanup),
+        )
+        .route("/cluster/reconcile/{node_id}", post(reconcile_from_node))
+        .route("/maintenance/cleanup", post(run_cleanup))
+        .route(
+            "/maintenance/tombstones/compact",
+            post(run_tombstone_compaction),
+        )
+        .route(
+            "/maintenance/tombstones/archive",
+            get(list_tombstone_archives),
+        )
+        .route(
+            "/maintenance/tombstones/archive/restore",
+            post(run_tombstone_archive_restore),
+        )
+        .route(
+            "/maintenance/tombstones/archive/purge",
+            post(run_tombstone_archive_purge),
+        )
+        .merge(public_maps_api.clone())
+        .merge(public_admin_api.clone())
+        .merge(public_cluster_info_api.clone())
+        .merge(public_client_api.clone());
+
+    let legacy_public_api = Router::new()
         .route("/health", get(health))
         .route(
             "/api/maps/mbtiles-metadata",
@@ -4274,6 +4329,17 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .merge(public_admin_api)
         .merge(public_cluster_info_api)
         .merge(public_client_api);
+
+    let public_app = Router::new()
+        .route("/", get(ui::index))
+        .route("/ironmesh-favicon.svg", get(ui::favicon))
+        .route("/assets/{*path}", get(ui::static_asset))
+        .route("/ui/assets/{*path}", get(ui::static_asset))
+        .route("/ui/app.css", get(ui::app_css))
+        .route("/ui/app.js", get(ui::app_js))
+        .route("/logs", get(ui::list_logs))
+        .nest(PUBLIC_API_V1_PREFIX, public_api_v1)
+        .merge(legacy_public_api);
 
     let public_app = public_app
         .with_state(state.clone())
@@ -5851,10 +5917,12 @@ where
     }
 
     let raw_path = request_head.path.trim();
+    let normalized_raw_path = transport_service::normalize_public_api_v1_path_and_query(raw_path);
     let path_only = raw_path
         .split_once('?')
         .map(|(path, _)| path)
         .unwrap_or(raw_path);
+    let path_only = transport_service::strip_public_api_v1_prefix(path_only);
     if !path_only.starts_with("/store/") {
         let response = buffered_transport_error_response(
             request_head.request_id,
@@ -5880,7 +5948,7 @@ where
                 .context("failed writing object read header error");
         }
     };
-    let query = match transport_service::parse_query::<ObjectGetQuery>(raw_path) {
+    let query = match transport_service::parse_query::<ObjectGetQuery>(&normalized_raw_path) {
         Ok(query) => query,
         Err(err) => {
             let response = buffered_transport_error_response(
@@ -5938,6 +6006,7 @@ where
         .split_once('?')
         .map(|(path, _)| path)
         .unwrap_or(raw_path);
+    let path_only = transport_service::strip_public_api_v1_prefix(path_only);
     let Some(path_tail) = path_only.strip_prefix("/store/uploads/") else {
         let response = buffered_transport_error_response(
             request_head.request_id,
@@ -8844,7 +8913,7 @@ async fn list_store_index(
     State(state): State<ServerState>,
     Query(query): Query<StoreIndexQuery>,
 ) -> impl IntoResponse {
-    list_store_index_response(&state, query, "/media/thumbnail").await
+    list_store_index_response(&state, query, PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE).await
 }
 
 async fn list_store_index_admin(
@@ -8871,7 +8940,7 @@ async fn list_store_index_admin(
         return status.into_response();
     }
 
-    list_store_index_response(&state, query, "/auth/media/thumbnail").await
+    list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
 }
 
 async fn list_store_index_response(

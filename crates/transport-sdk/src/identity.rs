@@ -236,9 +236,13 @@ mod tests {
         };
 
         let json = serde_json::to_value(&request).expect("request should serialize");
-        let object = json.as_object().expect("request should serialize as an object");
+        let object = json
+            .as_object()
+            .expect("request should serialize as an object");
         assert_eq!(
-            object.get("device_label").and_then(serde_json::Value::as_str),
+            object
+                .get("device_label")
+                .and_then(serde_json::Value::as_str),
             Some("Tablet")
         );
         assert!(!object.contains_key("label"));
@@ -268,9 +272,13 @@ mod tests {
         };
 
         let json = serde_json::to_value(&identity).expect("identity should serialize");
-        let object = json.as_object().expect("identity should serialize as an object");
+        let object = json
+            .as_object()
+            .expect("identity should serialize as an object");
         assert_eq!(
-            object.get("device_label").and_then(serde_json::Value::as_str),
+            object
+                .get("device_label")
+                .and_then(serde_json::Value::as_str),
             Some("Laptop")
         );
         assert!(!object.contains_key("label"));

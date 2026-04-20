@@ -2,6 +2,12 @@ import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
+const API_V1_PREFIX = "/api/v1";
+
+function apiV1(path: string): string {
+  return `${API_V1_PREFIX}${path}`;
+}
+
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
   test.setTimeout(45_000);
   const uploadMetrics = await installClientUiMocks(page);
@@ -197,6 +203,25 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("Under replicated")).toBeVisible();
   await expect(page.locator("pre").filter({ hasText: '"node_id": "node-alpha"' })).toBeVisible();
   await expect(page.getByText('"under_replicated": 1')).toBeVisible();
+
+  const requestedPaths = uploadMetrics.requestedPaths();
+  expect(requestedPaths).toEqual(
+    expect.arrayContaining([
+      apiV1("/ping"),
+      apiV1("/health"),
+      apiV1("/cluster/status"),
+      apiV1("/rendezvous"),
+      apiV1("/store/list"),
+      apiV1("/store/uploads/start")
+    ])
+  );
+  expect(requestedPaths.some((path) => path.startsWith(apiV1("/store/stream-binary")))).toBe(true);
+  expect(requestedPaths.some((path) => path.startsWith(apiV1("/maps/")))).toBe(true);
+  expect(requestedPaths).not.toContain("/api/ping");
+  expect(requestedPaths).not.toContain("/api/health");
+  expect(requestedPaths).not.toContain("/api/cluster/status");
+  expect(requestedPaths).not.toContain("/api/store/list");
+  expect(requestedPaths).not.toContain("/api/maps/logical-file");
 });
 
 test("client-ui gallery grid keeps multiple columns on narrow viewports", async ({ page }) => {
@@ -325,14 +350,16 @@ async function installClientUiMocks(page: Page) {
   let maxConcurrentUploadIds = 0;
   const activeUploadIds = new Set<string>();
   const deletedUploadSessionIds = new Set<string>();
+  const requestedPaths = new Set<string>();
   const storeEntries = createMockStoreEntries();
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const { pathname, searchParams } = url;
     const method = route.request().method();
+    requestedPaths.add(pathname);
 
-    if (pathname === "/api/ping" && method === "GET") {
+    if (pathname === apiV1("/ping") && method === "GET") {
       return json(route, {
         ok: true,
         service: "cli-client-web",
@@ -341,11 +368,11 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/health" && method === "GET") {
+    if (pathname === apiV1("/health") && method === "GET") {
       return json(route, { mode: "cluster", status: "ok" });
     }
 
-    if (pathname === "/api/cluster/status" && method === "GET") {
+    if (pathname === apiV1("/cluster/status") && method === "GET") {
       return json(route, {
         local_node_id: "node-alpha",
         total_nodes: 2,
@@ -357,7 +384,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/rendezvous" && method === "GET") {
+    if (pathname === apiV1("/rendezvous") && method === "GET") {
       return json(route, {
         available: true,
         editable: true,
@@ -385,7 +412,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/store/put" && method === "POST") {
+    if (pathname === apiV1("/store/put") && method === "POST") {
       const body = route.request().postDataJSON() as { key: string; value: string };
       if (body.key.endsWith("/")) {
         upsertMockFolderEntry(storeEntries, body.key);
@@ -396,7 +423,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/store/get" && method === "GET") {
+    if (pathname === apiV1("/store/get") && method === "GET") {
       if (searchParams.get("preview_bytes")) {
         expect(searchParams.get("preview_bytes")).toBe("1024");
         return json(route, {
@@ -417,7 +444,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/store/delete" && method === "DELETE") {
+    if (pathname === apiV1("/store/delete") && method === "DELETE") {
       deleteMockStorePath(storeEntries, searchParams.get("key") ?? "");
       return json(route, {
         key: searchParams.get("key"),
@@ -425,7 +452,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/store/rename" && method === "POST") {
+    if (pathname === apiV1("/store/rename") && method === "POST") {
       const body = route.request().postDataJSON() as {
         from_path: string;
         to_path: string;
@@ -438,7 +465,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/maps/logical-file") {
+    if (pathname === apiV1("/maps/logical-file")) {
       const rangeHeader = route.request().headers().range;
       const commonHeaders = {
         "accept-ranges": "bytes",
@@ -491,7 +518,7 @@ async function installClientUiMocks(page: Page) {
       }
     }
 
-    if (pathname === "/api/maps/mbtiles-metadata" && method === "GET") {
+    if (pathname === apiV1("/maps/mbtiles-metadata") && method === "GET") {
       return json(route, {
         attribution: "Imagery Copyright MapTiler 2017. Data Copyright OpenStreetMap contributors.",
         center: [0, 20, 1],
@@ -501,7 +528,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname.startsWith("/api/maps/tiles/") && method === "GET") {
+    if (pathname.startsWith(apiV1("/maps/tiles/")) && method === "GET") {
       await route.fulfill({
         status: 200,
         headers: {
@@ -513,7 +540,7 @@ async function installClientUiMocks(page: Page) {
       return;
     }
 
-    if (pathname.startsWith("/api/maps/vector-tiles/") && method === "GET") {
+    if (pathname.startsWith(apiV1("/maps/vector-tiles/")) && method === "GET") {
       await route.fulfill({
         status: 200,
         headers: {
@@ -526,7 +553,7 @@ async function installClientUiMocks(page: Page) {
       return;
     }
 
-    if (pathname.startsWith("/api/maps/fonts/") && method === "GET") {
+    if (pathname.startsWith(apiV1("/maps/fonts/")) && method === "GET") {
       await route.fulfill({
         status: 200,
         headers: {
@@ -538,7 +565,7 @@ async function installClientUiMocks(page: Page) {
       return;
     }
 
-    if (pathname === "/api/store/list" && method === "GET") {
+    if (pathname === apiV1("/store/list") && method === "GET") {
       expect(searchParams.get("view")).toBe("tree");
       const prefix = searchParams.get("prefix") ?? "";
       return json(route, {
@@ -549,7 +576,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/media/thumbnail" && method === "GET") {
+    if (pathname === apiV1("/media/thumbnail") && method === "GET") {
       await route.fulfill({
         status: 200,
         contentType: "image/png",
@@ -558,25 +585,25 @@ async function installClientUiMocks(page: Page) {
       return;
     }
 
-    if (pathname === "/api/snapshots" && method === "GET") {
+    if (pathname === apiV1("/snapshots") && method === "GET") {
       return json(route, [{ id: "snapshot-001" }]);
     }
 
-    if (pathname === "/api/versions" && method === "GET") {
+    if (pathname === apiV1("/versions") && method === "GET") {
       return json(route, {
         key: searchParams.get("key"),
         versions: [{ version_id: "version-001" }, { version_id: "version-000" }]
       });
     }
 
-    if (pathname === "/api/cluster/nodes" && method === "GET") {
+    if (pathname === apiV1("/cluster/nodes") && method === "GET") {
       return json(route, [
         { node_id: "node-alpha", status: "online" },
         { node_id: "node-beta", status: "online" }
       ]);
     }
 
-    if (pathname === "/api/cluster/replication/plan" && method === "GET") {
+    if (pathname === apiV1("/cluster/replication/plan") && method === "GET") {
       return json(route, {
         under_replicated: 1,
         over_replicated: 0,
@@ -584,7 +611,7 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (pathname === "/api/store/uploads/start" && method === "POST") {
+    if (pathname === apiV1("/store/uploads/start") && method === "POST") {
       uploadSessionStartCount += 1;
       const body = route.request().postDataJSON() as {
         key: string;
@@ -604,8 +631,8 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (/^\/api\/store\/uploads\/[^/]+\/chunk\/\d+$/.test(pathname) && method === "PUT") {
-      const uploadId = pathname.split("/")[4] ?? "upload-unknown";
+    if (/^\/api\/v1\/store\/uploads\/[^/]+\/chunk\/\d+$/.test(pathname) && method === "PUT") {
+      const uploadId = pathname.split("/")[5] ?? "upload-unknown";
       const index = Number(pathname.split("/").pop() ?? "0");
       activeUploadIds.add(uploadId);
       maxConcurrentUploadIds = Math.max(maxConcurrentUploadIds, activeUploadIds.size);
@@ -623,8 +650,8 @@ async function installClientUiMocks(page: Page) {
       return;
     }
 
-    if (/^\/api\/store\/uploads\/[^/]+\/complete$/.test(pathname) && method === "POST") {
-      const uploadId = pathname.split("/")[4] ?? "upload-unknown";
+    if (/^\/api\/v1\/store\/uploads\/[^/]+\/complete$/.test(pathname) && method === "POST") {
+      const uploadId = pathname.split("/")[5] ?? "upload-unknown";
       const key = uploadKeys.get(uploadId) ?? `uploads/${uploadId}.bin`;
       const totalSizeBytes = uploadSizes.get(uploadId) ?? 21;
       upsertMockBinaryEntry(storeEntries, key, totalSizeBytes);
@@ -640,15 +667,15 @@ async function installClientUiMocks(page: Page) {
       });
     }
 
-    if (/^\/api\/store\/uploads\/[^/]+$/.test(pathname) && method === "DELETE") {
-      deletedUploadSessionIds.add(pathname.split("/")[4] ?? "upload-unknown");
+    if (/^\/api\/v1\/store\/uploads\/[^/]+$/.test(pathname) && method === "DELETE") {
+      deletedUploadSessionIds.add(pathname.split("/")[5] ?? "upload-unknown");
       await route.fulfill({
         status: 204
       });
       return;
     }
 
-    if (pathname === "/api/store/stream-binary" && method === "GET") {
+    if (pathname === apiV1("/store/stream-binary") && method === "GET") {
       if (
         searchParams.get("key") === "gallery/cat.png" ||
         searchParams.get("key") === "gallery/dog.jpg"
@@ -675,7 +702,7 @@ async function installClientUiMocks(page: Page) {
       }
     }
 
-    if (pathname === "/api/store/get-binary" && method === "GET") {
+    if (pathname === apiV1("/store/get-binary") && method === "GET") {
       await route.fulfill({
         status: 200,
         contentType: "application/octet-stream",
@@ -692,7 +719,8 @@ async function installClientUiMocks(page: Page) {
 
   return {
     maxConcurrentUploadIds: () => maxConcurrentUploadIds,
-    deletedUploadSessionIds: () => Array.from(deletedUploadSessionIds)
+    deletedUploadSessionIds: () => Array.from(deletedUploadSessionIds),
+    requestedPaths: () => Array.from(requestedPaths)
   };
 }
 

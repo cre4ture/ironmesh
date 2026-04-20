@@ -948,55 +948,54 @@ mod tests {
     }
 }
 
+#[test]
+fn serve_accepts_server_ca_pem_file_flag() {
+    let cli = Cli::try_parse_from([
+        "ironmesh-os-integration",
+        "serve",
+        "--sync-root-id",
+        "demo-root",
+        "--display-name",
+        "Demo",
+        "--root-path",
+        r"C:\\demo",
+        "--server-ca-pem-file",
+        r"C:\\demo\\server-ca.pem",
+    ])
+    .expect("canonical CA flag should parse");
 
-        #[test]
-        fn serve_accepts_server_ca_pem_file_flag() {
-            let cli = Cli::try_parse_from([
-                "ironmesh-os-integration",
-                "serve",
-                "--sync-root-id",
-                "demo-root",
-                "--display-name",
-                "Demo",
-                "--root-path",
-                r"C:\\demo",
-                "--server-ca-pem-file",
-                r"C:\\demo\\server-ca.pem",
-            ])
-            .expect("canonical CA flag should parse");
+    let Commands::Serve(args) = cli.command else {
+        panic!("serve command should parse");
+    };
 
-            let Commands::Serve(args) = cli.command else {
-                panic!("serve command should parse");
-            };
+    assert_eq!(
+        args.server_ca_pem_file,
+        Some(PathBuf::from(r"C:\demo\server-ca.pem"))
+    );
+}
 
-            assert_eq!(
-                args.server_ca_pem_file,
-                Some(PathBuf::from(r"C:\demo\server-ca.pem"))
-            );
-        }
+#[test]
+fn serve_accepts_legacy_server_ca_cert_alias() {
+    let cli = Cli::try_parse_from([
+        "ironmesh-os-integration",
+        "serve",
+        "--sync-root-id",
+        "demo-root",
+        "--display-name",
+        "Demo",
+        "--root-path",
+        r"C:\\demo",
+        "--server-ca-cert",
+        r"C:\\demo\\server-ca.pem",
+    ])
+    .expect("legacy CA flag alias should parse");
 
-        #[test]
-        fn serve_accepts_legacy_server_ca_cert_alias() {
-            let cli = Cli::try_parse_from([
-                "ironmesh-os-integration",
-                "serve",
-                "--sync-root-id",
-                "demo-root",
-                "--display-name",
-                "Demo",
-                "--root-path",
-                r"C:\\demo",
-                "--server-ca-cert",
-                r"C:\\demo\\server-ca.pem",
-            ])
-            .expect("legacy CA flag alias should parse");
+    let Commands::Serve(args) = cli.command else {
+        panic!("serve command should parse");
+    };
 
-            let Commands::Serve(args) = cli.command else {
-                panic!("serve command should parse");
-            };
-
-            assert_eq!(
-                args.server_ca_pem_file,
-                Some(PathBuf::from(r"C:\demo\server-ca.pem"))
-            );
-        }
+    assert_eq!(
+        args.server_ca_pem_file,
+        Some(PathBuf::from(r"C:\demo\server-ca.pem"))
+    );
+}

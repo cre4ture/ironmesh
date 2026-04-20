@@ -15,6 +15,7 @@ use crate::ironmesh_client::{IronMeshClient, SnapshotRestoreResponse, UploadResu
 use transport_sdk::ClientIdentityMaterial;
 
 const CACHE_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
+const CACHE_SCHEMA_VERSION_CURRENT: i64 = 1;
 
 #[derive(Clone)]
 pub struct ContentAddressedClientCache {
@@ -807,7 +808,11 @@ fn configure_connection(connection: &Connection) -> Result<()> {
 
 fn init_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS cache_entries (
+        "CREATE TABLE IF NOT EXISTS cache_meta (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS cache_entries (
              key TEXT PRIMARY KEY,
              manifest_hash TEXT NOT NULL,
              size_bytes INTEGER NOT NULL,
@@ -835,6 +840,39 @@ fn init_schema(connection: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_manifest_chunks_chunk_hash
              ON manifest_chunks(chunk_hash);",
     )?;
+
+    let stored_version = connection
+        .query_row(
+            "SELECT value FROM cache_meta WHERE key = ?1",
+            ["schema_version"],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("failed to read client cache schema version")?;
+
+    let schema_version = match stored_version {
+        Some(raw) => raw
+            .parse::<i64>()
+            .with_context(|| format!("invalid client cache schema version: {raw}"))?,
+        None => CACHE_SCHEMA_VERSION_CURRENT,
+    };
+
+    if schema_version != CACHE_SCHEMA_VERSION_CURRENT {
+        return Err(anyhow!(
+            "unsupported client cache schema version: {} (current={})",
+            schema_version,
+            CACHE_SCHEMA_VERSION_CURRENT
+        ));
+    }
+
+    connection
+        .execute(
+            "INSERT INTO cache_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params!["schema_version", CACHE_SCHEMA_VERSION_CURRENT.to_string()],
+        )
+        .context("failed to persist client cache schema version")?;
+
     Ok(())
 }
 
@@ -990,4 +1028,65 @@ fn unix_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_schema_persists_cache_schema_version() {
+        let connection = Connection::open_in_memory().expect("in-memory sqlite should open");
+
+        init_schema(&connection).expect("schema should initialize");
+
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = ?1",
+                ["schema_version"],
+                |row| row.get(0),
+            )
+            .expect("schema version should persist");
+        assert_eq!(schema_version, CACHE_SCHEMA_VERSION_CURRENT.to_string());
+    }
+
+    #[test]
+    fn init_schema_accepts_missing_legacy_schema_version() {
+        let connection = Connection::open_in_memory().expect("in-memory sqlite should open");
+
+        init_schema(&connection).expect("schema should initialize");
+        connection
+            .execute("DELETE FROM cache_meta WHERE key = ?1", ["schema_version"])
+            .expect("schema version row should delete");
+
+        init_schema(&connection).expect("legacy schema should be accepted");
+
+        let schema_version: String = connection
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = ?1",
+                ["schema_version"],
+                |row| row.get(0),
+            )
+            .expect("schema version should be restored");
+        assert_eq!(schema_version, CACHE_SCHEMA_VERSION_CURRENT.to_string());
+    }
+
+    #[test]
+    fn init_schema_rejects_future_schema_version() {
+        let connection = Connection::open_in_memory().expect("in-memory sqlite should open");
+
+        init_schema(&connection).expect("schema should initialize");
+        connection
+            .execute(
+                "UPDATE cache_meta SET value = ?2 WHERE key = ?1",
+                params!["schema_version", "99"],
+            )
+            .expect("future schema version should write");
+
+        let err = init_schema(&connection).expect_err("future schema version should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported client cache schema version: 99")
+        );
+    }
 }

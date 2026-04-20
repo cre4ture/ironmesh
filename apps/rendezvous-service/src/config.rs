@@ -5,8 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use common::{ClusterId, NodeId};
 pub use rendezvous_server::{
-    RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerConfig,
-    RendezvousServerTlsIdentity,
+    RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerConfig, RendezvousServerTlsIdentity,
 };
 
 use crate::failover::{
@@ -245,8 +244,8 @@ fn build_mtls_config(
     }
 
     match (client_ca_cert_path, cert_path, key_path) {
-        (Some(client_ca_cert_path), Some(cert_path), Some(key_path)) => Ok(Some(
-            RendezvousMtlsConfig {
+        (Some(client_ca_cert_path), Some(cert_path), Some(key_path)) => {
+            Ok(Some(RendezvousMtlsConfig {
                 client_ca: RendezvousClientCa::File {
                     cert_path: PathBuf::from(client_ca_cert_path),
                 },
@@ -254,8 +253,8 @@ fn build_mtls_config(
                     cert_path: PathBuf::from(cert_path),
                     key_path: PathBuf::from(key_path),
                 },
-            },
-        )),
+            }))
+        }
         (None, None, None) => Ok(None),
         _ => bail!(
             "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT, IRONMESH_RENDEZVOUS_TLS_CERT, and IRONMESH_RENDEZVOUS_TLS_KEY must be set together"
@@ -417,9 +416,9 @@ mod tests {
             failover_passphrase: Some("correct horse battery staple".to_string()),
         };
         let env = HashMap::from([(
-                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
-                "https://other.example:44042".to_string(),
-            )]);
+            "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+            "https://other.example:44042".to_string(),
+        )]);
         let err = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect_err("mismatched public URL should fail");
         assert!(
@@ -462,7 +461,11 @@ mod tests {
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect("legacy failover package should still load");
 
-        match config.mtls.expect("mTLS config should be present").client_ca {
+        match config
+            .mtls
+            .expect("mTLS config should be present")
+            .client_ca
+        {
             RendezvousClientCa::File { cert_path } => {
                 assert_eq!(cert_path, PathBuf::from("/tmp/cluster-ca.pem"));
             }

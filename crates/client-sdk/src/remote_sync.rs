@@ -724,8 +724,8 @@ mod tests {
         }
 
         let router = Router::new()
-            .route("/health", get(health))
-            .route("/store/index", get(store_index));
+            .route("/api/v1/health", get(health))
+            .route("/api/v1/store/index", get(store_index));
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server = std::thread::spawn(move || {
@@ -788,8 +788,8 @@ mod tests {
         }
 
         let router = Router::new()
-            .route("/health", get(health))
-            .route("/store/index", get(store_index));
+            .route("/api/v1/health", get(health))
+            .route("/api/v1/store/index", get(store_index));
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server = std::thread::spawn(move || {

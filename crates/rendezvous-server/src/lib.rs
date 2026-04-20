@@ -46,12 +46,8 @@ pub enum RendezvousServerTlsIdentity {
 
 #[derive(Debug, Clone)]
 pub enum RendezvousClientCa {
-    File {
-        cert_path: PathBuf,
-    },
-    InlinePem {
-        cert_pem: String,
-    },
+    File { cert_path: PathBuf },
+    InlinePem { cert_pem: String },
 }
 
 #[derive(Debug, Clone)]

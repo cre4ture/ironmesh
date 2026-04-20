@@ -34,24 +34,30 @@ export type BinaryUploadOptions = {
   signal?: AbortSignal;
 };
 
+const API_V1_PREFIX = "/api/v1";
+
+function apiV1(path: string): string {
+  return `${API_V1_PREFIX}${path}`;
+}
+
 export async function getClientPing(): Promise<ClientUiPingResponse> {
-  return fetchJson<ClientUiPingResponse>("/api/ping");
+  return fetchJson<ClientUiPingResponse>(apiV1("/ping"));
 }
 
 export async function getClientHealth(): Promise<JsonObject> {
-  return fetchJson<JsonObject>("/api/health");
+  return fetchJson<JsonObject>(apiV1("/health"));
 }
 
 export async function getClientClusterStatus(): Promise<JsonObject> {
-  return fetchJson<JsonObject>("/api/cluster/status");
+  return fetchJson<JsonObject>(apiV1("/cluster/status"));
 }
 
 export async function getClientRendezvous(): Promise<ClientRendezvousView> {
-  return fetchJson<ClientRendezvousView>("/api/rendezvous");
+  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous"));
 }
 
 export async function refreshClientRendezvous(): Promise<ClientRendezvousView> {
-  return fetchJson<ClientRendezvousView>("/api/rendezvous/refresh", {
+  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous/refresh"), {
     method: "POST"
   });
 }
@@ -63,7 +69,7 @@ export async function runClientLatencyTest(request?: {
   server_delay_ms?: number;
   pause_between_samples_ms?: number;
 }): Promise<ClientLatencyTestResponse> {
-  return fetchJson<ClientLatencyTestResponse>("/api/latency-test", {
+  return fetchJson<ClientLatencyTestResponse>(apiV1("/latency-test"), {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -75,7 +81,7 @@ export async function runClientLatencyTest(request?: {
 export async function updateClientRendezvous(request: {
   rendezvous_urls: string[];
 }): Promise<ClientRendezvousView> {
-  return fetchJson<ClientRendezvousView>("/api/rendezvous", {
+  return fetchJson<ClientRendezvousView>(apiV1("/rendezvous"), {
     method: "PUT",
     headers: {
       "content-type": "application/json"
@@ -85,15 +91,15 @@ export async function updateClientRendezvous(request: {
 }
 
 export async function getClientClusterNodes(): Promise<unknown[]> {
-  return fetchJson<unknown[]>("/api/cluster/nodes");
+  return fetchJson<unknown[]>(apiV1("/cluster/nodes"));
 }
 
 export async function getClientReplicationPlan(): Promise<JsonObject> {
-  return fetchJson<JsonObject>("/api/cluster/replication/plan");
+  return fetchJson<JsonObject>(apiV1("/cluster/replication/plan"));
 }
 
 export async function listSnapshots(): Promise<SnapshotSummary[]> {
-  return fetchJson<SnapshotSummary[]>("/api/snapshots");
+  return fetchJson<SnapshotSummary[]>(apiV1("/snapshots"));
 }
 
 export async function listStoreEntries(
@@ -112,7 +118,7 @@ export async function listStoreEntries(
     query.set("snapshot", snapshot.trim());
   }
   query.set("view", view);
-  return fetchJson<StoreListResponse>(`/api/store/list?${query.toString()}`);
+  return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
 }
 
 export async function getStoreValue(
@@ -131,11 +137,11 @@ export async function getStoreValue(
   if (previewBytes && previewBytes > 0) {
     query.set("preview_bytes", String(Math.floor(previewBytes)));
   }
-  return fetchJson<StoreGetResponse>(`/api/store/get?${query.toString()}`);
+  return fetchJson<StoreGetResponse>(`${apiV1("/store/get")}?${query.toString()}`);
 }
 
 export async function putStoreValue(key: string, value: string): Promise<StorePutResponse> {
-  return fetchJson<StorePutResponse>("/api/store/put", {
+  return fetchJson<StorePutResponse>(apiV1("/store/put"), {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -149,7 +155,7 @@ export async function renameStorePath(
   toPath: string,
   overwrite = false
 ): Promise<JsonObject> {
-  return fetchJson<JsonObject>("/api/store/rename", {
+  return fetchJson<JsonObject>(apiV1("/store/rename"), {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -164,7 +170,7 @@ export async function renameStorePath(
 
 export async function deleteStoreValue(key: string): Promise<JsonObject> {
   const query = new URLSearchParams({ key });
-  return fetchJson<JsonObject>(`/api/store/delete?${query.toString()}`, {
+  return fetchJson<JsonObject>(`${apiV1("/store/delete")}?${query.toString()}`, {
     method: "DELETE"
   });
 }
@@ -175,7 +181,7 @@ export async function restoreStorePathFromSnapshot(
   targetPath: string,
   recursive = false
 ): Promise<JsonObject> {
-  return fetchJson<JsonObject>("/api/store/restore", {
+  return fetchJson<JsonObject>(apiV1("/store/restore"), {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -228,7 +234,7 @@ export async function putBinaryObject(
       const end = Math.min(start + session.chunk_size_bytes, file.size);
       const chunk = file.slice(start, end);
       const response = await fetch(
-        `/api/store/uploads/${encodeURIComponent(session.upload_id)}/chunk/${index}`,
+        apiV1(`/store/uploads/${encodeURIComponent(session.upload_id)}/chunk/${index}`),
         {
           method: "PUT",
           body: chunk,
@@ -295,7 +301,7 @@ export function getBinaryObjectDownloadUrl(
   snapshot?: string | null,
   version?: string | null
 ): string {
-  return buildBinaryObjectUrl("/api/store/get-binary", key, snapshot, version);
+  return buildBinaryObjectUrl(apiV1("/store/get-binary"), key, snapshot, version);
 }
 
 export function getBinaryObjectStreamUrl(
@@ -303,7 +309,7 @@ export function getBinaryObjectStreamUrl(
   snapshot?: string | null,
   version?: string | null
 ): string {
-  return buildBinaryObjectUrl("/api/store/stream-binary", key, snapshot, version);
+  return buildBinaryObjectUrl(apiV1("/store/stream-binary"), key, snapshot, version);
 }
 
 function buildBinaryObjectUrl(
@@ -342,7 +348,9 @@ export async function downloadBinaryObject(
 }
 
 export async function getVersionGraph(key: string): Promise<VersionGraphResponse> {
-  return fetchJson<VersionGraphResponse>(`/api/versions?key=${encodeURIComponent(key)}`);
+  return fetchJson<VersionGraphResponse>(
+    `${apiV1("/versions")}?key=${encodeURIComponent(key)}`
+  );
 }
 
 async function readJsonResponse<T>(response: Response): Promise<T> {
@@ -357,7 +365,7 @@ async function startStoreUploadSession(
   totalSizeBytes: number,
   signal?: AbortSignal
 ): Promise<StoreUploadSessionStartResponse> {
-  return fetchJson<StoreUploadSessionStartResponse>("/api/store/uploads/start", {
+  return fetchJson<StoreUploadSessionStartResponse>(apiV1("/store/uploads/start"), {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -375,7 +383,7 @@ async function completeStoreUploadSession(
   signal?: AbortSignal
 ): Promise<StoreUploadSessionCompleteResponse> {
   return fetchJson<StoreUploadSessionCompleteResponse>(
-    `/api/store/uploads/${encodeURIComponent(uploadId)}/complete`,
+    apiV1(`/store/uploads/${encodeURIComponent(uploadId)}/complete`),
     {
       method: "POST",
       signal
@@ -387,7 +395,7 @@ async function deleteStoreUploadSession(
   uploadId: string,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(`/api/store/uploads/${encodeURIComponent(uploadId)}`, {
+  const response = await fetch(apiV1(`/store/uploads/${encodeURIComponent(uploadId)}`), {
     method: "DELETE",
     signal
   });

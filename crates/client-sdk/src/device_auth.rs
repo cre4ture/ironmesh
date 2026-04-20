@@ -7,6 +7,8 @@ use std::fs;
 use std::path::Path;
 use transport_sdk::IssuedClientIdentity;
 
+use crate::ironmesh_client::CLIENT_API_V1_PREFIX;
+
 use crate::connection::{
     build_blocking_http_client, build_blocking_reqwest_client_from_pem_for_url,
     build_reqwest_client_from_pem_for_url,
@@ -66,7 +68,7 @@ pub async fn enroll_device(
     request: &DeviceEnrollmentRequest,
 ) -> Result<DeviceEnrollmentResponse> {
     let enroll_url = base_url
-        .join("auth/device/enroll")
+        .join(&format!("{CLIENT_API_V1_PREFIX}/auth/device/enroll"))
         .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
     let server_ca_pem = if let Some(ca_cert_path) = server_ca_cert {
         Some(fs::read_to_string(ca_cert_path).with_context(|| {
@@ -95,7 +97,7 @@ pub fn enroll_device_blocking(
     request: &DeviceEnrollmentRequest,
 ) -> Result<DeviceEnrollmentResponse> {
     let enroll_url = base_url
-        .join("auth/device/enroll")
+        .join(&format!("{CLIENT_API_V1_PREFIX}/auth/device/enroll"))
         .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
     let client = if let Some(ca_cert_path) = server_ca_cert {
         let server_ca_pem = fs::read_to_string(ca_cert_path).with_context(|| {
@@ -126,7 +128,7 @@ pub fn enroll_device_blocking_from_pem(
     request: &DeviceEnrollmentRequest,
 ) -> Result<DeviceEnrollmentResponse> {
     let enroll_url = base_url
-        .join("auth/device/enroll")
+        .join(&format!("{CLIENT_API_V1_PREFIX}/auth/device/enroll"))
         .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
     let client = build_blocking_reqwest_client_from_pem_for_url(server_ca_pem, &enroll_url)?;
     let response = client
@@ -240,9 +242,13 @@ mod tests {
         };
 
         let json = serde_json::to_value(&request).expect("request should serialize");
-        let object = json.as_object().expect("request should serialize as an object");
+        let object = json
+            .as_object()
+            .expect("request should serialize as an object");
         assert_eq!(
-            object.get("device_label").and_then(serde_json::Value::as_str),
+            object
+                .get("device_label")
+                .and_then(serde_json::Value::as_str),
             Some("Tablet")
         );
         assert!(!object.contains_key("label"));
@@ -267,9 +273,13 @@ mod tests {
     fn device_enrollment_response_serializes_device_label_and_accepts_legacy_label() {
         let response = sample_response();
         let json = serde_json::to_value(&response).expect("response should serialize");
-        let object = json.as_object().expect("response should serialize as an object");
+        let object = json
+            .as_object()
+            .expect("response should serialize as an object");
         assert_eq!(
-            object.get("device_label").and_then(serde_json::Value::as_str),
+            object
+                .get("device_label")
+                .and_then(serde_json::Value::as_str),
             Some("phone")
         );
         assert!(!object.contains_key("label"));

@@ -189,19 +189,19 @@ async fn main() -> Result<()> {
         }
         Commands::Health => {
             let client = build_authenticated_sdk_from_cli(&cli).await?;
-            print_json_endpoint(&client, "/health").await
+            print_json_endpoint(&client, "/api/v1/health").await
         }
         Commands::ClusterStatus => {
             let client = build_authenticated_sdk_from_cli(&cli).await?;
-            print_json_endpoint(&client, "/cluster/status").await
+            print_json_endpoint(&client, "/api/v1/cluster/status").await
         }
         Commands::Nodes => {
             let client = build_authenticated_sdk_from_cli(&cli).await?;
-            print_json_endpoint(&client, "/cluster/nodes").await
+            print_json_endpoint(&client, "/api/v1/cluster/nodes").await
         }
         Commands::ReplicationPlan => {
             let client = build_authenticated_sdk_from_cli(&cli).await?;
-            print_json_endpoint(&client, "/cluster/replication/plan").await
+            print_json_endpoint(&client, "/api/v1/cluster/replication/plan").await
         }
         Commands::LatencyTest {
             path,

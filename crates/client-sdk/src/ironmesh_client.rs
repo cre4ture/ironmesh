@@ -14,6 +14,7 @@ use reqwest::header::{
     IF_RANGE, RANGE,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
@@ -38,6 +39,7 @@ const CHUNK_UPLOAD_SIZE_BYTES: usize = 1024 * 1024;
 const DOWNLOAD_SEGMENT_SIZE_BYTES: usize = 1024 * 1024;
 const STAGED_DOWNLOAD_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
 const TRANSPORT_STREAM_COPY_BUFFER_SIZE_BYTES: usize = 64 * 1024;
+pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestedRange {
@@ -2143,9 +2145,23 @@ impl IronMeshClient {
         runtime.block_on(self.get_object_size(&key, snapshot.as_deref(), version.as_deref()))
     }
 
-    fn store_key_url(&self, key: &str) -> Result<Url> {
+    fn client_api_base_url(&self) -> Result<Url> {
         let mut url = reqwest::Url::parse(self.server_base_url())
             .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("api");
+            segments.push("v1");
+        }
+
+        Ok(url)
+    }
+
+    fn store_key_url(&self, key: &str) -> Result<Url> {
+        let mut url = self.client_api_base_url()?;
 
         let mut segments = url
             .path_segments_mut()
@@ -2163,16 +2179,21 @@ impl IronMeshClient {
             bail!("relative request path is empty");
         }
 
+        let normalized_path = normalize_client_api_path(path);
         let base_url = reqwest::Url::parse(self.server_base_url())
             .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
         base_url
-            .join(path.trim_start_matches('/'))
-            .with_context(|| format!("failed to build request URL from {} and {path}", base_url))
+            .join(normalized_path.trim_start_matches('/'))
+            .with_context(|| {
+                format!(
+                    "failed to build request URL from {} and {}",
+                    base_url, normalized_path
+                )
+            })
     }
 
     fn store_index_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2186,8 +2207,7 @@ impl IronMeshClient {
     }
 
     fn store_versions_url(&self, key: &str) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2201,8 +2221,7 @@ impl IronMeshClient {
     }
 
     fn store_index_change_wait_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2218,8 +2237,7 @@ impl IronMeshClient {
     }
 
     fn store_rename_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2233,8 +2251,7 @@ impl IronMeshClient {
     }
 
     fn store_copy_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2248,8 +2265,7 @@ impl IronMeshClient {
     }
 
     fn store_delete_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2263,8 +2279,7 @@ impl IronMeshClient {
     }
 
     fn store_restore_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2278,8 +2293,7 @@ impl IronMeshClient {
     }
 
     fn store_upload_session_start_url(&self) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2294,8 +2308,7 @@ impl IronMeshClient {
     }
 
     fn store_upload_session_url(&self, upload_id: &str) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2310,8 +2323,7 @@ impl IronMeshClient {
     }
 
     fn store_upload_session_chunk_url(&self, upload_id: &str, index: usize) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2328,8 +2340,7 @@ impl IronMeshClient {
     }
 
     fn store_upload_session_complete_url(&self, upload_id: &str) -> Result<Url> {
-        let mut url = reqwest::Url::parse(self.server_base_url())
-            .with_context(|| format!("invalid server URL: {}", self.server_base_url()))?;
+        let mut url = self.client_api_base_url()?;
 
         {
             let mut segments = url
@@ -2466,6 +2477,7 @@ where
 }
 
 fn transport_stream_kind_for_path(path: &str) -> TransportStreamKind {
+    let path = strip_client_api_v1_prefix(path);
     if path == "/health" || path.starts_with("/diagnostics/") {
         TransportStreamKind::Diagnostics
     } else {
@@ -3231,6 +3243,56 @@ fn path_and_query(url: &Url) -> String {
     }
 }
 
+fn normalize_client_api_path(path: &str) -> Cow<'_, str> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Cow::Borrowed(trimmed);
+    }
+
+    if trimmed == CLIENT_API_V1_PREFIX || trimmed.starts_with(&format!("{CLIENT_API_V1_PREFIX}/")) {
+        return Cow::Borrowed(trimmed);
+    }
+
+    let path_with_slash = if trimmed.starts_with('/') {
+        trimmed
+    } else {
+        return Cow::Owned(format!("{CLIENT_API_V1_PREFIX}/{trimmed}"));
+    };
+
+    let path_only = path_with_slash
+        .split_once('?')
+        .map(|(value, _)| value)
+        .unwrap_or(path_with_slash);
+
+    if path_only == "/health"
+        || path_only.starts_with("/diagnostics/")
+        || path_only.starts_with("/transport/")
+        || path_only.starts_with("/snapshots")
+        || path_only.starts_with("/store/")
+        || path_only.starts_with("/versions/")
+        || path_only.starts_with("/cluster/")
+        || path_only.starts_with("/auth/")
+        || path_only.starts_with("/storage/")
+        || path_only.starts_with("/media/")
+        || path_only.starts_with("/maintenance/")
+    {
+        Cow::Owned(format!("{CLIENT_API_V1_PREFIX}{path_with_slash}"))
+    } else {
+        Cow::Borrowed(path_with_slash)
+    }
+}
+
+fn strip_client_api_v1_prefix(path: &str) -> &str {
+    if let Some(rest) = path.strip_prefix(CLIENT_API_V1_PREFIX)
+        && !rest.is_empty()
+        && (rest.starts_with('/') || rest.starts_with('?'))
+    {
+        rest
+    } else {
+        path
+    }
+}
+
 fn unix_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3305,7 +3367,42 @@ mod tests {
         let url = client
             .store_key_url("read me.txt")
             .expect("object url should build");
-        assert_eq!(url.as_str(), "http://127.0.0.1:18080/store/read%20me.txt");
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:18080/api/v1/store/read%20me.txt"
+        );
+    }
+
+    #[test]
+    fn normalize_client_api_path_prefixes_known_public_routes() {
+        assert_eq!(
+            normalize_client_api_path("/cluster/status").as_ref(),
+            "/api/v1/cluster/status"
+        );
+        assert_eq!(
+            normalize_client_api_path("/api/v1/cluster/status").as_ref(),
+            "/api/v1/cluster/status"
+        );
+        assert_eq!(
+            normalize_client_api_path("/media/thumbnail?key=gallery%2Fcat.png").as_ref(),
+            "/api/v1/media/thumbnail?key=gallery%2Fcat.png"
+        );
+    }
+
+    #[test]
+    fn transport_stream_kind_classification_accepts_versioned_public_routes() {
+        assert_eq!(
+            transport_stream_kind_for_path("/api/v1/health"),
+            TransportStreamKind::Diagnostics
+        );
+        assert_eq!(
+            transport_stream_kind_for_path("/api/v1/diagnostics/latency"),
+            TransportStreamKind::Diagnostics
+        );
+        assert_eq!(
+            transport_stream_kind_for_path("/api/v1/cluster/status"),
+            TransportStreamKind::Rpc
+        );
     }
 
     #[test]
@@ -3444,7 +3541,7 @@ mod tests {
     fn delete_url_builder_builds_expected_path() {
         let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
         let url = client.store_delete_url().expect("delete url should build");
-        assert_eq!(url.as_str(), "http://127.0.0.1:18080/store/delete");
+        assert_eq!(url.as_str(), "http://127.0.0.1:18080/api/v1/store/delete");
     }
 
     #[test]
@@ -3453,7 +3550,7 @@ mod tests {
         let url = client.store_versions_url("docs/readme.txt").unwrap();
         assert_eq!(
             url.as_str(),
-            "http://127.0.0.1:18080/versions/docs%2Freadme.txt"
+            "http://127.0.0.1:18080/api/v1/versions/docs%2Freadme.txt"
         );
     }
 
@@ -3481,7 +3578,7 @@ mod tests {
             })
         }
 
-        let app = axum::Router::new().route("/versions/{key}", axum::routing::get(versions));
+        let app = axum::Router::new().route("/api/v1/versions/{key}", axum::routing::get(versions));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -3902,7 +3999,7 @@ mod tests {
                         .expect("mixed workload request should decode");
 
                     match (request.kind, request.method.as_str(), request.path.as_str()) {
-                        (TransportStreamKind::Rpc, "HEAD", "/store/large.bin") => {
+                        (TransportStreamKind::Rpc, "HEAD", "/api/v1/store/large.bin") => {
                             write_buffered_transport_response(
                                 &mut stream,
                                 &MultiplexBufferedTransportResponse {
@@ -3932,7 +4029,7 @@ mod tests {
                             .await
                             .expect("mixed workload HEAD response should write");
                         }
-                        (TransportStreamKind::ObjectRead, "GET", "/store/large.bin") => {
+                        (TransportStreamKind::ObjectRead, "GET", "/api/v1/store/large.bin") => {
                             let range = request
                                 .headers
                                 .iter()
@@ -3988,7 +4085,7 @@ mod tests {
                                 .await
                                 .expect("mixed workload object-read stream should close");
                         }
-                        (TransportStreamKind::Rpc, "GET", "/cluster/status") => {
+                        (TransportStreamKind::Rpc, "GET", "/api/v1/cluster/status") => {
                             write_buffered_transport_response(
                                 &mut stream,
                                 &MultiplexBufferedTransportResponse {
@@ -4173,7 +4270,7 @@ mod tests {
             .clone()
             .expect("relay request should be captured");
         assert_eq!(captured.method, "GET");
-        assert_eq!(captured.path_and_query, "/store/index?depth=1");
+        assert_eq!(captured.path_and_query, "/api/v1/store/index?depth=1");
         assert!(
             captured
                 .headers
@@ -4227,7 +4324,7 @@ mod tests {
             .await
             .clone()
             .expect("relay request should be captured");
-        assert_eq!(captured.path_and_query, "/cluster/status");
+        assert_eq!(captured.path_and_query, "/api/v1/cluster/status");
         assert!(
             captured
                 .headers
@@ -4284,7 +4381,7 @@ mod tests {
             .expect("relay request should be captured");
         assert_eq!(
             captured.path_and_query,
-            "/media/thumbnail?key=gallery%2Fcat.png"
+            "/api/v1/media/thumbnail?key=gallery%2Fcat.png"
         );
         assert!(
             captured
@@ -4347,7 +4444,7 @@ mod tests {
             .clone()
             .expect("relay request should be captured");
         assert_eq!(captured.method, "HEAD");
-        assert_eq!(captured.path_and_query, "/store/gallery%2Fcat.png");
+        assert_eq!(captured.path_and_query, "/api/v1/store/gallery%2Fcat.png");
 
         server.abort();
         let _ = server.await;
@@ -4448,7 +4545,7 @@ mod tests {
             .expect("relay request should be captured");
         assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
         assert_eq!(captured.method, "PUT");
-        assert_eq!(captured.path_and_query, "/store/uploads/upload-123/chunk/2");
+        assert_eq!(captured.path_and_query, "/api/v1/store/uploads/upload-123/chunk/2");
         assert_eq!(captured.body, b"chunk-body".to_vec());
 
         server.abort();
@@ -4508,7 +4605,7 @@ mod tests {
         assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
         assert_eq!(
             captured.path_and_query,
-            "/store/uploads/upload-retry/chunk/4"
+            "/api/v1/store/uploads/upload-retry/chunk/4"
         );
         assert_eq!(captured.body, b"retry-body".to_vec());
 
@@ -4562,7 +4659,7 @@ mod tests {
             .await
             .clone()
             .expect("direct request should be captured");
-        assert_eq!(captured.path_and_query, "/cluster/status");
+        assert_eq!(captured.path_and_query, "/api/v1/cluster/status");
         assert!(
             captured
                 .headers
@@ -4650,7 +4747,7 @@ mod tests {
             .clone()
             .expect("direct request should be captured");
         assert_eq!(captured.method, "GET");
-        assert_eq!(captured.path_and_query, "/store/index?depth=1");
+        assert_eq!(captured.path_and_query, "/api/v1/store/index?depth=1");
         assert!(
             captured
                 .headers
@@ -4706,7 +4803,7 @@ mod tests {
             .expect("direct request should be captured");
         assert_eq!(
             captured.path_and_query,
-            "/media/thumbnail?key=gallery%2Fcat.png"
+            "/api/v1/media/thumbnail?key=gallery%2Fcat.png"
         );
         assert!(
             captured
@@ -4768,7 +4865,7 @@ mod tests {
             .clone()
             .expect("direct request should be captured");
         assert_eq!(captured.method, "HEAD");
-        assert_eq!(captured.path_and_query, "/store/gallery%2Fcat.png");
+        assert_eq!(captured.path_and_query, "/api/v1/store/gallery%2Fcat.png");
 
         server.abort();
         let _ = server.await;
@@ -4822,7 +4919,7 @@ mod tests {
             .expect("direct request should be captured");
         assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
         assert_eq!(captured.method, "PUT");
-        assert_eq!(captured.path_and_query, "/store/uploads/upload-abc/chunk/3");
+        assert_eq!(captured.path_and_query, "/api/v1/store/uploads/upload-abc/chunk/3");
         assert_eq!(captured.body, b"direct-chunk".to_vec());
 
         server.abort();
@@ -5036,7 +5133,7 @@ mod tests {
         );
 
         let app = Router::new()
-            .route("/store/{*key}", get(get_store).head(head_store))
+            .route("/api/v1/store/{*key}", get(get_store).head(head_store))
             .with_state(payload.clone());
         let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
