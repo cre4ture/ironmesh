@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use common::{ClusterId, NodeId};
 pub use rendezvous_server::{
-    RendezvousMtlsConfig, RendezvousServerConfig, RendezvousServerTlsIdentity,
+    RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerConfig,
+    RendezvousServerTlsIdentity,
 };
 
 use crate::failover::{
@@ -29,6 +30,8 @@ const LONG_VERSION: &str = git_version::git_version!(
 #[command(long_version = LONG_VERSION)]
 #[command(after_help = BUILD_INFO)]
 pub struct RendezvousServiceCliConfig {
+    #[arg(long = "bind-addr", value_name = "ADDR")]
+    pub bind_addr: Option<SocketAddr>,
     #[arg(
         long = "failover-package",
         env = "IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE",
@@ -68,11 +71,17 @@ impl RendezvousServiceCliConfig {
 
     fn validate(self) -> Result<Self> {
         match (&self.failover_package_path, &self.failover_passphrase) {
-            (Some(_), Some(_)) | (None, None) => Ok(self),
+            (Some(_), Some(_)) | (None, None) => {}
             _ => bail!(
                 "IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE and IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE must be set together"
             ),
         }
+
+        if self.failover_package_path.is_some() && self.bind_addr.is_none() {
+            bail!("--bind-addr is required when using a failover package");
+        }
+
+        Ok(self)
     }
 }
 
@@ -90,10 +99,17 @@ impl RendezvousServiceConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let bind_addr: SocketAddr = lookup_env("IRONMESH_RENDEZVOUS_BIND")
-            .unwrap_or_else(|| "127.0.0.1:19090".to_string())
-            .parse()
-            .context("invalid IRONMESH_RENDEZVOUS_BIND")?;
+        if args.failover_package_path.is_some() && args.bind_addr.is_none() {
+            bail!("--bind-addr is required when using a failover package");
+        }
+
+        let bind_addr = match args.bind_addr {
+            Some(bind_addr) => bind_addr,
+            None => lookup_env("IRONMESH_RENDEZVOUS_BIND")
+                .unwrap_or_else(|| "127.0.0.1:19090".to_string())
+                .parse()
+                .context("invalid IRONMESH_RENDEZVOUS_BIND")?,
+        };
 
         let failover_package = args
             .failover_package_path
@@ -198,32 +214,49 @@ fn build_mtls_config(
     key_path: Option<String>,
     failover_package: Option<&DecryptedRendezvousFailoverPackage>,
 ) -> Result<Option<RendezvousMtlsConfig>> {
-    match (client_ca_cert_path, cert_path, key_path, failover_package) {
-        (Some(client_ca_cert_path), Some(cert_path), Some(key_path), None) => {
-            Ok(Some(RendezvousMtlsConfig {
-                client_ca_cert_path: PathBuf::from(client_ca_cert_path),
-                server_identity: RendezvousServerTlsIdentity::Files {
-                    cert_path: PathBuf::from(cert_path),
-                    key_path: PathBuf::from(key_path),
-                },
-            }))
+    if let Some(package) = failover_package {
+        if cert_path.is_some() || key_path.is_some() {
+            bail!(
+                "IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY cannot be combined with a failover package"
+            );
         }
-        (Some(client_ca_cert_path), None, None, Some(package)) => Ok(Some(RendezvousMtlsConfig {
-            client_ca_cert_path: PathBuf::from(client_ca_cert_path),
+
+        let client_ca = if let Some(client_ca_cert_pem) = package.client_ca_cert_pem.as_ref() {
+            RendezvousClientCa::InlinePem {
+                cert_pem: client_ca_cert_pem.clone(),
+            }
+        } else if let Some(client_ca_cert_path) = client_ca_cert_path {
+            RendezvousClientCa::File {
+                cert_path: PathBuf::from(client_ca_cert_path),
+            }
+        } else {
+            bail!(
+                "legacy failover packages require IRONMESH_RENDEZVOUS_CLIENT_CA_CERT because they do not embed the client CA"
+            );
+        };
+
+        return Ok(Some(RendezvousMtlsConfig {
+            client_ca,
             server_identity: RendezvousServerTlsIdentity::InlinePem {
                 cert_pem: package.cert_pem.clone(),
                 key_pem: package.key_pem.clone(),
             },
-        })),
-        (None, None, None, None) => Ok(None),
-        (None, None, None, Some(_)) => {
-            bail!("IRONMESH_RENDEZVOUS_CLIENT_CA_CERT is required when using a failover package")
-        }
-        (_, Some(_), Some(_), Some(_))
-        | (_, Some(_), None, Some(_))
-        | (_, None, Some(_), Some(_)) => bail!(
-            "IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY cannot be combined with a failover package"
-        ),
+        }));
+    }
+
+    match (client_ca_cert_path, cert_path, key_path) {
+        (Some(client_ca_cert_path), Some(cert_path), Some(key_path)) => Ok(Some(
+            RendezvousMtlsConfig {
+                client_ca: RendezvousClientCa::File {
+                    cert_path: PathBuf::from(client_ca_cert_path),
+                },
+                server_identity: RendezvousServerTlsIdentity::Files {
+                    cert_path: PathBuf::from(cert_path),
+                    key_path: PathBuf::from(key_path),
+                },
+            },
+        )),
+        (None, None, None) => Ok(None),
         _ => bail!(
             "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT, IRONMESH_RENDEZVOUS_TLS_CERT, and IRONMESH_RENDEZVOUS_TLS_KEY must be set together"
         ),
@@ -235,7 +268,9 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use crate::failover::build_test_failover_package_json;
+    use crate::failover::{
+        build_legacy_test_failover_package_json, build_test_failover_package_json,
+    };
 
     #[test]
     fn validate_startup_security_rejects_plain_http_by_default() {
@@ -274,6 +309,7 @@ mod tests {
     fn cli_config_parses_failover_args() {
         let cli = RendezvousServiceCliConfig::try_parse_from([
             "ironmesh-rendezvous-service",
+            "--bind-addr=0.0.0.0:44042",
             "--failover-package",
             "/tmp/failover.json",
             "--failover-passphrase=swordfish",
@@ -282,6 +318,10 @@ mod tests {
         .validate()
         .expect("cli config should validate");
 
+        assert_eq!(
+            cli.bind_addr,
+            Some("0.0.0.0:44042".parse().expect("bind addr should parse"))
+        );
         assert_eq!(
             cli.failover_package_path,
             Some(PathBuf::from("/tmp/failover.json"))
@@ -309,19 +349,11 @@ mod tests {
         .expect("test failover package should write");
 
         let cli = RendezvousServiceCliConfig {
+            bind_addr: Some("0.0.0.0:44042".parse().expect("bind addr should parse")),
             failover_package_path: Some(package_path.clone()),
             failover_passphrase: Some("correct horse battery staple".to_string()),
         };
-        let env = HashMap::from([
-            (
-                "IRONMESH_RENDEZVOUS_BIND".to_string(),
-                "0.0.0.0:44042".to_string(),
-            ),
-            (
-                "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
-                "/tmp/cluster-ca.pem".to_string(),
-            ),
-        ]);
+        let env = HashMap::<String, String>::new();
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect("config should load failover package");
 
@@ -338,11 +370,16 @@ mod tests {
                 .package_path,
             package_path
         );
-        match config
-            .mtls
-            .expect("mTLS config should be present")
-            .server_identity
-        {
+        let mtls = config.mtls.expect("mTLS config should be present");
+        match mtls.client_ca {
+            RendezvousClientCa::InlinePem { cert_pem } => {
+                assert!(cert_pem.contains("client-ca"));
+            }
+            RendezvousClientCa::File { .. } => {
+                panic!("failover package should produce inline client CA material");
+            }
+        }
+        match mtls.server_identity {
             RendezvousServerTlsIdentity::InlinePem { cert_pem, key_pem } => {
                 assert!(cert_pem.contains("BEGIN CERTIFICATE"));
                 assert!(key_pem.contains("BEGIN PRIVATE KEY"));
@@ -375,29 +412,64 @@ mod tests {
         .expect("test failover package should write");
 
         let cli = RendezvousServiceCliConfig {
+            bind_addr: Some("0.0.0.0:44042".parse().expect("bind addr should parse")),
             failover_package_path: Some(package_path),
             failover_passphrase: Some("correct horse battery staple".to_string()),
         };
-        let env = HashMap::from([
-            (
-                "IRONMESH_RENDEZVOUS_BIND".to_string(),
-                "0.0.0.0:44042".to_string(),
-            ),
-            (
-                "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
-                "/tmp/cluster-ca.pem".to_string(),
-            ),
-            (
+        let env = HashMap::from([(
                 "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
                 "https://other.example:44042".to_string(),
-            ),
-        ]);
+            )]);
         let err = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
             .expect_err("mismatched public URL should fail");
         assert!(
             err.to_string()
                 .contains("does not match failover package public_url")
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn from_lookup_legacy_failover_package_uses_env_client_ca() {
+        let dir = std::env::temp_dir().join(format!(
+            "ironmesh-rendezvous-config-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should create");
+        let package_path = dir.join("failover.json");
+        std::fs::write(
+            &package_path,
+            build_legacy_test_failover_package_json(
+                "https://creax.de:44042",
+                "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
+                "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+                "correct horse battery staple",
+            ),
+        )
+        .expect("test failover package should write");
+
+        let cli = RendezvousServiceCliConfig {
+            bind_addr: Some("0.0.0.0:44042".parse().expect("bind addr should parse")),
+            failover_package_path: Some(package_path),
+            failover_passphrase: Some("correct horse battery staple".to_string()),
+        };
+        let env = HashMap::from([(
+            "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
+            "/tmp/cluster-ca.pem".to_string(),
+        )]);
+
+        let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
+            .expect("legacy failover package should still load");
+
+        match config.mtls.expect("mTLS config should be present").client_ca {
+            RendezvousClientCa::File { cert_path } => {
+                assert_eq!(cert_path, PathBuf::from("/tmp/cluster-ca.pem"));
+            }
+            RendezvousClientCa::InlinePem { .. } => {
+                panic!("legacy failover packages should fall back to file-based client CA");
+            }
+        }
 
         let _ = std::fs::remove_dir_all(dir);
     }

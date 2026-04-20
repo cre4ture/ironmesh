@@ -293,7 +293,9 @@ mod tests {
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
             mtls: Some(config::RendezvousMtlsConfig {
-                client_ca_cert_path: rendezvous_ca_path.clone(),
+                client_ca: config::RendezvousClientCa::File {
+                    cert_path: rendezvous_ca_path.clone(),
+                },
                 server_identity: config::RendezvousServerTlsIdentity::Files {
                     cert_path: rendezvous_cert_path,
                     key_path: rendezvous_key_path,
@@ -555,7 +557,9 @@ mod tests {
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
             mtls: Some(config::RendezvousMtlsConfig {
-                client_ca_cert_path: rendezvous_ca_path.clone(),
+                client_ca: config::RendezvousClientCa::File {
+                    cert_path: rendezvous_ca_path.clone(),
+                },
                 server_identity: config::RendezvousServerTlsIdentity::InlinePem {
                     cert_pem: rendezvous_cert_pem,
                     key_pem: rendezvous_key_pem,
@@ -776,7 +780,9 @@ mod tests {
             public_url: rendezvous_public_url.clone(),
             relay_public_urls: vec![rendezvous_public_url.clone()],
             mtls: Some(config::RendezvousMtlsConfig {
-                client_ca_cert_path: rendezvous_ca_path.clone(),
+                client_ca: config::RendezvousClientCa::File {
+                    cert_path: rendezvous_ca_path.clone(),
+                },
                 server_identity: config::RendezvousServerTlsIdentity::InlinePem {
                     cert_pem: rendezvous_cert_pem,
                     key_pem: rendezvous_key_pem,

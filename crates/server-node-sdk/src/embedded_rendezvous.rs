@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use rendezvous_server::{
-    RendezvousAppState, RendezvousMtlsConfig, RendezvousServerConfig, RendezvousServerTlsIdentity,
+    RendezvousAppState, RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerConfig,
+    RendezvousServerTlsIdentity,
     serve as serve_rendezvous,
 };
 
@@ -23,7 +24,9 @@ impl EmbeddedRendezvousConfig {
             public_url: self.public_url.clone(),
             relay_public_urls: vec![self.public_url.clone()],
             mtls: Some(RendezvousMtlsConfig {
-                client_ca_cert_path: self.client_ca_cert_path.clone(),
+                client_ca: RendezvousClientCa::File {
+                    cert_path: self.client_ca_cert_path.clone(),
+                },
                 server_identity: RendezvousServerTlsIdentity::Files {
                     cert_path: self.cert_path.clone(),
                     key_path: self.key_path.clone(),

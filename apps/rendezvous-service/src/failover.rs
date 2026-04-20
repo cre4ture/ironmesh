@@ -36,6 +36,8 @@ struct ManagedRendezvousFailoverPlaintext {
     target_node_id: NodeId,
     exported_at_unix: u64,
     public_url: String,
+    #[serde(default)]
+    client_ca_cert_pem: Option<String>,
     cert_pem: String,
     key_pem: String,
 }
@@ -44,6 +46,7 @@ struct ManagedRendezvousFailoverPlaintext {
 pub(crate) struct DecryptedRendezvousFailoverPackage {
     pub package_path: PathBuf,
     pub package: ManagedRendezvousFailoverPackage,
+    pub client_ca_cert_pem: Option<String>,
     pub cert_pem: String,
     pub key_pem: String,
 }
@@ -114,6 +117,7 @@ fn decrypt_rendezvous_failover_package(
     Ok(DecryptedRendezvousFailoverPackage {
         package_path: package_path.to_path_buf(),
         package,
+        client_ca_cert_pem: plaintext.client_ca_cert_pem,
         cert_pem: plaintext.cert_pem,
         key_pem: plaintext.key_pem,
     })
@@ -136,13 +140,31 @@ pub(crate) fn build_test_failover_package_json(
     key_pem: &str,
     passphrase: &str,
 ) -> String {
-    let package = build_test_failover_package(public_url, cert_pem, key_pem, passphrase);
+    let package = build_test_failover_package(
+        public_url,
+        Some("-----BEGIN CERTIFICATE-----\nclient-ca\n-----END CERTIFICATE-----\n"),
+        cert_pem,
+        key_pem,
+        passphrase,
+    );
+    serde_json::to_string(&package).expect("test failover package should serialize")
+}
+
+#[cfg(test)]
+pub(crate) fn build_legacy_test_failover_package_json(
+    public_url: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    passphrase: &str,
+) -> String {
+    let package = build_test_failover_package(public_url, None, cert_pem, key_pem, passphrase);
     serde_json::to_string(&package).expect("test failover package should serialize")
 }
 
 #[cfg(test)]
 fn build_test_failover_package(
     public_url: &str,
+    client_ca_cert_pem: Option<&str>,
     cert_pem: &str,
     key_pem: &str,
     passphrase: &str,
@@ -160,6 +182,7 @@ fn build_test_failover_package(
         target_node_id,
         exported_at_unix,
         public_url: public_url.to_string(),
+        client_ca_cert_pem: client_ca_cert_pem.map(ToString::to_string),
         cert_pem: cert_pem.to_string(),
         key_pem: key_pem.to_string(),
     };
@@ -193,6 +216,7 @@ mod tests {
     fn failover_package_serializes_stable_public_contract() {
         let package = build_test_failover_package(
             "https://creax.de:44042",
+            Some("-----BEGIN CERTIFICATE-----\nclient-ca\n-----END CERTIFICATE-----\n"),
             "cert",
             "key",
             "correct horse battery staple",
@@ -216,8 +240,62 @@ mod tests {
         assert!(object.contains_key("salt_b64"));
         assert!(object.contains_key("nonce_b64"));
         assert!(object.contains_key("ciphertext_b64"));
+        assert!(!object.contains_key("client_ca_cert_pem"));
         assert!(!object.contains_key("cert_pem"));
         assert!(!object.contains_key("key_pem"));
+    }
+
+    #[test]
+    fn failover_package_encrypted_payload_carries_client_ca_contract() {
+        let public_url = "https://creax.de:44042";
+        let client_ca_cert_pem =
+            "-----BEGIN CERTIFICATE-----\nclient-ca\n-----END CERTIFICATE-----\n";
+        let package = build_test_failover_package(
+            public_url,
+            Some(client_ca_cert_pem),
+            "cert",
+            "key",
+            "correct horse battery staple",
+        );
+
+        let salt = BASE64_STANDARD
+            .decode(package.salt_b64.as_bytes())
+            .expect("salt should decode");
+        let nonce = BASE64_STANDARD
+            .decode(package.nonce_b64.as_bytes())
+            .expect("nonce should decode");
+        let ciphertext = BASE64_STANDARD
+            .decode(package.ciphertext_b64.as_bytes())
+            .expect("ciphertext should decode");
+        let key = derive_rendezvous_failover_key(
+            "correct horse battery staple",
+            &salt,
+            package.pbkdf2_rounds,
+        );
+        let cipher = Aes256GcmSiv::new_from_slice(&key).expect("cipher should initialize");
+        let plaintext_json = cipher
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .expect("ciphertext should decrypt");
+        let payload = serde_json::from_slice::<serde_json::Value>(&plaintext_json)
+            .expect("payload should parse as JSON");
+        let object = payload
+            .as_object()
+            .expect("payload should serialize as an object");
+
+        assert_eq!(
+            object
+                .get("client_ca_cert_pem")
+                .and_then(serde_json::Value::as_str),
+            Some(client_ca_cert_pem)
+        );
+        assert_eq!(
+            object
+                .get("public_url")
+                .and_then(serde_json::Value::as_str),
+            Some(public_url)
+        );
+        assert!(object.contains_key("cert_pem"));
+        assert!(object.contains_key("key_pem"));
     }
 
     #[test]
@@ -244,8 +322,40 @@ mod tests {
 
         assert_eq!(decrypted.package_path, path);
         assert_eq!(decrypted.package.public_url, public_url);
+        assert_eq!(
+            decrypted.client_ca_cert_pem.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\nclient-ca\n-----END CERTIFICATE-----\n")
+        );
         assert_eq!(decrypted.cert_pem, cert_pem);
         assert_eq!(decrypted.key_pem, key_pem);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_rendezvous_failover_package_accepts_legacy_payload_without_client_ca() {
+        let dir = std::env::temp_dir().join(format!(
+            "ironmesh-rendezvous-failover-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should create");
+        let path = dir.join("failover.json");
+
+        std::fs::write(
+            &path,
+            build_legacy_test_failover_package_json(
+                "https://creax.de:44042",
+                "cert",
+                "key",
+                "correct horse battery staple",
+            ),
+        )
+        .expect("test failover package should write");
+
+        let decrypted = load_rendezvous_failover_package(&path, "correct horse battery staple")
+            .expect("legacy package should decrypt");
+
+        assert_eq!(decrypted.client_ca_cert_pem, None);
 
         let _ = std::fs::remove_dir_all(dir);
     }

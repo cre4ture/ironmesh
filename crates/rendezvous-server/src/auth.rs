@@ -16,7 +16,7 @@ use transport_sdk::peer::PeerIdentity;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
-use crate::{RendezvousMtlsConfig, RendezvousServerTlsIdentity};
+use crate::{RendezvousClientCa, RendezvousMtlsConfig, RendezvousServerTlsIdentity};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AuthenticatedPeer {
@@ -198,16 +198,29 @@ pub(crate) fn build_mtls_rustls_config(
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut ca_reader = BufReader::new(
-        File::open(&mtls.client_ca_cert_path)
-            .with_context(|| format!("failed reading {}", mtls.client_ca_cert_path.display()))?,
-    );
     let mut roots = RootCertStore::empty();
-    for cert in CertificateDer::pem_reader_iter(&mut ca_reader) {
-        let cert = cert.context("failed parsing rendezvous client CA certificate")?;
-        roots
-            .add(cert)
-            .context("failed adding rendezvous client CA certificate to trust store")?;
+    match &mtls.client_ca {
+        RendezvousClientCa::File { cert_path } => {
+            let mut ca_reader = BufReader::new(
+                File::open(cert_path)
+                    .with_context(|| format!("failed reading {}", cert_path.display()))?,
+            );
+            for cert in CertificateDer::pem_reader_iter(&mut ca_reader) {
+                let cert = cert.context("failed parsing rendezvous client CA certificate")?;
+                roots
+                    .add(cert)
+                    .context("failed adding rendezvous client CA certificate to trust store")?;
+            }
+        }
+        RendezvousClientCa::InlinePem { cert_pem } => {
+            let mut ca_reader = BufReader::new(cert_pem.as_bytes());
+            for cert in CertificateDer::pem_reader_iter(&mut ca_reader) {
+                let cert = cert.context("failed parsing rendezvous client CA certificate")?;
+                roots
+                    .add(cert)
+                    .context("failed adding rendezvous client CA certificate to trust store")?;
+            }
+        }
     }
 
     let (cert_chain, key) = match &mtls.server_identity {

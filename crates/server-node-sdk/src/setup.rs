@@ -135,6 +135,8 @@ struct ManagedRendezvousFailoverPlaintext {
     target_node_id: NodeId,
     exported_at_unix: u64,
     public_url: String,
+    #[serde(default)]
+    client_ca_cert_pem: Option<String>,
     cert_pem: String,
     key_pem: String,
 }
@@ -458,6 +460,7 @@ async fn start_new_cluster(
         };
     if let Err(err) = write_managed_rendezvous_material(
         &state.config.data_dir,
+        Some(&artifacts.ca_cert_pem),
         &managed_rendezvous_cert_pem,
         &managed_rendezvous_key_pem,
     ) {
@@ -955,9 +958,20 @@ pub(crate) fn apply_managed_signer_paths(
 
 pub(crate) fn write_managed_rendezvous_material(
     data_dir: &std::path::Path,
+    client_ca_cert_pem: Option<&str>,
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<()> {
+    if let Some(client_ca_cert_pem) = client_ca_cert_pem {
+        let client_ca_cert_path = managed_runtime_internal_ca_cert_path(data_dir);
+        if let Some(parent) = client_ca_cert_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
+        std::fs::write(&client_ca_cert_path, client_ca_cert_pem)
+            .with_context(|| format!("failed writing {}", client_ca_cert_path.display()))?;
+    }
+
     let rendezvous_dir = managed_rendezvous_dir(data_dir);
     std::fs::create_dir_all(&rendezvous_dir)
         .with_context(|| format!("failed creating {}", rendezvous_dir.display()))?;
@@ -1143,6 +1157,7 @@ pub(crate) fn export_managed_rendezvous_failover_package(
     source_node_id: NodeId,
     target_node_id: NodeId,
     public_url: &str,
+    client_ca_cert_pem: &str,
     cert_pem: &str,
     key_pem: &str,
     passphrase: &str,
@@ -1155,6 +1170,7 @@ pub(crate) fn export_managed_rendezvous_failover_package(
         target_node_id,
         exported_at_unix,
         public_url: public_url.to_string(),
+        client_ca_cert_pem: Some(client_ca_cert_pem.to_string()),
         cert_pem: cert_pem.to_string(),
         key_pem: key_pem.to_string(),
     };
@@ -1257,7 +1273,12 @@ pub(crate) fn import_managed_rendezvous_failover_package(
         );
     }
 
-    write_managed_rendezvous_material(data_dir, &plaintext.cert_pem, &plaintext.key_pem)?;
+    write_managed_rendezvous_material(
+        data_dir,
+        plaintext.client_ca_cert_pem.as_deref(),
+        &plaintext.cert_pem,
+        &plaintext.key_pem,
+    )?;
 
     let state_path = managed_setup_state_path(data_dir);
     let mut managed_state = ensure_managed_setup_state(&state_path)?;
@@ -2152,6 +2173,7 @@ mod tests {
             source_node_id,
             target_node_id,
             "https://rendezvous.example:9443",
+            "cluster-ca-cert",
             "rendezvous-cert",
             "rendezvous-key",
             "correct horse battery staple",
@@ -2168,6 +2190,10 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            std::fs::read_to_string(managed_runtime_internal_ca_cert_path(&dir)).unwrap(),
+            "cluster-ca-cert"
+        );
         assert_eq!(
             std::fs::read_to_string(managed_rendezvous_cert_path(&dir)).unwrap(),
             "rendezvous-cert"
@@ -2201,6 +2227,7 @@ mod tests {
             NodeId::new_v4(),
             NodeId::new_v4(),
             "https://rendezvous.example:9443",
+            "cluster-ca-cert",
             "rendezvous-cert",
             "rendezvous-key",
             "correct horse battery staple",
