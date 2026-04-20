@@ -278,7 +278,7 @@ The env vars referenced in the tuning subsections below are current operational 
 
 - `ironmesh`, `ironmesh-os-integration`, and `ironmesh-folder-agent` should all treat `--server-base-url` as the canonical direct-connection flag.
 - `--bootstrap-file` is the canonical bootstrap-driven alternative across those clients.
-- `--client-identity-file` and `--server-ca-pem-file` remain the canonical explicit auth and CA override flags for these direct/bootstrap flows.
+- `--client-identity-file` and `--server-ca-pem-file` remain the canonical explicit auth and CA override flags for these direct/bootstrap flows, including Windows CFAPI; legacy `--server-ca-cert` is compatibility-only where it is still accepted.
 - `ironmesh` still accepts legacy `--server-url` as a compatibility alias, but release-facing docs and automation should move to `--server-base-url`.
 
 ### Reconciliation and maintenance
@@ -356,6 +356,7 @@ The env vars referenced in the tuning subsections below are current operational 
 	- header: `x-ironmesh-admin-token: <admin token>`
 - Clients enroll with a pairing token and receive issued credential material:
 	- `POST /auth/device/enroll`
+- Client-enrollment and bootstrap-claim redemption JSON should use `device_label` as the canonical label field; bare `label` is compatibility-only for older pre-release callers.
 - Admin can inspect and revoke enrolled client credentials:
 	- `GET /auth/client-credentials`
 	- `DELETE /auth/client-credentials/{device_id}?reason=<text>`

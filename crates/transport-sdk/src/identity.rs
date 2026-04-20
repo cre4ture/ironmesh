@@ -17,7 +17,7 @@ pub struct ClientEnrollmentRequest {
     pub pairing_token: String,
     #[serde(default)]
     pub device_id: Option<DeviceId>,
-    #[serde(default)]
+    #[serde(default, rename = "device_label", alias = "label")]
     pub label: Option<String>,
     pub public_key_pem: String,
 }
@@ -26,7 +26,7 @@ pub struct ClientEnrollmentRequest {
 pub struct IssuedClientIdentity {
     pub cluster_id: ClusterId,
     pub device_id: DeviceId,
-    #[serde(default)]
+    #[serde(default, rename = "device_label", alias = "label")]
     pub label: Option<String>,
     pub public_key_pem: String,
     pub credential_pem: String,
@@ -129,7 +129,7 @@ impl ClientEnrollmentRequest {
         if let Some(label) = self.label.as_deref()
             && label.trim().is_empty()
         {
-            bail!("client enrollment request label must not be empty when provided");
+            bail!("client enrollment request device_label must not be empty when provided");
         }
         Ok(())
     }
@@ -217,5 +217,75 @@ impl ClientIdentityMaterial {
             .as_deref()
             .map(credential_fingerprint)
             .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn client_enrollment_request_serializes_device_label_and_accepts_legacy_label() {
+        let request = ClientEnrollmentRequest {
+            cluster_id: "019d02eb-ab39-7220-911a-c0eafcb38249".parse().unwrap(),
+            pairing_token: "pairing-token".to_string(),
+            device_id: Some("019d04a8-3099-75bc-8ff5-f5bd9a78bb83".parse().unwrap()),
+            label: Some("Tablet".to_string()),
+            public_key_pem: "public-key".to_string(),
+        };
+
+        let json = serde_json::to_value(&request).expect("request should serialize");
+        let object = json.as_object().expect("request should serialize as an object");
+        assert_eq!(
+            object.get("device_label").and_then(serde_json::Value::as_str),
+            Some("Tablet")
+        );
+        assert!(!object.contains_key("label"));
+
+        let legacy: ClientEnrollmentRequest = serde_json::from_value(json!({
+            "cluster_id": "019d02eb-ab39-7220-911a-c0eafcb38249",
+            "pairing_token": "pairing-token",
+            "device_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb83",
+            "label": "Phone",
+            "public_key_pem": "public-key"
+        }))
+        .expect("legacy request should deserialize");
+
+        assert_eq!(legacy.label.as_deref(), Some("Phone"));
+    }
+
+    #[test]
+    fn issued_client_identity_serializes_device_label_and_accepts_legacy_label() {
+        let identity = IssuedClientIdentity {
+            cluster_id: "019d02eb-ab39-7220-911a-c0eafcb38249".parse().unwrap(),
+            device_id: "019d04a8-3099-75bc-8ff5-f5bd9a78bb83".parse().unwrap(),
+            label: Some("Laptop".to_string()),
+            public_key_pem: "public-key".to_string(),
+            credential_pem: "credential".to_string(),
+            issued_at_unix: 10,
+            expires_at_unix: Some(20),
+        };
+
+        let json = serde_json::to_value(&identity).expect("identity should serialize");
+        let object = json.as_object().expect("identity should serialize as an object");
+        assert_eq!(
+            object.get("device_label").and_then(serde_json::Value::as_str),
+            Some("Laptop")
+        );
+        assert!(!object.contains_key("label"));
+
+        let legacy: IssuedClientIdentity = serde_json::from_value(json!({
+            "cluster_id": "019d02eb-ab39-7220-911a-c0eafcb38249",
+            "device_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb83",
+            "label": "Desktop",
+            "public_key_pem": "public-key",
+            "credential_pem": "credential",
+            "issued_at_unix": 10,
+            "expires_at_unix": 20
+        }))
+        .expect("legacy issued identity should deserialize");
+
+        assert_eq!(legacy.label.as_deref(), Some("Desktop"));
     }
 }

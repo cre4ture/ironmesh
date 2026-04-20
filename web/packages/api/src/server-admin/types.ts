@@ -448,11 +448,17 @@ export type ManagedControlPlanePromotionPackage = {
   rendezvous_failover: Record<string, unknown>;
 };
 
-export type ManagedRendezvousFailoverPackage = Record<string, unknown> & {
-  cluster_id?: string;
-  source_node_id?: string;
-  target_node_id?: string;
-  public_url?: string;
+export type ManagedRendezvousFailoverPackage = {
+  version: number;
+  cluster_id: string;
+  source_node_id: string;
+  target_node_id: string;
+  exported_at_unix: number;
+  public_url: string;
+  pbkdf2_rounds: number;
+  salt_b64: string;
+  nonce_b64: string;
+  ciphertext_b64: string;
 };
 
 export type ManagedRendezvousFailoverImportResponse = {

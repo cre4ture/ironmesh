@@ -54,7 +54,7 @@ pub struct ClientBootstrapClaimRedeemRequest {
     pub target_node_id: NodeId,
     #[serde(default)]
     pub device_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "device_label", alias = "label")]
     pub label: Option<String>,
     pub public_key_pem: String,
 }
@@ -64,7 +64,7 @@ pub struct ClientBootstrapClaimRedeemResponse {
     pub bootstrap: ClientBootstrap,
     pub cluster_id: ClusterId,
     pub device_id: String,
-    #[serde(default)]
+    #[serde(default, rename = "device_label", alias = "label")]
     pub label: Option<String>,
     pub public_key_pem: String,
     pub credential_pem: String,
@@ -358,7 +358,7 @@ impl ClientBootstrapClaimRedeemRequest {
         if let Some(label) = self.label.as_deref()
             && label.trim().is_empty()
         {
-            bail!("bootstrap claim redeem request label must not be empty when provided");
+            bail!("bootstrap claim redeem request device_label must not be empty when provided");
         }
         Ok(())
     }
@@ -415,6 +415,25 @@ impl ClientBootstrapClaimRedeemResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_bootstrap_bundle() -> ClientBootstrap {
+        ClientBootstrap {
+            version: crate::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id: "019d02eb-ab39-7220-911a-c0eafcb38249".parse().unwrap(),
+            rendezvous_urls: vec!["https://rendezvous-a.example:9443/".to_string()],
+            rendezvous_mtls_required: true,
+            direct_endpoints: vec![],
+            relay_mode: crate::RelayMode::Fallback,
+            trust_roots: crate::BootstrapTrustRoots {
+                cluster_ca_pem: Some("cluster-ca".to_string()),
+                public_api_ca_pem: Some("public-ca".to_string()),
+                rendezvous_ca_pem: Some("rendezvous-ca".to_string()),
+            },
+            pairing_token: None,
+            device_id: Some("019d04a8-3099-75bc-8ff5-f5bd9a78bb83".parse().unwrap()),
+            device_label: Some("Tablet".to_string()),
+        }
+    }
 
     fn sample_claim() -> ClientBootstrapClaim {
         ClientBootstrapClaim {
@@ -487,7 +506,6 @@ mod tests {
             }"#,
         )
         .expect("legacy claim should deserialize");
-
         assert_eq!(
             claim.rendezvous_urls,
             vec![
@@ -496,5 +514,78 @@ mod tests {
             ]
         );
         assert_eq!(claim.trust.ca_der_b64u, "Y2xhaW0tdGVzdA");
+    }
+
+    #[test]
+    fn bootstrap_claim_redeem_request_serializes_device_label_and_accepts_legacy_label() {
+        let request = ClientBootstrapClaimRedeemRequest {
+            claim_token: "im-claim-test-token".to_string(),
+            target_node_id: "9f068697-bd16-431a-8311-8ae985025bcf".parse().unwrap(),
+            device_id: Some("019d04a8-3099-75bc-8ff5-f5bd9a78bb83".to_string()),
+            label: Some("Tablet".to_string()),
+            public_key_pem: "public-key".to_string(),
+        };
+
+        let json = serde_json::to_value(&request).expect("redeem request should serialize");
+        let object = json
+            .as_object()
+            .expect("redeem request should serialize as an object");
+        assert_eq!(
+            object.get("device_label").and_then(serde_json::Value::as_str),
+            Some("Tablet")
+        );
+        assert!(!object.contains_key("label"));
+
+        let legacy = serde_json::json!({
+            "claim_token": "im-claim-test-token",
+            "target_node_id": "9f068697-bd16-431a-8311-8ae985025bcf",
+            "device_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb83",
+            "label": "Phone",
+            "public_key_pem": "public-key"
+        });
+        let parsed: ClientBootstrapClaimRedeemRequest =
+            serde_json::from_value(legacy).expect("legacy redeem request should deserialize");
+
+        assert_eq!(parsed.label.as_deref(), Some("Phone"));
+    }
+
+    #[test]
+    fn bootstrap_claim_redeem_response_serializes_device_label_and_accepts_legacy_label() {
+        let response = ClientBootstrapClaimRedeemResponse {
+            bootstrap: sample_bootstrap_bundle(),
+            cluster_id: "019d02eb-ab39-7220-911a-c0eafcb38249".parse().unwrap(),
+            device_id: "019d04a8-3099-75bc-8ff5-f5bd9a78bb83".to_string(),
+            label: Some("Tablet".to_string()),
+            public_key_pem: "public-key".to_string(),
+            credential_pem: "credential".to_string(),
+            rendezvous_client_identity_pem: Some("rendezvous-identity".to_string()),
+            created_at_unix: Some(10),
+            expires_at_unix: Some(20),
+        };
+
+        let json = serde_json::to_value(&response).expect("redeem response should serialize");
+        let object = json
+            .as_object()
+            .expect("redeem response should serialize as an object");
+        assert_eq!(
+            object.get("device_label").and_then(serde_json::Value::as_str),
+            Some("Tablet")
+        );
+        assert!(!object.contains_key("label"));
+
+        let mut legacy = serde_json::to_value(&response).expect("response should serialize");
+        let legacy_object = legacy
+            .as_object_mut()
+            .expect("response should serialize as an object");
+        legacy_object.remove("device_label");
+        legacy_object.insert(
+            "label".to_string(),
+            serde_json::Value::String("Phone".to_string()),
+        );
+
+        let parsed: ClientBootstrapClaimRedeemResponse = serde_json::from_value(legacy)
+            .expect("legacy redeem response should deserialize");
+
+        assert_eq!(parsed.label.as_deref(), Some("Phone"));
     }
 }

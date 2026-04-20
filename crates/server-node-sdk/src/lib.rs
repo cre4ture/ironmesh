@@ -10585,6 +10585,7 @@ struct ClientDeviceEnrollRequest {
     cluster_id: ClusterId,
     pairing_token: String,
     device_id: Option<String>,
+    #[serde(rename = "device_label", alias = "label")]
     label: Option<String>,
     public_key_pem: String,
 }
@@ -10593,6 +10594,7 @@ struct ClientDeviceEnrollRequest {
 struct ClientDeviceEnrollResponse {
     cluster_id: ClusterId,
     device_id: String,
+    #[serde(rename = "device_label", alias = "label")]
     label: Option<String>,
     public_key_pem: String,
     credential_pem: String,

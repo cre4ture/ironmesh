@@ -904,6 +904,46 @@ run_on_main_metadata_backends!(
     enroll_client_device_consumes_pairing_token_and_persists_device_turso
 );
 
+#[test]
+fn client_device_enroll_request_accepts_legacy_label_alias() {
+    let request: super::ClientDeviceEnrollRequest = serde_json::from_value(serde_json::json!({
+        "cluster_id": Uuid::now_v7(),
+        "pairing_token": "pair-secret",
+        "device_id": Uuid::now_v7().to_string(),
+        "label": "Tablet",
+        "public_key_pem": "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----"
+    }))
+    .expect("legacy request should deserialize");
+
+    assert_eq!(request.label.as_deref(), Some("Tablet"));
+}
+
+#[test]
+fn client_device_enroll_response_serializes_device_label() {
+    let response = super::ClientDeviceEnrollResponse {
+        cluster_id: Uuid::now_v7(),
+        device_id: Uuid::now_v7().to_string(),
+        label: Some("Tablet".to_string()),
+        public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----".to_string(),
+        credential_pem:
+            "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\ntest\n-----END IRONMESH CLIENT CREDENTIAL-----\n"
+                .to_string(),
+        rendezvous_client_identity_pem: None,
+        created_at_unix: 10,
+        expires_at_unix: Some(20),
+    };
+
+    let json = serde_json::to_value(response).expect("response should serialize");
+    let object = json
+        .as_object()
+        .expect("response should serialize as an object");
+    assert_eq!(
+        object.get("device_label").and_then(serde_json::Value::as_str),
+        Some("Tablet")
+    );
+    assert!(!object.contains_key("label"));
+}
+
 #[tokio::test]
 async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
@@ -953,6 +993,8 @@ async fn enroll_client_device_issues_rendezvous_mtls_identity_when_required() {
     }
     let enrolled: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(enrolled["device_id"], device_id);
+    assert_eq!(enrolled["device_label"], "Laptop");
+    assert!(enrolled.get("label").is_none());
     let rendezvous_identity_pem = enrolled["rendezvous_client_identity_pem"]
         .as_str()
         .expect("rendezvous client identity PEM should be present");

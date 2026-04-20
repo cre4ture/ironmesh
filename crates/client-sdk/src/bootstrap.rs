@@ -117,7 +117,7 @@ pub struct BootstrapEnrollmentResult {
     #[serde(default)]
     pub connection_bootstrap_json: Option<String>,
     pub device_id: String,
-    #[serde(default)]
+    #[serde(default, rename = "device_label", alias = "label")]
     pub label: Option<String>,
     pub public_key_pem: String,
     pub private_key_pem: String,
@@ -1128,5 +1128,46 @@ mod tests {
 
         assert!(label.starts_with("relay://"));
         assert!(label.contains("@rendezvous.example"));
+    }
+
+    #[test]
+    fn bootstrap_enrollment_result_serializes_device_label_and_accepts_legacy_label() {
+        let response = BootstrapEnrollmentResult {
+            cluster_id: ClusterId::now_v7(),
+            server_base_url: Some("https://public.example/".to_string()),
+            server_ca_pem: Some("public-ca".to_string()),
+            connection_bootstrap_json: Some("{\"version\":1}".to_string()),
+            device_id: "019d04a8-3099-75bc-8ff5-f5bd9a78bb83".to_string(),
+            label: Some("Tablet".to_string()),
+            public_key_pem: "public-key".to_string(),
+            private_key_pem: "private-key".to_string(),
+            credential_pem: "credential".to_string(),
+            rendezvous_client_identity_pem: Some("rendezvous-identity".to_string()),
+            created_at_unix: Some(10),
+            expires_at_unix: Some(20),
+        };
+
+        let json = serde_json::to_value(&response).expect("response should serialize");
+        let object = json.as_object().expect("response should serialize as an object");
+        assert_eq!(
+            object.get("device_label").and_then(serde_json::Value::as_str),
+            Some("Tablet")
+        );
+        assert!(!object.contains_key("label"));
+
+        let mut legacy = serde_json::to_value(&response).expect("response should serialize");
+        let legacy_object = legacy
+            .as_object_mut()
+            .expect("response should serialize as an object");
+        legacy_object.remove("device_label");
+        legacy_object.insert(
+            "label".to_string(),
+            serde_json::Value::String("Phone".to_string()),
+        );
+
+        let parsed: BootstrapEnrollmentResult =
+            serde_json::from_value(legacy).expect("legacy response should deserialize");
+
+        assert_eq!(parsed.label.as_deref(), Some("Phone"));
     }
 }

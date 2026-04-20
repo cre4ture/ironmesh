@@ -188,8 +188,8 @@ struct ServeArgs {
     device_label: Option<String>,
     #[arg(long)]
     client_identity_file: Option<PathBuf>,
-    #[arg(long)]
-    server_ca_cert: Option<PathBuf>,
+    #[arg(long = "server-ca-pem-file", alias = "server-ca-cert")]
+    server_ca_pem_file: Option<PathBuf>,
     #[arg(long)]
     bootstrap_file: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
@@ -278,7 +278,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         device_id,
         device_label,
         client_identity_file,
-        server_ca_cert,
+        server_ca_pem_file,
         bootstrap_file,
         tray_status,
         tray_status_file,
@@ -289,7 +289,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
     let connection = resolve_connection_config(
         &root_path,
         server_base_url.as_deref(),
-        server_ca_cert.as_deref(),
+        server_ca_pem_file.as_deref(),
         bootstrap_file.as_deref(),
         pairing_token.as_deref(),
         device_id.as_deref(),
@@ -849,7 +849,9 @@ fn resolve_cli_relative_path(root_path: &std::path::Path, requested_path: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{PinHydrationSnapshot, should_request_pin_hydration};
+    use super::{Cli, Commands, PinHydrationSnapshot, should_request_pin_hydration};
+    use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn pin_hydration_requests_initial_explicit_hydrate() {
@@ -945,3 +947,56 @@ mod tests {
         ));
     }
 }
+
+
+        #[test]
+        fn serve_accepts_server_ca_pem_file_flag() {
+            let cli = Cli::try_parse_from([
+                "ironmesh-os-integration",
+                "serve",
+                "--sync-root-id",
+                "demo-root",
+                "--display-name",
+                "Demo",
+                "--root-path",
+                r"C:\\demo",
+                "--server-ca-pem-file",
+                r"C:\\demo\\server-ca.pem",
+            ])
+            .expect("canonical CA flag should parse");
+
+            let Commands::Serve(args) = cli.command else {
+                panic!("serve command should parse");
+            };
+
+            assert_eq!(
+                args.server_ca_pem_file,
+                Some(PathBuf::from(r"C:\demo\server-ca.pem"))
+            );
+        }
+
+        #[test]
+        fn serve_accepts_legacy_server_ca_cert_alias() {
+            let cli = Cli::try_parse_from([
+                "ironmesh-os-integration",
+                "serve",
+                "--sync-root-id",
+                "demo-root",
+                "--display-name",
+                "Demo",
+                "--root-path",
+                r"C:\\demo",
+                "--server-ca-cert",
+                r"C:\\demo\\server-ca.pem",
+            ])
+            .expect("legacy CA flag alias should parse");
+
+            let Commands::Serve(args) = cli.command else {
+                panic!("serve command should parse");
+            };
+
+            assert_eq!(
+                args.server_ca_pem_file,
+                Some(PathBuf::from(r"C:\demo\server-ca.pem"))
+            );
+        }

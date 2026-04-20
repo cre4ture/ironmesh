@@ -3,6 +3,7 @@ package io.ironmesh.android.data
 import io.ironmesh.android.api.StoreIndexEntry
 import io.ironmesh.android.api.StoreIndexResponse
 import com.squareup.moshi.Moshi
+import com.squareup.moshi.Json
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.io.InputStream
 import java.io.OutputStream
@@ -11,6 +12,7 @@ data class BootstrapEnrollmentData(
     val cluster_id: String,
     val connection_bootstrap_json: String? = null,
     val device_id: String,
+    @Json(name = "device_label")
     val label: String? = null,
     val public_key_pem: String,
     val private_key_pem: String,

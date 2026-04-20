@@ -18,7 +18,11 @@ pub struct DeviceEnrollmentRequest {
     pub pairing_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "device_label",
+        alias = "label",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub label: Option<String>,
     pub public_key_pem: String,
 }
@@ -27,6 +31,7 @@ pub struct DeviceEnrollmentRequest {
 pub struct DeviceEnrollmentResponse {
     pub cluster_id: ClusterId,
     pub device_id: String,
+    #[serde(rename = "device_label", alias = "label")]
     pub label: Option<String>,
     pub public_key_pem: String,
     pub credential_pem: String,
@@ -71,7 +76,7 @@ pub async fn enroll_device(
             )
         })?)
     } else if base_url.scheme() == "https" {
-        bail!("server-ca-cert needed for HTTPS server");
+        bail!("server-ca-pem-file needed for HTTPS server");
     } else {
         None
     };
@@ -222,6 +227,67 @@ mod tests {
                 .to_string()
                 .contains("failed to parse /auth/device/enroll response")
         );
+    }
+
+    #[test]
+    fn device_enrollment_request_serializes_device_label_and_accepts_legacy_label() {
+        let request = DeviceEnrollmentRequest {
+            cluster_id: Uuid::now_v7(),
+            pairing_token: "pairing-token".to_string(),
+            device_id: Some(Uuid::now_v7().to_string()),
+            label: Some("Tablet".to_string()),
+            public_key_pem: "public-key".to_string(),
+        };
+
+        let json = serde_json::to_value(&request).expect("request should serialize");
+        let object = json.as_object().expect("request should serialize as an object");
+        assert_eq!(
+            object.get("device_label").and_then(serde_json::Value::as_str),
+            Some("Tablet")
+        );
+        assert!(!object.contains_key("label"));
+
+        let mut legacy = serde_json::to_value(&request).expect("request should serialize");
+        let legacy_object = legacy
+            .as_object_mut()
+            .expect("request should serialize as an object");
+        legacy_object.remove("device_label");
+        legacy_object.insert(
+            "label".to_string(),
+            serde_json::Value::String("Phone".to_string()),
+        );
+
+        let parsed: DeviceEnrollmentRequest =
+            serde_json::from_value(legacy).expect("legacy request should deserialize");
+
+        assert_eq!(parsed.label.as_deref(), Some("Phone"));
+    }
+
+    #[test]
+    fn device_enrollment_response_serializes_device_label_and_accepts_legacy_label() {
+        let response = sample_response();
+        let json = serde_json::to_value(&response).expect("response should serialize");
+        let object = json.as_object().expect("response should serialize as an object");
+        assert_eq!(
+            object.get("device_label").and_then(serde_json::Value::as_str),
+            Some("phone")
+        );
+        assert!(!object.contains_key("label"));
+
+        let mut legacy = serde_json::to_value(&response).expect("response should serialize");
+        let legacy_object = legacy
+            .as_object_mut()
+            .expect("response should serialize as an object");
+        legacy_object.remove("device_label");
+        legacy_object.insert(
+            "label".to_string(),
+            serde_json::Value::String("desktop".to_string()),
+        );
+
+        let parsed: DeviceEnrollmentResponse =
+            serde_json::from_value(legacy).expect("legacy response should deserialize");
+
+        assert_eq!(parsed.label.as_deref(), Some("desktop"));
     }
 
     #[test]

@@ -190,6 +190,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failover_package_serializes_stable_public_contract() {
+        let package = build_test_failover_package(
+            "https://creax.de:44042",
+            "cert",
+            "key",
+            "correct horse battery staple",
+        );
+
+        let json = serde_json::to_value(&package).expect("failover package should serialize");
+        let object = json
+            .as_object()
+            .expect("failover package should serialize as an object");
+
+        assert_eq!(object.get("version").and_then(serde_json::Value::as_u64), Some(1));
+        assert!(object.contains_key("cluster_id"));
+        assert!(object.contains_key("source_node_id"));
+        assert!(object.contains_key("target_node_id"));
+        assert!(object.contains_key("exported_at_unix"));
+        assert_eq!(
+            object.get("public_url").and_then(serde_json::Value::as_str),
+            Some("https://creax.de:44042")
+        );
+        assert!(object.contains_key("pbkdf2_rounds"));
+        assert!(object.contains_key("salt_b64"));
+        assert!(object.contains_key("nonce_b64"));
+        assert!(object.contains_key("ciphertext_b64"));
+        assert!(!object.contains_key("cert_pem"));
+        assert!(!object.contains_key("key_pem"));
+    }
+
+    #[test]
     fn load_rendezvous_failover_package_decrypts_payload() {
         let dir = std::env::temp_dir().join(format!(
             "ironmesh-rendezvous-failover-{}",

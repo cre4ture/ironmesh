@@ -205,7 +205,7 @@ async fn start_cfapi_adapter_with_resolved_inputs(
         command.arg("--pairing-token").arg(pairing_token);
     }
     if let Some(server_ca_cert) = server_ca_cert {
-        command.arg("--server-ca-cert").arg(server_ca_cert);
+        command.arg("--server-ca-pem-file").arg(server_ca_cert);
     }
     if let Some(bootstrap_file) = bootstrap_file {
         command.arg("--bootstrap-file").arg(bootstrap_file);
