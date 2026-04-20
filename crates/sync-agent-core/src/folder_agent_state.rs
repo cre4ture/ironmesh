@@ -13,6 +13,7 @@ use crate::{LocalEntryKind, LocalEntryState, LocalTreeState, normalize_relative_
 
 pub(crate) const FOLDER_AGENT_BASELINE_FILE_NAME: &str = "baseline.sqlite";
 pub(crate) const FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME: &str = "modification-log.sqlite";
+const FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN: &str = "ironmesh-folder-agent-profile-v1";
 
 #[derive(Debug, Clone)]
 pub struct PathScope {
@@ -69,6 +70,7 @@ impl PathScope {
 #[derive(Debug, Clone)]
 pub(crate) struct FolderAgentProfilePaths {
     pub scope_fingerprint: String,
+    pub legacy_profile_dir: Option<PathBuf>,
     pub baseline_path: PathBuf,
     pub modification_log_path: PathBuf,
 }
@@ -86,18 +88,197 @@ pub(crate) fn folder_agent_profile_paths(
     connection_target: &str,
     state_root_dir: &Path,
 ) -> FolderAgentProfilePaths {
-    let mut hasher = DefaultHasher::new();
-    identity_root.to_string_lossy().hash(&mut hasher);
-    scope.remote_prefix().unwrap_or_default().hash(&mut hasher);
-    connection_target.hash(&mut hasher);
-    let scope_fingerprint = format!("{:016x}", hasher.finish());
+    let scope_fingerprint = stable_scope_fingerprint(identity_root, scope, connection_target);
+    let legacy_profile_dir = legacy_folder_agent_profile_dir(
+        identity_root,
+        scope,
+        connection_target,
+        state_root_dir,
+        &scope_fingerprint,
+    );
 
     let profile_dir = state_root_dir.join("profiles").join(&scope_fingerprint);
     FolderAgentProfilePaths {
         scope_fingerprint,
+        legacy_profile_dir,
         baseline_path: profile_dir.join(FOLDER_AGENT_BASELINE_FILE_NAME),
         modification_log_path: profile_dir.join(FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME),
     }
+}
+
+fn stable_scope_fingerprint(
+    identity_root: &Path,
+    scope: &PathScope,
+    connection_target: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(identity_root.to_string_lossy().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(scope.remote_prefix().unwrap_or_default().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(connection_target.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn legacy_scope_fingerprint(
+    identity_root: &Path,
+    scope: &PathScope,
+    connection_target: &str,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    identity_root.to_string_lossy().hash(&mut hasher);
+    scope.remote_prefix().unwrap_or_default().hash(&mut hasher);
+    connection_target.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+pub(crate) fn legacy_folder_agent_profile_dir(
+    identity_root: &Path,
+    scope: &PathScope,
+    connection_target: &str,
+    state_root_dir: &Path,
+    current_scope_fingerprint: &str,
+) -> Option<PathBuf> {
+    let legacy_scope_fingerprint = legacy_scope_fingerprint(identity_root, scope, connection_target);
+    (legacy_scope_fingerprint != current_scope_fingerprint)
+        .then(|| state_root_dir.join("profiles").join(legacy_scope_fingerprint))
+}
+
+pub(crate) fn migrate_legacy_folder_agent_profile_dir(
+    current_profile_dir: &Path,
+    legacy_profile_dir: Option<&Path>,
+    current_scope_fingerprint: &str,
+) -> Result<()> {
+    let Some(legacy_profile_dir) = legacy_profile_dir.filter(|path| path.exists()) else {
+        return Ok(());
+    };
+    if current_profile_dir.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = current_profile_dir.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create folder-agent profile parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    move_or_copy_profile_dir(legacy_profile_dir, current_profile_dir)?;
+    rewrite_scope_fingerprint_metadata(
+        &current_profile_dir.join(FOLDER_AGENT_BASELINE_FILE_NAME),
+        "baseline_meta",
+        current_scope_fingerprint,
+    )?;
+    rewrite_scope_fingerprint_metadata(
+        &current_profile_dir.join(FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME),
+        "modification_meta",
+        current_scope_fingerprint,
+    )?;
+
+    Ok(())
+}
+
+fn move_or_copy_profile_dir(source: &Path, target: &Path) -> Result<()> {
+    match fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            copy_profile_dir_recursive(source, target).with_context(|| {
+                format!(
+                    "failed copying legacy folder-agent profile dir from {} to {} after rename error: {}",
+                    source.display(),
+                    target.display(),
+                    rename_error
+                )
+            })?;
+            fs::remove_dir_all(source).with_context(|| {
+                format!(
+                    "failed removing legacy folder-agent profile dir {} after copy migration",
+                    source.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn copy_profile_dir_recursive(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type().with_context(|| {
+            format!("failed to inspect legacy folder-agent profile entry {}", source_path.display())
+        })?;
+
+        if file_type.is_dir() {
+            copy_profile_dir_recursive(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "failed copying legacy folder-agent profile file {} to {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_scope_fingerprint_metadata(
+    sqlite_path: &Path,
+    meta_table: &str,
+    current_scope_fingerprint: &str,
+) -> Result<()> {
+    if !sqlite_path.exists() {
+        return Ok(());
+    }
+
+    let connection = Connection::open(sqlite_path)
+        .with_context(|| format!("failed to open migrated sqlite store {}", sqlite_path.display()))?;
+    let table_exists = connection
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [meta_table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .with_context(|| {
+            format!(
+                "failed to inspect sqlite metadata table {} in {}",
+                meta_table,
+                sqlite_path.display()
+            )
+        })?;
+    if table_exists.is_none() {
+        return Ok(());
+    }
+
+    connection
+        .execute(
+            &format!(
+                "INSERT INTO {meta_table}(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            ),
+            params!["scope_fingerprint", current_scope_fingerprint],
+        )
+        .with_context(|| {
+            format!(
+                "failed to rewrite sqlite scope fingerprint metadata in {}",
+                sqlite_path.display()
+            )
+        })?;
+
+    Ok(())
 }
 
 fn xdg_state_home() -> Option<PathBuf> {
@@ -115,6 +296,7 @@ fn xdg_state_home() -> Option<PathBuf> {
 pub struct StartupStateStore {
     pub path: PathBuf,
     scope_fingerprint: String,
+    legacy_profile_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +331,12 @@ impl StartupStateStore {
         Self {
             path: profile_paths.baseline_path,
             scope_fingerprint: profile_paths.scope_fingerprint,
+            legacy_profile_dir: profile_paths.legacy_profile_dir,
         }
+    }
+
+    pub(crate) fn legacy_profile_dir(&self) -> Option<&Path> {
+        self.legacy_profile_dir.as_deref()
     }
 
     pub fn load_local_baseline(&self) -> Result<LocalTreeState> {
@@ -486,6 +673,12 @@ impl StartupStateStore {
     }
 
     fn sqlite_connection(&self) -> Result<Connection> {
+        migrate_legacy_folder_agent_profile_dir(
+            self.path.parent().unwrap_or_else(|| Path::new(".")),
+            self.legacy_profile_dir.as_deref(),
+            &self.scope_fingerprint,
+        )?;
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -1118,6 +1311,98 @@ mod tests {
             FOLDER_AGENT_BASELINE_FILE_NAME
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_state_store_migrates_legacy_profile_dir_to_stable_scope_fingerprint() {
+        let root = test_root();
+        let state_root = root.join("state-root");
+        let identity_root = root.join("identity-root");
+        let scope = PathScope::new(Some("photos/camera".to_string()));
+        let connection_target = "http://127.0.0.1:8080";
+        let profile_paths =
+            folder_agent_profile_paths(&identity_root, &scope, connection_target, &state_root);
+        let legacy_profile_dir = profile_paths
+            .legacy_profile_dir
+            .clone()
+            .expect("legacy profile dir should differ from stable digest path");
+        let legacy_baseline_path = legacy_profile_dir.join(FOLDER_AGENT_BASELINE_FILE_NAME);
+        ensure_parent_dir(&legacy_baseline_path);
+
+        let legacy_scope_fingerprint =
+            legacy_scope_fingerprint(&identity_root, &scope, connection_target);
+        {
+            let connection = Connection::open(&legacy_baseline_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE baseline_meta (
+                         key TEXT PRIMARY KEY,
+                         value TEXT NOT NULL
+                     );
+                     CREATE TABLE baseline_entries (
+                         path TEXT PRIMARY KEY,
+                         kind INTEGER NOT NULL,
+                         size_bytes INTEGER NOT NULL,
+                         modified_unix_ms INTEGER NOT NULL,
+                         content_hash TEXT
+                     );
+                     CREATE TABLE conflicts (
+                         path TEXT PRIMARY KEY,
+                         reason TEXT NOT NULL,
+                         details_json TEXT NOT NULL,
+                         created_unix_ms INTEGER NOT NULL
+                     );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
+                    params!["schema_version", BASELINE_SCHEMA_VERSION_CURRENT.to_string()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
+                    params!["scope_fingerprint", legacy_scope_fingerprint.as_str()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO baseline_entries(path, kind, size_bytes, modified_unix_ms, content_hash)
+                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params!["docs/readme.txt", 0_i64, 5_i64, 11_i64, "hash-1"],
+                )
+                .unwrap();
+        }
+
+        let store = StartupStateStore::new_with_state_root(
+            &identity_root,
+            &scope,
+            connection_target,
+            &state_root,
+        );
+        let loaded = store.load_local_baseline().unwrap();
+
+        let state = loaded.get("docs/readme.txt").unwrap();
+        assert_eq!(state.kind, LocalEntryKind::File);
+        assert_eq!(state.size_bytes, 5);
+        assert_eq!(state.modified_unix_ms, 11);
+        assert_eq!(store.path, profile_paths.baseline_path);
+        assert!(store.path.exists());
+        assert!(!legacy_profile_dir.exists());
+
+        let connection = Connection::open(&store.path).unwrap();
+        let stored_fingerprint: String = connection
+            .query_row(
+                "SELECT value FROM baseline_meta WHERE key = ?1",
+                ["scope_fingerprint"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_fingerprint, profile_paths.scope_fingerprint);
+
+        remove_sqlite_sidecars(&store.path);
         fs::remove_dir_all(root).unwrap();
     }
 

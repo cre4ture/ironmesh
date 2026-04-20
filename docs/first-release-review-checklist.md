@@ -261,7 +261,7 @@ Checklist:
 - [x] Review JSON and SQLite format stability, including whether explicit schema or format version markers are needed before release.
 - [x] Keep stable JSON stores on explicit format markers; `instances.json` and `last-launch-report.json` currently use `version: 1` with compatibility for missing legacy versions.
 - [x] Confirm compatibility behavior for SQLite stores that now persist explicit schema markers, including legacy databases that predate the marker rows.
-- [ ] Verify deterministic path derivation where state directories are keyed by sync-root path hashing or other derived labels.
+- [x] Verify deterministic path derivation where state directories are keyed by sync-root path hashing or other derived labels.
 
 Working evidence log:
 
@@ -294,15 +294,13 @@ Working evidence log:
   | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/os-integration/client-rights-edge/<sanitized-scope>/state/{pending-mutations.json, remote-snapshot.json}` plus sibling `staged/`, `upload-state/`, and `object-cache/` | `semi-stable root, private internal contents` | Root is derived from direct URL or bootstrap path, prefix, and mountpoint; contents are implementation detail | `--client-edge-state-dir` overrides the default root |
   | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/os-integration/downloads/<blake3(scope)>/` | `private implementation` | Deterministic blake3 hash of connection target, prefix, and mountpoint | Download staging only |
   | Linux | `${XDG_RUNTIME_DIR}/ironmesh/gnome-status.json` | `semi-stable` | Desktop-status JSON document | `--gnome-status-file` overrides the default runtime path |
-  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/folder-agent/profiles/<scope_fingerprint>/{baseline.sqlite, modification-log.sqlite}` | `semi-stable` | SQLite baseline plus modification log under a derived per-profile directory | Derivation reviewed below; current fingerprint implementation is not yet a frozen release contract |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/folder-agent/profiles/<scope_fingerprint>/{baseline.sqlite, modification-log.sqlite}` | `semi-stable` | SQLite baseline plus modification log under a domain-separated BLAKE3 digest of identity root, scope prefix, and connection target | Legacy pre-release `DefaultHasher` profile directories migrate forward on open and rewrite persisted scope-fingerprint metadata |
 - Findings:
-   - `major`: [crates/sync-agent-core/src/folder_agent_state.rs](../crates/sync-agent-core/src/folder_agent_state.rs) derives `profiles/<scope_fingerprint>/` with Rust `DefaultHasher`. That hash function is not an explicit cross-release compatibility contract, so folder-agent profile directory names can drift across toolchain or standard-library changes and orphan `baseline.sqlite` plus `modification-log.sqlite` state.
+   - `resolved`: [crates/sync-agent-core/src/folder_agent_state.rs](../crates/sync-agent-core/src/folder_agent_state.rs) now derives `profiles/<scope_fingerprint>/` with an explicit domain-separated BLAKE3 digest and migrates legacy `DefaultHasher` profile directories plus stored SQLite `scope_fingerprint` metadata on open.
    - `minor`: the Windows sync-root state family is on current release-facing names (`connection-bootstrap.json`, `client-identity.json`, `desktop-status.json`), but legacy hidden `.ironmesh-*` discovery names still exist in implementation and should remain compatibility-only.
 - Missing tests or docs:
-   - Add an explicit regression test or helper contract for folder-agent profile path derivation before freezing the persisted-path surface.
-   - If legacy hidden Windows discovery names remain supported through release, add them to [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) instead of leaving them implicit in implementation code.
+   - No additional persisted-path gaps were found in this pass beyond broader release-review work.
 - Proposed pre-release actions:
-   - Replace the `DefaultHasher`-based folder-agent `scope_fingerprint` with an explicitly stable digest, or add a migration plan that carries existing profile directories forward.
    - Keep the Windows `Ironmesh` root and Linux `ironmesh` XDG roots as intentional OS-specific contracts, and keep [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) as the cleanup ledger for retained legacy readers.
 - Deferred post-release items:
    - Remove missing-version compatibility paths only after the supported upgrade window no longer requires reading pre-marker files or databases.
@@ -310,7 +308,7 @@ Working evidence log:
 
 Exit criteria:
 
-- [ ] There is a platform-by-platform compatibility matrix for persisted files and migrations.
+- [x] There is a platform-by-platform compatibility matrix for persisted files and migrations.
 
 ## Pass 6. Review Packaging, Distribution, And Update Behavior
 

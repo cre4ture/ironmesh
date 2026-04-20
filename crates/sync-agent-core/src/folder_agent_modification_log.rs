@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::folder_agent_state::{
     FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME, FolderAgentProfilePaths,
     default_folder_agent_state_root, folder_agent_profile_paths,
+    migrate_legacy_folder_agent_profile_dir,
 };
 use crate::{PathScope, StartupStateStore};
 
@@ -149,6 +150,7 @@ pub struct ModificationHistoryPage {
 pub struct ModificationLogStore {
     pub path: PathBuf,
     scope_fingerprint: String,
+    legacy_profile_dir: Option<PathBuf>,
     scope_label: String,
     root_dir_label: String,
     connection_target: String,
@@ -200,6 +202,7 @@ impl ModificationLogStore {
         Self {
             path: profile_dir.join(FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME),
             scope_fingerprint,
+            legacy_profile_dir: state_store.legacy_profile_dir().map(Path::to_path_buf),
             scope_label: scope.remote_prefix().unwrap_or("<root>").to_string(),
             root_dir_label: root_dir_label.display().to_string(),
             connection_target: connection_target.to_string(),
@@ -215,6 +218,7 @@ impl ModificationLogStore {
         Self {
             path: profile_paths.modification_log_path,
             scope_fingerprint: profile_paths.scope_fingerprint,
+            legacy_profile_dir: profile_paths.legacy_profile_dir,
             scope_label: scope.remote_prefix().unwrap_or("<root>").to_string(),
             root_dir_label: root_dir_label.display().to_string(),
             connection_target: connection_target.to_string(),
@@ -342,6 +346,12 @@ impl ModificationLogStore {
     }
 
     fn sqlite_connection(&self) -> Result<Connection> {
+        migrate_legacy_folder_agent_profile_dir(
+            self.path.parent().unwrap_or_else(|| Path::new(".")),
+            self.legacy_profile_dir.as_deref(),
+            &self.scope_fingerprint,
+        )?;
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -726,6 +736,138 @@ mod tests {
         assert_eq!(uploads.records.len(), 1);
         assert_eq!(uploads.records[0].local_relative_path, "docs/one.txt");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modification_log_store_migrates_legacy_profile_dir_to_stable_scope_fingerprint() {
+        let root = test_root();
+        let state_root = root.join("state-root");
+        let identity_root = root.join("identity-root");
+        let scope = PathScope::new(Some("photos/camera".to_string()));
+        let connection_target = "http://127.0.0.1:8080";
+        let profile_paths =
+            folder_agent_profile_paths(&identity_root, &scope, connection_target, &state_root);
+        let legacy_profile_dir = profile_paths
+            .legacy_profile_dir
+            .clone()
+            .expect("legacy profile dir should differ from stable digest path");
+        fs::create_dir_all(&legacy_profile_dir).unwrap();
+        let legacy_scope_fingerprint =
+            crate::folder_agent_state::legacy_folder_agent_profile_dir(
+                &identity_root,
+                &scope,
+                connection_target,
+                &state_root,
+                &profile_paths.scope_fingerprint,
+            )
+            .and_then(|path| {
+                path.file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+            })
+            .unwrap();
+        let legacy_log_path = legacy_profile_dir.join(FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME);
+        {
+            let connection = Connection::open(&legacy_log_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE modification_meta (
+                         key TEXT PRIMARY KEY,
+                         value TEXT NOT NULL
+                     );
+                     CREATE TABLE modification_actions (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         occurred_unix_ms INTEGER NOT NULL,
+                         operation TEXT NOT NULL,
+                         outcome TEXT NOT NULL,
+                         phase TEXT NOT NULL,
+                         trigger_source TEXT NOT NULL,
+                         local_relative_path TEXT NOT NULL,
+                         remote_key TEXT NOT NULL,
+                         size_bytes INTEGER,
+                         content_hash TEXT,
+                         scope_label TEXT NOT NULL,
+                         root_dir TEXT NOT NULL,
+                         connection_target TEXT NOT NULL,
+                         error_text TEXT
+                     );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO modification_meta(key, value) VALUES(?1, ?2)",
+                    params!["schema_version", MODIFICATION_LOG_SCHEMA_VERSION_CURRENT.to_string()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO modification_meta(key, value) VALUES(?1, ?2)",
+                    params!["scope_fingerprint", legacy_scope_fingerprint],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO modification_actions(
+                         occurred_unix_ms,
+                         operation,
+                         outcome,
+                         phase,
+                         trigger_source,
+                         local_relative_path,
+                         remote_key,
+                         size_bytes,
+                         content_hash,
+                         scope_label,
+                         root_dir,
+                         connection_target,
+                         error_text
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        123_i64,
+                        "upload",
+                        "success",
+                        "startup",
+                        "startup-reconcile",
+                        "docs/readme.txt",
+                        "photos/camera/docs/readme.txt",
+                        5_i64,
+                        "hash-1",
+                        "photos/camera",
+                        root.display().to_string(),
+                        connection_target,
+                        Option::<String>::None,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let store = ModificationLogStore::new_with_state_root(
+            &identity_root,
+            &root,
+            &scope,
+            connection_target,
+            &state_root,
+        );
+        let page = store.list(Some(10), None, None).unwrap();
+
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].local_relative_path, "docs/readme.txt");
+        assert_eq!(store.path, profile_paths.modification_log_path);
+        assert!(store.path.exists());
+        assert!(!legacy_profile_dir.exists());
+
+        let connection = Connection::open(store.path()).unwrap();
+        let stored_fingerprint: String = connection
+            .query_row(
+                "SELECT value FROM modification_meta WHERE key = ?1",
+                ["scope_fingerprint"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_fingerprint, profile_paths.scope_fingerprint);
+
+        let _ = fs::remove_file(PathBuf::from(format!("{}-wal", store.path().display())));
+        let _ = fs::remove_file(PathBuf::from(format!("{}-shm", store.path().display())));
         fs::remove_dir_all(root).unwrap();
     }
 
