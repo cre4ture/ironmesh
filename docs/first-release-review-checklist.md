@@ -91,11 +91,54 @@ Primary repo areas:
 
 Checklist:
 
-- [ ] Build a contract table with package name, built binary name, user-facing command name, documented name, and supported platforms.
-- [ ] Mark each binary or command as `public stable`, `stable internal`, `experimental`, or `private implementation`.
+- [x] Build a contract table with package name, built binary name, user-facing command name, documented name, and supported platforms.
+- [x] Mark each binary or command as `public stable`, `stable internal`, `experimental`, or `private implementation`.
 - [ ] Inventory release-visible env vars and classify which ones are part of the supported contract versus debug-only or internal knobs.
 - [ ] Inventory release-visible persisted files and classify which ones are part of the supported contract versus implementation details.
-- [ ] Record every naming mismatch that could confuse users, packaging, automation, or docs.
+- [x] Record every naming mismatch that could confuse users, packaging, automation, or docs.
+
+Working evidence log:
+
+- Reviewed paths:
+   - [README.md](../README.md)
+   - [Cargo.toml](../Cargo.toml)
+   - [apps/cli-client/Cargo.toml](../apps/cli-client/Cargo.toml)
+   - [apps/cli-client/src/main.rs](../apps/cli-client/src/main.rs)
+   - [apps/server-node/Cargo.toml](../apps/server-node/Cargo.toml)
+   - [apps/server-node/src/main.rs](../apps/server-node/src/main.rs)
+   - [apps/rendezvous-service/Cargo.toml](../apps/rendezvous-service/Cargo.toml)
+   - [apps/os-integration/Cargo.toml](../apps/os-integration/Cargo.toml)
+   - [apps/os-integration/src/main.rs](../apps/os-integration/src/main.rs)
+   - [apps/config-app/Cargo.toml](../apps/config-app/Cargo.toml)
+   - [apps/config-app/src/main.rs](../apps/config-app/src/main.rs)
+   - [apps/background-launcher/Cargo.toml](../apps/background-launcher/Cargo.toml)
+   - [apps/background-launcher/src/main.rs](../apps/background-launcher/src/main.rs)
+   - [apps/folder-agent/Cargo.toml](../apps/folder-agent/Cargo.toml)
+   - [apps/folder-agent/src/main.rs](../apps/folder-agent/src/main.rs)
+   - [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs)
+- Confirmed stable contracts:
+
+   | Cargo package | Built binary name | User-facing command name | Documented name | Supported platforms | Initial classification |
+   | --- | --- | --- | --- | --- | --- |
+   | `cli-client` | `ironmesh` | `ironmesh` | `ironmesh` | Cross-platform Rust CLI | `public stable` |
+   | `server-node` | `ironmesh-server-node` | `ironmesh-server-node` | `ironmesh-server-node` | Cross-platform Rust service | `public stable` |
+   | `rendezvous-service` | `ironmesh-rendezvous-service` | `ironmesh-rendezvous-service` | `ironmesh-rendezvous-service` | Cross-platform Rust service | `public stable` |
+   | `os-integration` | `ironmesh-os-integration` | `ironmesh-os-integration` | `ironmesh-os-integration` | Windows CFAPI and Linux FUSE | `public stable` |
+   | `ironmesh-config-app` | `ironmesh-config-app` | `ironmesh-config-app` | `ironmesh-config-app` | Linux and Windows packaged desktop builds | `public stable` |
+   | `ironmesh-background-launcher` | `ironmesh-background-launcher` | `ironmesh-background-launcher` | packaged background launcher helper | Linux and Windows packaged desktop builds | `stable internal` |
+   | `ironmesh-folder-agent` | `ironmesh-folder-agent` | `ironmesh-folder-agent` | packaged folder sync agent | Linux and Windows packaged desktop builds | `stable internal` |
+- Findings:
+   - `major`: [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs) was still resolving the sibling packaged executable as `os-integration`; this pass updates it to `ironmesh-os-integration` so packaged launch behavior matches the actual binary contract already enforced by the app package and tests.
+   - `minor`: the package-name versus command-name split is intentional for `cli-client`, `server-node`, `rendezvous-service`, and `os-integration`; support docs should keep spelling out that `cargo run -p ...` uses Cargo package names while released binaries use the `ironmesh-*` command names above.
+   - `question`: the table above is enough to freeze names and classifications, but Pass 6 still needs to decide the final first-release artifact scope per platform.
+- Missing tests or docs:
+   - Release-visible env vars still need a single inventory and classification pass.
+   - Release-visible persisted files still need a stable-vs-internal matrix.
+- Proposed pre-release actions:
+   - Keep the table above as the naming source of truth and update it when Pass 6 trims or expands the shipped artifact set.
+   - Keep adding explicit package-name versus binary-name notes anywhere user docs show `cargo run -p ...` examples.
+- Deferred post-release items:
+   - Remove internal helper binaries from top-level user docs if packaging eventually hides them completely behind the config app.
 
 Exit criteria:
 
@@ -139,11 +182,37 @@ Primary repo areas:
 Checklist:
 
 - [ ] Inventory client-facing HTTP routes, query parameters, auth requirements, and error-response shapes.
-- [ ] Review `ConnectionBootstrap`, client enrollment, bootstrap-claim redemption, direct-vs-relay target selection, and client identity loading.
+- [x] Review `ConnectionBootstrap`, client enrollment, bootstrap-claim redemption, direct-vs-relay target selection, and client identity loading.
 - [ ] Decide whether `web-ui-backend` routes are part of the stable release surface or only internal to bundled tools.
-- [ ] Confirm the canonical `/api/v1` client-facing route set, and list any legacy unversioned aliases that remain temporarily supported for compatibility.
-- [ ] Freeze the first-release JSON error envelope on top-level `{ "error": string }` across the `/api/v1` surface unless a richer typed error contract lands before release.
+- [x] Confirm the canonical `/api/v1` client-facing route set, and list any legacy unversioned aliases that remain temporarily supported for compatibility.
+- [x] Freeze the first-release JSON error envelope on top-level `{ "error": string }` across the `/api/v1` surface unless a richer typed error contract lands before release.
 - [ ] Map every stable client-facing route and payload to existing automated tests or create missing-test follow-ups.
+
+Working evidence log:
+
+- Reviewed paths:
+   - [crates/client-sdk/src/ironmesh_client.rs](../crates/client-sdk/src/ironmesh_client.rs)
+   - [crates/client-sdk/src/remote_sync.rs](../crates/client-sdk/src/remote_sync.rs)
+   - [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs)
+   - [crates/server-node-sdk/src/web_maps.rs](../crates/server-node-sdk/src/web_maps.rs)
+   - [crates/web-ui-backend/src/lib.rs](../crates/web-ui-backend/src/lib.rs)
+   - [web/tests/client-ui.smoke.spec.ts](../web/tests/client-ui.smoke.spec.ts)
+   - [web/tests/server-admin.smoke.spec.ts](../web/tests/server-admin.smoke.spec.ts)
+   - [docs/backwards-compatibility-aliases.md](backwards-compatibility-aliases.md)
+- Confirmed stable contracts:
+   - `client-sdk`, `server-node-sdk`, and `web-ui-backend` now use `/api/v1` as the canonical client-facing prefix, and bootstrap direct-target probes use `/api/v1/health`.
+   - Legacy unversioned client-facing aliases remain server-side only as temporary compatibility shims and are now recorded in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md).
+   - Representative server-node and bundled-web error helpers now pin the top-level public JSON envelope to `{ "error": string }`, and the smoke suites assert canonical `/api/v1` URLs instead of legacy unversioned paths.
+- Findings:
+   - `question`: whether bundled `web-ui-backend` routes should be documented as part of the public stable surface or treated as bundled-tool internal routes is still undecided.
+   - `minor`: the route and payload contract is better pinned than before, but the stable-route inventory is still distributed across source and tests rather than one explicit contract list.
+- Missing tests or docs:
+   - A single route catalog that maps each stable client-facing endpoint and payload to Rust or smoke-test coverage is still missing.
+- Proposed pre-release actions:
+   - Write the explicit stable-route catalog and decide whether `web-ui-backend` stays internal or joins the public first-release API surface.
+   - Keep legacy aliases documented in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) until external callers are known to be off them.
+- Deferred post-release items:
+   - Remove temporary unversioned aliases once the compatibility window closes.
 
 Exit criteria:
 
@@ -189,10 +258,33 @@ Checklist:
 - [ ] Enumerate stable or semi-stable persisted files by platform, including `instances.json`, `last-launch-report.json`, `connection-bootstrap.json`, `client-identity.json`, `desktop-status.json`, GNOME status JSON, and the folder-agent SQLite files.
 - [ ] Decide whether path-root casing differences such as `Ironmesh` versus `ironmesh` are intentional release contracts or inconsistencies to fix before release.
 - [ ] Review migration behavior for legacy paths such as `windows-client-config` and older bootstrap or identity-file discovery names.
-- [ ] Review JSON and SQLite format stability, including whether explicit schema or format version markers are needed before release.
-- [ ] Keep stable JSON stores on explicit format markers; `instances.json` and `last-launch-report.json` currently use `version: 1` with compatibility for missing legacy versions.
-- [ ] Confirm compatibility behavior for SQLite stores that now persist explicit schema markers, including legacy databases that predate the marker rows.
+- [x] Review JSON and SQLite format stability, including whether explicit schema or format version markers are needed before release.
+- [x] Keep stable JSON stores on explicit format markers; `instances.json` and `last-launch-report.json` currently use `version: 1` with compatibility for missing legacy versions.
+- [x] Confirm compatibility behavior for SQLite stores that now persist explicit schema markers, including legacy databases that predate the marker rows.
 - [ ] Verify deterministic path derivation where state directories are keyed by sync-root path hashing or other derived labels.
+
+Working evidence log:
+
+- Reviewed paths:
+   - [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs)
+   - [crates/client-sdk/src/content_addressed_client_cache.rs](../crates/client-sdk/src/content_addressed_client_cache.rs)
+   - [crates/server-node-sdk/src/storage/sqlite_impl.rs](../crates/server-node-sdk/src/storage/sqlite_impl.rs)
+   - [docs/backwards-compatibility-aliases.md](backwards-compatibility-aliases.md)
+   - [docs/windows-msix-release-update-strategy.md](windows-msix-release-update-strategy.md)
+- Confirmed stable contracts:
+   - `instances.json` and `last-launch-report.json` now persist top-level `version: 1` and accept missing version in legacy files.
+   - The client content cache and server metadata SQLite stores now persist explicit `schema_version` markers and treat missing legacy marker rows as current while rejecting future versions.
+   - Desktop config roots remain `%LOCALAPPDATA%\Ironmesh\desktop-client-config\...` on Windows and XDG `ironmesh/...` roots on Linux, with migration from older legacy roots still in place.
+- Findings:
+   - `question`: the repo still needs one explicit platform-by-platform persisted-file matrix that covers GNOME status JSON, sync-root local state files, and folder-agent SQLite state alongside the versioned stores above.
+   - `minor`: the new format markers are now explicit for the reviewed stores, but the remaining path and file inventory is still spread across implementation code and strategy docs.
+- Missing tests or docs:
+   - The persisted-file compatibility matrix is still missing.
+   - Deterministic derived-path rules still need one place where they are documented for release review.
+- Proposed pre-release actions:
+   - Extend this pass into a platform-by-platform persisted-file matrix and keep [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) as the cleanup ledger for any retained legacy readers.
+- Deferred post-release items:
+   - Remove missing-version compatibility paths only after the supported upgrade window no longer requires reading pre-marker files or databases.
 
 Exit criteria:
 
