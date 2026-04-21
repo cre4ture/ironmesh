@@ -39,5 +39,5 @@ os_integration = { path = "../../apps/os-integration", package = "os-integration
 ironmesh_folder_agent = { path = "../../apps/folder-agent", package = "ironmesh-folder-agent", artifact = "bin" }
 rendezvous_service = { path = "../../apps/rendezvous-service", package = "rendezvous-service", artifact = "bin" }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"

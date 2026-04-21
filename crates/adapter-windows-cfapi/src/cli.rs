@@ -37,10 +37,12 @@ use sync_core::SyncPolicy;
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_INFO: &str = git_version::git_version!(
     prefix = "Build revision: ",
+    fallback = "Build revision: unknown",
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
 const LONG_VERSION: &str = git_version::git_version!(
     prefix = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: "),
+    fallback = concat!(env!("CARGO_PKG_VERSION"), "\nBuild revision: unknown"),
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
 

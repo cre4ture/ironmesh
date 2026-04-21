@@ -1,0 +1,12 @@
+/cargo-home/
+/cargo-vendor/
+/prebuilt-web/
+/.debhelper/
+/debhelper-build-stamp
+/files
+/source/include-binaries
+/*.debhelper.log
+/*.substvars
+/ironmesh-client/
+/ironmesh-rendezvous-service/
+/ironmesh-server-node/

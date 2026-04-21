@@ -1,0 +1,16 @@
+[Unit]
+Description=Ironmesh server node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/ironmesh/server-node.env
+StateDirectory=ironmesh-server-node
+WorkingDirectory=/var/lib/ironmesh-server-node
+ExecStart=/usr/bin/ironmesh-server-node
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

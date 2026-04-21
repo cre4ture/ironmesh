@@ -1,0 +1,42 @@
+Ironmesh Debian/PPA packaging
+==============================
+
+This packaging is aimed at Launchpad PPA source uploads.
+
+Before building a source package, prepare the generated packaging inputs:
+
+  ./scripts/prepare-ppa-source.sh
+
+That command does two things:
+
+  1. Vendors Rust dependencies into `debian/cargo-vendor/` so Launchpad can
+     build without network access.
+  2. Builds the `server-admin` and `client-ui` web apps and copies their built
+     assets into `debian/prebuilt-web/` so the Rust crates can embed them
+     without running `pnpm` on the builder.
+
+After that, create a unique changelog entry for the Ubuntu series you want to
+target. Example for Ubuntu 24.04 LTS (`noble`):
+
+  dch -D noble -v 0.1.0-1~ppa1~ubuntu24.04.1 "PPA build"
+
+Then build the source package:
+
+  ./scripts/build-ppa-source.sh
+
+This helper intentionally uses `debuild -S -sa -nc` so the prepared vendored
+dependencies and prebuilt web assets remain in the source tree for the source
+upload.
+
+The resulting `../ironmesh_<version>_source.changes` file can then be uploaded
+with `dput`.
+
+Notes:
+
+  * The package build intentionally skips the workspace test suites because the
+    repository includes long-running integration tests and a nightly-only
+    `system-tests` harness that are not suitable for Launchpad builders.
+  * The systemd units for `ironmesh-server-node` and
+    `ironmesh-rendezvous-service` are installed but not enabled or started
+    automatically. Fill in the matching `/etc/ironmesh/*.env` file and enable
+    the service manually after installation.

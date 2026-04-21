@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Ironmesh Config App
+Comment=Configure packaged Ironmesh background services
+Exec=ironmesh-config-app
+Terminal=false
+Categories=Network;Utility;

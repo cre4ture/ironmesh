@@ -1,0 +1,16 @@
+[Unit]
+Description=Ironmesh rendezvous service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/ironmesh/rendezvous-service.env
+StateDirectory=ironmesh-rendezvous-service
+WorkingDirectory=/var/lib/ironmesh-rendezvous-service
+ExecStart=/usr/bin/ironmesh-rendezvous-service
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

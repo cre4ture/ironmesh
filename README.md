@@ -93,13 +93,10 @@ Current setup:
 
 The `system-tests` crate is intentionally isolated from root workspace membership so stable Cargo can run root workspace jobs without parsing nightly-only `artifact` dependency declarations.
 
-If you must run with stable for local work, use explicit binaries instead of artifact deps:
+When you need to run `system-tests`, invoke it directly with nightly:
 
 ```bash
-cargo build -p server-node -p cli-client
-IRONMESH_SERVER_BIN=target/debug/ironmesh-server-node \
-IRONMESH_CLI_BIN=target/debug/ironmesh \
-cargo +stable test -p system-tests
+cargo +nightly -Z bindeps test --manifest-path tests/system-tests/Cargo.toml
 ```
 
 Note: CI/push hooks may enforce stricter checks across the workspace. If local commits are needed while unrelated lint debt exists in untouched crates, use local-only commits and avoid pushing until lint debt is resolved.

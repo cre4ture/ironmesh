@@ -89,7 +89,7 @@ use uuid::Uuid;
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_REVISION: &str =
-    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+    git_version::git_version!(fallback = "unknown", args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
 const STORAGE_STATS_REFRESH_INTERVAL_SECS: u64 = 300;
 const STORAGE_STATS_CHANGE_DEBOUNCE_SECS: u64 = 15;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;

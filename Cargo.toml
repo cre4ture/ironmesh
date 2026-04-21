@@ -22,8 +22,8 @@ members = [
     "apps/android-app",
     "apps/ios-app",
     "apps/os-integration",
-    "tests/system-tests",
 ]
+exclude = ["tests/system-tests"]
 resolver = "2"
 
 [workspace.package]

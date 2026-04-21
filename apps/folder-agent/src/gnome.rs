@@ -105,6 +105,23 @@ pub fn run_with_gnome_status(
 }
 
 fn extension_source_dir() -> PathBuf {
+    if let Some(package_dir) = packaged_extension_source_dir() {
+        return package_dir;
+    }
+
+    source_tree_extension_source_dir()
+}
+
+fn packaged_extension_source_dir() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let package_root = current_exe.parent()?;
+    let candidate = package_root
+        .join("gnome-shell-extension")
+        .join(GNOME_EXTENSION_UUID);
+    candidate.is_dir().then_some(candidate)
+}
+
+fn source_tree_extension_source_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("gnome-shell-extension")
         .join(GNOME_EXTENSION_UUID)

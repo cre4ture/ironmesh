@@ -30,7 +30,7 @@ use tracing::info;
 
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKEND_REVISION: &str =
-    git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+    git_version::git_version!(fallback = "unknown", args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 const WEB_API_V1_PREFIX: &str = "/api/v1";
 

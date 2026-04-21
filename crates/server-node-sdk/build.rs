@@ -9,13 +9,14 @@ fn main() {
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
     let web_workspace_dir = manifest_dir.join("..").join("..").join("web");
-    let server_admin_dist_dir = manifest_dir
+    let source_server_admin_dist_dir = manifest_dir
         .join("..")
         .join("..")
         .join("web")
         .join("apps")
         .join("server-admin")
         .join("dist");
+    let prebuilt_web_dir = env::var_os("IRONMESH_PREBUILT_WEB_DIR").map(PathBuf::from);
 
     println!("cargo:rerun-if-changed=build.rs");
     println!(
@@ -165,12 +166,25 @@ fn main() {
             .display()
     );
     println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=IRONMESH_PREBUILT_WEB_DIR");
+    if let Some(prebuilt_web_dir) = prebuilt_web_dir.as_deref() {
+        println!(
+            "cargo:rerun-if-changed={}",
+            prebuilt_web_dir.join("server-admin").display()
+        );
+    }
 
     let generated_index = out_dir.join("server_admin_index.html");
     let generated_css = out_dir.join("server_admin_app.css");
     let generated_js = out_dir.join("server_admin_app.js");
     let generated_assets = out_dir.join("server_admin_assets.rs");
-    run_frontend_build(&web_workspace_dir);
+    let server_admin_dist_dir = match prebuilt_web_dir.as_deref() {
+        Some(prebuilt_web_dir) => resolve_prebuilt_dist_dir(prebuilt_web_dir, "server-admin"),
+        None => {
+            run_frontend_build(&web_workspace_dir);
+            source_server_admin_dist_dir.clone()
+        }
+    };
 
     let built_index_path = server_admin_dist_dir.join("index.html");
     let index_html = fs::read_to_string(&built_index_path).unwrap_or_else(|error| {
@@ -334,6 +348,19 @@ fn extract_tag_attr(
 
 fn resolve_dist_asset(dist_dir: &Path, asset_path: &str) -> PathBuf {
     dist_dir.join(asset_path.trim_start_matches('/'))
+}
+
+fn resolve_prebuilt_dist_dir(prebuilt_web_dir: &Path, app_name: &str) -> PathBuf {
+    let candidate = prebuilt_web_dir.join(app_name);
+    if candidate.join("index.html").is_file() {
+        return candidate;
+    }
+
+    panic!(
+        "prebuilt web assets requested via IRONMESH_PREBUILT_WEB_DIR={}, but {} is missing index.html",
+        prebuilt_web_dir.display(),
+        candidate.display()
+    );
 }
 
 fn run_frontend_build(web_workspace_dir: &Path) {

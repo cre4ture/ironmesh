@@ -1,0 +1,121 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export IRONMESH_PREBUILT_WEB_DIR := $(CURDIR)/debian/prebuilt-web
+export CARGO_HOME := $(CURDIR)/debian/cargo-home
+export CARGO_TARGET_DIR := $(CURDIR)/target/debian
+export CARGO_NET_OFFLINE := true
+
+CARGO_BIN := $(firstword \
+	$(wildcard /usr/bin/cargo-1.91) \
+	$(wildcard /usr/bin/cargo-1.89) \
+	$(wildcard /usr/bin/cargo-1.85) \
+	/usr/bin/cargo)
+RUSTC_BIN := $(firstword \
+	$(wildcard /usr/bin/rustc-1.91) \
+	$(wildcard /usr/bin/rustc-1.89) \
+	$(wildcard /usr/bin/rustc-1.85) \
+	/usr/bin/rustc)
+
+CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/ironmesh-client/usr/lib/ironmesh-client
+CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	test -f $(CURDIR)/debian/prebuilt-web/server-admin/index.html || \
+		(echo "missing prebuilt server-admin assets; run ./scripts/prepare-ppa-source.sh" >&2; exit 1)
+	test -f $(CURDIR)/debian/prebuilt-web/client-ui/index.html || \
+		(echo "missing prebuilt client-ui assets; run ./scripts/prepare-ppa-source.sh" >&2; exit 1)
+	test -d $(CURDIR)/debian/cargo-vendor || \
+		(echo "missing vendored Rust dependencies; run ./scripts/prepare-ppa-source.sh" >&2; exit 1)
+	mkdir -p $(CARGO_HOME)
+	printf '%s\n' \
+		'[source.crates-io]' \
+		'replace-with = "vendored-sources"' \
+		'' \
+		'[source.vendored-sources]' \
+		'directory = "$(CURDIR)/debian/cargo-vendor"' \
+		'' \
+		'[net]' \
+		'offline = true' \
+		> $(CARGO_HOME)/config.toml
+
+override_dh_auto_build:
+	RUSTC=$(RUSTC_BIN) $(CARGO_BIN) build \
+		--manifest-path $(CURDIR)/Cargo.toml \
+		--locked \
+		--offline \
+		--release \
+		-p server-node \
+		-p cli-client \
+		-p ironmesh-config-app \
+		-p ironmesh-background-launcher \
+		-p ironmesh-folder-agent \
+		-p os-integration \
+		-p rendezvous-service
+
+override_dh_auto_test:
+	# Skip the repository's long-running integration-heavy test suites during
+	# package builds. The Launchpad PPA path is intended to validate that the
+	# source package builds cleanly for the requested Ubuntu series.
+	:
+
+override_dh_auto_install:
+	install -d $(CURDIR)/debian/ironmesh-server-node/usr/bin
+	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-server-node \
+		$(CURDIR)/debian/ironmesh-server-node/usr/bin/ironmesh-server-node
+	install -d $(CURDIR)/debian/ironmesh-server-node/usr/lib/systemd/system
+	install -m0644 debian/ironmesh-server-node.service \
+		$(CURDIR)/debian/ironmesh-server-node/usr/lib/systemd/system/ironmesh-server-node.service
+	install -d $(CURDIR)/debian/ironmesh-server-node/etc/ironmesh
+	install -m0644 debian/ironmesh-server-node.env \
+		$(CURDIR)/debian/ironmesh-server-node/etc/ironmesh/server-node.env
+
+	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin
+	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-rendezvous-service \
+		$(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin/ironmesh-rendezvous-service
+	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/usr/lib/systemd/system
+	install -m0644 debian/ironmesh-rendezvous-service.service \
+		$(CURDIR)/debian/ironmesh-rendezvous-service/usr/lib/systemd/system/ironmesh-rendezvous-service.service
+	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh
+	install -m0644 debian/ironmesh-rendezvous-service.env \
+		$(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh/rendezvous-service.env
+
+	install -d $(CLIENT_PACKAGE_ROOT)
+	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh $(CLIENT_PACKAGE_ROOT)/ironmesh
+	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-config-app \
+		$(CLIENT_PACKAGE_ROOT)/ironmesh-config-app
+	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-background-launcher \
+		$(CLIENT_PACKAGE_ROOT)/ironmesh-background-launcher
+	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-folder-agent \
+		$(CLIENT_PACKAGE_ROOT)/ironmesh-folder-agent
+	install -m0755 $(CARGO_TARGET_DIR)/release/ironmesh-os-integration \
+		$(CLIENT_PACKAGE_ROOT)/ironmesh-os-integration
+
+	install -d $(CLIENT_EXTENSION_ROOT)
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js \
+		$(CLIENT_EXTENSION_ROOT)/extension.js
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/metadata.json \
+		$(CLIENT_EXTENSION_ROOT)/metadata.json
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/stylesheet.css \
+		$(CLIENT_EXTENSION_ROOT)/stylesheet.css
+
+	install -d $(CURDIR)/debian/ironmesh-client/usr/bin
+	ln -sf ../lib/ironmesh-client/ironmesh \
+		$(CURDIR)/debian/ironmesh-client/usr/bin/ironmesh
+	ln -sf ../lib/ironmesh-client/ironmesh-config-app \
+		$(CURDIR)/debian/ironmesh-client/usr/bin/ironmesh-config-app
+	ln -sf ../lib/ironmesh-client/ironmesh-folder-agent \
+		$(CURDIR)/debian/ironmesh-client/usr/bin/ironmesh-folder-agent
+	ln -sf ../lib/ironmesh-client/ironmesh-os-integration \
+		$(CURDIR)/debian/ironmesh-client/usr/bin/ironmesh-os-integration
+
+	install -d $(CURDIR)/debian/ironmesh-client/usr/share/applications
+	install -m0644 debian/ironmesh-config-app.desktop \
+		$(CURDIR)/debian/ironmesh-client/usr/share/applications/ironmesh-config-app.desktop
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start

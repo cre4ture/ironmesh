@@ -4,8 +4,10 @@ const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const EXPECTED_NAME: &str = "ironmesh-server-node";
 
 fn expected_version_outputs(binary_name: &str) -> [String; 2] {
-    let build_revision =
-        git_version::git_version!(args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+    let build_revision = git_version::git_version!(
+        fallback = "unknown",
+        args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
+    );
     let clean_revision = build_revision.trim_end_matches("-dirty");
     [
         format!("{binary_name} {PACKAGE_VERSION}\nBuild revision: {clean_revision}\n"),

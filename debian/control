@@ -1,0 +1,46 @@
+Source: ironmesh
+Section: utils
+Priority: optional
+Maintainer: Ulrich Hornung <hornunguli@gmx.de>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo-1.91 | cargo-1.89 | cargo-1.85,
+ rustc-1.91 | rustc-1.89 | rustc-1.85,
+ libfuse3-dev,
+ pkg-config
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: ironmesh-server-node
+Section: net
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends}
+Description: Ironmesh storage server node
+ Ironmesh server node for the distributed storage platform workspace.
+ This package ships the `ironmesh-server-node` service binary with the embedded
+ server-admin web UI.
+
+Package: ironmesh-client
+Section: utils
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ fuse3
+Description: Ironmesh client CLI and desktop helper applications
+ This package ships the public `ironmesh` CLI together with the packaged client
+ applications used for desktop workflows:
+ `ironmesh-config-app`, `ironmesh-folder-agent`, `ironmesh-os-integration`,
+ and the internal `ironmesh-background-launcher` helper.
+
+Package: ironmesh-rendezvous-service
+Section: net
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends}
+Description: Ironmesh standalone rendezvous and relay service
+ Ironmesh standalone rendezvous service for advanced deployments where the
+ public connectivity service is run separately from the storage nodes.

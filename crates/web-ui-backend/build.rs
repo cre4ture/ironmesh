@@ -10,6 +10,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
     let web_workspace_dir =
         canonicalize_or_fallback(manifest_dir.join("..").join("..").join("web"));
+    let prebuilt_web_dir = env::var_os("IRONMESH_PREBUILT_WEB_DIR").map(PathBuf::from);
     let generated_dist_dir = out_dir.join("client-ui-dist");
     let mut client_ui_dist_candidates = client_ui_dist_candidates(&web_workspace_dir);
 
@@ -161,23 +162,35 @@ fn main() {
             .display()
     );
     println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=IRONMESH_PREBUILT_WEB_DIR");
+    if let Some(prebuilt_web_dir) = prebuilt_web_dir.as_deref() {
+        println!(
+            "cargo:rerun-if-changed={}",
+            prebuilt_web_dir.join("client-ui").display()
+        );
+    }
 
     let generated_index = out_dir.join("client_ui_index.html");
     let generated_css = out_dir.join("client_ui_app.css");
     let generated_js = out_dir.join("client_ui_app.js");
     let generated_assets = out_dir.join("client_ui_assets.rs");
     let generated_assets_dir = out_dir.join("client_ui_embedded_assets");
-    run_frontend_build(&web_workspace_dir, &generated_dist_dir);
+    let client_ui_dist_dir = match prebuilt_web_dir.as_deref() {
+        Some(prebuilt_web_dir) => resolve_prebuilt_dist_dir(prebuilt_web_dir, "client-ui"),
+        None => {
+            run_frontend_build(&web_workspace_dir, &generated_dist_dir);
 
-    client_ui_dist_candidates.insert(0, generated_dist_dir.clone());
-    client_ui_dist_candidates.extend(discover_dist_dirs(&web_workspace_dir));
-    client_ui_dist_candidates = dedupe_paths_preserving_order(client_ui_dist_candidates);
-    let client_ui_dist_dir = locate_dist_dir(&client_ui_dist_candidates).unwrap_or_else(|| {
-        panic!(
-            "failed locating built client-ui dist after frontend build; checked: {}",
-            format_path_list(&client_ui_dist_candidates)
-        )
-    });
+            client_ui_dist_candidates.insert(0, generated_dist_dir.clone());
+            client_ui_dist_candidates.extend(discover_dist_dirs(&web_workspace_dir));
+            client_ui_dist_candidates = dedupe_paths_preserving_order(client_ui_dist_candidates);
+            locate_dist_dir(&client_ui_dist_candidates).unwrap_or_else(|| {
+                panic!(
+                    "failed locating built client-ui dist after frontend build; checked: {}",
+                    format_path_list(&client_ui_dist_candidates)
+                )
+            })
+        }
+    };
     let built_index_path = client_ui_dist_dir.join("index.html");
     let index_html = fs::read_to_string(&built_index_path).unwrap_or_else(|error| {
         panic!(
@@ -382,6 +395,19 @@ fn extract_tag_attr(
 
 fn resolve_dist_asset(dist_dir: &Path, asset_path: &str) -> PathBuf {
     dist_dir.join(asset_path.trim_start_matches('/'))
+}
+
+fn resolve_prebuilt_dist_dir(prebuilt_web_dir: &Path, app_name: &str) -> PathBuf {
+    let candidate = prebuilt_web_dir.join(app_name);
+    if candidate.join("index.html").is_file() {
+        return candidate;
+    }
+
+    panic!(
+        "prebuilt web assets requested via IRONMESH_PREBUILT_WEB_DIR={}, but {} is missing index.html",
+        prebuilt_web_dir.display(),
+        candidate.display()
+    );
 }
 
 fn client_ui_dist_candidates(web_workspace_dir: &Path) -> Vec<PathBuf> {
