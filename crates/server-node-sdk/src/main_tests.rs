@@ -275,6 +275,7 @@ fn test_cluster_config_without_internal_tls(
         public_url: Some(format!("http://{bind_addr}")),
         labels,
         public_tls: None,
+        allow_insecure_public_http: true,
         public_ca_cert_path: None,
         public_ca_key_path: None,
         bootstrap_trust_roots: None,
@@ -788,6 +789,23 @@ fn token_matches_requires_exact_match() {
     assert!(token_matches("secret", Some("secret")));
 }
 
+#[test]
+fn cluster_config_requires_explicit_insecure_public_http_override() {
+    let data_dir = std::env::temp_dir().join(format!(
+        "ironmesh-public-http-test-{}",
+        Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let mut config = test_cluster_config_without_internal_tls(data_dir, free_bind_addr());
+    config.allow_insecure_public_http = false;
+
+    let error = config.validate_public_listener_security().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP"));
+}
+
 async fn admin_authorization_requires_token_when_configured_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
@@ -842,6 +860,47 @@ run_on_main_metadata_backends!(
     admin_authorization_requires_explicit_approval_for_destructive_action_impl,
     admin_authorization_requires_explicit_approval_for_destructive_action,
     admin_authorization_requires_explicit_approval_for_destructive_action_turso
+);
+
+async fn public_logs_route_requires_client_or_admin_auth_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.client_auth_control.require_client_auth = true;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
+
+    let app = Router::new()
+        .route("/logs", get(super::ui::list_logs))
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::require_client_or_admin_auth,
+        ));
+
+    let unauthorized = app
+        .clone()
+        .oneshot(Request::builder().uri("/logs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/logs")
+                .header("x-ironmesh-admin-token", "admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    public_logs_route_requires_client_or_admin_auth_impl,
+    public_logs_route_requires_client_or_admin_auth,
+    public_logs_route_requires_client_or_admin_auth_turso
 );
 
 async fn enroll_client_device_consumes_pairing_token_and_persists_device_impl(
@@ -5765,7 +5824,7 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
 
     assert_eq!(
         payload["entries"][0]["media"]["thumbnail"]["url"],
-        "/auth/media/thumbnail?key=gallery%2Fcat.png"
+        "/api/v1/auth/media/thumbnail?key=gallery%2Fcat.png"
     );
 
     cleanup_test_state(&state).await;

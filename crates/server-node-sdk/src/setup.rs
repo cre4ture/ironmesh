@@ -1657,6 +1657,7 @@ mod tests {
             public_url: Some(format!("http://{bind_addr}")),
             labels,
             public_tls: None,
+            allow_insecure_public_http: true,
             public_ca_cert_path: None,
             public_ca_key_path: None,
             bootstrap_trust_roots: None,

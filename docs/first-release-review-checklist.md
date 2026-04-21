@@ -391,15 +391,49 @@ Primary repo areas:
 
 Checklist:
 
-- [ ] Review TLS and mTLS requirements, plus every plaintext or insecure-dev escape hatch.
-- [ ] Review admin-token fallback behavior, audit logging, and safe defaults for destructive maintenance actions.
-- [ ] Review certificate renewal, issuer matching, membership validation, and client-identity handling for release-time robustness.
-- [ ] Review rendezvous and relay preconditions, especially cases where missing CA material or misaligned bootstrap metadata should fail fast.
-- [ ] Confirm that logs, status files, and status endpoints are sufficient for release support and incident diagnosis.
+- [x] Review TLS and mTLS requirements, plus every plaintext or insecure-dev escape hatch.
+- [x] Review admin-token fallback behavior, audit logging, and safe defaults for destructive maintenance actions.
+- [x] Review certificate renewal, issuer matching, membership validation, and client-identity handling for release-time robustness.
+- [x] Review rendezvous and relay preconditions, especially cases where missing CA material or misaligned bootstrap metadata should fail fast.
+- [x] Confirm that logs, status files, and status endpoints are sufficient for release support and incident diagnosis.
+
+Working evidence log:
+
+- Reviewed paths:
+   - [docs/security-architecture.md](security-architecture.md)
+   - [docs/node-certificate-renewal-model-decision.md](node-certificate-renewal-model-decision.md)
+   - [docs/nat-traversal-rendezvous-strategy.md](nat-traversal-rendezvous-strategy.md)
+   - [README.md](../README.md)
+   - [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs)
+   - [crates/server-node-sdk/src/ui.rs](../crates/server-node-sdk/src/ui.rs)
+   - [crates/server-node-sdk/src/storage/sqlite_impl.rs](../crates/server-node-sdk/src/storage/sqlite_impl.rs)
+   - [crates/server-node-sdk/src/storage/turso_impl.rs](../crates/server-node-sdk/src/storage/turso_impl.rs)
+   - [apps/rendezvous-service/src/config.rs](../apps/rendezvous-service/src/config.rs)
+   - [apps/rendezvous-service/src/main.rs](../apps/rendezvous-service/src/main.rs)
+   - [crates/rendezvous-server/src/lib.rs](../crates/rendezvous-server/src/lib.rs)
+   - [crates/rendezvous-server/src/auth.rs](../crates/rendezvous-server/src/auth.rs)
+   - [crates/transport-sdk/src/rendezvous.rs](../crates/transport-sdk/src/rendezvous.rs)
+- Confirmed security and operational controls:
+   - Internal peer traffic is materially stricter than the public listener. `ironmesh-server-node` requires internal TLS material at startup, wraps the internal router with authenticated `InternalCaller` extraction, and only allows node-enrollment auto-renew when the caller cluster ID matches and the caller node ID is still present in cluster membership.
+   - `ironmesh-server-node` public startup now mirrors the rendezvous fail-closed model: runtime startup refuses plaintext public HTTP unless `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP=true` is set explicitly for local development or testing.
+   - Standalone `ironmesh-rendezvous-service` already refuses plaintext HTTP by default. It only starts without mTLS when `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` is set explicitly for local development, and its config validation also rejects partial or inconsistent failover-package TLS inputs.
+   - Client bootstrap and rendezvous enrollment flows fail fast when the release-time trust roots are incomplete. In particular, rendezvous client identity issuance aborts when rendezvous mTLS is required but cluster CA or internal CA key material is missing.
+   - Admin actions are audit-persisted in both metadata backends through `admin_audit_events`, and destructive operations still require explicit `approve=true` before they can run as non-dry-run requests.
+   - Support-facing status surfaces already exist for first release triage: public `/health`, authenticated node-certificate status, scrub and repair activity or history endpoints, and the recent log buffer, which now sits behind client-or-admin authentication on the public router.
+- Findings:
+   - `blocker`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) only enforces admin authentication when an admin token or password-backed session hash is configured. If neither exists, `authorize_admin_request()` falls through to the dry-run and approval checks and leaves the public admin or maintenance surface reachable without authentication.
+   - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now refuses public runtime startup without `IRONMESH_PUBLIC_TLS_CERT` and `IRONMESH_PUBLIC_TLS_KEY` unless `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP=true` is set explicitly for local development or testing.
+   - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now treats unauthenticated client access as an explicit development-only override via `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS=true`, and [README.md](../README.md) no longer advertises the old `IRONMESH_REQUIRE_CLIENT_AUTH` knob as part of the supported runtime contract.
+   - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) no longer leaves `/logs` anonymous on the public router; the route now requires either valid client auth or admin auth, and [web/apps/server-admin/src/pages/LogsPage.tsx](../web/apps/server-admin/src/pages/LogsPage.tsx) forwards the admin token override when present.
+- Missing tests or docs:
+   - Add fail-closed tests for admin routes when no admin auth is configured.
+- Proposed pre-release actions:
+   - Fail closed on public admin and maintenance routes unless password-backed admin auth or an explicit emergency token is configured.
+   - Keep `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP` and `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS` documented as development-only overrides rather than release-facing runtime contract knobs.
 
 Exit criteria:
 
-- [ ] No auth, transport, or destructive-operation blocker is left unclassified.
+- [x] No auth, transport, or destructive-operation blocker is left unclassified.
 
 ## Pass 8. Review CI, Tests, And Manual Release Gates
 

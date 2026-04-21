@@ -539,6 +539,11 @@ start_cluster() {
     local logfile
     logfile="$(log_file "$idx")"
 
+    local allow_unauthenticated_clients="false"
+    if [[ "${CLIENT_AUTH_ENABLED}" != "true" ]]; then
+      allow_unauthenticated_clients="true"
+    fi
+
     echo "[local-cluster] starting node${idx} on ${bind}"
     nohup env \
       IRONMESH_NODE_ID="${node_id}" \
@@ -554,7 +559,7 @@ start_cluster() {
       IRONMESH_INTERNAL_TLS_KEY="$(node_key_file "$idx")" \
       IRONMESH_DATA_DIR="${ddir}" \
       IRONMESH_REPLICATION_FACTOR=3 \
-      IRONMESH_REQUIRE_CLIENT_AUTH="${CLIENT_AUTH_ENABLED}" \
+      IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS="${allow_unauthenticated_clients}" \
       IRONMESH_ADMIN_TOKEN="$(admin_token)" \
       "${BIN_PATH}" >"${logfile}" 2>&1 </dev/null &
 

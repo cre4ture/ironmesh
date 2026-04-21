@@ -143,6 +143,8 @@ const MAX_LATENCY_DIAGNOSTIC_SERVER_DELAY_MS: u64 = 5_000;
 pub(crate) const PUBLIC_API_V1_PREFIX: &str = "/api/v1";
 const PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/media/thumbnail";
 const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thumbnail";
+const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
+const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
 
 use cluster::{
     ClusterService, NodeCapabilities, NodeDescriptor, NodeReachability, NodeStorageStatsSummary,
@@ -1453,6 +1455,7 @@ pub struct ServerNodeConfig {
     pub public_url: Option<String>,
     pub labels: HashMap<String, String>,
     pub public_tls: Option<PublicTlsConfig>,
+    pub allow_insecure_public_http: bool,
     pub public_ca_cert_path: Option<PathBuf>,
     pub public_ca_key_path: Option<PathBuf>,
     bootstrap_trust_roots: Option<BootstrapTrustRoots>,
@@ -1496,6 +1499,13 @@ pub struct LocalNodeHandle {
     base_url: String,
     shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2886,6 +2896,8 @@ impl ServerNodeConfig {
         bootstrap.validate()?;
 
         let mode = ServerNodeMode::Cluster;
+        let allow_insecure_public_http = env_flag_enabled(ALLOW_INSECURE_PUBLIC_HTTP_ENV);
+        let allow_unauthenticated_clients = env_flag_enabled(ALLOW_UNAUTHENTICATED_CLIENTS_ENV);
         let bind_addr: SocketAddr = bootstrap
             .bind_addr
             .parse()
@@ -2937,6 +2949,7 @@ impl ServerNodeConfig {
             public_url: bootstrap.public_url,
             labels: bootstrap.labels,
             public_tls,
+            allow_insecure_public_http,
             public_ca_cert_path: bootstrap.public_ca_cert_path.map(PathBuf::from),
             public_ca_key_path: None,
             bootstrap_trust_roots: Some(bootstrap.trust_roots),
@@ -3047,10 +3060,7 @@ impl ServerNodeConfig {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             admin_password_hash: None,
-            require_client_auth: std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
+            require_client_auth: !allow_unauthenticated_clients,
         })
     }
 
@@ -3072,6 +3082,8 @@ impl ServerNodeConfig {
         }
 
         let mode = ServerNodeMode::Cluster;
+        let allow_insecure_public_http = env_flag_enabled(ALLOW_INSECURE_PUBLIC_HTTP_ENV);
+        let allow_unauthenticated_clients = env_flag_enabled(ALLOW_UNAUTHENTICATED_CLIENTS_ENV);
 
         let node_id = std::env::var("IRONMESH_NODE_ID")
             .ok()
@@ -3209,6 +3221,7 @@ impl ServerNodeConfig {
             public_url,
             labels,
             public_tls,
+            allow_insecure_public_http,
             public_ca_cert_path: std::env::var("IRONMESH_PUBLIC_TLS_CA_CERT")
                 .ok()
                 .map(PathBuf::from),
@@ -3325,11 +3338,18 @@ impl ServerNodeConfig {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             admin_password_hash: None,
-            require_client_auth: std::env::var("IRONMESH_REQUIRE_CLIENT_AUTH")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
+            require_client_auth: !allow_unauthenticated_clients,
         })
+    }
+
+    fn validate_public_listener_security(&self) -> Result<()> {
+        if self.public_tls.is_some() || self.allow_insecure_public_http {
+            return Ok(());
+        }
+
+        bail!(
+            "ironmesh-server-node refuses insecure public HTTP startup without TLS; configure IRONMESH_PUBLIC_TLS_CERT plus IRONMESH_PUBLIC_TLS_KEY, or set {ALLOW_INSECURE_PUBLIC_HTTP_ENV}=true for local development/testing only"
+        )
     }
 
     fn metadata_backend(&self) -> MetadataBackendKind {
@@ -3373,6 +3393,8 @@ impl ServerNodeConfig {
 
 impl LocalNodeHandle {
     pub fn start(config: ServerNodeConfig) -> Result<Self> {
+        config.validate_public_listener_security()?;
+
         let base_url = config.public_url.clone().unwrap_or_else(|| {
             let scheme = if config.public_tls.is_some() {
                 "https"
@@ -3542,6 +3564,8 @@ async fn shutdown_signal() {
 
 async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    config.validate_public_listener_security()?;
+
     let public_tls_runtime = match config.public_tls.as_ref() {
         Some(public_tls) => Some(PublicTlsRuntime {
             config: RustlsConfig::from_pem_file(&public_tls.cert_path, &public_tls.key_path)
@@ -4330,6 +4354,13 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .merge(public_cluster_info_api)
         .merge(public_client_api);
 
+    let public_logs_api = Router::new()
+        .route("/logs", get(ui::list_logs))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_or_admin_auth,
+        ));
+
     let public_app = Router::new()
         .route("/", get(ui::index))
         .route("/ironmesh-favicon.svg", get(ui::favicon))
@@ -4337,7 +4368,7 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .route("/ui/assets/{*path}", get(ui::static_asset))
         .route("/ui/app.css", get(ui::app_css))
         .route("/ui/app.js", get(ui::app_js))
-        .route("/logs", get(ui::list_logs))
+        .merge(public_logs_api)
         .nest(PUBLIC_API_V1_PREFIX, public_api_v1)
         .merge(legacy_public_api);
 

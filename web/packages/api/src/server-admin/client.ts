@@ -381,10 +381,12 @@ export async function clearAdminMediaCache(
   });
 }
 
-export async function getRecentLogs(limit = 200): Promise<LogsResponse> {
-  return fetchJson<LogsResponse>(`/logs?limit=${limit}`, {
-    credentials: "same-origin",
-    cache: "no-store"
+export async function getRecentLogs(
+  limit = 200,
+  adminTokenOverride?: string
+): Promise<LogsResponse> {
+  return fetchAdminJson<LogsResponse>(`/logs?limit=${limit}`, {
+    adminTokenOverride
   });
 }
 

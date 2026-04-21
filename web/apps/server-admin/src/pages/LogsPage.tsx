@@ -10,11 +10,14 @@ import {
   Text
 } from "@mantine/core";
 import { useCallback, useEffect, useRef, useState, type UIEvent } from "react";
+import { useAdminAccess } from "../lib/admin-access";
 
 const LOGS_POLL_INTERVAL_MS = 3_000;
 const LOGS_AUTO_FOLLOW_THRESHOLD_PX = 24;
 
 export function LogsPage() {
+  const { adminTokenOverride } = useAdminAccess();
+  const normalizedAdminTokenOverride = adminTokenOverride.trim();
   const [limit, setLimit] = useState<number | string>(200);
   const [logs, setLogs] = useState<LogsResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -37,7 +40,10 @@ export function LogsPage() {
     try {
       const resolvedLimit =
         typeof limit === "number" && Number.isFinite(limit) ? Math.max(1, Math.min(1000, limit)) : 200;
-      const payload = await getRecentLogs(resolvedLimit);
+      const payload = await getRecentLogs(
+        resolvedLimit,
+        normalizedAdminTokenOverride || undefined
+      );
       setLogs(payload);
       setError(null);
     } catch (refreshError) {
@@ -49,7 +55,7 @@ export function LogsPage() {
         setLoading(false);
       }
     }
-  }, [limit]);
+  }, [limit, normalizedAdminTokenOverride]);
 
   useEffect(() => {
     void refresh();

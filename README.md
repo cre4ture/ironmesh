@@ -128,9 +128,9 @@ Optional overrides:
 
 Treat only a small runtime subset as the first-release env var contract.
 
-- `ironmesh-server-node` supported runtime envs: `IRONMESH_NODE_ENROLLMENT_FILE`, `IRONMESH_NODE_BOOTSTRAP_FILE`, `IRONMESH_NODE_ID`, `IRONMESH_CLUSTER_ID`, `IRONMESH_DATA_DIR`, `IRONMESH_SERVER_BIND`, `IRONMESH_PUBLIC_URL`, `IRONMESH_PUBLIC_TLS_CERT`, `IRONMESH_PUBLIC_TLS_KEY`, `IRONMESH_INTERNAL_BIND`, `IRONMESH_INTERNAL_URL`, `IRONMESH_INTERNAL_TLS_CA_CERT`, `IRONMESH_INTERNAL_TLS_CERT`, `IRONMESH_INTERNAL_TLS_KEY`, `IRONMESH_RENDEZVOUS_URLS`, `IRONMESH_RENDEZVOUS_CA_CERT`, `IRONMESH_RENDEZVOUS_MTLS_REQUIRED`, `IRONMESH_RELAY_MODE`, `IRONMESH_ADMIN_TOKEN`, and `IRONMESH_REQUIRE_CLIENT_AUTH`.
+- `ironmesh-server-node` supported runtime envs: `IRONMESH_NODE_ENROLLMENT_FILE`, `IRONMESH_NODE_BOOTSTRAP_FILE`, `IRONMESH_NODE_ID`, `IRONMESH_CLUSTER_ID`, `IRONMESH_DATA_DIR`, `IRONMESH_SERVER_BIND`, `IRONMESH_PUBLIC_URL`, `IRONMESH_PUBLIC_TLS_CERT`, `IRONMESH_PUBLIC_TLS_KEY`, `IRONMESH_INTERNAL_BIND`, `IRONMESH_INTERNAL_URL`, `IRONMESH_INTERNAL_TLS_CA_CERT`, `IRONMESH_INTERNAL_TLS_CERT`, `IRONMESH_INTERNAL_TLS_KEY`, `IRONMESH_RENDEZVOUS_URLS`, `IRONMESH_RENDEZVOUS_CA_CERT`, `IRONMESH_RENDEZVOUS_MTLS_REQUIRED`, `IRONMESH_RELAY_MODE`, and `IRONMESH_ADMIN_TOKEN`.
 - `ironmesh-rendezvous-service` supported runtime envs: `IRONMESH_RENDEZVOUS_BIND`, `IRONMESH_RENDEZVOUS_PUBLIC_URL`, `IRONMESH_RELAY_PUBLIC_URLS`, `IRONMESH_RENDEZVOUS_CLIENT_CA_CERT`, `IRONMESH_RENDEZVOUS_TLS_CERT`, `IRONMESH_RENDEZVOUS_TLS_KEY`, `IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE`, and `IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE`. Standalone failover startup now expects `--bind-addr`, and new failover exports embed the rendezvous client CA so `IRONMESH_RENDEZVOUS_CLIENT_CA_CERT` is only needed for file-based TLS or legacy failover packages.
-- Local-dev or helper-only envs are intentionally separate contracts: `IRONMESH_LOCAL_CLUSTER_*`, `IRONMESH_SERVER_BIN`, `IRONMESH_CLI_BIN`, and `IRONMESH_RENDEZVOUS_DEPLOY_*`. `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP` is development-only and should not be treated as a production runtime contract.
+- Local-dev or helper-only envs are intentionally separate contracts: `IRONMESH_LOCAL_CLUSTER_*`, `IRONMESH_SERVER_BIN`, `IRONMESH_CLI_BIN`, and `IRONMESH_RENDEZVOUS_DEPLOY_*`. `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP`, `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP`, and `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS` are development-only and should not be treated as production runtime contracts.
 - Advanced tuning and debug envs such as `IRONMESH_METADATA_*`, `IRONMESH_AUTONOMOUS_*`, `IRONMESH_REPLICATION_*`, `IRONMESH_REPAIR_*`, `IRONMESH_DATA_SCRUB_*`, `IRONMESH_STORAGE_STATS_*`, `IRONMESH_MAP_*`, and `IRONMESH_TEST_*` are current operational knobs, not frozen compatibility promises for the first release.
 
 ## Local git hooks (recommended)
@@ -204,13 +204,15 @@ Direct server mode:
 ```bash
 mkdir -p /tmp/ironmesh-mount
 cargo run -p os-integration -- \
-  --server-base-url http://127.0.0.1:18080 \
+	--server-base-url https://127.0.0.1:18080 \
+	--server-ca-pem-file /path/to/ironmesh-public-ca.pem \
 	--client-identity-file /path/to/ironmesh-client-identity.json \
   --mountpoint /tmp/ironmesh-mount
 ```
 
 Notes:
 
+- Regular server-node deployments now expect public TLS. Plain HTTP is only available for explicit local testing with `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP=true`.
 - Live mounts now require client auth when the server protects `/store/*` APIs. In direct mode,
   pass `--client-identity-file`.
 - In bootstrap mode, `ironmesh-os-integration` auto-loads a sibling
@@ -346,8 +348,7 @@ The env vars referenced in the tuning subsections below are current operational 
 ### Client device authentication
 
 - Public client auth is enabled by default.
-- Opt out only for explicit open/local-dev scenarios:
-	- `IRONMESH_REQUIRE_CLIENT_AUTH=false`
+- Unauthenticated public client APIs are only intended for explicit local testing with `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS=true`; this is not part of the first-release runtime contract.
 - Admin can issue one-time pairing authorizations:
 	- `POST /auth/pairing-tokens/issue`
 	- header: `x-ironmesh-admin-token: <admin token>`

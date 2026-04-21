@@ -491,7 +491,7 @@ pub async fn start_authenticated_server_with_env_options(
 ) -> Result<ChildGuard> {
     let env = [
         ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
-        ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "false"),
     ];
     let mut merged_env = env.to_vec();
     merged_env.extend_from_slice(extra_env);
@@ -634,7 +634,7 @@ pub async fn start_open_server_with_public_https_env(
     replication_factor: usize,
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
-    let mut merged_env = vec![("IRONMESH_REQUIRE_CLIENT_AUTH", "false")];
+    let mut merged_env = vec![("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "true")];
     merged_env.extend_from_slice(extra_env);
     start_server_with_env_options_inner(
         bind,
@@ -658,7 +658,7 @@ pub async fn start_open_server_with_env_options(
     heartbeat_timeout_secs: Option<u64>,
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
-    let mut merged_env = vec![("IRONMESH_REQUIRE_CLIENT_AUTH", "false")];
+    let mut merged_env = vec![("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "true")];
     merged_env.extend_from_slice(extra_env);
     start_server_with_env_options_inner(
         bind,
@@ -748,6 +748,9 @@ async fn start_server_with_env_options_inner(
 
     command.env("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "false");
     command.env("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false");
+    if !public_https {
+        command.env("IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP", "true");
+    }
 
     for (key, value) in extra_env {
         command.env(key, value);
