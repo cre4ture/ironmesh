@@ -323,15 +323,60 @@ Primary repo areas:
 
 Checklist:
 
-- [ ] Confirm the first-release artifact list per platform and label anything not ready as out of scope or experimental.
-- [ ] Verify the Windows package identity, packaged executable set, and rule that mutable state must stay outside the package.
-- [ ] Review update-time behavior for anything that uses the package root, sync-root registration, shell extensions, or background startup.
-- [ ] Review Linux packaging and install assumptions, including mountpoint prerequisites and optional GNOME integration.
-- [ ] Explicitly decide whether mobile shells are part of the first release or only present as workspace code.
+- [x] Confirm the first-release artifact list per platform and label anything not ready as out of scope or experimental.
+- [x] Verify the Windows package identity, packaged executable set, and rule that mutable state must stay outside the package.
+- [x] Review update-time behavior for anything that uses the package root, sync-root registration, shell extensions, or background startup.
+- [x] Review Linux packaging and install assumptions, including mountpoint prerequisites and optional GNOME integration.
+- [x] Explicitly decide whether mobile shells are part of the first release or only present as workspace code.
+
+Working evidence log:
+
+- Reviewed paths:
+   - [docs/windows-msix-release-update-strategy.md](windows-msix-release-update-strategy.md)
+   - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md)
+   - [debian/README.source](../debian/README.source)
+   - [debian/control](../debian/control)
+   - [debian/rules](../debian/rules)
+   - [debian/ironmesh-server-node.service](../debian/ironmesh-server-node.service)
+   - [debian/ironmesh-rendezvous-service.service](../debian/ironmesh-rendezvous-service.service)
+   - [debian/ironmesh-server-node.env](../debian/ironmesh-server-node.env)
+   - [debian/ironmesh-rendezvous-service.env](../debian/ironmesh-rendezvous-service.env)
+   - [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs)
+   - [apps/background-launcher/src/main.rs](../apps/background-launcher/src/main.rs)
+   - [crates/adapter-linux-fuse/src/gnome.rs](../crates/adapter-linux-fuse/src/gnome.rs)
+   - [apps/folder-agent/src/gnome.rs](../apps/folder-agent/src/gnome.rs)
+   - [crates/desktop-status/src/gnome.rs](../crates/desktop-status/src/gnome.rs)
+- First-release artifact and update decisions:
+
+  | Platform | Artifact / install channel | Classification | Update path | Notes |
+  | --- | --- | --- | --- | --- |
+  | Windows | Store-submitted `.msixupload` / MSIX package | `public stable` | Microsoft Store | Package identity is fixed; installed package root is ephemeral; mutable runtime state must stay outside the package |
+  | Ubuntu Linux | Launchpad PPA packages `ironmesh-client`, `ironmesh-server-node`, and `ironmesh-rendezvous-service` | `public stable` | `apt upgrade`, Update Manager, or unattended-upgrades | No custom self-updater; Launchpad builds per-series binaries from the Debian source package |
+  | Android and iOS shells | Workspace code only | `out of scope for first release` | n/a | No first-release packaging or update channel is defined yet |
+- Confirmed packaging and update behavior:
+   - Windows first release stays on Microsoft Store delivery; direct sideload packaging remains a development-only path.
+   - Ubuntu first release should use a Launchpad PPA as the supported install and update channel. Users add the PPA once, install the package they need with `apt`, and receive updates through normal Ubuntu package management rather than an Ironmesh self-updater.
+   - `ironmesh-client` installs the public `ironmesh` CLI and the packaged helpers `ironmesh-config-app`, `ironmesh-folder-agent`, `ironmesh-os-integration`, and `ironmesh-background-launcher` under one package root, with `/usr/bin` symlinks for the documented commands.
+   - Linux background launching resolves sibling binaries from `current_exe().parent()`, so keeping the client helpers together under one package root is part of the update contract for `apt`-delivered upgrades.
+   - Linux mutable client state stays under XDG `Ironmesh` roots, while server and rendezvous packages keep operator-edited config in `/etc/ironmesh/*.env` and runtime state in systemd `StateDirectory` roots under `/var/lib`; package upgrades should not rewrite those paths.
+   - Debian packaging installs but does not auto-enable or auto-start `ironmesh-server-node.service` or `ironmesh-rendezvous-service.service`; operators must fill in the matching env file and run `systemctl enable --now ...` explicitly.
+   - The client package ships GNOME extension assets, but GNOME Shell integration remains optional and per-user. The package does not auto-enable the extension; `ironmesh-os-integration gnome install-extension` or `ironmesh-folder-agent gnome install-extension` still performs the user install step.
+   - Linux `Run Enabled Services` works from the config app, but login autostart is not wired yet, so Linux background behavior is intentionally below Windows startup-task parity for the first release.
+- Findings:
+   - `decision`: [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) should treat Launchpad PPA plus `apt` as the supported Ubuntu install and update contract for the first release; no custom in-app updater is needed on Ubuntu.
+   - `minor`: [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs) still reports that Linux login autostart is not configured, so release docs must describe Linux background relaunch as manual-on-demand rather than automatic at sign-in.
+   - `minor`: [crates/desktop-status/src/gnome.rs](../crates/desktop-status/src/gnome.rs) installs the GNOME extension into `~/.local/share/gnome-shell/extensions/...`, which keeps the extension per-user and update-safe but means the Debian package alone does not finish desktop integration.
+- Missing tests or docs:
+   - Validate the real `add-apt-repository` plus `apt install` and `apt upgrade` flow against a fresh supported Ubuntu series once the production PPA name exists.
+- Proposed pre-release actions:
+   - Keep Launchpad PPA as the Ubuntu consumer channel and document the final end-user install and update commands with the real PPA name.
+   - Keep Linux service enablement and GNOME extension enablement as explicit opt-in steps unless a deliberate packaging hook is added later.
+- Deferred post-release items:
+   - Add Linux login autostart only after the XDG autostart behavior is intentionally designed and tested.
 
 Exit criteria:
 
-- [ ] Artifact and update behavior are documented without depending on ephemeral install paths or hidden packaging assumptions.
+- [x] Artifact and update behavior are documented without depending on ephemeral install paths or hidden packaging assumptions.
 
 ## Pass 7. Review Security, Identity, And Operational Safety
 

@@ -7,6 +7,62 @@ single source package that builds three installable packages:
 - `ironmesh-client`
 - `ironmesh-rendezvous-service`
 
+## First-release install and update strategy
+
+For Ubuntu, the first-release distribution path should be a Launchpad PPA backed
+by the source package in this repository.
+
+That means:
+
+- end users install Ironmesh through `apt`, not from ad-hoc tarballs or a
+  custom binary updater,
+- updates arrive through the normal Ubuntu package-management path (`apt
+  upgrade`, Software Updater, or unattended upgrades),
+- the repository only needs to publish per-series source uploads and let
+  Launchpad build the binary packages.
+
+Example user flow once the production PPA name exists:
+
+```bash
+sudo add-apt-repository ppa:<launchpad-user>/<ppa-name>
+sudo apt update
+sudo apt install ironmesh-client
+```
+
+For server deployments, install `ironmesh-server-node` and/or
+`ironmesh-rendezvous-service` instead of, or in addition to,
+`ironmesh-client`.
+
+Package-specific notes:
+
+- `ironmesh-client` installs the public `ironmesh` CLI and the packaged desktop
+  helpers `ironmesh-config-app`, `ironmesh-folder-agent`,
+  `ironmesh-os-integration`, and `ironmesh-background-launcher`.
+- Package upgrades replace binaries inside the package payload, while XDG user
+  state, `/etc/ironmesh/*.env`, and systemd-managed service state stay outside
+  the package and should survive upgrades.
+- `ironmesh-server-node` and `ironmesh-rendezvous-service` install systemd
+  units plus sample `/etc/ironmesh/*.env` files, but the units remain disabled
+  until an operator fills in configuration and runs `systemctl enable --now`.
+- GNOME Shell integration stays optional. The client package ships the
+  extension assets, but a user still installs or enables them through the CLI
+  helper.
+
+## Updating installed systems
+
+Once the PPA is configured, updates should come through the normal Ubuntu
+package-management flow:
+
+```bash
+sudo apt update
+sudo apt upgrade
+```
+
+If unattended upgrades or the graphical Software Updater are enabled, those
+mechanisms can apply new Ironmesh package versions too. The first release
+should not ship a separate in-app updater or another binary replacement path on
+Ubuntu.
+
 ## Why there is a preparation step
 
 Launchpad PPA builders only receive the uploaded Debian source package. They do
