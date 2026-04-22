@@ -806,6 +806,33 @@ fn cluster_config_requires_explicit_insecure_public_http_override() {
         .contains("IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP"));
 }
 
+async fn admin_authorization_requires_configured_auth_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let headers = HeaderMap::new();
+
+    let result = super::authorize_admin_request(
+        &state,
+        &headers,
+        "auth/client-credentials/list",
+        true,
+        true,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        result.err(),
+        Some(axum::http::StatusCode::PRECONDITION_FAILED)
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    admin_authorization_requires_configured_auth_impl,
+    admin_authorization_requires_configured_auth,
+    admin_authorization_requires_configured_auth_turso
+);
+
 async fn admin_authorization_requires_token_when_configured_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.admin_control.admin_token = Some("admin-secret".to_string());
@@ -2380,6 +2407,25 @@ async fn admin_password_login_creates_session_cookie() {
 }
 
 #[tokio::test]
+async fn admin_session_status_stays_locked_when_admin_auth_is_unconfigured() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    let response = super::get_admin_session_status(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let status: super::AdminSessionStatusResponse = serde_json::from_slice(&body).unwrap();
+    assert!(status.login_required);
+    assert!(!status.authenticated);
+    assert_eq!(status.session_expires_at_unix, None);
+    assert!(!status.token_override_enabled);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn admin_session_cookie_authorizes_admin_request() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.admin_control.admin_password_hash = Some(super::hash_token("super-secret-password"));
@@ -2755,6 +2801,7 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
 #[tokio::test]
 async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.admin_control.admin_token = Some("admin-secret".to_string());
     let (cluster_ca_pem, internal_ca_key_pem) = generate_test_internal_ca();
     let (public_ca_pem, public_ca_key_pem) = generate_test_internal_ca();
     state.cluster_ca_pem = Some(cluster_ca_pem);

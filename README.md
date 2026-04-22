@@ -349,6 +349,7 @@ The env vars referenced in the tuning subsections below are current operational 
 
 - Public client auth is enabled by default.
 - Unauthenticated public client APIs are only intended for explicit local testing with `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS=true`; this is not part of the first-release runtime contract.
+- Public admin and maintenance routes are fail-closed. Use the local admin password flow or set `IRONMESH_ADMIN_TOKEN` for automation-oriented environments; nodes without either configured reject admin requests instead of leaving the surface open.
 - Admin can issue one-time pairing authorizations:
 	- `POST /auth/pairing-tokens/issue`
 	- header: `x-ironmesh-admin-token: <admin token>`

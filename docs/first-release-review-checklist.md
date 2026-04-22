@@ -421,14 +421,13 @@ Working evidence log:
    - Admin actions are audit-persisted in both metadata backends through `admin_audit_events`, and destructive operations still require explicit `approve=true` before they can run as non-dry-run requests.
    - Support-facing status surfaces already exist for first release triage: public `/health`, authenticated node-certificate status, scrub and repair activity or history endpoints, and the recent log buffer, which now sits behind client-or-admin authentication on the public router.
 - Findings:
-   - `blocker`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) only enforces admin authentication when an admin token or password-backed session hash is configured. If neither exists, `authorize_admin_request()` falls through to the dry-run and approval checks and leaves the public admin or maintenance surface reachable without authentication.
+   - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now fails closed on public admin and maintenance routes when no admin token or password-backed admin auth is configured. `authorize_admin_request()` returns `412 Precondition Failed` instead of falling through, and the admin session status endpoint no longer reports the surface as implicitly open.
    - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now refuses public runtime startup without `IRONMESH_PUBLIC_TLS_CERT` and `IRONMESH_PUBLIC_TLS_KEY` unless `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP=true` is set explicitly for local development or testing.
    - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now treats unauthenticated client access as an explicit development-only override via `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS=true`, and [README.md](../README.md) no longer advertises the old `IRONMESH_REQUIRE_CLIENT_AUTH` knob as part of the supported runtime contract.
    - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) no longer leaves `/logs` anonymous on the public router; the route now requires either valid client auth or admin auth, and [web/apps/server-admin/src/pages/LogsPage.tsx](../web/apps/server-admin/src/pages/LogsPage.tsx) forwards the admin token override when present.
 - Missing tests or docs:
-   - Add fail-closed tests for admin routes when no admin auth is configured.
+   - None beyond keeping the development-only override notes explicit in the README runtime contract.
 - Proposed pre-release actions:
-   - Fail closed on public admin and maintenance routes unless password-backed admin auth or an explicit emergency token is configured.
    - Keep `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP` and `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS` documented as development-only overrides rather than release-facing runtime contract knobs.
 
 Exit criteria:

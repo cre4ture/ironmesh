@@ -945,6 +945,10 @@ async fn request_has_admin_auth(state: &ServerState, headers: &HeaderMap) -> boo
         || current_admin_session_expiry(state, headers).await.is_some()
 }
 
+fn admin_auth_configured(state: &ServerState) -> bool {
+    state.admin_control.admin_password_hash.is_some() || state.admin_control.admin_token.is_some()
+}
+
 fn hash_token(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
 }
@@ -15611,18 +15615,12 @@ async fn get_admin_session_status(
         })
         .unwrap_or(false);
     let session_expires_at_unix = current_admin_session_expiry(&state, &headers).await;
-    let auth_configured = state.admin_control.admin_password_hash.is_some()
-        || state.admin_control.admin_token.is_some();
-    let authenticated = if auth_configured {
-        token_valid || session_expires_at_unix.is_some()
-    } else {
-        true
-    };
+    let authenticated = token_valid || session_expires_at_unix.is_some();
 
     (
         StatusCode::OK,
         Json(AdminSessionStatusResponse {
-            login_required: auth_configured,
+            login_required: true,
             authenticated,
             session_expires_at_unix,
             token_override_enabled: state.admin_control.admin_token.is_some(),
@@ -15764,8 +15762,7 @@ async fn logout_admin_session(
         StatusCode::OK,
         [(header::SET_COOKIE, cookie)],
         Json(AdminSessionStatusResponse {
-            login_required: state.admin_control.admin_password_hash.is_some()
-                || state.admin_control.admin_token.is_some(),
+            login_required: true,
             authenticated: false,
             session_expires_at_unix: None,
             token_override_enabled: state.admin_control.admin_token.is_some(),
@@ -15783,6 +15780,20 @@ async fn authorize_admin_request(
     details: serde_json::Value,
 ) -> std::result::Result<AdminRequestMetadata, StatusCode> {
     let mut request = admin_request_metadata(headers);
+    if !admin_auth_configured(state) {
+        append_admin_audit(
+            state,
+            action,
+            &request,
+            false,
+            dry_run,
+            approve,
+            "denied_unconfigured",
+            details.clone(),
+        )
+        .await;
+        return Err(StatusCode::PRECONDITION_FAILED);
+    }
     let token_valid = state
         .admin_control
         .admin_token
@@ -15798,9 +15809,7 @@ async fn authorize_admin_request(
         .unwrap_or(false);
     let session_expires_at_unix = current_admin_session_expiry(state, headers).await;
 
-    let requires_admin_auth = state.admin_control.admin_token.is_some()
-        || state.admin_control.admin_password_hash.is_some();
-    if requires_admin_auth && !token_valid && session_expires_at_unix.is_none() {
+    if !token_valid && session_expires_at_unix.is_none() {
         append_admin_audit(
             state,
             action,
