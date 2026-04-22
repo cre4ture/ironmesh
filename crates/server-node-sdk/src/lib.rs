@@ -88,8 +88,10 @@ use transport_sdk::{
 use uuid::Uuid;
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
-const BUILD_REVISION: &str =
-    git_version::git_version!(fallback = "unknown", args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]);
+const BUILD_REVISION: &str = git_version::git_version!(
+    fallback = "unknown",
+    args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
+);
 const STORAGE_STATS_REFRESH_INTERVAL_SECS: u64 = 300;
 const STORAGE_STATS_CHANGE_DEBOUNCE_SECS: u64 = 15;
 const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
@@ -4358,12 +4360,13 @@ async fn run_inner(config: ServerNodeConfig, log_buffer: Option<Arc<LogBuffer>>)
         .merge(public_cluster_info_api)
         .merge(public_client_api);
 
-    let public_logs_api = Router::new()
-        .route("/logs", get(ui::list_logs))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_client_or_admin_auth,
-        ));
+    let public_logs_api =
+        Router::new()
+            .route("/logs", get(ui::list_logs))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_client_or_admin_auth,
+            ));
 
     let public_app = Router::new()
         .route("/", get(ui::index))

@@ -753,19 +753,18 @@ mod tests {
             .clone()
             .expect("legacy profile dir should differ from stable digest path");
         fs::create_dir_all(&legacy_profile_dir).unwrap();
-        let legacy_scope_fingerprint =
-            crate::folder_agent_state::legacy_folder_agent_profile_dir(
-                &identity_root,
-                &scope,
-                connection_target,
-                &state_root,
-                &profile_paths.scope_fingerprint,
-            )
-            .and_then(|path| {
-                path.file_name()
-                    .map(|value| value.to_string_lossy().to_string())
-            })
-            .unwrap();
+        let legacy_scope_fingerprint = crate::folder_agent_state::legacy_folder_agent_profile_dir(
+            &identity_root,
+            &scope,
+            connection_target,
+            &state_root,
+            &profile_paths.scope_fingerprint,
+        )
+        .and_then(|path| {
+            path.file_name()
+                .map(|value| value.to_string_lossy().to_string())
+        })
+        .unwrap();
         let legacy_log_path = legacy_profile_dir.join(FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME);
         {
             let connection = Connection::open(&legacy_log_path).unwrap();
@@ -796,7 +795,10 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO modification_meta(key, value) VALUES(?1, ?2)",
-                    params!["schema_version", MODIFICATION_LOG_SCHEMA_VERSION_CURRENT.to_string()],
+                    params![
+                        "schema_version",
+                        MODIFICATION_LOG_SCHEMA_VERSION_CURRENT.to_string()
+                    ],
                 )
                 .unwrap();
             connection

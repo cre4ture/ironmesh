@@ -141,9 +141,13 @@ pub(crate) fn legacy_folder_agent_profile_dir(
     state_root_dir: &Path,
     current_scope_fingerprint: &str,
 ) -> Option<PathBuf> {
-    let legacy_scope_fingerprint = legacy_scope_fingerprint(identity_root, scope, connection_target);
-    (legacy_scope_fingerprint != current_scope_fingerprint)
-        .then(|| state_root_dir.join("profiles").join(legacy_scope_fingerprint))
+    let legacy_scope_fingerprint =
+        legacy_scope_fingerprint(identity_root, scope, connection_target);
+    (legacy_scope_fingerprint != current_scope_fingerprint).then(|| {
+        state_root_dir
+            .join("profiles")
+            .join(legacy_scope_fingerprint)
+    })
 }
 
 pub(crate) fn migrate_legacy_folder_agent_profile_dir(
@@ -206,17 +210,19 @@ fn move_or_copy_profile_dir(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn copy_profile_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)
-        .with_context(|| format!("failed to create {}", target.display()))?;
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
 
-    for entry in fs::read_dir(source)
-        .with_context(|| format!("failed to read {}", source.display()))?
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
     {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry.file_type().with_context(|| {
-            format!("failed to inspect legacy folder-agent profile entry {}", source_path.display())
+            format!(
+                "failed to inspect legacy folder-agent profile entry {}",
+                source_path.display()
+            )
         })?;
 
         if file_type.is_dir() {
@@ -244,8 +250,12 @@ fn rewrite_scope_fingerprint_metadata(
         return Ok(());
     }
 
-    let connection = Connection::open(sqlite_path)
-        .with_context(|| format!("failed to open migrated sqlite store {}", sqlite_path.display()))?;
+    let connection = Connection::open(sqlite_path).with_context(|| {
+        format!(
+            "failed to open migrated sqlite store {}",
+            sqlite_path.display()
+        )
+    })?;
     let table_exists = connection
         .query_row(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1358,7 +1368,10 @@ mod tests {
             connection
                 .execute(
                     "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
-                    params!["schema_version", BASELINE_SCHEMA_VERSION_CURRENT.to_string()],
+                    params![
+                        "schema_version",
+                        BASELINE_SCHEMA_VERSION_CURRENT.to_string()
+                    ],
                 )
                 .unwrap();
             connection

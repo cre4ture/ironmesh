@@ -573,8 +573,7 @@ pub fn save_launch_report(path: &Path, report: &LaunchReport) -> Result<()> {
     ensure_parent_dir(path)?;
     let mut report = report.clone();
     report.version = LAUNCH_REPORT_VERSION;
-    let payload =
-        serde_json::to_vec_pretty(&report).context("failed serializing launch report")?;
+    let payload = serde_json::to_vec_pretty(&report).context("failed serializing launch report")?;
     fs::write(path, payload)
         .with_context(|| format!("failed writing launch report {}", path.display()))
 }
@@ -916,7 +915,8 @@ mod tests {
         )
         .expect("legacy store should write");
 
-        let loaded = ManagedInstanceStore::load_or_default(&path).expect("legacy store should load");
+        let loaded =
+            ManagedInstanceStore::load_or_default(&path).expect("legacy store should load");
 
         assert_eq!(loaded.version, MANAGED_INSTANCE_STORE_VERSION);
 
@@ -939,7 +939,10 @@ mod tests {
 
         let err = ManagedInstanceStore::load_or_default(&path)
             .expect_err("future store version should fail");
-        assert!(err.to_string().contains("unsupported managed instance store version 99"));
+        assert!(
+            err.to_string()
+                .contains("unsupported managed instance store version 99")
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = path.parent().map(std::fs::remove_dir_all);
@@ -1022,9 +1025,12 @@ mod tests {
         )
         .expect("future launch report should write");
 
-        let err = load_last_launch_report(&path)
-            .expect_err("future launch report version should fail");
-        assert!(err.to_string().contains("unsupported launch report version 99"));
+        let err =
+            load_last_launch_report(&path).expect_err("future launch report version should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported launch report version 99")
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = path.parent().map(std::fs::remove_dir_all);

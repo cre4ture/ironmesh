@@ -1071,6 +1071,36 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn load_current_state_from_db(db: &Connection) -> Result<CurrentState> {
+    let mut stmt = db.prepare(
+        "SELECT key, manifest_hash, object_id
+         FROM current_objects",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut state = CurrentState::default();
+    for row in rows {
+        let (key, manifest_hash, object_id) = row?;
+        state.objects.insert(key.clone(), manifest_hash);
+        state.object_ids.insert(key, object_id);
+    }
+    Ok(state)
+}
+
+fn u64_to_i64(value: u64) -> Result<i64> {
+    i64::try_from(value).context("integer overflow converting u64 to i64")
+}
+
+fn usize_to_i64(value: usize) -> Result<i64> {
+    i64::try_from(value).context("integer overflow converting usize to i64")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,34 +1161,4 @@ mod tests {
                 .contains("unsupported sqlite metadata schema version: 99")
         );
     }
-}
-
-fn load_current_state_from_db(db: &Connection) -> Result<CurrentState> {
-    let mut stmt = db.prepare(
-        "SELECT key, manifest_hash, object_id
-         FROM current_objects",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-
-    let mut state = CurrentState::default();
-    for row in rows {
-        let (key, manifest_hash, object_id) = row?;
-        state.objects.insert(key.clone(), manifest_hash);
-        state.object_ids.insert(key, object_id);
-    }
-    Ok(state)
-}
-
-fn u64_to_i64(value: u64) -> Result<i64> {
-    i64::try_from(value).context("integer overflow converting u64 to i64")
-}
-
-fn usize_to_i64(value: usize) -> Result<i64> {
-    i64::try_from(value).context("integer overflow converting usize to i64")
 }

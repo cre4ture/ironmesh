@@ -803,7 +803,10 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
     let endpoint = Url::parse(server_base_url)
         .with_context(|| format!("invalid planned bootstrap URL {server_base_url}"))?;
     let health_url = endpoint
-        .join(&format!("{}/health", CLIENT_API_V1_PREFIX.trim_start_matches('/')))
+        .join(&format!(
+            "{}/health",
+            CLIENT_API_V1_PREFIX.trim_start_matches('/')
+        ))
         .with_context(|| format!("failed to build health URL from {endpoint}"))?;
 
     let probe_client = if endpoint.scheme() == "https" {

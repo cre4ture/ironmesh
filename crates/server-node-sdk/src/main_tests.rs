@@ -791,19 +791,19 @@ fn token_matches_requires_exact_match() {
 
 #[test]
 fn cluster_config_requires_explicit_insecure_public_http_override() {
-    let data_dir = std::env::temp_dir().join(format!(
-        "ironmesh-public-http-test-{}",
-        Uuid::now_v7()
-    ));
+    let data_dir =
+        std::env::temp_dir().join(format!("ironmesh-public-http-test-{}", Uuid::now_v7()));
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let mut config = test_cluster_config_without_internal_tls(data_dir, free_bind_addr());
     config.allow_insecure_public_http = false;
 
     let error = config.validate_public_listener_security().unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP"));
+    assert!(
+        error
+            .to_string()
+            .contains("IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP")
+    );
 }
 
 async fn admin_authorization_requires_configured_auth_impl(backend: MainTestBackend) {

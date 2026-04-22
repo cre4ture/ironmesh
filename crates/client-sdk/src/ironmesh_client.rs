@@ -4545,7 +4545,10 @@ mod tests {
             .expect("relay request should be captured");
         assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
         assert_eq!(captured.method, "PUT");
-        assert_eq!(captured.path_and_query, "/api/v1/store/uploads/upload-123/chunk/2");
+        assert_eq!(
+            captured.path_and_query,
+            "/api/v1/store/uploads/upload-123/chunk/2"
+        );
         assert_eq!(captured.body, b"chunk-body".to_vec());
 
         server.abort();
@@ -4919,7 +4922,10 @@ mod tests {
             .expect("direct request should be captured");
         assert_eq!(captured.kind, Some(TransportStreamKind::ObjectWrite));
         assert_eq!(captured.method, "PUT");
-        assert_eq!(captured.path_and_query, "/api/v1/store/uploads/upload-abc/chunk/3");
+        assert_eq!(
+            captured.path_and_query,
+            "/api/v1/store/uploads/upload-abc/chunk/3"
+        );
         assert_eq!(captured.body, b"direct-chunk".to_vec());
 
         server.abort();
