@@ -446,15 +446,45 @@ Primary repo areas:
 
 Checklist:
 
-- [ ] Map each stable contract from Passes 1 to 7 to automated tests or explicit manual checks.
-- [ ] Confirm the minimum automated gates for release, including formatting, check, clippy, unit tests, coverage, and system tests.
-- [ ] Decide whether `cargo-deny` and audit checks are hard release gates or advisory-only checks.
-- [ ] Define the minimum manual flows for release validation, such as local cluster start, direct client enroll, rendezvous relay enroll, packaged Windows sync-root restart flow, Linux FUSE mount, and folder-agent restart or resume.
-- [ ] Record exact commands and pass or fail criteria for each manual flow.
+- [x] Map each stable contract from Passes 1 to 7 to automated tests or explicit manual checks.
+- [x] Confirm the minimum automated gates for release, including formatting, check, clippy, unit tests, coverage, and system tests.
+- [x] Decide whether `cargo-deny` and audit checks are hard release gates or advisory-only checks.
+- [x] Define the minimum manual flows for release validation, such as local cluster start, direct client enroll, rendezvous relay enroll, packaged Windows sync-root restart flow, Linux FUSE mount, and folder-agent restart or resume.
+- [x] Record exact commands and pass or fail criteria for each manual flow.
 
 Exit criteria:
 
 - [ ] Someone other than the original author can run the release gates and decide pass or fail.
+
+Working evidence log:
+
+- Automated gate evidence:
+   - Branch-protected CI lanes are defined explicitly in `.github/workflows/check.yml`, `.github/workflows/coverage.yml`, and `.github/workflows/system-tests.yml` under the exact status names `workspace-check`, `rustfmt`, `clippy`, `unit-tests`, `coverage`, and `system-tests`.
+   - `justfile` now mirrors the stable CI split correctly: stable unit tests use `cargo test --workspace` without the old redundant `--exclude system-tests` warning, `ci-stable` includes `fmt-check`, and `ci-required` provides one local entry point for the required gate set.
+   - `docs/ci-runbook.md` now records the exact repo-root commands for the required checks, the coverage threshold, and the nightly system-test lane.
+- Security-gate decision:
+   - `cargo-audit` and `cargo-deny` remain advisory-only rather than branch-protected hard gates.
+   - This matches `.github/workflows/security.yml`, which runs both checks continuously but does not define them as the required six checks for `main`.
+   - `deny.toml` still carries one explicit advisory ignore for the optional Turso path, so release sign-off still requires human triage.
+- Contract-to-check mapping:
+   - `Pass 1` binary and command-name contracts map to the per-binary `--version` integration tests in `apps/cli-client/tests/version.rs`, `apps/server-node/tests/version.rs`, `apps/rendezvous-service/tests/version.rs`, `apps/os-integration/tests/version.rs`, and `apps/folder-agent/tests/version.rs`, plus the branch-protected `workspace-check` and `unit-tests` lanes that keep those binaries building.
+   - `Pass 2` client-facing API versioning and JSON-shape contracts map to `crates/web-ui-backend/src/lib.rs::error_response_preserves_public_json_contract`, `crates/server-node-sdk/src/web_maps.rs::error_response_preserves_public_json_contract`, and `crates/server-node-sdk/src/main_tests.rs::client_device_enroll_request_accepts_legacy_label_alias`, with relay/bootstrap issuance regressions covered by `issue_bootstrap_claim_returns_json_error_when_rendezvous_is_unavailable`.
+   - `Pass 3` inter-node protocol and identity expectations map to `crates/server-node-sdk/src/main_tests.rs::register_node_uses_structured_reachability_payload` plus the nightly relay or peer system tests in `tests/system-tests/src/cluster_test.rs`, especially `bootstrap_client_prefers_direct_and_uses_relay_after_rendezvous_restart_and_forced_direct_failure` and `relay_required_nodes_reconnect_after_rendezvous_restart_and_replicate`.
+   - `Pass 4` bootstrap, enrollment, and failover handoff contracts map to `crates/server-node-sdk/src/setup.rs::managed_setup_state_roundtrip`, `crates/server-node-sdk/src/setup.rs::managed_rendezvous_failover_roundtrip_restores_material_and_state`, the bootstrap-claim issuance tests in `crates/server-node-sdk/src/main_tests.rs`, and the embedded rendezvous manual guide in `docs/manual-rendezvous-relay-test.md`.
+   - `Pass 5` persisted-file and path contracts map to the desktop config migration tests in `crates/desktop-client-config/src/lib.rs` and `crates/windows-client-config/src/lib.rs`, metadata schema-marker coverage in `crates/server-node-sdk/src/storage/sqlite_impl.rs::init_metadata_db_persists_schema_version`, Windows LocalAppData restart coverage in `tests/system-tests/src/cfapi_monitor_test.rs::test_cfapi_adapter_persists_local_appdata_state_and_restarts_without_bootstrap_argument`, and folder-agent restart coverage in `tests/system-tests/src/folder_agent_test.rs`.
+   - `Pass 6` packaging and update contracts map to the build workflows `android-build`, `fuse-mount-build`, and `windows-cfapi-check`, the Windows packaging strategy in `docs/windows-msix-release-update-strategy.md`, the Linux FUSE and packaged Windows manual flows in `docs/ci-runbook.md`, and the dedicated packaged Windows restart guide in `docs/manual-windows-sync-root-restart-test.md`.
+   - `Pass 7` security and operational-safety contracts map to `crates/server-node-sdk/src/main_tests.rs::cluster_config_requires_explicit_insecure_public_http_override`, `public_logs_route_requires_client_or_admin_auth`, `admin_authorization_requires_configured_auth`, `admin_authorization_requires_token_when_configured`, and the full `cargo test -p server-node-sdk` regression suite.
+- Manual-flow coverage gathered:
+   - Local 4-node cluster smoke is reproducible from `scripts/local-cluster.sh start|status|stop` and the README local-cluster section.
+   - Direct client enroll and CRUD smoke can be driven entirely from `scripts/local-cluster.sh bootstrap ...` plus `cargo run -p cli-client -- ... enroll|put|get`.
+   - Embedded rendezvous relay enroll already has an exact command-oriented guide in `docs/manual-rendezvous-relay-test.md`.
+   - Linux FUSE live mount commands exist in the README and are now copied into the CI runbook as explicit release validation steps.
+   - Folder-agent restart or resume can be exercised with the existing `ironmesh-folder-agent` CLI, and automated restart coverage already exists in `tests/system-tests/src/folder_agent_test.rs` through `folder_agent_detects_remote_add_and_modify_done_while_stopped_after_restart` and `folder_agent_detects_local_add_and_modify_done_while_stopped_after_restart`.
+   - Packaged Windows sync-root restart now has a dedicated operator-facing guide in `docs/manual-windows-sync-root-restart-test.md`, derived from the packaged config-app flow and the existing LocalAppData restart coverage in `tests/system-tests/src/cfapi_monitor_test.rs`.
+- Findings:
+   - `open`: Pass 8 still needs one human-executed packaged Windows sync-root restart run recorded against the new manual guide before the exit criteria can be treated as satisfied.
+   - `resolved`: local stable test reproduction no longer drifts from CI or emits the old redundant workspace warning. `just test-stable`, `just ci-stable`, and `.github/workflows/check.yml` now use the same clean `cargo test --workspace` command.
+   - `resolved`: the runbook now records exact required-check commands, explicit advisory status for `cargo-audit` and `cargo-deny`, and concrete pass or fail criteria for the Linux and CLI-driven manual flows.
 
 ## Pass 9. Review Docs, Examples, Scripts, And Shipped Sample Assets
 
