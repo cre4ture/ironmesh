@@ -499,15 +499,39 @@ Primary repo areas:
 
 Checklist:
 
-- [ ] Ensure docs consistently use the final executable names, command names, and supported path conventions.
-- [ ] Ensure examples and shipped sample assets use supported bootstrap and client-identity naming conventions.
-- [ ] Ensure scripts do not bake in obsolete package names or unstable implementation details.
-- [ ] Ensure experimental or platform-limited features are labeled accurately.
-- [ ] Ensure README and release notes explain what is stable now and what is still expected to evolve.
+- [x] Ensure docs consistently use the final executable names, command names, and supported path conventions.
+- [x] Ensure examples and shipped sample assets use supported bootstrap and client-identity naming conventions.
+- [x] Ensure scripts do not bake in obsolete package names or unstable implementation details.
+- [x] Ensure experimental or platform-limited features are labeled accurately.
+- [x] Ensure README and release notes explain what is stable now and what is still expected to evolve.
 
 Exit criteria:
 
 - [ ] A new user can follow the docs without accidentally depending on obsolete names or unsupported paths.
+
+Working evidence log:
+
+- Reviewed paths:
+   - [README.md](../README.md)
+   - [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md)
+   - [docs/manual-windows-sync-root-restart-test.md](manual-windows-sync-root-restart-test.md)
+   - [start_node.sh](../start_node.sh)
+   - [ironmesh-client-bootstrap.json](../ironmesh-client-bootstrap.json)
+   - [ironmesh-client-bootstrap.client-identity.json](../ironmesh-client-bootstrap.client-identity.json)
+- Confirmed stable contracts:
+   - The shipped sample asset filenames already use the canonical release-facing pair `ironmesh-client-bootstrap.json` and `ironmesh-client-bootstrap.client-identity.json`.
+   - `start_node.sh` and `scripts/local-cluster.sh` are source-checkout helpers that intentionally use Cargo package names like `server-node`; they are not installed-command documentation surfaces.
+   - README now carries an explicit first-release scope snapshot so the stable public commands, canonical bootstrap filenames, and intentionally still-evolving surfaces are spelled out in one place.
+- Findings:
+   - `resolved`: [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md) was still describing `apps/os-integration` as the user-facing binary and still showed direct FUSE examples against plain HTTP. Those examples now point at the public `ironmesh-os-integration` command contract, while the source-checkout `cargo run -p os-integration` wording stays clearly labeled as a Cargo package detail, and the direct-mode examples now match the hardened HTTPS plus CA expectations from the runtime contract.
+   - `resolved`: [ironmesh-client-bootstrap.client-identity.json](../ironmesh-client-bootstrap.client-identity.json) was still using the legacy top-level `label` field even though current client SDK serialization emits `device_label` and only accepts bare `label` for compatibility. The shipped sample asset now uses the canonical field.
+   - `resolved`: [docs/manual-windows-sync-root-restart-test.md](manual-windows-sync-root-restart-test.md) no longer exposes the internal `os-integration` label as if it were the public Windows runtime name; the guide now talks about the OS integration instance generically while keeping the packaged binary name `ironmesh-os-integration` explicit where it matters.
+   - `resolved`: README now distinguishes what is stable for the first release from what is still expected to evolve, especially around packaged command names, bootstrap naming, mobile shells, Apple filesystem integration, and non-contract tuning envs.
+- Missing tests or docs:
+   - The remaining gap is not naming or path drift inside the repo; it is independent human validation of the doc flows, especially the packaged Windows restart guide.
+- Proposed pre-release actions:
+   - Run the new packaged Windows restart guide once on a real packaged build and record the result.
+   - Do one fresh-reader dry run of the README plus Linux FUSE instructions to validate the exit criterion.
 
 ## Pass 10. Final Sign-Off And Backlog Split
 

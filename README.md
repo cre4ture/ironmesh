@@ -44,6 +44,14 @@ Ironmesh is also a test of what is now possible for an individual builder. AI co
 - `apps/android-app` — Android-facing Rust app layer.
 - `apps/ios-app` — iOS-facing Rust app layer.
 
+## First-release scope snapshot
+
+- Stable release-facing command names are `ironmesh`, `ironmesh-server-node`, `ironmesh-rendezvous-service`, `ironmesh-os-integration`, and `ironmesh-folder-agent`.
+- Canonical release-facing bootstrap filenames use the `ironmesh-client-bootstrap*.json` family with sibling `*.client-identity.json` files, while Windows persisted sync-root state stays on `connection-bootstrap.json` and `client-identity.json` under `%LOCALAPPDATA%\Ironmesh\sync-roots\...`.
+- Source-checkout examples in this repo may still use `cargo run -p ...`; those are Cargo package names for local development, not the installed command names users should depend on.
+- Android and iOS remain app shells rather than first-release consumer products, Apple filesystem integration is still expected to evolve, and GNOME desktop integration remains optional rather than a mandatory packaging contract.
+- Advanced tuning or debug envs outside the runtime env contract below are operational knobs, not frozen first-release compatibility promises.
+
 ## Quick start
 
 ```bash

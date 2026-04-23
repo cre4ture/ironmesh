@@ -97,12 +97,14 @@ cargo run -p os-integration -- \
   --mountpoint /tmp/ironmesh-mount
 
 cargo run -p os-integration -- \
-  --server-base-url http://127.0.0.1:18080 \
+  --server-base-url https://127.0.0.1:18080 \
+  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
   --client-identity-file /path/to/ironmesh-client-identity.json \
   --mountpoint /tmp/ironmesh-mount-live
 
 cargo run -p os-integration -- \
-  --server-base-url http://127.0.0.1:18080 \
+  --server-base-url https://127.0.0.1:18080 \
+  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
   --client-identity-file /path/to/ironmesh-client-identity.json \
   --offline-object-cache off \
   --mountpoint /tmp/ironmesh-mount-live

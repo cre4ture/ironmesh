@@ -153,7 +153,7 @@ use cluster::{
     ReplicationPlan, ReplicationPolicy,
 };
 use setup::{
-    ManagedRendezvousFailoverPackage, ManagedSignerBackup,
+    ManagedRendezvousFailoverExportParams, ManagedRendezvousFailoverPackage, ManagedSignerBackup,
     export_managed_rendezvous_failover_package, export_managed_signer_backup,
     import_managed_rendezvous_failover_package, import_managed_signer_backup,
     issue_managed_rendezvous_tls_identity_from_ca, managed_rendezvous_cert_path,
@@ -12528,36 +12528,37 @@ async fn export_managed_rendezvous_failover_handler(
         }
     };
 
-    let package = match export_managed_rendezvous_failover_package(
-        state.cluster_id,
-        state.node_id,
-        request.target_node_id,
-        &public_url,
-        ca_cert_pem,
-        &cert_pem,
-        &key_pem,
-        &request.passphrase,
-    ) {
-        Ok(package) => package,
-        Err(err) => {
-            append_admin_audit(
-                &state,
-                action,
-                &authz,
-                true,
-                true,
-                true,
-                "error",
-                json!({ "error": err.to_string() }),
-            )
-            .await;
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response();
-        }
-    };
+    let package =
+        match export_managed_rendezvous_failover_package(ManagedRendezvousFailoverExportParams {
+            cluster_id: state.cluster_id,
+            source_node_id: state.node_id,
+            target_node_id: request.target_node_id,
+            public_url: &public_url,
+            client_ca_cert_pem: ca_cert_pem,
+            cert_pem: &cert_pem,
+            key_pem: &key_pem,
+            passphrase: &request.passphrase,
+        }) {
+            Ok(package) => package,
+            Err(err) => {
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": err.to_string() }),
+                )
+                .await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        };
 
     append_admin_audit(
         &state,
@@ -12912,36 +12913,37 @@ async fn export_managed_control_plane_promotion_handler(
         }
     };
 
-    let rendezvous_failover = match export_managed_rendezvous_failover_package(
-        state.cluster_id,
-        state.node_id,
-        request.target_node_id,
-        &public_url,
-        ca_cert_pem,
-        &cert_pem,
-        &key_pem,
-        &request.passphrase,
-    ) {
-        Ok(package) => package,
-        Err(err) => {
-            append_admin_audit(
-                &state,
-                action,
-                &authz,
-                true,
-                true,
-                true,
-                "error",
-                json!({ "error": err.to_string() }),
-            )
-            .await;
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response();
-        }
-    };
+    let rendezvous_failover =
+        match export_managed_rendezvous_failover_package(ManagedRendezvousFailoverExportParams {
+            cluster_id: state.cluster_id,
+            source_node_id: state.node_id,
+            target_node_id: request.target_node_id,
+            public_url: &public_url,
+            client_ca_cert_pem: ca_cert_pem,
+            cert_pem: &cert_pem,
+            key_pem: &key_pem,
+            passphrase: &request.passphrase,
+        }) {
+            Ok(package) => package,
+            Err(err) => {
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": err.to_string() }),
+                )
+                .await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        };
 
     let package = ManagedControlPlanePromotionPackage {
         signer_backup,

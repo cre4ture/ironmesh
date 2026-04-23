@@ -220,7 +220,9 @@ Current Linux FUSE interpretation:
 mkdir -p /tmp/ironmesh-root
 cargo run -p ironmesh-folder-agent -- \
   --root-dir /tmp/ironmesh-root \
-  --server-base-url http://127.0.0.1:18080
+  --server-base-url https://127.0.0.1:18080 \
+  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
+  --client-identity-file /path/to/ironmesh-client-identity.json
 ```
 
 Key options:
@@ -233,10 +235,11 @@ Key options:
 
 ## Linux FUSE usage (current)
 
-The Linux adapter currently ships through `os-integration`:
+The Linux adapter is exposed to users as `ironmesh-os-integration`.
 
 - Crate: `crates/adapter-linux-fuse`
-- User-facing binary: `apps/os-integration`
+- Cargo package for source-checkout `cargo run`: `apps/os-integration`
+- Installed/public command name: `ironmesh-os-integration`
 
 Example snapshot file:
 
@@ -280,13 +283,16 @@ Direct/bootstrap client-rights edge mode:
 ```bash
 mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
-  --server-base-url http://127.0.0.1:18080 \
+  --server-base-url https://127.0.0.1:18080 \
+  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
   --client-identity-file /path/to/ironmesh-client-identity.json \
   --mountpoint /tmp/ironmesh-mount-live
 ```
 
 - `--server-base-url` loads namespace entries from `/store/index` and, when auth is required,
   should be paired with `--client-identity-file`.
+- Regular server-node deployments now expect public TLS, so direct mode should also provide
+  `--server-ca-pem-file` unless the environment is an explicit local insecure test setup.
 - `--bootstrap-file` is the equivalent authenticated entrypoint when a client bootstrap bundle is
   preferred over a raw base URL. If `--client-identity-file` is omitted, the adapter also checks
   for a sibling `*.client-identity.json`, for example
@@ -313,7 +319,8 @@ cargo run -p os-integration -- \
 
 mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
-  --server-base-url http://127.0.0.1:18080 \
+  --server-base-url https://127.0.0.1:18080 \
+  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
   --client-identity-file /path/to/ironmesh-client-identity.json \
   --mountpoint /tmp/ironmesh-mount-live \
   --publish-gnome-status
@@ -333,7 +340,9 @@ Recommended same-device deployment:
 ```bash
 mkdir -p /tmp/ironmesh-mount-live
 cargo run -p os-integration -- \
-  --server-base-url http://127.0.0.1:18080 \
+  --server-base-url https://127.0.0.1:18080 \
+  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
+  --client-identity-file /path/to/ironmesh-client-identity.json \
   --offline-object-cache off \
   --mountpoint /tmp/ironmesh-mount-live
 ```

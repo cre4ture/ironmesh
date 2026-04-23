@@ -79,7 +79,7 @@ Wait until the launch report panel updates.
 Pass or fail rule:
 
 - `last-launch-report.json` is created at `$LaunchReportPath`.
-- The launch report shows the enabled `os-integration` instance starting successfully.
+- The launch report shows the enabled OS integration instance starting successfully.
 - Explorer shows the configured sync root at `$Root` or under the configured display name.
 
 ## 4. Verify LocalAppData sync-root state was materialized
@@ -169,7 +169,7 @@ If you want one stronger reconnect proof, create a remote file while the runtime
 
 This manual flow passes only if all of the following are true:
 
-- the packaged config app can save and relaunch an enabled Windows `os-integration` instance,
+- the packaged config app can save and relaunch an enabled Windows OS integration instance,
 - LocalAppData sync-root state is created under `%LocalAppData%\Ironmesh\sync-roots\...`,
 - deleting the original bootstrap file does not break restart,
 - uploads succeed both before and after restart.
