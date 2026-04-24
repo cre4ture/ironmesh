@@ -684,7 +684,7 @@ const APP_HTML: &str = r###"<!doctype html>
                   <span class="field-help">The launcher will try to restart this instance when platform startup integration is available.</span>
                 </span>
               </label>
-              <div id="os-windows-fields" class="form-section">
+              <div id="os-windows-fields" class="form-section" hidden>
                 <h4>Windows Explorer</h4>
                 <label>
                   <span class="field-label">Sync Root Identifier</span>
@@ -951,6 +951,10 @@ body {
 
 * {
   box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
 }
 
 body {
@@ -1236,7 +1240,7 @@ button.secondary {
 
 .panel-split {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 440px);
+  grid-template-columns: minmax(0, 1fr) minmax(420px, 720px);
   gap: 24px;
 }
 
@@ -1290,8 +1294,16 @@ dd {
 
 .instance-form {
   display: grid;
-  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 16px;
   align-content: start;
+}
+
+.instance-form > h3,
+.instance-form > .panel-note,
+.instance-form > .form-section,
+.instance-form > button {
+  grid-column: 1 / -1;
 }
 
 .panel-form {
@@ -1305,12 +1317,14 @@ dd {
 
 .form-section {
   display: grid;
-  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 16px;
   padding-top: 14px;
   border-top: 1px solid var(--panel-border);
 }
 
 .form-section h4 {
+  grid-column: 1 / -1;
   margin: 0;
   font-size: 15px;
   letter-spacing: 0.03em;
@@ -1428,6 +1442,11 @@ pre {
 
 @media (max-width: 980px) {
   .panel-split {
+    grid-template-columns: 1fr;
+  }
+
+  .instance-form,
+  .form-section {
     grid-template-columns: 1fr;
   }
 }
@@ -1577,7 +1596,7 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
   `;
 }
 
-function applyOsPlatformChrome(platform) {
+function applyOsPlatformUi(platform) {
   const isWindows = platform === 'windows';
   const isLinux = platform === 'linux';
 
@@ -1649,7 +1668,7 @@ function renderConfig(config) {
   document.getElementById('os-instance-count').textContent = String(config.store.os_integration_instances.length);
   document.getElementById('folder-instance-count').textContent = String(config.store.folder_agent_instances.length);
   renderLaunchReport(config.last_launch_report);
-  applyOsPlatformChrome(config.platform);
+  applyOsPlatformUi(config.platform);
 
   const supportsOsIntegration = !!config.supports_os_integration;
   document.getElementById('os-nav-link').hidden = !supportsOsIntegration;
