@@ -472,6 +472,9 @@ struct InternalCaller {
     cluster_id: ClusterId,
 }
 
+#[derive(Debug, Clone)]
+struct TransportRequestAuthPath(String);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerCertificateIdentity {
     node_id: NodeId,
@@ -812,12 +815,7 @@ async fn require_client_auth(
     }
 
     let request_headers = request.headers().clone();
-    let request_path_and_query = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or_else(|| request.uri().path())
-        .to_string();
+    let request_path_and_query = request_auth_path_and_query(&request);
     let request_method = request.method().as_str().to_string();
 
     validate_client_auth_request(
@@ -845,12 +843,7 @@ async fn require_client_or_admin_auth(
         return Ok(next.run(request).await);
     }
 
-    let request_path_and_query = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or_else(|| request.uri().path())
-        .to_string();
+    let request_path_and_query = request_auth_path_and_query(&request);
     let request_method = request.method().as_str().to_string();
 
     validate_client_auth_request(
@@ -862,6 +855,21 @@ async fn require_client_or_admin_auth(
     .await?;
 
     Ok(next.run(request).await)
+}
+
+fn request_auth_path_and_query(request: &Request) -> String {
+    request
+        .extensions()
+        .get::<TransportRequestAuthPath>()
+        .map(|path| path.0.clone())
+        .unwrap_or_else(|| {
+            request
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or_else(|| request.uri().path())
+                .to_string()
+        })
 }
 
 async fn validate_client_auth_request(

@@ -188,6 +188,9 @@ async fn execute_fallback_local_router_request(
     let mut outbound = builder
         .body(Body::from(request.body.clone()))
         .context("failed building fallback local multiplex transport request")?;
+    outbound
+        .extensions_mut()
+        .insert(crate::TransportRequestAuthPath(request.path.clone()));
     if let TransportExecutionScope::Internal(caller) = scope {
         outbound.extensions_mut().insert(caller.clone());
     }

@@ -1676,6 +1676,10 @@ async fn folder_agent_nested_prefix_uploads_camera_files_under_full_scope() -> R
             );
 
             fs::write(local_root.join("IMG20260314_200501.jpg"), b"camera-one")?;
+            fs::write(
+                local_root.join("Screenshot 2026-04-25 110534.png"),
+                b"camera-space-name",
+            )?;
             fs::create_dir_all(local_root.join("nested"))?;
             fs::write(
                 local_root.join("nested/IMG20260314_200502.jpg"),
@@ -1686,6 +1690,13 @@ async fn folder_agent_nested_prefix_uploads_camera_files_under_full_scope() -> R
                 &sdk,
                 "cameras/vm1/IMG20260314_200501.jpg",
                 b"camera-one",
+                220,
+            )
+            .await?;
+            wait_for_remote_file_bytes(
+                &sdk,
+                "cameras/vm1/Screenshot 2026-04-25 110534.png",
+                b"camera-space-name",
                 220,
             )
             .await?;
